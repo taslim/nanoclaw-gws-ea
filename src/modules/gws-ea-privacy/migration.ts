@@ -1,17 +1,14 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
 /**
- * The principal's private values, and what the audience check keeps per
- * outbound thread.
+ * The principal's private values. Each has a label the principal knows it by
+ * and one fixed kind. The value is held as the principal wrote it; the check
+ * reduces it to its matching form when it runs, so a better normalization
+ * covers every stored value at once.
  *
- * - A private value has a label the principal knows it by and one fixed
- *   kind. The value is held as the principal wrote it; the check reduces it
- *   to its matching form when it runs, so a better normalization covers
- *   every stored value at once.
- * - A thread record holds only what the check needs: the canonical tail of
- *   the latest sends to anyone but the principal (bounded, see `db.ts`), the
- *   number of refusals, and when the thread was stopped. `thread_id` is ''
- *   for a send outside any thread.
+ * Installs that ran an earlier release also created a per-thread record table
+ * here; `drop-thread-records` removes it there and does nothing on a fresh
+ * install.
  */
 export const gwsEaPrivacyMigration: ModuleMigration = {
   version: 1,
@@ -25,17 +22,19 @@ export const gwsEaPrivacyMigration: ModuleMigration = {
         value       TEXT NOT NULL CHECK (value <> ''),
         created_at  TEXT NOT NULL
       );
-
-      CREATE TABLE gws_ea_privacy_threads (
-        channel_type  TEXT NOT NULL CHECK (channel_type <> ''),
-        platform_id   TEXT NOT NULL CHECK (platform_id <> ''),
-        thread_id     TEXT NOT NULL,
-        recent        TEXT NOT NULL,
-        refusals      INTEGER NOT NULL CHECK (refusals >= 0),
-        stopped_at    TEXT,
-        updated_at    TEXT NOT NULL,
-        PRIMARY KEY (channel_type, platform_id, thread_id)
-      );
     `);
+  },
+};
+
+/**
+ * The audience check judges each send on its own, so an earlier release's
+ * per-thread records (what each outbound thread sent, its refusals, and when
+ * it stopped) go. A no-op on a fresh install.
+ */
+export const gwsEaPrivacyDropThreadsMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-privacy:drop-thread-records',
+  async up(db) {
+    await db.exec('DROP TABLE IF EXISTS gws_ea_privacy_threads');
   },
 };

@@ -28,8 +28,6 @@ const BUILT_IN = [
   'agents',
   'self-mod',
   'time',
-  'schedule-stats',
-  'calendar-facts',
   'request-status',
 ];
 

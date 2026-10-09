@@ -33,8 +33,6 @@ const ALL = [
   'agents',
   'self-mod',
   'time',
-  'schedule-stats',
-  'calendar-facts',
   'request-status',
   'gws-ea-email',
   'gws-ea-reminders',
@@ -47,21 +45,13 @@ const ALL = [
 const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
-const EXTERNAL_EMAIL_TOOLS = [
-  'book',
-  'cancel_booking',
-  'change_booking',
-  'email_send',
-  'free_time',
-  'hold',
-  'tell_main',
-];
+const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email_send', 'free_time', 'tell_main'];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 const REMINDER_TOOLS = ['clear_reminder', 'remind_me'];
-/** main's writes on the principal's events, which Google Calendar's key grants with gog's calendar commands. */
-const CALENDAR_WRITE_TOOLS = ['change_guests', 'create_event'];
+/** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
+const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats'];
 
 /** Every tool of the default-on keys. */
 const DEFAULT_ON_TOOLS = [
@@ -70,17 +60,14 @@ const DEFAULT_ON_TOOLS = [
   'ask_user_question',
   'create_agent',
   'edit_message',
-  'find_conflicts',
   'install_packages',
-  'people_stats',
   'request_status',
-  'schedule_stats',
   'send_card',
   'send_file',
   'send_message',
   ...MAIN_EMAIL_TOOLS,
   ...REMINDER_TOOLS,
-  ...CALENDAR_WRITE_TOOLS,
+  ...CALENDAR_TOOLS,
   ...TIME_TOOLS,
 ].sort();
 
@@ -121,12 +108,11 @@ describe('NanoClaw tool server capabilities', () => {
     ['every default-on key', ALL, DEFAULT_ON_TOOLS],
     ['reply and time', ['reply', 'time'], ['send_message', ...TIME_TOOLS].sort()],
     ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
-    ['calendar-facts', ['calendar-facts'], ['find_conflicts', 'people_stats']],
     ['request-status', ['request-status'], ['request_status']],
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['gws-ea-reminders', ['gws-ea-reminders'], REMINDER_TOOLS],
-    ['google-calendar', ['google-calendar'], CALENDAR_WRITE_TOOLS],
+    ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     [
       "external-email's keys",
       EXTERNAL_EMAIL,
@@ -139,9 +125,13 @@ describe('NanoClaw tool server capabilities', () => {
 
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
-    for (const tool of ['tell_main', 'free_time', 'hold', 'book', 'change_booking', 'cancel_booking']) {
+    for (const tool of ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking']) {
       expect(tools).not.toContain(tool);
     }
+  });
+
+  it('serves no hold tool to any group: nothing reserves the principal’s time before someone agrees', async () => {
+    for (const grants of [ALL, EXTERNAL_EMAIL]) expect(await served(grants)).not.toContain('hold');
   });
 
   it("serves main email_principal for the principal's threads, and external-email email_send for its own", async () => {

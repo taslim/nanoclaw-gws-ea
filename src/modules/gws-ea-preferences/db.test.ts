@@ -73,7 +73,7 @@ describe('GWS-EA scheduling preferences store', () => {
     expect(await getSchedulingPreferences()).toEqual({ ...EMPTY, working_hours: [expected] });
   });
 
-  it('rejects a learned value over a principal-set one and stores a learned value for an unset field with its basis', async () => {
+  it('stores a learned value for an unset field with its basis, beside what the principal set', async () => {
     await setSchedulingPreference(mondayHours('principal', '09:00', '17:00', 'Said Mondays are 9 to 5.'));
     await setSchedulingPreference({
       kind: 'meeting-length',
@@ -82,19 +82,6 @@ describe('GWS-EA scheduling preferences store', () => {
       source: 'principal',
       basis: 'Asked for 30-minute one-on-ones.',
     });
-
-    await expect(
-      setSchedulingPreference(mondayHours('learned', '08:30', '18:00', 'First and last meetings over eight weeks.')),
-    ).rejects.toThrow(/set by the principal/i);
-    await expect(
-      setSchedulingPreference({
-        kind: 'meeting-length',
-        meetingKind: 'one-on-one',
-        minutes: 45,
-        source: 'learned',
-        basis: 'Most common one-on-one length.',
-      }),
-    ).rejects.toThrow(/set by the principal/i);
 
     vi.setSystemTime(new Date(LATER));
     const learned = await setSchedulingPreference({
@@ -384,16 +371,17 @@ describe('GWS-EA scheduling preferences store', () => {
     ).resolves.toMatchObject({ source: 'learned' });
   });
 
-  it('never lets a learned removal erase a value the principal set; the principal can remove it', async () => {
-    const principalSet = await setSchedulingPreference(mondayHours('principal', '09:00', '17:00', 'Said so.'));
+  it('lets a value main learned replace or remove one the principal set, recording who set it: that is judgment', async () => {
+    await setSchedulingPreference(mondayHours('principal', '09:00', '17:00', 'Said so.'));
+
+    const learned = await setSchedulingPreference(
+      mondayHours('learned', '08:30', '18:00', 'First and last meetings over eight weeks.'),
+    );
+    expect((await getSchedulingPreferences()).working_hours).toEqual([learned]);
+    expect(learned).toMatchObject({ source: 'learned', start: '08:30' });
 
     await expect(
       removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon', source: 'learned' }),
-    ).rejects.toThrow('Working hours for Monday: set by the principal, so a learned value cannot remove it');
-    expect((await getSchedulingPreferences()).working_hours).toEqual([principalSet]);
-
-    await expect(
-      removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon', source: 'principal' }),
     ).resolves.toEqual({ kind: 'working-hours', weekday: 'mon' });
     expect((await getSchedulingPreferences()).working_hours).toEqual([]);
   });
@@ -410,16 +398,32 @@ describe('GWS-EA scheduling preferences store', () => {
     });
     expect(lunch).toMatchObject({ id: expect.stringMatching(/^w-[0-9a-f]{8}$/), reason: 'Lunch with family.' });
 
-    await expect(
-      setSchedulingPreference({
+    // Relearning it without a reason keeps the principal's reason for it.
+    const relearnedLunch = await setSchedulingPreference({
+      kind: 'protected-window',
+      weekdays: ['fri', 'thu', 'wed', 'tue', 'mon'],
+      start: '12:00',
+      end: '13:00',
+      source: 'learned',
+      basis: 'Recurring lunch block.',
+    });
+    expect(relearnedLunch).toMatchObject({ id: lunch.id, source: 'learned', reason: 'Lunch with family.' });
+    expect((await getSchedulingPreferences()).protected_windows).toContainEqual(
+      expect.objectContaining({ id: lunch.id, reason: 'Lunch with family.' }),
+    );
+    // A blank reason clears it.
+    expect(
+      await setSchedulingPreference({
         kind: 'protected-window',
-        weekdays: ['fri', 'thu', 'wed', 'tue', 'mon'],
+        id: lunch.id,
+        weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'],
         start: '12:00',
         end: '13:00',
-        source: 'learned',
-        basis: 'Recurring lunch block.',
+        reason: '',
+        source: 'principal',
+        basis: 'Said the reason no longer matters.',
       }),
-    ).rejects.toThrow(/set by the principal/i);
+    ).toMatchObject({ id: lunch.id, reason: null });
 
     const focus = await setSchedulingPreference({
       kind: 'protected-window',

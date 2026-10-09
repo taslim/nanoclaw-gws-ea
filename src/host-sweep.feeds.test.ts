@@ -70,8 +70,8 @@ beforeEach(() => {
   }) as typeof setTimeout);
 });
 
-afterEach(() => {
-  stopHostSweep();
+afterEach(async () => {
+  await stopHostSweep();
   setTimeoutSpy.mockRestore();
 });
 
@@ -108,7 +108,7 @@ describe('runtime terminal-event feed', () => {
     await startAndDrainFirstTick();
     const handler = watchHandler!;
 
-    stopHostSweep();
+    await stopHostSweep();
     expect(watchStop).toHaveBeenCalledTimes(1);
 
     handler(terminalEvent('s-9'));

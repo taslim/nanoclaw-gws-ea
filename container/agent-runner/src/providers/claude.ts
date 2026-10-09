@@ -1,5 +1,6 @@
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { acknowledgmentReminder } from '../acknowledge.js';
 import { runnerCapabilities } from '../config.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { sessionsSealed } from '../memory/sealed.js';
@@ -205,6 +206,18 @@ const postToolUseHook: HookCallback = async () => {
   return { continue: true };
 };
 
+/**
+ * After each batch of tool calls, the reminder to acknowledge a person left
+ * waiting (acknowledge.ts). A subagent speaks to no one, so it gets none.
+ * Removable with acknowledge.ts once the channel has a typing indicator.
+ */
+const acknowledgeHook: HookCallback = async (input) => {
+  const reminder = input.agent_id === undefined ? acknowledgmentReminder() : undefined;
+  return reminder === undefined
+    ? { continue: true }
+    : { hookSpecificOutput: { hookEventName: 'PostToolBatch', additionalContext: reminder } };
+};
+
 /** Minimum spacing between `activity` frames derived from streaming deltas. */
 const STREAM_ACTIVITY_INTERVAL_MS = 1000;
 
@@ -384,6 +397,7 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [{ hooks: [this.preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PostToolBatch: [{ hooks: [acknowledgeHook] }],
           ...(this.sealed ? {} : { PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }] }),
         },
       },

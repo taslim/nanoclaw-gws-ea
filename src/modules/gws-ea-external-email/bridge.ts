@@ -18,10 +18,9 @@
  *   session, never from a path `main` names. Core stages them into the
  *   thread session's inbox, and each is recorded for the thread by its
  *   SHA-256, the only way a file goes out (KTD9). A `calendar` names where
- *   the thread's holds and bookings go: one of the principal's calendars the
- *   assistant can write to. A thread the privacy check stopped may send
- *   again. `main`'s words join the mail already waiting in the thread's
- *   session, or are due at once when none is (`pendingDeadline`).
+ *   the thread's bookings go: one of the principal's calendars the
+ *   assistant can write to. `main`'s words join the mail already waiting in
+ *   the thread's session, or are due at once when none is (`pendingDeadline`).
  * - `tell_main` writes `external-email`'s words into `main`'s session as
  *   information, framed untrusted because they draw on what outsiders wrote,
  *   and wakes it. The host's own words name only the thread's key and its
@@ -70,7 +69,7 @@ import {
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
-import { checkOutbound, resumeThread } from '../gws-ea-privacy/index.js';
+import { checkOutbound } from '../gws-ea-privacy/index.js';
 import { getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
 
@@ -408,11 +407,6 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
   const at = handoff.context.at.toISOString();
   const threadKey = target.kind === 'thread' ? target.threadKey : newThreadKey(session, requestId);
   await recordHandoff(threadKey, handoff, at);
-  const resumed = await resumeThread({
-    channelType: EMAIL_CHANNEL_TYPE,
-    platformId: INBOX_PLATFORM_ID,
-    threadId: threadKey,
-  });
   const { session: thread } = await resolveSession(externalEmail, inbox, threadKey, 'per-thread');
   await writeHandoff(thread, threadKey, handoff, requestId, at);
   return {
@@ -423,9 +417,8 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
         : `external-email has your words for thread ${threadKey} and takes them up within a few minutes.${
             target.people.length === 0 ? '' : ` It may write to ${target.people.join(', ')} there.`
           }`,
-      ...(resumed ? ['The thread, stopped after repeated attempts to send private details, may send again.'] : []),
       ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
-      ...(bookingCalendar === undefined ? [] : [`Its holds and bookings go on calendar ${bookingCalendar}.`]),
+      ...(bookingCalendar === undefined ? [] : [`Its bookings go on calendar ${bookingCalendar}.`]),
     ].join(' '),
   };
 };

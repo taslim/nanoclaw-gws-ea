@@ -161,28 +161,7 @@ describe('GWS-EA preferences ncl resource', () => {
     expect(await getSchedulingPreferences()).toMatchObject({ protected_windows: [], meeting_lengths: [] });
   });
 
-  it('rejects a learned write over a principal value and values outside the kind shape', async () => {
-    await setSchedulingPreference({
-      kind: 'working-hours',
-      weekday: 'mon',
-      hours: { start: '09:00', end: '17:00' },
-      source: 'principal',
-      basis: 'Said so.',
-    });
-
-    expect(
-      await run('preferences-set', {
-        kind: 'working-hours',
-        weekday: 'mon',
-        start: '08:00',
-        end: '18:00',
-        source: 'learned',
-        basis: 'Usual first and last meeting.',
-      }),
-    ).toMatchObject({
-      ok: false,
-      error: { code: 'handler-error', message: expect.stringMatching(/set by the principal/i) },
-    });
+  it('rejects values outside the kind shape', async () => {
     expect(
       await run('preferences-set', {
         kind: 'working-hours',

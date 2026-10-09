@@ -1,10 +1,9 @@
 /**
- * `unknownToolNames` against the instruction files for the runner's
- * calendar-facts, schedule-stats, time and reminder tools, and each agent's
- * email tools:
- * each should name only a tool the runner actually exports, or a word this
- * file's own not-tools list explicitly carves out as something else (a
- * request field, a sender, an outcome word, and so on).
+ * `unknownToolNames` against the instruction files for the runner's time and
+ * reminder tools, and each agent's email tools: each should name only a tool
+ * the runner actually exports, or a word this file's own not-tools list
+ * explicitly carves out as something else (a request field, a sender, an
+ * outcome word, and so on).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -18,10 +17,8 @@ function instructions(name: string): string {
   return fs.readFileSync(path.join(MODULES, `${name}.instructions.md`), 'utf8');
 }
 
-/** Each instruction file this branch touched, with the backticked words in it that are not tool names. */
+/** Each instruction file GWS-EA relies on, with the backticked words in it that are not tool names. */
 const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]> = [
-  ['calendar-facts', ['from', 'to', 'start', 'end', 'candidate_ical_uid', 'assistant_address', 'people']],
-  ['schedule-stats', ['from', 'to']],
   ['time', ['reference_date']],
   ['reminders', []],
   ['gws-ea-email', []],

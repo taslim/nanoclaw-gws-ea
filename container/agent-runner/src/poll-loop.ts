@@ -1,3 +1,4 @@
+import { startWaiting, stopWaiting } from './acknowledge.js';
 import { deliveredByRequest } from './action-request.js';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
@@ -428,13 +429,20 @@ export async function processQuery(
     taskBlockNudged: boolean;
   };
   const queuedTurns: QueuedTurn[] = [];
+  // A person waiting in a live chat is reminded of after a while if nothing has gone out (acknowledge.ts).
+  const awaitAnswer = (): void => {
+    if (routing.personWaiting === true) startWaiting(() => deliveredSince(turnStartSeq));
+    else stopWaiting();
+  };
   const adoptTurn = (next: QueuedTurn): void => {
     Object.assign(routing, next.routing);
     unwrappedNudged = next.unwrappedNudged;
     taskBlockNudged = next.taskBlockNudged;
     publishReplyRoute(routing);
     answering = true;
+    awaitAnswer();
   };
+  if (answering) awaitAnswer();
   // A retry is another provider input, behind any follow-ups already pushed.
   // Preserve its original route, prompt and retry guards until it is answered.
   const pushRetry = (prompt: string): void => {
@@ -689,6 +697,7 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        stopWaiting();
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
         else answering = false;
@@ -743,6 +752,8 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    // No turn outlives its query, so no later turn is reminded of this one's wait.
+    stopWaiting();
   }
 
   return { continuation: queryContinuation };

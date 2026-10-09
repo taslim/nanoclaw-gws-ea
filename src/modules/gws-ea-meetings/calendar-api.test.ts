@@ -137,7 +137,7 @@ describe('the Calendar client', () => {
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'none')).toBe('exists');
   });
 
-  it('marks a hold private, busy and silent', async () => {
+  it('writes an event private, busy and silent when asked', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'h1' } }));
     await api.insertEvent(
       'pat@principal.example',
@@ -204,6 +204,54 @@ describe('the Calendar client', () => {
     ]);
   });
 
+  it("reads every page of main's detailed listing, titles and names included, and fails rather than come back short", async () => {
+    const page = (token: string | undefined, id: string) => ({
+      items: [
+        {
+          id,
+          summary: 'Quarterly review',
+          organizer: { email: 'Pat@Principal.example', self: true },
+          attendees: [
+            { email: 'pat@principal.example', self: true, responseStatus: 'accepted' },
+            { email: 'remy@friends.example', displayName: 'Remy Vance', responseStatus: 'needsAction' },
+          ],
+          recurringEventId: 'series1',
+          originalStartTime: { dateTime: '2026-10-07T09:00:00Z' },
+          start: { dateTime: '2026-10-07T09:00:00Z' },
+          end: { dateTime: '2026-10-07T10:00:00Z' },
+        },
+      ],
+      ...(token === undefined ? {} : { nextPageToken: token }),
+    });
+    const { api, requests } = stubGoogle((request) =>
+      request.url.searchParams.get('pageToken') === 'p2'
+        ? { status: 200, body: page(undefined, 'e2') }
+        : { status: 200, body: page('p2', 'e1') },
+    );
+    const events = await api.listEventDetails('pat@principal.example', '2026-10-07T00:00:00Z', '2026-10-08T00:00:00Z');
+    expect(events.map((event) => event.id)).toEqual(['e1', 'e2']);
+    expect(events[0]).toEqual({
+      id: 'e1',
+      summary: 'Quarterly review',
+      recurringEventId: 'series1',
+      organizer: { email: 'pat@principal.example', self: true },
+      attendees: [
+        { email: 'pat@principal.example', self: true, responseStatus: 'accepted' },
+        { email: 'remy@friends.example', displayName: 'Remy Vance', responseStatus: 'needsAction' },
+      ],
+      originalStartTime: { dateTime: '2026-10-07T09:00:00Z' },
+      start: { dateTime: '2026-10-07T09:00:00Z' },
+      end: { dateTime: '2026-10-07T10:00:00Z' },
+    });
+    expect(requests[0].url.searchParams.get('singleEvents')).toBe('true');
+    expect(requests[0].url.searchParams.get('fields')).toContain('summary');
+
+    const endless = stubGoogle(() => ({ status: 200, body: page('more', 'e') }));
+    await expect(
+      endless.api.listEventDetails('pat@principal.example', '2026-01-01T00:00:00Z', '2026-12-31T00:00:00Z'),
+    ).rejects.toThrow(/too long to read/u);
+  });
+
   it("reads an event's own tags, but never its title, description or location", async () => {
     const { api, requests } = stubGoogle(() => ({
       status: 200,
@@ -212,11 +260,11 @@ describe('the Calendar client', () => {
         status: 'confirmed',
         start: { dateTime: '2026-10-07T09:00:00Z' },
         end: { dateTime: '2026-10-07T09:30:00Z' },
-        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'hold' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' } },
       },
     }));
     const event = await api.getEvent('pat@principal.example', 'h1');
-    expect(event?.tags).toEqual({ gwsEaThread: 'mail-1', gwsEaRole: 'hold' });
+    expect(event?.tags).toEqual({ gwsEaThread: 'mail-1', gwsEaRole: 'booking' });
     const fields = requests[0].url.searchParams.get('fields') ?? '';
     expect(fields).toContain('extendedProperties');
     for (const hidden of ['summary', 'description', 'location']) expect(fields).not.toContain(hidden);
@@ -244,7 +292,7 @@ describe('the Calendar client', () => {
     });
   });
 
-  it("reads an event's guests whole with its organizer and version, and writes a guest list back as given over that version", async () => {
+  it("reads an event's guests whole with its organizer, version and words, and writes a guest list back as given over that version", async () => {
     const guests = [
       { email: 'pat@principal.example', responseStatus: 'accepted', organizer: true, self: true },
       { email: 'sam@acme.example', responseStatus: 'accepted', comment: 'Running late', optional: true },
@@ -258,6 +306,9 @@ describe('the Calendar client', () => {
               status: 'confirmed',
               organizer: { email: 'Pat@Principal.example' },
               attendees: guests,
+              summary: 'Quarterly review',
+              description: 'The numbers, then the plan.',
+              location: 'Boardroom',
             },
           }
         : { status: 200, body: { id: 'evt-1' } },
@@ -267,8 +318,13 @@ describe('the Calendar client', () => {
       status: 'confirmed',
       organizer: 'pat@principal.example',
       guests,
+      summary: 'Quarterly review',
+      description: 'The numbers, then the plan.',
+      location: 'Boardroom',
     });
-    expect(requests[0].url.searchParams.get('fields')).toBe('etag,status,organizer(email),attendees');
+    expect(requests[0].url.searchParams.get('fields')).toBe(
+      'etag,status,organizer(email),attendees,summary,description,location',
+    );
 
     expect(
       await api.setGuests(

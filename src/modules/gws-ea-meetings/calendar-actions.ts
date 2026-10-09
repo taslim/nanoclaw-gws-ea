@@ -6,19 +6,26 @@
  * - Every event lists the owner of its calendar, the principal, as its first
  *   guest, accepted (`guestsOn`): Google then shows them on the guest list
  *   as its organizer, as it does for an event they made themselves.
+ * - An invitation shows no one Google sends it to a private detail of the
+ *   principal's, and names no weekday beside a date it does not fall on
+ *   (`assertInvitationShareable`).
  * - An event's id derives from what it is for (`eventIdFor`), so a retry
  *   after a partial failure finds the event it made (`ensureEvent`), and an
- *   event under that id that is not the assistant's is never touched.
+ *   event under that id that is not the assistant's is never touched. Its
+ *   guests hear of it from the first write alone.
  * - Every event the assistant places carries private tags no one else can
- *   set: its role (`TAG_ROLE`), a hold or a booking, and the thread it was
- *   placed for.
+ *   set: its role (`TAG_ROLE`), which marks it a booking, and the thread it
+ *   was placed for.
  * - Every write is recorded as the assistant's own change, so its
  *   notification produces no note.
  */
 import { createHash } from 'node:crypto';
 
+import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { log } from '../../log.js';
+import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import type {
   CalendarEvent,
   EventConference,
@@ -29,7 +36,7 @@ import type {
 } from './calendar-api.js';
 import type { Span } from './slots.js';
 
-/** The private tag naming an event's role, `hold` or `booking`, on the events the assistant places. */
+/** The private tag naming an event's role, `booking`, on the events the assistant places. */
 export const TAG_ROLE = 'gwsEaRole';
 
 /** A Google event id from its parts: lowercase hex, which Google's id alphabet allows. */
@@ -59,6 +66,46 @@ export function guestsOn(calendarId: string, invitees: readonly string[]): Guest
   ];
 }
 
+/** What an invitation shows the people Google sends it to. */
+export interface Invitation {
+  /** What the write says: its title, notes and place. */
+  readonly texts: readonly (string | undefined)[];
+  /**
+   * What else they see beside it: the name of the calendar it is on and,
+   * unless they have seen them already, the other addresses on its guest
+   * list.
+   */
+  readonly shown: readonly (string | undefined)[];
+  /** Who Google sends it to. The principal may see anything; nobody at all sees nothing. */
+  readonly recipients: readonly string[];
+}
+
+/**
+ * Refuse, writing nothing, an invitation whose words name a weekday beside a
+ * date it does not fall on, or which would show anyone Google sends it to
+ * one of the principal's private details. `refused` leads the refusal and
+ * `advice` ends one for a private detail, saying what to do about it; the
+ * refusal names the detail's kind, never the detail.
+ */
+export async function assertInvitationShareable(
+  invitation: Invitation,
+  refused: string,
+  advice: string,
+): Promise<void> {
+  const misdated = await weekdayRefusal(invitation.texts.map((text) => text ?? ''));
+  if (misdated !== undefined) throw invalidArgs(`${refused}: ${misdated}`);
+  if (invitation.recipients.length === 0) return;
+  const check = await checkOutbound(
+    [...invitation.texts, ...invitation.shown].map((text) => text ?? ''),
+    await audienceForAddresses(invitation.recipients),
+  );
+  if (!check.allowed) {
+    throw forbidden(
+      `${refused}: as its guests would see it, the invitation carries one of the principal's private details (${check.kind}). ${advice}`,
+    );
+  }
+}
+
 /** Whether the event Google holds already says what the write would: its time, and each guest with any answer it gives them. */
 function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
   const startsTogether =
@@ -81,10 +128,13 @@ function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
 }
 
 /**
- * Create the event under its own id, or find the one an earlier attempt
- * made: restored if it was deleted, corrected if its time or people differ,
- * left alone (and nobody emailed again) if it already says the same. An
- * event under that id that does not carry `owner`'s tag is never touched.
+ * Create the event under its own id, telling its guests as `sendUpdates`
+ * says, or find the one an earlier attempt made: restored if it was
+ * deleted, corrected if its time or people differ, left alone if it already
+ * says the same. Its guests heard of it from that first write, so a
+ * correction emails nobody again; a restore tells them as the first write
+ * did, since the last they heard was that it was cancelled. An event under
+ * that id that does not carry `owner`'s tag is never touched.
  */
 export async function ensureEvent(
   api: MeetingsCalendarApi,
@@ -112,7 +162,7 @@ export async function ensureEvent(
           ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
           status: 'confirmed',
         },
-        sendUpdates,
+        deleted ? sendUpdates : 'none',
       );
     }
   }
@@ -170,6 +220,17 @@ export function slotLabel(span: Span, timezone: string): string {
   return `${dayLabel(span.start, timezone)}, ${clockLabel(span.start, timezone)}–${clockLabel(span.end, timezone)} ${zoneName(span.start, timezone)}`;
 }
 
+/**
+ * A span as people write it, in `timezone`: a slot when it starts and ends
+ * on one day, and both days otherwise, "Thursday 8 Oct, 09:00 PDT to
+ * Saturday 10 Oct, 17:00 PDT". Ending at midnight stays the same day.
+ */
+export function spanLabel(span: Span, timezone: string): string {
+  return dayLabel(span.start, timezone) === dayLabel(span.end - 1, timezone)
+    ? slotLabel(span, timezone)
+    : `${momentLabel(span.start, timezone)} to ${momentLabel(span.end, timezone)}`;
+}
+
 /** One instant as people write it, in `timezone`: "Thursday 8 Oct, 09:00 PDT". */
 export function momentLabel(instant: number, timezone: string): string {
   return `${dayLabel(instant, timezone)}, ${clockLabel(instant, timezone)} ${zoneName(instant, timezone)}`;
@@ -179,10 +240,27 @@ function clockLabel(instant: number, timezone: string): string {
   return new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
 }
 
-/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct". */
+/**
+ * How far from now a day is written without its year: the reading the
+ * outgoing weekday check takes of a date written without one
+ * (`gws-ea-dates`), so a label copied into a message never reads as another
+ * year's.
+ */
+const YEARLESS_PAST_MS = 120 * 24 * 60 * 60 * 1000;
+const YEARLESS_AHEAD_MS = 300 * 24 * 60 * 60 * 1000;
+
+/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct", with its year when far from now. */
 export function dayLabel(instant: number, timezone: string): string {
+  const now = Date.now();
+  const near = instant >= now - YEARLESS_PAST_MS && instant < now + YEARLESS_AHEAD_MS;
   return new Date(instant)
-    .toLocaleDateString('en-GB', { timeZone: timezone, weekday: 'long', day: 'numeric', month: 'short' })
+    .toLocaleDateString('en-GB', {
+      timeZone: timezone,
+      weekday: 'long',
+      day: 'numeric',
+      month: 'short',
+      ...(near ? {} : { year: 'numeric' }),
+    })
     .replace(',', '');
 }
 
