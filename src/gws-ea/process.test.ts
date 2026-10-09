@@ -1,7 +1,9 @@
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,6 +19,8 @@ import { resolveControlPlanePaths } from './paths.js';
 import { REDACTED } from './redact.js';
 import { startRunLog, type RunLog } from './run-log.js';
 import { GwsEaError } from './types.js';
+
+const execFileAsync = promisify(execFile);
 
 const NODE = process.execPath;
 const roots: string[] = [];
@@ -646,4 +650,29 @@ describe('GWS-EA persisted executables', () => {
       message: expect.stringContaining('temporary'),
     });
   });
+});
+
+describe('the instance host launcher', () => {
+  it('runs when the service manager starts it through the live link, as it starts every release', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-launcher-link-')));
+    // `<instance>/nanoclaw -> <release>`: the service definition names the launcher through the link.
+    const release = path.resolve(import.meta.dirname, '..', '..');
+    const live = path.join(root, 'nanoclaw');
+    await symlink(release, live);
+    try {
+      const run = execFileAsync(
+        process.execPath,
+        ['--import', 'tsx', path.join(live, 'src', 'gws-ea', 'process.ts'), 'launch-host'],
+        // Run from the release, as the service definition does, so `tsx` resolves.
+        { cwd: release, timeout: 60_000 },
+      );
+      // It ran: its argument check answered, rather than the module exiting without a word.
+      await expect(run).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining('Usage: process.js launch-host <runtime-config>'),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
