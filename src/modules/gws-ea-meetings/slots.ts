@@ -472,11 +472,12 @@ function onQuarterHours(span: Span): Span {
 
 /**
  * A free run split where its fit changes, at the day's working hours,
- * preferred times and protected windows. A piece too short for the meeting cannot hold one at its
- * own fit, so it joins a neighbour whose fit the joining leaves as it was,
- * the better fitting one first, and goes when no neighbour takes it; then
- * neighbours that fit alike as one become one. Every window is labeled with
- * the fit of the window as a whole, which every meeting inside it meets.
+ * preferred times and protected windows. A piece too short for the meeting
+ * cannot hold one at its own fit, so it joins a neighbour when the joined
+ * window keeps the fit of either, the better fitting join first, and goes
+ * when none does; then neighbours that fit alike as one become one. Every
+ * window is labeled with the fit of the window as a whole, which every
+ * meeting inside it meets.
  */
 function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: string, length: number): FreeWindow[] {
   const weekday = weekdayOf(date);
@@ -508,7 +509,7 @@ function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: str
       .filter((index) => index >= 0 && index < pieces.length)
       .flatMap((index) => {
         const first = Math.min(index, short);
-        const window = join(pieces, first, pieces[index]);
+        const window = join(pieces, first, pieces[index]) ?? join(pieces, first, pieces[short]);
         return window === undefined ? [] : [{ first, window }];
       })
       .sort((a, b) => rank(a.window.fit) - rank(b.window.fit));

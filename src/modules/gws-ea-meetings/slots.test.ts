@@ -152,6 +152,22 @@ describe('free time', () => {
     expect(fitOf(span('2026-10-06T12:00:00Z', '2026-10-06T12:30:00Z'), rules, LONDON)).toBe('acceptable');
   });
 
+  it('keeps a free run long enough for the meeting whichever way round its short parts fit', () => {
+    const rules = schedulingRules({
+      ...NONE,
+      working_hours: workingDays('09:00', '17:00'),
+      protected_windows: [{ ...PROVENANCE, id: 'pw-1', weekdays: ['tue'], start: '12:00', end: '13:00' }],
+    });
+    // Free 12:00 to 13:30 and 08:00 to 09:30 London on Tuesday, for 90 minutes: each run's worse part comes first.
+    const busy = [
+      span('2026-10-06T05:00:00Z', '2026-10-06T07:00:00Z'),
+      span('2026-10-06T08:30:00Z', '2026-10-06T11:00:00Z'),
+      span('2026-10-06T12:30:00Z', '2026-10-06T21:00:00Z'),
+    ];
+    const tuesday = on('Tue', freeWindows(query({ window: WEEK, rules, busy, lengthMinutes: 90 })));
+    expect(tuesday).toEqual(['Tue 08:00–09:30 outside usual hours', 'Tue 12:00–13:30 protected time']);
+  });
+
   it("keeps the principal's default buffer around busy time, and no other kind's", () => {
     const rules = schedulingRules({
       ...NONE,
