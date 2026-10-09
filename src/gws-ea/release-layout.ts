@@ -14,7 +14,7 @@
  *   kept/0123abcd/         what is kept with each release, its receipt last
  *   snapshots/<op>/        a copy of `state/` an operation took while fenced
  *   quarantine/<op>/       the state a snapshot restore replaced
- *   fence.json             which fence is in force
+ *   fence.json             which fence is in force, and the release it ended
  *
  * NanoClaw roots its state at `process.cwd()` (`src/config.ts`), and upstream
  * already supports `data`, `groups`, `store`, and `.env` as links to storage
@@ -261,8 +261,8 @@ export async function readCurrent(layout: InstanceLayout): Promise<string | unde
   return target;
 }
 
-/** The `epoch` a JSON record at `file` names, or undefined when there is no such file or it names none. */
-async function readEpoch(file: string): Promise<string | undefined> {
+/** The JSON record at `file`, or undefined when there is no such file or it holds no record. */
+async function readRecordFile(file: string): Promise<Record<string, unknown> | undefined> {
   let value: unknown;
   try {
     value = JSON.parse(await readFile(file, 'utf8'));
@@ -270,27 +270,45 @@ async function readEpoch(file: string): Promise<string | undefined> {
     if (isErrno(error, 'ENOENT') || error instanceof SyntaxError) return undefined;
     throw error;
   }
-  return isRecord(value) && typeof value.epoch === 'string' && value.epoch ? value.epoch : undefined;
+  return isRecord(value) ? value : undefined;
+}
+
+/** The `epoch` a JSON record at `file` names, or undefined when there is no such file or it names none. */
+async function readEpoch(file: string): Promise<string | undefined> {
+  const epoch = (await readRecordFile(file))?.epoch;
+  return typeof epoch === 'string' && epoch ? epoch : undefined;
 }
 
 /**
  * Remove the live link, so neither the service manager nor anything else can
  * start a host until a switch points it again, and return the fence's epoch.
- * Each fence that removes the link starts a new epoch, recorded before the
- * link goes: a release may have run since any earlier fence, so a snapshot
- * that one took is stale. Fencing again while fenced keeps the epoch.
+ * Each fence that removes the link starts a new epoch, recorded with the
+ * release the link named before the link goes: a release may have run since
+ * any earlier fence, so a snapshot that one took is stale. Fencing again
+ * while fenced keeps the epoch, and the release it ended.
  */
 export async function fence(layout: InstanceLayout): Promise<string> {
   const live = await readCurrent(layout);
   const recorded = await readEpoch(fenceFile(layout));
   if (live === undefined && recorded !== undefined) return recorded;
   const epoch = randomUUID();
-  await writePrivate(fenceFile(layout), { epoch });
+  await writePrivate(fenceFile(layout), { epoch, ...(live === undefined ? {} : { ended: live }) });
   if (live !== undefined) {
     await rm(layout.current);
     await syncDirectory(layout.root);
   }
   return epoch;
+}
+
+/**
+ * The release whose live link the fence in force removed, which may have run
+ * until then; undefined while a release is live, or when the fence removed
+ * none.
+ */
+export async function fenceEnded(layout: InstanceLayout): Promise<string | undefined> {
+  if ((await readCurrent(layout)) !== undefined) return undefined;
+  const ended = (await readRecordFile(fenceFile(layout)))?.ended;
+  return typeof ended === 'string' && RELEASE_NAME.test(ended) ? ended : undefined;
 }
 
 /** The epoch of the fence in force; refused unless a fence is. */

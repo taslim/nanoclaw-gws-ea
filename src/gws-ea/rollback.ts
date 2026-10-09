@@ -16,12 +16,15 @@
  * continued by the next `rollback --id`. One that fails goes back to the
  * release it left (KTD5): the state it restored is renamed aside to
  * `quarantine/<op>-returned/` and the quarantined state put back, and the
- * release it left is switched to, started, and verified; when that fails
- * too, the record is closed for fix-forward (KTD9). An update whose release
- * has not started is not rolled back: the release it left is served again
- * and the update discarded. One whose release started is reverted by the same
- * rules, from the snapshot it took and committing by its own record; there
- * is nothing to go back to when that fails, so it is closed for fix-forward.
+ * release it left is switched to, started, and verified. When that fails
+ * too, the record is closed for fix-forward (KTD9) once the state it
+ * replaced is back; before that it stays open, going back, for the next
+ * `rollback --id` to finish the return. An update whose release
+ * cannot have started is not rolled back: the release it left is served
+ * again and the update discarded. One whose release may have started (from
+ * its switch on) is reverted by the same rules, from the snapshot it took and
+ * committing by its own record; there is nothing to go back to when that
+ * fails, so it is closed for fix-forward.
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -66,6 +69,7 @@ import {
   readRollbackPoint,
   recordOperationFacts,
   reservationAt,
+  targetMayHaveStarted,
   type OperationRecord,
   type RollbackMode,
   type SnapshotManifest,
@@ -677,7 +681,7 @@ async function pinsOf(rollback: Rollback, release: ReleaseCoordinates): Promise<
 async function goBack(rollback: Rollback): Promise<void> {
   const { operation, layout } = rollback;
   await beginOperationReturn(operation);
-  await serveLeftRelease(rollback, rollback.from, () => returnQuarantinedState(layout, rollback.op));
+  await serveLeftRelease(rollback, rollback, () => returnQuarantinedState(layout, rollback.op));
   await runStep(rollback.reporter, { id: 'verify_release', label: 'Checking the release it left serves…' }, async () =>
     verifyServingRelease(rollback, {
       view: reservationAt(rollback.reservation, rollback.from),
@@ -712,6 +716,24 @@ async function closedForFixForward(rollback: Rollback, cause: unknown, why: stri
     'rollback_return_failed',
     `${safeErrorMessage(cause)} ${why} Fix it forward: update it to a newer release with gws-ea update --id ${id}.`,
     { cause, details: { continueWith: `gws-ea update --id ${id}` } },
+  );
+}
+
+/**
+ * A rollback whose return failed too: closed for fix-forward once the state
+ * its restore replaced is back, or when it restored none. Until the return
+ * has put that state back, the record stays open and going back, so the next
+ * `rollback --id` finishes the return, rather than a fix-forward building on
+ * the restored snapshot while what the assistant recorded since stays in
+ * quarantine (KTD5).
+ */
+async function returnFailed(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
+  if (!(await exists(rollback.layout.quarantine(rollback.op)))) return closedForFixForward(rollback, cause, why);
+  const id = rollback.operation.instanceId;
+  return new GwsEaError(
+    'rollback_return_unfinished',
+    `${safeErrorMessage(cause)} ${why} The state it replaced is not back yet. Continue going back with gws-ea rollback --id ${id}.`,
+    { cause, details: { continueWith: `gws-ea rollback --id ${id}` } },
   );
 }
 
@@ -757,7 +779,7 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
     try {
       await goBack(rollback);
     } catch (error) {
-      throw await closedForFixForward(
+      throw await returnFailed(
         rollback,
         error,
         `Going back from the rollback to ${releaseLine(rollback.to)} to ${releaseLine(rollback.from)} failed.`,
@@ -793,12 +815,12 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
           break;
         }
         case 'snapshotted':
-          definitionChanged = await switchTo(rollback, record.to, 'Switching to the previous release…');
+          definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
           record = await advanceOperation(operation, 'switched');
           break;
         case 'switched':
           if ((await readCurrent(layout)) !== releaseName(record.to.deployed_commit)) {
-            definitionChanged = await switchTo(rollback, record.to, 'Switching to the previous release…');
+            definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
           }
           await startRelease(rollback, definitionChanged, 'Starting the previous release…');
           record = await advanceOperation(operation, 'started');
@@ -845,7 +867,7 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
     try {
       await goBack(rollback);
     } catch (returnError) {
-      throw await closedForFixForward(
+      throw await returnFailed(
         rollback,
         returnError,
         `The rollback to ${releaseLine(rollback.to)} failed (${safeErrorMessage(error)}), and going back to ${releaseLine(rollback.from)} failed too.`,
@@ -865,12 +887,13 @@ async function rolledBack(rollback: Rollback, record: OperationRecord): Promise<
 }
 
 /**
- * Revert an update that is unfinished (KTD2). One whose release has not
+ * Revert an update that is unfinished (KTD2). One whose release cannot have
  * started is discarded: the release it left is served again
- * (`serveLeftRelease`), its staged release kept. One whose release started is
- * rolled back by the rollback rules, from the snapshot it took, the rollback
- * replacing its record in one write so the gate never lifts. One with no
- * release to return to is refused: it is fixed forward.
+ * (`serveLeftRelease`), its staged release kept. One whose release may have
+ * started (`targetMayHaveStarted`) is rolled back by the rollback rules, from
+ * the snapshot it took, the rollback replacing its record in one write so the
+ * gate never lifts. One with no release to return to is refused: it is fixed
+ * forward.
  */
 async function revertOpenUpdate(
   operation: InstanceOperation,
@@ -886,8 +909,8 @@ async function revertOpenUpdate(
     );
   }
   const host = await openCutoverHost(operation, dependencies);
-  if (update.phase !== 'started' && update.phase !== 'verified') {
-    await serveLeftRelease(host, update.from);
+  if (!targetMayHaveStarted(update)) {
+    await serveLeftRelease(host, update);
     await discardOperation(operation);
     return { kind: 'update_discarded', release: update.from, discarded: update.to };
   }

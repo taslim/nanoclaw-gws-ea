@@ -20,6 +20,7 @@ import {
   createState,
   discardIncompleteRelease,
   fence,
+  fenceEnded,
   instanceLayout,
   isReleaseComplete,
   linkReleaseState,
@@ -254,6 +255,23 @@ describe('switching releases', STAGING, () => {
     await pointCurrent(layout, b);
     expect(startHost(layout).status).toBe(0);
     expect(await readFile(path.join(layout.state, 'data', 'started'), 'utf8')).toBe('bravo\n');
+  });
+
+  it('names the release whose link the fence in force removed, through a fence again, and none while one is live', async () => {
+    const { layout, a, b } = await layoutWithReleases();
+    await pointCurrent(layout, a);
+    expect(await fenceEnded(layout)).toBeUndefined();
+
+    await fence(layout);
+    expect(await fenceEnded(layout)).toBe(a);
+    // Fenced again after a crash, the fence still names the release it ended.
+    await fence(layout);
+    expect(await fenceEnded(layout)).toBe(a);
+
+    await pointCurrent(layout, b);
+    expect(await fenceEnded(layout)).toBeUndefined();
+    await fence(layout);
+    expect(await fenceEnded(layout)).toBe(b);
   });
 
   it('refuses a live link naming anything but a release beside it', async () => {

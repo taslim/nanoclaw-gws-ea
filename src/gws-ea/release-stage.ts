@@ -10,10 +10,17 @@
  */
 import path from 'node:path';
 
+import { isErrno } from '../community-portal/errors.js';
 import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.js';
 import type { ImageDocker } from './agent-image.js';
 import { committedTree, materializeReleaseCheckout, type CheckoutRuntime } from './checkout.js';
-import { keepRelease, loadReleasePreflightReceipt, readKeptHostEnvironment, readKeptRelease } from './kept-release.js';
+import {
+  keepRelease,
+  keptReleaseFiles,
+  loadReleasePreflightReceipt,
+  readKeptHostEnvironment,
+  readKeptRelease,
+} from './kept-release.js';
 import { restoreReleaseGateway, type OnecliRuntimeDependencies } from './onecli.js';
 import { renderOnecliCompose, type OnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
@@ -26,8 +33,10 @@ import {
   isReleaseComplete,
   linkReleaseState,
   releaseName,
+  type InstanceLayout,
 } from './release-layout.js';
 import { activeStep } from './run-log.js';
+import { readOwnerOnlyFile } from './secrets.js';
 import {
   instanceHostConfiguration,
   renderInstanceServiceDefinition,
@@ -165,19 +174,39 @@ export interface ReleaseFilesTarget {
   readonly onecli: OnecliRuntimeLayout;
   /** The release's commit. */
   readonly commit: string;
+  /** The commit of the release the switch leaves, whose kept Compose file the OneCLI project ran. */
+  readonly leaving: string;
+}
+
+/**
+ * The OneCLI Compose file that release `name`, which a switch leaves, ran
+ * with: the one kept with it. A release on the layout before releases kept
+ * none; the conversion brought the project up from `applied`, the file of the
+ * release it switches to, and proved it (`release-convert.ts`), so that is
+ * the file it leaves.
+ */
+async function leftCompose(layout: InstanceLayout, name: string, applied: string): Promise<string> {
+  try {
+    return await readOwnerOnlyFile(keptReleaseFiles(layout.kept(name)).compose);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return applied;
+    throw error;
+  }
 }
 
 /**
  * Apply the files kept with the release `target` names to the assistant,
  * while it is fenced and before the live link names the release: gws-ea's
- * `.env` keys into `state/.env`; its OneCLI Compose file, put back and
- * brought up (`restoreReleaseGateway`), which recreates the gateway only when
- * its configuration differs and probes isolation when it did, so a failed
- * probe refuses the release before its host starts (KTD15); and its service
- * definition, installed when it differs. Each part converges, so a rerun
- * after an apply cut short finishes it; the gateway is brought up even when
- * its file already matches, since a run cut short after writing it may not
- * have. Returns whether the service definition changed, which a start needs.
+ * `.env` keys into `state/.env`; its OneCLI Compose file, put back and the
+ * project brought up from it (`restoreReleaseGateway`), which recreates only
+ * the services whose configuration differs and probes isolation when it did
+ * or when the file differs from the one the release it leaves ran with, so a
+ * failed probe refuses the release before its host starts (KTD15); and its
+ * service definition, installed when it differs. Each part converges, so a
+ * rerun after an apply cut short finishes it, and proves isolation again;
+ * the project is brought up even when its file already matches, since a run
+ * cut short after writing it may not have. Returns whether the service
+ * definition changed, which a start needs.
  */
 export async function applyReleaseFiles(
   target: ReleaseFilesTarget,
@@ -194,6 +223,11 @@ export async function applyReleaseFiles(
   });
   const kept = await readKeptRelease(layout.kept(name));
   writeStateEnvironment(layout.state, kept.hostEnvironment, dependencies.upsertEnvVars);
-  await restoreReleaseGateway(onecli, { gateway: receipt.onecli.gateway }, kept.compose, onecliDependencies);
+  await restoreReleaseGateway(
+    onecli,
+    { gateway: receipt.onecli.gateway },
+    { compose: kept.compose, left: await leftCompose(layout, releaseName(target.leaving), kept.compose) },
+    onecliDependencies,
+  );
   return { definitionChanged: await restoreInstanceServiceDefinition(runtime, kept.serviceDefinition, dependencies) };
 }

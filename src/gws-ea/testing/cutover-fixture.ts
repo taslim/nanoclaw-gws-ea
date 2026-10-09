@@ -481,10 +481,11 @@ export function applying(...names: readonly string[]): Migrate {
 
 /**
  * Where a run is killed: the boundary call it never returns from. `stamp` is
- * the release's tripwire script, the first step of a switch, `verify` the
+ * the release's tripwire script, the first step of a switch, `probe` the
+ * isolation probe of the OneCLI project a switch brought up, `verify` the
  * wait for the started host, and `rebuild` an agent group's image rebuild.
  */
-export type HangPoint = 'build' | 'migrate' | 'stop' | 'stamp' | 'verify' | 'rebuild';
+export type HangPoint = 'build' | 'migrate' | 'stop' | 'stamp' | 'probe' | 'verify' | 'rebuild';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
@@ -526,6 +527,8 @@ export interface World {
   buildFails?: boolean;
   /** Every layer of a per-group image is cached, so its rebuild gives the image its tag already names. */
   cachedRebuild?: boolean;
+  /** An image a container still runs, which Docker refuses to remove by its ID. */
+  imageInUse?: string;
   /** What `ps` lists, and what `lsof` finds open under the instance's state. */
   processes: string;
   openFiles: string;
@@ -637,6 +640,11 @@ function removeImage(state: World, reference: string): void {
     return;
   }
   if (!state.ids.has(reference)) throw dockerFailure(`Error response from daemon: No such image: ${reference}`);
+  if (state.imageInUse === reference) {
+    throw dockerFailure(
+      `Error response from daemon: conflict: unable to delete ${reference.slice(7, 19)} (cannot be forced) - image is being used by running container`,
+    );
+  }
   const names = [...state.tags].filter(([, id]) => id === reference).map(([name]) => name);
   if (names.length > 1) {
     throw dockerFailure(
@@ -725,6 +733,7 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
           ? DEPLOYED_GATEWAY
           : 'unknown',
     );
+    await hang(state, 'probe');
     if (state.failingGateway && running.includes(state.failingGateway)) {
       throw new GwsEaError('command_failed', 'docker exited with code 1', {
         details: { exitCode: 1, stderrTail: 'link-local/metadata reachable through gateway' },

@@ -73,6 +73,8 @@ import {
   recordOperationFacts,
   reservationAt,
   revertClause,
+  supersedable,
+  targetMayHaveStarted,
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
@@ -85,6 +87,7 @@ import { getInstanceReservation } from './registry.js';
 import { continueConversion, finishConversion, prepareConversion, type ConversionSeams } from './release-convert.js';
 import {
   exists,
+  fenceEnded,
   isReleaseComplete,
   operationName,
   readCurrent,
@@ -427,18 +430,13 @@ async function assertFreeDisk(
 
 /**
  * Whether this update supersedes an operation with no release to return to
- * (KTD9): one closed for fix-forward, or an update with no rollback target,
- * to another release. Such an assistant may be fenced, so its host is not
- * required to serve, and the release it ran is not checked.
+ * (KTD9, `supersedable`): one closed for fix-forward, or an update with no
+ * rollback target, to another release. Such an assistant may be fenced, so
+ * its host is not required to serve, and the release it ran is not checked.
  */
 async function supersedes(paths: ControlPlanePaths, instanceId: string, target: ReleaseCoordinates): Promise<boolean> {
   const record = await readOperationRecord(paths, instanceId);
-  return (
-    record !== undefined &&
-    record.phase !== 'committed' &&
-    (record.closed === 'failed' || record.no_rollback_target === true) &&
-    !sameRelease(record.to, target)
-  );
+  return record !== undefined && supersedable(record, target);
 }
 
 /** Every refusal an update makes before it changes anything, under the instance lock. */
@@ -802,17 +800,18 @@ interface FailedUpdate {
   readonly cause: unknown;
 }
 
-/** From here on the update's release ran, so a failure takes the rollback rules. */
+/** From here on the update's release was started, so one with no release to return to is closed for fix-forward. */
 const STARTED: ReadonlySet<OperationRecord['phase']> = new Set(['started', 'verified']);
 
 /**
  * Recovery for an update that failed before its release was committed. The
  * registry is read first: an update it already names was committed, so it
  * stands, and is reported for `update --id` to finish recording (see
- * `assertNotCommitted`). Once its release started, the update is rolled
- * back by the rollback rules, which its own confirmation covers: code only
- * when neither schema moved, else the snapshot its fence took; one with no
- * rollback target is closed for fix-forward instead (KTD9). Before that the
+ * `assertNotCommitted`). Once its release may have started (from `switched`,
+ * `targetMayHaveStarted`), the update is rolled back by the rollback rules,
+ * which its own confirmation covers: code only when neither schema moved,
+ * else the snapshot its fence took. One with no rollback target is closed for
+ * fix-forward instead once its release started (KTD9). Before that the
  * release it left is served again (`serveLeftRelease`) and the record
  * discarded, the staged release kept for the next update: a refusal before
  * the release started. When that return fails too, or the update has no
@@ -839,7 +838,7 @@ async function recoverUpdate(
       { cause, details: { ...details, continueWith: `gws-ea update --id ${id}` } },
     );
   }
-  if (STARTED.has(record.phase)) {
+  if (targetMayHaveStarted(record) && !record.no_rollback_target) {
     let rolledBack: string;
     try {
       rolledBack = describeRollback(await revertUpdate(operation, dependencies), localTimezone());
@@ -865,7 +864,7 @@ async function recoverUpdate(
     );
   }
   try {
-    await serveLeftRelease(await openCutoverHost(operation, dependencies), record.from);
+    await serveLeftRelease(await openCutoverHost(operation, dependencies), record);
     await discardOperation(operation);
   } catch (error) {
     throw new GwsEaError(
@@ -909,10 +908,22 @@ const RESUMED_FENCED: ReadonlySet<OperationRecord['phase']> = new Set(['fenced',
 /**
  * Re-establish the fence of an update resumed while fenced (KTD1): whatever
  * started since (a reboot, a login) is stopped and the instance proven quiet
- * again before anything goes on, and the stop is recorded afresh.
+ * again before anything goes on, and the stop is recorded afresh. Once the
+ * update took its snapshot, a fence in force that ended the release the
+ * update left means that release was served again since (a return that
+ * refused the update and was cut short) and may have recorded more, so the
+ * snapshot is taken again under this fence before the update goes on (KTD4);
+ * one this fence already took is kept. A fence that ended the update's own
+ * release leaves the snapshot as the release it left wrote it.
  */
-async function refence(host: CutoverHost): Promise<OperationRecord> {
+async function refence(host: CutoverHost, record: OperationRecord): Promise<OperationRecord> {
   const stop = await fenceInstance(host, 'Making sure the assistant is still stopped…');
+  const left = releaseName(record.from.deployed_commit);
+  if (record.phase !== 'fenced' && (await fenceEnded(host.layout)) === left) {
+    await runStep(host.reporter, { id: 'snapshot_state', label: 'Taking a snapshot of its state…' }, () =>
+      takeSnapshot(host.layout, operationName(record.started_at), left),
+    );
+  }
   return recordOperationFacts(host.operation, { stop });
 }
 
@@ -931,7 +942,7 @@ async function refence(host: CutoverHost): Promise<OperationRecord> {
 async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<GwsEaError | undefined> {
   const { operation, layout, reporter } = host;
   const name = releaseName(start.to.deployed_commit);
-  let record = RESUMED_FENCED.has(start.phase) ? await refence(host) : start;
+  let record = RESUMED_FENCED.has(start.phase) ? await refence(host, start) : start;
   let definitionChanged = false;
   for (;;) {
     switch (record.phase) {
@@ -956,12 +967,12 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<Gws
         record = await advanceOperation(operation, 'snapshotted');
         break;
       case 'snapshotted':
-        definitionChanged = await switchTo(host, record.to, 'Switching to the new release…');
+        definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         record = await advanceOperation(operation, 'switched');
         break;
       case 'switched':
         if ((await readCurrent(layout)) !== name) {
-          definitionChanged = await switchTo(host, record.to, 'Switching to the new release…');
+          definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         }
         await startRelease(host, definitionChanged, 'Starting the new release…');
         record = await advanceOperation(operation, 'started');

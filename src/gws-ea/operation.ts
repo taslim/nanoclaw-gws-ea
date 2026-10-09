@@ -486,20 +486,27 @@ function inProgress(record: OperationRecord, deploying?: ReleaseCoordinates): Gw
   );
 }
 
-/** The refusal a record closed for fix-forward gives: only an update to another release goes on. */
+/**
+ * The refusal a record closed for fix-forward gives: only an update to
+ * another release goes on. Only a rollback of a committed release tried to
+ * go back; an update with no release to return to, or a rollback reverting
+ * an update, had none to try.
+ */
 function closedFailed(record: OperationRecord): GwsEaError {
   const id = record.instance_id;
+  const returned = record.kind === 'rollback' && record.commit_point === 'registry';
   return new GwsEaError(
     'operation_failed',
-    `${describeRecord(record)} failed, and so did returning to the release it left (${record.phase}). ` +
+    `${describeRecord(record)} failed${returned ? ', and so did returning to the release it left' : ' and left no release to return to'} (${record.phase}). ` +
       `Fix it forward: update it to a newer release with gws-ea update --id ${id}, or remove it with gws-ea remove --id ${id}.`,
     { details: { phase: record.phase, continueWith: `gws-ea update --id ${id}` } },
   );
 }
 
-/** Whether an update to `target` may replace `record` (KTD9): it has no release to return to. */
-function supersedable(record: OperationRecord, target: ReleaseCoordinates): boolean {
+/** Whether an update to `target`, another release, may replace an unfinished `record` (KTD9): it has no release to return to. */
+export function supersedable(record: OperationRecord, target: ReleaseCoordinates): boolean {
   return (
+    record.phase !== 'committed' &&
     (record.closed === 'failed' || (record.kind === 'update' && record.no_rollback_target === true)) &&
     !sameRelease(record.to, target)
   );
@@ -597,14 +604,23 @@ async function currentRecord(operation: InstanceOperation): Promise<OperationRec
   return record;
 }
 
-/** Whether `start` is a rollback reverting `record`, an update whose release started and was never committed. */
+/**
+ * Whether an unfinished operation's target may have run: from `switched` the
+ * live link may name it, so a reboot, a login, or a start that failed after
+ * the service manager began it can have run it, and leaving it takes the
+ * rollback rules (R14). Before that, nothing could start it.
+ */
+export function targetMayHaveStarted(record: OperationRecord): boolean {
+  return rank(record.phase) >= rank('switched') && record.phase !== 'committed';
+}
+
+/** Whether `start` is a rollback reverting `record`, an update whose release may have started and was never committed. */
 function reverts(record: OperationRecord, start: OperationStart): boolean {
   return (
     record.kind === 'update' &&
     record.closed === undefined &&
     record.no_rollback_target === undefined &&
-    rank(record.phase) >= rank('started') &&
-    record.phase !== 'committed' &&
+    targetMayHaveStarted(record) &&
     start.kind === 'rollback' &&
     sameRelease(start.from, record.to) &&
     sameRelease(start.to, record.from)
@@ -620,11 +636,12 @@ function reverts(record: OperationRecord, start: OperationStart): boolean {
  * - a committed update's record with follow-ups left, when it is a rollback,
  *   carrying those follow-ups, so a failed rebuild never blocks going back
  *   and nothing it planned is dropped;
- * - an update whose release started and was never committed, when it is the
- *   rollback reverting it, which commits by its own record and keeps the
+ * - an update whose release may have started and was never committed, when it
+ *   is the rollback reverting it, which commits by its own record and keeps the
  *   update's start time, so it finds the snapshot the update took;
  * - a record with no release to return to, when it is an update to another
- *   release, which supersedes it with no release to return to either (KTD9).
+ *   release, which supersedes it with no release to return to either,
+ *   carrying the follow-ups it left, so none is dropped (KTD9).
  */
 export async function beginOperation(operation: InstanceOperation, start: OperationStart): Promise<OperationRecord> {
   operation.assertActive();
@@ -653,6 +670,7 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
     startedAt = existing.started_at;
   } else if (existing && start.kind === 'update' && supersedable(existing, to)) {
     noRollbackTarget = true;
+    followUps = existing.follow_ups;
   } else if (existing) {
     throw existing.closed === 'failed' ? closedFailed(existing) : inProgress(existing);
   }

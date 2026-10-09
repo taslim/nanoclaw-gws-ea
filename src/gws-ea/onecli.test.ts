@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import {
   restoreReleaseGateway,
@@ -1020,45 +1020,71 @@ describe("an update's gateway image", () => {
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
   });
 
-  it("puts a rollback's kept Compose file back and recreates only the gateway from the image it kept, converging when rerun", async () => {
+  it('puts a kept Compose file back and brings the whole project up from it, converging when rerun', async () => {
     const layout = await layoutFixture();
-    await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    const running = await writeInstanceCompose(layout, GATEWAY_IMAGE);
     const kept = renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE);
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
 
-    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT });
+    await restoreReleaseGateway(
+      layout,
+      PINS,
+      { compose: kept, left: running },
+      { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT },
+    );
 
     expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
     expect((await stat(layout.composeFile)).mode & 0o777).toBe(0o600);
-    // The kept image is present: nothing is built or pulled, and only the gateway is recreated.
+    // The kept image is present: nothing is built or pulled, and Compose brings every service to the file.
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
     expect(composeCalls(world)).toEqual([
-      [
-        'up',
-        '--detach',
-        '--wait',
-        '--wait-timeout',
-        String(ONECLI_WAIT_TIMEOUT_SECONDS),
-        '--pull',
-        'never',
-        '--no-deps',
-        'gateway',
-      ],
+      ['up', '--detach', '--wait', '--wait-timeout', String(ONECLI_WAIT_TIMEOUT_SECONDS), '--pull', 'never'],
     ]);
     expect(world.calls.every((call) => call.env?.DOCKER_HOST === DOCKER_ENDPOINT)).toBe(true);
 
-    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
+    await restoreReleaseGateway(layout, PINS, { compose: kept, left: running }, { dockerCommandRunner: runner });
     expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
   });
 
-  it('probes the gateway a switch recreated before returning, and only when it was recreated', async () => {
+  it('recreates the app a release renders differently, keeping its volumes, so the runtime verifies on its file', async () => {
+    const layout = await layoutFixture();
+    const running = await writeInstanceCompose(layout);
+    const rendered = parseYaml(running) as { services: { app: { environment: Record<string, string> } } };
+    rendered.services.app.environment.LOG_LEVEL = 'warn';
+    const kept = stringifyYaml(rendered);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, running);
+    const { app, ...unchanged } = containerIds(world);
+    const volumes = structuredClone(world.volumes);
+    const dependencies = { dockerCommandRunner: runner, fetch: healthyFetch() };
+
+    await restoreReleaseGateway(layout, PINS, { compose: kept, left: running }, dependencies);
+
+    const { app: recreated, ...after } = containerIds(world);
+    expect(recreated).not.toBe(app);
+    expect(after).toEqual(unchanged);
+    expect(world.volumes).toEqual(volumes);
+    const args = world.calls.flatMap((call) => call.args);
+    for (const removal of ['down', 'rm', '--volumes', '-v', '--renew-anon-volumes', '-V', '--force-recreate']) {
+      expect(args).not.toContain(removal);
+    }
+    expect(probes(world)).toHaveLength(1);
+    // Every service now runs the configuration its file gives, as verification compares it.
+    await expect(observeOnecliRuntime(layout, PINS, dependencies)).resolves.toEqual({ status: 'present' });
+    await expect(verifyOnecliRuntime(layout, PINS, dependencies)).resolves.toBeDefined();
+  });
+
+  it('probes a recreated gateway before returning, and again when a switch cut short before its probe resumes', async () => {
     const layout = await layoutFixture();
     const running = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, running);
     const { gateway, ...unchanged } = containerIds(world);
     const kept = renderOnecliCompose(layout, PINS, GATEWAY_IMAGE);
+    // The run is cut short while its probe runs, after Compose recreated the gateway.
+    world.failProbe = new GwsEaError('command_timeout', 'docker run was interrupted');
 
-    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
+    await expect(
+      restoreReleaseGateway(layout, PINS, { compose: kept, left: running }, { dockerCommandRunner: runner }),
+    ).rejects.toBe(world.failProbe);
 
     const { gateway: recreated, ...after } = containerIds(world);
     expect(recreated).not.toBe(gateway);
@@ -1068,23 +1094,40 @@ describe("an update's gateway image", () => {
     expect(probe?.args).toContain(layout.agentEgressNetwork);
     expect(world.calls.indexOf(probe!)).toBeGreaterThan(world.calls.findIndex((call) => call.args.includes('up')));
     expect(world.calls.at(-1)).toBe(probe);
+    delete world.failProbe;
 
-    // Run again, Compose recreates nothing, so there is nothing new to prove.
-    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
+    // Resumed, Compose recreates nothing, and the gateway no probe passed is proven before the switch goes on.
+    await restoreReleaseGateway(layout, PINS, { compose: kept, left: running }, { dockerCommandRunner: runner });
     expect(containerIds(world).gateway).toBe(recreated);
-    expect(probes(world)).toHaveLength(1);
+    expect(probes(world)).toHaveLength(2);
+    expect(world.calls.at(-1)).toBe(probes(world)[1]);
+  });
+
+  it('recreates and probes nothing when the release runs the Compose file of the one it leaves', async () => {
+    const layout = await layoutFixture();
+    const running = await writeInstanceCompose(layout);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, running);
+    const before = containerIds(world);
+
+    await restoreReleaseGateway(layout, PINS, { compose: running, left: running }, { dockerCommandRunner: runner });
+
+    expect(containerIds(world)).toEqual(before);
+    expect(probes(world)).toEqual([]);
   });
 
   it('refuses a rollback whose recreated gateway fails the isolation probe', async () => {
     const layout = await layoutFixture();
-    await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    const written = await writeInstanceCompose(layout, GATEWAY_IMAGE);
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
     world.failProbe = new GwsEaError('command_failed', 'link-local/metadata reachable through gateway');
 
     await expect(
-      restoreReleaseGateway(layout, PINS, renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE), {
-        dockerCommandRunner: runner,
-      }),
+      restoreReleaseGateway(
+        layout,
+        PINS,
+        { compose: renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE), left: written },
+        { dockerCommandRunner: runner },
+      ),
     ).rejects.toBe(world.failProbe);
     expect(probes(world)).toHaveLength(1);
   });
@@ -1096,9 +1139,12 @@ describe("an update's gateway image", () => {
     world.wrapperImageMissing = true;
 
     await expect(
-      restoreReleaseGateway(layout, PINS, renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE), {
-        dockerCommandRunner: runner,
-      }),
+      restoreReleaseGateway(
+        layout,
+        PINS,
+        { compose: renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE), left: written },
+        { dockerCommandRunner: runner },
+      ),
     ).rejects.toMatchObject({
       code: 'onecli_gateway_image_missing',
       message: expect.stringContaining(RELEASE_GATEWAY_IMAGE),
@@ -1115,9 +1161,12 @@ describe("an update's gateway image", () => {
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
 
     await expect(
-      restoreReleaseGateway(layout, PINS, renderOnecliCompose(layout, PINS, unwrapped), {
-        dockerCommandRunner: runner,
-      }),
+      restoreReleaseGateway(
+        layout,
+        PINS,
+        { compose: renderOnecliCompose(layout, PINS, unwrapped), left: written },
+        { dockerCommandRunner: runner },
+      ),
     ).rejects.toMatchObject({ code: 'unsafe_onecli_image', message: expect.stringContaining(unwrapped) });
     expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
     expect(composeCalls(world)).toEqual([]);

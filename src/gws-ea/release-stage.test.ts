@@ -263,9 +263,13 @@ function onecliWorld(onecli: OnecliRuntimeLayout, running: string) {
   return { world, runner };
 }
 
+/** The commit of the release the switch leaves, which kept the Compose file the OneCLI project runs. */
+const LEFT = 'e'.repeat(40);
+
 /**
- * An assistant with a release kept as staging keeps it, running the OneCLI
- * Compose file an earlier release rendered, which names the gateway it built.
+ * An assistant with a release kept as staging keeps it, switching from a
+ * release that kept the OneCLI Compose file it runs, which names the gateway
+ * an earlier release built.
  */
 async function keptAssistant() {
   const root = await temporaryRoot('gws-ea-apply-');
@@ -273,32 +277,36 @@ async function keptAssistant() {
   const layout = target.paths.instanceLayout(target.reservation.instance_id);
   const service = { platform: 'macos' as const, homeDirectory: target.home, runningAsRoot: false };
   const { image } = await resolveWrapperGatewayImage(PINS);
+  const preflight = {
+    provider: 'claude',
+    providerCredential: CREDENTIAL,
+    packageManager: 'pnpm@10.0.0',
+    onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+  };
   const kept = {
     compose: renderOnecliCompose(target.onecli, PINS, image),
     serviceDefinition: renderInstanceServiceDefinition(target.runtime, service),
     hostEnvironment: instanceHostConfiguration(target.runtime),
   };
+  const instanceId = target.reservation.instance_id;
   await keepRelease(layout.kept(releaseName(target.reservation.deployed_commit)), kept, {
-    instanceId: target.reservation.instance_id,
+    instanceId,
     commit: target.reservation.deployed_commit,
-    preflight: {
-      provider: 'claude',
-      providerCredential: CREDENTIAL,
-      packageManager: 'pnpm@10.0.0',
-      onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
-    },
+    preflight,
   });
+  const running = renderOnecliCompose(target.onecli, PINS, wrapperImageTag('0'.repeat(16)));
+  await keepRelease(
+    layout.kept(releaseName(LEFT)),
+    { ...kept, compose: running },
+    { instanceId, commit: LEFT, preflight },
+  );
   await createState(layout);
   await mkdir(target.onecli.rootDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(
-    target.onecli.composeFile,
-    renderOnecliCompose(target.onecli, PINS, wrapperImageTag('0'.repeat(16))),
-    { mode: 0o600 },
-  );
-  const docker = onecliWorld(target.onecli, await readFile(target.onecli.composeFile, 'utf8'));
-  const apply = () =>
+  await writeFile(target.onecli.composeFile, running, { mode: 0o600 });
+  const docker = onecliWorld(target.onecli, running);
+  const apply = (leaving = LEFT) =>
     applyReleaseFiles(
-      { runtime: target.runtime, onecli: target.onecli, commit: target.reservation.deployed_commit },
+      { runtime: target.runtime, onecli: target.onecli, commit: target.reservation.deployed_commit, leaving },
       { upsertEnvVars, ...service },
       { dockerCommandRunner: docker.runner },
     );
@@ -339,7 +347,7 @@ describe("applying a release's kept files", () => {
     await expect(subject.apply()).resolves.toEqual({ definitionChanged: false });
   });
 
-  it('puts back a differing Compose file and probes the gateway Compose recreated, and recreates nothing when they match', async () => {
+  it('puts back a differing Compose file and probes it, again when resumed, and not between releases that run one file', async () => {
     const subject = await keptAssistant();
 
     await subject.apply();
@@ -348,9 +356,14 @@ describe("applying a release's kept files", () => {
     expect(subject.docker.running).toBe(subject.kept.compose);
     expect(subject.docker.probes).toBe(1);
 
-    // Run again, as a switch resumed after its apply does: Compose recreates nothing, so nothing new is probed.
+    // Run again, as a switch resumed after its apply does: Compose recreates nothing, but the release it leaves ran
+    // another file, so the gateway is proven again before the switch goes on.
     await subject.apply();
-    expect(subject.docker.probes).toBe(1);
+    expect(subject.docker.probes).toBe(2);
+
+    // A switch from a release that ran this very file changes nothing to prove.
+    await subject.apply(subject.target.reservation.deployed_commit);
+    expect(subject.docker.probes).toBe(2);
   });
 
   it('brings the gateway up when the kept Compose file was written but the run was cut short before it came up', async () => {

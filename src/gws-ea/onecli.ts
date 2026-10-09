@@ -300,20 +300,31 @@ export async function prepareReleaseGatewayImage(
   return { current, release };
 }
 
+/** The Compose file a switch applies, and the one the release it leaves ran with. */
+interface GatewaySwitch {
+  readonly compose: string;
+  readonly left: string;
+}
+
 /**
- * Put back the Compose file a kept release runs with and recreate the gateway
- * it names, at a switch to that release (KTD8): the gateway image the release
- * names was built when it was staged, or by an earlier release, and is still
- * present, since assistant commands never delete one; only when it is
- * missing and this tool's tree builds the same content is it built again,
- * and otherwise it is refused before the Compose file changes. Only the
- * gateway is recreated, and probed when it was (KTD15), and every volume is
- * kept. Run again after an interruption, it converges.
+ * Put back the Compose file a kept release runs with and bring the whole
+ * project to it, at a switch to that release (KTD8, KTD15): the gateway image
+ * the release names was built when it was staged, or by an earlier release,
+ * and is still present, since assistant commands never delete one; only when
+ * it is missing and this tool's tree builds the same content is it built
+ * again, and otherwise it is refused before the Compose file changes. Compose
+ * recreates only the services whose configuration changed, keeping every
+ * volume. Run again after an interruption, it converges.
+ *
+ * The isolation probe then runs before returning when a container was
+ * recreated, or when the file differs from `left`: a switch cut short after
+ * its `up` recreated a service and before the probe passed recreates nothing
+ * when it is resumed, so only the file shows what is still unproven.
  */
 export async function restoreReleaseGateway(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
-  compose: string,
+  { compose, left }: GatewaySwitch,
   dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
@@ -324,19 +335,9 @@ export async function restoreReleaseGateway(
   await ensureWrapperGatewayImage(docker, pins, gateway);
   if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
     await writePrivateTextFile(layout.composeFile, compose);
-  await upGateway(docker, pins);
-}
-
-/**
- * Bring the gateway to its Compose file, which recreates it only when its
- * configuration changed, and then prove the egress boundary again before
- * returning (KTD15): a recreated gateway is a new container whose firewall no
- * probe has seen. Compose gives a container it recreates a new ID.
- */
-async function upGateway(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
   const before = new Set(await projectContainerIds(docker));
   await docker.runner({
-    ...buildComposeInvocation(docker.layout, [
+    ...buildComposeInvocation(layout, [
       'up',
       '--detach',
       '--wait',
@@ -344,15 +345,14 @@ async function upGateway(docker: OnecliDocker, pins: OnecliPins): Promise<void> 
       String(ONECLI_WAIT_TIMEOUT_SECONDS),
       '--pull',
       'never',
-      '--no-deps',
-      'gateway',
     ]),
     env: docker.environment,
     timeoutMs: UP_TIMEOUT_MS,
     stream: true,
   });
-  if ((await projectContainerIds(docker)).some((id) => !before.has(id)))
-    await verifyAgentNetworkIsolation(docker, pins);
+  // A recreated container is a new one, with a new ID, whose egress no probe has seen.
+  const recreated = (await projectContainerIds(docker)).some((id) => !before.has(id));
+  if (recreated || compose !== left) await verifyAgentNetworkIsolation(docker, pins);
 }
 
 /**

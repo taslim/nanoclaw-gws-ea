@@ -278,7 +278,7 @@ describe('operation record', () => {
     expect(await readOperationRecord(paths, instanceId)).toBeUndefined();
   });
 
-  it("reverts an update whose release started with a rollback committed by its record, keeping the update's start", async () => {
+  it('reverts an update whose release may have started with a rollback committed by its record, keeping its start', async () => {
     const { paths, instanceId } = await fixture();
     // An earlier update committed, leaving FROM to roll back to; the next one, to NEWER, is reverted.
     await updateTo(paths, instanceId, 'committed', []);
@@ -287,7 +287,7 @@ describe('operation record', () => {
     const update = await held(paths, instanceId, { command: 'update', target: NEWER });
     try {
       await beginOperation(update, { kind: 'update', from: TO, to: NEWER, manifest: MANIFEST });
-      await drive(update, 'switched', []);
+      await drive(update, 'snapshotted', []);
     } finally {
       update.release();
     }
@@ -302,7 +302,8 @@ describe('operation record', () => {
 
     const resumed = await held(paths, instanceId, { command: 'update', target: NEWER });
     try {
-      await advanceOperation(resumed, 'started');
+      // Switched, the live link may name its release, which a reboot can start.
+      await advanceOperation(resumed, 'switched');
     } finally {
       resumed.release();
     }
@@ -373,6 +374,10 @@ describe('operation record', () => {
     } finally {
       operation.release();
     }
+    const refusal = await acquireInstanceOperation(paths, instanceId, { command: 'rollback' }).catch(
+      (error: unknown) => error,
+    );
+    expect((refusal as Error).message).toContain('failed, and so did returning to the release it left (switched)');
   });
 });
 
@@ -434,6 +439,8 @@ describe('operation gate', () => {
     for (const intent of [{ command: 'start' }, { command: 'rollback' }, { command: 'update', target: TO }] as const) {
       const refusal = await acquireInstanceOperation(paths, instanceId, intent).catch((error: unknown) => error);
       expect(refusal, intent.command).toMatchObject({ code: 'operation_failed' });
+      // An update closed for fix-forward never tried to go back, and says so.
+      expect((refusal as Error).message).toContain('failed and left no release to return to (started)');
       expect((refusal as Error).message).toContain(
         `update it to a newer release with gws-ea update --id ${instanceId}`,
       );

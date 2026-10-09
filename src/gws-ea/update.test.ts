@@ -64,9 +64,11 @@ import { readOperationRecord, readRollbackPoint, type OperationPhase } from './o
 import type { SanitizedCommandRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
+import type { RollbackPreview } from './rollback.js';
 import { launchInstanceHost, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from './types.js';
 import {
+  continueUpdate,
   dryRunReleaseMigrations,
   prepareUpdate,
   resolveUpdateIntent,
@@ -78,13 +80,14 @@ import {
 import { readCentralMigrations } from './verify.js';
 
 /**
- * Kill the process once the operation record is written at `phase`, as a
- * crash right after recording it would; or fail the write of the committed
- * record once, as a full disk fails it, right after the registry's
- * compare-and-swap.
+ * Kill the process once the operation record is written at `phase`, or once
+ * a snapshot's record is written into the copy it is building, as a crash
+ * then would; or fail the write of the committed record once, as a full disk
+ * fails it, right after the registry's compare-and-swap.
  */
 const records = vi.hoisted(() => ({
   killAfter: undefined as string | undefined,
+  killAtSnapshot: false,
   reached: undefined as (() => void) | undefined,
   failCommitted: false,
 }));
@@ -98,8 +101,10 @@ vi.mock('../community-portal/private-file.js', async (importOriginal) => {
       throw Object.assign(new Error(`ENOSPC: no space left on device, write '${file}'`), { code: 'ENOSPC' });
     }
     await actual.writePrivate(file, value);
-    if (record && phase !== undefined && phase === records.killAfter) {
+    const snapshotting = records.killAtSnapshot && file.endsWith('/snapshot.json');
+    if (snapshotting || (record && phase !== undefined && phase === records.killAfter)) {
       records.killAfter = undefined;
+      records.killAtSnapshot = false;
       records.reached?.();
       await new Promise(() => undefined);
     }
@@ -110,6 +115,7 @@ vi.mock('../community-portal/private-file.js', async (importOriginal) => {
 afterEach(removeTemporaryRoots);
 afterEach(() => {
   records.killAfter = undefined;
+  records.killAtSnapshot = false;
   records.failCommitted = false;
 });
 
@@ -805,6 +811,112 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
   });
 
+  it('probes on resume the gateway a switch killed before its probe finished recreated, and never starts it unproven', async () => {
+    const host = await machine();
+    const runtime = await assistant(host, { gateway: DEPLOYED_GATEWAY });
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.hangAt = 'probe';
+    await killDuringUpdate(host, runtime, state, next);
+    expect(state.probes).toEqual([RELEASE_GATEWAY]);
+    delete state.hangAt;
+    // The gateway the killed switch recreated would fail its probe.
+    state.failingGateway = RELEASE_GATEWAY;
+    state.events.length = 0;
+
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    // Compose recreated nothing on resume, and the gateway was still proven, failed, and never served the release.
+    expect(state.probes).toEqual([RELEASE_GATEWAY, RELEASE_GATEWAY, DEPLOYED_GATEWAY]);
+    expect(state.events).toEqual(['start']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(messages(runtime.state_root)).toEqual(['m1']);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+
+  /**
+   * An update refused before its release started (its new gateway fails the probe), whose return to the release it
+   * left failed too: that release is pointed at again, but its start failed, so the update stays open at
+   * `snapshotted`.
+   */
+  async function returnCutShort() {
+    const host = await machine();
+    const runtime = await assistant(host, { gateway: DEPLOYED_GATEWAY });
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.failingGateway = RELEASE_GATEWAY;
+    let stamps = 0;
+    state.onStamp = () => {
+      stamps += 1;
+      if (stamps === 2) state.startFails = true;
+    };
+    const { run } = cli(host, state, next, runtime);
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    expect((await readOperationRecord(host.paths, runtime.instance_id))?.phase).toBe('snapshotted');
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(false);
+    delete state.onStamp;
+    delete state.startFails;
+    delete state.failingGateway;
+    return { host, runtime, next, state, run };
+  }
+
+  /**
+   * After `returnCutShort`, a login ran the release the update left, which recorded `m-after` after the update's
+   * snapshot. Continuing the update, the new release migrates the database as it starts and its callback route
+   * never reaches it.
+   */
+  async function leftReleaseRanAgain() {
+    const cut = await returnCutShort();
+    const { runtime, next, state } = cut;
+    reboot(state, runtime);
+    expect(state.running).toBe(true);
+    await converse(runtime, 'm-after');
+    state.onStart = (root) => {
+      state.routeDown = readlinkSync(root) === releaseName(next.commit);
+      if (state.routeDown) applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
+    };
+    return cut;
+  }
+
+  /** Rolled back to a snapshot taken after the release it left ran again: nothing that release recorded is lost. */
+  async function expectRevertedKeepingWhatItRecorded(host: Machine, runtime: InstanceRuntimeConfig, state: World) {
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+    expect(messages(runtime.state_root)).toEqual(['m-after', 'm1']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+  }
+
+  it('takes its snapshot again when resumed after the release it left ran since, so a revert keeps what that recorded', async () => {
+    const { host, runtime, state, run } = await leftReleaseRanAgain();
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    await expectRevertedKeepingWhatItRecorded(host, runtime, state);
+  });
+
+  it('takes its snapshot again when killed while doing so, the link to the release it left already gone', async () => {
+    const { host, runtime, next, state, run } = await leftReleaseRanAgain();
+    const operation = await acquireInstanceOperation(host.paths, runtime.instance_id, {
+      command: 'update',
+      target: release(host, next.commit),
+    });
+    if (!operation) throw new Error('The test instance operation was busy');
+    records.killAtSnapshot = true;
+    const reached = new Promise<'killed'>((resolve) => (records.reached = () => resolve('killed')));
+    const continued = continueUpdate(operation, dependencies(state, next, runtime)).then(() => 'finished' as const);
+    expect(await Promise.race([reached, continued])).toBe('killed');
+    operation.release();
+    expect(await exists(runtime.checkout_root)).toBe(false);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    await expectRevertedKeepingWhatItRecorded(host, runtime, state);
+  });
+
   it('re-verifies the serving gateway before the fence, and a failure there leaves the assistant serving', async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -883,6 +995,31 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(await readRollbackPoint(host.paths, runtime.instance_id)).toEqual(point);
   });
 
+  it('takes the rollback rules when its start failed after the release ran: the snapshot comes back once it migrated', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    // The service manager reports a failed start after the new release's host came up, migrated, and served m2.
+    state.onStart = (root) => {
+      if (readlinkSync(root) !== releaseName(next.commit)) return;
+      applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
+      void converse(runtime, 'm2');
+      throw new Error('Bootstrap failed: 5: Input/output error');
+    };
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain('stopped at switched, so it was rolled back');
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+    expect(messages(runtime.state_root)).toEqual(['m1']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+
   it('closes for fix-forward when rolling back fails too, and a newer release supersedes it', async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -915,6 +1052,7 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
     err.length = 0;
     expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+    expect(err.join('\n')).toContain('failed and left no release to return to (started)');
     expect(err.join('\n')).toContain(`Fix it forward: update it to a newer release with gws-ea update --id ${id}`);
     const newer = await nextRelease(host);
     delete state.routeDown;
@@ -926,6 +1064,77 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     // A superseding update has no release to return to, so it leaves no rollback point.
     expect(await readRollbackPoint(host.paths, id)).toBeUndefined();
+  });
+});
+
+describe('an update killed once switched, its release then run by a login', GIT_HEAVY, () => {
+  /** Kill an update once switched; then a login runs the release the live link names, which serves m2, migrating first. */
+  async function switchedAndRun(migrate: boolean) {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    await killAfter('switched', host, runtime, state, next);
+    reboot(state, runtime);
+    expect(state.running).toBe(true);
+    if (migrate) applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
+    await converse(runtime, 'm2');
+    const asked: RollbackPreview[] = [];
+    const { run } = cli(host, state, next, runtime, {
+      confirmRollback: async (preview) => {
+        asked.push(preview);
+        return true;
+      },
+    });
+    return { host, runtime, next, state, run, asked };
+  }
+
+  it('is reverted by restoring the snapshot it took, once confirmed, when the release migrated the database', async () => {
+    const { host, runtime, state, run, asked } = await switchedAndRun(true);
+
+    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
+
+    expect(asked.map((preview) => preview.reason)).toEqual(['central_schema']);
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+    expect(messages(runtime.state_root)).toEqual(['m1']);
+    const quarantine = path.join(layoutOf(host, runtime).root, 'quarantine');
+    const [kept] = await readdir(quarantine);
+    expect(readCentralMigrations(path.join(quarantine, kept!))).toEqual([...LIVE_MIGRATIONS, ADDED_MIGRATION]);
+    expect(messages(path.join(quarantine, kept!))).toEqual(['m1', 'm2']);
+    expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+
+  it('continued and failing its checks, restores the snapshot taken before its release ran, never one taken since', async () => {
+    const { host, runtime, next, state, run } = await switchedAndRun(true);
+    // The new release's callback route never reaches it.
+    state.onStart = (root) => {
+      state.routeDown = readlinkSync(root) === releaseName(next.commit);
+    };
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+    expect(messages(runtime.state_root)).toEqual(['m1']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+  });
+
+  it('goes back code only, keeping what the release recorded, when no schema moved', async () => {
+    const { host, runtime, state, run, asked } = await switchedAndRun(false);
+    const inode = await centralInode(runtime);
+
+    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
+
+    expect(asked).toEqual([]);
+    expect(await centralInode(runtime)).toBe(inode);
+    expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
   });
 });
 
@@ -1131,11 +1340,13 @@ describe('the switch', GIT_HEAVY, () => {
     if (!operation) throw new Error('The test instance operation was busy');
     try {
       const switching = await openCutoverHost(operation, deps);
-      expect(await switchTo(switching, release(host, next.commit), 'Switching…')).toBe(true);
+      expect(await switchTo(switching, release(host, next.commit), release(host, host.first), 'Switching…')).toBe(true);
       const resumed = state.commands.length;
 
       // Resumed after it installed the definition: unchanged now, and systemd is still told to read it.
-      expect(await switchTo(switching, release(host, next.commit), 'Switching…')).toBe(false);
+      expect(await switchTo(switching, release(host, next.commit), release(host, host.first), 'Switching…')).toBe(
+        false,
+      );
 
       const reloads = state.commands.slice(resumed).filter((command) => command.command === 'systemctl');
       expect(reloads.map((command) => command.args)).toEqual([['--user', 'daemon-reload']]);

@@ -522,14 +522,20 @@ export async function fenceInstance(host: CutoverHost, label: string, inspect?: 
  * quiet: stamp the target release's upgrade tripwire with its own script, so
  * the host it starts accepts exactly that release; reset the circuit
  * breaker, which counts only the crashes of the release it left; apply the
- * files kept with the release, its OneCLI gateway recreated and probed only
- * when its Compose file differs, a failed probe refusing the release before
- * its host starts (KTD15); have the service manager read its definition; and
- * point the live link at it. Each step converges, so a switch cut short is
- * finished by running it again. Returns whether the service definition
- * changed, which the start needs.
+ * files kept with the release, its OneCLI project brought to its Compose file
+ * and probed when that recreated a service or differs from the file of
+ * `leaving`, the release the switch leaves, a failed probe refusing the
+ * release before its host starts (KTD15); have the service manager read its
+ * definition; and point the live link at it. Each step converges, so a
+ * switch cut short is finished by running it again. Returns whether the
+ * service definition changed, which the start needs.
  */
-export async function switchTo(host: CutoverHost, release: ReleaseCoordinates, label: string): Promise<boolean> {
+export async function switchTo(
+  host: CutoverHost,
+  release: ReleaseCoordinates,
+  leaving: ReleaseCoordinates,
+  label: string,
+): Promise<boolean> {
   const name = releaseName(release.deployed_commit);
   return runStep(host.reporter, { id: 'switch_release', label }, async () => {
     const { runtime, layout, dependencies } = host;
@@ -540,7 +546,7 @@ export async function switchTo(host: CutoverHost, release: ReleaseCoordinates, l
     await rm(path.join(layout.state, 'data', 'circuit-breaker.json'), { force: true });
     const service = cutoverServiceDependencies(host);
     const { definitionChanged } = await applyReleaseFiles(
-      { runtime, onecli: host.onecli, commit: release.deployed_commit },
+      { runtime, onecli: host.onecli, commit: release.deployed_commit, leaving: leaving.deployed_commit },
       { ...service, upsertEnvVars: dependencies.upsertEnvVars },
       onecliBoundaries(host),
     );
@@ -558,21 +564,21 @@ export async function startRelease(host: CutoverHost, definitionChanged: boolean
 }
 
 /**
- * Serve `release` again, the one an operation left, after the operation
- * stopped short of its target serving. While the live link still names it,
- * nothing of its own was touched: the fence never removed the link, or an
- * earlier return already switched back; only its host is started. Otherwise
- * the assistant is fenced again, which stops whatever started since and
- * proves it quiet, `beforeSwitch` runs (a rollback's state goes back), and
- * the release is switched to, its kept files put back over whatever the
- * operation's switch applied, and started.
+ * Serve `move.from` again, the release an operation left, after the
+ * operation stopped short of `move.to` serving. While the live link still
+ * names `move.from`, nothing of its own was touched: the fence never removed
+ * the link, or an earlier return already switched back; only its host is
+ * started. Otherwise the assistant is fenced again, which stops whatever
+ * started since and proves it quiet, `beforeSwitch` runs (a rollback's state
+ * goes back), and `move.from` is switched to from `move.to`, its kept files
+ * put back over whatever the operation's switch applied, and started.
  */
 export async function serveLeftRelease(
   host: CutoverHost,
-  release: ReleaseCoordinates,
+  move: { readonly from: ReleaseCoordinates; readonly to: ReleaseCoordinates },
   beforeSwitch?: () => Promise<void>,
 ): Promise<void> {
-  if ((await readCurrent(host.layout)) === releaseName(release.deployed_commit)) {
+  if ((await readCurrent(host.layout)) === releaseName(move.from.deployed_commit)) {
     await runStep(host.reporter, { id: 'start_release', label: 'Starting the assistant again…' }, async () => {
       await host.service.start();
     });
@@ -580,7 +586,7 @@ export async function serveLeftRelease(
   }
   await fenceInstance(host, 'Stopping the assistant to go back…');
   await beforeSwitch?.();
-  const changed = await switchTo(host, release, 'Switching back to the release it ran…');
+  const changed = await switchTo(host, move.from, move.to, 'Switching back to the release it ran…');
   await startRelease(host, changed, 'Starting the assistant again…');
 }
 

@@ -371,6 +371,47 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     expect((await readRollbackPoint(host.paths, runtime.instance_id))?.release).toEqual(release(host, host.first));
   });
 
+  it('stays open going back when its return fails before the state it replaced is back, and rollback --id finishes it', async () => {
+    const { host, runtime, next, state } = await migrated();
+    const database = path.join(runtime.state_root, 'data', 'v2.db');
+    // The release it returns to never answers on its callback route, and once it ran, something holds its state open.
+    state.onStart = (root) => {
+      state.routeDown = readlinkSync(root) === releaseName(host.first);
+      if (state.routeDown) state.openFiles = `p777\ncsqlite3\nf3\nn${database}\n`;
+    };
+    const id = runtime.instance_id;
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(`sqlite3 (PID 777) holds ${database}`);
+    expect(err.join('\n')).toContain(`Continue going back with gws-ea rollback --id ${id}`);
+    const record = await readOperationRecord(host.paths, id);
+    expect(record).toMatchObject({ kind: 'rollback', returning: true });
+    expect(record).not.toHaveProperty('closed');
+    expect((await status(host, state, next, runtime)).operation).toMatchObject({
+      state: 'open',
+      continue_with: `gws-ea rollback --id ${id}`,
+    });
+    // What the new release recorded is still held aside, whole.
+    const quarantine = path.join(layoutOf(host, runtime).root, 'quarantine');
+    const [held] = await readdir(quarantine);
+    expect(messages(path.join(quarantine, held!))).toEqual(['m1', 'm2']);
+    state.openFiles = '';
+    delete state.onStart;
+    delete state.routeDown;
+    err.length = 0;
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(`went back: the assistant runs dogfood ${next.commit.slice(0, 12)} again`);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS, ADDED_MIGRATION]);
+    expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(state.running).toBe(true);
+  });
+
   it('closes for fix-forward when going back fails too, and a newer update supersedes it', async () => {
     const { host, runtime, next, state } = await migrated();
     // Neither release answers on its callback route.
@@ -392,6 +433,41 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
 
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, newer.commit));
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(newer.commit));
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
+});
+
+describe('a rollback closed for fix-forward with follow-ups left', GIT_HEAVY, () => {
+  it('hands them to the update that supersedes it, which reclaims the image a rebuild displaced', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, NEW_IMAGE);
+    const state = world(runtime);
+    const id = runtime.instance_id;
+    // The update rebuilds a group's image, but a container still runs the image it displaced, so it is not reclaimed.
+    const displaced = state.tags.get(`${imageBase(runtime)}:ag-research`)!;
+    state.imageInUse = displaced;
+    expect(await cli(host, state, next, runtime).run(['update', '--id', id, '--yes'])).toBe(1);
+    expect((await readOperationRecord(host.paths, id))?.follow_ups).toEqual([
+      { kind: 'reclaim_image', image_id: displaced },
+    ]);
+    // The rollback takes that follow-up over, then fails, and so does going back: it is closed for fix-forward.
+    state.routeDown = true;
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(1);
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({
+      kind: 'rollback',
+      closed: 'failed',
+      follow_ups: [{ kind: 'reclaim_image', image_id: displaced }],
+    });
+    delete state.routeDown;
+    delete state.imageInUse;
+    const newer = await nextRelease(host);
+
+    expect(await cli(host, state, newer, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
+
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(newer.commit));
+    expect(state.ids.has(displaced)).toBe(false);
+    expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
   });
 });
