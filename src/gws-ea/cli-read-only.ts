@@ -183,7 +183,8 @@ async function assertLogFile(file: string, name: string): Promise<void> {
 
 /**
  * `logs`: the assistant's host log, or its error log with `--errors`, at the
- * paths its service definition sends them to. The process is handed to
+ * paths its service definition sends them to, in the physical `logs/` that is
+ * there whether or not a release is live. The process is handed to
  * `cat`, or to `tail -f` with `--follow`, so the log streams as the file
  * holds it. An unfinished update or rollback is named first, on stderr.
  */
@@ -192,7 +193,7 @@ async function showHostLog(context: ReadOnlyContext, options: CommandOptions): P
   const reservation = await getInstanceReservation(context.paths, instanceId);
   const note = operationNote(await inspectOperation(context.paths, reservation));
   if (note) context.errorOutput(note);
-  const logs = hostLogFiles(reservation.checkout_realpath);
+  const logs = hostLogFiles(context.paths.instanceRoot(instanceId));
   const file = options.errors ? logs.errors : logs.output;
   await assertLogFile(file, options.errors ? 'host error log' : 'host log');
   return {

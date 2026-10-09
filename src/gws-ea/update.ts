@@ -68,6 +68,8 @@ import {
   reverseSwapBeforeLiveMoved,
   settleCheckoutDatabases,
   stopCutoverHost,
+  swapLiveReceipt,
+  swapSlotReceipt,
   verifyServingRelease,
   type CutoverDependencies,
   type CutoverHost,
@@ -113,7 +115,7 @@ import {
   readInstanceHostEnvironment,
   stampUpgradeState,
   writeInstanceServiceDefinition,
-  writeReleaseRuntime,
+  writeReleaseEnvironment,
   type InstanceRuntimeConfig,
 } from './service.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
@@ -125,7 +127,6 @@ import {
   sameRelease,
   shortCommit,
   type GwsEaErrorDetails,
-  type InstanceMarker,
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
@@ -354,7 +355,7 @@ function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateD
     throw refused(
       'service_unmanaged',
       'unmanaged',
-      `A NanoClaw host runs from ${runtime.checkout_realpath} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
+      `A NanoClaw host runs from ${runtime.checkout_root} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
     );
   }
   if (!handle.active) throw refused('host_not_running', 'stopped');
@@ -434,7 +435,7 @@ async function releaseAgentImageShared(
     {
       repository: dependencies.toolRoot ?? CONTROL_PLANE_ROOT,
       commit: target.release.deployed_commit,
-      checkout: runtime.checkout_realpath,
+      checkout: runtime.state_root,
     },
     checkoutRuntime(dependencies),
   );
@@ -459,10 +460,10 @@ async function assertFreeDisk(
   target: UpdateReleaseTarget,
   dependencies: UpdateDependencies,
 ): Promise<void> {
-  const database = path.join(runtime.checkout_realpath, 'data', 'v2.db');
+  const database = path.join(runtime.state_root, 'data', 'v2.db');
   const shared = await releaseAgentImageShared(paths, runtime, target, dependencies);
   const [checkout, central, journal, image] = await Promise.all([
-    treeBytes(runtime.checkout_realpath),
+    treeBytes(runtime.checkout_root),
     fileBytes(database),
     fileBytes(`${database}-wal`),
     shared ? 0 : agentImageBytes(paths, runtime, dependencies),
@@ -512,7 +513,7 @@ async function checkUpdate(
     );
   }
   assertHostRunning(runtime, dependencies);
-  await assertDeploymentCheckoutUnmodified(reservation, checkoutRuntime(dependencies));
+  await assertDeploymentCheckoutUnmodified(paths, reservation, checkoutRuntime(dependencies));
   await assertFreeDisk(paths, runtime, target, dependencies);
   return { reservation, runtime, target };
 }
@@ -712,7 +713,7 @@ async function stageRelease(
   const { paths, instanceId } = operation;
   const reporter = dependencies.reporter ?? {};
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const live = reservation.checkout_realpath;
+  const live = paths.checkoutRoot(instanceId);
   const staged = paths.releaseCheckoutRoot(instanceId, 'next');
   const release = target.release;
 
@@ -731,7 +732,7 @@ async function stageRelease(
         { runCommand: run },
       );
       await writeReleasePreflightReceipt(
-        paths.releasePreflightFile(instanceId, 'next'),
+        swapSlotReceipt(paths, instanceId, 'next'),
         instanceId,
         release.deployed_commit,
         preflight,
@@ -1032,7 +1033,7 @@ async function prepareCutover(
     ...host,
     dependencies,
     target,
-    release: createInstanceRuntimeConfig(target, host.onecli, {
+    release: createInstanceRuntimeConfig(operation.paths, target, host.onecli, {
       nodePath: host.runtime.node_path,
       homeDirectory: host.runtime.home_directory,
       selectedProvider: host.runtime.selected_provider,
@@ -1078,15 +1079,15 @@ async function displacedGroupImages(cutover: Cutover, record: OperationRecord): 
 async function carryIntoRelease(cutover: Cutover, stoppedAt: string): Promise<void> {
   const { operation, runtime, release, reservation, dependencies } = cutover;
   const { paths, instanceId } = operation;
-  const live = reservation.checkout_realpath;
+  const live = paths.checkoutRoot(instanceId);
   const staged = paths.releaseCheckoutRoot(instanceId, 'next');
   await carryState(live, staged);
-  await writeReleaseRuntime(release, staged, dependencies.upsertEnvVars);
+  writeReleaseEnvironment(release, staged, dependencies.upsertEnvVars);
   await writePrivate(instanceMarkerFile(staged), {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
     instance_id: instanceId,
-    deployed_commit: release.deployed_commit,
-  } satisfies InstanceMarker);
+    deployed_commit: reservation.deployed_commit,
+  });
   await stampUpgradeState(staged, cutover.run, {
     ...dockerEnvironment(runtime, dependencies),
     NANOCLAW_INSTALL_ID: runtime.install_id,
@@ -1099,7 +1100,7 @@ async function carryIntoRelease(cutover: Cutover, stoppedAt: string): Promise<vo
       release: releaseOf(reservation),
       snapshot_at: stoppedAt,
     },
-    receipt: paths.releasePreflightFile(instanceId),
+    receipt: swapLiveReceipt(paths, instanceId),
     compose: cutover.onecli.composeFile,
     serviceDefinition: (await isRegularFile(definition)) ? definition : undefined,
     hostEnvironment: readInstanceHostEnvironment(live),
@@ -1114,9 +1115,9 @@ async function carryIntoRelease(cutover: Cutover, stoppedAt: string): Promise<vo
  * have started the old host meanwhile.
  */
 async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const { operation, reporter, reservation } = cutover;
+  const { operation, reporter } = cutover;
   const { paths, instanceId } = operation;
-  const live = reservation.checkout_realpath;
+  const live = paths.checkoutRoot(instanceId);
   await assertCarriable(live);
   await stopCutoverHost(cutover, STOP_LABEL);
   const stoppedAt = new Date().toISOString();
@@ -1157,13 +1158,13 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
  * swap the releases from wherever an interrupted swap left them.
  */
 async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
-  const { operation, reporter, reservation, dependencies } = cutover;
+  const { operation, reporter, dependencies } = cutover;
   const { paths, instanceId } = operation;
   await keepCutoverHostStopped(cutover);
   await runStep(reporter, { id: 'swap_releases', label: 'Switching to the new release…' }, async () => {
     // Between the two renames the outgoing release is no longer at the live path, but in previous/.
-    const outgoing = (await exists(reservation.checkout_realpath))
-      ? reservation.checkout_realpath
+    const outgoing = (await exists(paths.checkoutRoot(instanceId)))
+      ? paths.checkoutRoot(instanceId)
       : paths.releaseCheckoutRoot(instanceId, 'previous');
     await assertCheckoutQuiet(quietCheckoutOf(cutover, outgoing), cutoverQuiescence(cutover));
     await finishSwap(paths, instanceId, cutover.releases, dependencies.rename ? { rename: dependencies.rename } : {});

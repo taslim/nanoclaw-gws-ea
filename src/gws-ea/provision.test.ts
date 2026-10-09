@@ -74,13 +74,11 @@ async function testPaths(): Promise<ControlPlanePaths> {
 }
 
 function reservation(
-  paths: ControlPlanePaths,
   allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
 ): InstanceReservationInput {
   const instanceId = '11111111-1111-4111-8111-111111111111';
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.com/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -97,10 +95,9 @@ function reservation(
 }
 
 function managedReservation(
-  paths: ControlPlanePaths,
   allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
 ): InstanceReservationInput {
-  const input = reservation(paths, allocatedPorts);
+  const input = reservation(allocatedPorts);
   return {
     ...input,
     exclusive_resource_claims: {
@@ -269,7 +266,7 @@ function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'):
 
 async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
   const paths = await testPaths();
-  const reserved = await reserveInstance(paths, reservation(paths));
+  const reserved = await reserveInstance(paths, reservation());
   const world: World = {
     present: new Set(),
     observed: [],
@@ -721,7 +718,7 @@ describe('production bootstrap trust boundary', () => {
 
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     const manifest = bootstrapManifest(paths);
 
     await installProductionBootstrapManifest(paths, input.instance_id, manifest);
@@ -737,7 +734,7 @@ describe('production bootstrap trust boundary', () => {
     olderReceiptFields: Record<string, unknown> = {},
   ) {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const onecli = createOnecliRuntimeLayout({
       instanceId: reserved.instance_id,
       instanceRoot: paths.instanceRoot(reserved.instance_id),
@@ -746,15 +743,17 @@ describe('production bootstrap trust boundary', () => {
       gatewayPort: reserved.allocated_ports.onecli_gateway,
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+    const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: path.dirname(paths.stateRoot),
       selectedProvider: 'claude',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     await persistInstanceRuntime(runtime, recordEnv);
+    const receipt = paths.releasePreflightFile(reserved.instance_id, reserved.deployed_commit);
+    await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
     await writeFile(
-      paths.releasePreflightFile(reserved.instance_id),
+      receipt,
       `${JSON.stringify({
         schema_version: 1,
         instance_id: reserved.instance_id,
@@ -773,8 +772,7 @@ describe('production bootstrap trust boundary', () => {
       })}\n`,
       { mode: 0o600 },
     );
-    await mkdir(path.join(reserved.checkout_realpath, 'data'), { recursive: true });
-    new Database(path.join(reserved.checkout_realpath, 'data', 'v2.db')).close();
+    new Database(path.join(runtime.state_root, 'data', 'v2.db')).close();
     return { paths, reserved };
   }
 
@@ -836,7 +834,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
     gatewayPort: reserved.allocated_ports.onecli_gateway,
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
-  const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+  const runtime = createInstanceRuntimeConfig(operation.paths, reserved, onecli, {
     nodePath: '/usr/local/bin/node',
     homeDirectory: path.dirname(operation.paths.stateRoot),
     selectedProvider: 'claude',
@@ -852,7 +850,9 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         commit: reserved.deployed_commit,
       },
       releasePreflight: {
-        checkoutRoot: reserved.checkout_realpath,
+        checkoutRoot: operation.paths
+          .instanceLayout(reserved.instance_id)
+          .release(reserved.deployed_commit.slice(0, 8)),
         provider: 'claude',
         providerCredential: {
           name: 'Claude provider',
@@ -869,7 +869,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         account: reserved.exclusive_resource_claims.gcp_account,
         serviceAccountEmail: reserved.exclusive_resource_claims.gchat_service_account,
         credentialFile: runtime.secret_files.gchat_credentials,
-        cwd: reserved.checkout_realpath,
+        cwd: runtime.instance_root,
       },
       providerCredentialMetadata: {
         name: 'Claude provider',
@@ -919,7 +919,6 @@ function hostStatusOf(reserved: InstanceReservation, overrides: Readonly<Record<
     pid: 4242,
     started_at: '2026-09-25T12:00:00.000Z',
     instance_id: 'host-instance-1',
-    project_root: reserved.checkout_realpath,
     webhook: { id: 'listener-1', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
     channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
     ...overrides,
@@ -937,8 +936,10 @@ async function writeReleaseReceipt(
   reserved: InstanceReservation,
   onecli: { gateway: string; sdk: string },
 ): Promise<void> {
+  const receipt = paths.releasePreflightFile(reserved.instance_id, reserved.deployed_commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(reserved.instance_id),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: reserved.instance_id,
@@ -1110,7 +1111,7 @@ describe('production provision step composition', () => {
     ['managed', ['start_onecli', 'start_nanoclaw', 'establish_transport']],
   ] as const)('re-checks only runtime steps once complete (%s ingress)', async (mode, runtime) => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation(paths) : reservation(paths));
+    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation() : reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const steps = createProductionProvisionSteps(productionContext(operation, reserved));
@@ -1123,7 +1124,7 @@ describe('production provision step composition', () => {
 
   it('forwards Google Cloud waits through the provision runtime', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const progress: RunEvent[] = [];
     const reason = 'Waiting for Google Cloud to allow Google Chat key creation…';
 
@@ -1153,7 +1154,7 @@ describe('production provision step composition', () => {
 
   it('observes Google Cloud as its own resources, restoring a lifted key policy only after the key', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const resources = createProductionProvisionSteps(productionContext(operation, reserved)).provision_gcp.resources;
@@ -1170,7 +1171,7 @@ describe('production provision step composition', () => {
 
   it('accepts only an all-mode canonical main without enumerating its grants', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1200,7 +1201,7 @@ describe('production provision step composition', () => {
 
   it('repairs a completed OneCLI runtime whose container stopped at once, and refuses unsafe drift', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1248,7 +1249,7 @@ describe('production provision step composition', () => {
 
   it('runs and checks OneCLI at the pins its release recorded, not this launcher’s', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const recorded = { gateway: '1.41.3', sdk: '2.2.0' };
     await writeReleaseReceipt(paths, reserved, recorded);
     const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
@@ -1279,7 +1280,7 @@ describe('production provision step composition', () => {
 
   it('adopts a healthy OneCLI runtime its release created, interrupted before its API keys were persisted', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1312,7 +1313,7 @@ describe('production provision step composition', () => {
 
   it('asks for the provider credential and imports it with the OneCLI receipt the run already holds', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
     const collected = {
       name: 'Claude provider',
@@ -1348,7 +1349,7 @@ describe('production provision step composition', () => {
 
   it('rejects a credential that does not match the selected provider definition', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const importProviderCredential = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1380,7 +1381,7 @@ describe('production provision step composition', () => {
 
   it('hands the managed transport its instance, claim, and platform, and asks for the account token only through it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
     const claim = reserved.exclusive_resource_claims.ingress;
     if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
     const resources = [{ name: 'the managed transport', observe: async () => PRESENT, apply: async () => undefined }];
@@ -1444,7 +1445,7 @@ describe('production provision step composition', () => {
 
   it('keeps the account token only until the route is set up, and asks again only when Cloudflare refuses it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
     const claim = reserved.exclusive_resource_claims.ingress;
     if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
     const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
@@ -1573,7 +1574,7 @@ describe('production provision step composition', () => {
 
   it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const managedTransportResources = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1593,7 +1594,7 @@ describe('production provision step composition', () => {
 
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const verifyRoute = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1622,7 +1623,7 @@ describe('production provision step composition', () => {
 
   it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
@@ -1643,7 +1644,7 @@ describe('production provision step composition', () => {
     ['identity', { client_email: 'other@gws-ea-dogfood.iam.gserviceaccount.com' }],
   ] as const)('rejects a service-account %s swap before starting NanoClaw', async (_label, credentialOverride) => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const startRuntime = vi.fn(async (): Promise<never> => {
       throw new Error('NanoClaw must not start');
     });
@@ -1671,7 +1672,7 @@ describe('production provision step composition', () => {
 
   it('continues main identity setup when this checkout’s host already serves, without restarting it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1696,7 +1697,7 @@ describe('production provision step composition', () => {
       }).start_nanoclaw;
 
       await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
-      expect(queryHost).toHaveBeenCalledWith(reserved.checkout_realpath);
+      expect(queryHost).toHaveBeenCalledWith(paths.checkoutRoot(reserved.instance_id));
       expect(waitForHost).not.toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
       expect(reconcileMainIdentity).toHaveBeenCalledOnce();
@@ -1712,7 +1713,7 @@ describe('production provision step composition', () => {
     const port = (webhook.address() as { port: number }).port;
     const bound = await reserveInstance(
       paths,
-      reservation(paths, { nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
+      reservation({ nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
     );
     const events: RunEvent[] = [];
     let socketOpen = false;
@@ -1720,7 +1721,8 @@ describe('production provision step composition', () => {
     try {
       await withInstanceOperation(paths, bound.instance_id, async (operation) => {
         const base = productionContext(operation, bound);
-        const socketClosed = () => new Error(`connect ENOENT ${path.join(bound.checkout_realpath, 'data/ncl.sock')}`);
+        const socketClosed = () =>
+          new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
         const waitForHost = vi.fn(async (_root: string, _options?: WaitForHostOptions) => {
           socketOpen = true;
           return hostStatusOf(bound);
@@ -1762,7 +1764,7 @@ describe('production provision step composition', () => {
           runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
         ).resolves.toEqual({ status: 'ready' });
         expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
-        expect(waitForHost).toHaveBeenCalledWith(bound.checkout_realpath, {
+        expect(waitForHost).toHaveBeenCalledWith(paths.checkoutRoot(bound.instance_id), {
           channel: 'gchat',
           pid: 4242,
           alive: expect.any(Function),
@@ -1782,7 +1784,7 @@ describe('production provision step composition', () => {
 
   it('names a foreign process on the webhook port when the host does not become ready', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1825,7 +1827,7 @@ describe('production provision step composition', () => {
 
   it('stops with the host’s reason and its error log at the instance path when it does not become ready', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1852,14 +1854,14 @@ describe('production provision step composition', () => {
 
       await expect(host.apply(context)).rejects.toMatchObject({
         code: 'nanoclaw_not_ready',
-        message: `Channel gchat is not connected in the running host. Check ${path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')}.`,
+        message: `Channel gchat is not connected in the running host. Check ${path.join(paths.instanceRoot(reserved.instance_id), 'logs', 'nanoclaw.error.log')}.`,
       });
     });
   });
 
   it('waits on a starting host, and restarts a stopped one at once without restamping its matching main identity', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     let host: 'serving' | 'stopped' | number = 'serving';
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1932,7 +1934,7 @@ describe('production provision step composition', () => {
 
   it('waits on a host whose Google Chat channel has not connected yet', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1952,7 +1954,9 @@ describe('production provision step composition', () => {
       await expect(host.observe(context)).resolves.toMatchObject({
         status: 'unknown',
         reason: 'Channel gchat is not connected in the running host',
-        evidence: expect.stringContaining(path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')),
+        evidence: expect.stringContaining(
+          path.join(paths.instanceRoot(reserved.instance_id), 'logs', 'nanoclaw.error.log'),
+        ),
       });
     });
   });
@@ -2017,7 +2021,7 @@ const PRINCIPAL = {
 
 async function productionHarness(): Promise<ProductionHarness> {
   const paths = await testPaths();
-  const reserved = await reserveInstance(paths, reservation(paths));
+  const reserved = await reserveInstance(paths, reservation());
   await mkdir(paths.instanceRoot(reserved.instance_id), { recursive: true, mode: 0o700 });
   await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
   const resources = new Set<string>();
@@ -2066,7 +2070,7 @@ async function productionHarness(): Promise<ProductionHarness> {
             hostStatus: {
               queryHost: async () => {
                 if (resources.has('host')) return hostStatusOf(reserved);
-                throw new Error(`connect ENOENT ${path.join(reserved.checkout_realpath, 'data/ncl.sock')}`);
+                throw new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
               },
               waitForHost: async () => hostStatusOf(reserved),
             },
@@ -2261,9 +2265,9 @@ describe('production step order and pause outcomes', () => {
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    await expect(readFile(harness.paths.releasePreflightFile(harness.instanceId), 'utf8')).resolves.toContain(
-      '"providerCredential"',
-    );
+    await expect(
+      readFile(harness.paths.releasePreflightFile(harness.instanceId, 'a'.repeat(40)), 'utf8'),
+    ).resolves.toContain('"providerCredential"');
 
     harness.principal = 'bound';
     harness.selectedMessagingGroupId = 'mg-principal';
@@ -2320,7 +2324,7 @@ describe('production step order and pause outcomes', () => {
   }
 
   async function writeErrorLog(harness: ProductionHarness, lines: readonly string[], writtenAt: Date): Promise<string> {
-    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    const errorLog = path.join(harness.lastContext!.input.runtime.instance_root, 'logs', 'nanoclaw.error.log');
     await mkdir(path.dirname(errorLog), { recursive: true });
     await writeFile(errorLog, `${lines.join('\n')}\n`);
     await utimes(errorLog, writtenAt, writtenAt);
@@ -2331,7 +2335,7 @@ describe('production step order and pause outcomes', () => {
     const harness = await productionHarness();
     const first = await harness.run();
     const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
-    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    const errorLog = path.join(harness.lastContext!.input.runtime.instance_root, 'logs', 'nanoclaw.error.log');
     expect(first).toMatchObject({
       status: 'paused',
       pause: {

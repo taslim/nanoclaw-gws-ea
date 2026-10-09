@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -11,7 +12,7 @@ import { wrapperImageTag } from './onecli-gateway-image.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { allocateInstanceId } from './registry.js';
+
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { ReleaseSource } from './release-tracks.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
@@ -114,10 +115,9 @@ async function deployedAssistant(
   release: ReleaseCoordinates,
   record: AssistantRecord = {},
 ): Promise<InstanceReservation> {
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     ...release,
     allocated_ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
     exclusive_resource_claims: {
@@ -138,7 +138,7 @@ async function deployedAssistant(
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   await persistInstanceRuntime(
-    createInstanceRuntimeConfig(reserved, onecli, {
+    createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: path.dirname(paths.stateRoot),
       selectedProvider: 'claude',
@@ -147,8 +147,10 @@ async function deployedAssistant(
     () => undefined,
   );
   const cohort = record.onecli ?? { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION };
+  const receipt = paths.releasePreflightFile(instanceId, release.deployed_commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(instanceId),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,

@@ -34,7 +34,6 @@ const REQUEST: PrerequisiteRequest = {
     configRoot: '/Users/operator/.config/gws-ea',
     stateRoot: '/Users/operator/.local/share/gws-ea',
     logsRoot: '/Users/operator/.local/share/gws-ea/logs',
-    instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
   },
 };
 

@@ -50,6 +50,7 @@ import {
   instanceOnecliAdmin,
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
+  hostLogFiles,
   instanceServicePid,
   loadInstanceRuntimeConfig,
   type HostStatusHelpers,
@@ -82,7 +83,8 @@ import {
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { instanceRuntimeFile, isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { instanceLayout, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
@@ -310,7 +312,8 @@ async function loadReleasePreflightReceipt(
 
 /** The receipt create's release preflight wrote for this instance, checked against it. */
 function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
-  return loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
+  const { paths, instanceId } = context.operation;
+  return loadReleasePreflightReceipt(paths.releasePreflightFile(instanceId, context.input.release.commit), {
     instanceId: context.operation.instanceId,
     deployedCommits: [context.input.release.commit],
     provider: context.input.releasePreflight.provider,
@@ -337,6 +340,7 @@ export async function writeReleasePreflightReceipt(
     deployed_commit: deployedCommit,
     ...result,
   };
+  await preparePrivateDirectory(path.dirname(file));
   await writePrivateTextFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
 }
 
@@ -345,12 +349,8 @@ async function persistReleasePreflightReceipt(
   result: ReleasePreflightResult,
 ): Promise<void> {
   const { paths, instanceId } = context.operation;
-  await writeReleasePreflightReceipt(
-    paths.releasePreflightFile(instanceId),
-    instanceId,
-    context.input.release.commit,
-    result,
-  );
+  const commit = context.input.release.commit;
+  await writeReleasePreflightReceipt(paths.releasePreflightFile(instanceId, commit), instanceId, commit, result);
 }
 
 async function ensureReleaseCheckout(
@@ -430,13 +430,10 @@ async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: re
 /** How long a (re)started host may take to answer and connect Google Chat. */
 const HOST_READY_TIMEOUT_MS = 60_000;
 
-/** Upstream's messages name the checkout-relative error log; point at this instance's. */
+/** Upstream's messages name the checkout-relative error log; point at this instance's physical one. */
 function hostReason(error: unknown, runtime: InstanceRuntimeConfig): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replaceAll(
-    'logs/nanoclaw.error.log',
-    path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log'),
-  );
+  return message.replaceAll('logs/nanoclaw.error.log', hostLogFiles(runtime.instance_root).errors);
 }
 
 /**
@@ -451,10 +448,10 @@ async function observeInstanceHost(
   dependencies: ProductionProvisionDependencies,
 ): Promise<Observation> {
   const { runtime, hostStatus, serviceDependencies } = context.input;
-  const errorLog = path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+  const errorLog = hostLogFiles(runtime.instance_root).errors;
   let status: unknown;
   try {
-    status = await hostStatus.queryHost(runtime.checkout_realpath);
+    status = await hostStatus.queryHost(runtime.checkout_root);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering; its service manager then tells starting from stopped.
   } catch (error) {
     const pid = await dependencies.instanceServicePid(runtime, serviceDependencies);
@@ -497,11 +494,11 @@ async function startInstanceHost(
   dependencies: ProductionProvisionDependencies,
   emit: ProvisionRuntime['emit'],
 ): Promise<void> {
-  const { runtime, hostStatus, serviceDependencies } = context.input;
-  const { pid } = await dependencies.reconcileInstanceRuntime(runtime, serviceDependencies);
+  const { runtime, hostStatus, serviceDependencies, release } = context.input;
+  const { pid } = await dependencies.reconcileInstanceRuntime(runtime, release.commit, serviceDependencies);
   emit?.({ type: 'step-waiting', step: 'start_nanoclaw', reason: 'Waiting for the assistant to connect Google Chat…' });
   try {
-    await hostStatus.waitForHost(runtime.checkout_realpath, {
+    await hostStatus.waitForHost(runtime.checkout_root, {
       channel: 'gchat',
       ...(pid === undefined ? {} : { pid, alive: () => processAlive(pid) }),
       timeoutMs: HOST_READY_TIMEOUT_MS,
@@ -765,7 +762,7 @@ async function principalPause(
 ): Promise<ProvisionHumanPause> {
   const journal = await readProvisionJournal(context.operation.paths, context.operation.instanceId);
   const since = journal.steps[phase]?.started_at ?? new Date().toISOString();
-  const errors = await instanceErrorsSince(context.input.runtime.checkout_realpath, since);
+  const errors = await instanceErrorsSince(context.input.runtime.instance_root, since);
   return {
     ...humanPause(phase, code, message),
     details: [
@@ -859,7 +856,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
   const welcomeEventId = context.state.welcomeEventId;
   if (!mainAgentGroupId || !principal || !welcomeEventId) return undefined;
   return {
-    checkoutRoot: context.input.runtime.checkout_realpath,
+    stateRoot: context.input.runtime.state_root,
     mainAgentGroupId,
     messagingGroupId: principal.messagingGroupId,
     principalUserId: principal.userId,
@@ -886,10 +883,10 @@ export function createProductionProvisionSteps(
   if (input.runtime.instance_id !== context.operation.instanceId) {
     throw new GwsEaError('runtime_mismatch', 'Provision runtime targets a different instance');
   }
-  if (input.release.commit !== input.runtime.deployed_commit) {
-    throw new GwsEaError('release_mismatch', 'Provision release and runtime commits disagree');
-  }
-  if (input.releasePreflight.checkoutRoot !== input.runtime.checkout_realpath) {
+  if (
+    input.releasePreflight.checkoutRoot !==
+    instanceLayout(input.runtime.instance_root).release(releaseName(input.release.commit))
+  ) {
     throw new GwsEaError('runtime_mismatch', 'Release preflight targets a different checkout');
   }
   if (input.runtime.endpoint_url !== validateExistingGchatEndpoint(input.runtime.endpoint_url)) {
@@ -1315,7 +1312,7 @@ export async function installProductionBootstrapManifest(
 ): Promise<void> {
   assertInstanceId(instanceId);
   const manifest = validateProductionBootstrapManifest(input);
-  await preparePrivateDirectory(paths.instancesRoot);
+  await preparePrivateDirectory(paths.stateRoot);
   try {
     await mkdir(paths.instanceRoot(instanceId), { mode: 0o700 });
   } catch (error) {
@@ -1354,7 +1351,7 @@ interface PersistedProfileIdentity {
 }
 
 function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileIdentity | undefined {
-  const file = path.join(runtime.checkout_realpath, 'data', 'v2.db');
+  const file = path.join(runtime.state_root, 'data', 'v2.db');
   let database: Database.Database;
   try {
     database = new Database(file, { readonly: true, fileMustExist: true });
@@ -1422,7 +1419,8 @@ async function resolveProvisionSource(
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
   }
-  const preflight = await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
+  const receipt = operation.paths.releasePreflightFile(operation.instanceId, reservation.deployed_commit);
+  const preflight = await loadReleasePreflightReceipt(receipt, {
     instanceId: operation.instanceId,
     deployedCommits: [reservation.deployed_commit],
     provider: runtime.selected_provider,
@@ -1459,7 +1457,7 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   };
   const [manifest, runtime] = await Promise.all([
     loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath)).catch(absent),
+    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch(absent),
   ]);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
@@ -1482,21 +1480,21 @@ export function instanceOnecliLayout(
 
 /**
  * What a created assistant's own record says it runs (KTD6): the provider,
- * credential metadata, and OneCLI cohort its release receipt records, and
- * the Postgres image its Compose file names.
- * An update holds the tool's release to these, never to the tool's own tree.
- * The receipt must be for one of `commits`: the reservation's by default, or
- * mid-update also the release an operation placed live (KTD17).
+ * credential metadata, and OneCLI cohort the receipt kept with the
+ * reservation's release records, and the Postgres image its Compose file
+ * names. An update holds the tool's release to these, never to the tool's
+ * own tree. Everything is read physically, so it is there while no release
+ * is live.
  */
 export async function readDeployedSetup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-  commits: readonly string[] = [reservation.deployed_commit],
 ): Promise<DeployedSetup> {
-  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
-  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
+  const commit = reservation.deployed_commit;
+  const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id));
+  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id, commit), {
     instanceId: reservation.instance_id,
-    deployedCommits: commits,
+    deployedCommits: [commit],
     provider: runtime.selected_provider,
   });
   const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
@@ -1555,7 +1553,7 @@ export async function runProductionProvision(
     if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
     // The runtime records this layout's Docker endpoint verbatim, so the layout matches it too.
     onecli = instanceOnecliLayout(operation.paths, reservation, manifest.docker_endpoint);
-    runtime = createInstanceRuntimeConfig(reservation, onecli, {
+    runtime = createInstanceRuntimeConfig(operation.paths, reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
       selectedProvider: manifest.provider.id,
@@ -1577,7 +1575,9 @@ export async function runProductionProvision(
         commit: reservation.deployed_commit,
       },
       releasePreflight: {
-        checkoutRoot: reservation.checkout_realpath,
+        checkoutRoot: operation.paths
+          .instanceLayout(reservation.instance_id)
+          .release(releaseName(reservation.deployed_commit)),
         provider: runtime.selected_provider,
         providerCredential: source.providerCredentialMetadata,
       },
@@ -1589,7 +1589,7 @@ export async function runProductionProvision(
         account: reservation.exclusive_resource_claims.gcp_account,
         serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
         credentialFile: runtime.secret_files.gchat_credentials,
-        cwd: reservation.checkout_realpath,
+        cwd: runtime.instance_root,
       },
       providerCredentialMetadata: source.providerCredentialMetadata,
       ...(manifest && interaction

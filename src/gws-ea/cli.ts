@@ -732,7 +732,7 @@ class Cli {
         interaction,
       ),
     );
-    const instanceId = allocateInstanceId();
+    const instanceId = await allocateInstanceId(paths);
     state.instanceId = instanceId;
     this.#presenter.line(`instance_id: ${instanceId}`);
     // After the ID, which scripts read as the first line.
@@ -794,7 +794,7 @@ class Cli {
     const bootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
     const held = await (this.#runtime.holdLoopbackPorts ?? holdLoopbackPorts)();
     try {
-      const input = createReservation(paths, track, sourceRemote, setup, {
+      const input = createReservation(track, sourceRemote, setup, {
         instanceId,
         commit,
         ports: held.ports,
@@ -938,7 +938,7 @@ class Cli {
               account: claims.gcp_account,
               serviceAccountEmail: claims.gchat_service_account,
               credentialFile: runtime.secret_files.gchat_credentials,
-              cwd: reservation.checkout_realpath,
+              cwd: runtime.instance_root,
             },
             google: {
               runtime,
@@ -1619,7 +1619,6 @@ function failureStop(report: FailureReport, error: unknown): StopReport {
 }
 
 function createReservation(
-  paths: ControlPlanePaths,
   track: string,
   sourceRemote: string,
   setup: CreateSetupAnswers,
@@ -1634,7 +1633,6 @@ function createReservation(
   const gcpProjectId = deriveGcpProjectId(instanceId);
   const input: InstanceReservationInput = {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: track,
     source_remote: sourceRemote,
     deployed_commit: production.commit,
@@ -1659,7 +1657,7 @@ function createReservation(
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   };
-  return validateReservation(input, paths);
+  return validateReservation(input);
 }
 
 function removalPreviewLines(preview: RemovalPreview): string[] {

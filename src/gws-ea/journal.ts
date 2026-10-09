@@ -21,7 +21,6 @@ import { isErrno } from '../community-portal/errors.js';
 import {
   assertOwnedDestination,
   assertPrivateStateFile,
-  instanceRuntimeFile,
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
@@ -36,6 +35,7 @@ import {
   validateReservation,
   withMachineLock,
 } from './registry.js';
+import { assertConverted } from './release-convert.js';
 import { removePrivateFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import {
@@ -231,8 +231,8 @@ export async function reserveInstance(
   paths: ControlPlanePaths,
   input: InstanceReservationInput,
 ): Promise<InstanceReservation> {
-  const reservation = validateReservation(input, paths);
-  await assertOwnedDestination(reservation.checkout_realpath);
+  const reservation = validateReservation(input);
+  await assertOwnedDestination(paths.instanceRoot(reservation.instance_id));
   return withMachineLock(paths, async () => {
     const staged = await stageReservation(paths, reservation);
     await createProvisionJournal(paths, reservation.instance_id);
@@ -267,11 +267,13 @@ function journalCreated(journal: ProvisionJournal): boolean {
   return PROVISION_STEPS.every((step) => journal.steps[step]?.completed_at !== undefined);
 }
 
-/** The runtime record of a fully created assistant, read from its own checkout (R18). */
+/**
+ * The runtime record of a fully created assistant, read from its own physical
+ * `state/` (R18), so it is there while no release is live.
+ */
 export async function loadCreatedRuntime(paths: ControlPlanePaths, instanceId: string): Promise<InstanceRuntimeConfig> {
   await assertInstanceCreated(paths, instanceId);
-  const reservation = await getInstanceReservation(paths, instanceId);
-  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
+  const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
   if (runtime.instance_id !== instanceId) {
     throw new GwsEaError('runtime_mismatch', "The assistant's runtime record belongs to another instance");
   }
@@ -420,6 +422,8 @@ export async function acquireInstanceOperation(
       if (!isErrno(error, 'ENOENT')) throw error;
     }
     const reservation = await getInstanceReservation(paths, instanceId);
+    // Only an update moves an assistant off the layout before releases.
+    if (intent.command !== 'update') assertConverted(paths, reservation);
     await preparePrivateDirectory(paths.instanceRoot(instanceId));
     await admitInstanceCommand(paths, reservation, intent);
     if (CONTRACT_BOUND.has(intent.command)) await readProvisionJournal(paths, instanceId);

@@ -153,7 +153,12 @@ async function intendedTurn(
         ...(seams.toolRoot ? { toolRoot: seams.toolRoot } : {}),
       },
     );
-    return { kind: 'update', from: releaseOf(reservation), to: intent.target, checkout: reservation.checkout_realpath };
+    return {
+      kind: 'update',
+      from: releaseOf(reservation),
+      to: intent.target,
+      checkout: paths.checkoutRoot(reservation.instance_id),
+    };
   } catch (error) {
     if (error instanceof GwsEaError) return { kind: 'refused', reason: safeErrorMessage(error) };
     // Only its code is shown: an unexpected error's message may carry a secret.

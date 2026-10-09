@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +27,7 @@ import {
   type OperationRecord,
 } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { allocateInstanceId, getInstanceReservation, readRegistry, swapInstanceRelease } from './registry.js';
+import { getInstanceReservation, readRegistry, swapInstanceRelease } from './registry.js';
 import type { InstanceReservation, InstanceReservationInput, ReleaseCoordinates } from './types.js';
 
 const roots: string[] = [];
@@ -50,11 +51,10 @@ const CLEANUP: OperationFollowUp = { kind: 'delete_release', release: 'supersede
 /** Every command that takes the instance lock but neither continues nor reverts an update. */
 const CONFLICTING = ['create', 'resume', 'start', 'stop', 'restart', 'ncl'] as const;
 
-function reservation(paths: ControlPlanePaths, port: number): InstanceReservationInput {
-  const instanceId = allocateInstanceId();
+function reservation(port: number): InstanceReservationInput {
+  const instanceId = randomUUID();
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     ...FROM,
     allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
@@ -76,7 +76,7 @@ async function testPaths(): Promise<ControlPlanePaths> {
 
 async function fixture(): Promise<{ paths: ControlPlanePaths; instanceId: string }> {
   const paths = await testPaths();
-  const input = await reserveInstance(paths, reservation(paths, 35_001));
+  const input = await reserveInstance(paths, reservation(35_001));
   return { paths, instanceId: input.instance_id };
 }
 
@@ -162,7 +162,7 @@ describe('operation record', () => {
     expect(unsupported).toMatchObject({ code: 'unsupported_operation' });
     expect((unsupported as Error).message).toContain(`gws-ea remove --id ${instanceId}`);
 
-    await writeFile(paths.operationFile(instanceId), JSON.stringify({ ...raw, instance_id: allocateInstanceId() }), {
+    await writeFile(paths.operationFile(instanceId), JSON.stringify({ ...raw, instance_id: randomUUID() }), {
       mode: 0o600,
     });
     await expect(readOperationRecord(paths, instanceId)).rejects.toMatchObject({ code: 'invalid_operation' });
@@ -422,8 +422,8 @@ describe('operation gate', () => {
 
   it("never lets one assistant's record block a command on another", async () => {
     const paths = await testPaths();
-    const a = (await reserveInstance(paths, reservation(paths, 35_101))).instance_id;
-    const b = (await reserveInstance(paths, reservation(paths, 35_201))).instance_id;
+    const a = (await reserveInstance(paths, reservation(35_101))).instance_id;
+    const b = (await reserveInstance(paths, reservation(35_201))).instance_id;
     await updateTo(paths, a, 'swapped');
 
     const intents: readonly OperationIntent[] = [
@@ -520,7 +520,7 @@ describe('target reservation view and live checkout agreement (KTD17)', () => {
     const view: InstanceReservation = targetReservationView(reserved, base);
     expect(view).toEqual({ ...reserved, ...TO });
     expect((await readRegistry(paths)).instances[instanceId]).toEqual(reserved);
-    expect(() => targetReservationView(reserved, { ...base, instance_id: allocateInstanceId() })).toThrow(
+    expect(() => targetReservationView(reserved, { ...base, instance_id: randomUUID() })).toThrow(
       expect.objectContaining({ code: 'operation_mismatch' }),
     );
   });

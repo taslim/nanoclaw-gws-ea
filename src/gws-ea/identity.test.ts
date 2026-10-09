@@ -9,15 +9,16 @@ const ADMIN_KEY = `oc_${'a'.repeat(64)}`;
 
 function runtimeConfig(): InstanceRuntimeConfig {
   const instanceId = '11111111-1111-4111-8111-111111111111';
-  const checkout = '/opt/gws-ea/instances/one/nanoclaw';
-  const secrets = '/opt/gws-ea/instances/one/secrets';
+  const root = '/opt/gws-ea/11111111';
+  const secrets = `${root}/secrets`;
   const project = `gws-ea-${instanceId.replaceAll('-', '')}`;
   return {
-    schema_version: 1,
+    schema_version: 2,
     instance_id: instanceId,
     install_id: instanceId.replaceAll('-', ''),
-    deployed_commit: 'a'.repeat(40),
-    checkout_realpath: checkout,
+    instance_root: root,
+    checkout_root: `${root}/nanoclaw`,
+    state_root: `${root}/state`,
     node_path: '/usr/bin/node',
     home_directory: '/Users/operator',
     allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },

@@ -8,6 +8,7 @@
  * the release's scripts and migration registry, the hosts, OneCLI, and `ncl`
  * are faked at their boundaries.
  */
+import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -42,12 +43,13 @@ import type { CliRuntime } from './cli.js';
 import { removeToolCheckouts, toolCheckoutWorld } from './testing/stray-fixture.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { advanceOperation, beginOperation, readOperationRecord } from './operation.js';
-import { allocateInstanceId, getInstanceReservation, swapInstanceRelease } from './registry.js';
+import { getInstanceReservation, swapInstanceRelease } from './registry.js';
 import type { HostStatusHelpers, InstanceRuntimeConfig } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import { releaseOf, type ReleaseCoordinates } from './types.js';
 import type { UpdatePreview } from './update.js';
 import { registeredReleaseMigrations, type UpdateAllPlan } from './update-all.js';
+import { swapLiveReceipt } from './cutover.js';
 
 afterEach(async () => {
   await removeTemporaryRoots();
@@ -162,7 +164,7 @@ function serviceCallsOf(state: World, runtime: InstanceRuntimeConfig): string[] 
 
 async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, commit: string): Promise<void> {
   expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, commit));
-  expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(commit);
+  expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(commit);
   expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
 }
 
@@ -404,7 +406,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const machineFleet = await fleet(host, next, [first, unreadable]);
     // A database the plan cannot read is named, not a reason to stop.
-    await writeFile(path.join(unreadable.checkout_realpath, 'data', 'v2.db'), 'not a database\n');
+    await writeFile(path.join(unreadable.checkout_root, 'data', 'v2.db'), 'not a database\n');
     const before = await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)));
     const asked: Array<{ readonly toolCommit: string; readonly shown: readonly string[]; readonly staged: boolean }> =
       [];
@@ -574,10 +576,9 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     await mkdir(path.dirname(host.paths.removalFile(removing.instance_id)), { recursive: true, mode: 0o700 });
     await writeFile(host.paths.removalFile(removing.instance_id), '{}\n', { mode: 0o600 });
     // Reserved as create reserves it, with no step of its provisioning finished.
-    const creating = allocateInstanceId();
+    const creating = randomUUID();
     await reserveInstance(host.paths, {
       instance_id: creating,
-      checkout_realpath: host.paths.checkoutRoot(creating),
       source_remote: host.remote,
       release_track: 'dogfood',
       deployed_commit: host.first,
@@ -608,7 +609,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const eligible = await assistant(host, 37_101);
     const next = await nextRelease(host);
     const machineFleet = await fleet(host, next, [unreadable, eligible]);
-    await rm(host.paths.releasePreflightFile(unreadable.instance_id));
+    await rm(swapLiveReceipt(host.paths, unreadable.instance_id));
     const { run, out, err } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(1);

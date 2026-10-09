@@ -5,7 +5,7 @@
  * file. The host, service manager, Docker, OneCLI, and the callback are
  * faked at their boundaries; Git and SQLite are real.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
   mkdir,
@@ -14,8 +14,8 @@ import {
   readFile,
   readlink,
   realpath,
-  rename,
   rm,
+  symlink,
   utimes,
   writeFile,
 } from 'node:fs/promises';
@@ -44,7 +44,7 @@ import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
-import { allocateInstanceId, writeInstanceMarker } from './registry.js';
+import { writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
@@ -145,17 +145,32 @@ interface AssistantOptions {
   readonly from?: { readonly repository: string; readonly commit: string };
 }
 
-/** An assistant create finished: its reservation, checkout, marker, runtime, release receipt, and Compose file. */
+/** Each fixture assistant's machine paths, by instance ID. */
+const machineOf = new Map<string, ControlPlanePaths>();
+
+/** The assistant's live link, which the host's status and `ncl` run through. */
+function liveOf(reservation: InstanceReservation): string {
+  return machineOf.get(reservation.instance_id)!.checkoutRoot(reservation.instance_id);
+}
+
+/** The assistant's physical state, which holds NanoClaw's `data`. */
+function stateOf(reservation: InstanceReservation): string {
+  return machineOf.get(reservation.instance_id)!.instanceLayout(reservation.instance_id).state;
+}
+
+/**
+ * An assistant create finished: its reservation, its release live, its marker and runtime in its state, its
+ * release receipt, and its Compose file.
+ */
 async function assistant(
   host: Machine,
   { label, port, ingress, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
 ): Promise<InstanceReservation> {
   const { paths } = host;
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const callback = `https://${label}.example.test/webhook/gchat`;
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     source_remote: from.repository,
     release_track: 'dogfood',
     deployed_commit: from.commit,
@@ -180,9 +195,12 @@ async function assistant(
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   });
-  const checkout = paths.checkoutRoot(instanceId);
+  machineOf.set(instanceId, paths);
+  const release = from.commit.slice(0, 8);
+  const checkout = paths.instanceLayout(instanceId).release(release);
   git(host.root, 'clone', '--quiet', from.repository, checkout);
   git(checkout, 'checkout', '--quiet', '--detach', from.commit);
+  await symlink(release, paths.checkoutRoot(instanceId));
   await writeInstanceMarker(paths, instanceId);
   const onecli = createOnecliRuntimeLayout({
     instanceId,
@@ -193,7 +211,7 @@ async function assistant(
     dockerEndpoint: DOCKER,
   });
   await persistInstanceRuntime(
-    createInstanceRuntimeConfig(reserved, onecli, {
+    createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: host.root,
       selectedProvider: 'claude',
@@ -201,8 +219,10 @@ async function assistant(
     }),
     () => undefined,
   );
+  const receipt = paths.releasePreflightFile(instanceId, from.commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(instanceId),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,
@@ -330,13 +350,13 @@ interface World {
 }
 
 function world(...assistants: readonly InstanceReservation[]): World {
-  const checkouts = assistants.map((reservation) => reservation.checkout_realpath);
+  const checkouts = assistants.map(liveOf);
   return {
     installed: new Set(assistants.map(installOf)),
     active: new Set(assistants.map(installOf)),
     serving: new Set(checkouts),
     ports: new Map(
-      assistants.map((reservation) => [reservation.checkout_realpath, reservation.allocated_ports.nanoclaw_webhook]),
+      assistants.map((reservation) => [liveOf(reservation), reservation.allocated_ports.nanoclaw_webhook]),
     ),
     commands: [],
     serviceEnvironments: [],
@@ -409,7 +429,7 @@ function callbackFetch(state: World): typeof globalThis.fetch {
 
 function ncl(state: World): StatusObservers['ncl'] {
   return async (runtime, args) => {
-    if (!state.serving.has(runtime.checkout_realpath)) {
+    if (!state.serving.has(runtime.checkout_root)) {
       throw new GwsEaError('command_failed', 'ncl exited with code 1', { details: { exitCode: 1 } });
     }
     switch (args.join(' ')) {
@@ -605,7 +625,7 @@ describe('status', () => {
     expect(status.probes.service).toEqual({ status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' });
     expect(status.probes.host).toEqual({
       status: 'degraded',
-      reason: `The host is unreachable: NanoClaw is not running; see ${reservation.checkout_realpath}/logs/nanoclaw.error.log`,
+      reason: `The host is unreachable: NanoClaw is not running; see ${host.paths.instanceRoot(reservation.instance_id)}/logs/nanoclaw.error.log`,
     });
     expect(status.probes.main_identity).toMatchObject({ status: 'unknown', agent_group_id: null });
     expect(status.probes.route).toMatchObject({ status: 'degraded', reason: expect.stringMatching(/local listener/u) });
@@ -820,7 +840,7 @@ describe('status', () => {
     let live = MANIFEST;
     const observers: Partial<StatusObservers> = {
       ...healthyObservers(state),
-      schema: (root) => (root === reservation.checkout_realpath ? live : MANIFEST),
+      schema: (root) => (root === stateOf(reservation) ? live : MANIFEST),
     };
     const observe = async (manifest: SnapshotManifest): Promise<StatusShape> => {
       live = manifest;
@@ -870,7 +890,7 @@ describe('status', () => {
         const manifest = JSON.parse(await readFile(path.join(root, 'release-manifest.json'), 'utf8')) as object;
         await writePrivate(path.join(root, 'release-manifest.json'), {
           ...manifest,
-          instance_id: allocateInstanceId(),
+          instance_id: randomUUID(),
         });
       }
 
@@ -927,23 +947,18 @@ describe('status', () => {
     );
   });
 
-  it('names what finishes an update mid-switch for a live checkout it moved, and a host never started as such', async () => {
+  it('names a host never started as such, and reads a started one with no release live', async () => {
     const host = await machine();
-    const switching = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const fenced = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const unstarted = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
-    const target: ReleaseCoordinates = { ...releaseOf(switching), deployed_commit: 'c'.repeat(40) };
-    await updateUnfinishedAt(host.paths, switching, target, 'swapping');
-    // Between the swap's renames: the live checkout is kept in previous/, and the staged one is not yet in its place.
-    const previous = host.paths.releaseCheckoutRoot(switching.instance_id, 'previous');
-    await mkdir(path.dirname(previous), { recursive: true, mode: 0o700 });
-    await rename(switching.checkout_realpath, previous);
+    // A switch has removed the live link; the runtime record stays in the assistant's state.
+    await rm(liveOf(fenced));
     // The other's host never started, so it has no runtime record.
-    await rm(instanceRuntimeFile(unstarted.checkout_realpath));
-    const state = world(switching, unstarted);
-    const midSwitch = `The assistant is mid-switch; gws-ea update --id ${switching.instance_id} finishes it.`;
+    await rm(instanceRuntimeFile(stateOf(unstarted)));
+    const state = world(fenced, unstarted);
     const neverStarted = 'The assistant has no runtime record: its host has never been started.';
 
-    const switchingStatus = (await statusJson(host, state, switching.instance_id)).status;
+    const fencedStatus = (await statusJson(host, state, fenced.instance_id)).status;
     const unstartedStatus = (await statusJson(host, state, unstarted.instance_id)).status;
     const listed = command(host, state);
     expect(await runListCommand(listed.runtime, { json: true })).toBe(0);
@@ -951,10 +966,10 @@ describe('status', () => {
       assistants: Array<{ instance_id: string; service: unknown }>;
     };
 
-    expect(switchingStatus.probes.service).toEqual({ status: 'unknown', reason: midSwitch, state: 'unknown' });
+    expect(fencedStatus.probes.service).toMatchObject({ state: 'running' });
     expect(unstartedStatus.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
     expect(Object.fromEntries(listing.assistants.map(({ instance_id, service }) => [instance_id, service]))).toEqual({
-      [switching.instance_id]: { state: 'unknown', reason: midSwitch },
+      [fenced.instance_id]: { state: 'running', reason: null },
       [unstarted.instance_id]: { state: 'unknown', reason: neverStarted },
     });
   });
@@ -963,7 +978,7 @@ describe('status', () => {
     const host = await machine();
     const state = world();
     const { runtime, output } = command(host, state);
-    const unknown = allocateInstanceId();
+    const unknown = randomUUID();
 
     expect(await runStatusCommand(runtime, { instanceId: unknown, json: true })).toBe(1);
     expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false })).toBe(1);
@@ -1217,8 +1232,8 @@ describe('read-only commands', () => {
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     await bound(host.paths, alpha.instance_id);
-    hostDatabases(alpha.checkout_realpath, ['initial-v2-schema', 'host-coordination']);
-    await sessionMailbox(alpha.checkout_realpath);
+    hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
+    await sessionMailbox(stateOf(alpha));
     const previous = host.paths.releaseCheckoutRoot(alpha.instance_id, 'previous');
     await keepPrevious(host.paths, alpha, 'e'.repeat(40));
     hostDatabases(previous, ['initial-v2-schema']);
@@ -1236,11 +1251,11 @@ describe('read-only commands', () => {
     };
     // Stale stat entries make an ordinary `git status` rewrite each index; a read-only one must not.
     const later = new Date(Date.now() + 60_000);
-    for (const repository of [alpha.checkout_realpath, host.tool]) {
+    for (const repository of [liveOf(alpha), host.tool]) {
       await utimes(path.join(repository, 'release.txt'), later, later);
     }
     const before = await snapshot(host.root);
-    expect([...before.keys()]).not.toContain(path.relative(host.root, `${alpha.checkout_realpath}/data/v2.db-wal`));
+    expect([...before.keys()]).not.toContain(path.relative(host.root, `${stateOf(alpha)}/data/v2.db-wal`));
 
     const outputs: Output[] = [];
     for (const json of [true, false]) {

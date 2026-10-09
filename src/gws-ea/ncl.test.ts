@@ -23,11 +23,12 @@ async function instanceWithNcl(script: string): Promise<InstanceRuntimeConfig> {
   await writeFile(path.join(checkout, 'bin', 'ncl'), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   const project = `gws-ea-${INSTANCE_ID.replaceAll('-', '')}`.slice(0, 30);
   return {
-    schema_version: 1,
+    schema_version: 2,
     instance_id: INSTANCE_ID,
     install_id: INSTANCE_ID.replaceAll('-', ''),
-    deployed_commit: 'a'.repeat(40),
-    checkout_realpath: checkout,
+    instance_root: root,
+    checkout_root: checkout,
+    state_root: path.join(root, 'state'),
     node_path: '/usr/bin/node',
     home_directory: root,
     allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },

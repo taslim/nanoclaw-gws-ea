@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,7 +34,7 @@ import {
   type ProvisionSteps,
 } from './phases.js';
 import type { SanitizedCommandOutcome } from './process.js';
-import { allocateInstanceId } from './registry.js';
+
 import { PROVISION_STEPS } from './types.js';
 
 const roots: string[] = [];
@@ -401,12 +402,11 @@ async function harness(): Promise<Harness> {
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const projectId = deriveGcpProjectId(instanceId);
   const serviceAccountEmail = deriveGchatServiceAccountEmail(projectId);
   await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -671,7 +671,7 @@ describe('Google Cloud setup through the step engine', () => {
   it('refuses, by name, a project whose creation reports it already exists under other labels', async () => {
     const setup = await harness();
     setup.cloud.ready().hiddenProjectReads = 1;
-    setup.cloud.project!.labels = { 'gws-ea-instance': allocateInstanceId(), 'gws-ea-managed': 'true' };
+    setup.cloud.project!.labels = { 'gws-ea-instance': randomUUID(), 'gws-ea-managed': 'true' };
 
     const failure = await setup.run().catch((error: unknown) => error);
 
@@ -1041,7 +1041,7 @@ describe('Google Cloud setup through the step engine', () => {
 describe('Google Cloud project removal', () => {
   async function removal(): Promise<{ cloud: FakeGoogleCloud; coordinates: GcpProjectCoordinates }> {
     const root = await tempRoot();
-    const instanceId = allocateInstanceId();
+    const instanceId = randomUUID();
     const projectId = deriveGcpProjectId(instanceId);
     const coordinates = { instanceId, projectId, account: ACCOUNT, cwd: root };
     const cloud = new FakeGoogleCloud({
@@ -1119,7 +1119,7 @@ describe('Google Cloud project removal', () => {
 
   it('refuses project deletion when the instance ownership label differs', async () => {
     const { cloud, coordinates } = await removal();
-    cloud.ready().project!.labels['gws-ea-instance'] = allocateInstanceId();
+    cloud.ready().project!.labels['gws-ea-instance'] = randomUUID();
 
     await expect(
       deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),

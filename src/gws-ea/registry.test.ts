@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -12,11 +13,11 @@ import {
   recordStepStarted,
   reserveInstance,
 } from './journal.js';
-import { advanceOperation, beginOperation, liveCheckoutCommits } from './operation.js';
 import {
   allocateInstanceId,
-  assertCheckoutConsistent,
   assertRegistryMarkerAgreement,
+  assertStateConsistent,
+  getInstanceReservation,
   readRegistry,
   swapInstanceRelease,
   withLockedCloudflareRegistry,
@@ -42,10 +43,9 @@ async function testPaths(): Promise<ControlPlanePaths> {
   });
 }
 
-function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()): InstanceReservationInput {
+function reservation(instanceId: string = randomUUID()): InstanceReservationInput {
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -68,8 +68,8 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
   };
 }
 
-function managedReservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()): InstanceReservationInput {
-  const input = reservation(paths, instanceId);
+function managedReservation(instanceId: string = randomUUID()): InstanceReservationInput {
+  const input = reservation(instanceId);
   return {
     ...input,
     exclusive_resource_claims: {
@@ -87,8 +87,8 @@ function managedReservation(paths: ControlPlanePaths, instanceId = allocateInsta
   };
 }
 
-function distinctManagedReservation(paths: ControlPlanePaths): InstanceReservationInput {
-  const input = managedReservation(paths);
+function distinctManagedReservation(): InstanceReservationInput {
+  const input = managedReservation();
   input.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
   input.exclusive_resource_claims.gcp_project_id = 'second-project';
   input.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
@@ -221,8 +221,8 @@ describe('machine registry', () => {
         process.exitCode = 2;
       }
     `;
-    const first = reservation(paths);
-    const second = { ...reservation(paths), allocated_ports: { ...first.allocated_ports } };
+    const first = reservation();
+    const second = { ...reservation(), allocated_ports: { ...first.allocated_ports } };
     const readyFiles = [path.join(path.dirname(barrier), 'ready-1'), path.join(path.dirname(barrier), 'ready-2')];
     const children = [first, second].map((input, index) =>
       spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childScript], {
@@ -252,7 +252,7 @@ describe('machine registry', () => {
 
   it('survives reopen without changing immutable coordinates or claims', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
 
     const reopened = await readRegistry(
@@ -268,7 +268,7 @@ describe('machine registry', () => {
 
   it('records one shared Cloudflare owner for managed reservations', async () => {
     const paths = await testPaths();
-    const input = managedReservation(paths);
+    const input = managedReservation();
     await reserveInstance(paths, input);
 
     const registry = await readRegistry(paths);
@@ -282,7 +282,7 @@ describe('machine registry', () => {
 
   it('records and reads back a tunnel whose ID is a version 7 UUID', async () => {
     const paths = await testPaths();
-    await reserveInstance(paths, managedReservation(paths));
+    await reserveInstance(paths, managedReservation());
     const v7 = '01922b7e-8c3a-7d4e-9f12-3456789abcde';
 
     await withLockedCloudflareRegistry(paths, (locked) => locked.updateCoordinates({ tunnelId: v7 }));
@@ -349,8 +349,8 @@ describe('machine registry', () => {
     ],
   ] as const)('refuses a competing %s claim without changing its owner', async (_claim, collide) => {
     const paths = await testPaths();
-    const first = managedReservation(paths);
-    const second = distinctManagedReservation(paths);
+    const first = managedReservation();
+    const second = distinctManagedReservation();
     collide(first, second);
     await reserveInstance(paths, first);
     const before = await readFile(paths.registryFile);
@@ -363,8 +363,8 @@ describe('machine registry', () => {
 
   it('refuses an existing callback URL claimed by another instance', async () => {
     const paths = await testPaths();
-    const first = reservation(paths);
-    const second = reservation(paths);
+    const first = reservation();
+    const second = reservation();
     second.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
     second.exclusive_resource_claims.gcp_project_id = 'second-project';
     second.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
@@ -377,22 +377,19 @@ describe('machine registry', () => {
 
   it('keeps derived checkout and Chat identities tied to the instance and project', async () => {
     const paths = await testPaths();
-    const first = managedReservation(paths);
-    const second = distinctManagedReservation(paths);
+    const first = managedReservation();
+    const second = distinctManagedReservation();
     await reserveInstance(paths, first);
     await reserveInstance(paths, second);
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id, second.instance_id]);
-    expect(first.checkout_realpath).not.toBe(second.checkout_realpath);
+    expect(paths.instanceRoot(first.instance_id)).toBe(path.join(paths.stateRoot, first.instance_id.slice(0, 8)));
+    expect(paths.instanceRoot(first.instance_id)).not.toBe(paths.instanceRoot(second.instance_id));
     expect(first.exclusive_resource_claims.gchat_service_account).not.toBe(
       second.exclusive_resource_claims.gchat_service_account,
     );
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.account_id).toBe('a'.repeat(32));
 
-    const invalidCheckout = distinctManagedReservation(paths);
-    invalidCheckout.checkout_realpath = first.checkout_realpath;
-    await expect(reserveInstance(paths, invalidCheckout)).rejects.toMatchObject({ code: 'unsafe_path' });
-
-    const invalidChatIdentity = distinctManagedReservation(paths);
+    const invalidChatIdentity = distinctManagedReservation();
     invalidChatIdentity.exclusive_resource_claims.gchat_service_account =
       first.exclusive_resource_claims.gchat_service_account;
     await expect(reserveInstance(paths, invalidChatIdentity)).rejects.toMatchObject({ code: 'invalid_claim' });
@@ -401,10 +398,10 @@ describe('machine registry', () => {
 
   it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
     const paths = await testPaths();
-    const first = managedReservation(paths);
+    const first = managedReservation();
     await reserveInstance(paths, first);
 
-    const duplicate = managedReservation(paths);
+    const duplicate = managedReservation();
     duplicate.allocated_ports.nanoclaw_webhook += 100;
     duplicate.allocated_ports.onecli_app += 100;
     duplicate.allocated_ports.onecli_gateway += 100;
@@ -413,7 +410,7 @@ describe('machine registry', () => {
     duplicate.exclusive_resource_claims.workspace_email = 'second@example.test';
     await expect(reserveInstance(paths, duplicate)).rejects.toMatchObject({ code: 'claim_conflict' });
 
-    const crossAccount = managedReservation(paths);
+    const crossAccount = managedReservation();
     crossAccount.allocated_ports.nanoclaw_webhook += 200;
     crossAccount.allocated_ports.onecli_app += 200;
     crossAccount.allocated_ports.onecli_gateway += 200;
@@ -437,7 +434,7 @@ describe('machine registry', () => {
 
   it('rejects inconsistent managed callbacks and a tunnel name that does not match its ownership ID', async () => {
     const paths = await testPaths();
-    const invalid = managedReservation(paths);
+    const invalid = managedReservation();
     if (invalid.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
       throw new Error('managed reservation fixture is invalid');
     }
@@ -447,7 +444,7 @@ describe('machine registry', () => {
     };
     await expect(reserveInstance(paths, invalid)).rejects.toMatchObject({ code: 'invalid_claim' });
 
-    const nestedHostname = managedReservation(paths);
+    const nestedHostname = managedReservation();
     if (nestedHostname.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
       throw new Error('managed reservation fixture is invalid');
     }
@@ -466,7 +463,7 @@ describe('machine registry', () => {
         instances: {},
         shared_infrastructure_metadata: {
           cloudflare: {
-            ownership_id: allocateInstanceId(),
+            ownership_id: randomUUID(),
             account_id: 'a'.repeat(32),
             tunnel_name: 'gws-ea-owner',
             tunnel_id: null,
@@ -483,7 +480,7 @@ describe('machine registry', () => {
 
   it('loads a registry record with unknown fields and keeps its claims exact', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     const stored = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
       instances: Record<string, Record<string, unknown> & { exclusive_resource_claims: Record<string, unknown> }>;
@@ -507,7 +504,7 @@ describe('machine registry', () => {
 
     expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
     await expect(
-      reserveInstance(paths, { ...reservation(paths), allocated_ports: input.allocated_ports }),
+      reserveInstance(paths, { ...reservation(), allocated_ports: input.allocated_ports }),
     ).rejects.toMatchObject({
       code: 'claim_conflict',
     });
@@ -521,7 +518,7 @@ describe('machine registry', () => {
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
     await writeFile(paths.registryFile, contents, { mode: 0o600 });
 
-    await expect(reserveInstance(paths, reservation(paths))).rejects.toThrow();
+    await expect(reserveInstance(paths, reservation())).rejects.toThrow();
     expect(await readFile(paths.registryFile, 'utf8')).toBe(contents);
   });
 
@@ -549,50 +546,163 @@ describe('machine registry', () => {
 
   it('fails closed when an immutable marker disagrees with the registry', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
     await writeFile(
       paths.markerFile(input.instance_id),
-      JSON.stringify({ schema_version: 1, instance_id: allocateInstanceId(), deployed_commit: input.deployed_commit }),
-      { mode: 0o600 },
+      JSON.stringify({ schema_version: 1, instance_id: randomUUID() }),
+      {
+        mode: 0o600,
+      },
     );
 
     await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toThrow(/marker.*mismatch/i);
   });
 
-  it('writes and verifies a minimal immutable marker', async () => {
+  it("writes a minimal marker into the assistant's own physical state, naming no release", async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
-    await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
     await writeInstanceMarker(paths, input.instance_id);
 
     await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).resolves.toEqual(input);
+    const state = paths.instanceLayout(input.instance_id).state;
+    expect(paths.markerFile(input.instance_id)).toBe(path.join(state, 'data', 'gws-ea', 'instance.json'));
     expect(JSON.parse(await readFile(paths.markerFile(input.instance_id), 'utf8'))).toEqual({
       schema_version: 1,
       instance_id: input.instance_id,
-      deployed_commit: input.deployed_commit,
     });
     expect((await stat(paths.markerFile(input.instance_id))).mode & 0o777).toBe(0o600);
+    expect((await stat(state)).mode & 0o777).toBe(0o700);
   });
 
-  it('fails closed when the marker commit disagrees with the registry', async () => {
+  it('reads a marker the layout before releases wrote, whose release it no longer trusts', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
     await writeFile(
       paths.markerFile(input.instance_id),
+      JSON.stringify({ schema_version: 1, instance_id: input.instance_id, deployed_commit: 'b'.repeat(40) }),
+      { mode: 0o600 },
+    );
+
+    await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).resolves.toEqual(input);
+  });
+
+  it('refuses a marker reached through a link, as it does a state root that is one', async () => {
+    const paths = await testPaths();
+    const input = reservation();
+    await reserveInstance(paths, input);
+    const elsewhere = path.join(path.dirname(paths.stateRoot), 'elsewhere');
+    await mkdir(path.join(elsewhere, 'data', 'gws-ea'), { recursive: true, mode: 0o700 });
+    await writeFile(
+      path.join(elsewhere, 'data', 'gws-ea', 'instance.json'),
+      JSON.stringify({ schema_version: 1, instance_id: input.instance_id }),
+      { mode: 0o600 },
+    );
+    await mkdir(paths.instanceRoot(input.instance_id), { recursive: true, mode: 0o700 });
+    const state = paths.instanceLayout(input.instance_id).state;
+    await symlink(elsewhere, state);
+
+    await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toMatchObject({
+      code: 'unsafe_path',
+    });
+    await rm(state);
+    await mkdir(path.join(state, 'data'), { recursive: true, mode: 0o700 });
+    await symlink(path.join(elsewhere, 'data', 'gws-ea'), path.join(state, 'data', 'gws-ea'));
+    await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toMatchObject({
+      code: 'unsafe_path',
+    });
+  });
+});
+
+describe('instance roots', () => {
+  it("refuses an assistant whose ID begins with another's first eight hex digits, as it would share its root", async () => {
+    const paths = await testPaths();
+    const first = reservation();
+    await reserveInstance(paths, first);
+    const id = `${first.instance_id.slice(0, 8)}${randomUUID().slice(8)}`;
+    const sharingRoot: InstanceReservationInput = {
+      ...reservation(id),
+      allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
+      exclusive_resource_claims: {
+        ingress: { mode: 'existing', endpoint_url: 'https://second.example.test/webhook/gchat' },
+        gcp_project_id: 'second-project',
+        gcp_account: 'operator@example.test',
+        gchat_service_account: 'gws-ea-chat@second-project.iam.gserviceaccount.com',
+        workspace_email: 'second@example.test',
+        onecli_project: `gws-ea-${id.replaceAll('-', '')}`,
+      },
+    };
+
+    await expect(reserveInstance(paths, sharingRoot)).rejects.toMatchObject({ code: 'claim_conflict' });
+    // With any other ID, the same claims are free.
+    await expect(reserveInstance(paths, { ...sharingRoot, instance_id: randomUUID() })).resolves.toBeDefined();
+  });
+
+  it("draws the ID again while its first eight hex digits name a registered assistant's root, or anything there", async () => {
+    const paths = await testPaths();
+    const registered = reservation();
+    await reserveInstance(paths, registered);
+    const unconverted = { ...distinctManagedReservation(), checkout_realpath: '/old/layout/nanoclaw' };
+    await reserveInstance(paths, unconverted);
+    // An unconverted assistant still lives under instances/<id>: nothing is at its short root yet.
+    await rm(paths.instanceRoot(unconverted.instance_id), { recursive: true });
+    const occupied = randomUUID();
+    await mkdir(paths.instanceRoot(occupied), { recursive: true, mode: 0o700 });
+    const clash = (id: string): string => `${id.slice(0, 8)}${randomUUID().slice(8)}`;
+    const free = randomUUID();
+    const drawn = [clash(registered.instance_id), clash(unconverted.instance_id), clash(occupied), free];
+    const generate = vi.fn(() => drawn.shift()!);
+
+    await expect(allocateInstanceId(paths, generate)).resolves.toBe(free);
+    expect(generate).toHaveBeenCalledTimes(4);
+  });
+
+  it('parses a registry entry an assistant before releases left, and never writes its checkout path for a new one', async () => {
+    const paths = await testPaths();
+    const created = reservation();
+    await reserveInstance(paths, created);
+    const legacy = distinctManagedReservation();
+    const stored = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    } & Record<string, unknown>;
+    expect(stored.instances[created.instance_id]).not.toHaveProperty('checkout_realpath');
+    const legacyCheckout = path.join(paths.stateRoot, 'instances', legacy.instance_id, 'nanoclaw');
+    await writeFile(
+      paths.registryFile,
       JSON.stringify({
-        schema_version: 1,
-        instance_id: input.instance_id,
-        deployed_commit: 'b'.repeat(40),
+        ...stored,
+        instances: { ...stored.instances, [legacy.instance_id]: { ...legacy, checkout_realpath: legacyCheckout } },
+        shared_infrastructure_metadata: {
+          cloudflare: {
+            ownership_id: legacy.instance_id,
+            account_id: 'a'.repeat(32),
+            tunnel_name: `gws-ea-${legacy.instance_id.replaceAll('-', '')}`,
+            tunnel_id: null,
+          },
+        },
       }),
       { mode: 0o600 },
     );
 
-    await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toThrow(/marker.*mismatch/i);
+    expect(await getInstanceReservation(paths, legacy.instance_id)).toEqual({
+      ...legacy,
+      checkout_realpath: legacyCheckout,
+    });
+    expect(await getInstanceReservation(paths, created.instance_id)).toEqual(created);
+    // A rewrite keeps the entry unconverted until the conversion drops the field; it adds the field to no other.
+    await swapInstanceRelease(paths, created.instance_id, releaseOf(created), {
+      ...releaseOf(created),
+      deployed_commit: 'c'.repeat(40),
+    });
+    const rewritten = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    expect(rewritten.instances[created.instance_id]).not.toHaveProperty('checkout_realpath');
+    expect(rewritten.instances[legacy.instance_id]).toMatchObject({ checkout_realpath: legacyCheckout });
   });
 });
 
@@ -603,19 +713,10 @@ describe('release compare-and-swap and live checkout agreement', () => {
     deployed_commit: 'b'.repeat(40),
   };
 
-  async function markerAt(paths: ControlPlanePaths, instanceId: string, commit: string, id = instanceId) {
-    await mkdir(path.dirname(paths.markerFile(instanceId)), { recursive: true, mode: 0o700 });
-    await writeFile(
-      paths.markerFile(instanceId),
-      JSON.stringify({ schema_version: 1, instance_id: id, deployed_commit: commit }),
-      { mode: 0o600 },
-    );
-  }
-
   it('moves only the release fields, from the release it expects, leaving every claim and peer as it was', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
-    const peer = distinctManagedReservation(paths);
+    const input = reservation();
+    const peer = distinctManagedReservation();
     await reserveInstance(paths, input);
     await reserveInstance(paths, peer);
     const before = await readRegistry(paths);
@@ -632,7 +733,7 @@ describe('release compare-and-swap and live checkout agreement', () => {
 
   it('refuses when the recorded release is not the one expected, or the instance is unknown', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     const before = await readFile(paths.registryFile, 'utf8');
 
@@ -642,7 +743,7 @@ describe('release compare-and-swap and live checkout agreement', () => {
     await expect(
       swapInstanceRelease(paths, input.instance_id, releaseOf(input), { ...target, release_track: 'Not A Track' }),
     ).rejects.toMatchObject({ code: 'invalid_state' });
-    await expect(swapInstanceRelease(paths, allocateInstanceId(), releaseOf(input), target)).rejects.toMatchObject({
+    await expect(swapInstanceRelease(paths, randomUUID(), releaseOf(input), target)).rejects.toMatchObject({
       code: 'unknown_instance',
     });
     expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
@@ -654,7 +755,7 @@ describe('release compare-and-swap and live checkout agreement', () => {
     ['source', { source_remote: 'https://example.test/fork.git' }],
   ])('refuses a swap from a release that differs from the recorded one only in its %s', async (_field, change) => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     const before = await readFile(paths.registryFile, 'utf8');
 
@@ -666,8 +767,8 @@ describe('release compare-and-swap and live checkout agreement', () => {
 
   it("commits two assistants' concurrent swaps, neither overwriting the other's", async () => {
     const paths = await testPaths();
-    const first = reservation(paths);
-    const second = distinctManagedReservation(paths);
+    const first = reservation();
+    const second = distinctManagedReservation();
     await reserveInstance(paths, first);
     await reserveInstance(paths, second);
 
@@ -681,43 +782,30 @@ describe('release compare-and-swap and live checkout agreement', () => {
     expect(after.instances[second.instance_id]).toEqual({ ...second, ...target });
   });
 
-  it('accepts the live marker at the commits an unfinished operation allows, and any commit only when told to', async () => {
+  it('finds a missing state consistent, and a present one only with its own marker', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
-    const reserved = await readRegistry(paths).then((registry) => registry.instances[input.instance_id]!);
-    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
-    if (!operation) throw new Error('The test instance operation was busy');
-    try {
-      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
-      await markerAt(paths, input.instance_id, target.deployed_commit);
-      const stopped = await advanceOperation(operation, 'stopped', {
-        stop: { at: '2026-09-28T10:00:00.000Z', graceful: true },
-      });
-      await expect(
-        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, stopped)),
-      ).rejects.toMatchObject({ code: 'marker_mismatch' });
+    const reserved = await getInstanceReservation(paths, input.instance_id);
 
-      await advanceOperation(operation, 'swapping');
-      const swapped = await advanceOperation(operation, 'swapped');
-      await expect(
-        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, swapped)),
-      ).resolves.toBeUndefined();
-      await expect(assertCheckoutConsistent(paths, reserved)).rejects.toMatchObject({ code: 'marker_mismatch' });
-      await expect(assertCheckoutConsistent(paths, reserved, null)).resolves.toBeUndefined();
-
-      await markerAt(paths, input.instance_id, target.deployed_commit, allocateInstanceId());
-      await expect(assertCheckoutConsistent(paths, reserved, null)).rejects.toMatchObject({ code: 'marker_mismatch' });
-    } finally {
-      operation.release();
-    }
+    await expect(assertStateConsistent(paths, reserved)).resolves.toBeUndefined();
+    await writeInstanceMarker(paths, input.instance_id);
+    await expect(assertStateConsistent(paths, reserved)).resolves.toBeUndefined();
+    await writeFile(
+      paths.markerFile(input.instance_id),
+      JSON.stringify({ schema_version: 1, instance_id: randomUUID() }),
+      {
+        mode: 0o600,
+      },
+    );
+    await expect(assertStateConsistent(paths, reserved)).rejects.toMatchObject({ code: 'marker_mismatch' });
   });
 });
 
 describe('create recovery contract', () => {
   it('checks Google sign-in on every resume, even after GCP setup is complete', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     const operation = await acquireInstanceOperation(paths, input.instance_id);
     if (!operation) throw new Error('Test instance operation could not be acquired');
@@ -750,7 +838,7 @@ describe('create recovery contract', () => {
 
   it('does not advance a GCP resume when the reserved Google account needs sign-in', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await reserveInstance(paths, input);
     const errors: string[] = [];
     const advanceProvision = vi.fn();
@@ -1027,7 +1115,7 @@ describe('create recovery contract', () => {
 
   it('stops a real create claim conflict before provisioning the second assistant', async () => {
     const paths = await testPaths();
-    const owner = reservation(paths);
+    const owner = reservation();
     await reserveInstance(paths, owner);
     const before = await readFile(paths.registryFile);
     const advanceProvision = vi.fn();

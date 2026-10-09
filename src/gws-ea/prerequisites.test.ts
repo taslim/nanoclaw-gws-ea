@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -163,7 +163,6 @@ const PATHS = {
   configRoot: '/Users/operator/.config/gws-ea',
   stateRoot: '/Users/operator/.local/share/gws-ea',
   logsRoot: '/Users/operator/.local/share/gws-ea/logs',
-  instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
 } as const;
 const CREATE: PrerequisiteRequest = { command: 'create', paths: PATHS };
 
@@ -174,7 +173,6 @@ function rootsUnder(home: string) {
     configRoot: path.join(home, '.config', 'gws-ea'),
     stateRoot,
     logsRoot: path.join(stateRoot, 'logs'),
-    instancesRoot: path.join(stateRoot, 'instances'),
   };
 }
 
@@ -492,4 +490,90 @@ describe('Docker endpoint', () => {
       details: { exitCode: 1, stderrTail: expect.stringContaining('context not found') },
     });
   });
+});
+
+describe('the state root create accepts', () => {
+  /** What NanoClaw binds under a state root, longest first: `<root>/<instance>/<release>/data/ncl.sock`. */
+  const SOCKET_TAIL = '/12345678/12345678/data/ncl.sock';
+
+  /** A state root that does not exist yet, whose socket would be `bytes` long: nothing on its way is a link. */
+  function stateRootOf(bytes: number): string {
+    const base = '/gws-ea-socket-test';
+    return path.join(base, 'r'.repeat(bytes - SOCKET_TAIL.length - base.length - 1));
+  }
+
+  function create(stateRoot: string): PrerequisiteRequest {
+    return { command: 'create', paths: { ...PATHS, stateRoot, logsRoot: path.join(stateRoot, 'logs') } };
+  }
+
+  it.each([
+    ['macOS', 'darwin', 103],
+    ['Linux', 'linux', 107],
+  ] as const)(
+    'refuses on %s a state root whose NanoClaw socket would be one byte too long, naming GWS_EA_STATE_ROOT, before running anything',
+    async (system, platform, limit) => {
+      const host = fakeHost('unix:///var/run/docker.sock');
+      const stateRoot = stateRootOf(limit + 1);
+
+      await expect(
+        checkPrerequisites(create(stateRoot), operator(host), dependencies(host, { platform })),
+      ).rejects.toMatchObject({
+        code: 'state_root_too_long',
+        message: expect.stringMatching(
+          new RegExp(`${limit + 1} bytes, and ${system} allows ${limit}.*GWS_EA_STATE_ROOT`, 'u'),
+        ),
+        details: { stateRoot, socket: `${stateRoot}${SOCKET_TAIL}`, bytes: limit + 1, limit },
+      });
+      expect(host.commands).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['darwin', 103],
+    ['linux', 107],
+  ] as const)('accepts on %s a state root whose socket is exactly as long as allowed', async (platform, limit) => {
+    const daemon = await dockerDaemon();
+    const host = fakeHost(daemon.host);
+
+    await expect(
+      checkPrerequisites(create(stateRootOf(limit)), operator(host), dependencies(host, { platform })),
+    ).resolves.toMatchObject({ dockerEndpoint: daemon.host });
+  });
+
+  it('measures the state root as the kernel sees it, every link on its way resolved', async () => {
+    // Under /tmp: the platform's temporary directory is itself too deep for a socket on macOS.
+    const directory = await realpath(await mkdtemp(path.join('/tmp', 'gws-ea-socket-')));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    // The written root reaches a deeper folder through a link; resolved, its socket is one byte too long.
+    const deeper = path.join(directory, 'd'.repeat(104 - SOCKET_TAIL.length - directory.length - 1 - '/state'.length));
+    await mkdir(deeper);
+    await symlink(deeper, path.join(directory, 'link'));
+    const written = path.join(directory, 'link', 'state');
+    const host = fakeHost('unix:///var/run/docker.sock');
+
+    expect(Buffer.byteLength(`${written}${SOCKET_TAIL}`)).toBeLessThanOrEqual(103);
+    await expect(
+      checkPrerequisites(create(written), operator(host), dependencies(host, { platform: 'darwin' })),
+    ).rejects.toMatchObject({
+      code: 'state_root_too_long',
+      details: { socket: path.join(deeper, 'state', SOCKET_TAIL), bytes: 104 },
+    });
+  });
+
+  it.runIf(process.platform === 'darwin' && os.tmpdir().startsWith('/var/'))(
+    'counts a state root under /var as the /private/var it is on macOS',
+    async () => {
+      // As written, its socket fits by one byte to spare; under /private/var it is eight bytes longer.
+      const written = path.join(os.tmpdir(), 'v'.repeat(102 - SOCKET_TAIL.length - os.tmpdir().length - 1));
+      const host = fakeHost('unix:///var/run/docker.sock');
+
+      expect(Buffer.byteLength(`${written}${SOCKET_TAIL}`)).toBe(102);
+      await expect(
+        checkPrerequisites(create(written), operator(host), dependencies(host, { platform: 'darwin' })),
+      ).rejects.toMatchObject({
+        code: 'state_root_too_long',
+        details: { socket: `/private${written}${SOCKET_TAIL}`, bytes: 110 },
+      });
+    },
+  );
 });

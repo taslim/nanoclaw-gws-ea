@@ -54,14 +54,7 @@ import {
   type MovedImage,
   type OperationFollowUp,
 } from './operation.js';
-import {
-  instanceMarkerFile,
-  instanceRuntimeFile,
-  isRegularFile,
-  isWithinDirectory,
-  type ControlPlanePaths,
-  type ReleaseSlot,
-} from './paths.js';
+import { instanceMarkerFile, isWithinDirectory, type ControlPlanePaths, type ReleaseSlot } from './paths.js';
 import type { Observation } from './phases.js';
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
@@ -70,7 +63,7 @@ import { redact, safeErrorMessage } from './redact.js';
 import { getInstanceReservation, readInstanceMarkerFile } from './registry.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
 import {
-  validateRuntimeConfig,
+  loadInstanceRuntimeConfig,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
@@ -645,13 +638,34 @@ interface SwapLayout {
   readonly superseded: boolean;
 }
 
+/** The receipt the swap keeps for its live checkout. Deleted with the swap (U11). */
+export function swapLiveReceipt(paths: ControlPlanePaths, instanceId: string): string {
+  return path.join(paths.instanceRoot(instanceId), 'release-preflight.json');
+}
+
+/** The receipt the swap keeps beside a release slot. Deleted with the swap (U11). */
+export function swapSlotReceipt(paths: ControlPlanePaths, instanceId: string, slot: ReleaseSlot): string {
+  return path.join(paths.releaseRoot(instanceId, slot), 'release-preflight.json');
+}
+
+/** The commit the swap's marker in `checkout` names, which only the swap still writes. Deleted with the swap (U11). */
+export async function swapMarkerCommit(checkout: string): Promise<string> {
+  const file = instanceMarkerFile(checkout);
+  await readInstanceMarkerFile(file);
+  const marker = await readOwnerOnlyJson(file, 'Instance marker', 'invalid_marker');
+  if (!isRecord(marker) || typeof marker.deployed_commit !== 'string') {
+    throw new GwsEaError('invalid_marker', `${file} names no release.`);
+  }
+  return marker.deployed_commit;
+}
+
 function swapPlaces(paths: ControlPlanePaths, instanceId: string): SwapPlaces {
   return {
     live: paths.checkoutRoot(instanceId),
-    liveReceipt: paths.releasePreflightFile(instanceId),
+    liveReceipt: swapLiveReceipt(paths, instanceId),
     next: paths.releaseRoot(instanceId, 'next'),
     staged: paths.releaseCheckoutRoot(instanceId, 'next'),
-    stagedReceipt: paths.releasePreflightFile(instanceId, 'next'),
+    stagedReceipt: swapSlotReceipt(paths, instanceId, 'next'),
     kept: stagedKeptFilesRoot(paths, instanceId),
     previous: paths.releaseRoot(instanceId, 'previous'),
     previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
@@ -676,7 +690,7 @@ async function markerCommit(checkout: string, instanceId: string): Promise<strin
     throw error;
   }
   if (marker.instance_id !== instanceId) throw layoutFault(`${checkout} belongs to another assistant.`);
-  return marker.deployed_commit;
+  return swapMarkerCommit(checkout);
 }
 
 /** The commit a release receipt names, or undefined when there is none. */
@@ -961,7 +975,7 @@ function rollbackPlaces(paths: ControlPlanePaths, instanceId: string): RollbackP
   const previous = paths.releaseRoot(instanceId, 'previous');
   return {
     live: paths.checkoutRoot(instanceId),
-    liveReceipt: paths.releasePreflightFile(instanceId),
+    liveReceipt: swapLiveReceipt(paths, instanceId),
     previous,
     previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
     previousReceipt: keptReleaseFiles(previous).receipt,
@@ -1205,33 +1219,16 @@ export interface CutoverHost {
   readonly uid: number | undefined;
 }
 
-/** Where a cutover may find a runtime record: the live checkout, then the releases kept, staged, and left. */
-const RUNTIME_SLOTS = ['previous', 'next', 'outgoing'] as const satisfies readonly ReleaseSlot[];
-
-/**
- * The runtime record of whichever of the assistant's releases holds one: the
- * live checkout's, or mid-swap a kept, staged, or outgoing release's. Only
- * the fields every release shares are used.
- */
+/** The assistant's one runtime record, read physically from its `state/`. */
 async function readCutoverRuntime(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
 ): Promise<InstanceRuntimeConfig> {
-  const id = reservation.instance_id;
-  const checkouts = [
-    reservation.checkout_realpath,
-    ...RUNTIME_SLOTS.map((slot) => paths.releaseCheckoutRoot(id, slot)),
-  ];
-  for (const checkout of checkouts) {
-    const file = instanceRuntimeFile(checkout);
-    if (!(await isRegularFile(file))) continue;
-    const runtime = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', 'invalid_runtime_config'));
-    if (runtime.instance_id === id && runtime.checkout_realpath === reservation.checkout_realpath) return runtime;
+  const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id));
+  if (runtime.instance_id !== reservation.instance_id) {
+    throw new GwsEaError('runtime_mismatch', "The assistant's runtime record belongs to another instance");
   }
-  throw new GwsEaError(
-    'runtime_missing',
-    `None of assistant ${id}'s releases holds its runtime record, so its update or rollback cannot go on.`,
-  );
+  return runtime;
 }
 
 /** Read what one cutover works from: the reservation, the runtime some release holds, and its service. */
@@ -1464,7 +1461,7 @@ function hostFailure(error: unknown, checkoutRoot: string): string {
 
 /** The listener ID of the host serving the live checkout, once it answers with Google Chat connected. */
 async function servingListener(host: CutoverHost, budgetMs: number, subject: string): Promise<string> {
-  const root = host.reservation.checkout_realpath;
+  const root = host.runtime.checkout_root;
   const port = host.reservation.allocated_ports.nanoclaw_webhook;
   let status: unknown;
   try {
@@ -1590,7 +1587,9 @@ export async function verifyServingRelease(host: CutoverHost, release: ServingRe
   if (!(await host.service.verifyHealth(budget))) {
     throw new GwsEaError('host_not_serving', `${subject}'s host service never became healthy.`);
   }
-  await observeLiveCheckout(release.view, [release.view.deployed_commit], { runCommand: host.run });
+  await observeLiveCheckout(host.operation.paths, release.view, [release.view.deployed_commit], {
+    runCommand: host.run,
+  });
   const listener = await servingListener(host, budget, subject);
   await assertListenerServes(host, listener, budget, subject);
   const onecli = cutoverOnecli(host);
@@ -1641,7 +1640,7 @@ async function rebuildGroupImage(
   dependencies: CutoverSeams,
 ): Promise<void> {
   const base = getInstallScopedNames(runtime.install_id).containerImageBase;
-  if (!readDerivedImageGroups(runtime.checkout_realpath, base).some((group) => group.id === agentGroupId)) return;
+  if (!readDerivedImageGroups(runtime.state_root, base).some((group) => group.id === agentGroupId)) return;
   const result = await (dependencies.ncl ?? runInstanceNclJson)(
     runtime,
     ['groups', 'restart', '--id', agentGroupId, '--rebuild'],

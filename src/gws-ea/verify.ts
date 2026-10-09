@@ -8,7 +8,7 @@ import { isErrno } from '../community-portal/errors.js';
 import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
-import type { InstanceRuntimeConfig } from './service.js';
+import { hostLogFiles, type InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
 import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
 
@@ -20,7 +20,8 @@ const ERROR_LOG_LINE_CHARACTERS = 300;
 const LOG_STAMP = /^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\] /u;
 
 export interface ConversationVerificationInput {
-  readonly checkoutRoot: string;
+  /** The assistant's physical `state/`, which holds NanoClaw's `data`. */
+  readonly stateRoot: string;
   readonly mainAgentGroupId: string;
   readonly messagingGroupId: string;
   readonly principalUserId: string;
@@ -85,7 +86,7 @@ interface PrincipalBindingRow {
 }
 
 export interface PrincipalBindingVerificationInput {
-  readonly runtime: Pick<InstanceRuntimeConfig, 'checkout_realpath' | 'instance_id'>;
+  readonly runtime: Pick<InstanceRuntimeConfig, 'state_root' | 'instance_id'>;
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
   readonly selectedMessagingGroupId?: string;
@@ -194,8 +195,8 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
       'Principal selection does not match the requested conversation',
     );
   }
-  const checkoutRoot = path.resolve(input.runtime.checkout_realpath);
-  const central = openReadonly(path.join(checkoutRoot, 'data', 'v2.db'));
+  const stateRoot = path.resolve(input.runtime.state_root);
+  const central = openReadonly(path.join(stateRoot, 'data', 'v2.db'));
   let row: PrincipalBindingRow | undefined;
   let sessionId: string | undefined;
   try {
@@ -249,7 +250,7 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
   if (!row || !sessionId) return { status: 'absent' };
   const welcomeEventId = principalWelcomeEventId(input.runtime, row.main_agent_group_id, candidate);
   const inbound = openReadonly(
-    path.join(checkoutRoot, 'data', 'v2-sessions', row.main_agent_group_id, sessionId, 'inbound.db'),
+    path.join(stateRoot, 'data', 'v2-sessions', row.main_agent_group_id, sessionId, 'inbound.db'),
   );
   try {
     const welcome = inbound
@@ -325,14 +326,14 @@ function isAuthenticatedPrincipalChatSdkMessage(content: string, principalUserId
  * principal turn need an assistant output marked delivered.
  */
 export function verifyTalkableConversation(input: ConversationVerificationInput): ConversationVerificationResult {
-  const checkoutRoot = path.resolve(input.checkoutRoot);
+  const stateRoot = path.resolve(input.stateRoot);
   const mainAgentGroupId = safeIdentifier(input.mainAgentGroupId, 'main agent group ID');
   const messagingGroupId = safeIdentifier(input.messagingGroupId, 'messaging group ID');
   const principalUserId = safeIdentifier(input.principalUserId, 'principal user ID');
   const adapterInstance = safeIdentifier(input.adapterInstance, 'adapter instance');
   const boundAt = timestamp(input.boundAt, 'binding timestamp');
   const welcomeEventId = safeIdentifier(input.welcomeEventId, 'welcome event ID');
-  const central = openReadonly(path.join(checkoutRoot, 'data', 'v2.db'));
+  const central = openReadonly(path.join(stateRoot, 'data', 'v2.db'));
 
   let sessionId: string;
   let platformId: string;
@@ -375,7 +376,7 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
     central.close();
   }
 
-  const mailboxRoot = path.join(checkoutRoot, 'data', 'v2-sessions', mainAgentGroupId, sessionId);
+  const mailboxRoot = path.join(stateRoot, 'data', 'v2-sessions', mainAgentGroupId, sessionId);
   const inbound = openReadonly(path.join(mailboxRoot, 'inbound.db'));
   let outbound: Database.Database | undefined;
   try {
@@ -433,16 +434,16 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   }
 }
 
-function centralDatabaseFile(checkoutRoot: string): string {
-  return path.join(path.resolve(checkoutRoot), 'data', 'v2.db');
+function centralDatabaseFile(stateRoot: string): string {
+  return path.join(path.resolve(stateRoot), 'data', 'v2.db');
 }
 
 function hasTable(database: Database.Database, name: string): boolean {
   return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
-/** Each session database under a checkout, keyed by its mailbox side: `inbound` or `outbound`. */
-function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; readonly file: string }> {
+/** Each session database under `stateRoot`'s `data`, keyed by its mailbox side: `inbound` or `outbound`. */
+function sessionDatabases(stateRoot: string): Array<{ readonly side: string; readonly file: string }> {
   const directories = (directory: string): string[] => {
     try {
       return readdirSync(directory, { withFileTypes: true })
@@ -454,7 +455,7 @@ function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; 
     }
   };
   const found: Array<{ side: string; file: string }> = [];
-  for (const group of directories(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions'))) {
+  for (const group of directories(path.join(path.resolve(stateRoot), 'data', 'v2-sessions'))) {
     for (const session of directories(group)) {
       for (const entry of readdirSync(session, { withFileTypes: true })) {
         const side = entry.isFile() ? /^(inbound|outbound)\.db$/u.exec(entry.name)?.[1] : undefined;
@@ -466,14 +467,14 @@ function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; 
 }
 
 /**
- * The schema a checkout's databases record (KTD5): the central migrations
+ * The schema the databases under `stateRoot`'s `data` record (KTD5): the central migrations
  * applied, in the order they ran, and every session table with its columns,
  * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
  */
-export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
-  const migrations = readCentralMigrations(checkoutRoot);
+export function readSchemaManifest(stateRoot: string): SnapshotManifest {
+  const migrations = readCentralMigrations(stateRoot);
   const tables = new Map<string, Set<string>>();
-  for (const { side, file } of sessionDatabases(checkoutRoot)) {
+  for (const { side, file } of sessionDatabases(stateRoot)) {
     const session = openReadonly(file);
     try {
       const names = session
@@ -502,9 +503,9 @@ export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
   };
 }
 
-/** The central migrations a checkout's database records, in the order they ran. Only read, never changed. */
-export function readCentralMigrations(checkoutRoot: string): string[] {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+/** The central migrations the database under `stateRoot`'s `data` records, in the order they ran. Only read, never changed. */
+export function readCentralMigrations(stateRoot: string): string[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     if (!hasTable(central, 'schema_version')) {
       throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
@@ -527,8 +528,8 @@ export interface DerivedImageGroup {
  * The agent groups running a per-group image (`<imageBase>:<agent group ID>`,
  * NanoClaw's `buildAgentGroupImage` tag), by name. Only read, never changed.
  */
-export function readDerivedImageGroups(checkoutRoot: string, imageBase: string): DerivedImageGroup[] {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+export function readDerivedImageGroups(stateRoot: string, imageBase: string): DerivedImageGroup[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     if (!hasTable(central, 'container_configs')) return [];
     const rows = central
@@ -546,13 +547,13 @@ export function readDerivedImageGroups(checkoutRoot: string, imageBase: string):
 }
 
 /**
- * Copy a checkout's central database to `destination` as one consistent
+ * Copy the central database under `stateRoot`'s `data` to `destination` as one consistent
  * snapshot: an online backup whose every page moves in a single step, so a
  * write the running host makes meanwhile restarts the copy rather than
  * mixing into it. The live database is only read. The copy is owner-only.
  */
-export async function backupCentralDatabase(checkoutRoot: string, destination: string): Promise<void> {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+export async function backupCentralDatabase(stateRoot: string, destination: string): Promise<void> {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     await central.backup(destination, { progress: () => SINGLE_STEP_PAGES });
   } finally {
@@ -574,8 +575,8 @@ export interface LatestDelivery {
 }
 
 /** Main's latest delivery result, or undefined until main is published. Only read, never changed. */
-export function readLatestDelivery(checkoutRoot: string): LatestDelivery | undefined {
-  const root = path.resolve(checkoutRoot);
+export function readLatestDelivery(stateRoot: string): LatestDelivery | undefined {
+  const root = path.resolve(stateRoot);
   const central = openReadonly(centralDatabaseFile(root));
   let mainAgentGroupId: string;
   let sessionId: string | undefined;
@@ -676,14 +677,15 @@ function printableLogLine(line: string): string {
 }
 
 /**
- * What the instance's host logged as warnings and errors since `since`, from
- * the end of its `logs/nanoclaw.error.log`. NanoClaw stamps each entry with
+ * What the host of the assistant at `instanceRoot` logged as warnings and
+ * errors since `since`, from the end of its physical `logs/nanoclaw.error.log`,
+ * which is there whether or not a release is live. NanoClaw stamps each entry with
  * its local time of day only, so each entry's date is recovered walking back
  * from the file's last write, one day earlier at each rollover; lines without
  * a stamp (stack traces) belong to the entry above them.
  */
-export async function instanceErrorsSince(checkoutRoot: string, since: string): Promise<InstanceErrorLog> {
-  const file = path.join(path.resolve(checkoutRoot), 'logs', 'nanoclaw.error.log');
+export async function instanceErrorsSince(instanceRoot: string, since: string): Promise<InstanceErrorLog> {
+  const file = hostLogFiles(path.resolve(instanceRoot)).errors;
   const sinceMs = new Date(timestamp(since, 'error log start')).getTime();
   let handle: Awaited<ReturnType<typeof open>>;
   try {

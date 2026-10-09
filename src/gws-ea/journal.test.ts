@@ -1,5 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -22,7 +23,7 @@ import {
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { beginOperation } from './operation.js';
 import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { allocateInstanceId, getInstanceReservation } from './registry.js';
+import { getInstanceReservation } from './registry.js';
 import { createInstanceRuntimeConfig } from './service.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
@@ -32,11 +33,10 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-function reservation(paths: ControlPlanePaths): InstanceReservationInput {
-  const instanceId = allocateInstanceId();
+function reservation(): InstanceReservationInput {
+  const instanceId = randomUUID();
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -59,7 +59,7 @@ async function fixture(): Promise<{ paths: ControlPlanePaths; input: InstanceRes
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
-  const input = reservation(paths);
+  const input = reservation();
   await reserveInstance(paths, input);
   return { paths, input };
 }
@@ -95,13 +95,13 @@ describe('provision journal v3', () => {
     expect(Date.parse(journal.started_at)).toBeGreaterThanOrEqual(before - 1_000);
     expect((await stat(paths.journalFile(input.instance_id))).mode & 0o777).toBe(0o600);
     expect((await stat(paths.stateRoot)).mode & 0o777).toBe(0o700);
-    expect((await stat(paths.instancesRoot)).mode & 0o777).toBe(0o700);
+    expect(paths.instanceRoot(input.instance_id)).toBe(path.join(paths.stateRoot, input.instance_id.slice(0, 8)));
     expect((await stat(paths.instanceRoot(input.instance_id))).mode & 0o777).toBe(0o700);
   });
 
   it('starts no journal for a reservation whose claims conflict', async () => {
     const { paths, input } = await fixture();
-    const conflicting = { ...reservation(paths), allocated_ports: input.allocated_ports };
+    const conflicting = { ...reservation(), allocated_ports: input.allocated_ports };
 
     await expect(reserveInstance(paths, conflicting)).rejects.toMatchObject({ code: 'claim_conflict' });
     await expect(stat(paths.journalFile(conflicting.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
@@ -315,7 +315,33 @@ describe('provision journal v3', () => {
     }
   });
 
-  it("refuses a runtime record in the assistant's own checkout that names another assistant (R17)", async () => {
+  it('refuses every command but update, which converts it, for an assistant on the layout before releases', async () => {
+    const { paths } = await fixture();
+    const legacy = { ...reservation(), checkout_realpath: '/old/layout/instances/nanoclaw' };
+    legacy.allocated_ports = { nanoclaw_webhook: 32_101, onecli_app: 32_102, onecli_gateway: 32_103 };
+    legacy.exclusive_resource_claims = {
+      ...legacy.exclusive_resource_claims,
+      ingress: { mode: 'existing', endpoint_url: 'https://legacy.example.test/webhook/gchat' },
+      gcp_project_id: 'legacy-project',
+      gchat_service_account: 'gws-ea-chat@legacy-project.iam.gserviceaccount.com',
+      workspace_email: 'legacy@example.test',
+    };
+    await reserveInstance(paths, legacy);
+    const id = legacy.instance_id;
+    await rm(paths.instanceRoot(id), { recursive: true });
+
+    for (const command of ['resume', 'start', 'stop', 'restart', 'ncl', 'rollback', 'connect-google'] as const) {
+      const refusal = await acquireInstanceOperation(paths, id, { command }).catch((error: unknown) => error);
+      expect(refusal).toMatchObject({
+        code: 'legacy_layout',
+        message: `Assistant ${id} is on the legacy layout: run gws-ea update --id ${id} to convert it.`,
+      });
+    }
+    // A refused command creates nothing at the short root the conversion will move the assistant to.
+    await expect(stat(paths.instanceRoot(id))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it("reads the runtime record from the assistant's physical state, with no release live (R17)", async () => {
     const { paths, input } = await fixture();
     const id = input.instance_id;
     const operation = await acquireInstanceOperation(paths, id);
@@ -334,18 +360,21 @@ describe('provision journal v3', () => {
       gatewayPort: reserved.allocated_ports.onecli_gateway,
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+    const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: paths.stateRoot,
       selectedProvider: 'claude',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const file = instanceRuntimeFile(reserved.checkout_realpath);
+    const file = instanceRuntimeFile(paths.instanceLayout(id).state);
+    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     await writePrivate(file, runtime);
+    // No release is live: the live link is absent, as while a switch has fenced the assistant.
+    await expect(lstat(paths.checkoutRoot(id))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await loadCreatedRuntime(paths, id)).toEqual(runtime);
 
-    // Another assistant's record, at this checkout's own path: nothing gws-ea runs may act on it for this one.
-    await writePrivate(file, { ...runtime, instance_id: allocateInstanceId() });
+    // Another assistant's record, at this assistant's own path: nothing gws-ea runs may act on it for this one.
+    await writePrivate(file, { ...runtime, instance_id: randomUUID() });
 
     await expect(loadCreatedRuntime(paths, id)).rejects.toMatchObject({ code: 'runtime_mismatch' });
   });

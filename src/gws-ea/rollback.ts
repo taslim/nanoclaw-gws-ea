@@ -65,6 +65,8 @@ import {
   setAsideStateRoot,
   settleCheckoutDatabases,
   stopCutoverHost,
+  swapLiveReceipt,
+  swapMarkerCommit,
   verifyServingRelease,
   type CutoverDependencies,
   type CutoverHost,
@@ -220,7 +222,7 @@ function rollbackPlaces(host: CutoverHost): RollbackPlaces {
   const previous = paths.releaseRoot(instanceId, 'previous');
   const outgoing = paths.releaseRoot(instanceId, 'outgoing');
   return {
-    live: host.reservation.checkout_realpath,
+    live: host.runtime.checkout_root,
     previous,
     previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
     state: setAsideStateRoot(previous),
@@ -304,10 +306,11 @@ export async function readKeptPreviousRelease(
       `The release kept in ${checkout} belongs to another assistant, so it cannot be restored into ${instanceId}.`,
     );
   }
-  if (marker.deployed_commit !== manifest.release.deployed_commit) {
+  const keptCommit = await swapMarkerCommit(checkout);
+  if (keptCommit !== manifest.release.deployed_commit) {
     throw new GwsEaError(
       'invalid_kept_release',
-      `The release kept in ${checkout} is at ${shortCommit(marker.deployed_commit)}, not the ${shortCommit(manifest.release.deployed_commit)} its manifest names.`,
+      `The release kept in ${checkout} is at ${shortCommit(keptCommit)}, not the ${shortCommit(manifest.release.deployed_commit)} its manifest names.`,
     );
   }
   if (!(await isRegularFile(keptReleaseFiles(root).receipt)))
@@ -779,10 +782,10 @@ async function prepareRestored(rollback: Rollback, stopped: Stopped): Promise<vo
   const definition = instanceServiceDefinitionFile(runtime, cutoverServiceDependencies(rollback));
   await keepReleaseFiles(places.outgoing, {
     manifest: { schema_version: 1, instance_id: instanceId, release: rollback.from, snapshot_at: stopped.at },
-    receipt: paths.releasePreflightFile(instanceId),
+    receipt: swapLiveReceipt(paths, instanceId),
     compose: rollback.onecli.composeFile,
     serviceDefinition: (await isRegularFile(definition)) ? definition : undefined,
-    hostEnvironment: readInstanceHostEnvironment(reservation.checkout_realpath),
+    hostEnvironment: readInstanceHostEnvironment(paths.checkoutRoot(reservation.instance_id)),
   });
 }
 
@@ -931,7 +934,7 @@ async function swapRollback(rollback: Rollback): Promise<OperationRecord> {
 /** The OneCLI version the live receipt records; releases never differ in it (R9). */
 async function livePins(rollback: Rollback, release: ReleaseCoordinates): Promise<OnecliPins> {
   const view = reservationAt(rollback.reservation, release);
-  const { onecli } = await readDeployedSetup(rollback.operation.paths, view, [release.deployed_commit]);
+  const { onecli } = await readDeployedSetup(rollback.operation.paths, view);
   return { gateway: onecli.gateway };
 }
 
@@ -1219,10 +1222,8 @@ async function revertOpenUpdate(
   if (record.phase === 'swapping') {
     await keepCutoverHostStopped(host);
     const releases = { from: record.from.deployed_commit, to: record.to.deployed_commit };
-    const live = host.reservation.checkout_realpath;
-    const liveCommit = (await exists(instanceMarkerFile(live)))
-      ? (await readInstanceMarkerFile(instanceMarkerFile(live))).deployed_commit
-      : undefined;
+    const live = host.runtime.checkout_root;
+    const liveCommit = (await exists(instanceMarkerFile(live))) ? await swapMarkerCommit(live) : undefined;
     const seams = dependencies.rename ? { rename: dependencies.rename } : {};
     if (liveCommit === record.to.deployed_commit) {
       await finishSwap(paths, instanceId, releases, seams);
@@ -1265,11 +1266,11 @@ async function rollBackRecorded(
   const kept = await readKeptPreviousRelease(host.operation.paths, instanceId);
   const from = releaseOf(host.reservation);
   const to = kept.release;
-  const live = await readInstanceMarkerFile(instanceMarkerFile(host.reservation.checkout_realpath));
-  if (live.deployed_commit !== from.deployed_commit || to.deployed_commit === from.deployed_commit) {
+  const live = await swapMarkerCommit(host.runtime.checkout_root);
+  if (live !== from.deployed_commit || to.deployed_commit === from.deployed_commit) {
     throw new GwsEaError(
       'rollback_unavailable',
-      `Assistant ${instanceId} runs ${shortCommit(live.deployed_commit)}, and its kept release is ${shortCommit(to.deployed_commit)}, so there is nothing to roll back to.`,
+      `Assistant ${instanceId} runs ${shortCommit(live)}, and its kept release is ${shortCommit(to.deployed_commit)}, so there is nothing to roll back to.`,
     );
   }
   const base = getInstallScopedNames(host.runtime.install_id).containerImageBase;
@@ -1281,10 +1282,10 @@ async function rollBackRecorded(
     );
   }
   const rollback = rollbackOf(host, from, to, false, request, host.service.detect().active);
-  const current = readSchemaManifest(host.reservation.checkout_realpath);
+  const current = readSchemaManifest(host.runtime.state_root);
   const tentative = decideMode(current, readSchemaManifest(await snapshotRoot(rollback)), request.snapshot === true);
   if (tentative.mode === 'snapshot' && tentative.reason && !request.confirm) {
-    await confirmSnapshot(rollback, tentative.reason, host.reservation.checkout_realpath);
+    await confirmSnapshot(rollback, tentative.reason, host.runtime.state_root);
     throw confirmationRequired(instanceId);
   }
   const record = await beginOperation(operation, {

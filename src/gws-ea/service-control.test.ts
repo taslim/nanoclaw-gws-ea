@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -6,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths } from './paths.js';
-import { allocateInstanceId } from './registry.js';
+
 import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRuntimeConfig } from './service.js';
 import {
   createServiceControl,
@@ -508,18 +509,18 @@ describe("an assistant's own service coordinates", () => {
       configRoot: path.join(root, 'config'),
       stateRoot: path.join(root, 'state'),
     });
-    const instanceId = allocateInstanceId();
-    const checkout = paths.checkoutRoot(instanceId);
+    const instanceId = randomUUID();
+    const checkout = paths.instanceLayout(instanceId).release('aaaaaaaa');
     await mkdir(path.join(checkout, 'dist', 'gws-ea'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(checkout, 'bin'), { mode: 0o700 });
     await writeFile(path.join(checkout, 'dist', 'index.js'), 'host');
     await writeFile(path.join(checkout, 'dist', 'gws-ea', 'process.js'), 'launcher');
     await writeFile(path.join(checkout, 'bin', 'ncl'), '#!/bin/sh\n', { mode: 0o700 });
+    await symlink('aaaaaaaa', paths.checkoutRoot(instanceId));
     const home = path.join(root, 'home');
     await mkdir(home, { mode: 0o700 });
     const reservation: InstanceReservation = {
       instance_id: instanceId,
-      checkout_realpath: checkout,
       release_track: 'dogfood',
       source_remote: 'https://example.test/nanoclaw.git',
       deployed_commit: 'a'.repeat(40),
@@ -541,7 +542,7 @@ describe("an assistant's own service coordinates", () => {
       gatewayPort: 31_003,
       dockerEndpoint: TARGET.dockerEndpoint,
     });
-    return createInstanceRuntimeConfig(reservation, onecli, {
+    return createInstanceRuntimeConfig(paths, reservation, onecli, {
       nodePath: process.execPath,
       homeDirectory: home,
       selectedProvider: 'claude',
@@ -565,7 +566,7 @@ describe("an assistant's own service coordinates", () => {
         restartService: async () => undefined,
       });
       const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
-      const logs = hostLogFiles(runtime.checkout_realpath);
+      const logs = hostLogFiles(runtime.instance_root);
 
       expect(definition).toContain(logs.output);
       expect(definition).toContain(logs.errors);

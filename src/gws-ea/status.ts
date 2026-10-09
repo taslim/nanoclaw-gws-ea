@@ -16,7 +16,6 @@
  * unknown assistant ID exits 1.
  */
 import { createHash } from 'node:crypto';
-import path from 'node:path';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
 import { formatLocalTime } from '../timezone.js';
@@ -45,7 +44,7 @@ import {
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
-import { CONTROL_PLANE_ROOT, instanceRuntimeFile, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
@@ -53,6 +52,7 @@ import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
 import { readKeptPreviousRelease, sameSchema } from './rollback.js';
 import {
+  hostLogFiles,
   instanceOnecliAdmin,
   loadInstanceRuntimeConfig,
   type HostStatusHelpers,
@@ -301,9 +301,9 @@ export interface StatusObservers {
     dockerEndpoint: string,
   ) => Promise<CloudflareConnectorObservation>;
   readonly principalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
-  /** The schema a checkout's databases record. */
-  readonly schema: (checkoutRoot: string) => SnapshotManifest;
-  readonly delivery: (checkoutRoot: string) => LatestDelivery | undefined;
+  /** The schema the databases under a `data`-holding root record: the physical `state/`, or a kept release. */
+  readonly schema: (stateRoot: string) => SnapshotManifest;
+  readonly delivery: (stateRoot: string) => LatestDelivery | undefined;
   /** The assistant's Google connection, observed without changing it. */
   readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
@@ -411,11 +411,12 @@ function missingRuntime(inspection: OperationInspection): string {
 }
 
 async function readRuntimeRecord(
+  paths: ControlPlanePaths,
   reservation: InstanceReservation,
   inspection: OperationInspection,
 ): Promise<RuntimeRecord> {
   try {
-    const file = instanceRuntimeFile(reservation.checkout_realpath);
+    const file = paths.runtimeFile(reservation.instance_id);
     return { state: 'recorded', config: await loadInstanceRuntimeConfig(file) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime is reported by each probe that needs it.
   } catch (error) {
@@ -559,10 +560,15 @@ function fromObservation(seen: Observation): ProbeResult {
   }
 }
 
-async function checkoutProbe({ reservation, inspection, observers }: Subject): Promise<ProbeResult & CheckoutFacts> {
+async function checkoutProbe({
+  context,
+  reservation,
+  inspection,
+  observers,
+}: Subject): Promise<ProbeResult & CheckoutFacts> {
   const record = inspection.state === 'open' ? inspection.record : undefined;
   try {
-    const commit = await observeLiveCheckout(reservation, liveCheckoutCommits(reservation, record), {
+    const commit = await observeLiveCheckout(context.paths, reservation, liveCheckoutCommits(reservation, record), {
       runCommand: observers.runCommand,
     });
     return { ...OK, commit };
@@ -572,10 +578,10 @@ async function checkoutProbe({ reservation, inspection, observers }: Subject): P
   }
 }
 
-/** Upstream's messages name the checkout-relative error log; point at this assistant's. */
-function hostFailure(error: unknown, checkoutRoot: string): string {
+/** Upstream's messages name the checkout-relative error log; point at this assistant's physical one. */
+function hostFailure(error: unknown, instanceRoot: string): string {
   const message = error instanceof Error ? error.message : String(error);
-  return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(checkoutRoot, 'logs', 'nanoclaw.error.log')));
+  return redact(message.replaceAll('logs/nanoclaw.error.log', hostLogFiles(instanceRoot).errors));
 }
 
 /** The host's own status over its CLI socket, which answers only for this checkout (upstream `queryHost`). */
@@ -583,12 +589,12 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
   if (!context.hostStatus) throw new Unobservable(`${LAUNCHER_REQUIRED}'s host status helpers.`);
   let status: unknown;
   try {
-    status = await context.hostStatus.queryHost(reservation.checkout_realpath);
+    status = await context.hostStatus.queryHost(context.paths.checkoutRoot(reservation.instance_id));
     // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering.
   } catch (error) {
     return {
       status: 'degraded',
-      reason: `The host is unreachable: ${hostFailure(error, reservation.checkout_realpath)}`,
+      reason: `The host is unreachable: ${hostFailure(error, context.paths.instanceRoot(reservation.instance_id))}`,
     };
   }
   const webhook = isRecord(status) ? status.webhook : undefined;
@@ -611,20 +617,12 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
 }
 
 /**
- * OneCLI at the pins the live release's receipt records and the images its own
- * Compose file names (KTD6); mid-update that receipt may be the release the
- * update placed live (KTD17).
+ * OneCLI at the pins the receipt of the release the registry records holds,
+ * and the images its own Compose file names (KTD6).
  */
-async function onecliProbe({
-  context,
-  reservation,
-  inspection,
-  runtime: record,
-  observers,
-}: Subject): Promise<ProbeResult> {
+async function onecliProbe({ context, reservation, runtime: record, observers }: Subject): Promise<ProbeResult> {
   const runtime = requireRuntime(record);
-  const open = inspection.state === 'open' ? inspection.record : undefined;
-  const setup = await readDeployedSetup(context.paths, reservation, liveCheckoutCommits(reservation, open));
+  const setup = await readDeployedSetup(context.paths, reservation);
   const layout = createOnecliRuntimeLayout({
     instanceId: reservation.instance_id,
     instanceRoot: context.paths.instanceRoot(reservation.instance_id),
@@ -806,7 +804,10 @@ async function principalProbe({ context, reservation, observers }: Subject): Pro
   const candidate = journal.decisions.principal;
   if (!candidate) return { status: 'degraded', reason: 'No principal conversation is bound yet.' };
   const result = observers.principalBinding({
-    runtime: { checkout_realpath: reservation.checkout_realpath, instance_id: reservation.instance_id },
+    runtime: {
+      state_root: context.paths.instanceLayout(reservation.instance_id).state,
+      instance_id: reservation.instance_id,
+    },
     adapterInstance: ADAPTER_INSTANCE,
     provisioningStartedAt: journal.started_at,
     selectedCandidate: candidate,
@@ -849,8 +850,8 @@ async function connectorProbe({ context, runtime: record, observers }: Subject):
 }
 
 /** Main's latest delivery result, and the replies the host is still retrying. */
-async function deliveryProbe({ reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
-  const seen = observers.delivery(reservation.checkout_realpath);
+async function deliveryProbe({ context, reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
+  const seen = observers.delivery(context.paths.instanceLayout(reservation.instance_id).state);
   if (!seen) return { status: 'unknown', reason: 'Main is not published yet.', last: null, retrying: null };
   const facts: DeliveryFacts = {
     last: seen.last ? { status: seen.last.status, message_out_id: seen.last.messageOutId, at: seen.last.at } : null,
@@ -912,9 +913,9 @@ async function observeRelease({
 
 type SchemaRead = { readonly manifest: SnapshotManifest } | { readonly error: unknown };
 
-function readSchema(observers: StatusObservers, checkoutRoot: string): SchemaRead {
+function readSchema(observers: StatusObservers, stateRoot: string): SchemaRead {
   try {
-    return { manifest: observers.schema(checkoutRoot) };
+    return { manifest: observers.schema(stateRoot) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- A schema that cannot be read is reported, never thrown.
   } catch (error) {
     return { error };
@@ -1010,13 +1011,13 @@ export async function observeAssistantStatus(
   const observers = resolveObservers(context.observers);
   const inspection = await inspect(context.paths, reservation);
   const [runtime, removal] = await Promise.all([
-    readRuntimeRecord(reservation, inspection),
+    readRuntimeRecord(context.paths, reservation, inspection),
     removalInProgress(context.paths, instanceId),
   ]);
   const subject: Subject = { context, observers, reservation, inspection, runtime };
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
-  const live = readSchema(observers, reservation.checkout_realpath);
+  const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
   const managed = reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare';
   const [
     checkout,
@@ -1105,7 +1106,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
       const [runtime, removal, release] = await Promise.all([
-        readRuntimeRecord(reservation, inspection),
+        readRuntimeRecord(context.paths, reservation, inspection),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
       ]);

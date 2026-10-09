@@ -13,7 +13,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { heldImageTag } from './agent-image.js';
-import { finishFollowUps } from './cutover.js';
+import { finishFollowUps, swapLiveReceipt } from './cutover.js';
 import type { RunEvent } from './events.js';
 import {
   ADDED_MIGRATION,
@@ -239,14 +239,14 @@ async function expectRolledBack(
   ran: string,
 ) {
   const id = runtime.instance_id;
-  const live = runtime.checkout_realpath;
+  const live = runtime.checkout_root;
   const outgoing = host.paths.releaseCheckoutRoot(id, 'outgoing');
   expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
   expect(commitOf(live)).toBe(host.first);
   expect(git(live, 'status', '--porcelain', '--untracked-files=all')).toBe('');
   expect(await receiptCommit(instanceMarkerFile(live))).toBe(host.first);
   expect(await runtimeCommit(live)).toBe(host.first);
-  expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
+  expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(host.first);
   // The restored release boots past NanoClaw's tripwire: stamped by its own script, for its own commit.
   expect(JSON.parse(await readFile(path.join(live, 'data', 'upgrade-state.json'), 'utf8'))).toEqual({
     commit: host.first,
@@ -303,7 +303,7 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
   it('keeps every message since the update, restores the release-owned files, and boots the old release', async () => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     // A message the new release received after the update.
     await converse(runtime, 'm2');
     const asked: RollbackPreview[] = [];
@@ -383,14 +383,14 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
     expect(rows(path.join(previous, 'data', 'v2.db'), 'agent_groups')).toContainEqual(
       expect.objectContaining({ id: 'ag-stale' }),
     );
-    const source = runtime.checkout_realpath;
+    const source = runtime.checkout_root;
     const centralRows = rows(path.join(source, 'data', 'v2.db'), 'agent_groups');
     const sessionRows = rows(path.join(source, SESSION, 'inbound.db'), 'messages_in');
 
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state, images.first);
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     expect(await exists(path.join(live, 'data', 'v2.db-wal'))).toBe(false);
     expect(await exists(path.join(live, SESSION, 'inbound.db-journal'))).toBe(false);
     expect(integrity(path.join(live, 'data', 'v2.db'))).toBe('ok');
@@ -406,7 +406,7 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
 
   it('never opens a file an agent planted beside a -journal or -wal, even with SQLite’s header, and carries it back as it is', async () => {
     const { host, runtime, next, state, images } = await updatedAssistant();
-    const session = path.join(runtime.checkout_realpath, SESSION);
+    const session = path.join(runtime.checkout_root, SESSION);
     // SQLite's header and nothing a database holds: SQLite would delete each side file as it refused the file.
     const planted = {
       'evil.db': SQLITE_HEADER,
@@ -422,7 +422,7 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
     for (const [file, contents] of Object.entries(planted)) {
       expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
     }
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
   });
 });
 
@@ -472,7 +472,7 @@ describe('gws-ea rollback of an update that moved a schema (AE6)', GIT_HEAVY, ()
       discarded: { inbound: { count: 1, ids: ['m2'] }, centralRows: [{ table: 'schema_version', count: 1 }] },
     });
     // The snapshot: the first release's schema and messages as the update's stop left them.
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     expect(readCentralMigrations(live)).toEqual([...LIVE_MIGRATIONS]);
     expect(messages(live)).toEqual(['m1']);
     // What it discarded is quarantined with the release left.
@@ -514,8 +514,8 @@ describe('gws-ea rollback of an update that moved a schema (AE6)', GIT_HEAVY, ()
       `Rollback cancelled. Assistant ${id} stays on dogfood ${next.commit.slice(0, 12)} as before.`,
     );
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
     const previous = host.paths.releaseCheckoutRoot(id, 'previous');
     expect(messages(previous)).toEqual(['m1']);
     expect(await exists(path.join(host.paths.releaseRoot(id, 'previous'), 'state'))).toBe(false);
@@ -541,8 +541,8 @@ describe('gws-ea rollback of an update that moved a schema (AE6)', GIT_HEAVY, ()
     expect(await run(['rollback', '--id', id])).toBe(0);
 
     expect(asked.map((preview) => preview.reason)).toEqual(['session_schema']);
-    expect(readCentralMigrations(runtime.checkout_realpath)).toEqual([...LIVE_MIGRATIONS]);
-    const columns = rows(path.join(runtime.checkout_realpath, SESSION, 'inbound.db'), 'messages_in');
+    expect(readCentralMigrations(runtime.checkout_root)).toEqual([...LIVE_MIGRATIONS]);
+    const columns = rows(path.join(runtime.checkout_root, SESSION, 'inbound.db'), 'messages_in');
     expect(Object.keys(columns[0] as object)).not.toContain('routed_by');
   });
 });
@@ -603,7 +603,7 @@ describe('an update that fails after its swap (AE2, R14)', GIT_HEAVY, () => {
     );
     await expectRolledBack(host, runtime, next, state, ran);
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     expect(messages(live)).toEqual(['m1']);
     expect(await readFile(runtimeCompose(host, runtime), 'utf8')).toContain(DEPLOYED_GATEWAY);
     expect(await readFile(definition, 'utf8')).toBe(CREATED_DEFINITION);
@@ -640,7 +640,7 @@ describe('an update that fails after its swap (AE2, R14)', GIT_HEAVY, () => {
 
     expect(asked).toEqual([]);
     expect(err.join('\n')).toContain('on its snapshot from');
-    expect(readCentralMigrations(runtime.checkout_realpath)).toEqual([...LIVE_MIGRATIONS]);
+    expect(readCentralMigrations(runtime.checkout_root)).toEqual([...LIVE_MIGRATIONS]);
     expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
   });
@@ -666,9 +666,9 @@ describe('a rollback whose restored release fails its checks', GIT_HEAVY, () => 
     expect(summary).not.toContain('Retry with');
     // Back on the release it left, recorded, with its data and files as they were.
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
-    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(next.commit);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
+    expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(next.commit);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
     expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(images.next);
     expect(await readFile(runtimeCompose(host, runtime), 'utf8')).toContain(RELEASE_GATEWAY);
     expect(await readFile(serviceDefinitionFile(host, runtime), 'utf8')).not.toBe(CREATED_DEFINITION);
@@ -703,8 +703,8 @@ describe('a rollback whose restored release fails its checks', GIT_HEAVY, () => 
 
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--snapshot', '--yes'])).toBe(1);
 
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
     expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(images.next);
     // The snapshot ran on a copy: what the failed run wrote went with it.
     expect(await contents(previous)).toEqual(kept);
@@ -728,7 +728,7 @@ describe('after a rollback', GIT_HEAVY, () => {
     // With no `:previous` tag to displace, the next update's retag still keeps the image the assistant ran.
     expect(await run(['update', '--id', id, '--yes'])).toBe(0);
 
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
     expect(commitOf(host.paths.releaseCheckoutRoot(id, 'previous'))).toBe(host.first);
     expect(await exists(host.paths.releaseRoot(id, 'outgoing'))).toBe(false);
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
@@ -740,7 +740,7 @@ describe('after a rollback', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     const id = runtime.instance_id;
-    withoutGroupImages(runtime.checkout_realpath);
+    withoutGroupImages(runtime.checkout_root);
     const next = await nextRelease(host);
     const state = world(runtime);
     const base = imageBase(runtime);
@@ -776,7 +776,7 @@ describe('gws-ea rollback refusals', GIT_HEAVY, () => {
   it('gives up before changing anything when something still holds the live data open, and starts it again', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     const previous = host.paths.releaseCheckoutRoot(id, 'previous');
     const kept = await contents(previous);
     // A leftover opener, idle: an operator's sqlite3 shell on a session database.
@@ -800,7 +800,7 @@ describe('gws-ea rollback refusals', GIT_HEAVY, () => {
   it('gives up when something opens the live data just before the first rename, moving nothing, and starts it again', async () => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     await converse(runtime, 'm2');
     const previous = host.paths.releaseCheckoutRoot(id, 'previous');
     const kept = await contents(previous);
@@ -881,7 +881,7 @@ describe('gws-ea rollback refusals', GIT_HEAVY, () => {
   > = [
     [
       'its live checkout runs a release the registry does not name',
-      ({ runtime }) => markAt(runtime.checkout_realpath, 'c'.repeat(40)),
+      ({ runtime }) => markAt(runtime.checkout_root, 'c'.repeat(40)),
       ({ host, runtime }) =>
         `Assistant ${runtime.instance_id} runs ${'c'.repeat(12)}, and its kept release is ${host.first.slice(0, 12)}, so there is nothing to roll back to.`,
     ],
@@ -1006,7 +1006,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
       expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
 
       await expectRolledBack(host, runtime, next, state, images.first);
-      expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+      expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
       expect(out).toContain(
         phase === 'recorded'
           ? `Assistant ${id} runs dogfood ${host.first.slice(0, 12)}; its rollback is finished.`
@@ -1046,7 +1046,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
   it('stands by a rollback the registry committed when the record write after it fails, and rollback settles it', async () => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     await converse(runtime, 'm2');
     const { run, err, out } = cli(host, state, next, runtime);
     failing.recordedWrite = true;
@@ -1061,7 +1061,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
     expect(commitOf(live)).toBe(host.first);
     expect(await receiptCommit(instanceMarkerFile(live))).toBe(host.first);
-    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
+    expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(host.first);
     expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(images.first);
     expect(state.running).toBe(true);
     expect((await readOperationRecord(host.paths, id))?.phase).toBe('verified');
@@ -1082,7 +1082,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
   ] as const)('re-stops a host the OS started at stopped that %s', async (_label, addsColumn) => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     state.hangAt = 'stamp';
     await killDuringRollback(host, runtime, state, next);
     expect((await readOperationRecord(host.paths, id))?.phase).toBe('stopped');
@@ -1131,7 +1131,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state, images.first);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2', 'm3']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2', 'm3']);
   });
 
   it('decides and asks again once killed at the first rename, counting what a host the OS started recorded since', async () => {
@@ -1155,7 +1155,7 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
 
     expect(asked.map((preview) => preview.discarded.inbound)).toEqual([{ count: 2, ids: ['m2', 'm3'] }]);
     await expectRolledBack(host, runtime, next, state, images.first);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
     expect(messages(host.paths.releaseCheckoutRoot(id, 'outgoing'))).toEqual(['m1', 'm2', 'm3']);
   });
 
@@ -1177,8 +1177,8 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
     expect(err.join('\n')).toContain('pass --yes');
     // Given up as before its swap: the release it would leave runs on, and the kept release is as its update left it.
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2', 'm3']);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2', 'm3']);
     expect(await contents(previous)).toEqual(kept);
     expect(state.running).toBe(true);
   });
@@ -1247,9 +1247,9 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     expect(await exists(host.paths.releaseRoot(id, 'next'))).toBe(false);
     expect(await exists(host.paths.releaseRoot(id, 'previous'))).toBe(false);
-    expect(commitOf(runtime.checkout_realpath)).toBe(host.first);
-    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(commitOf(runtime.checkout_root)).toBe(host.first);
+    expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(host.first);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
     expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(ran);
     expect(state.tags.has(`${imageBase(runtime)}:next`)).toBe(false);
     expect(state.running).toBe(true);
@@ -1292,7 +1292,7 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state, ran);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
     expect(state.rebuilds).toEqual([]);
   });
 
@@ -1325,7 +1325,7 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     expect(await unasked.run(['rollback', '--id', id])).toBe(1);
     expect(unasked.err.join('\n')).toContain('pass --yes');
     expect(await readOperationRecord(host.paths, id)).toMatchObject({ kind: 'update', phase: 'started' });
-    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
+    expect(commitOf(runtime.checkout_root)).toBe(next.commit);
     expect(state.running).toBe(true);
 
     // Continued, the update verifies its release and records it.
@@ -1349,7 +1349,7 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
 
     expect(await cli(host, state, second, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
 
-    expect(commitOf(runtime.checkout_realpath)).toBe(first.commit);
+    expect(commitOf(runtime.checkout_root)).toBe(first.commit);
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, first.commit));
     expect(commitOf(host.paths.releaseCheckoutRoot(id, 'previous'))).toBe(host.first);
     expect(await exists(host.paths.releaseRoot(id, 'superseded'))).toBe(false);
@@ -1395,7 +1395,7 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
 
     expect(await cli(host, state, second, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
 
-    expect(commitOf(runtime.checkout_realpath)).toBe(first.commit);
+    expect(commitOf(runtime.checkout_root)).toBe(first.commit);
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
     expect([...state.tags.keys()].filter(isHold)).toEqual([]);
@@ -1419,7 +1419,7 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
 
     expect(await cli(host, state, second, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
 
-    expect(commitOf(runtime.checkout_realpath)).toBe(second.commit);
+    expect(commitOf(runtime.checkout_root)).toBe(second.commit);
     expect(state.ids.has(oldest)).toBe(false);
     expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
     expect([...state.tags.keys()].filter(isHold)).toEqual([]);
@@ -1447,7 +1447,7 @@ describe('rollback isolation (AE3)', GIT_HEAVY, () => {
     const identifiers = [
       b.instance_id,
       b.install_id,
-      b.checkout_realpath,
+      b.checkout_root,
       b.onecli_project,
       imageBase(b),
       String(b.allocated_ports.nanoclaw_webhook),

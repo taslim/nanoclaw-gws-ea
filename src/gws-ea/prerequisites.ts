@@ -6,6 +6,7 @@
  */
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
+import path from 'node:path';
 
 import { errorCode } from '../community-portal/errors.js';
 import { SignInRequired, withGoogleSignIn, type Interaction } from './events.js';
@@ -17,7 +18,7 @@ import {
   isGoogleAccountAddress,
 } from './gcloud.js';
 import { protectFromAgentMounts } from './mount-allowlist.js';
-import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, canonicalPath, type ControlPlanePaths } from './paths.js';
 import {
   buildToolEnvironment,
   checkedRunner,
@@ -34,8 +35,8 @@ import { isRecord, parseJson, unixSocketPath } from './validation.js';
 const DOCKER_PING_TIMEOUT_MS = 5_000;
 const TOOL_TIMEOUT_MS = 30_000;
 
-/** gws-ea's own roots: executables may not live in its instances, and agent mounts may not reach any of them. */
-export type PrerequisitePaths = Pick<ControlPlanePaths, 'configRoot' | 'stateRoot' | 'logsRoot' | 'instancesRoot'>;
+/** gws-ea's own roots: executables may not live in its state, and agent mounts may not reach any of them. */
+export type PrerequisitePaths = Pick<ControlPlanePaths, 'configRoot' | 'stateRoot' | 'logsRoot'>;
 
 export type PrerequisiteRequest =
   /** `account` is `--google-account`; without it the operator confirms the signed-in account. */
@@ -80,6 +81,34 @@ export interface PrerequisiteDependencies {
   readonly platform?: NodeJS.Platform;
   /** The shared NanoClaw mount allowlist; its documented location under the home directory by default. */
   readonly mountAllowlistFile?: string;
+}
+
+/**
+ * NanoClaw's longest socket under a state root: it binds `data/ncl.sock` and
+ * `data/cli.sock`, as long as each other, in its working directory, which is
+ * a release's physical folder, `<state root>/<8 hex>/<8 hex>` (KTD10).
+ */
+const LONGEST_SOCKET = path.join('12345678', '12345678', 'data', 'ncl.sock');
+
+/** The longest path a Unix socket may have: `sun_path` holds 104 bytes on macOS and 108 on Linux, with the NUL. */
+const SOCKET_PATH_LIMIT: Readonly<Record<Prerequisites['platform'], number>> = { macos: 103, linux: 107 };
+
+/**
+ * A state root under which NanoClaw could not bind its sockets is refused
+ * before anything is created: a host that cannot bind `ncl` never starts. The
+ * root is measured as the kernel sees it, every link resolved, so a root
+ * under `/var` counts as `/private/var` on macOS.
+ */
+function assertSocketPathsFit(stateRoot: string, platform: Prerequisites['platform']): void {
+  const socket = path.join(canonicalPath(stateRoot), LONGEST_SOCKET);
+  const bytes = Buffer.byteLength(socket);
+  const limit = SOCKET_PATH_LIMIT[platform];
+  if (bytes <= limit) return;
+  throw new GwsEaError(
+    'state_root_too_long',
+    `The state root ${stateRoot} is too long: an assistant's NanoClaw socket under it, ${socket}, would be ${bytes} bytes, and ${platform === 'macos' ? 'macOS' : 'Linux'} allows ${limit}. Choose a shorter state root with GWS_EA_STATE_ROOT, then retry.`,
+    { details: { stateRoot, socket, bytes, limit } },
+  );
 }
 
 function toolEnvironment(): Readonly<Record<string, string>> {
@@ -332,10 +361,13 @@ export async function checkPrerequisites(
   const runner = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const resolvePersisted = dependencies.resolvePersisted ?? resolvePersistedExecutable;
   const node = dependencies.node ?? process;
-  const checkoutRoots = [request.paths.instancesRoot];
+  const checkoutRoots = [request.paths.stateRoot];
   const homeDirectory = os.homedir();
 
   const platform = supportedPlatform(dependencies.platform ?? process.platform);
+  if (request.command === 'create') {
+    assertSocketPathsFit(request.paths.stateRoot, platform);
+  }
   assertNodeExecve(node);
   await protectFromAgentMounts(request.paths, {
     homeDirectory,

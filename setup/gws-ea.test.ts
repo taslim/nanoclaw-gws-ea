@@ -213,7 +213,6 @@ describe('GWS-EA driver', () => {
         configRoot: '/config',
         stateRoot: '/state',
         logsRoot: '/state/logs',
-        instancesRoot: '/state/instances',
       },
       account: 'reserved@example.com',
       dockerEndpoint: 'unix:///var/run/docker.sock',

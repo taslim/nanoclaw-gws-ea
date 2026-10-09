@@ -89,12 +89,12 @@ export interface ServiceControlTarget {
 export function runtimeServiceTarget(
   runtime: Pick<
     InstanceRuntimeConfig,
-    'instance_id' | 'checkout_realpath' | 'install_id' | 'home_directory' | 'docker_endpoint'
+    'instance_id' | 'checkout_root' | 'install_id' | 'home_directory' | 'docker_endpoint'
   >,
 ): ServiceControlTarget {
   return {
     instanceId: runtime.instance_id,
-    checkoutRoot: runtime.checkout_realpath,
+    checkoutRoot: runtime.checkout_root,
     installId: runtime.install_id,
     homeDirectory: runtime.home_directory,
     dockerEndpoint: runtime.docker_endpoint,

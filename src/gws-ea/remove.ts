@@ -65,7 +65,7 @@ import {
 import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
-import { liveCheckoutCommits, readOperationRecord, type OperationRecord } from './operation.js';
+import { readOperationRecord, type OperationRecord } from './operation.js';
 import {
   CONTROL_PLANE_ROOT,
   instanceRuntimeFile,
@@ -85,9 +85,9 @@ import {
 } from './process.js';
 import {
   activeRemovalInstanceIds,
-  assertCheckoutConsistent,
-  assertCheckoutMarker,
   assertInstanceId,
+  assertStateConsistent,
+  assertStateMarker,
   getInstanceReservation,
   readRegistry,
   releaseInstanceReservation,
@@ -288,7 +288,7 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
         `Removal receipt schema ${String(raw.schema_version)} is not this launcher's`,
       );
     }
-    const reservation = validateReservation(raw.reservation, paths);
+    const reservation = validateReservation(raw.reservation);
     if (reservation.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt reservation does not match this instance');
     }
@@ -386,27 +386,16 @@ function recordedAgentImages(record: OperationRecord | undefined | null): readon
 }
 
 /**
- * The live checkout must carry this assistant's marker at the registry's
- * commit, or at the one an unfinished update or rollback placed there; a
- * record that cannot be read cannot say which, so only the marker's instance
- * identity is checked. Every kept release, wherever an update or rollback
- * left it, is checked by its marker's instance identity alone, and staging
- * may have stopped before writing one.
+ * The assistant's `state/` must carry its marker. Every kept release,
+ * wherever an update or rollback left it, is checked by its marker's
+ * instance identity alone, and staging may have stopped before writing one.
  */
-async function assertOwnCheckouts(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-  operation: OperationRecord | undefined | null,
-): Promise<void> {
-  await assertCheckoutConsistent(
-    paths,
-    reservation,
-    operation === null ? null : liveCheckoutCommits(reservation, operation),
-  );
+async function assertOwnCheckouts(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await assertStateConsistent(paths, reservation);
   for (const slot of KEPT_RELEASES) {
     const checkout = paths.releaseCheckoutRoot(reservation.instance_id, slot);
     try {
-      await assertCheckoutMarker(checkout, reservation.instance_id, null);
+      await assertStateMarker(checkout, reservation.instance_id);
     } catch (error) {
       if (isErrno(error, 'ENOENT') || (error instanceof GwsEaError && error.code === 'marker_missing')) continue;
       throw error;
@@ -426,7 +415,7 @@ async function readRecordedRuntime(
   reservation: InstanceReservation,
 ): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string }> {
   const records = await Promise.all([
-    readRecord(instanceRuntimeFile(reservation.checkout_realpath)),
+    readRecord(paths.runtimeFile(reservation.instance_id)),
     ...KEPT_RELEASES.map((slot) =>
       readRecord(instanceRuntimeFile(paths.releaseCheckoutRoot(reservation.instance_id, slot))),
     ),
@@ -875,7 +864,7 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
   const ingress = claims.ingress;
   return {
     instanceId,
-    checkout: reservation.checkout_realpath,
+    checkout: paths.checkoutRoot(instanceId),
     gcpProject: claims.gcp_project_id,
     gcpAccount: claims.gcp_account,
     onecliProject: claims.onecli_project,
@@ -937,7 +926,7 @@ async function removeLocked(
 
   // Everything below reads; nothing changes until the receipt is written.
   const operation = await readUnfinishedOperation(paths, instanceId);
-  await assertOwnCheckouts(paths, reservation, operation);
+  await assertOwnCheckouts(paths, reservation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
   // Released last, so a released reservation left only local files and the receipt behind.
@@ -979,7 +968,7 @@ async function removeLocked(
       ? (removed: InstanceReservation, runtime: LocalRuntime) =>
           uninstallNanoclaw(
             {
-              checkoutRoot: removed.checkout_realpath,
+              checkoutRoot: paths.checkoutRoot(removed.instance_id),
               installId: removed.instance_id.replaceAll('-', ''),
               homeDirectory: runtime.homeDirectory,
               dockerEndpoint: runtime.dockerEndpoint,

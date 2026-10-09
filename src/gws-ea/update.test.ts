@@ -91,6 +91,7 @@ import {
   type UpdatePreview,
 } from './update.js';
 import { readCentralMigrations } from './verify.js';
+import { swapLiveReceipt, swapSlotReceipt } from './cutover.js';
 
 /**
  * The operation record's write as its release is recorded, failed once as a
@@ -190,7 +191,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
         providerCredential: CREDENTIAL,
       },
     ]);
-    expect(JSON.parse(await readFile(host.paths.releasePreflightFile(id, 'next'), 'utf8'))).toMatchObject({
+    expect(JSON.parse(await readFile(swapSlotReceipt(host.paths, id, 'next'), 'utf8'))).toMatchObject({
       instance_id: id,
       deployed_commit: next.commit,
       provider: 'claude',
@@ -198,7 +199,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     // No image carried the release's key, so NanoClaw's build made one from the staged checkout, with the
     // instance's own .env and identity, and gws-ea labeled it with the key as :next, adding no layer.
     expect(await readFile(path.join(checkout, '.env'), 'utf8')).toBe(
-      await readFile(path.join(runtime.checkout_realpath, '.env'), 'utf8'),
+      await readFile(path.join(runtime.checkout_root, '.env'), 'utf8'),
     );
     const build = state.commands.find((command) => command.command === 'bash')!;
     expect(build).toMatchObject({ args: [path.join(checkout, 'container', 'build.sh'), 'building'], cwd: checkout });
@@ -343,7 +344,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     const next = await nextRelease(host);
-    await write(runtime.checkout_realpath, 'release.txt', 'patched in place\n');
+    await write(runtime.checkout_root, 'release.txt', 'patched in place\n');
     const state = world(runtime);
 
     await expect(stage(host, runtime, dependencies(state, next, runtime))).rejects.toMatchObject({
@@ -644,14 +645,14 @@ async function openUpdate(host: Machine, runtime: InstanceRuntimeConfig, to: Rel
  */
 async function expectUpdated(host: Machine, runtime: InstanceRuntimeConfig, to: Release, state: World, ran: string) {
   const id = runtime.instance_id;
-  const live = runtime.checkout_realpath;
+  const live = runtime.checkout_root;
   const previous = host.paths.releaseCheckoutRoot(id, 'previous');
   expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, to.commit));
   expect(git(live, 'rev-parse', 'HEAD')).toBe(to.commit);
   expect(git(live, 'status', '--porcelain', '--untracked-files=all')).toBe('');
   expect(await receiptCommit(instanceMarkerFile(live))).toBe(to.commit);
   expect(await runtimeCommit(live)).toBe(to.commit);
-  expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(to.commit);
+  expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(to.commit);
   // The tripwire was stamped by the release's own script, in its checkout, for its own commit.
   expect(JSON.parse(await readFile(path.join(live, 'data', 'upgrade-state.json'), 'utf8'))).toEqual({
     commit: to.commit,
@@ -660,7 +661,7 @@ async function expectUpdated(host: Machine, runtime: InstanceRuntimeConfig, to: 
   expect(git(previous, 'rev-parse', 'HEAD')).toBe(host.first);
   expect(await receiptCommit(instanceMarkerFile(previous))).toBe(host.first);
   expect(await runtimeCommit(previous)).toBe(host.first);
-  expect(await receiptCommit(host.paths.releasePreflightFile(id, 'previous'))).toBe(host.first);
+  expect(await receiptCommit(swapSlotReceipt(host.paths, id, 'previous'))).toBe(host.first);
   expect(await readOperationRecord(host.paths, id)).toBeUndefined();
   expect(await exists(host.paths.releaseRoot(id, 'next'))).toBe(false);
   const base = imageBase(runtime);
@@ -737,8 +738,8 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
       // It went on from its record: nothing was staged twice.
       expect(state.preflights).toHaveLength(1);
       await expectUpdated(host, runtime, next, state, ran);
-      expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
-      expect(await readFile(path.join(runtime.checkout_realpath, MEMORY), 'utf8')).toContain('mornings');
+      expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
+      expect(await readFile(path.join(runtime.checkout_root, MEMORY), 'utf8')).toContain('mornings');
       expect(state.running).toBe(true);
       const target = `dogfood ${next.commit.slice(0, 12)}`;
       expect(out).toContain(
@@ -792,7 +793,7 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
     const state = world(runtime);
     const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     const { run, err, out } = cli(host, state, next, runtime);
     failing.recordedWrite = true;
 
@@ -808,7 +809,7 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
     expect(git(live, 'rev-parse', 'HEAD')).toBe(next.commit);
     expect(await receiptCommit(instanceMarkerFile(live))).toBe(next.commit);
-    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(next.commit);
+    expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(next.commit);
     expect(state.tags.get(`${imageBase(runtime)}:previous`)).toBe(ran);
     expect(state.running).toBe(true);
     expect((await readOperationRecord(host.paths, id))?.phase).toBe('verified');
@@ -845,7 +846,7 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
 
     expect(state.serviceCalls.filter((call) => call.startsWith('stop')).length).toBe(stops + 1);
     await expectUpdated(host, runtime, next, state, ran);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
     // The release kept for rollback is the state as the old host last left it.
     expect(messages(host.paths.releaseCheckoutRoot(runtime.instance_id, 'previous'))).toEqual(['m1', 'm2']);
   });
@@ -874,7 +875,7 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
       expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
       await expectUpdated(host, runtime, next, state, ran);
-      expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+      expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
       expect(messages(host.paths.releaseCheckoutRoot(runtime.instance_id, 'previous'))).toEqual(['m1', 'm2']);
     },
   );
@@ -899,8 +900,8 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
     expect(await cli(host, state, second, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
 
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, second.commit));
-    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(second.commit);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(second.commit);
+    expect(messages(runtime.checkout_root)).toEqual(['m1', 'm2']);
     const previous = host.paths.releaseCheckoutRoot(id, 'previous');
     expect(git(previous, 'rev-parse', 'HEAD')).toBe(first.commit);
     expect(messages(previous)).toEqual(['m1', 'm2']);
@@ -946,10 +947,10 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     state.hangAt = 'stop';
     await killDuringCutover(host, runtime, state, next);
     // Something migrated the live database while the update waited to stop it.
-    applying(FAILING_MIGRATION)(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
+    applying(FAILING_MIGRATION)(path.join(runtime.checkout_root, 'data', 'v2.db'));
     delete state.hangAt;
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     const staging = host.paths.releaseRoot(id, 'next');
     const liveBefore = await snapshot(live, centralSideFiles(live));
     const stagingBefore = await snapshot(staging);
@@ -983,7 +984,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const state = world(runtime);
     const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     const before = await snapshot(live);
     // A leftover opener, idle: an operator's sqlite3 shell on a session database.
     state.openFiles = `p4242\ncsqlite3\nf5\nn${path.join(live, SESSION, 'inbound.db')}\n`;
@@ -1026,7 +1027,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     // Another assistant's agents run on, which is no concern of A's; one of A's own stays after the drain.
     state.containers.set(installLabel(b), ['b0b0b0b0b0b0']);
     state.containers.set(installLabel(a), ['a0a0a0a0a0a0']);
-    const live = a.checkout_realpath;
+    const live = a.checkout_root;
     const before = await snapshot(live);
     const { run, err } = cli(host, state, next, a);
     const id = a.instance_id;
@@ -1050,7 +1051,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     const runtime = await assistant(host);
     const next = await nextRelease(host);
     const state = world(runtime);
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     state.openFiles = `p4242\ncsqlite3\nf5\nn${path.join(live, 'data', 'v2.db')}\n`;
     state.startFails = true;
     const { run, err } = cli(host, state, next, runtime);
@@ -1075,7 +1076,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const state = world(runtime);
     const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     state.onStamp = () => {
       state.openFiles = `p5150\ncnode\nf9\nn${path.join(live, 'data', 'v2.db')}\n`;
     };
@@ -1156,7 +1157,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
       expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(
         release(host, host.first),
       );
-      expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(host.first);
+      expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(host.first);
       expect(state.running).toBe(true);
     },
   );
@@ -1207,10 +1208,10 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     expect(out).toContain(`Assistant ${id} was rolled back to dogfood ${host.first.slice(0, 12)}.`);
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
-    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(host.first);
-    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
+    expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(host.first);
+    expect(await receiptCommit(swapLiveReceipt(host.paths, id))).toBe(host.first);
     expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(ran);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
     expect(state.running).toBe(true);
   });
 
@@ -1247,7 +1248,7 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
     expect(summary).toContain('so it was rolled back');
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
-    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(host.first);
+    expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(host.first);
     expect(state.running).toBe(true);
   });
 });
@@ -1257,7 +1258,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     await write(live, 'data/circuit-breaker.json', '{"crashes":4}');
     const next = await nextRelease(host);
     const state = world(runtime, applying(ADDED_MIGRATION));
@@ -1353,7 +1354,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
-    const session = path.join(runtime.checkout_realpath, SESSION);
+    const session = path.join(runtime.checkout_root, SESSION);
     // Named as databases are, with side files beside them, but no SQLite database: opened, they would fail the
     // cutover. The last two even begin with SQLite's header, and SQLite deletes such a file's side file as it
     // refuses it.
@@ -1378,7 +1379,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     for (const [file, contents] of Object.entries(planted)) {
       expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
     }
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(runtime.checkout_root)).toEqual(['m1']);
   });
 
   it('refuses the cutover when a session mailbox it owns cannot be settled, naming it, and serves the old release again', async () => {
@@ -1387,7 +1388,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     await converse(runtime, 'm1');
     const next = await nextRelease(host);
     const state = world(runtime);
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     const inbound = path.join(live, SESSION, 'inbound.db');
     const forged = `${SQLITE_HEADER}${'junk'.repeat(256)}`;
     const id = runtime.instance_id;
@@ -1416,7 +1417,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
-    const pipe = path.join(runtime.checkout_realpath, SESSION, 'outbound.db');
+    const pipe = path.join(runtime.checkout_root, SESSION, 'outbound.db');
     execFileSync('mkfifo', [pipe]);
     await writeFile(`${pipe}-journal`, 'Not a journal.\n');
     // A writer waiting on the pipe: whatever opens it to read is let go at once instead of hanging the test, and
@@ -1431,7 +1432,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
       expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
       await expectUpdated(host, runtime, next, state, ran);
-      expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+      expect(messages(runtime.checkout_root)).toEqual(['m1']);
       // Nothing opened the pipe: its writer still waits.
       expect(await Promise.race([exited, delay(250).then(() => 'waiting' as const)])).toBe('waiting');
     } finally {
@@ -1444,7 +1445,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
     const id = runtime.instance_id;
-    const live = runtime.checkout_realpath;
+    const live = runtime.checkout_root;
     // A mirror of the release repository, whose own track carries a release the original does not.
     const mirror = path.join(host.root, 'mirror.git');
     git(host.root, 'clone', '--quiet', '--bare', host.remote, mirror);
@@ -1484,7 +1485,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     // The host was killed: its lease row was never marked stopped, and has not expired.
-    const database = new Database(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
+    const database = new Database(path.join(runtime.checkout_root, 'data', 'v2.db'));
     try {
       database.exec(`CREATE TABLE host_instances (
         instance_id TEXT PRIMARY KEY, install_id TEXT, hostname TEXT, pid INTEGER,
@@ -1550,7 +1551,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await cli(host, state, second, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
     const id = runtime.instance_id;
-    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(second.commit);
+    expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(second.commit);
     expect(git(host.paths.releaseCheckoutRoot(id, 'previous'), 'rev-parse', 'HEAD')).toBe(first.commit);
     expect(await exists(host.paths.releaseRoot(id, 'superseded'))).toBe(false);
     expect(state.tags.get(`${base}:previous`)).toBe(ran);
@@ -1589,7 +1590,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
 
       expect(await cli(host, state, second, runtime).run(['update', '--id', id, '--yes'])).toBe(fails ? 1 : 0);
 
-      expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(fails ? first.commit : second.commit);
+      expect(git(runtime.checkout_root, 'rev-parse', 'HEAD')).toBe(fails ? first.commit : second.commit);
       expect(await readOperationRecord(host.paths, id)).toBeUndefined();
       const after = tagged();
       expect(after).toEqual(fails ? before : { ...before, previous: before.latest });
@@ -1615,7 +1616,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const identifiers = [
       b.instance_id,
       b.install_id,
-      b.checkout_realpath,
+      b.checkout_root,
       b.onecli_project,
       imageBase(b),
       String(b.allocated_ports.nanoclaw_webhook),
@@ -1701,7 +1702,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
 
   it('builds a separate image for an assistant whose .env asks for other build flags', async () => {
     const { host, a, b, next, state } = await pair();
-    const environment = path.join(b.checkout_realpath, '.env');
+    const environment = path.join(b.checkout_root, '.env');
     await writeFile(
       environment,
       (await readFile(environment, 'utf8')).replace('INSTALL_CJK_FONTS=true', 'INSTALL_CJK_FONTS=false'),
@@ -1915,7 +1916,7 @@ describe("main's template across an update (R11)", GIT_HEAVY, () => {
     // Each entry by type, mode, and content: the carry keeps modification times only to the millisecond.
     const main = async () =>
       new Map(
-        [...(await snapshot(path.join(runtime.checkout_realpath, MAIN_FOLDER)))].map(([entry, facts]) => [
+        [...(await snapshot(path.join(runtime.checkout_root, MAIN_FOLDER)))].map(([entry, facts]) => [
           entry,
           facts.replace(/^file (\d+) \S+ /u, 'file $1 '),
         ]),

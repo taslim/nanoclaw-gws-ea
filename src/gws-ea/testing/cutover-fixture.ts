@@ -11,7 +11,7 @@
  * with `removeTemporaryRoots`.
  */
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { cp, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -30,7 +30,7 @@ import { CONTROL_PLANE_ROOT, instanceRuntimeFile, resolveControlPlanePaths, type
 import type { Observation } from '../phases.js';
 import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from '../pins.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from '../process.js';
-import { allocateInstanceId, getInstanceReservation } from '../registry.js';
+import { getInstanceReservation } from '../registry.js';
 import type { ReleasePreflightInput } from '../release-preflight.js';
 import type { ToolProviderSetup } from '../release-target.js';
 import {
@@ -234,7 +234,7 @@ export function releaseAgentImageKey(release: Release, flags: { readonly install
  * and one an image of its own.
  */
 export function centralDatabase(runtime: InstanceRuntimeConfig): void {
-  const database = new Database(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
+  const database = new Database(path.join(runtime.checkout_root, 'data', 'v2.db'));
   try {
     database.pragma('journal_mode = WAL');
     database.exec(`
@@ -276,10 +276,9 @@ export async function assistant(
   gateway: string = DEPLOYED_GATEWAY,
 ): Promise<InstanceRuntimeConfig> {
   const { paths } = host;
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     source_remote: host.remote,
     release_track: 'dogfood',
     deployed_commit: host.first,
@@ -309,7 +308,7 @@ export async function assistant(
     gatewayPort: reserved.allocated_ports.onecli_gateway,
     dockerEndpoint: DOCKER,
   });
-  const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+  const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
     nodePath: process.execPath,
     homeDirectory: host.root,
     selectedProvider: 'claude',
@@ -324,8 +323,9 @@ export async function assistant(
       { mode: 0o600 },
     ),
   );
+  await mkdir(path.dirname(paths.releasePreflightFile(instanceId, host.first)), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(instanceId),
+    paths.releasePreflightFile(instanceId, host.first),
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,
@@ -340,7 +340,7 @@ export async function assistant(
   await mkdir(onecli.rootDirectory, { recursive: true, mode: 0o700 });
   await writeFile(onecli.composeFile, renderOnecliCompose(onecli, COHORT, gateway), { mode: 0o600 });
   centralDatabase(runtime);
-  await stampMain(runtime.checkout_realpath);
+  await stampMain(runtime.checkout_root);
   return runtime;
 }
 
@@ -386,7 +386,7 @@ export async function stampMain(checkout: string): Promise<void> {
 
 /** What the assistant's conversations and memory hold: a session message row and a memory file. */
 export async function converse(runtime: InstanceRuntimeConfig, ...messages: readonly string[]): Promise<void> {
-  const session = path.join(runtime.checkout_realpath, SESSION);
+  const session = path.join(runtime.checkout_root, SESSION);
   await mkdir(session, { recursive: true, mode: 0o700 });
   const database = new Database(path.join(session, 'inbound.db'));
   try {
@@ -396,7 +396,7 @@ export async function converse(runtime: InstanceRuntimeConfig, ...messages: read
   } finally {
     database.close();
   }
-  await write(runtime.checkout_realpath, MEMORY, 'The principal prefers mornings.\n');
+  await write(runtime.checkout_root, MEMORY, 'The principal prefers mornings.\n');
 }
 
 export function messages(checkout: string): string[] {
@@ -961,10 +961,16 @@ export function release(host: Machine, commit: string): ReleaseCoordinates {
 export async function liveState(host: Machine, runtime: InstanceRuntimeConfig) {
   return {
     registered: releaseOf(await getInstanceReservation(host.paths, runtime.instance_id)),
-    head: git(runtime.checkout_realpath, 'rev-parse', 'HEAD'),
-    status: git(runtime.checkout_realpath, 'status', '--porcelain'),
-    receipt: await readFile(host.paths.releasePreflightFile(runtime.instance_id), 'utf8'),
-    migrations: readCentralMigrations(runtime.checkout_realpath),
+    head: git(runtime.checkout_root, 'rev-parse', 'HEAD'),
+    status: git(runtime.checkout_root, 'status', '--porcelain'),
+    receipt: await readFile(
+      host.paths.releasePreflightFile(
+        runtime.instance_id,
+        (await getInstanceReservation(host.paths, runtime.instance_id)).deployed_commit,
+      ),
+      'utf8',
+    ),
+    migrations: readCentralMigrations(runtime.checkout_root),
   };
 }
 

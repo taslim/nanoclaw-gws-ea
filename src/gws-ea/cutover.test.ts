@@ -23,7 +23,7 @@ import {
 } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -37,6 +37,7 @@ import {
   finishRollbackSwap,
   finishSwap,
   openFileHolders,
+  type QuietCheckout,
   restoreSetAsideState,
   reverseRollbackSwap,
   reverseRollbackSwapBeforeLiveMoved,
@@ -45,12 +46,13 @@ import {
   setAsideState,
   setAsideStateRoot,
   settleCheckoutDatabases,
-  type QuietCheckout,
+  swapLiveReceipt,
+  swapSlotReceipt,
 } from './cutover.js';
 import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { instanceMarkerFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { allocateInstanceId } from './registry.js';
+
 import { exists, removeTemporaryRoots, temporaryRoot } from './testing/cutover-fixture.js';
 import { GwsEaError } from './types.js';
 
@@ -562,12 +564,12 @@ async function readyToSwap(withOlder: boolean): Promise<{ paths: ControlPlanePat
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await checkoutAt(paths.checkoutRoot(instanceId), instanceId, FROM);
-  await writeFile(paths.releasePreflightFile(instanceId), receipt(instanceId, FROM), { mode: 0o600 });
+  await writeFile(swapLiveReceipt(paths, instanceId), receipt(instanceId, FROM), { mode: 0o600 });
   await checkoutAt(paths.releaseCheckoutRoot(instanceId, 'next'), instanceId, TO);
-  await writeFile(paths.releasePreflightFile(instanceId, 'next'), receipt(instanceId, TO), { mode: 0o600 });
+  await writeFile(swapSlotReceipt(paths, instanceId, 'next'), receipt(instanceId, TO), { mode: 0o600 });
   await mkdir(path.join(paths.releaseRoot(instanceId, 'next'), '.release-home'), { mode: 0o700 });
   const compose = path.join(paths.instanceRoot(instanceId), 'compose.yaml');
   await writeFile(compose, 'services: {}\n', { mode: 0o600 });
@@ -578,14 +580,14 @@ async function readyToSwap(withOlder: boolean): Promise<{ paths: ControlPlanePat
       release: { source_remote: 'https://example.test/nanoclaw.git', release_track: 'dogfood', deployed_commit: FROM },
       snapshot_at: '2026-09-28T10:00:00.000Z',
     },
-    receipt: paths.releasePreflightFile(instanceId),
+    receipt: swapLiveReceipt(paths, instanceId),
     compose,
     serviceDefinition: undefined,
     hostEnvironment: { WEBHOOK_PORT: '1' },
   });
   if (withOlder) {
     await checkoutAt(paths.releaseCheckoutRoot(instanceId, 'previous'), instanceId, OLDER);
-    await writeFile(paths.releasePreflightFile(instanceId, 'previous'), receipt(instanceId, OLDER), { mode: 0o600 });
+    await writeFile(swapSlotReceipt(paths, instanceId, 'previous'), receipt(instanceId, OLDER), { mode: 0o600 });
   }
   return { paths, instanceId };
 }
@@ -602,10 +604,10 @@ async function layout(paths: ControlPlanePaths, instanceId: string) {
   const kept = (slot: string) => keptReleaseFiles(path.join(root, slot));
   return {
     live: await commit(paths.checkoutRoot(instanceId)),
-    liveReceipt: await deployed(paths.releasePreflightFile(instanceId)),
+    liveReceipt: await deployed(swapLiveReceipt(paths, instanceId)),
     next: await exists(paths.releaseRoot(instanceId, 'next')),
     staged: await commit(paths.releaseCheckoutRoot(instanceId, 'next')),
-    stagedReceipt: await deployed(paths.releasePreflightFile(instanceId, 'next')),
+    stagedReceipt: await deployed(swapSlotReceipt(paths, instanceId, 'next')),
     stagedKept: await deployed(keptReleaseFiles(stagedKeptFilesRoot(paths, instanceId)).receipt),
     previous: await commit(paths.releaseCheckoutRoot(instanceId, 'previous')),
     previousReceipt: await deployed(kept('previous').receipt),
@@ -751,7 +753,7 @@ describe('swapping the releases', () => {
     await finishSwap(paths, instanceId, { from: FROM, to: TO });
     // The reversal had made next/ again and moved the promoted receipt back into it, then was killed.
     await mkdir(paths.releaseRoot(instanceId, 'next'), { mode: 0o700 });
-    await rename(paths.releasePreflightFile(instanceId), paths.releasePreflightFile(instanceId, 'next'));
+    await rename(swapLiveReceipt(paths, instanceId), swapSlotReceipt(paths, instanceId, 'next'));
 
     await reverseSwap(paths, instanceId, { from: FROM, to: TO });
 
@@ -798,10 +800,10 @@ async function readyToRollBack(withSetAside: boolean): Promise<{ paths: ControlP
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await checkoutAt(paths.checkoutRoot(instanceId), instanceId, TO);
-  await writeFile(paths.releasePreflightFile(instanceId), receipt(instanceId, TO), { mode: 0o600 });
+  await writeFile(swapLiveReceipt(paths, instanceId), receipt(instanceId, TO), { mode: 0o600 });
   await checkoutAt(paths.releaseCheckoutRoot(instanceId, 'previous'), instanceId, FROM);
   const previous = paths.releaseRoot(instanceId, 'previous');
   await writeFile(keptReleaseFiles(previous).receipt, receipt(instanceId, FROM), { mode: 0o600 });
@@ -816,7 +818,7 @@ async function readyToRollBack(withSetAside: boolean): Promise<{ paths: ControlP
       release: { source_remote: 'https://example.test/nanoclaw.git', release_track: 'dogfood', deployed_commit: TO },
       snapshot_at: '2026-09-28T11:00:00.000Z',
     },
-    receipt: paths.releasePreflightFile(instanceId),
+    receipt: swapLiveReceipt(paths, instanceId),
     compose,
     serviceDefinition: undefined,
     hostEnvironment: { WEBHOOK_PORT: '1' },
@@ -837,7 +839,7 @@ async function rollbackLayout(paths: ControlPlanePaths, instanceId: string) {
   const restored = path.join(paths.releaseRoot(instanceId, 'outgoing'), 'restored');
   return {
     live: await commit(paths.checkoutRoot(instanceId)),
-    liveReceipt: await deployed(paths.releasePreflightFile(instanceId)),
+    liveReceipt: await deployed(swapLiveReceipt(paths, instanceId)),
     previous: await commit(paths.releaseCheckoutRoot(instanceId, 'previous')),
     previousReceipt: await deployed(keptReleaseFiles(previous).receipt),
     previousState: await exists(setAsideStateRoot(previous)),
@@ -973,7 +975,7 @@ describe("swapping a rollback's releases", () => {
     // The return had moved the rest of previous/ back and the restored receipt with it, then was killed.
     const previous = paths.releaseRoot(instanceId, 'previous');
     await rename(path.join(paths.releaseRoot(instanceId, 'outgoing'), 'restored'), previous);
-    await rename(paths.releasePreflightFile(instanceId), keptReleaseFiles(previous).receipt);
+    await rename(swapLiveReceipt(paths, instanceId), keptReleaseFiles(previous).receipt);
 
     await reverseRollbackSwap(paths, instanceId, releases(false));
 
@@ -1016,7 +1018,7 @@ describe("setting a kept release's own state aside", () => {
       [kept, 'kept'],
       [live, 'live'],
     ] as const) {
-      await checkoutAt(checkout, allocateInstanceId(), who === 'kept' ? FROM : TO);
+      await checkoutAt(checkout, randomUUID(), who === 'kept' ? FROM : TO);
       await write(checkout, 'data/gws-ea/runtime.json', `{"release":"${who}"}`);
       await write(checkout, 'data/circuit-breaker.json', `{"crashes":"${who}"}`);
       await write(checkout, 'groups/main/CLAUDE.local.md', `${who} memory\n`, 0o640);

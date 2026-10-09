@@ -71,7 +71,6 @@ export interface ExclusiveResourceClaims {
 
 export interface InstanceReservationInput {
   instance_id: string;
-  checkout_realpath: string;
   release_track: string;
   source_remote: string;
   deployed_commit: string;
@@ -79,7 +78,16 @@ export interface InstanceReservationInput {
   exclusive_resource_claims: ExclusiveResourceClaims;
 }
 
-export type InstanceReservation = Readonly<InstanceReservationInput>;
+export type InstanceReservation = Readonly<
+  InstanceReservationInput & {
+    /**
+     * The checkout an assistant created before releases recorded; its presence
+     * marks the entry unconverted (`release-convert.ts`). Read only by the
+     * legacy locator, never written by a create, and dropped by the conversion.
+     */
+    checkout_realpath?: string;
+  }
+>;
 
 /**
  * Which release a reservation deploys: the only reservation fields an update
@@ -120,10 +128,10 @@ export function ingressEndpointUrl(claim: IngressClaim): string {
   return claim.mode === 'existing' ? claim.endpoint_url : claim.callback_url;
 }
 
+/** Names the assistant a `state/` belongs to; which release runs is the live link and its Git HEAD (KTD2). */
 export interface InstanceMarker {
   schema_version: typeof INSTANCE_MARKER_SCHEMA_VERSION;
   instance_id: string;
-  deployed_commit: string;
 }
 
 /** Structured, non-secret facts about a failure, for rendering and diagnosis. */
