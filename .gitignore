@@ -20,6 +20,7 @@ groups/*
 data
 store
 groups
+logs
 
 # Per-group memory (CLAUDE.local.md) must never be committed.
 **/CLAUDE.local.md
