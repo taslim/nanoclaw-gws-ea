@@ -327,7 +327,12 @@ registerResource({
         { name: 'end', type: 'string', description: 'End time, local 24-hour HH:MM (24:00 for midnight).' },
         { name: 'off', type: 'boolean', description: 'working-hours: the principal does not work that day.' },
         ID_ARG,
-        { name: 'reason', type: 'string', description: 'protected-window: why the time is protected.' },
+        {
+          name: 'reason',
+          type: 'string',
+          description:
+            'protected-window: why the time is protected. Left out, a change keeps the reason; "" clears it.',
+        },
         MEETING_KIND_ARG,
         { name: 'minutes', type: 'number', description: 'meeting-length, buffer: whole minutes.' },
       ],

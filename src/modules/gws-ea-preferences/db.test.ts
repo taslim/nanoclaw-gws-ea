@@ -411,6 +411,19 @@ describe('GWS-EA scheduling preferences store', () => {
     expect((await getSchedulingPreferences()).protected_windows).toContainEqual(
       expect.objectContaining({ id: lunch.id, reason: 'Lunch with family.' }),
     );
+    // A blank reason clears it.
+    expect(
+      await setSchedulingPreference({
+        kind: 'protected-window',
+        id: lunch.id,
+        weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'],
+        start: '12:00',
+        end: '13:00',
+        reason: '',
+        source: 'principal',
+        basis: 'Said the reason no longer matters.',
+      }),
+    ).toMatchObject({ id: lunch.id, reason: null });
 
     const focus = await setSchedulingPreference({
       kind: 'protected-window',

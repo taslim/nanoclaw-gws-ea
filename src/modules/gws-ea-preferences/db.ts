@@ -422,7 +422,8 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
       const weekdays = parseWeekdays(input.weekdays);
       const range = parseRange(input);
       const given = parseReason(input.reason);
-      // A write that gives no reason keeps the window's own: relearning a window never erases why it is protected.
+      // A write that leaves the reason out keeps the window's own, so relearning it never erases why it is
+      // protected; a blank reason clears it.
       const { id, reason } = await db.transaction(async () => {
         const sameShape = await db.get<{ readonly id: string; readonly reason: string | null }>(
           `SELECT id, reason FROM gws_ea_pref_protected_windows
@@ -435,7 +436,7 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
         let kept: string | null;
         if (input.id === undefined) {
           target = sameShape?.id ?? newWindowId();
-          kept = given ?? sameShape?.reason ?? null;
+          kept = input.reason === undefined ? (sameShape?.reason ?? null) : given;
         } else {
           target = input.id.trim();
           const existing = await db.get<{ readonly reason: string | null }>(
@@ -446,7 +447,7 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
           if (sameShape && sameShape.id !== target) {
             throw new Error(`Protected window ${sameShape.id} already protects those days and hours`);
           }
-          kept = given ?? existing.reason;
+          kept = input.reason === undefined ? existing.reason : given;
         }
         await db.run(
           `INSERT INTO gws_ea_pref_protected_windows
