@@ -12,13 +12,19 @@
  * reason; a probe that throws becomes its own result, so one failing
  * observation never hides another. An unfinished update or rollback never
  * stops either command (R16): both show it, with the command that continues
- * or reverts it. Both exit 0 once they observed, whatever the health; an
- * unknown assistant ID exits 1.
+ * or reverts it. Both work in every phase (R9): while a switch has fenced the
+ * assistant they read its `state/` and `logs/` physically, and one on the
+ * layout before releases, or moving off it, is shown by its record with the
+ * update that converts it (KTD11). Both exit 0 once they observed, whatever
+ * the health; an unknown assistant ID exits 1.
  */
 import { createHash } from 'node:crypto';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
+import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
+import { taggedImageId } from './agent-image.js';
+import { releaseImageTag } from './agent-image-release.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
 import {
   createCloudflareConnectorLayout,
@@ -47,10 +53,12 @@ import {
 } from './operation.js';
 import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
-import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
+import { isConverting, legacyInstanceRoot } from './release-convert.js';
+import { readCurrent } from './release-layout.js';
 import { sameSchema } from './rollback.js';
 import {
   hostLogFiles,
@@ -122,6 +130,10 @@ export interface DeliveryView {
 export interface CheckoutFacts {
   readonly commit: string | null;
 }
+export interface ImageFacts {
+  /** The live release's tag, `<base>:r-<release>`. */
+  readonly tag: string | null;
+}
 export interface ServiceFacts {
   readonly state: ServiceState;
 }
@@ -160,6 +172,8 @@ export interface WorkspaceFacts {
 export interface AssistantProbes {
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
+  /** The live release's own agent image, which its host runs agents on (KTD6). */
+  readonly image: ProbeResult & ImageFacts;
   /** The host's service, as NanoClaw's own service helpers detect it. */
   readonly service: ProbeResult & ServiceFacts;
   /** The host's own status over its CLI socket: webhook open, Google Chat connected. */
@@ -189,6 +203,7 @@ export interface AssistantProbes {
 
 export const PROBE_NAMES = [
   'checkout',
+  'image',
   'service',
   'host',
   'onecli',
@@ -223,11 +238,26 @@ export type OperationView =
       })
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
 
+/**
+ * Where the assistant stands between releases and layouts (R9): `live` while
+ * the live link names a release; `fenced` while a switch has removed it, so
+ * nothing can start the host; `converting` while its one-time conversion to
+ * the release layout is under way; `legacy` while it is still on the layout
+ * before releases; `unknown` when that cannot be read.
+ */
+export type PhaseView =
+  | { readonly state: 'live'; readonly release: string }
+  | { readonly state: 'fenced' }
+  | { readonly state: 'converting'; readonly continue_with: string }
+  | { readonly state: 'legacy'; readonly convert_with: string }
+  | { readonly state: 'unknown'; readonly reason: string };
+
 export interface ListedAssistant {
   readonly instance_id: string;
   readonly hostname: string;
   readonly track: string;
   readonly deployed_commit: string;
+  readonly phase: PhaseView;
   /** Whether the tool's release is ahead of it, as `status` reports it. */
   readonly release: ReleaseView;
   readonly service: { readonly state: ServiceState; readonly reason: string | null };
@@ -273,17 +303,29 @@ export interface SchemaView {
   readonly reason: string | null;
 }
 
-export interface AssistantStatus {
+/**
+ * What `status` shows of every assistant. One whose state is not all in its
+ * own root yet, on the layout before releases or moving off it, is shown by
+ * this alone: none of the observers would find what they read.
+ */
+export interface AssistantRecordStatus {
   readonly instance_id: string;
   readonly observed_at: string;
+  readonly phase: PhaseView;
   readonly registry: RegistryView;
   readonly operation: OperationView;
   readonly removal_in_progress: boolean;
   readonly release: ReleaseView;
+}
+
+/** An assistant whose state is all in its own root, observed through every probe. */
+export interface ObservedAssistantStatus extends AssistantRecordStatus {
   readonly rollback: RollbackView;
   readonly schema: SchemaView;
   readonly probes: AssistantProbes;
 }
+
+export type AssistantStatus = AssistantRecordStatus | ObservedAssistantStatus;
 
 /** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
@@ -520,6 +562,42 @@ function removalInProgress(paths: ControlPlanePaths, instanceId: string): Promis
   return isRegularFile(paths.removalFile(instanceId));
 }
 
+/** Whether the assistant's state is all in its own root: false on the layout before releases, or moving off it. */
+function inOwnRoot(paths: ControlPlanePaths, reservation: InstanceReservation): boolean {
+  return legacyInstanceRoot(paths, reservation) === undefined;
+}
+
+/** Where the assistant stands between releases and layouts, read physically, never through the live link. */
+async function observePhase(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<PhaseView> {
+  const id = reservation.instance_id;
+  const update = `gws-ea update --id ${id}`;
+  try {
+    if (await isConverting(paths, id)) return { state: 'converting', continue_with: update };
+    if (!inOwnRoot(paths, reservation)) return { state: 'legacy', convert_with: update };
+    const live = await readCurrent(paths.instanceLayout(id));
+    return live === undefined ? { state: 'fenced' } : { state: 'live', release: live };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A phase that cannot be read is reported, never thrown.
+  } catch (error) {
+    return { state: 'unknown', reason: failure(error).reason ?? '' };
+  }
+}
+
+/** What an operator is told of the assistant's phase, naming what moves it on where a command does. */
+function phaseDetail(phase: PhaseView): string {
+  switch (phase.state) {
+    case 'live':
+      return `Release ${phase.release} is live.`;
+    case 'fenced':
+      return 'No release is live: a switch has fenced it, so nothing can start its host.';
+    case 'converting':
+      return `Its conversion to the release layout is unfinished; continue it with ${phase.continue_with}.`;
+    case 'legacy':
+      return `It is on the legacy layout: run ${phase.convert_with} to convert it.`;
+    case 'unknown':
+      return `Which release is live cannot be read: ${phase.reason}`;
+  }
+}
+
 /** Everything one status observation shares, read once. */
 interface Subject {
   readonly context: ObservationContext;
@@ -558,6 +636,28 @@ async function checkoutProbe({
     if (isErrno(error, 'ENOENT')) return { status: 'degraded', reason: 'The live checkout is missing.', commit: null };
     throw error;
   }
+}
+
+/** The live release's own agent image, `<base>:r-<release>`, which its host runs agents on (KTD6). */
+async function imageProbe({
+  context,
+  reservation,
+  runtime: record,
+  observers,
+}: Subject): Promise<ProbeResult & ImageFacts> {
+  const runtime = requireRuntime(record);
+  const live = await readCurrent(context.paths.instanceLayout(reservation.instance_id));
+  if (live === undefined) throw new Unobservable('No release is live, so no agent image is in use.');
+  const tag = releaseImageTag(getInstallScopedNames(runtime.install_id).containerImageBase, live);
+  const docker = {
+    run: observers.runCommand,
+    cwd: CONTROL_PLANE_ROOT,
+    env: buildToolEnvironment(process.env, { DOCKER_HOST: runtime.docker_endpoint }),
+  };
+  if ((await taggedImageId(docker, tag)) === undefined) {
+    return { status: 'degraded', reason: `Its agent image ${tag} is missing, so no agent can start.`, tag };
+  }
+  return { ...OK, tag };
 }
 
 /** Upstream's messages name the checkout-relative error log; point at this assistant's physical one. */
@@ -993,17 +1093,39 @@ export async function observeAssistantStatus(
   const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const observers = resolveObservers(context.observers);
   const inspection = await inspect(context.paths, reservation);
-  const [runtime, removal] = await Promise.all([
-    readRuntimeRecord(context.paths, reservation),
+  const [phase, removal, release] = await Promise.all([
+    observePhase(context.paths, reservation),
     removalInProgress(context.paths, instanceId),
+    observeRelease({ context, reservation, observers }),
   ]);
+  const ingress = reservation.exclusive_resource_claims.ingress;
+  const record: AssistantRecordStatus = {
+    instance_id: reservation.instance_id,
+    observed_at: observedAt,
+    phase,
+    registry: {
+      hostname: hostnameOf(ingress),
+      endpoint_url: ingressEndpointUrl(ingress),
+      ingress_mode: ingress.mode,
+      track: reservation.release_track,
+      source_remote: reservation.source_remote,
+      deployed_commit: reservation.deployed_commit,
+    },
+    operation: operationView(inspection),
+    removal_in_progress: removal,
+    release,
+  };
+  if (!inOwnRoot(context.paths, reservation)) return record;
+
+  const runtime = await readRuntimeRecord(context.paths, reservation);
   const subject: Subject = { context, observers, reservation, inspection, runtime };
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
   const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
-  const managed = reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare';
+  const managed = ingress.mode === 'managed-cloudflare';
   const [
     checkout,
+    image,
     service,
     host,
     onecli,
@@ -1015,10 +1137,10 @@ export async function observeAssistantStatus(
     route,
     connector,
     delivery,
-    release,
     rollback,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
+    probe<ImageFacts>(() => imageProbe(subject), { tag: null }),
     observeService(context, runtime),
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
@@ -1035,28 +1157,15 @@ export async function observeAssistantStatus(
     probe(() => routeProbe(subject), {}),
     managed ? probe<ConnectorFacts>(() => connectorProbe(subject), { drift: null }) : undefined,
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
-    observeRelease(subject),
     observeRollback(subject, live),
   ]);
-  const ingress = reservation.exclusive_resource_claims.ingress;
   return {
-    instance_id: reservation.instance_id,
-    observed_at: observedAt,
-    registry: {
-      hostname: hostnameOf(ingress),
-      endpoint_url: ingressEndpointUrl(ingress),
-      ingress_mode: ingress.mode,
-      track: reservation.release_track,
-      source_remote: reservation.source_remote,
-      deployed_commit: reservation.deployed_commit,
-    },
-    operation: operationView(inspection),
-    removal_in_progress: removal,
-    release,
+    ...record,
     rollback,
     schema: schemaView(live),
     probes: {
       checkout,
+      image,
       service,
       host,
       onecli,
@@ -1075,6 +1184,8 @@ export async function observeAssistantStatus(
 /**
  * Every registered assistant, from local state only (R1): the registry, cheap
  * service detection, and where each stands against the tool's own release.
+ * An assistant whose state is not all in its own root yet has no runtime
+ * record there to find its service by.
  */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
   const registry = await readRegistry(context.paths);
@@ -1088,17 +1199,21 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
   const assistants = await Promise.all(
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
-      const [runtime, removal, release] = await Promise.all([
-        readRuntimeRecord(context.paths, reservation),
+      const [phase, removal, release, observed] = await Promise.all([
+        observePhase(context.paths, reservation),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
+        inOwnRoot(context.paths, reservation)
+          ? readRuntimeRecord(context.paths, reservation).then((runtime) => observeService(context, runtime))
+          : undefined,
       ]);
-      const service = await observeService(context, runtime);
+      const service = observed ?? { state: 'unknown' as const, reason: phaseDetail(phase) };
       return {
         instance_id: reservation.instance_id,
         hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
         track: reservation.release_track,
         deployed_commit: reservation.deployed_commit,
+        phase,
         release,
         service: { state: service.state, reason: service.reason },
         operation: operationView(inspection),
@@ -1142,8 +1257,8 @@ export function unfinishedOperation(
     }
     case 'failed':
       return (
-        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed, and so did going back ` +
-        `(${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
+        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed and left no release ` +
+        `to return to (${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
       );
     case 'unreadable':
       return `Its update or rollback record cannot be read: ${operation.message}`;
@@ -1191,7 +1306,7 @@ function behindCell(release: ReleaseView): string {
 function renderList(listing: AssistantListing): string[] {
   if (listing.assistants.length === 0) return ['No assistants are registered on this machine.'];
   const rows = [
-    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'OPERATION'],
+    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'PHASE', 'OPERATION'],
     ...listing.assistants.map((assistant) => [
       assistant.instance_id,
       assistant.hostname,
@@ -1199,13 +1314,17 @@ function renderList(listing: AssistantListing): string[] {
       shortCommit(assistant.deployed_commit),
       behindCell(assistant.release),
       assistant.service.state,
+      assistant.phase.state,
       assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation),
     ]),
   ];
-  const details = listing.assistants.flatMap((assistant) =>
-    operationDetail(assistant.instance_id, assistant.operation, assistant.removal_in_progress).map(
-      (line) => `${assistant.instance_id}: ${line}`,
-    ),
+  // Beside the table: a conversion to start or finish, or a phase that cannot be read. A fenced assistant's
+  // operation names what moves it on.
+  const details = listing.assistants.flatMap(({ instance_id: id, phase, operation, removal_in_progress: removal }) =>
+    [
+      ...(phase.state === 'live' || phase.state === 'fenced' ? [] : [phaseDetail(phase)]),
+      ...operationDetail(id, operation, removal),
+    ].map((line) => `${id}: ${line}`),
   );
   return [...table(rows), ...(details.length > 0 ? ['', ...details] : [])];
 }
@@ -1234,6 +1353,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
   switch (name) {
     case 'checkout':
       return probes.checkout.commit ? `at ${shortCommit(probes.checkout.commit)}` : '';
+    case 'image':
+      return probes.image.tag ?? '';
     case 'service':
       return probes.service.state;
     case 'main_identity':
@@ -1261,30 +1382,34 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
 }
 
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
-  const { registry, schema } = status;
+  const { registry } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
-  const schemaLine =
-    schema.central_fingerprint === null || schema.session_fingerprint === null
-      ? `unknown: ${schema.reason ?? ''}`
-      : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
+  const observed = 'probes' in status;
   const lines = [
     `Assistant ${status.instance_id}`,
     `  Hostname:  ${registry.hostname} (${ingress})`,
     `  Endpoint:  ${registry.endpoint_url}`,
     `  Track:     ${registry.track} from ${registry.source_remote}`,
+    `  Phase:     ${phaseDetail(status.phase)}`,
     `  Release:   ${releaseLine(status.instance_id, status.release)}`,
-    `  Rollback:  ${rollbackLine(status.rollback)}`,
+    ...(observed ? [`  Rollback:  ${rollbackLine(status.rollback)}`] : []),
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
-    `  Schema:    ${schemaLine}`,
-    'Probes:',
   ];
-  for (const name of PROBE_NAMES) {
-    const result = status.probes[name];
-    if (!result) continue;
-    const detail = result.reason ?? probeDetail(name, status.probes, timezone);
-    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
+  if (observed) {
+    const { schema } = status;
+    const schemaLine =
+      schema.central_fingerprint === null || schema.session_fingerprint === null
+        ? `unknown: ${schema.reason ?? ''}`
+        : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
+    lines.push(`  Schema:    ${schemaLine}`, 'Probes:');
+    for (const name of PROBE_NAMES) {
+      const result = status.probes[name];
+      if (!result) continue;
+      const detail = result.reason ?? probeDetail(name, status.probes, timezone);
+      lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
+    }
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
   return lines;
@@ -1298,21 +1423,24 @@ export const LIST_USAGE: readonly string[] = [
   'list [--json]',
   "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
   '       release is newer. JSON: {"assistants": [...]}, each with instance_id, hostname, track,',
-  '       deployed_commit, release (deployed_commit, tool_commit, behind_tool_release: true|false, or null',
-  '       with a reason when unknown), service (state: running|stopped|not_installed|unmanaged|unknown,',
-  '       reason), operation (state: none|open|recorded|unreadable), removal_in_progress.',
+  '       deployed_commit, phase (state: live with its release|fenced|converting|legacy|unknown), release',
+  '       (deployed_commit, tool_commit, behind_tool_release: true|false, or null with a reason when',
+  '       unknown), service (state: running|stopped|not_installed|unmanaged|unknown, reason), operation',
+  '       (state: none|open|failed|committed|unreadable), removal_in_progress.',
 ];
 
 export const STATUS_USAGE: readonly string[] = [
   'status --id <instance_id> [--json]',
   '       One assistant, observed live and read-only; it never repairs. JSON: instance_id, observed_at,',
-  '       registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
+  '       phase, registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, service, host, onecli, main_identity, external_email, inbox (state, since, last_success_at,',
-  '       calendar_notifications), workspace (account), principal, route, connector (managed',
-  '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
-  '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
+  '       probes: checkout, image (tag), service, host, onecli, main_identity, external_email, inbox (state,',
+  '       since, last_success_at, calendar_notifications), workspace (account), principal, route, connector',
+  '       (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a',
+  '       reason. Until its conversion moves its record, an assistant on the legacy layout has no rollback,',
+  '       schema, or probes. list and status exit 0 once they observed, whatever the health; status exits 1',
+  '       for an unknown ID.',
 ];
 
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {

@@ -152,6 +152,15 @@ describe('OneCLI runtime removal', () => {
         return { stdout: `${name}\n`, stderr: '' };
       }
       if (command.args[0] === 'compose' && command.args.includes('down')) {
+        // By the project's name alone: Compose finds what to remove by its labels, wherever its file now is.
+        expect(command.args).toEqual([
+          'compose',
+          '--project-name',
+          layout.project,
+          'down',
+          '--volumes',
+          '--remove-orphans',
+        ]);
         downCalls += 1;
         resourcesPresent = false;
         return { stdout: '', stderr: '' };

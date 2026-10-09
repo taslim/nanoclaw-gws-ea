@@ -1,4 +1,3 @@
-import { access } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -678,6 +677,13 @@ async function foreignPortError(
   return undefined;
 }
 
+/**
+ * Take the instance's OneCLI project down, its volumes with it, once every
+ * container and named resource in it is proven the instance's own. Compose
+ * is given the project's name alone and finds what to remove by its labels,
+ * so neither the Compose file nor the paths it names need be where they were
+ * written: a conversion moves them (KTD13).
+ */
 export async function removeOnecliRuntime(
   layout: OnecliRuntimeLayout,
   dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
@@ -691,16 +697,11 @@ export async function removeOnecliRuntime(
     }
   }
   const namedResources = await assertOwnedOnecliNamedResources(docker);
-  if (containers.length === 0 && namedResources.length === 0) {
-    try {
-      await access(layout.composeFile);
-    } catch (error) {
-      if (isErrno(error, 'ENOENT')) return;
-      throw error;
-    }
-  }
+  if (containers.length === 0 && namedResources.length === 0) return;
   await runner({
-    ...buildComposeInvocation(layout, ['down', '--volumes', '--remove-orphans']),
+    command: 'docker',
+    args: ['compose', '--project-name', layout.project, 'down', '--volumes', '--remove-orphans'],
+    cwd: path.dirname(layout.rootDirectory),
     env: environment,
     timeoutMs: 120_000,
     stream: true,

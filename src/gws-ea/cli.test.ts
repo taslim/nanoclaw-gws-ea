@@ -1,6 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,6 +41,7 @@ import { redact } from './redact.js';
 import { readRegistry } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type InstanceRuntimeConfig } from './service.js';
 import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
+import { legacyLocation } from './release-convert.js';
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
@@ -2018,6 +2031,28 @@ describe('gws-ea logs', () => {
 
     expect(logs.errors).toBe(path.join(paths.instanceRoot(a.instance_id), 'logs', 'nanoclaw.error.log'));
     expect(replacement?.args).toEqual(['cat', logs.errors]);
+  });
+
+  it("shows a legacy assistant's host log from its legacy checkout until its conversion moves the logs", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { checkout } = legacyLocation(paths, a.instance_id);
+    const legacy = await writeHostLogs(checkout);
+    await rm(paths.instanceLayout(a.instance_id).logs, { recursive: true, force: true });
+    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[a.instance_id] = { ...registry.instances[a.instance_id], checkout_realpath: checkout };
+    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
+
+    const before = await runReplacing(['logs', '--id', a.instance_id], { paths, ...lines().runtime });
+    // The conversion moves the checkout's logs into the assistant's root by rename.
+    await rename(path.dirname(legacy.output), paths.instanceLayout(a.instance_id).logs);
+    const after = await runReplacing(['logs', '--id', a.instance_id, '--errors'], { paths, ...lines().runtime });
+
+    expect(legacy.output).toBe(path.join(checkout, 'logs', 'nanoclaw.log'));
+    expect(before.replacement?.args).toEqual(['cat', legacy.output]);
+    expect(after.replacement?.args).toEqual(['cat', hostLogFiles(a.instance_root).errors]);
   });
 
   it('streams the host log as the file holds it', async () => {

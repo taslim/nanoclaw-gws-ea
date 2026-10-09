@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -29,10 +29,11 @@ import {
   type OperationFollowUp,
   type OperationPhase,
 } from './operation.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome, SanitizedCommandOutcomeRunner } from './process.js';
 import { readRegistry, swapInstanceRelease, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
-import { linkReleaseState, pointCurrent, releaseName, type InstanceLayout } from './release-layout.js';
+import { conversionRecordFile, legacyLocation } from './release-convert.js';
+import { fence, linkReleaseState, pointCurrent, releaseName, type InstanceLayout } from './release-layout.js';
 import {
   describeRemoval,
   RemovalPause,
@@ -538,12 +539,25 @@ class FakeDocker {
   }
 }
 
-/** Removal's local commands, Docker's answered by `docker`, with no stray host to find. */
-function teardownCommands(docker: FakeDocker, calls: string[] = []): SanitizedCommandOutcomeRunner {
+/**
+ * Removal's local commands, Docker's answered by `docker`, and `pkill -f` and
+ * `pgrep -f` by the command lines in `processes` their pattern matches (JS
+ * reads the extended regular expressions removal writes as POSIX does).
+ */
+function teardownCommands(
+  docker: FakeDocker,
+  calls: string[] = [],
+  processes = new Set<string>(),
+): SanitizedCommandOutcomeRunner {
   return async (command) => {
     calls.push(`${command.command} ${command.args.join(' ')}`);
     if (command.command === 'docker') return docker.run(command.args);
-    if (command.command === 'pkill' || command.command === 'pgrep') return failed('');
+    if (command.command === 'pkill' || command.command === 'pgrep') {
+      const pattern = new RegExp(command.args.at(-1) ?? '', 'u');
+      const matching = [...processes].filter((line) => pattern.test(line));
+      if (command.command === 'pkill') for (const line of matching) processes.delete(line);
+      return matching.length === 0 ? failed('') : ok(command.command === 'pgrep' ? '4242\n' : '');
+    }
     throw new Error(`Unexpected command: ${command.command} ${command.args.join(' ')}`);
   };
 }
@@ -1537,6 +1551,145 @@ describe('removal after an update or rollback', () => {
 
     expect([...docker.images]).toEqual([[identical, new Set([`${peerRepository}:r-bbbbbbbb`])]]);
     await expectGone(paths, input);
+  });
+});
+
+describe('removal in any phase and either layout', () => {
+  const RECORDED_DOCKER = 'unix:///var/run/recorded-docker.sock';
+  const EVERY_STEP = ['materialize_checkout', 'provision_gcp', 'start_onecli', 'start_nanoclaw'] as const;
+
+  /**
+   * An assistant as the layout before releases left it (`paths.ts` at
+   * 27245c7a): under `instances/<id>/`, the live checkout with the state and
+   * the host's logs inside it, the release it kept to roll back to, the live
+   * release's receipt, its secrets, its OneCLI folder, and its journal; its
+   * registry entry records the checkout. Nothing of it is in a short root.
+   */
+  async function legacyAssistant(paths: ControlPlanePaths, input: InstanceReservationInput) {
+    await reserve(paths, input, { checkout: false, started: EVERY_STEP });
+    const { root, checkout } = legacyLocation(paths, input.instance_id);
+    for (const directory of [
+      ...['data/gws-ea', 'groups', 'store', 'logs'].map((state) => path.join(checkout, state)),
+      path.join(root, 'previous', 'nanoclaw'),
+      path.join(root, 'onecli'),
+    ]) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+    }
+    await writeFile(path.join(checkout, '.env'), '', { mode: 0o600 });
+    await writePrivate(instanceRuntimeFile(checkout), {
+      home_directory: path.join(paths.stateRoot, 'home'),
+      docker_endpoint: RECORDED_DOCKER,
+    });
+    await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: input.instance_id });
+    await writeFile(path.join(root, 'onecli', 'compose.yaml'), 'services: {}\n', { mode: 0o600 });
+    await keepAccountToken(path.join(root, 'secrets', 'cloudflare-account-token'), 'account-token-canary');
+    await rename(paths.journalFile(input.instance_id), path.join(root, 'provision.json'));
+    await rm(paths.instanceRoot(input.instance_id), { recursive: true, force: true });
+    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[input.instance_id] = { ...registry.instances[input.instance_id], checkout_realpath: checkout };
+    await writePrivate(paths.registryFile, registry);
+    return { root, checkout };
+  }
+
+  /** Docker holding the assistant's images, containers, and OneCLI project, and the command line of its host. */
+  function running(input: InstanceReservationInput, host: string) {
+    const docker = new FakeDocker().assistant(
+      input,
+      { live: imageId('1'), kept: imageId('2'), group: imageId('3') },
+      { postgres: imageId('c'), app: imageId('d'), gateway: imageId('a') },
+    );
+    return { docker, processes: new Set([`/usr/local/bin/node ${host}/dist/index.js`]) };
+  }
+
+  it('removes an assistant on the legacy layout, its legacy root and every resource its journal there names', async () => {
+    const paths = await testPaths();
+    const input = reservationInput();
+    const { root, checkout } = await legacyAssistant(paths, input);
+    const { docker, processes } = running(input, checkout);
+    const { dependencies: faked, gcloud } = world(input);
+    const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...dependencies } = faked;
+    gcloud.owned();
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      runCommand: teardownCommands(docker, [], processes),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'gcp-project', 'onecli', 'instance-files']);
+    expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
+    expect(gcloud.mutations).toEqual(['projects delete']);
+    expect(processes).toEqual(new Set());
+    expect(docker.of(input)).toEqual({ tags: [], containers: [], networks: [], volumes: [] });
+    expect(await exists(root)).toBe(false);
+    await expectGone(paths, input);
+  });
+
+  it('removes an assistant mid-conversion: both roots, secrets included, though its state is half moved', async () => {
+    const paths = await testPaths();
+    const input = reservationInput();
+    const { root, checkout } = await legacyAssistant(paths, input);
+    // The conversion staged its release in the short root, recorded its progress, and moved `.env` into `state/`
+    // before it was cut short; `data`, with the marker, and the secrets are still in the legacy root.
+    const layout = paths.instanceLayout(input.instance_id);
+    await mkdir(layout.release('bbbbbbbb'), { recursive: true, mode: 0o700 });
+    await linkReleaseState(layout, 'bbbbbbbb');
+    await writePrivate(conversionRecordFile(paths, input.instance_id), { step: 'stopped', legacy_root: root });
+    await mkdir(layout.state, { mode: 0o700 });
+    await rename(path.join(checkout, '.env'), path.join(layout.state, '.env'));
+    const { docker, processes } = running(input, checkout);
+    const calls: string[] = [];
+    const { dependencies: faked, gcloud } = world(input);
+    const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...dependencies } = faked;
+    gcloud.owned();
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      runCommand: teardownCommands(docker, calls, processes),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'gcp-project', 'onecli', 'instance-files']);
+    expect(processes).toEqual(new Set());
+    expect(docker.of(input)).toEqual({ tags: [], containers: [], networks: [], volumes: [] });
+    // Compose takes the project down by its name alone, whichever root holds its file.
+    expect(calls).toContain(
+      `docker compose --project-name ${input.exclusive_resource_claims.onecli_project} down --volumes --remove-orphans`,
+    );
+    for (const gone of [root, path.join(root, 'secrets'), paths.instanceRoot(input.instance_id)]) {
+      expect(await exists(gone), gone).toBe(false);
+    }
+    await expectGone(paths, input);
+  });
+
+  it("removes a fenced assistant, finding its host by its root and leaving another assistant's", async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout', 'start_nanoclaw'] });
+    const peer = await reserve(paths, reservationInput({ label: 'peer', port: 34_001 }), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const layout = paths.instanceLayout(input.instance_id);
+    await mkdir(layout.release('aaaaaaaa'), { recursive: true, mode: 0o700 });
+    await linkReleaseState(layout, 'aaaaaaaa');
+    await fence(layout);
+    // Each host runs from the release folder the live link named when it started, never through the link.
+    const { docker, processes } = running(input, layout.release('aaaaaaaa'));
+    const peerHost = `/usr/local/bin/node ${paths.instanceLayout(peer.instance_id).release('aaaaaaaa')}/dist/index.js`;
+    processes.add(peerHost);
+    const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...dependencies } = world(input).dependencies;
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      runCommand: teardownCommands(docker, [], processes),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+    expect(processes).toEqual(new Set([peerHost]));
+    await expectGone(paths, input);
+    expect(await exists(paths.markerFile(peer.instance_id))).toBe(true);
   });
 });
 

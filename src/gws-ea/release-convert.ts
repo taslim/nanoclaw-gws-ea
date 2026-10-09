@@ -10,7 +10,7 @@
  */
 import path from 'node:path';
 
-import type { ControlPlanePaths } from './paths.js';
+import { isRegularFile, type ControlPlanePaths } from './paths.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 
 /** Where an unconverted assistant still lives, or undefined once it is converted. */
@@ -31,4 +31,28 @@ export function assertConverted(paths: Pick<ControlPlanePaths, 'stateRoot'>, res
     `Assistant ${id} is on the legacy layout: run gws-ea update --id ${id} to convert it.`,
     { details: { instanceId: id } },
   );
+}
+
+/**
+ * Where the layout before releases kept an assistant, whether or not it is
+ * still there: its root, `<state root>/instances/<id>`, and the live checkout
+ * under it that held its state and its host's logs. `remove` deletes the root
+ * of every assistant, converted or not, while the converter exists.
+ */
+export function legacyLocation(
+  paths: Pick<ControlPlanePaths, 'stateRoot'>,
+  instanceId: string,
+): { readonly root: string; readonly checkout: string } {
+  const root = path.join(paths.stateRoot, 'instances', instanceId);
+  return { root, checkout: path.join(root, 'nanoclaw') };
+}
+
+/** The conversion's progress record in the assistant's short root: there from its first rename until it commits. */
+export function conversionRecordFile(paths: Pick<ControlPlanePaths, 'instanceRoot'>, instanceId: string): string {
+  return path.join(paths.instanceRoot(instanceId), 'conversion.json');
+}
+
+/** Whether the assistant's conversion is under way: its progress record is there. */
+export function isConverting(paths: Pick<ControlPlanePaths, 'instanceRoot'>, instanceId: string): Promise<boolean> {
+  return isRegularFile(conversionRecordFile(paths, instanceId));
 }
