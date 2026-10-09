@@ -680,11 +680,9 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   });
 }
 
-/** How often, and how many times, removal checks that what it stopped (a launchd job, a stray host) is gone. */
+/** How often, and how many times, removal checks that a stray host it stopped is gone. */
 const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
-/** `launchctl print` exits with this, and only this, when the job is not loaded. */
-const LAUNCHD_JOB_NOT_FOUND = 113;
 
 /** The tags in `repository` that `docker image ls --format {{.Repository}}:{{.Tag}} <repository>` lists. */
 export function repositoryTags(listing: string, repository: string): string[] {
@@ -710,8 +708,8 @@ export interface NanoclawTeardown {
 /**
  * Stop the instance's host through NanoClaw's own service helpers, then clean
  * up whatever that stop leaves: the service definition (a launchd job whose
- * plist is gone, which NanoClaw cannot find, is booted out by its label, and
- * a systemd unit is disabled too, so neither login nor boot starts it again),
+ * plist is gone, which NanoClaw cannot find, is stopped by its label, and a
+ * systemd unit is disabled too, so neither login nor boot starts it again),
  * a host running outside the service, the agent containers (drained, then
  * removed with any that had already stopped), and the agent images.
  */
@@ -742,24 +740,6 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     });
   const coordinates = (runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
-  /** Boot a launchd job out by its label, then wait until launchd no longer has it loaded. */
-  const bootOutByLabel = async (service: InstanceServiceCoordinates): Promise<void> => {
-    const uid = process.getuid?.();
-    if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const env = serviceManagerEnvironment(recorded, service.manager, {});
-    const job = `gui/${uid}/${service.serviceIdentity}`;
-    const loaded = async (): Promise<boolean> => {
-      const printed = await execute('launchctl', ['print', job], env);
-      if (printed.outcome.exitCode === LAUNCHD_JOB_NOT_FOUND) return false;
-      if (printed.outcome.exitCode !== 0) throw commandExitError(printed.command, printed.outcome);
-      return true;
-    };
-    if (!(await loaded())) return;
-    // A bootout that failed leaves the job loaded, which the wait reports. One that worked returns before
-    // launchd has finished removing the job, so the job gets a moment to go.
-    await execute('launchctl', ['bootout', job], env);
-    if (await stillPresent(loaded)) throw incomplete('The NanoClaw launchd service is still loaded');
-  };
 
   const units: InstanceServiceCoordinates[] = [];
   if (platform === 'linux') {
@@ -796,9 +776,9 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
 
   if (platform === 'macos') {
     const service = coordinates(false);
-    // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is booted
-    // out by its label, before the stray-host kill below: launchd would only start that host again.
-    if (detected.mode !== 'launchd') await bootOutByLabel(service);
+    // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is stopped
+    // by its label, before the stray-host kill below: launchd would only start that host again.
+    if (detected.mode !== 'launchd') await control.stopByLabel(service.serviceIdentity, service.serviceDefinitionPath);
     await rm(service.serviceDefinitionPath, { force: true });
   }
   for (const service of units) {

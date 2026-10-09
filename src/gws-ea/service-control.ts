@@ -4,8 +4,9 @@
  * drift from NanoClaw's: detection, stop, start, container drain, and health.
  * `src/` cannot import `scripts/`, so the driver supplies the helpers and this
  * module binds them to one instance: its checkout, install, home, and Docker
- * endpoint. What gws-ea adds is only the exact-ID targeting: NanoClaw's stop
- * itself waits until the host has exited, so nothing starts it again early.
+ * endpoint. What gws-ea adds is the exact-ID targeting (NanoClaw's stop itself
+ * waits until the host has exited, so nothing starts it again early), and on
+ * systemd a reset of a unit's failed state before each start.
  *
  * Stop follows NanoClaw: agent containers are left for the next start to
  * adopt, and the stop lasts until the next start, login, or reboot. Only
@@ -113,12 +114,29 @@ export type StartOutcome = 'started' | 'already-running';
 export type StopOutcome = 'stopped' | 'already-stopped';
 export type RestartOutcome = 'restarted' | 'started';
 
+export interface StartOptions {
+  /**
+   * Whether the service definition changed since the job was loaded, as
+   * writing or restoring it reports. A job still loaded holds the old
+   * definition, so it is stopped (launchd boots it out) and started from the
+   * new one (launchd bootstraps it); otherwise a running job is left running.
+   */
+  readonly definitionChanged?: boolean;
+}
+
 export interface InstanceServiceControl {
   /** The service as NanoClaw detects it now. */
   detect(): NanoclawServiceHandle;
-  start(): Promise<StartOutcome>;
+  /** Starts the host unless it runs; a running host is only restarted when its definition changed. */
+  start(options?: StartOptions): Promise<StartOutcome>;
   /** Stops the host, leaving agent containers for the next start, and returns once it has exited. */
   stop(): Promise<StopOutcome>;
+  /**
+   * Stops a launchd job by its label, and returns once it has gone. NanoClaw
+   * finds a job by its plist, so a job still loaded after its plist was deleted
+   * is stopped this way; for removal only.
+   */
+  stopByLabel(label: string, definition: string): Promise<void>;
   restart(): Promise<RestartOutcome>;
   /** Stops this assistant's agent containers and waits until none runs; for cutover and removal only. */
   drain(timeoutMs?: number): Promise<void>;
@@ -222,9 +240,26 @@ export function createServiceControl(
     }
   };
 
+  /**
+   * A systemd unit that kept failing while it could not start (inside an
+   * update's fence, after a reboot) hits its start limit, and systemd refuses
+   * to start it again until its failed state is reset. A unit systemd has not
+   * loaded has no failed state, and starting it loads it. launchd retries such
+   * a job on its own, so needs nothing.
+   */
+  const resetFailed = ({ mode, name }: NanoclawServiceHandle): void => {
+    if (name === undefined || (mode !== 'systemd-user' && mode !== 'systemd-system')) return;
+    try {
+      env.runner.run('systemctl', [...(mode === 'systemd-user' ? ['--user'] : []), 'reset-failed', name]);
+    } catch (cause) {
+      if (!/not loaded/u.test(reasonOf(cause))) throw cause;
+    }
+  };
+
   /** Start the way NanoClaw's own transaction does: the service's handle, marked active. */
   const startHandle = (handle: NanoclawServiceHandle): void => {
     try {
+      resetFailed(handle);
       helpers.startService({ ...handle, active: true }, root, env);
     } catch (cause) {
       throw new GwsEaError(
@@ -235,12 +270,18 @@ export function createServiceControl(
     }
   };
 
+  /** Stop a running job before starting it, so it is loaded from its definition as it is now. */
+  const startAfresh = async (handle: NanoclawServiceHandle): Promise<void> => {
+    if (handle.active) await stopHost(handle);
+    startHandle(handle);
+  };
+
   return {
     detect,
-    async start() {
+    async start({ definitionChanged = false } = {}) {
       const handle = managed(detect());
-      if (handle.active) return 'already-running';
-      startHandle(installed(handle));
+      if (handle.active && !definitionChanged) return 'already-running';
+      await startAfresh(installed(handle));
       return 'started';
     },
     async stop() {
@@ -249,10 +290,10 @@ export function createServiceControl(
       await stopHost(handle);
       return 'stopped';
     },
+    stopByLabel: (name, definition) => stopHost({ mode: 'launchd', name, definition, active: true }),
     async restart() {
       const handle = installed(managed(detect()));
-      if (handle.active) await stopHost(handle);
-      startHandle(handle);
+      await startAfresh(handle);
       return handle.active ? 'restarted' : 'started';
     },
     drain: (timeoutMs) => helpers.drainContainers(root, env, timeoutMs),

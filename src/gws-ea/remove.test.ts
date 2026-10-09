@@ -1996,40 +1996,39 @@ describe('removal safety', () => {
 
   /**
    * launchd holding a job under the assistant's label whose plist was deleted
-   * outside gws-ea: `print` finds the job while it is loaded, `bootout` unloads
-   * it and stops its host unless it `sticks`, and a host killed while its job
-   * is loaded is only started again.
+   * outside gws-ea. NanoClaw finds a job by its plist, so its detection sees at
+   * most the job's host, running outside any service; its stop, given the
+   * job's label, boots the job out and stops its host unless the job `sticks`.
+   * A host killed while its job is loaded is only started again.
    */
   function launchdWithoutPlist(
     input: InstanceReservationInput,
     launchd: { loaded: boolean; readonly sticks: boolean },
   ) {
-    const job = `gui/${process.getuid?.()}/${getInstallScopedNames(installOf(input)).launchdLabel}`;
+    const label = getInstallScopedNames(installOf(input)).launchdLabel;
     const state = { host: launchd.loaded };
     const order: string[] = [];
     const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
       const line = `${command.command} ${command.args.join(' ')}`;
       order.push(line);
-      if (line === `launchctl print ${job}`) {
-        return launchd.loaded ? ok() : { stdout: '', stderr: 'Could not find service', exitCode: 113 };
-      }
-      if (line === `launchctl bootout ${job}`) {
-        if (launchd.sticks) return { stdout: '', stderr: 'Boot-out failed: 5: Input/output error', exitCode: 5 };
-        launchd.loaded = false;
-        state.host = false;
-        return ok();
-      }
       if (command.command === 'pkill') state.host = launchd.loaded;
       if (command.command === 'pgrep') return state.host ? ok('4242\n') : failed('');
       if (command.command === 'launchctl') throw new Error(`Unexpected command: ${line}`);
       return ok();
     };
-    // NanoClaw finds a job by its plist, so it sees at most a host running outside any service.
     const serviceHelpers = nanoclawService(
       order,
       state.host ? { mode: 'unmanaged', active: true, name: '4242' } : { mode: 'none', active: false },
     );
-    return { job, state, order, runCommand, serviceHelpers };
+    serviceHelpers.stopService.mockImplementation(async (handle) => {
+      order.push(`service-stop ${handle.name}`);
+      if (launchd.sticks) {
+        throw new Error(`NanoClaw service ${handle.name} did not stop (PID 4242). Once it has exited, start it again`);
+      }
+      launchd.loaded = false;
+      state.host = false;
+    });
+    return { label, state, order, runCommand, serviceHelpers };
   }
 
   async function macosRemoval(paths: ControlPlanePaths) {
@@ -2044,29 +2043,22 @@ describe('removal safety', () => {
     return { input, dependencies: { ...dependencies, platform: 'macos' as const } };
   }
 
-  it('boots out by its label a launchd job still loaded after its plist was deleted, before killing its host', async () => {
+  it("stops by its label, through NanoClaw's stop, a launchd job still loaded after its plist was deleted, before killing its host", async () => {
     const paths = await testPaths();
     const { input, dependencies } = await macosRemoval(paths);
     const launchd = { loaded: true, sticks: false };
-    const { job, state, order, runCommand, serviceHelpers } = launchdWithoutPlist(input, launchd);
+    const { label, state, order, runCommand, serviceHelpers } = launchdWithoutPlist(input, launchd);
 
     await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
 
-    expect(serviceHelpers.stopService).not.toHaveBeenCalled();
-    expect(order).toContain(`launchctl bootout ${job}`);
-    expect(order.indexOf(`launchctl bootout ${job}`)).toBeLessThan(order.findIndex((line) => line.startsWith('pkill')));
+    // The job NanoClaw would have detected from its plist, in the environment detection was given.
+    const plist = path.join(paths.stateRoot, 'home', 'Library', 'LaunchAgents', `${label}.plist`);
+    expect(serviceHelpers.stopService).toHaveBeenCalledExactlyOnceWith(
+      { mode: 'launchd', name: label, definition: plist, active: true },
+      serviceHelpers.detectService.mock.calls[0]![1],
+    );
+    expect(order.indexOf(`service-stop ${label}`)).toBeLessThan(order.findIndex((line) => line.startsWith('pkill')));
     expect({ loaded: launchd.loaded, host: state.host }).toEqual({ loaded: false, host: false });
-    await expectGone(paths, input);
-  });
-
-  it('asks launchd by label, and boots out nothing, when no job is loaded', async () => {
-    const paths = await testPaths();
-    const { input, dependencies } = await macosRemoval(paths);
-    const { job, order, runCommand, serviceHelpers } = launchdWithoutPlist(input, { loaded: false, sticks: false });
-
-    await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
-
-    expect(order.filter((line) => line.startsWith('launchctl'))).toEqual([`launchctl print ${job}`]);
     await expectGone(paths, input);
   });
 
@@ -2077,7 +2069,7 @@ describe('removal safety', () => {
 
     await expect(
       removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers }),
-    ).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete', message: expect.stringContaining('still loaded') });
+    ).rejects.toMatchObject({ code: 'service_still_running', message: expect.stringContaining('did not stop') });
     expect(order.some((line) => line.startsWith('pkill'))).toBe(false);
     expect(serviceHelpers.drainContainers).not.toHaveBeenCalled();
     expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
