@@ -18,6 +18,7 @@ import {
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { reserveInstance } from './journal.js';
+import { writeInstanceMarker } from './registry.js';
 import type { InstanceReservation, InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -102,6 +103,12 @@ function releaseFolder(paths: ControlPlanePaths, reservation: InstanceReservatio
 
 function stagingRoot(paths: ControlPlanePaths, reservation: InstanceReservation): string {
   return `${releaseFolder(paths, reservation)}.staging`;
+}
+
+/** The reservation's release published, and the assistant's marker in its state, as create's release step makes them. */
+async function publishCreated(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await writeInstanceMarker(paths, reservation.instance_id);
+  await materializeReleaseCheckout(paths, reservation);
 }
 
 /** Point the live link at the reservation's release, as create does once the release is complete. */
@@ -206,7 +213,7 @@ describe('exact release checkout', () => {
     const reservation = await reserved(paths, source.remote, source.firstCommit);
     const instanceId = reservation.instance_id;
 
-    await materializeReleaseCheckout(paths, reservation);
+    await expect(materializeReleaseCheckout(paths, reservation)).resolves.toEqual(reservation);
 
     expect(git(releaseFolder(paths, reservation), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
     expect(git(releaseFolder(paths, reservation), 'branch', '--show-current')).toBe('');
@@ -214,15 +221,8 @@ describe('exact release checkout', () => {
     expect(releaseFolder(paths, reservation)).toBe(
       path.join(paths.instanceRoot(instanceId), source.firstCommit.slice(0, 8)),
     );
-    expect(await assertReleaseCheckoutAgreement(paths, instanceId)).toMatchObject({
-      instance_id: instanceId,
-      deployed_commit: source.firstCommit,
-    });
-    // The marker is in the assistant's own state, not in the release, and names no release.
-    expect(JSON.parse(await readFile(paths.markerFile(instanceId), 'utf8'))).toEqual({
-      schema_version: 1,
-      instance_id: instanceId,
-    });
+    // Nothing outside the release is written: the assistant's state is not even created, and the release holds none.
+    await expect(lstat(paths.instanceLayout(instanceId).state)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(lstat(path.join(releaseFolder(paths, reservation), 'data'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -235,7 +235,7 @@ describe('exact release checkout', () => {
     const paths = await controlPlanePaths();
     const deployed = await reserved(paths, dogfood.remote, dogfood.firstCommit);
     const instanceId = deployed.instance_id;
-    await materializeReleaseCheckout(paths, deployed);
+    await publishCreated(paths, deployed);
     // A prod repository whose history carries the deployed commit, one commit ahead of it.
     const prodRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-prod-source-'));
     roots.push(prodRoot);
@@ -287,14 +287,18 @@ describe('exact release checkout', () => {
     });
   });
 
-  it('refuses to publish into the live checkout a release the registry does not record', async () => {
+  it("publishes a view at another commit in that commit's own folder, beside the release the registry records", async () => {
     const source = await sourceFixture();
+    await write(source.source, 'release.txt', 'second\n');
+    const second = commit(source.source, 'second release');
+    git(source.source, 'push', 'origin', 'dogfood');
     const paths = await controlPlanePaths();
-    const reservation = await reserved(paths, source.remote, 'f'.repeat(40));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const view = { ...reservation, deployed_commit: second };
 
-    const unrecorded = { ...reservation, deployed_commit: source.firstCommit };
-    await expect(materializeReleaseCheckout(paths, unrecorded)).rejects.toMatchObject({ code: 'release_mismatch' });
-    await expect(stat(releaseFolder(paths, unrecorded))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(materializeReleaseCheckout(paths, view)).resolves.toEqual(view);
+
+    expect(git(releaseFolder(paths, view), 'rev-parse', 'HEAD')).toBe(second);
     await expect(stat(releaseFolder(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -477,7 +481,7 @@ describe('read-only observation', () => {
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
     const instanceId = reservation.instance_id;
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
     const helper = path.join(paths.instanceRoot(instanceId), '.release-home');
     await rm(helper, { recursive: true, force: true });
@@ -497,7 +501,7 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
 
     await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).rejects.toMatchObject({
       code: 'release_fenced',
@@ -517,7 +521,7 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
     const operationTarget = 'e'.repeat(40);
 
@@ -544,7 +548,7 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
 
     git(checkout, 'checkout', '--quiet', '-b', 'local');
@@ -562,7 +566,7 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
     await write(checkout, 'notes.txt', 'an agent wrote this; it belongs to no release\n');
     await staleIndexEntry(checkout, 'release.txt');
@@ -581,7 +585,7 @@ describe('read-only observation', () => {
     git(source.source, 'push', 'origin', 'dogfood');
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, commitWithTwoFiles);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
     await write(checkout, 'release.txt', 'edited\n');
     await rm(path.join(checkout, 'second.txt'));
@@ -601,7 +605,7 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
     const checkout = await goLive(paths, reservation);
     await write(checkout, 'release.txt', 'moved\n');
     git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'local commit');

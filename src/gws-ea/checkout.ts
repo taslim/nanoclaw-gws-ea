@@ -10,16 +10,11 @@ import {
   type ControlPlanePaths,
   type ReleaseSlot,
 } from './paths.js';
-import {
-  assertRegistryMarkerAgreement,
-  assertStateMarker,
-  getInstanceReservation,
-  writeInstanceMarker,
-} from './registry.js';
+import { assertRegistryMarkerAgreement, assertStateMarker, getInstanceReservation } from './registry.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readCurrent, releaseName } from './release-layout.js';
 import type { ReleaseSource } from './release-tracks.js';
-import { GwsEaError, sameRelease, shortCommit, type InstanceReservation } from './types.js';
+import { GwsEaError, shortCommit, type InstanceReservation } from './types.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 /** A Git object ID, in a SHA-1 or a SHA-256 repository. */
@@ -433,13 +428,14 @@ function releaseFolder(paths: ControlPlanePaths, instanceId: string, commit: str
 }
 
 /**
- * Materialize a reservation's release. Create publishes the release the
- * registry records in its physical folder, `<instance root>/<hex8>`, and
- * writes the instance marker into the assistant's `state/`. An update stages
- * its target reservation view (KTD17) in a release `slot`, while the registry
- * still names the release the update moves from. A staged checkout is
- * published only at the reservation's commit with a clean tree: its folder
- * and its Git HEAD are what identify it.
+ * Materialize a reservation view's release (KTD17) in its own physical
+ * folder, `<instance root>/<hex8>`, which is where it runs: its installed
+ * tools record their absolute paths, so it is never built elsewhere and
+ * moved. Nothing outside the folder is written, the assistant's `state/`
+ * included, and publishing a release does not make it live. The swap's
+ * update stages in a release `slot` instead, deleted with the swap (U11). A
+ * checkout is published only at the view's commit with a clean tree: its
+ * folder and its Git HEAD are what identify it.
  */
 export async function materializeReleaseCheckout(
   paths: ControlPlanePaths,
@@ -448,24 +444,19 @@ export async function materializeReleaseCheckout(
   slot?: ReleaseSlot,
 ): Promise<InstanceReservation> {
   const instanceId = reservation.instance_id;
-  const recorded = await getInstanceReservation(paths, instanceId);
-  if (!slot && !sameRelease(recorded, reservation)) {
-    throw new GwsEaError('release_mismatch', 'The live checkout holds only the release the registry records');
-  }
+  await getInstanceReservation(paths, instanceId);
   const destination = slot
     ? paths.releaseCheckoutRoot(instanceId, slot)
-    : releaseFolder(paths, instanceId, recorded.deployed_commit);
+    : releaseFolder(paths, instanceId, reservation.deployed_commit);
   await assertCheckoutTargetAbsent(destination);
   await assertOwnedDestination(destination);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await assertPrivateDirectory(paths.instanceRoot(instanceId));
   if (slot) await preparePrivateDirectory(paths.releaseRoot(instanceId, slot));
-  else await writeInstanceMarker(paths, instanceId);
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   const stagingRoot = stagingCheckoutRoot(destination);
   const run = runtime.runCommand ?? runSanitizedCommand;
   const verifyPublished = async (): Promise<InstanceReservation> => {
-    if (!slot) return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
     await assertCheckoutRoot(destination, reservation.deployed_commit, run, environments.git);
     return reservation;
   };

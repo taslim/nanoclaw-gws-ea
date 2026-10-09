@@ -7,7 +7,6 @@ import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
-import { adoptSharedAgentImage, agentImageKey, readAgentImageInputs } from './agent-image.js';
 import { createOnecliAdmin, type OnecliAdmin, type OnecliAdminDependencies } from './onecli-admin.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import {
@@ -325,7 +324,8 @@ export const INSTANCE_HOST_ENV_KEYS = [
 
 type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
 
-function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
+/** gws-ea's `.env` keys for the assistant `config` describes, as this tool renders them. */
+export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
   return {
     NANOCLAW_INSTALL_ID: config.install_id,
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
@@ -510,6 +510,15 @@ export function instanceServiceDefinitionFile(
   options: ServiceLayoutOptions,
 ): string {
   return createInstanceServiceLayout(configInput, options).serviceDefinitionPath;
+}
+
+/** The assistant's service definition as this tool renders it, for the service manager `options` name. */
+export function renderInstanceServiceDefinition(
+  configInput: InstanceRuntimeConfig,
+  options: ServiceLayoutOptions,
+): string {
+  const config = validateRuntimeConfig(configInput);
+  return renderInstanceService(config, createInstanceServiceLayout(config, options));
 }
 
 /**
@@ -867,8 +876,10 @@ export async function stampUpgradeState(
 }
 
 /**
- * Persist the runtime, prepare the release at `commit` (its upgrade tripwire
- * and its agent image), and install and start the service.
+ * Persist the runtime, stamp the upgrade tripwire of the release at `commit`
+ * with that release's own script, and install and start the service. The
+ * release's agent image was provided when the release was staged
+ * (`release-stage.ts`), and its host runs that image's tag.
  */
 export async function reconcileInstanceRuntime(
   configInput: InstanceRuntimeConfig,
@@ -878,52 +889,12 @@ export async function reconcileInstanceRuntime(
   const config = validateRuntimeConfig(configInput);
   const release = instanceLayout(config.instance_root).release(releaseName(commit));
   await persistInstanceRuntime(config, dependencies.upsertEnvVars);
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  // The build runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
+  // The script runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
   const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
     HOME: config.home_directory,
     DOCKER_HOST: config.docker_endpoint,
     NANOCLAW_INSTALL_ID: config.install_id,
   });
-  await stampUpgradeState(release, run, environment);
-  if (!(await adoptReleaseAgentImage(config, { release, commit }, run, environment))) {
-    await run({
-      command: 'pnpm',
-      args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],
-      cwd: release,
-      env: environment,
-      timeoutMs: 15 * 60_000,
-      stream: true,
-    });
-  }
+  await stampUpgradeState(release, dependencies.runCommand ?? runSanitizedCommand, environment);
   return reconcileInstanceService(config, dependencies);
-}
-
-/**
- * Tag the agent image an update already built for this release and these
- * build flags as the new assistant's `:latest`, and say whether there was one
- * (see `agent-image.ts`): its content key is read from the checkout create
- * deployed and its `.env`. Without one, NanoClaw's own container step builds
- * and smoke-tests the image as it always has. That image is not labeled: the
- * step runs `docker build` itself, without the agent-runner lockfile label
- * `container/build.sh` adds, so it is not the image the key names. The
- * assistant's first update moves it onto a shared one.
- */
-async function adoptReleaseAgentImage(
-  config: InstanceRuntimeConfig,
-  { release, commit }: { readonly release: string; readonly commit: string },
-  run: SanitizedCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<boolean> {
-  const inputs = await readAgentImageInputs(
-    { repository: release, commit, checkout: config.state_root },
-    { runCommand: run },
-  );
-  const names = getInstallScopedNames(config.install_id);
-  return adoptSharedAgentImage(
-    { run, cwd: release, env: environment },
-    agentImageKey(inputs),
-    names.containerImageBase,
-    names.defaultContainerImage,
-  );
 }

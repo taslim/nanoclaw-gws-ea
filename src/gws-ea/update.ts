@@ -76,7 +76,12 @@ import {
   type CutoverSeams,
   type SwapReleases,
 } from './cutover.js';
-import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
+import {
+  keepReleaseFiles,
+  keptReleaseFiles,
+  stagedKeptFilesRoot,
+  writeReleasePreflightReceipt,
+} from './kept-release.js';
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
@@ -101,7 +106,7 @@ import {
 import { CONTROL_PLANE_ROOT, instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
 import { LAUNCHER_PINS } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { instanceOnecliLayout, readDeployedSetup, writeReleasePreflightReceipt } from './provision.js';
+import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import { runReleasePreflight } from './release-preflight.js';

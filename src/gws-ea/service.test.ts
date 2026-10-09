@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { AGENT_IMAGE_KEY_LABEL, agentImageKey } from './agent-image.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths } from './paths.js';
 import type { SanitizedCommand } from './process.js';
@@ -40,18 +39,6 @@ const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', '
 const roots: string[] = [];
 /** The Docker endpoint create recorded; deliberately not the default socket. */
 const DOCKER_ENDPOINT = 'unix:///Users/operator/.colima/default/docker.sock';
-/** The Git tree of `container/` at the release create deployed. */
-const CONTAINER_TREE = 'c'.repeat(40);
-
-/**
- * Git's answer to create's image step, which reads the release's `container/`
- * tree before it looks for a shared agent image; every other command answers
- * nothing, so no image is shared and NanoClaw's container step builds one.
- */
-function releaseTree(command: SanitizedCommand): string {
-  return command.command === 'git' && command.args[0] === 'ls-tree' ? `040000 tree ${CONTAINER_TREE}\tcontainer\n` : '';
-}
-
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -402,7 +389,7 @@ describe('GWS-EA instance runtime', () => {
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push(command);
-      return { stdout: releaseTree(command), stderr: '' };
+      return { stdout: '', stderr: '' };
     });
 
     for (const platform of ['macos', 'linux'] as const) {
@@ -424,8 +411,6 @@ describe('GWS-EA instance runtime', () => {
       expect(definition).toContain(path.join(config.instance_root, 'logs', 'nanoclaw.log'));
       expect(definition).toContain(path.join(config.instance_root, 'logs', 'nanoclaw.error.log'));
     }
-    const build = calls.find((call) => call.command === 'pnpm' && call.args.includes('container'))!;
-    expect(build.env?.DOCKER_HOST).toBe(DOCKER_ENDPOINT);
     const environment = await readFile(path.join(config.state_root, '.env'), 'utf8');
     expect(environment.trimEnd().split('\n').sort()).toEqual(
       [
@@ -456,7 +441,7 @@ describe('GWS-EA instance runtime', () => {
     const calls: string[][] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push([command.command, ...command.args]);
-      return { stdout: releaseTree(command), stderr: '' };
+      return { stdout: '', stderr: '' };
     });
     const upsert = vi.fn(upsertEnvVars);
     let restarts = 0;
@@ -632,103 +617,15 @@ describe('GWS-EA instance runtime', () => {
     expect(Object.values(calls[0]?.env ?? {})).not.toContain('admin-secret-canary');
   });
 
-  it("prepares only the release's image and service without invoking generic service setup", async () => {
+  it("stamps the release's tripwire with its own script and starts its service, building no image", async () => {
     const { config, home, release } = await fixture();
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push(command);
-      return { stdout: releaseTree(command), stderr: '' };
+      return { stdout: '', stderr: '' };
     });
     // pnpm lives outside the service's minimal PATH, as a pnpm standalone install puts it.
     const operatorPath = '/Users/operator/Library/pnpm/bin:/usr/bin:/bin';
-    await reconcileInstanceRuntime(config, COMMIT, {
-      upsertEnvVars,
-      restartService: async () => undefined,
-      platform: 'macos',
-      homeDirectory: home,
-      runCommand: runner,
-      uid: 501,
-      ambientEnv: { PATH: operatorPath, HOME: '/Users/elsewhere' },
-    });
-
-    // The tripwire is stamped, nothing is held from an earlier attempt, no image is shared under the release's key,
-    // and NanoClaw's container step builds one.
-    const key = agentImageKey({ contextTree: CONTAINER_TREE, installCjkFonts: false, hardenedImage: false });
-    const [stamp, tree, holds, lookup, build] = calls;
-    expect(stamp).toMatchObject({
-      command: 'pnpm',
-      args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', '2.3.0', 'gws-ea'],
-      cwd: release,
-    });
-    expect(tree).toMatchObject({ command: 'git', args: ['ls-tree', '--full-tree', COMMIT, '--', 'container'] });
-    expect(holds).toMatchObject({
-      command: 'docker',
-      args: ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', `nanoclaw-agent-v2-${config.install_id}`],
-    });
-    expect(lookup).toMatchObject({
-      command: 'docker',
-      args: expect.arrayContaining([`label=${AGENT_IMAGE_KEY_LABEL}=${key}`]),
-    });
-    expect(build).toMatchObject({
-      command: 'pnpm',
-      args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],
-      cwd: release,
-    });
-    expect(calls.flatMap((call) => call.args)).not.toContain('service');
-    expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('.local/bin/ncl');
-    // The build finds the operator's tools, against this instance's home, Docker endpoint, and install ID.
-    for (const call of [stamp, lookup, build]) {
-      expect(call?.env).toMatchObject({
-        PATH: operatorPath,
-        HOME: config.home_directory,
-        DOCKER_HOST: config.docker_endpoint,
-        NANOCLAW_INSTALL_ID: config.install_id,
-      });
-    }
-  });
-
-  it('tags the agent image an update already built for the release as :latest, building none, and releases the one it displaces', async () => {
-    const { config, home } = await fixture();
-    await persistInstanceRuntime(config, upsertEnvVars);
-    await writeFile(path.join(config.state_root, '.env'), 'INSTALL_CJK_FONTS=true\n', { flag: 'a' });
-    const key = agentImageKey({ contextTree: CONTAINER_TREE, installCjkFonts: true, hardenedImage: false });
-    const shared = `sha256:${'5'.repeat(64)}`;
-    // An earlier, interrupted run of this step left an image of its own build, and a hold it had yet to release.
-    const earlier = `sha256:${'e'.repeat(64)}`;
-    const repository = `nanoclaw-agent-v2-${config.install_id}`;
-    const latest = `${repository}:latest`;
-    const leftover = `${repository}:held-${'d'.repeat(12)}`;
-    const held = `${repository}:held-${'e'.repeat(12)}`;
-    const peer = `nanoclaw-agent-v2-${'0'.repeat(32)}:latest`;
-    const calls: SanitizedCommand[] = [];
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      calls.push(command);
-      const [group, verb] = command.args;
-      const stdout = (() => {
-        if (command.command !== 'docker') return releaseTree(command);
-        if (group === 'image' && verb === 'ls' && command.args.includes(`label=${AGENT_IMAGE_KEY_LABEL}=${key}`)) {
-          return `${shared}\n`;
-        }
-        if (group === 'image' && verb === 'ls' && command.args.at(-1) === latest) return `${earlier}\n`;
-        if (group === 'image' && verb === 'ls' && command.args.at(-1) === repository) {
-          return `${latest}\n${leftover}\n`;
-        }
-        if (group === 'image' && verb === 'inspect' && command.args.at(-1) === shared) {
-          return JSON.stringify([
-            {
-              Id: shared,
-              RepoTags: [peer],
-              Created: '2026-09-28T12:00:00.123456789Z',
-              Config: { Labels: { [AGENT_IMAGE_KEY_LABEL]: key } },
-            },
-          ]);
-        }
-        if (group === 'image' && verb === 'inspect' && command.args.at(-1) === earlier) return '[]\n';
-        return '';
-      })();
-      return { stdout, stderr: '' };
-    });
-
     let restarts = 0;
     await reconcileInstanceRuntime(config, COMMIT, {
       upsertEnvVars,
@@ -739,18 +636,24 @@ describe('GWS-EA instance runtime', () => {
       homeDirectory: home,
       runCommand: runner,
       uid: 501,
+      ambientEnv: { PATH: operatorPath, HOME: '/Users/elsewhere' },
     });
 
-    const docker = calls.filter((call) => call.command === 'docker').map((call) => call.args.join(' '));
-    // The earlier attempt's hold goes first; the image :latest named is held while the tag moves, then released by
-    // removing that hold, which deletes it only if no other tag names it. Nothing is deleted by ID.
-    expect(docker.indexOf(`image rm ${leftover}`)).toBe(docker.findIndex((call) => call.startsWith('image rm')));
-    expect(docker.indexOf(`image rm ${leftover}`)).toBeLessThan(docker.indexOf(`tag ${earlier} ${held}`));
-    expect(docker.indexOf(`tag ${earlier} ${held}`)).toBeLessThan(docker.indexOf(`tag ${shared} ${latest}`));
-    expect(docker.lastIndexOf(`image rm ${held}`)).toBeGreaterThan(docker.indexOf(`tag ${shared} ${latest}`));
-    expect(docker).not.toContain(`image rm ${earlier}`);
-    expect(calls.some((call) => call.args.join(' ').includes('--step container'))).toBe(false);
-    // The service still starts, on the shared image.
+    // The release was staged with its own image (`release-stage.ts`): only its tripwire is stamped, and the
+    // service manager asked for the pid of the host it started.
+    expect(calls.map((call) => call.command)).toEqual(['pnpm', 'launchctl']);
+    expect(calls[0]).toMatchObject({
+      command: 'pnpm',
+      args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', '2.3.0', 'gws-ea'],
+      cwd: release,
+      // The script finds the operator's tools, against this instance's home, Docker endpoint, and install ID.
+      env: {
+        PATH: operatorPath,
+        HOME: config.home_directory,
+        DOCKER_HOST: config.docker_endpoint,
+        NANOCLAW_INSTALL_ID: config.install_id,
+      },
+    });
     expect(restarts).toBe(1);
   });
 });

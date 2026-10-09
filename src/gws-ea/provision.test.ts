@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,7 +14,7 @@ import {
   withInstanceOperation,
   type InstanceOperation,
 } from './journal.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
   OBSERVATION_WAITS_SECONDS,
@@ -37,23 +37,31 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
+import { keepRelease, keptReleaseFiles } from './kept-release.js';
 import { createOnecliAdmin } from './onecli-admin.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
+import type { SanitizedCommand } from './process.js';
+import { linkReleaseState } from './release-layout.js';
+import { stageRelease, type ReleaseStageRequest } from './release-stage.js';
 import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
+  instanceHostConfiguration,
+  instanceServiceDefinitionFile,
   persistInstanceRuntime,
+  readInstanceHostEnvironment,
   type HostStatusHelpers,
   type UpsertEnvVars,
   type WaitForHostOptions,
 } from './service.js';
 import type { ManagedTransport } from './cloudflare-ingress.js';
+import { KILLED_INSTALL_LEFTOVER, releaseRepository, stagingWorld } from './testing/release-fixture.js';
 import {
   GwsEaError,
   PROVISION_STEPS,
@@ -66,6 +74,11 @@ import type { CloudflareZoneChoice } from './create-input.js';
 import type { ConversationNotReadyReason } from './verify.js';
 
 const roots: string[] = [];
+
+/** Upstream's `.env` writer, which the driver injects; loaded by path because `src/` cannot import `setup/`. */
+const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', 'set-env.ts'))) as {
+  readonly upsertEnvVars: UpsertEnvVars;
+};
 
 async function testPaths(): Promise<ControlPlanePaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-provision-'));
@@ -850,9 +863,6 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         commit: reserved.deployed_commit,
       },
       releasePreflight: {
-        checkoutRoot: operation.paths
-          .instanceLayout(reserved.instance_id)
-          .release(reserved.deployed_commit.slice(0, 8)),
         provider: 'claude',
         providerCredential: {
           name: 'Claude provider',
@@ -1962,6 +1972,187 @@ describe('production provision step composition', () => {
   });
 });
 
+describe('create on the release layout', () => {
+  /** A reserved assistant whose release is a real repository; staging's install, build, and Docker are faked. */
+  async function releaseCreate() {
+    const paths = await testPaths();
+    const repository = await releaseRepository(path.dirname(paths.stateRoot));
+    const reserved = await reserveInstance(paths, {
+      ...reservation(),
+      source_remote: repository.remote,
+      deployed_commit: repository.commit,
+    });
+    const staging = stagingWorld();
+    const serviceCommands: SanitizedCommand[] = [];
+    const contextOf = (operation: InstanceOperation): ProductionProvisionContext => {
+      const base = productionContext(operation, reserved);
+      return {
+        ...base,
+        input: {
+          ...base.input,
+          serviceDependencies: {
+            ...base.input.serviceDependencies,
+            upsertEnvVars,
+            restartService: async () => undefined,
+            runCommand: async (command) => {
+              serviceCommands.push(command);
+              return { stdout: '', stderr: '' };
+            },
+            uid: 501,
+          },
+          // Create's OneCLI step renders its Compose file first; the Docker it then reaches is not needed here.
+          onecliDependencies: {
+            dockerCommandRunner: async () => {
+              throw new Error('Docker is not reached');
+            },
+          },
+        },
+      };
+    };
+    /** Run `use` with create's production steps, staging through the fixture. */
+    const withSteps = async <T>(
+      use: (
+        steps: ProvisionSteps<ProductionProvisionContext>,
+        context: ProductionProvisionContext,
+        operation: InstanceOperation,
+      ) => Promise<T>,
+    ): Promise<T> => {
+      const result = await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const context = contextOf(operation);
+        const steps = createProductionProvisionSteps(context, {
+          stageRelease: (request) => stageRelease(request, staging.seams),
+          getOwnedGcpProjectNumber: async () => '441811502258',
+        });
+        return { value: await use(steps, context, operation) };
+      });
+      if (!result) throw new Error('The instance operation was busy');
+      return result.value;
+    };
+    return {
+      paths,
+      reserved,
+      layout: paths.instanceLayout(reserved.instance_id),
+      release: repository.commit.slice(0, 8),
+      staging: staging.world,
+      serviceCommands,
+      withSteps,
+      runReleaseStep: () =>
+        withSteps((steps, context, operation) =>
+          runAlone(operation, context, 'materialize_checkout', steps.materialize_checkout),
+        ),
+    };
+  }
+
+  /** The release layout create leaves (KTD1), as its directories hold it. */
+  async function expectReleaseLayout(create: Awaited<ReturnType<typeof releaseCreate>>): Promise<void> {
+    const { layout, release, reserved } = create;
+    expect(await readlink(layout.current)).toBe(release);
+    expect((await readdir(layout.root)).sort()).toEqual(
+      ['.release-home', 'kept', 'logs', 'nanoclaw', 'provision.json', release, 'state'].sort(),
+    );
+    // The release holds no state: each of NanoClaw's state roots, and its logs, is a link to the assistant's own.
+    for (const [link, target] of [
+      ['.env', '../state/.env'],
+      ['data', '../state/data'],
+      ['groups', '../state/groups'],
+      ['store', '../state/store'],
+      ['logs', '../logs'],
+    ] as const) {
+      expect((await lstat(path.join(layout.release(release), link))).isSymbolicLink()).toBe(true);
+      expect(await readlink(path.join(layout.release(release), link))).toBe(target);
+    }
+    expect((await readdir(layout.state)).sort()).toEqual(['.env', 'data', 'groups', 'store']);
+    expect((await readdir(path.join(layout.state, 'data'), { recursive: true })).sort()).toEqual([
+      'gws-ea',
+      path.join('gws-ea', 'instance.json'),
+    ]);
+    expect(await readdir(layout.logs)).toEqual([]);
+    expect(await readdir(path.join(layout.root, 'kept'))).toEqual([release]);
+    expect((await readdir(layout.kept(release))).sort()).toEqual([
+      'host-environment.json',
+      'onecli-compose.yaml',
+      'release-preflight.json',
+      'service-definition',
+    ]);
+    expect(JSON.parse(await readFile(layout.receipt(release), 'utf8'))).toMatchObject({
+      instance_id: reserved.instance_id,
+      deployed_commit: reserved.deployed_commit,
+      onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+    });
+    // gws-ea's `.env` keys in the assistant's state are the ones kept with its release.
+    expect(readInstanceHostEnvironment(layout.state)).toEqual(
+      JSON.parse(await readFile(keptReleaseFiles(layout.kept(release)).hostEnvironment, 'utf8')),
+    );
+  }
+
+  it('leaves exactly the release layout: the live link, the release and its links, state, logs, and what is kept', async () => {
+    const create = await releaseCreate();
+
+    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+
+    await expectReleaseLayout(create);
+    // The release runs its own agent image, built for it while staging.
+    const install = create.reserved.instance_id.replaceAll('-', '');
+    expect(create.staging.faked.map((command) => command.args.join(' '))).toContainEqual(
+      expect.stringMatching(new RegExp(`--tag nanoclaw-agent-v2-${install}:r-${create.release} -$`, 'u')),
+    );
+  });
+
+  it('resumes a create killed during the release install by staging the release again, leaving nothing stray', async () => {
+    const create = await releaseCreate();
+    const { layout, release } = create;
+    create.staging.killInstall = true;
+
+    await expect(create.runReleaseStep()).rejects.toThrow('The install was killed');
+    // Staging wrote nothing into the assistant's state, linked nothing, kept nothing, and nothing is live.
+    expect((await readdir(layout.state)).sort()).toEqual(['.env', 'data', 'groups', 'store']);
+    expect(await readFile(path.join(layout.state, '.env'), 'utf8')).toBe('');
+    await expect(lstat(path.join(layout.release(release), 'data'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(layout.kept(release))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(layout.current)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+
+    // A fresh checkout, installed again: the killed install's work is gone with the release it began.
+    expect(create.staging.git.filter((subcommand) => subcommand === 'init')).toHaveLength(2);
+    expect(create.staging.setup.filter((command) => command.args[0] === 'install')).toHaveLength(2);
+    await expect(lstat(path.join(layout.release(release), KILLED_INSTALL_LEFTOVER))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expectReleaseLayout(create);
+  });
+
+  it("keeps with the release exactly what create's own steps then run, so the first update has a rollback target", async () => {
+    const create = await releaseCreate();
+    await create.runReleaseStep();
+
+    await create.withSteps(async (steps, context) => {
+      // Create's OneCLI step renders the Compose file itself before it reaches Docker.
+      await expect(steps.start_onecli.resources[0]!.apply(context)).rejects.toThrow('Docker is not reached');
+      // Create's service step installs the service definition when it starts the host.
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      await expect(steps.start_nanoclaw.resources[0]!.apply(context)).resolves.toBeUndefined();
+
+      const kept = keptReleaseFiles(create.layout.kept(create.release));
+      expect(await readFile(context.input.onecli.composeFile, 'utf8')).toBe(await readFile(kept.compose, 'utf8'));
+      expect(
+        await readFile(instanceServiceDefinitionFile(context.input.runtime, context.input.serviceDependencies), 'utf8'),
+      ).toBe(await readFile(kept.serviceDefinition, 'utf8'));
+      expect(readInstanceHostEnvironment(context.input.runtime.state_root)).toEqual(
+        JSON.parse(await readFile(kept.hostEnvironment, 'utf8')),
+      );
+    });
+    // The host starts on its release, stamped by the release's own script, without building any image.
+    expect(create.serviceCommands.map((command) => [command.command, command.cwd])).toContainEqual([
+      'pnpm',
+      create.layout.release(create.release),
+    ]);
+    expect(create.serviceCommands.some((command) => command.command === 'docker')).toBe(false);
+    expect(create.serviceCommands.some((command) => command.args.includes('container'))).toBe(false);
+  });
+});
+
 describe('port holders', () => {
   it('names the process lsof reports, and nobody when lsof finds none or is missing', async () => {
     const answers: Array<Error | string> = [
@@ -2018,6 +2209,35 @@ const PRINCIPAL = {
   authenticatedMessageId: 'signed-first-dm',
   authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
 } as const;
+
+/**
+ * A release staged as `stageRelease` leaves it, without a checkout to build:
+ * its folder linked to the assistant's state, and what is kept with it, its
+ * receipt last.
+ */
+async function stageWithoutCheckout(request: ReleaseStageRequest): Promise<void> {
+  const layout = request.paths.instanceLayout(request.view.instance_id);
+  const release = request.view.deployed_commit.slice(0, 8);
+  await mkdir(layout.release(release), { recursive: true, mode: 0o700 });
+  await linkReleaseState(layout, release);
+  await keepRelease(
+    layout.kept(release),
+    {
+      compose: 'services: {}\n',
+      serviceDefinition: 'the service definition\n',
+      hostEnvironment: instanceHostConfiguration(request.runtime),
+    },
+    {
+      instanceId: request.view.instance_id,
+      commit: request.view.deployed_commit,
+      preflight: {
+        ...request.provider,
+        packageManager: 'pnpm@10.0.0',
+        onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+      },
+    },
+  );
+}
 
 async function productionHarness(): Promise<ProductionHarness> {
   const paths = await testPaths();
@@ -2088,21 +2308,10 @@ async function productionHarness(): Promise<ProductionHarness> {
         };
         const overrides: Partial<ProductionProvisionDependencies> = {
           observeCheckout: async () => (resources.has('checkout') ? PRESENT : ABSENT),
-          materializeReleaseCheckout: async () => {
-            effect('materializeReleaseCheckout', 'checkout');
-            return reserved;
+          stageRelease: async (request) => {
+            effect('stageRelease', 'checkout');
+            await stageWithoutCheckout(request);
           },
-          runReleasePreflight: async () => ({
-            provider: 'claude',
-            providerCredential: {
-              name: 'Claude provider',
-              type: 'api_key',
-              hostPattern: 'api.anthropic.com',
-              headerName: 'x-api-key',
-            },
-            packageManager: 'pnpm@10.0.0',
-            onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
-          }),
           googleCloudResources: () => [
             {
               name: 'the Google Cloud project',
@@ -2239,7 +2448,7 @@ describe('production step order and pause outcomes', () => {
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
-      'materializeReleaseCheckout',
+      'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
@@ -2274,7 +2483,7 @@ describe('production step order and pause outcomes', () => {
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
     expect(harness.sleeps).toEqual([]);
     expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
-      'materializeReleaseCheckout',
+      'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
