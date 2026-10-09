@@ -102,19 +102,6 @@ export interface MailboxTimelineMessage {
   content: string;
 }
 
-/** The turn the runner is answering: the ids of every inbound message in its batch. */
-export interface TurnStamp {
-  messageIds: readonly string[];
-}
-
-/** Where an inbound message came from: its kind, its conversation, and its content (which names its sender). */
-export interface InboundOrigin {
-  kind: string;
-  channelType: string | null;
-  platformId: string | null;
-  content: string;
-}
-
 /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface InboundMailbox {
   setRouting(routing: SessionRouting): void;
@@ -128,8 +115,6 @@ export interface InboundMailbox {
   getWaitingMessages(): WaitingMessage[];
   /** Whether the mailbox holds a message with this id, whatever its status. */
   hasMessage(messageId: string): boolean;
-  /** Where the message with this id came from, whatever its status. */
-  getInboundOrigin(messageId: string): InboundOrigin | undefined;
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;
@@ -170,8 +155,6 @@ export interface OutboundMailbox {
   getProcessingClaims(): ProcessingClaim[];
   deleteOrphanProcessingClaims(): number;
   getContainerState(): ContainerState | null;
-  /** The turn the runner is answering now, or null when it published none. */
-  getTurnStamp(): TurnStamp | null;
   getDueMessages(excludeIds?: ReadonlySet<string>): OutboundMessage[];
   writeDirect(message: DirectOutboundMessage): Promise<void>;
   getOutboundHistory(limit: number): MailboxHistoryMessage[];

@@ -174,66 +174,6 @@ describe('SQLite mailbox canonical serialization', () => {
     ]);
   });
 
-  it("reads the runner's turn stamp: the ids of every message the current turn answers", () => {
-    const outboundDb = new Database(':memory:');
-    databases.push(outboundDb);
-    outboundDb.exec(OUTBOUND_SCHEMA);
-    const outbound = wrapSqliteOutbound(outboundDb);
-    const stamp = (value: string) =>
-      outboundDb
-        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-        .run('current_reply_route', value, '2026-01-01T00:00:00.000Z');
-
-    expect(outbound.getTurnStamp()).toBeNull();
-    // As container/agent-runner/src/db/session-state.ts publishes it.
-    stamp(
-      JSON.stringify({
-        inReplyTo: 'in-1',
-        channelType: 'gchat',
-        platformId: 'spaces/dm',
-        threadId: null,
-        messageIds: ['in-1', 'in-2'],
-      }),
-    );
-    expect(outbound.getTurnStamp()).toEqual({ messageIds: ['in-1', 'in-2'] });
-
-    // A stamp without its ids names no message.
-    for (const value of [
-      JSON.stringify({ inReplyTo: 'in-1', channelType: 'gchat', platformId: 'spaces/dm', threadId: null }),
-      JSON.stringify({ inReplyTo: 'in-1', messageIds: ['in-1', 7] }),
-      'not json',
-    ]) {
-      stamp(value);
-      expect(outbound.getTurnStamp(), value).toBeNull();
-    }
-  });
-
-  it('reads where one inbound message came from, by its id', async () => {
-    const inboundDb = new Database(':memory:');
-    databases.push(inboundDb);
-    inboundDb.exec(INBOUND_SCHEMA);
-    const inbound = wrapSqliteInbound(inboundDb);
-    await inbound.insertMessage({
-      id: 'in-1',
-      kind: 'chat-sdk',
-      timestamp: '2026-01-01T00:00:00.000Z',
-      platformId: 'spaces/dm',
-      channelType: 'gchat',
-      threadId: null,
-      content: '{"senderId":"users/1","text":"hello"}',
-      processAfter: null,
-      recurrence: null,
-    });
-
-    expect(inbound.getInboundOrigin('in-1')).toEqual({
-      kind: 'chat-sdk',
-      channelType: 'gchat',
-      platformId: 'spaces/dm',
-      content: '{"senderId":"users/1","text":"hello"}',
-    });
-    expect(inbound.getInboundOrigin('in-missing')).toBeUndefined();
-  });
-
   it('lists the pending messages still waiting for their time, soonest first, with their tries', async () => {
     const inboundDb = new Database(':memory:');
     databases.push(inboundDb);

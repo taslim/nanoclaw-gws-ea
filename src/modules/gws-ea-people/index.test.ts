@@ -3,11 +3,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../config.js', async () => {
-  const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-gws-ea-people-ncl' };
-});
-
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { lookup } from '../../cli/registry.js';
@@ -19,7 +14,6 @@ import type { AgentGroup } from '../../types.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
-import { answering, fromPrincipal, principalDmSession } from '../gws-ea-profile/testing/principal-turn.js';
 import { addPerson, getPerson, getPersonLevel, listPeople, type Person } from './db.js';
 import { FINGERPRINT_KEY_FILE_NAME } from './fingerprint.js';
 import { MAIN_PEOPLE_POINTER } from './index.js';
@@ -38,11 +32,9 @@ function agent(agentGroupId: string): CallerContext {
 }
 
 const HOST: CallerContext = { caller: 'host' };
-const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-people-ncl';
-/** main, in a turn answering the principal's message, so its principal-sourced writes count. */
-let mainCaller: CallerContext;
+const MAIN_CALLER = agent(main.id);
 
-function run(command: string, args: Record<string, unknown>, ctx: CallerContext = mainCaller) {
+function run(command: string, args: Record<string, unknown>, ctx: CallerContext = MAIN_CALLER) {
   return dispatch({ id: command, command, args }, ctx);
 }
 
@@ -55,7 +47,6 @@ async function data<T>(response: Promise<{ ok: boolean; data?: unknown; error?: 
 let root: string;
 
 beforeEach(async () => {
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-ea-people-ncl-'));
   fs.chmodSync(root, 0o700);
   vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(root, 'google-grant.json'));
@@ -73,14 +64,12 @@ beforeEach(async () => {
     mainAgentGroupId: main.id,
     principalEmails: ['morgan@example.test'],
   });
-  mainCaller = await answering(await principalDmSession(main.id), fromPrincipal('m-principal'));
 });
 
 afterEach(async () => {
   vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
 describe('GWS-EA people ncl resource', () => {

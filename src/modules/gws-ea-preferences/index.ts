@@ -20,7 +20,6 @@ import {
   type Weekday,
 } from './db.js';
 import { assertMainCaller, projectDocAudience } from '../gws-ea-profile/db.js';
-import { assertPrincipalProvenance } from '../gws-ea-profile/provenance.js';
 import { gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
@@ -247,8 +246,7 @@ function removeTarget(args: Record<string, unknown>): PreferenceTarget {
 const SOURCE_ARG: ColumnDef = {
   name: 'source',
   type: 'string',
-  description:
-    'Who is making the change: principal for what the principal tells you in the message you are answering, learned for what you derived.',
+  description: 'Who is making the change.',
   required: true,
   enum: ['principal', 'learned'],
 };
@@ -308,7 +306,7 @@ registerResource({
       description:
         'Store one preference, replacing the value it names.\n\n' +
         'Use --source principal for what the principal states or corrects, and --source learned for a value derived from calendar history. ' +
-        'A learned value never replaces one the principal set, and protected time is only ever the principal’s. --basis is a short account of where the value came from.\n\n' +
+        'A learned value never replaces one the principal set. --basis is a short account of where the value came from.\n\n' +
         'Shapes by --kind:\n' +
         '  working-hours     --weekday with --start and --end, or --off for a day the principal does not work\n' +
         '  protected-window  --start and --end, optional --weekdays (every day when omitted) and --reason; --id changes an existing window\n' +
@@ -340,9 +338,7 @@ registerResource({
       ],
       handler: async (args, ctx) => {
         await assertMainCaller(ctx, 'scheduling preferences');
-        const input = setInput(args);
-        await assertPrincipalProvenance(ctx, input.source);
-        return setSchedulingPreference(input);
+        return setSchedulingPreference(setInput(args));
       },
     },
     remove: {
@@ -350,7 +346,7 @@ registerResource({
       description:
         'Forget one preference, returning it to unset: --weekday for working-hours, --id for protected-window, --meeting-kind otherwise.\n\n' +
         'Use --source principal when the principal asks you to forget it, and --source learned when you drop a value on your own inference. ' +
-        'A learned removal never removes a value the principal set, or any protected time.',
+        'A learned removal never removes a value the principal set.',
       args: [KIND_ARG, SOURCE_ARG, WEEKDAY_ARG, ID_ARG, MEETING_KIND_ARG],
       examples: [
         'ncl preferences remove --kind working-hours --weekday mon --source principal',
@@ -358,9 +354,7 @@ registerResource({
       ],
       handler: async (args, ctx) => {
         await assertMainCaller(ctx, 'scheduling preferences');
-        const target = removeTarget(args);
-        await assertPrincipalProvenance(ctx, target.source);
-        return { removed: await removeSchedulingPreference(target) };
+        return { removed: await removeSchedulingPreference(removeTarget(args)) };
       },
     },
   },

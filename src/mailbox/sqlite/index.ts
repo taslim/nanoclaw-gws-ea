@@ -53,7 +53,6 @@ import {
 import type {
   AgentMailbox,
   InboundMailbox,
-  InboundOrigin,
   MailboxHistoryMessage,
   MailboxSession,
   MailboxSessionKey,
@@ -62,7 +61,6 @@ import type {
   ProcessingAck,
   TaskRecord,
   TaskStats,
-  TurnStamp,
   WaitingMessage,
 } from '../types.js';
 
@@ -72,29 +70,6 @@ function sqliteTimestamp(value: string): string {
   const source = SQLITE_TIMESTAMP.test(value) ? `${value.replace(' ', 'T')}Z` : value;
   const milliseconds = Date.parse(source);
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : value;
-}
-
-/**
- * The runner's reply stamp in `session_state`, republished at every turn start
- * (container/agent-runner/src/db/session-state.ts). Its `messageIds` name every
- * message the turn answers.
- */
-const REPLY_STAMP_KEY = 'current_reply_route';
-
-/** The stamp's message ids; a stamp that names none, or is not the runner's shape, is no stamp. */
-function turnStamp(value: string): TurnStamp | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch (error) {
-    if (error instanceof SyntaxError) return null;
-    throw error;
-  }
-  const messageIds: unknown =
-    typeof parsed === 'object' && parsed !== null ? (parsed as { messageIds?: unknown }).messageIds : undefined;
-  return Array.isArray(messageIds) && messageIds.every((id: unknown): id is string => typeof id === 'string')
-    ? { messageIds }
-    : null;
 }
 
 function applyProcessingAcks(db: Database.Database, acks: ProcessingAck[]): void {
@@ -247,12 +222,6 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .all() as WaitingMessage[]
       ).map((row) => ({ ...row, processAfter: sqliteTimestamp(row.processAfter) })),
     hasMessage: (messageId) => db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined,
-    getInboundOrigin: (messageId) =>
-      db
-        .prepare(
-          'SELECT kind, channel_type AS channelType, platform_id AS platformId, content FROM messages_in WHERE id = ?',
-        )
-        .get(messageId) as InboundOrigin | undefined,
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
     getDeliveredIds: () => getDeliveredIds(db),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),
@@ -388,12 +357,6 @@ export function wrapSqliteOutbound(
         toolDeclaredTimeoutMs: record.toolDeclaredTimeoutMs,
         toolStartedAt: record.toolStartedAt,
       };
-    },
-    getTurnStamp: () => {
-      const row = readable().prepare('SELECT value FROM session_state WHERE key = ?').get(REPLY_STAMP_KEY) as
-        | { value: string }
-        | undefined;
-      return row === undefined ? null : turnStamp(row.value);
     },
     getDueMessages: (excludeIds) =>
       getDueOutboundMessages(readable())
