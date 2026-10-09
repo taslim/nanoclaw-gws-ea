@@ -43,13 +43,7 @@ import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
-import {
-  keptReleaseFiles,
-  readKeptReleaseManifest,
-  recordKeptTemplateRestamp,
-  stagedKeptFilesRoot,
-} from './kept-release.js';
-import { refreshMainTemplate, reverseMainTemplate, type TemplateFollowUp } from './main-template.js';
+import { keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { applyReleaseGateway, observeOnecliRuntime, restoreReleaseGateway, verifyOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
@@ -1622,10 +1616,6 @@ function describeFollowUp(followUp: OperationFollowUp): string {
   switch (followUp.kind) {
     case 'rebuild_group_image':
       return `rebuilding agent group ${followUp.agent_group_id}'s image`;
-    case 'refresh_template':
-      return "refreshing main's template";
-    case 'reverse_template_restamp':
-      return "reversing main's template refresh";
     case 'delete_release':
       return followUp.release === 'outgoing'
         ? 'deleting the outgoing release'
@@ -1666,62 +1656,24 @@ async function rebuildGroupImage(
   );
 }
 
-/**
- * A template follow-up's view of the release its restamp is recorded with:
- * for a refresh, the one the update kept in `previous/`; for a reversal, the
- * restored release's own files, which its rollback moved to
- * `outgoing/restored/`.
- */
-function templateFollowUp(
-  operation: InstanceOperation,
-  runtime: InstanceRuntimeConfig,
-  releaseRoot: string,
-  dependencies: CutoverSeams,
-): TemplateFollowUp {
-  return {
-    runtime,
-    ncl: dependencies.ncl ?? runInstanceNclJson,
-    recorded: async () => {
-      try {
-        return (await readKeptReleaseManifest(releaseRoot, operation.instanceId)).template_restamp;
-      } catch (error) {
-        if (!isErrno(error, 'ENOENT')) throw error;
-        throw new GwsEaError(
-          'kept_release_missing',
-          `The release kept in ${releaseRoot} has no manifest, so main's template restamp cannot be recorded with it.`,
-        );
-      }
-    },
-    record: (restamp) => recordKeptTemplateRestamp(releaseRoot, operation.instanceId, restamp),
-  };
-}
-
-/** Run one follow-up; returns what the operator is told about it, if anything. */
+/** Run one follow-up. */
 async function runFollowUp(
   operation: InstanceOperation,
   runtime: InstanceRuntimeConfig,
   followUp: OperationFollowUp,
   dependencies: CutoverSeams,
-): Promise<string | undefined> {
+): Promise<void> {
   const { paths, instanceId } = operation;
   switch (followUp.kind) {
     case 'rebuild_group_image':
       await rebuildGroupImage(runtime, followUp.agent_group_id, dependencies);
-      return undefined;
-    case 'refresh_template':
-      return refreshMainTemplate(
-        templateFollowUp(operation, runtime, paths.releaseRoot(instanceId, 'previous'), dependencies),
-      );
-    case 'reverse_template_restamp':
-      return reverseMainTemplate(
-        templateFollowUp(operation, runtime, restoredReleaseRoot(paths, instanceId), dependencies),
-      );
+      return;
     case 'delete_release':
       await rm(paths.releaseRoot(instanceId, followUp.release === 'outgoing' ? 'outgoing' : 'superseded'), {
         recursive: true,
         force: true,
       });
-      return undefined;
+      return;
     case 'delete_image':
       // Displaced by a retag or a rebuild; another assistant sharing it by content keeps it by its own tag (KTD19).
       await releaseImage(
@@ -1729,7 +1681,7 @@ async function runFollowUp(
         getInstallScopedNames(runtime.install_id).containerImageBase,
         followUp.image_id,
       );
-      return undefined;
+      return;
   }
 }
 
@@ -1771,12 +1723,11 @@ export async function leftoverPreviousTag(host: AssistantDocker): Promise<string
 
 /**
  * Run a recorded update's or rollback's follow-ups (KTD2): the per-group image
- * rebuilds and main's template refresh or its reversal first, then, once they
- * all succeeded, the cleanup of the superseded releases and displaced images.
+ * rebuilds first, then, once they all succeeded, the cleanup of the superseded
+ * releases and displaced images.
  * Each is struck from the record as it finishes, and the record is deleted
  * with the last. A failure never rolls back: it stays in the record, `status`
- * reports it, and the next run of the same command retries it. Returns what
- * the operator is told about the follow-ups that finished.
+ * reports it, and the next run of the same command retries it.
  *
  * A rollback's cleanup also drops the `:previous` tag it leaves (see
  * `leftoverPreviousTag`), derived from the state rather than recorded, and
@@ -1785,29 +1736,24 @@ export async function leftoverPreviousTag(host: AssistantDocker): Promise<string
  * follow up has no record left: `rollback --id` finds its leftover tag
  * instead.
  */
-export async function finishFollowUps(
-  operation: InstanceOperation,
-  dependencies: CutoverDependencies,
-): Promise<readonly string[]> {
+export async function finishFollowUps(operation: InstanceOperation, dependencies: CutoverDependencies): Promise<void> {
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
-  if (record && record.phase !== 'recorded') return [];
+  if (record && record.phase !== 'recorded') return;
   const rolledBack = await rolledBackKeepingNone(paths, instanceId);
-  if (!record && !rolledBack) return [];
+  if (!record && !rolledBack) return;
   const runtime = await loadCreatedRuntime(paths, instanceId);
   const reporter = dependencies.reporter ?? {};
   const kind = record?.kind ?? 'rollback';
   const pending = record?.follow_ups ?? [];
   const failures: string[] = [];
-  const notes: string[] = [];
   const attempt = async (followUp: OperationFollowUp, label: string): Promise<void> => {
     try {
-      const note = await runStep(reporter, { id: followUp.kind, label }, () =>
+      await runStep(reporter, { id: followUp.kind, label }, () =>
         runFollowUp(operation, runtime, followUp, dependencies),
       );
       await completeFollowUp(operation, followUp);
-      if (note) notes.push(note);
     } catch (error) {
       if (!(error instanceof GwsEaError)) throw error;
       failures.push(`${describeFollowUp(followUp)}: ${safeErrorMessage(error)}`);
@@ -1838,12 +1784,11 @@ export async function finishFollowUps(
       await attempt(followUp, `Cleaning up after the ${kind}…`);
     }
   }
-  if (failures.length === 0) return notes;
+  if (failures.length === 0) return;
   const release = record?.to ?? releaseOf(await getInstanceReservation(paths, instanceId));
   throw new GwsEaError(
     'follow_ups_failed',
     `Assistant ${instanceId} runs ${releaseLine(release)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${kind} failed: ${failures.join('; ')}. ` +
-      `${record ? `gws-ea status --id ${instanceId} lists what is left, and ` : ''}gws-ea ${kind} --id ${instanceId} retries it.` +
-      notes.map((note) => ` ${note}`).join(''),
+      `${record ? `gws-ea status --id ${instanceId} lists what is left, and ` : ''}gws-ea ${kind} --id ${instanceId} retries it.`,
   );
 }

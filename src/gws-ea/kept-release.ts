@@ -9,7 +9,6 @@ import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import { writePrivate } from '../community-portal/private-file.js';
-import { parseTemplateRestamp, type TemplateRestamp } from './main-template.js';
 import type { ControlPlanePaths } from './paths.js';
 import { validateReleaseCoordinates } from './registry.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
@@ -54,12 +53,6 @@ export interface KeptReleaseManifest {
   readonly instance_id: string;
   readonly release: ReleaseCoordinates;
   readonly snapshot_at: string;
-  /**
-   * The restamp of main's template the update that kept this release ran once
-   * it was recorded (KTD12): what it changed, recorded before it ran and
-   * again once it settled, so a code-only rollback back here can reverse it.
-   */
-  readonly template_restamp?: TemplateRestamp;
 }
 
 /** A kept release's manifest, refused when it belongs to another assistant: a release is restorable only into its own. */
@@ -89,20 +82,7 @@ export async function readKeptReleaseManifest(releaseRoot: string, instanceId: s
     instance_id: instanceId,
     release,
     snapshot_at: requireCanonicalTimestamp(value.snapshot_at, 'invalid_kept_release', `${file} names no snapshot time`),
-    ...(value.template_restamp === undefined
-      ? {}
-      : { template_restamp: parseTemplateRestamp(value.template_restamp, invalid) }),
   };
-}
-
-/** Record main's template restamp with a kept release, in place of any recorded before (one atomic write). */
-export async function recordKeptTemplateRestamp(
-  releaseRoot: string,
-  instanceId: string,
-  restamp: TemplateRestamp,
-): Promise<void> {
-  const manifest = await readKeptReleaseManifest(releaseRoot, instanceId);
-  await writePrivate(keptReleaseFiles(releaseRoot).manifest, { ...manifest, template_restamp: restamp });
 }
 
 /** The live release's files a cutover keeps. */

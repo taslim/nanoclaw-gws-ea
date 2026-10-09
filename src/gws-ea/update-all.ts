@@ -78,7 +78,7 @@ export interface UpdateAllPlan {
 export type AssistantUpdate =
   | { readonly kind: 'updated'; readonly updated: UpdatedAssistant }
   /** Its recorded update to the release it would deploy only had follow-ups left, and they finished. */
-  | { readonly kind: 'completed'; readonly release: ReleaseCoordinates; readonly notes: readonly string[] };
+  | { readonly kind: 'completed'; readonly release: ReleaseCoordinates };
 
 /** How one assistant's turn ended: its update's end, a failure, or another command holding it. */
 export type UpdateTurn = AssistantUpdate | { readonly kind: 'failed' } | { readonly kind: 'busy' };

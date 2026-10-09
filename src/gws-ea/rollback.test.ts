@@ -13,7 +13,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { heldImageTag } from './agent-image.js';
-import { finishFollowUps, restoredReleaseRoot } from './cutover.js';
+import { finishFollowUps } from './cutover.js';
 import type { RunEvent } from './events.js';
 import {
   ADDED_MIGRATION,
@@ -31,14 +31,9 @@ import {
   killDuringCutover,
   LIVE_MIGRATIONS,
   machine,
-  MAIN_TEMPLATE_DIR,
-  makeMain,
-  mainTemplate,
   MEMORY,
   messages,
   nextRelease,
-  PERSONA,
-  PROCEDURE,
   receiptCommit,
   release,
   releaseAgentImageKey,
@@ -49,7 +44,6 @@ import {
   SESSION,
   snapshot,
   SQLITE_HEADER,
-  stampedPersona,
   status,
   temporaryRoot,
   world,
@@ -58,7 +52,6 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import { acquireInstanceOperation } from './journal.js';
-import { readKeptReleaseManifest } from './kept-release.js';
 import { advanceOperation, readOperationRecord, type OperationPhase, type OperationRecord } from './operation.js';
 import { instanceMarkerFile } from './paths.js';
 import { getInstanceReservation, swapInstanceRelease } from './registry.js';
@@ -1602,200 +1595,5 @@ describe('what a snapshot restore discards', () => {
     expect(lines).toContain(
       `  Memory and group files changed since: 1 (${path.join('main', 'notes\\u001b[2K\\rNothing is lost.\\n.md')})`,
     );
-  });
-});
-
-describe("main's template across a rollback (KTD12)", GIT_HEAVY, () => {
-  const PLAN = ['groups', 'create', '--template', 'gws-ea/main', '--id', 'ag-main'];
-
-  async function persona(runtime: InstanceRuntimeConfig): Promise<string> {
-    return readFile(path.join(runtime.checkout_realpath, PERSONA), 'utf8');
-  }
-
-  it("reverses the update's refresh with the restored release's own restamp after a code-only rollback", async () => {
-    const { host, runtime, next, state, images } = await updatedAssistant(mainTemplate('2'));
-    const id = runtime.instance_id;
-    expect(await persona(runtime)).toBe(stampedPersona('2'));
-    state.restamps.length = 0;
-    // The restored release's restamp brings back the task series the update's had removed.
-    state.restampPlan = [{ surface: 'task', name: 'Morning brief', action: 'create', note: 'created paused' }];
-    const { run, out } = cli(host, state, next, runtime);
-
-    expect(await run(['rollback', '--id', id])).toBe(0);
-
-    await expectRolledBack(host, runtime, next, state, images.first);
-    expect(await persona(runtime)).toBe(stampedPersona('1'));
-    expect(await readFile(path.join(runtime.checkout_realpath, PROCEDURE), 'utf8')).toBe('Operating procedure 1.\n');
-    expect(state.restamps).toEqual([
-      { instanceId: id, args: PLAN },
-      { instanceId: id, args: [...PLAN, '--yes'] },
-    ]);
-    expect(out.join('\n')).toContain(
-      "Main's template was restored to this release's. It created these scheduled tasks, paused: Morning brief.",
-    );
-  });
-
-  it('plans no reversal after an update that kept main customized', async () => {
-    const host = await machine();
-    const runtime = await assistant(host);
-    await writeFile(path.join(runtime.checkout_realpath, PERSONA), 'My own instructions.\n');
-    const next = await nextRelease(host, mainTemplate('2'));
-    const state = world(runtime);
-    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
-    state.hangAt = 'rebuild';
-
-    // Stopped at its first follow-up, the recorded rollback shows what it planned.
-    await killDuringRollback(host, runtime, state, next);
-
-    const record = await readOperationRecord(host.paths, runtime.instance_id);
-    expect(record).toMatchObject({ kind: 'rollback', phase: 'recorded', mode: 'code_only' });
-    expect(record?.follow_ups).not.toContainEqual({ kind: 'reverse_template_restamp' });
-    expect(state.restamps).toEqual([]);
-    expect(await persona(runtime)).toBe('My own instructions.\n');
-  });
-
-  it('plans no reversal when it takes over an update whose refresh never ran', async () => {
-    const host = await machine();
-    const runtime = await assistant(host);
-    const next = await nextRelease(host, mainTemplate('2'));
-    const state = world(runtime);
-    state.restampFails = true;
-    const { run, out } = cli(host, state, next, runtime);
-    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
-    state.restamps.length = 0;
-    const updating = out.length;
-
-    expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
-
-    expect(state.restamps).toEqual([]);
-    expect(await persona(runtime)).toBe(stampedPersona('1'));
-    expect(out.slice(updating).join('\n')).not.toContain("Main's template");
-    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
-  });
-
-  /** A task series the release's template stamps, in a session mailbox of main's. */
-  function taskMailbox(checkout: string, prompt: string): void {
-    const directory = path.join(checkout, 'data', 'v2-sessions', 'ag-main', 'tasks-1');
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const database = new Database(path.join(directory, 'inbound.db'));
-    try {
-      database.pragma('journal_mode = DELETE');
-      database.exec(`CREATE TABLE IF NOT EXISTS messages_in (
-        id TEXT PRIMARY KEY, kind TEXT, series_id TEXT, status TEXT, recurrence TEXT, content TEXT, seq INTEGER)`);
-      database
-        .prepare(
-          "INSERT OR REPLACE INTO messages_in VALUES ('weekly-review-1a2b', 'task', 'weekly-review-1a2b', 'paused', '0 9 * * 1', ?, 2)",
-        )
-        .run(JSON.stringify({ prompt, script: null }));
-    } finally {
-      database.close();
-    }
-  }
-
-  it.each([
-    [
-      'its files',
-      (runtime: InstanceRuntimeConfig) =>
-        writeFileSync(path.join(runtime.checkout_realpath, PERSONA), 'Edited since the update.\n'),
-      'instructions.prepend.md',
-    ],
-    [
-      'its plugin MCP servers',
-      (runtime: InstanceRuntimeConfig) => {
-        const database = new Database(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
-        try {
-          database
-            .prepare("UPDATE container_configs SET mcp_servers = ? WHERE agent_group_id = 'ag-main'")
-            .run(
-              JSON.stringify({ calendar: { type: 'http', url: 'https://example.test/mcp', plugin: 'gws-ea-main' } }),
-            );
-        } finally {
-          database.close();
-        }
-      },
-      'its plugin MCP servers',
-    ],
-    [
-      'its template tasks',
-      (runtime: InstanceRuntimeConfig) => taskMailbox(runtime.checkout_realpath, 'Review the week, and the month.'),
-      'its template tasks',
-    ],
-  ] as const)(
-    'leaves main as the update refreshed it when %s changed since, and says so',
-    async (_label, change, named) => {
-      const host = await machine();
-      const runtime = await assistant(host);
-      taskMailbox(runtime.checkout_realpath, 'Review the week.');
-      const next = await nextRelease(host, {
-        ...mainTemplate('2'),
-        [path.join(MAIN_TEMPLATE_DIR, 'ai.nanoco.nanoclaw', 'tasks', 'Weekly review.md')]:
-          '---\nschedule: 0 9 * * 1\n---\nReview the week.\n',
-      });
-      const state = world(runtime);
-      const { run, out } = cli(host, state, next, runtime);
-      expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
-      expect(
-        (await readKeptReleaseManifest(host.paths.releaseRoot(runtime.instance_id, 'previous'), runtime.instance_id))
-          .template_restamp,
-      ).toMatchObject({ task_slugs: ['weekly-review'] });
-      const refreshed = await persona(runtime);
-      change(runtime);
-      state.restamps.length = 0;
-
-      expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
-
-      expect(commitOf(runtime.checkout_realpath)).toBe(host.first);
-      expect(out.join('\n')).toContain(
-        `Main's template was left as the update refreshed it, because ${named} changed since the update.`,
-      );
-      // Only planned when NanoClaw's plan was consulted, never applied.
-      expect(state.restamps.filter((call) => call.args.includes('--yes'))).toEqual([]);
-      if (named !== 'instructions.prepend.md') expect(await persona(runtime)).toBe(refreshed);
-    },
-  );
-
-  it('leaves main as the update refreshed it when another group became main since, touching no file', async () => {
-    const { host, runtime, next, state } = await updatedAssistant(mainTemplate('2'));
-    const id = runtime.instance_id;
-    makeMain(runtime.checkout_realpath, 'ag-research');
-    const groups = path.join(runtime.checkout_realpath, 'groups');
-    const before = await contents(groups);
-    state.restamps.length = 0;
-    const { run, out } = cli(host, state, next, runtime);
-
-    expect(await run(['rollback', '--id', id])).toBe(0);
-
-    expect(commitOf(runtime.checkout_realpath)).toBe(host.first);
-    expect(out.join('\n')).toContain(
-      "Main's template was left as the update refreshed it, because main is no longer the group it restamped.",
-    );
-    // Nothing was planned or applied, on the group that was main or the one that is now.
-    expect(state.restamps).toEqual([]);
-    expect(await contents(groups)).toEqual(before);
-    expect(await persona(runtime)).toBe(stampedPersona('2'));
-    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
-  });
-
-  it('finishes a reversal killed partway when the rollback is run again', async () => {
-    const { host, runtime, next, state } = await updatedAssistant(mainTemplate('2'));
-    const id = runtime.instance_id;
-    state.hangAt = 'restamp-partway';
-
-    await killDuringRollback(host, runtime, state, next);
-
-    // It was marked as reversing before the restored release's restamp ran, which stopped after the plugin.
-    const marked = (await readKeptReleaseManifest(restoredReleaseRoot(host.paths, id), id)).template_restamp;
-    expect(marked).toMatchObject({ reversing: true });
-    expect(await persona(runtime)).toBe(stampedPersona('2'));
-    delete state.hangAt;
-    state.restamps.length = 0;
-    const { run, out } = cli(host, state, next, runtime);
-
-    expect(await run(['rollback', '--id', id])).toBe(0);
-
-    expect(await persona(runtime)).toBe(stampedPersona('1'));
-    expect(state.restamps).toEqual([{ instanceId: id, args: [...PLAN, '--yes'] }]);
-    expect(out.join('\n')).toContain("Main's template was restored to this release's.");
-    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
   });
 });

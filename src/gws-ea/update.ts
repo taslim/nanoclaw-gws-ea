@@ -77,12 +77,6 @@ import {
 import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
-import {
-  decideMainTemplate,
-  describeCustomized,
-  mainTemplateRoot,
-  type MainTemplateDecision,
-} from './main-template.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
 import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
 import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
@@ -213,12 +207,6 @@ export interface UpdatePreview {
   readonly agentRunnerLockChanged: boolean;
   /** The session-schema sources differ, so session columns may change once the new host opens each session. */
   readonly sessionSchemaChanged: boolean;
-  /**
-   * What happens to main's template (R11, KTD12): refreshed once the update
-   * is recorded, unchanged, kept because these files are customized, or not
-   * stamped. Decided here and again right before any restamp.
-   */
-  readonly mainTemplate: MainTemplateDecision;
 }
 
 /** A release staged and previewed, not yet recorded. */
@@ -759,10 +747,9 @@ async function stageRelease(
     ),
   );
 
-  const [lockUnchanged, sessionSchemaUnchanged, mainTemplate] = await Promise.all([
+  const [lockUnchanged, sessionSchemaUnchanged] = await Promise.all([
     sameFiles(live, staged, [AGENT_RUNNER_LOCKFILE]),
     sameFiles(live, staged, SESSION_SCHEMA_SOURCES),
-    decideMainTemplate(live, mainTemplateRoot(staged)),
   ]);
   return {
     from: releaseOf(reservation),
@@ -779,7 +766,6 @@ async function stageRelease(
       groupImages: readDerivedImageGroups(live, getInstallScopedNames(runtime.install_id).containerImageBase),
       agentRunnerLockChanged: !lockUnchanged,
       sessionSchemaChanged: !sessionSchemaUnchanged,
-      mainTemplate,
     },
   };
 }
@@ -810,11 +796,8 @@ export async function prepareUpdate(
 
 /**
  * Record a confirmed update at `staged` (KTD2): from the release the registry
- * names to the staged one, with the live schema staging read, the groups
- * whose image is rebuilt once the release is recorded, and main's template
- * refresh when the preview promised one. One the preview kept is not planned,
- * so a customization undone meanwhile never refreshes what the operator was
- * told is kept.
+ * names to the staged one, with the live schema staging read and the groups
+ * whose image is rebuilt once the release is recorded.
  */
 export function recordStagedUpdate(operation: InstanceOperation, staged: StagedUpdate): Promise<OperationRecord> {
   return beginOperation(operation, {
@@ -822,13 +805,10 @@ export function recordStagedUpdate(operation: InstanceOperation, staged: StagedU
     from: staged.from,
     to: staged.to,
     manifest: staged.manifest,
-    follow_ups: [
-      ...staged.preview.groupImages.map((group) => ({
-        kind: 'rebuild_group_image' as const,
-        agent_group_id: group.id,
-      })),
-      ...(staged.preview.mainTemplate.kind === 'refresh' ? [{ kind: 'refresh_template' as const }] : []),
-    ],
+    follow_ups: staged.preview.groupImages.map((group) => ({
+      kind: 'rebuild_group_image' as const,
+      agent_group_id: group.id,
+    })),
   });
 }
 
@@ -860,19 +840,6 @@ function releaseLine(release: ReleaseCoordinates): string {
   return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
-function mainTemplateLine(decision: MainTemplateDecision): string {
-  switch (decision.kind) {
-    case 'refresh':
-      return "Main's template: refreshed from this release once the update is recorded, unless something is customized by then";
-    case 'unchanged':
-      return "Main's template: unchanged in this release";
-    case 'customized':
-      return `Main's template: kept as it is, because these are customized: ${describeCustomized(decision.customized)}`;
-    case 'not_stamped':
-      return `Main's template: not refreshed (${decision.reason})`;
-  }
-}
-
 /** The preview, one fact per line (R8). */
 export function updatePreviewLines(preview: UpdatePreview): string[] {
   const { from, to, gateway, groupImages } = preview;
@@ -887,7 +854,6 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
       ? `Gateway image: unchanged (${gateway.current})`
       : `Gateway image: ${gateway.current} → ${gateway.release}`,
     `Agent group images rebuilt after the update: ${groups || 'none'}`,
-    mainTemplateLine(preview.mainTemplate),
     ...(preview.agentRunnerLockChanged && groupImages.length > 0
       ? [
           `Until rebuilt, ${groups} run the previous agent-runner dependencies, so their first turns may fail and retry.`,
@@ -1333,11 +1299,10 @@ async function runCutover(cutover: Cutover, start: OperationRecord): Promise<voi
   }
 }
 
-/** Where an update left the assistant: the release it runs, the one kept to roll back to, and what its follow-ups said. */
+/** Where an update left the assistant: the release it runs, and the one kept to roll back to. */
 export interface UpdatedAssistant {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  readonly notes: readonly string[];
 }
 
 /**
@@ -1374,5 +1339,6 @@ export async function continueUpdate(
       );
     }
   }
-  return { from: record.from, to: record.to, notes: await finishFollowUps(operation, dependencies) };
+  await finishFollowUps(operation, dependencies);
+  return { from: record.from, to: record.to };
 }

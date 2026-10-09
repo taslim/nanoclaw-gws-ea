@@ -30,13 +30,6 @@ import {
 import { observeManagedGchatRoute, verifyExistingGchatEndpoint } from './endpoint.js';
 import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
-import {
-  describeCustomized,
-  inspectMainTemplate,
-  planMainRestamp,
-  type CustomizedTemplateFile,
-  type MainTemplateInspection,
-} from './main-template.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
 import { observeGoogleConnection, type GoogleConnectionReport } from './google-connection.js';
@@ -271,20 +264,6 @@ export interface RollbackView {
   readonly reason: string | null;
 }
 
-export type { CustomizedTemplateFile } from './main-template.js';
-
-export interface TemplatesView {
-  /**
-   * What of main's template is customized, which updates keep (R11): its
-   * files, compared with what the plugin it was stamped from stamps, and the
-   * skills, MCP servers, and tasks NanoClaw's restamp plan flags. Null when
-   * unknown.
-   */
-  readonly customized: readonly CustomizedTemplateFile[] | null;
-  /** Why the list is unknown, or what it leaves out; null when it is whole. */
-  readonly reason: string | null;
-}
-
 export interface SchemaView {
   readonly central_fingerprint: string | null;
   readonly session_fingerprint: string | null;
@@ -300,7 +279,6 @@ export interface AssistantStatus {
   readonly removal_in_progress: boolean;
   readonly release: ReleaseView;
   readonly rollback: RollbackView;
-  readonly templates: TemplatesView;
   readonly schema: SchemaView;
   readonly probes: AssistantProbes;
 }
@@ -324,8 +302,6 @@ export interface StatusObservers {
   /** The schema a checkout's databases record. */
   readonly schema: (checkoutRoot: string) => SnapshotManifest;
   readonly delivery: (checkoutRoot: string) => LatestDelivery | undefined;
-  /** Main's template files in a checkout, compared with the plugin they were stamped from. */
-  readonly mainTemplate: (checkoutRoot: string) => Promise<MainTemplateInspection>;
   /** The assistant's Google connection, observed without changing it. */
   readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
@@ -416,7 +392,6 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
         observeGoogleConnection(runtime, declaredEmail, overrides.fetch ? { fetch: overrides.fetch } : {})),
     schema: overrides.schema ?? readSchemaManifest,
     delivery: overrides.delivery ?? readLatestDelivery,
-    mainTemplate: overrides.mainTemplate ?? inspectMainTemplate,
   };
 }
 
@@ -1026,38 +1001,6 @@ async function observeRollback({ context, reservation, observers }: Subject, liv
   };
 }
 
-/**
- * What of main's template the operator customized, which updates keep (R11):
- * its files, read from main's folder whether or not the host runs, and the
- * skills, MCP servers, and tasks NanoClaw's restamp plan flags, which only
- * the running host can plan. Planned with the group named and without
- * `--yes`, the restamp only plans: nothing is stamped or changed.
- */
-async function observeTemplates(subject: Subject, main: () => Promise<string>): Promise<TemplatesView> {
-  let files: readonly CustomizedTemplateFile[];
-  try {
-    const inspected = await subject.observers.mainTemplate(subject.reservation.checkout_realpath);
-    if (inspected.kind === 'not_stamped') return { customized: null, reason: sentence(inspected.reason) };
-    files = inspected.customized;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Customization that cannot be observed is reported, never thrown.
-  } catch (error) {
-    return { customized: null, reason: failure(error).reason };
-  }
-  try {
-    const runtime = requireRuntime(subject.runtime);
-    return {
-      customized: [...files, ...(await planMainRestamp(runtime, await main(), subject.observers.ncl))],
-      reason: null,
-    };
-    // eslint-disable-next-line no-catch-all/no-catch-all -- What the host cannot plan is reported beside the files it read.
-  } catch (error) {
-    return {
-      customized: files,
-      reason: `Only its files were compared; its skills, MCP servers, and tasks were not: ${failure(error).reason ?? 'unknown'}`,
-    };
-  }
-}
-
 /** Run `observe` once, however many probes ask for its result. */
 function once<T>(observe: () => Promise<T>): () => Promise<T> {
   let result: Promise<T> | undefined;
@@ -1104,7 +1047,6 @@ export async function observeAssistantStatus(
     delivery,
     release,
     rollback,
-    templates,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
     observeService(context, runtime),
@@ -1125,7 +1067,6 @@ export async function observeAssistantStatus(
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
     observeRelease(subject),
     observeRollback(subject, live),
-    observeTemplates(subject, main),
   ]);
   const ingress = reservation.exclusive_resource_claims.ingress;
   return {
@@ -1143,7 +1084,6 @@ export async function observeAssistantStatus(
     removal_in_progress: removal,
     release,
     rollback,
-    templates,
     schema: schemaView(live),
     probes: {
       checkout,
@@ -1349,16 +1289,9 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
 }
 
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
-  const { registry, templates, schema } = status;
+  const { registry, schema } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
-  const listed =
-    templates.customized === null
-      ? `unknown: ${templates.reason ?? ''}`
-      : templates.customized.length === 0
-        ? 'none customized'
-        : `customized, kept by updates: ${describeCustomized(templates.customized)}`;
-  const customized = templates.customized !== null && templates.reason ? `${listed}. ${templates.reason}` : listed;
   const schemaLine =
     schema.central_fingerprint === null || schema.session_fingerprint === null
       ? `unknown: ${schema.reason ?? ''}`
@@ -1372,7 +1305,6 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
     `  Rollback:  ${rollbackLine(status.rollback)}`,
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
-    `  Templates: ${customized}`,
     `  Schema:    ${schemaLine}`,
     'Probes:',
   ];
@@ -1403,8 +1335,7 @@ export const STATUS_USAGE: readonly string[] = [
   'status --id <instance_id> [--json]',
   '       One assistant, observed live and read-only; it never repairs. JSON: instance_id, observed_at,',
   '       registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
-  '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
-  '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
+  '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
   '       probes: checkout, service, host, onecli, main_identity, external_email, inbox (state, since, last_success_at,',
   '       calendar_notifications), workspace (account), principal, route, connector (managed',

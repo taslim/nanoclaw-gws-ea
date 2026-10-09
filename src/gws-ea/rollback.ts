@@ -804,11 +804,8 @@ async function abandonPreparation(rollback: Rollback): Promise<void> {
  * The follow-ups a rollback runs once recorded (KTD2): the images its retag
  * displaced, released by ID; and for a rollback of the recorded release, the
  * per-group images rebuilt on the restored base with those they displace, a
- * previous release an update set aside and never deleted, and in code-only
- * mode the reversal of the update's restamp of main's template, when the kept
- * release records one (KTD12). A snapshot restore brings main's files back
- * with the rest of the snapshot. A rollback reverting an unrecorded update
- * rebuilt nothing and restamped nothing, since that update's follow-ups never
+ * previous release an update set aside and never deleted. A rollback reverting
+ * an unrecorded update rebuilt nothing, since that update's follow-ups never
  * ran, and puts its set-aside release back.
  */
 async function rollbackFollowUps(
@@ -835,10 +832,7 @@ async function rollbackFollowUps(
   const superseded: OperationFollowUp[] = (await exists(paths.releaseRoot(instanceId, 'superseded')))
     ? [{ kind: 'delete_release', release: 'superseded_previous' }]
     : [];
-  const restamped =
-    mode === 'code_only' && (await readKeptReleaseManifest(rollback.places.previous, instanceId)).template_restamp;
-  const template: OperationFollowUp[] = restamped ? [{ kind: 'reverse_template_restamp' }] : [];
-  return [...rebuilds, ...template, ...displaced, ...superseded];
+  return [...rebuilds, ...displaced, ...superseded];
 }
 
 /** A rollback given up before its swap: nothing changed, and the release it would have left runs again. */
@@ -889,11 +883,9 @@ async function prepareRollback(rollback: Rollback, record: OperationRecord): Pro
     await abandonPreparation(rollback);
     throw notPrepared(rollback, error);
   }
-  // The template reversal depends on the mode, decided again after a code-only attempt went back.
-  const planned = record.follow_ups.filter((followUp) => followUp.kind !== 'reverse_template_restamp');
   return advanceOperation(rollback.operation, 'swapping', {
     mode: stopped.mode,
-    follow_ups: planFollowUps(planned, await rollbackFollowUps(rollback, record, stopped.mode)),
+    follow_ups: planFollowUps(record.follow_ups, await rollbackFollowUps(rollback, record, stopped.mode)),
   });
 }
 

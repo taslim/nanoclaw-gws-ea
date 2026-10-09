@@ -104,8 +104,6 @@ const DELETABLE_RELEASES = ['superseded_previous', 'outgoing'] as const;
 /** Work that runs once the release is recorded; its failure never rolls back. */
 export type OperationFollowUp =
   | { readonly kind: 'rebuild_group_image'; readonly agent_group_id: string }
-  | { readonly kind: 'refresh_template' }
-  | { readonly kind: 'reverse_template_restamp' }
   | { readonly kind: 'delete_release'; readonly release: (typeof DELETABLE_RELEASES)[number] }
   | { readonly kind: 'delete_image'; readonly image_id: string };
 
@@ -260,10 +258,6 @@ function parseFollowUp(value: unknown): OperationFollowUp {
         kind: 'rebuild_group_image',
         agent_group_id: matching(value.agent_group_id, AGENT_GROUP_ID_PATTERN, 'agent group ID'),
       };
-    case 'refresh_template':
-      return { kind: 'refresh_template' };
-    case 'reverse_template_restamp':
-      return { kind: 'reverse_template_restamp' };
     case 'delete_release':
       return { kind: 'delete_release', release: oneOf(DELETABLE_RELEASES, value.release, 'release to delete') };
     case 'delete_image':
@@ -278,9 +272,6 @@ export function followUpKey(followUp: OperationFollowUp): string {
   switch (followUp.kind) {
     case 'rebuild_group_image':
       return `${followUp.kind}:${followUp.agent_group_id}`;
-    case 'refresh_template':
-    case 'reverse_template_restamp':
-      return followUp.kind;
     case 'delete_release':
       return `${followUp.kind}:${followUp.release}`;
     case 'delete_image':

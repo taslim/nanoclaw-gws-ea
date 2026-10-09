@@ -1372,7 +1372,10 @@ describe('removal after an update or rollback', () => {
     );
     if (!operation) throw new Error('The test instance operation was busy');
     try {
-      await beginOperation(operation, { ...moving, follow_ups: recorded.followUps ?? [{ kind: 'refresh_template' }] });
+      await beginOperation(operation, {
+        ...moving,
+        follow_ups: recorded.followUps ?? [{ kind: 'rebuild_group_image', agent_group_id: 'ag-research' }],
+      });
       for (const step of OPERATION_PHASES.slice(1, OPERATION_PHASES.indexOf(phase) + 1)) {
         if (step === 'recorded') await commitOperationRelease(operation);
         else if (step === 'stopped') {
