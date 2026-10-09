@@ -1074,17 +1074,19 @@ describe('a conversion refused before anything moves', GIT_HEAVY, () => {
     await expectNothingMoved(host, legacy, state, before);
   });
 
-  it('refuses an assistant no launchd job runs', async () => {
+  it('refuses an assistant no launchd job runs, staging nothing', async () => {
     const host = await machine();
     const legacy = await legacyAssistant(host);
     const next = await nextRelease(host);
     const state = legacyWorld(host, legacy);
+    const before = await snapshot(legacy.root);
     const deps = conversionDependencies(state, next, legacy, conversion());
 
     await expect(stage(host, legacy, { ...deps, service: { ...SERVICE, platform: 'linux' } })).rejects.toMatchObject({
       code: 'conversion_unsupported',
     });
-    expect((await getInstanceReservation(host.paths, legacy.id)).checkout_realpath).toBe(legacy.checkout);
+    await expectNothingMoved(host, legacy, state, before);
+    expect(await readdir(host.paths.instanceRoot(legacy.id))).toEqual([]);
   });
 
   it('serves the old release again when something still holds its state open at the stop, moving nothing', async () => {
