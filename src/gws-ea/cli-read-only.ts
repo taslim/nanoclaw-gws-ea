@@ -10,7 +10,7 @@ import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
-import { inspectOperation, revertClause, type OperationInspection } from './operation.js';
+import { failedOutcome, inspectOperation, revertClause, type OperationInspection } from './operation.js';
 import type { ControlPlanePaths } from './paths.js';
 import { buildToolEnvironment, type SanitizedCommand } from './process.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
@@ -169,7 +169,7 @@ function operationNote(inspection: OperationInspection): string | undefined {
     case 'failed': {
       const { record, next } = inspection;
       const subject = record.kind === 'update' ? 'An update' : 'A rollback';
-      return `${subject} of this assistant failed and left no release to return to (${record.phase}); fix it forward with ${next.continueWith} to a newer release.`;
+      return `${subject} of this assistant failed${failedOutcome(record)} (${record.phase}); fix it forward with ${next.continueWith} to a newer release.`;
     }
     case 'unreadable':
       return `This assistant's update or rollback record cannot be read: ${inspection.message}`;

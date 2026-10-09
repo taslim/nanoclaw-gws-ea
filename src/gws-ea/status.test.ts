@@ -33,6 +33,7 @@ import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
   advanceOperation,
   beginOperation,
+  beginOperationReturn,
   closeOperationFailed,
   commitOperationRelease,
   type OperationFollowUp,
@@ -364,6 +365,26 @@ async function updateFailedWithoutReturn(
   try {
     await beginOperation(operation, { kind: 'update', from: releaseOf(reservation), to, no_rollback_target: true });
     await advanceOperation(operation, 'started', { stop: { at: NOW.toISOString(), graceful: true } });
+    await closeOperationFailed(operation);
+  } finally {
+    operation.release();
+  }
+}
+
+/** A rollback of the release the registry names whose return to that release failed too. */
+async function rollbackFailedReturning(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  to: ReleaseCoordinates,
+): Promise<void> {
+  const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'rollback' });
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    await beginOperation(operation, { kind: 'rollback', from: releaseOf(reservation), to });
+    await advanceOperation(operation, 'fenced', { stop: { at: NOW.toISOString(), graceful: true } });
+    await advanceOperation(operation, 'snapshotted', { mode: 'code_only' });
+    await advanceOperation(operation, 'switched');
+    await beginOperationReturn(operation);
     await closeOperationFailed(operation);
   } finally {
     operation.release();
@@ -1209,6 +1230,23 @@ describe('status', () => {
     expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
     expect(listed.output.stdout.join('\n')).toMatch(new RegExp(` +update failed$`, 'mu'));
     expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
+  });
+
+  it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    await rollbackFailedReturning(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+
+    expect(text.output.stdout).toContain(
+      `  Operation: Its rollback to dogfood ${'c'.repeat(12)} failed, and so did returning to the release it left (switched); ` +
+        `fix it forward to a newer release with gws-ea update --id ${id}.`,
+    );
   });
 
   it('refuses an unknown assistant ID with exit code 1', async () => {

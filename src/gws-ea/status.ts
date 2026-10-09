@@ -41,6 +41,7 @@ import type { OnecliAgent } from './onecli-admin.js';
 import { observeGoogleConnection, type GoogleConnectionReport } from './google-connection.js';
 import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
 import {
+  failedOutcome,
   inspectOperation,
   liveCheckoutCommits,
   readRollbackPoint,
@@ -229,9 +230,15 @@ interface OperationRecordFacts {
 /** An assistant's update or rollback, as the operation record and the registry show it. */
 export type OperationView =
   | { readonly state: 'none' }
-  | ({ readonly state: 'open' | 'failed' } & OperationRecordFacts & {
+  | ({ readonly state: 'open' } & OperationRecordFacts & {
         readonly continue_with: string;
         readonly revert_with: string | null;
+      })
+  | ({ readonly state: 'failed' } & OperationRecordFacts & {
+        readonly continue_with: string;
+        readonly revert_with: string | null;
+        /** How it failed, after the word "failed" (`failedOutcome`). */
+        readonly outcome: string;
       })
   | ({ readonly state: 'committed' } & OperationRecordFacts & {
         readonly follow_ups: readonly OperationFollowUp[];
@@ -487,12 +494,19 @@ function operationView(inspection: OperationInspection): OperationView {
     case 'none':
       return { state: 'none' };
     case 'open':
-    case 'failed':
       return {
-        state: inspection.state,
+        state: 'open',
         ...operationFacts(inspection.record),
         continue_with: inspection.next.continueWith,
         revert_with: inspection.next.revertWith ?? null,
+      };
+    case 'failed':
+      return {
+        state: 'failed',
+        ...operationFacts(inspection.record),
+        continue_with: inspection.next.continueWith,
+        revert_with: inspection.next.revertWith ?? null,
+        outcome: failedOutcome(inspection.record),
       };
     case 'committed':
       return {
@@ -1269,8 +1283,8 @@ export function unfinishedOperation(
     }
     case 'failed':
       return (
-        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed and left no release ` +
-        `to return to (${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
+        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed${operation.outcome} ` +
+        `(${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
       );
     case 'unreadable':
       return `Its update or rollback record cannot be read: ${operation.message}`;

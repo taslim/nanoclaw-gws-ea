@@ -90,8 +90,10 @@ async function forgetAgain(file: string): Promise<void> {
     /* eslint-enable no-catch-all/no-catch-all */
   }
 
+  // Decided by person, not name: two people may share a name, and one kept must not hide the other forgotten.
+  const forgottenNow = new Set(people.filter((person) => !kept.includes(person)).map((person) => person.name));
   const keptNames = new Set(kept.map((person) => person.name));
-  const forgotten = names.filter((name) => !keptNames.has(name));
+  const forgotten = names.filter((name) => forgottenNow.has(name) || !keptNames.has(name));
   if (forgotten.length > 0) await tellMain(handoff, forgotten);
   await removePrivateFile(file);
   log.info('Forgot again the people a snapshot restore brought back', {

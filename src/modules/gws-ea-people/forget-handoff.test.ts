@@ -268,6 +268,28 @@ describe('forgetting again after a snapshot restore', () => {
     expect(fs.existsSync(HANDOFF)).toBe(false);
   });
 
+  it('still tells main of a person it forgot whose name a person it could not forget shares', async () => {
+    const kept = await keep('Juno Hale', ['email:juno.h@example.test']);
+    await getDb().run(
+      'INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at) VALUES (?, ?, NULL, ?)',
+      'email:juno.h@example.test',
+      'ag-main',
+      NOW,
+    );
+    const namesake = await keep('Juno Hale', ['email:jhale@example.test']);
+    await writePeopleForgetHandoff(HANDOFF, {
+      fingerprints: forgottenIn(['email:juno.h@example.test', 'email:jhale@example.test']),
+    });
+
+    await sweepForgetHandoff(HANDOFF);
+
+    expect(await getPerson(kept)).toBeDefined();
+    expect(await getPerson(namesake)).toBeUndefined();
+    const notes = await notesForMain();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].text).toContain('Juno Hale');
+  });
+
   it('does nothing without a handoff, or with one that hands over nothing', async () => {
     const noel = await keep('Noel Archer', ['email:noel@example.test']);
     const before = await getPerson(noel);

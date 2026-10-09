@@ -653,6 +653,18 @@ describe('GWS-EA persisted executables', () => {
 });
 
 describe('the instance host launcher', () => {
+  it('loads as a module of a process whose first argument names no file', async () => {
+    const release = path.resolve(import.meta.dirname, '..', '..');
+    // `node -e <code> <arg>` puts `<arg>` in argv[1]: nothing the launcher's entry check may resolve.
+    const loaded = await execFileAsync(
+      process.execPath,
+      ['--import', 'tsx', '-e', "import('./src/gws-ea/process.ts').then(() => console.log('loaded'))", 'no-such-file'],
+      { cwd: release, timeout: 60_000 },
+    );
+
+    expect(loaded.stdout.trim()).toBe('loaded');
+  }, 60_000);
+
   it('runs when the service manager starts it through the live link, as it starts every release', async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-launcher-link-')));
     // `<instance>/nanoclaw -> <release>`: the service definition names the launcher through the link.

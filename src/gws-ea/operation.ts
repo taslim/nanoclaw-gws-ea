@@ -492,12 +492,22 @@ function inProgress(record: OperationRecord, deploying?: ReleaseCoordinates): Gw
  * go back; an update with no release to return to, or a rollback reverting
  * an update, had none to try.
  */
+/**
+ * How a record closed as failed ended, after the word "failed": a rollback of
+ * a recorded release tried to return to the release it left; any other
+ * failed record had no release to return to.
+ */
+export function failedOutcome(record: OperationRecord): string {
+  return record.kind === 'rollback' && record.commit_point === 'registry'
+    ? ', and so did returning to the release it left'
+    : ' and left no release to return to';
+}
+
 function closedFailed(record: OperationRecord): GwsEaError {
   const id = record.instance_id;
-  const returned = record.kind === 'rollback' && record.commit_point === 'registry';
   return new GwsEaError(
     'operation_failed',
-    `${describeRecord(record)} failed${returned ? ', and so did returning to the release it left' : ' and left no release to return to'} (${record.phase}). ` +
+    `${describeRecord(record)} failed${failedOutcome(record)} (${record.phase}). ` +
       `Fix it forward: update it to a newer release with gws-ea update --id ${id}, or remove it with gws-ea remove --id ${id}.`,
     { details: { phase: record.phase, continueWith: `gws-ea update --id ${id}` } },
   );

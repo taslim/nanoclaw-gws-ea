@@ -586,9 +586,23 @@ async function runLauncherCommand(args: readonly string[]): Promise<void> {
   await launchInstanceHost(args[1]);
 }
 
-// The service manager starts the launcher through the live link, which Node keeps in `argv[1]` but resolves for
-// `import.meta.url`, so the two are compared as the one file they are.
-const invokedPath = process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : undefined;
+/**
+ * The file this process was started as. The service manager starts the
+ * launcher through the live link, which Node keeps in `argv[1]` but resolves
+ * for `import.meta.url`, so the two are compared as the one file they are. An
+ * argument that names no file (`node -e <code> <arg>`) is not this module.
+ */
+function invokedFile(argument: string | undefined): string | undefined {
+  if (!argument) return undefined;
+  try {
+    return pathToFileURL(realpathSync(argument)).href;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return undefined;
+    throw error;
+  }
+}
+
+const invokedPath = invokedFile(process.argv[1]);
 if (invokedPath === import.meta.url) {
   runLauncherCommand(process.argv.slice(2)).catch((error: unknown) => {
     const message = error instanceof GwsEaError ? error.message : 'The instance host launcher failed';
