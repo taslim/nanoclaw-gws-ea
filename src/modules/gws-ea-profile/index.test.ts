@@ -922,6 +922,18 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
       ok: true,
       data: { timezone: 'Asia/Kolkata' },
     });
+
+    // Another name for a zone in capitals is miscased too, and takes the zone's own spelling.
+    for (const [given, held] of [
+      ['US/PACIFIC', 'America/Los_Angeles'],
+      ['Asia/KOLKATA', 'Asia/Calcutta'],
+      ['Europe/KYIV', 'Europe/Kiev'],
+    ] as const) {
+      expect(await run('principal-profile-set', { timezone: given }, agent(main.id)), given).toMatchObject({
+        ok: true,
+        data: { timezone: held },
+      });
+    }
   });
 
   it("refuses every caller but main and the operator, and leaves the control plane's profile read as it was", async () => {

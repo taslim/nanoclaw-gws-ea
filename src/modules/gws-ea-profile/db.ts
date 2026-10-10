@@ -137,7 +137,9 @@ function personalName(value: string): string {
  * flipped, and a miscased name as UTC. A name already cased as the zone
  * database writes it stays as given, even when it is another name for a
  * zone (`Asia/Kolkata`); a miscased one takes the zone's own spelling.
- * Refused when it is no zone.
+ * Each part of such a name opens with one capital and runs in lowercase
+ * (`US/Pacific` aside, which takes its zone's spelling), so a part in
+ * capitals is miscased. Refused when it is no zone.
  */
 function principalTimezone(value: string): string {
   const zone = value.trim();
@@ -146,7 +148,7 @@ function principalTimezone(value: string): string {
   }
   const resolved = new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
   if (resolved.toLowerCase() === zone.toLowerCase()) return resolved;
-  return zone.split('/').every((part) => /^[A-Z]/u.test(part)) ? zone : resolved;
+  return zone.split('/').every((part) => /^[A-Z]/u.test(part) && !/[A-Z]{2}/u.test(part)) ? zone : resolved;
 }
 
 function identifier(value: string, label: string): string {
