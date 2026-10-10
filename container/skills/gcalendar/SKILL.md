@@ -15,13 +15,12 @@ Two habits prevent most mistakes:
 
 ## Find the principal's calendars
 
-Sharing a calendar with you doesn't add it to your list, whichever account it comes from: Google adds one only when you subscribe to it by its ID. An account's main (primary) calendar has the account's address as its ID. Any other calendar's ID is in Google's sharing email, and its owner can copy it from that calendar's "Integrate calendar" settings.
+The host adds the main (primary) calendar of each of the principal's addresses to your list itself, and keeps trying while one isn't shared with you. An account's main calendar has the account's address as its ID. Sharing any other calendar with you doesn't add it to your list, whichever account it comes from: Google adds one only when you subscribe to it by its ID, which is in Google's sharing email, and which its owner can copy from that calendar's "Integrate calendar" settings.
 
 1. `gog calendar calendars` lists the calendars in your list, with your `accessRole` on each: `owner`, `writer` (you can change events), `reader` (you can see details), or `freeBusyReader` (you can see only when they're busy).
-2. For each of the principal's addresses that isn't in the list, run `gog calendar subscribe <address>`. Success means the principal has shared it, and it now appears in your list with your access role. `404 notFound` means they haven't shared it yet.
-3. Decide whose each calendar is by the ownership rule in your gcalendar instructions. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
+2. Decide whose each calendar is by the ownership rule in your gcalendar instructions. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
 
-Add any other calendar with `gog calendar subscribe <calendarId>`. To stop using a calendar, run `gog calendar unsubscribe <calendarId>`: it leaves your list, and the sharing stays until its owner changes it.
+Add any other calendar, such as one of the principal's secondary calendars, or a main calendar they have just shared that the host has not added yet, with `gog calendar subscribe <calendarId>`: success means it is shared with you, and `404 notFound` that it isn't yet. To stop using a calendar, run `gog calendar unsubscribe <calendarId>`: it leaves your list, and the sharing stays until its owner changes it. The host puts the principal's main calendars back, so one of those leaves only when its address is no longer listed as theirs or they stop sharing it.
 
 ## Read
 
@@ -46,9 +45,9 @@ For one occurrence of a recurring invitation, pass that occurrence's own `id`. `
 
 ## Change
 
-- Create: the `create_event` tool, never gog. It puts the principal on the event's guest list, accepted, as on an event they made themselves, which gog can't. Pass `free: true` for a block that shouldn't make the principal look busy, and `private: true` when its title is no one else's business.
+- Create: the `create_event` tool, never gog, on one of the principal's calendars or on your own. On theirs it puts the principal on the guest list, accepted, as on an event they made themselves; on yours they are a guest only when you invite them. Pass `free: true` for a block that shouldn't make the principal look busy, and `private: true` when its details are no one else's business.
 - Move or edit: `gog calendar update <calendarId> <eventId> --from <start> --to <end>`, plus any other field to change. Fields you don't pass stay as they are.
-- Invite people or take them off: the `change_guests` tool, which leaves everyone else's answer as it was and keeps the principal on the event. gog's `--attendees` replaces the whole guest list, dropping the principal, so change guests with the tool alone.
+- Invite people or take them off: the `change_guests` tool, which leaves everyone else's answer as it was, keeps the principal on their own events, and checks each invitation for their private details. gog's `--attendees` replaces the whole guest list and checks nothing, so change guests with the tool alone.
 - Cancel: `gog calendar delete <calendarId> <eventId> --force`.
 - One occurrence of a recurring event: pass that occurrence's own `id` from `events`, because the series ID changes or cancels every occurrence. For one occurrence and all after it, pass the series ID with `--scope future --original-start <the occurrence's originalStartTime.dateTime, exactly as events printed it>`.
 

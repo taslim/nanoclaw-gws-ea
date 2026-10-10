@@ -628,6 +628,14 @@ describe("the principal's email addresses", () => {
     expect(section?.body).not.toMatch(/morgan@(work\.)?example\.test/u);
   });
 
+  it('names the field of the live list that carries each calendar’s access (R9)', async () => {
+    const listed = await run('principal-addresses-list', {}, agent(main.id));
+    const [row] = listed.ok ? (listed.data as Array<Record<string, unknown>>) : [];
+
+    expect(Object.keys(row ?? {})).toContain('calendar_access');
+    expect(MAIN_PRINCIPAL_ADDRESSES_POINTER).toContain('`calendar_access`');
+  });
+
   it("lists every current address in another group's identity section", async () => {
     await run('principal-addresses-add', { email: 'first_last@example.test' });
     await run('principal-addresses-remove', { email: 'morgan@work.example.test' });

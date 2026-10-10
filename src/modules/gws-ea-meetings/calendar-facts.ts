@@ -170,7 +170,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       .map((entry) => entry.id);
     if (calendars.length === 0) {
       throw forbidden(
-        "None of the calendars you can see is the principal's yet, so there is nothing to count: find and add their calendars as the gcalendar skill shows.",
+        "None of the calendars you can see is the principal's yet, so there is nothing to count: the host adds each of their addresses' calendars to yours once they share it with you.",
       );
     }
     return { timezone: (await getGwsEaProfile()).principal_timezone ?? TIMEZONE, addresses, calendars };

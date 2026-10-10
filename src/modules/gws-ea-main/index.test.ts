@@ -22,12 +22,13 @@ import '../gws-ea-people/index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-test';
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
+const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 
 /** Tools only external-email holds: main's guidance names none of them. */
 const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking'];
 
-/** Backticked words the guidance uses that are not tools: main's own name, a preference's sources, and a handoff's field. */
-const NOT_TOOLS = ['main', 'principal', 'learned', 'people'];
+/** Backticked words the guidance uses that are not tools: main's own name, a preference's sources, and a handoff's fields. */
+const NOT_TOOLS = ['main', 'principal', 'learned', 'people', 'calendar'];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-30T00:00:00.000Z' };
@@ -120,12 +121,22 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
   });
 
-  it('teaches the memory file each person gets, and names only `ncl people` verbs that exist', () => {
+  it('teaches the memory file each person gets', () => {
     // `ncl people` points main at these files, and its name search at the aliases in them.
     for (const layout of ['`memory/people/`', '`type: person`', 'aliases']) expect(GUIDANCE, layout).toContain(layout);
-    const verbs = [...GUIDANCE.matchAll(/`ncl people ([a-z-]+)/gu)].map(([, verb]) => verb);
-    expect(verbs.length).toBeGreaterThan(0);
-    for (const verb of verbs) expect(lookup(`people-${verb}`), verb).toBeDefined();
+  });
+
+  it('names only `ncl` commands that exist, in the guidance and in the welcome', () => {
+    for (const [name, text] of [
+      ['guidance', GUIDANCE],
+      ['welcome', WELCOME],
+    ] as const) {
+      const commands = [...text.matchAll(/`ncl ([a-z-]+) ([a-z-]+)/gu)].map(
+        ([, resource, verb]) => `${resource}-${verb}`,
+      );
+      expect(commands.length, name).toBeGreaterThan(0);
+      for (const command of commands) expect(lookup(command), `${name}: ${command}`).toBeDefined();
+    }
   });
 
   it('names no tool the agent does not have, and none only external-email holds', () => {
@@ -153,6 +164,27 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).toContain('# NanoClaw Module: gws-ea-email\n');
     expect(document).toContain('# NanoClaw Module: reminders\n');
     expect(document).not.toContain('# NanoClaw Module: gws-ea-email-external');
+  });
+
+  it('teaches where each booking goes, what it holds about the principal, and what unconfirmed mail in their name is', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    const groupDir = path.join(TEST_ROOT, main.folder);
+
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+
+    // The booking calendar is set on a thread's handoff, and the principal's default is kept where the guidance says (KTD8).
+    for (const taught of ['`calendar`', '`people_stats`', '`memory/calendars.md`']) {
+      expect(document, taught).toContain(taught);
+    }
+    // The inventory: the profile beside the stores main already keeps, and each address with its calendar access.
+    for (const taught of ['`ncl principal-profile`', '`ncl principal-addresses list`', '`calendar_access`']) {
+      expect(document, taught).toContain(taught);
+    }
+    // The host's note on unsigned mail in their name opens with these words.
+    expect(document).toContain('Gmail could not confirm');
   });
 });
 

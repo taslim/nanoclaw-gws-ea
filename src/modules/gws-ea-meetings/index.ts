@@ -6,9 +6,10 @@
  *
  *   free_time, book, change_booking, cancel_booking
  *
- * Beside them, `main`'s two writes on the principal's own events, which list
- * the principal as an accepted guest as `gog` cannot (`principal-events.ts`),
- * and its two calendar facts, counted from Google's own answer
+ * Beside them, `main`'s two writes on events, on the principal's calendars or
+ * the assistant's own, which `gog` cannot make with the principal on the
+ * guest list or with the private-details check (`principal-events.ts`), and
+ * its two calendar facts, counted from Google's own answer
  * (`calendar-facts.ts`), for a group holding Google Calendar:
  *
  *   create_event, change_guests, find_conflicts, people_stats

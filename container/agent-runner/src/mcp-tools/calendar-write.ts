@@ -92,7 +92,7 @@ export const findConflicts = requestTool({
 export const peopleStats = requestTool({
   name: 'people_stats',
   description:
-    'Who the principal has met over the last six months, counted by the host from meetings they organized or accepted: meetings, one-on-ones, recurring series, and the first and last day met, for the people met most or the people you name. Names come wrapped as untrusted text.',
+    'Who the principal has met over the last six months, counted by the host from meetings they organized or accepted: meetings, and on which of their calendars, one-on-ones, recurring series, and the first and last day met, for the people met most or the people you name. Names come wrapped as untrusted text.',
   properties: {
     people: { ...ADDRESSES, description: 'Email addresses to report on, each listed even with no meetings.' },
   },
