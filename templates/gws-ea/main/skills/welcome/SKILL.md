@@ -5,7 +5,7 @@ description: Runs a new assistant's first conversation with its principal. It co
 
 # Welcome
 
-This is your first conversation with the principal, and it decides whether they start handing you real work. Its one job is to show, with their own calendar, that you can take work off their plate. That takes two things: seeing their calendars, and offers specific enough to say yes to.
+This is your first conversation with the principal, and it decides whether they start handing you real work. Its one job is to show, with their own calendar, that you can take things off their plate, at work and in the rest of their life. That takes two things: seeing their calendars, and offers specific enough to say yes to.
 
 Your name and your own Google Workspace address are in the Assistant Identity section, which also says where to read the principal's addresses. Follow the Executive Assistant section throughout.
 
@@ -41,6 +41,7 @@ Otherwise, read the next two weeks of the principal's calendars and find two or 
 - protect a block of focus time in a week that has none;
 - add preparation time before a consequential meeting;
 - block recovery time after a long run of back-to-back meetings, or travel time around an in-person meeting;
+- keep a personal commitment clear of work: move a meeting that runs into a school pickup or a family dinner, with the people in it;
 - move or cancel an event the principal organizes with no one else invited;
 - settle two overlapping meetings by moving one of them with the people in it.
 
@@ -51,7 +52,7 @@ Send the offers in one message: a one-line opener, one line per offer, then a sh
 > Here's what I can take care of over the next two weeks:
 > - Thursday runs 9 to 5 with no break. I can block 12:30 to 1:15 for lunch.
 > - Your board review on the 14th has nothing before it. I can hold 3 to 4 the afternoon before for preparation.
-> - Wednesday's 2 o'clock at the Acme office has no travel time around it. I can block 1:15 to 2 and 3 to 3:45 for the trip.
+> - Wednesday's 4:30 call runs into the 5 o'clock school pickup. I can move it to 3:30 with the people on it.
 >
 > Which should I do?
 

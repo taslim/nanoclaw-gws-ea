@@ -148,8 +148,8 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/\b(?:AI|artificial intelligence|language model|chatbot|bot)\b/iu);
   });
 
-  it('stays within 2,000 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_000);
+  it('stays within 2,250 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_250);
   });
 
   it("teaches main its email and reminder tools, and none of external-email's", async () => {
