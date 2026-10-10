@@ -15,6 +15,12 @@ import { GoogleApiError, googleJson, type GoogleClientOptions } from '../gws-ea-
 
 export const FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 
+/** A Google account as Drive names it on a file: its own address and its permission id. */
+export interface DriveUser {
+  readonly emailAddress?: string;
+  readonly permissionId?: string;
+}
+
 /** A file as the host reads it. */
 export interface DriveFile {
   readonly id: string;
@@ -23,6 +29,14 @@ export interface DriveFile {
   /** In the trash, from where it can be restored. A file deleted for good is not found at all. */
   readonly trashed?: boolean;
   readonly parents?: readonly string[];
+  /** Who owns the file; Drive shows this to anyone who can see it. */
+  readonly owners?: readonly DriveUser[];
+  /** Who shared the file with the assistant, when someone did. */
+  readonly sharingUser?: DriveUser;
+  /** When the file was shared with the assistant. */
+  readonly sharedWithMeTime?: string;
+  /** Whether the assistant can change who has access; only then can it read the full access list. */
+  readonly canShare?: boolean;
 }
 
 /** Where one person's access to a file comes from: the file itself, or a folder above it. */
@@ -133,17 +147,27 @@ function booleanField<K extends string>(record: Record<string, unknown>, key: K)
   return (typeof value === 'boolean' ? { [key]: value } : {}) as { readonly [P in K]?: boolean };
 }
 
+function toUser(value: unknown): DriveUser[] {
+  return isRecord(value) ? [{ ...textField(value, 'emailAddress'), ...textField(value, 'permissionId') }] : [];
+}
+
 function toFile(value: unknown): DriveFile {
   if (!isRecord(value) || typeof value.id !== 'string') throw unreadable('file');
   const parents = Array.isArray(value.parents)
     ? value.parents.filter((parent): parent is string => typeof parent === 'string')
     : undefined;
+  const sharingUser = toUser(value.sharingUser)[0];
+  const canShare = isRecord(value.capabilities) ? booleanField(value.capabilities, 'canShare') : {};
   return {
     id: value.id,
     ...textField(value, 'name'),
     ...textField(value, 'mimeType'),
     ...booleanField(value, 'trashed'),
     ...(parents === undefined ? {} : { parents }),
+    ...(Array.isArray(value.owners) ? { owners: value.owners.flatMap(toUser) } : {}),
+    ...(sharingUser === undefined ? {} : { sharingUser }),
+    ...textField(value, 'sharedWithMeTime'),
+    ...canShare,
   };
 }
 
@@ -208,7 +232,8 @@ function toProposal(value: unknown): DriveAccessProposal[] {
 
 const DRIVE = 'https://www.googleapis.com/drive/v3';
 const DRIVE_V2 = 'https://www.googleapis.com/drive/v2';
-const FILE_FIELDS = 'id,name,mimeType,trashed,parents';
+const FILE_FIELDS =
+  'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)';
 const PERMISSION_FIELDS =
   'id,type,role,emailAddress,domain,deleted,expirationTime,view,permissionDetails(permissionType,role,inherited,inheritedFrom)';
 /** Pages read before a list is refused as too long: an access list and its requests are short. */

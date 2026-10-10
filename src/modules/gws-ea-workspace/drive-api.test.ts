@@ -58,9 +58,33 @@ describe('the Drive client', () => {
     expect(request.method).toBe('GET');
     expect(request.url.origin).toBe('https://www.googleapis.com');
     expect(request.url.pathname).toBe('/drive/v3/files/folder-1');
-    expect(request.url.searchParams.get('fields')).toBe('id,name,mimeType,trashed,parents');
+    expect(request.url.searchParams.get('fields')).toBe(
+      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)',
+    );
     expect(request.url.searchParams.get('supportsAllDrives')).toBe('true');
     expect(request.headers.authorization).toBe('Bearer host-drive-token');
+  });
+
+  it('reads who owns a file, who shared it with the assistant and when, and whether the assistant can share it', async () => {
+    const { api } = stubGoogle(() => ({
+      status: 200,
+      body: {
+        id: 'itinerary-1',
+        name: 'Lake trip',
+        owners: [{ emailAddress: 'remy.vance@example.com', permissionId: '0901', displayName: 'Remy Vance' }],
+        sharingUser: { emailAddress: 'morgan.fixture@gmail.com', permissionId: '0902', displayName: 'Morgan' },
+        sharedWithMeTime: '2026-10-09T15:00:00.000Z',
+        capabilities: { canShare: false, canEdit: false },
+      },
+    }));
+    expect(await api.getFile('itinerary-1')).toEqual({
+      id: 'itinerary-1',
+      name: 'Lake trip',
+      owners: [{ emailAddress: 'remy.vance@example.com', permissionId: '0901' }],
+      sharingUser: { emailAddress: 'morgan.fixture@gmail.com', permissionId: '0902' },
+      sharedWithMeTime: '2026-10-09T15:00:00.000Z',
+      canShare: false,
+    });
   });
 
   it('creates a file with its name, type and parents, and reads back what it made', async () => {
@@ -77,7 +101,9 @@ describe('the Drive client', () => {
     const [folder, document] = requests;
     expect(folder.method).toBe('POST');
     expect(folder.url.pathname).toBe('/drive/v3/files');
-    expect(folder.url.searchParams.get('fields')).toBe('id,name,mimeType,trashed,parents');
+    expect(folder.url.searchParams.get('fields')).toBe(
+      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)',
+    );
     expect(folder.body).toEqual({ name: 'Morgan Ellery · Juno', mimeType: FOLDER_MIME_TYPE });
     expect(document.body).toEqual({
       name: 'Trip plan',

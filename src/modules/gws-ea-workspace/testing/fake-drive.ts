@@ -12,9 +12,13 @@
  * - a file lists the access it inherits from the folders above it, merged
  *   with its own, and inherited access cannot be removed from the file.
  *
+ * - a file someone else owns and shares with the assistant shows its owner
+ *   and who shared it; only when the assistant can share it may it read
+ *   its full access list, as Drive allows owners and writers only.
+ *
  * Every call is recorded, reads included. A test makes the changes people
- * make in Drive itself (`trash`, `deleteForever`, `share`, `removeAccess`)
- * and makes a call fail once (`failNext`).
+ * make in Drive itself (`trash`, `deleteForever`, `share`, `removeAccess`,
+ * `shareWithAssistant`) and makes a call fail once (`failNext`).
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
@@ -23,6 +27,7 @@ import type {
   DriveFile,
   DrivePermission,
   DrivePermissionDetail,
+  DriveUser,
   ShareRole,
 } from '../drive-api.js';
 
@@ -49,6 +54,10 @@ interface StoredFile {
   /** The access granted on the file itself. */
   readonly permissions: DrivePermission[];
   readonly proposals: DriveAccessProposal[];
+  readonly owner: DriveUser;
+  /** Set for a file someone else shared with the assistant. */
+  readonly sharingUser?: DriveUser;
+  readonly sharedWithMeTime?: string;
 }
 
 interface Account {
@@ -124,6 +133,44 @@ export class FakeDrive implements DriveApi {
     this.live(fileId).proposals.push(proposal);
   }
 
+  /**
+   * Someone else's file, shared with the assistant at `role` by `sharedBy`
+   * (the owner, unless named). `access` is the rest of its access list.
+   * Both owner and sharer must be accounts. Returns the file's id.
+   */
+  shareWithAssistant(input: {
+    readonly name: string;
+    readonly owner: string;
+    readonly role: ShareRole;
+    readonly sharedBy?: string;
+    readonly sharedAt?: string;
+    readonly mimeType?: string;
+    readonly access?: readonly DrivePermission[];
+  }): string {
+    const owner = this.account(input.owner);
+    const sharer = this.account(input.sharedBy ?? input.owner);
+    const assistant = this.account(this.owner);
+    const file: StoredFile = {
+      id: `file-${String(this.nextFile++)}`,
+      name: input.name,
+      mimeType: input.mimeType ?? 'application/vnd.google-apps.document',
+      parents: [],
+      trashed: false,
+      deleted: false,
+      permissions: [
+        { id: owner.permissionId, type: 'user', role: 'owner', emailAddress: owner.email },
+        { id: assistant.permissionId, type: 'user', role: input.role, emailAddress: assistant.email },
+        ...(input.access ?? []),
+      ],
+      proposals: [],
+      owner: { emailAddress: owner.email, permissionId: owner.permissionId },
+      sharingUser: { emailAddress: sharer.email, permissionId: sharer.permissionId },
+      ...(input.sharedAt === undefined ? {} : { sharedWithMeTime: input.sharedAt }),
+    };
+    this.files.set(file.id, file);
+    return file.id;
+  }
+
   // -------------------------------------------------------------------------
   // DriveApi
   // -------------------------------------------------------------------------
@@ -151,6 +198,7 @@ export class FakeDrive implements DriveApi {
       deleted: false,
       permissions: [{ id: owner.permissionId, type: 'user', role: 'owner', emailAddress: owner.email }],
       proposals: [],
+      owner: { emailAddress: owner.email, permissionId: owner.permissionId },
     };
     this.files.set(file.id, file);
     return this.view(file);
@@ -169,6 +217,11 @@ export class FakeDrive implements DriveApi {
 
   async listPermissions(fileId: string): Promise<DrivePermission[]> {
     this.begin('listPermissions', fileId);
+    if (!this.canShare(this.live(fileId))) {
+      throw new GoogleApiError(403, `Google refused /drive/v3/files/${fileId}/permissions: Insufficient permissions.`, {
+        reason: 'insufficientFilePermissions',
+      });
+    }
     const merged = new Map<string, DrivePermission>();
     const add = (permission: DrivePermission, detail: DrivePermissionDetail) => {
       const held = merged.get(permission.id);
@@ -287,7 +340,28 @@ export class FakeDrive implements DriveApi {
     return found;
   }
 
+  /** Whether the assistant may share the file: it owns it, or holds writer access to it or a folder above it. */
+  private canShare(file: StoredFile): boolean {
+    const assistant = this.account(this.owner).permissionId;
+    return [file, ...this.ancestors(file)].some((held) =>
+      held.permissions.some(
+        (permission) =>
+          permission.id === assistant && ROLE_RANK.indexOf(permission.role) >= ROLE_RANK.indexOf('writer'),
+      ),
+    );
+  }
+
   private view(file: StoredFile): DriveFile {
-    return { id: file.id, name: file.name, mimeType: file.mimeType, trashed: file.trashed, parents: [...file.parents] };
+    return {
+      id: file.id,
+      name: file.name,
+      mimeType: file.mimeType,
+      trashed: file.trashed,
+      parents: [...file.parents],
+      owners: [file.owner],
+      ...(file.sharingUser === undefined ? {} : { sharingUser: file.sharingUser }),
+      ...(file.sharedWithMeTime === undefined ? {} : { sharedWithMeTime: file.sharedWithMeTime }),
+      canShare: this.canShare(file),
+    };
   }
 }
