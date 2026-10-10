@@ -955,7 +955,9 @@ class Cli {
       return {
         status: 'ready',
         message: `Assistant ${instanceId} is connected to Google as ${claims.workspace_email}.`,
-        details: ['Its host keeps the Calendar access agents use fresh while it runs.'],
+        details: [
+          "While it runs, its host keeps the agents' Google access fresh and keeps the home folder in its Drive shared with the principal.",
+        ],
       };
     } finally {
       operation.release();

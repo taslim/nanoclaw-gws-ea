@@ -1775,6 +1775,10 @@ describe('gws-ea connect-google', () => {
 
     expect(accounts).toEqual([email]);
     expect(io.out.join('\n')).toContain(`Assistant ${instanceId} is connected to Google as ${email}.`);
+    // All of the agents' Google access, not only Calendar's, and the home folder.
+    expect(io.out.join('\n')).toContain(
+      "While it runs, its host keeps the agents' Google access fresh and keeps the home folder in its Drive shared with the principal.",
+    );
   });
 
   it('stops for the operator with the command that continues it', async () => {
