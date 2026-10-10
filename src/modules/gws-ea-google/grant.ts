@@ -174,28 +174,66 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
 
 /**
  * What the sign-in asks for beyond its services' scopes. The grant never
- * leaves the host and is the assistant's own account, so the sign-in holds
- * every supported product's broadest scopes and the read-only variants a
- * narrower token can be cut to. A new capability then needs no new sign-in,
- * and each token still carries only what its services want. The read-only
- * variants are asked for by name because minting asks Google for an exact
- * subset of the granted scopes: a token wanting `drive.readonly` gets it only
- * from a grant that lists it.
+ * leaves the host and is the assistant's own account, so the sign-in lists
+ * every scope of each supported product that could be handed to an agent: a
+ * new capability or a narrower agent then needs no new sign-in, and each
+ * token still carries only what its services want. Each scope is listed by
+ * name because Google mints only scopes the grant lists, even when a broader
+ * granted scope covers them: checked live on 2026-10-10, a refresh for
+ * `calendar.events.readonly` from a grant holding `calendar.events` was
+ * refused as `invalid_scope`. Left out are add-on scopes, which apply only
+ * inside a Workspace add-on; app-scoped ones (`drive.file`, `drive.appdata`,
+ * `drive.appfolder`, `drive.install`, `drive.apps.readonly`,
+ * `calendar.app.created`), which cannot tell agents apart because every agent
+ * shares one OAuth client; and admin and Apps Script scopes, which lie outside
+ * the products.
  */
 const SIGN_IN_CEILING: readonly string[] = [
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://www.googleapis.com/auth/calendar.events.owned',
+  'https://www.googleapis.com/auth/calendar.events.owned.readonly',
+  'https://www.googleapis.com/auth/calendar.events.freebusy',
+  'https://www.googleapis.com/auth/calendar.events.public.readonly',
+  'https://www.googleapis.com/auth/calendar.freebusy',
+  'https://www.googleapis.com/auth/calendar.calendarlist',
+  'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+  'https://www.googleapis.com/auth/calendar.calendars',
+  'https://www.googleapis.com/auth/calendar.calendars.readonly',
+  'https://www.googleapis.com/auth/calendar.acls',
+  'https://www.googleapis.com/auth/calendar.acls.readonly',
+  'https://www.googleapis.com/auth/calendar.settings.readonly',
   'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.metadata',
+  'https://www.googleapis.com/auth/gmail.compose',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.insert',
+  'https://www.googleapis.com/auth/gmail.labels',
   'https://www.googleapis.com/auth/gmail.settings.basic',
   'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.metadata',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
+  'https://www.googleapis.com/auth/drive.activity',
   'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.labels',
   'https://www.googleapis.com/auth/drive.labels.readonly',
+  'https://www.googleapis.com/auth/drive.meet.readonly',
+  'https://www.googleapis.com/auth/documents',
   'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations',
   'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.body.readonly',
+  'https://www.googleapis.com/auth/forms.responses.readonly',
+  'https://www.googleapis.com/auth/directory.readonly',
 ];
 
 /**

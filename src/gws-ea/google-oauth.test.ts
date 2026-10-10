@@ -223,7 +223,7 @@ describe('signing in as the assistant', () => {
       fetch: g.fetch,
     }).catch((caught: unknown) => caught);
 
-    // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the read-only variants the ceiling adds.
+    // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the rest of those products' scopes the ceiling adds.
     const workspaceScopes = [
       'https://www.googleapis.com/auth/drive',
       'https://www.googleapis.com/auth/documents',
@@ -232,8 +232,13 @@ describe('signing in as the assistant', () => {
       'https://www.googleapis.com/auth/forms.body',
       'https://www.googleapis.com/auth/forms.responses.readonly',
       'https://www.googleapis.com/auth/drive.readonly',
+      'https://www.googleapis.com/auth/drive.metadata',
+      'https://www.googleapis.com/auth/drive.metadata.readonly',
+      'https://www.googleapis.com/auth/drive.activity',
       'https://www.googleapis.com/auth/drive.activity.readonly',
+      'https://www.googleapis.com/auth/drive.labels',
       'https://www.googleapis.com/auth/drive.labels.readonly',
+      'https://www.googleapis.com/auth/drive.meet.readonly',
       'https://www.googleapis.com/auth/documents.readonly',
       'https://www.googleapis.com/auth/spreadsheets.readonly',
       'https://www.googleapis.com/auth/presentations.readonly',
