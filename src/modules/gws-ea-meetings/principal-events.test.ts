@@ -1,9 +1,10 @@
 /**
- * main's tools on the principal's own events: `create_event` puts an event
- * on one of their calendars and `change_guests` changes who an event of
- * theirs invites. On every event either writes, the principal is a guest,
- * accepted, as the organizer of an event they made themselves, unless they
- * answered it otherwise themselves.
+ * main's tools on events: `create_event` puts an event on one of the
+ * principal's calendars or the assistant's own, and `change_guests` changes
+ * who an event there invites. On every event either writes on a principal
+ * calendar, the principal is a guest, accepted, as the organizer of an event
+ * they made themselves, unless they answered it otherwise themselves; on the
+ * assistant's own calendar, they are a guest only when main invites them.
  *
  * Drives the real delivery actions, guard, capabilities and session DBs
  * against an in-memory Google Calendar. Only the container runtime and its
@@ -74,6 +75,7 @@ import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-inbox/index.js';
+import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
@@ -92,9 +94,16 @@ const PACIFIC = 'America/Los_Angeles';
 const HOME = '12 Rosewood Lane';
 /** The personal address of someone close to the principal, which they keep private. */
 const JUNO_PERSONAL = 'juno.hale@home.example';
+/** The assistant's own address, which names its own calendar. */
+const ASSISTANT = 'juno@northwind.example';
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
+/** The assistant on an event of its own calendar, its organizer like the owner of any calendar. */
+const ASSISTANT_GUEST = { email: ASSISTANT, responseStatus: 'accepted', organizer: true };
+/** What every answer for an event on the assistant's own calendar says of who sees it (KTD10). */
+const OWN_CALENDAR_VISIBILITY =
+  'It is on your own calendar: anyone your calendar is shared with sees its details unless it is private, and in a company Workspace that can include colleagues.';
 
 let calendar: FakeCalendar;
 let main: Session;
@@ -200,8 +209,10 @@ beforeEach(async () => {
   }
   await getDb().run(
     `UPDATE gws_ea_profile
-        SET main_agent_group_id = 'ag-main', assistant_display_name = 'Juno', principal_timezone = ?
+        SET main_agent_group_id = 'ag-main', assistant_display_name = 'Juno', assistant_workspace_email = ?,
+            principal_timezone = ?
       WHERE singleton = 1`,
+    ASSISTANT,
     PACIFIC,
   );
   await recordExternalEmailAgentGroupId('ag-external');
@@ -213,6 +224,7 @@ beforeEach(async () => {
   calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', conferenceTypes: ['hangoutsMeet'] });
   calendar.calendars.set(READ_ONLY, { id: READ_ONLY, accessRole: 'reader' });
   calendar.calendars.set(COLLEAGUE_CALENDAR, { id: COLLEAGUE_CALENDAR, accessRole: 'writer' });
+  calendar.calendars.set(ASSISTANT, { id: ASSISTANT, accessRole: 'owner' });
 
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
   external = (await resolveSession('ag-external', 'mg-inbox', 'mail-1', 'per-thread')).session;
@@ -250,6 +262,7 @@ describe('create_event', () => {
     expect(created).toMatchObject({ calendar: PRINCIPAL, start: FOCUS.start, end: FOCUS.end });
     expect(created.message).toMatch(/^Added "Focus: board deck" to .+: Thursday 8 Oct, 09:00–11:00 PDT\./u);
     expect(created.message).toMatch(/the principal is on its guest list, accepted/u);
+    expect(created.message).not.toContain(OWN_CALENDAR_VISIBILITY);
   });
 
   it('invites the guests named after the principal, repeats, and adds a Meet link', async () => {
@@ -452,10 +465,10 @@ describe('create_event', () => {
     expect(calendar.writes.map((write) => write.op)).toEqual(['insert', 'delete']);
   });
 
-  it('refuses a calendar that is not the principal’s, one it may only read, and one not in its list, writing nothing', async () => {
+  it('refuses a calendar neither the principal’s nor its own, one it may only read, and one not in its list, writing nothing', async () => {
     for (const [calendarId, problem] of [
-      [COLLEAGUE_CALENDAR, /not one of the principal's calendars/u],
-      ['nobody@northwind.example', /not one of the principal's calendars/u],
+      [COLLEAGUE_CALENDAR, /is not one of the principal's calendars in your list, nor your own/u],
+      ['nobody@northwind.example', /is not one of the principal's calendars in your list, nor your own/u],
       [READ_ONLY, /lets you see that calendar but not change it/u],
       ['not a calendar', /calendar must be a calendar ID/u],
     ] as const) {
@@ -783,6 +796,136 @@ describe('change_guests', () => {
       /Give add, remove, or both/u,
     );
     expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses an event on a calendar neither the principal’s nor its own, though it may write there', async () => {
+    calendar.put({
+      ...teamSync([{ email: COLLEAGUE_CALENDAR, responseStatus: 'accepted', organizer: true }]),
+      calendarId: COLLEAGUE_CALENDAR,
+      organizer: { email: COLLEAGUE_CALENDAR },
+    });
+    expect(
+      refusal(await send(main, 'change_guests', { calendar: COLLEAGUE_CALENDAR, event: 'teamsync01', add: [NOEL] })),
+    ).toBe(
+      `${COLLEAGUE_CALENDAR} is not one of the principal's calendars in your list, nor your own: you write only on those.`,
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+});
+
+describe('the assistant’s own calendar (R19)', () => {
+  it('puts an event there with itself its one guest, no principal, emailing no one, and says who sees it', async () => {
+    const created = data(await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT }));
+
+    expect(calendar.event(ASSISTANT, String(created.event))?.attendees).toEqual([ASSISTANT_GUEST]);
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({ op: 'insert', calendarId: ASSISTANT, sendUpdates: 'none' }),
+    ]);
+    expect(created).toMatchObject({ calendar: ASSISTANT, start: FOCUS.start, end: FOCUS.end });
+    expect(created.message).toBe(
+      `Added "Focus: board deck" to ${ASSISTANT}: Thursday 8 Oct, 09:00–11:00 PDT. ${OWN_CALENDAR_VISIBILITY} Change who it invites with change_guests, event ${String(created.event)}; anything else with gog calendar update.`,
+    );
+  });
+
+  it('invites the principal only when named, and takes their time only through the copy Google’s invitation puts on their calendar', async () => {
+    const invited = data(
+      await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT, title: 'Board prep', guests: [PRINCIPAL] }),
+    );
+    const alone = data(
+      await send(main, 'create_event', {
+        calendar: ASSISTANT,
+        title: 'Draft the agenda',
+        start: '2026-10-08T11:00:00-07:00',
+        end: '2026-10-08T12:00:00-07:00',
+      }),
+    );
+    const made = calendar.event(ASSISTANT, String(invited.event));
+    if (made === undefined) throw new Error('create_event made no event');
+    // A guest like any other: Google sends them the invitation.
+    expect(made.attendees).toEqual([ASSISTANT_GUEST, { email: PRINCIPAL, responseStatus: 'needsAction' }]);
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({ op: 'insert', eventId: invited.event, sendUpdates: 'all' }),
+      expect.objectContaining({ op: 'insert', eventId: alone.event, sendUpdates: 'none' }),
+    ]);
+    expect(invited.message).toMatch(new RegExp(`Its guests: ${PRINCIPAL}; Google sent them the invitation\\.`, 'u'));
+
+    // Google's invitation puts a copy of the event on the principal's calendar.
+    calendar.put({ ...made, calendarId: PRINCIPAL });
+    const read = vi.spyOn(calendar, 'listEventDetails');
+    const facts = data(
+      await send(main, 'find_conflicts', { start: '2026-10-08T09:00:00-07:00', end: '2026-10-08T12:00:00-07:00' }),
+    );
+    expect(facts.conflicts).toEqual([expect.objectContaining({ calendars: [PRINCIPAL], ical_uid: made.iCalUID })]);
+    expect(read.mock.calls.map(([calendarId]) => calendarId)).not.toContain(ASSISTANT);
+  });
+
+  it('changes who an event there invites, telling the principal like any guest, and keeps itself on it', async () => {
+    const event = String(
+      data(await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT, guests: [REMY] })).event,
+    );
+
+    calendar.writes.length = 0;
+    const changed = data(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [PRINCIPAL] }));
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({
+        op: 'guests',
+        sendUpdates: 'all',
+        guests: [ASSISTANT_GUEST, { email: REMY, responseStatus: 'needsAction' }, { email: PRINCIPAL }],
+      }),
+    ]);
+    expect(changed.guests).toEqual([REMY, PRINCIPAL]);
+    expect(changed.message).toBe(`Its guests now: ${REMY} and ${PRINCIPAL}. Google sent the guests the update.`);
+
+    calendar.writes.length = 0;
+    const without = data(await send(main, 'change_guests', { calendar: ASSISTANT, event, remove: [PRINCIPAL] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
+    expect(without.message).toBe(`Its guests now: ${REMY}. Google sent the guests the update.`);
+
+    calendar.writes.length = 0;
+    expect(data(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [REMY] })).message).toBe(
+      `Nothing changed: ${REMY} is already invited; you are already on it.`,
+    );
+    expect(refusal(await send(main, 'change_guests', { calendar: ASSISTANT, event, remove: [ASSISTANT] }))).toBe(
+      'You stay on the events on your own calendar: you organize them.',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('runs the private-details check on every invitee but the principal, for either tool', async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+    const dinner = { ...FOCUS, calendar: ASSISTANT, title: 'Dinner', location: HOME };
+
+    expect(refusal(await send(main, 'create_event', { ...dinner, guests: [NOEL] }))).toMatch(
+      /^The event was not added: as its guests would see it, the invitation carries one of the principal's private details \(address\)\./u,
+    );
+    expect(calendar.writes).toEqual([]);
+
+    const event = String(data(await send(main, 'create_event', dinner)).event);
+    calendar.writes.length = 0;
+    expect(refusal(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [NOEL] }))).toMatch(
+      /^The guests were not changed: as its guests would see it, the invitation carries one of the principal's private details \(address\)\./u,
+    );
+    expect(calendar.writes).toEqual([]);
+
+    // The principal may see anything of theirs.
+    data(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [PRINCIPAL] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
+  });
+
+  it('records no change of its own there, so a guest’s answer minutes later still reaches main (AE5, KTD12)', async () => {
+    const minutesLater = (): Date => new Date(Date.now() + 5 * 60_000);
+    const own = String(data(await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT, guests: [NOEL] })).event);
+    expect(consumeOwnCalendarChange(ASSISTANT, own, minutesLater())).toBe(false);
+    data(await send(main, 'change_guests', { calendar: ASSISTANT, event: own, add: [REMY] }));
+    expect(consumeOwnCalendarChange(ASSISTANT, own, minutesLater())).toBe(false);
+
+    // On the principal's calendar, Google's notification of the assistant's own write is still its own.
+    const theirs = String(data(await send(main, 'create_event', { ...FOCUS, guests: [NOEL] })).event);
+    expect(consumeOwnCalendarChange(PRINCIPAL, theirs, minutesLater())).toBe(true);
+    // An event no earlier test has changed, so the record is this write's.
+    calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'replysync01' });
+    data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'replysync01', add: [NOEL] }));
+    expect(consumeOwnCalendarChange(PRINCIPAL, 'replysync01', minutesLater())).toBe(true);
   });
 });
 

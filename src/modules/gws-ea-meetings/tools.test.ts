@@ -510,6 +510,46 @@ describe('busy time on the principal’s other calendars', () => {
     expect(bookings()).toEqual([]);
     expect(calendar.live(TEAM)).toEqual([]);
   });
+
+  it('never reads the assistant’s own calendar: an event there takes the principal’s time only through the copy its invitation put on theirs (R10, R19)', async () => {
+    calendar.calendars.set(JUNO, { id: JUNO, accessRole: 'owner' });
+    await replacePrincipalCalendars([PRINCIPAL], now());
+    const ownEvent = (id: string, start: string, end: string): StoredEvent => ({
+      calendarId: JUNO,
+      id,
+      iCalUID: `${id}@google.com`,
+      status: 'confirmed',
+      organizer: { email: JUNO },
+      start: { dateTime: start },
+      end: { dateTime: end },
+    });
+    // The assistant's own work at 10:00, and at 11:00 an event of its own the principal is invited to.
+    calendar.put(ownEvent('ownwork01', WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'));
+    const invitation = {
+      ...ownEvent('owninvite01', '2026-10-07T10:00:00.000Z', '2026-10-07T10:30:00.000Z'),
+      attendees: [
+        { email: JUNO, responseStatus: 'accepted', organizer: true },
+        { email: PRINCIPAL, responseStatus: 'needsAction' },
+      ],
+    };
+    calendar.put(invitation);
+    // Google's invitation put a copy of it on the principal's calendar.
+    calendar.put({ ...invitation, calendarId: PRINCIPAL });
+    const read = vi.spyOn(calendar, 'listEvents');
+
+    const { windows } = data(
+      await send(sessionA, 'free_time', {
+        from: '2026-10-07T09:00:00+01:00',
+        to: '2026-10-07T12:00:00+01:00',
+        minutes: 30,
+      }),
+    ) as { windows: Free[] };
+    expect(windows.map((free) => free.principal_time)).toEqual([
+      'Wednesday 7 Oct, 09:00–11:00 BST',
+      'Wednesday 7 Oct, 11:30–12:00 BST',
+    ]);
+    expect(read.mock.calls.map(([calendarId]) => calendarId)).not.toContain(JUNO);
+  });
 });
 
 describe('book', () => {

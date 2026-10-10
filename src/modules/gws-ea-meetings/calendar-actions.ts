@@ -61,8 +61,9 @@ export interface OwnerTag {
 }
 
 /**
- * Whether `address` is the owner's of the principal's calendar
- * `calendarId`, in any spelling the one rule gives their addresses (R1).
+ * Whether `address` is the owner's of the calendar `calendarId`, one of the
+ * principal's or the assistant's own, in any spelling the one rule gives
+ * the principal's addresses (R1).
  */
 export function isOwnerAddress(calendarId: string, address: string | undefined): boolean {
   return address !== undefined && principalMatchKey(address) === principalMatchKey(calendarId);
