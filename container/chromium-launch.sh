@@ -17,7 +17,18 @@
 # src/modules/gws-ea-google/browser-bypass.test.ts fails when they differ.
 set -eu
 
-GOOGLE_API_HOSTS='www.googleapis.com,gmail.googleapis.com,people.googleapis.com,docs.googleapis.com,sheets.googleapis.com,slides.googleapis.com,forms.googleapis.com'
+GOOGLE_API_HOSTS='www.googleapis.com gmail.googleapis.com people.googleapis.com docs.googleapis.com sheets.googleapis.com slides.googleapis.com forms.googleapis.com'
+
+# Chromium matches a bypass entry against the URL's host as written, and a page
+# can write any host fully qualified, ending in the root's dot
+# (https://www.googleapis.com./drive/v3/files). That spelling is not the
+# bypassed host, so it would go through the gateway, which might match it to
+# the host's credential. Each host is bypassed in both spellings, so that
+# matching never decides.
+bypass=
+for host in $GOOGLE_API_HOSTS; do
+  bypass=$bypass${bypass:+,}$host,$host.
+done
 
 # The gateway is the proxy the container's environment names. Chromium cannot
 # use the credentials in it, so they are left out; agent-browser reads them
@@ -55,4 +66,4 @@ for arg do
   set -- "$@" "$arg"
 done
 
-exec /usr/bin/chromium --proxy-server="$scheme$server" --proxy-bypass-list="$GOOGLE_API_HOSTS" "$@"
+exec /usr/bin/chromium --proxy-server="$scheme$server" --proxy-bypass-list="$bypass" "$@"

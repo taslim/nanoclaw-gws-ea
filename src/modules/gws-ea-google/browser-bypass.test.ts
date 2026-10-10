@@ -3,8 +3,9 @@
  * assistant's Google token (KTD10). Chromium's URL blocklist stops navigations,
  * not a page's own requests, so the image starts Chromium through a launch
  * wrapper that sends it through the gateway and bypasses the gateway for
- * exactly those hosts. On the internal agent-egress network a bypassed host has
- * no route, while gog keeps the gateway.
+ * exactly those hosts, each in its plain and fully-qualified spelling. On the
+ * internal agent-egress network a bypassed host has no route, while gog keeps
+ * the gateway.
  */
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -70,13 +71,16 @@ describe("an agent's browser and Google's API hosts", () => {
 
     expect(status).toBe(0);
     expect(argv[0]).toBe(GATEWAY_SERVER);
-    expect(bypassList(argv).sort()).toEqual([...AGENT_GOOGLE_HOSTS].sort());
+    // Chromium matches a bypass entry against the URL's host as written, and a
+    // page can write each host fully qualified, ending in the root's dot.
+    const spellings = AGENT_GOOGLE_HOSTS.flatMap((host) => [host, `${host}.`]);
+    expect(bypassList(argv).sort()).toEqual(spellings.sort());
   });
 
   it('leaves every other host on the gateway: each bypass entry is one exact host', () => {
     const bypassed = bypassList(launch({ HTTPS_PROXY: GATEWAY }).argv);
 
-    for (const host of bypassed) expect(host).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/);
+    for (const host of bypassed) expect(host).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+\.?$/);
     for (const host of ['fonts.googleapis.com', 'maps.googleapis.com', 'docs.google.com', 'example.com']) {
       expect(bypassed).not.toContain(host);
     }
