@@ -20,7 +20,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   AGENT_GOOGLE_CREDENTIALS,
-  credentialScopes,
   googleCredentialFor,
   missingGoogleScopes,
   type GoogleGrant,
@@ -164,15 +163,15 @@ function listed(names: readonly string[]): string {
 }
 
 /**
- * Why the secrets the host publishes from `grant` do not each inject exactly
- * one token on their credential's host, or undefined when they do. The host
- * publishes a credential only when the grant holds some of its scopes.
- * Secrets the host has not published yet are named together.
+ * Why the secrets the host publishes for agents do not each inject exactly one
+ * token on their credential's host, or undefined when they do. Asked only of a
+ * grant holding every scope this release asks for, from which the host
+ * publishes every credential. Secrets it has not published yet are named
+ * together.
  */
-function publishedAccessProblem(secrets: readonly VaultSecret[], grant: GoogleGrant): string | undefined {
+function publishedAccessProblem(secrets: readonly VaultSecret[]): string | undefined {
   const missing: string[] = [];
   for (const credential of AGENT_GOOGLE_CREDENTIALS) {
-    if (credentialScopes(credential, grant.scopes).length === 0) continue;
     const named = secrets.filter((secret) => secret.name === credential.secretName);
     if (named.length === 0) missing.push(credential.secretName);
     else if (named.length > 1) return `OneCLI holds ${named.length} secrets named ${credential.secretName}`;
@@ -250,11 +249,11 @@ export function googleConnectionResources(
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
     ...(dependencies.now ? { now: dependencies.now } : {}),
   };
-  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> =>
-    publishedAccessProblem(
-      await listVaultSecrets(context.input.google.runtime, fetchImpl),
-      await requireGrant(context),
-    );
+  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
+    const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
+    await requireGrant(context);
+    return publishedAccessProblem(secrets);
+  };
   return [
     googleWorkspaceApisResource(dependencies.gcloud),
     {
@@ -400,7 +399,7 @@ export async function observeGoogleConnection(
   const secrets = await listVaultSecrets(runtime, dependencies.fetch);
   const modify = gmailModifyProblem(secrets);
   if (modify) return degraded(modify);
-  const access = publishedAccessProblem(secrets, grant);
+  const access = publishedAccessProblem(secrets);
   if (access) return degraded(`agents have no Google access: ${access}; ${repair}`);
   if (calendar.fallback) {
     return degraded(

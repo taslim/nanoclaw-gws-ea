@@ -430,7 +430,7 @@ async function describeAccessRequest(
     else if (proposals.value.length === 0) status = ' Drive shows no request still waiting on it.';
     else
       requests =
-        '\nDrive shows these requests waiting on it:' +
+        '\nDrive shows these requests waiting on it; answer them with the Google tool:' +
         proposals.value.map((proposal) => proposalLine(proposal, context)).join('');
   }
   return (
@@ -495,9 +495,6 @@ export async function workspaceNoteText(
       : []),
     ...(listed.some((notice) => notice.activity === 'comment')
       ? ['Read each comment in its file with the Google tool before you act on it.']
-      : []),
-    ...(listed.some((notice) => notice.activity === 'access-request')
-      ? ['Answer each request with the Google tool.']
       : []),
   ].join('\n');
 }
