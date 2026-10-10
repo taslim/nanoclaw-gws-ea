@@ -204,3 +204,24 @@ export const gwsEaInboxRelativeFilePathsMigration: ModuleMigration = {
     }
   },
 };
+
+/**
+ * Unsigned mail in the principal's name (R5, KTD3): one row for each listed
+ * address and reason the principal was told of, written before they are told
+ * and removed when Gmail next verifies mail from that address. Each failure
+ * is told once, and a new one after verified mail is told again.
+ */
+export const gwsEaInboxUnsignedNoticesMigration: ModuleMigration = {
+  version: 5,
+  name: 'module:gws-ea-inbox:unsigned-notices',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_inbox_unsigned_notices (
+        address      TEXT NOT NULL CHECK (address <> '' AND address = lower(address)),
+        reason       TEXT NOT NULL CHECK (reason <> ''),
+        notified_at  TEXT NOT NULL,
+        PRIMARY KEY (address, reason)
+      );
+    `);
+  },
+};

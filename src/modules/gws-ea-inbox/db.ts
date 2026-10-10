@@ -1,10 +1,12 @@
 /**
  * The inbox's own tables (see migration.ts): its state, each message seen,
- * each sender's hourly count, and the principal's calendars. The thread map
- * has its own module (thread-map.ts). Every timestamp is passed in as an ISO
- * string; SQL never reads the clock.
+ * each sender's hourly count, the principal's calendars, and the unsigned
+ * mail in the principal's name they were told of. The thread map has its own
+ * module (thread-map.ts). Every timestamp is passed in as an ISO string; SQL
+ * never reads the clock.
  */
 import { getDb } from '../../db/connection.js';
+import type { PrincipalRefusal } from './authentication.js';
 
 // ---------------------------------------------------------------------------
 // State
@@ -179,4 +181,29 @@ export async function replacePrincipalCalendars(calendarIds: readonly string[], 
       );
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Unsigned mail in the principal's name
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that the principal is told of unsigned mail from `address`, as they
+ * listed it, for `reason`. True when the record is new and they are to be
+ * told; false when they already were.
+ */
+export async function recordUnsignedNotice(address: string, reason: PrincipalRefusal, at: string): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT INTO gws_ea_inbox_unsigned_notices (address, reason, notified_at) VALUES (?, ?, ?)
+       ON CONFLICT (address, reason) DO NOTHING`,
+    address,
+    reason,
+    at,
+  );
+  return result.changes > 0;
+}
+
+/** Gmail verified mail from `address`, as listed: the next failure from it is told again. */
+export async function clearUnsignedNotices(address: string): Promise<void> {
+  await getDb().run('DELETE FROM gws_ea_inbox_unsigned_notices WHERE address = ?', address);
 }
