@@ -13,26 +13,24 @@ export interface GoogleServiceScopes {
 }
 
 /**
- * A Google service whose token reaches agents (KTD6): the host publishes it
- * as one gateway credential, and the service's capability decides which agent
+ * A Google service agents reach (KTD6): its capability decides which agent
  * groups are taught to use it, with its skill and gog's commands for it.
+ * Its token reaches agents through the credential of the host it is served
+ * on (`AGENT_GOOGLE_CREDENTIALS`).
  */
 export interface AgentGoogleService extends GoogleServiceScopes {
   /** The capability key (src/capabilities.ts) that grants the service. */
   readonly capability: string;
-  /** The gateway credential its access token is published as. */
-  readonly secretName: string;
-  /** The one host the gateway injects it on. */
-  readonly hostPattern: string;
   /** The container skill (`container/skills/<skill>/`) that teaches agents to use it. */
   readonly skill: string;
 }
 
+/** Drive, Docs, Sheets, Slides and Forms are one capability, taught by one skill. */
+const WORKSPACE = { capability: 'google-workspace', skill: 'gworkspace' } as const;
+
 export const AGENT_GOOGLE_SERVICES = {
   calendar: {
     capability: 'google-calendar',
-    secretName: 'google-calendar',
-    hostPattern: 'www.googleapis.com',
     scopes: [
       'https://www.googleapis.com/auth/calendar.events',
       'https://www.googleapis.com/auth/calendar.calendarlist',
@@ -42,19 +40,66 @@ export const AGENT_GOOGLE_SERVICES = {
   },
   'gmail-read': {
     capability: 'google-mail-read',
-    secretName: 'google-gmail-read',
-    hostPattern: 'gmail.googleapis.com',
     scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
     skill: 'gmail',
   },
   directory: {
     capability: 'google-directory',
-    secretName: 'google-directory',
-    hostPattern: 'people.googleapis.com',
     scopes: ['https://www.googleapis.com/auth/directory.readonly'],
     skill: 'gpeople',
   },
+  drive: { ...WORKSPACE, scopes: ['https://www.googleapis.com/auth/drive'] },
+  docs: { ...WORKSPACE, scopes: ['https://www.googleapis.com/auth/documents'] },
+  sheets: { ...WORKSPACE, scopes: ['https://www.googleapis.com/auth/spreadsheets'] },
+  slides: { ...WORKSPACE, scopes: ['https://www.googleapis.com/auth/presentations'] },
+  forms: {
+    ...WORKSPACE,
+    scopes: ['https://www.googleapis.com/auth/forms.body', 'https://www.googleapis.com/auth/forms.responses.readonly'],
+  },
 } as const satisfies Record<string, AgentGoogleService>;
+
+export type AgentGoogleServiceId = keyof typeof AGENT_GOOGLE_SERVICES;
+
+/**
+ * One gateway credential the host publishes for agents (KTD1): a token
+ * injected on exactly one host, since the gateway matches a credential by
+ * exact host (`src/gateway-providers/credential-connection.ts`), carrying the
+ * scopes of every service served there.
+ */
+export interface AgentGoogleCredential {
+  /** The one host the gateway injects it on. */
+  readonly host: string;
+  /** The gateway credential its access token is published as. */
+  readonly secretName: string;
+  /** The services served on the host. The first is the one it keeps when Google refuses the rest. */
+  readonly services: readonly AgentGoogleServiceId[];
+}
+
+/**
+ * One credential per Google host. Drive v3 has no host of its own, so it
+ * rides with Calendar on `www.googleapis.com`, whose credential keeps the
+ * vault name it had before: renaming it would need removal logic the
+ * credential seam does not have, and would break a rollback.
+ */
+export const AGENT_GOOGLE_CREDENTIALS: readonly AgentGoogleCredential[] = [
+  { host: 'www.googleapis.com', secretName: 'google-calendar', services: ['calendar', 'drive'] },
+  { host: 'gmail.googleapis.com', secretName: 'google-gmail-read', services: ['gmail-read'] },
+  { host: 'people.googleapis.com', secretName: 'google-directory', services: ['directory'] },
+  { host: 'docs.googleapis.com', secretName: 'google-docs', services: ['docs'] },
+  { host: 'sheets.googleapis.com', secretName: 'google-sheets', services: ['sheets'] },
+  { host: 'slides.googleapis.com', secretName: 'google-slides', services: ['slides'] },
+  { host: 'forms.googleapis.com', secretName: 'google-forms', services: ['forms'] },
+];
+
+/** Every host where the gateway injects a Google token for agents. */
+export const AGENT_GOOGLE_HOSTS: readonly string[] = AGENT_GOOGLE_CREDENTIALS.map((credential) => credential.host);
+
+/** The credential serving `service`. */
+export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleCredential {
+  const credential = AGENT_GOOGLE_CREDENTIALS.find((candidate) => candidate.services.includes(service));
+  if (!credential) throw new Error(`No Google credential serves ${service}`);
+  return credential;
+}
 
 /**
  * Google services only the host uses (KTD6): their tokens are minted on
@@ -62,13 +107,17 @@ export const AGENT_GOOGLE_SERVICES = {
  * modify scope reads and sends the assistant's own inbox. The host's Calendar
  * token, with the same scopes agents' Calendar token has, turns on the
  * principal's calendar notifications and runs the host's calendar actions.
+ * The host's Drive token keeps the home folder, checks links, and enriches
+ * activity notices; it has the scope agents' `www.googleapis.com` token
+ * carries, so it keeps a token out of the gateway but is no privilege
+ * boundary.
  */
 export const HOST_GOOGLE_SERVICES = {
   gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
   'calendar-host': { scopes: AGENT_GOOGLE_SERVICES.calendar.scopes },
+  'drive-host': { scopes: AGENT_GOOGLE_SERVICES.drive.scopes },
 } as const satisfies Record<string, GoogleServiceScopes>;
 
-export type AgentGoogleServiceId = keyof typeof AGENT_GOOGLE_SERVICES;
 export type HostGoogleServiceId = keyof typeof HOST_GOOGLE_SERVICES;
 export type GoogleServiceId = AgentGoogleServiceId | HostGoogleServiceId;
 
@@ -77,13 +126,55 @@ export const GOOGLE_SERVICES: Readonly<Record<GoogleServiceId, GoogleServiceScop
   ...HOST_GOOGLE_SERVICES,
 };
 
-/** The services whose tokens reach agents, each to the groups holding its capability. */
-export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = ['calendar', 'gmail-read', 'directory'];
+/**
+ * The services whose tokens reach agents: each credential carries the
+ * scopes of its exposed services that the grant holds, so a scope reaches
+ * agents only once its service is listed here and the operator has granted it.
+ */
+export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = [
+  'calendar',
+  'gmail-read',
+  'directory',
+  'drive',
+  'docs',
+  'sheets',
+  'slides',
+  'forms',
+];
 
-/** The skills of the exposed services; each reaches only a group holding its service's capability. */
-export const EXPOSED_GOOGLE_SKILLS: readonly string[] = EXPOSED_GOOGLE_SERVICES.map(
+/**
+ * The exposed services agents are taught: each brings its capability, its
+ * skill, and gog's commands for it to the groups holding the capability.
+ * Drive, Docs, Sheets, Slides and Forms are not taught yet.
+ */
+export const TAUGHT_GOOGLE_SERVICES = [
+  'calendar',
+  'gmail-read',
+  'directory',
+] as const satisfies readonly AgentGoogleServiceId[];
+export type TaughtGoogleServiceId = (typeof TAUGHT_GOOGLE_SERVICES)[number];
+
+/** The skills of the taught services; each reaches only a group holding its service's capability. */
+export const EXPOSED_GOOGLE_SKILLS: readonly string[] = TAUGHT_GOOGLE_SERVICES.map(
   (id) => AGENT_GOOGLE_SERVICES[id].skill,
 );
+
+/** The scopes of `wanted` that `granted` holds, each once, in `wanted`'s order. */
+export function grantedScopes(wanted: readonly string[], granted: readonly string[]): string[] {
+  const held = new Set(granted);
+  return [...new Set(wanted)].filter((scope) => held.has(scope));
+}
+
+/**
+ * What a credential's token asks for (KTD1): the scopes of its exposed
+ * services that `granted` holds. Empty means the host publishes nothing for it.
+ */
+export function credentialScopes(credential: AgentGoogleCredential, granted: readonly string[]): string[] {
+  const wanted = credential.services
+    .filter((id) => EXPOSED_GOOGLE_SERVICES.includes(id))
+    .flatMap((id) => AGENT_GOOGLE_SERVICES[id].scopes);
+  return grantedScopes(wanted, granted);
+}
 
 /** What the sign-in asks for, each once: the account's identity, and every service, agent-facing and host-only. */
 export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [

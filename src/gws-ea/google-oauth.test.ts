@@ -208,6 +208,39 @@ describe('signing in as the assistant', () => {
     });
   });
 
+  it('asks for the Workspace scopes, and refuses a sign-in that leaves them unticked', async () => {
+    const workspace = /\/auth\/(drive|documents|spreadsheets|presentations|forms\.)/u;
+    const withoutWorkspace = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !workspace.test(scope)).map((scope) =>
+      scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
+    );
+    const g = google({ scope: withoutWorkspace.join(' ') });
+    const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
+
+    const error = await signInAsAssistant({
+      client: CLIENT,
+      account: 'juno@example.test',
+      present: b.present,
+      fetch: g.fetch,
+    }).catch((caught: unknown) => caught);
+
+    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(
+      expect.arrayContaining([
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/presentations',
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/forms.responses.readonly',
+      ]),
+    );
+    expect(error).toMatchObject({ code: 'google_scope_missing' });
+    expect(String(error)).toContain(
+      'https://www.googleapis.com/auth/drive, https://www.googleapis.com/auth/documents, ' +
+        'https://www.googleapis.com/auth/spreadsheets, https://www.googleapis.com/auth/presentations, ' +
+        'https://www.googleapis.com/auth/forms.body, https://www.googleapis.com/auth/forms.responses.readonly',
+    );
+  });
+
   it('refuses a sign-in that returns no refresh token', async () => {
     const g = google({ refresh: false });
     const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));

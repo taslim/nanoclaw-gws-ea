@@ -50,6 +50,11 @@ export const GOOGLE_WORKSPACE_APIS = [
   'calendar-json.googleapis.com',
   'gmail.googleapis.com',
   'people.googleapis.com',
+  'drive.googleapis.com',
+  'docs.googleapis.com',
+  'sheets.googleapis.com',
+  'slides.googleapis.com',
+  'forms.googleapis.com',
 ] as const;
 /** The legacy and managed constraints that can block service-account key creation. */
 const KEY_CREATION_CONSTRAINTS = [
@@ -778,7 +783,7 @@ function enabledApisResource(
   };
 }
 
-/** The Calendar and Gmail APIs the assistant's sign-in calls, in its own project. */
+/** The Workspace APIs the assistant's sign-in calls, in its own project. */
 export function googleWorkspaceApisResource(dependencies: GcloudDependencies = {}): StepResource<GcpProjectContext> {
   return enabledApisResource('the Google Workspace APIs', GOOGLE_WORKSPACE_APIS, dependencies);
 }

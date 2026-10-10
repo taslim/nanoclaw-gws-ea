@@ -1,14 +1,30 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  AGENT_GOOGLE_CREDENTIALS,
+  AGENT_GOOGLE_HOSTS,
   AGENT_GOOGLE_SERVICES,
+  credentialScopes,
   EXPOSED_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SKILLS,
+  GOOGLE_SERVICES,
   GOOGLE_SIGN_IN_SCOPES,
+  googleCredentialFor,
   HOST_GOOGLE_SERVICES,
   missingGoogleScopes,
   parseGoogleGrant,
+  TAUGHT_GOOGLE_SERVICES,
 } from './grant.js';
+
+const DRIVE = 'https://www.googleapis.com/auth/drive';
+const WORKSPACE_SCOPES = [
+  DRIVE,
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/presentations',
+  'https://www.googleapis.com/auth/forms.body',
+  'https://www.googleapis.com/auth/forms.responses.readonly',
+];
 
 const VALID = {
   schema_version: 1,
@@ -35,7 +51,7 @@ describe("the assistant's Google grant", () => {
     expect(() => parseGoogleGrant(value)).toThrow(/Google grant/);
   });
 
-  it('asks in one sign-in for identity and every service, agent-facing and host-only', () => {
+  it('asks in one sign-in for identity and every service, agent-facing and host-only, each scope once', () => {
     expect(GOOGLE_SIGN_IN_SCOPES).toEqual([
       'openid',
       'email',
@@ -44,8 +60,10 @@ describe("the assistant's Google grant", () => {
       'https://www.googleapis.com/auth/calendar.freebusy',
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/directory.readonly',
+      ...WORKSPACE_SCOPES,
       'https://www.googleapis.com/auth/gmail.modify',
     ]);
+    expect(new Set(GOOGLE_SIGN_IN_SCOPES).size).toBe(GOOGLE_SIGN_IN_SCOPES.length);
   });
 
   it("names each required scope a grant lacks, accepting Google's long form of email", () => {
@@ -53,46 +71,122 @@ describe("the assistant's Google grant", () => {
       'openid',
       'https://www.googleapis.com/auth/userinfo.email',
       ...AGENT_GOOGLE_SERVICES.calendar.scopes,
+      ...AGENT_GOOGLE_SERVICES['gmail-read'].scopes,
+      ...AGENT_GOOGLE_SERVICES.directory.scopes,
       ...HOST_GOOGLE_SERVICES.gmail.scopes,
     ];
-    expect(missingGoogleScopes(beforeThisRelease)).toEqual([
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/directory.readonly',
-    ]);
+    expect(missingGoogleScopes(beforeThisRelease)).toEqual(WORKSPACE_SCOPES);
     expect(missingGoogleScopes([...GOOGLE_SIGN_IN_SCOPES])).toEqual([]);
   });
 });
 
 describe('the Google services agents reach', () => {
-  it('exposes read-only Gmail and the directory beside Calendar, each on its own host, key, and skill', () => {
-    expect(EXPOSED_GOOGLE_SERVICES).toEqual(['calendar', 'gmail-read', 'directory']);
+  it('keeps the services agents are taught, each on its own key and skill', () => {
+    expect(TAUGHT_GOOGLE_SERVICES).toEqual(['calendar', 'gmail-read', 'directory']);
     expect(AGENT_GOOGLE_SERVICES['gmail-read']).toEqual({
       capability: 'google-mail-read',
-      secretName: 'google-gmail-read',
-      hostPattern: 'gmail.googleapis.com',
       scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
       skill: 'gmail',
     });
     expect(AGENT_GOOGLE_SERVICES.directory).toEqual({
       capability: 'google-directory',
-      secretName: 'google-directory',
-      hostPattern: 'people.googleapis.com',
       scopes: ['https://www.googleapis.com/auth/directory.readonly'],
       skill: 'gpeople',
     });
-    expect(AGENT_GOOGLE_SERVICES.calendar).toMatchObject({
-      capability: 'google-calendar',
-      secretName: 'google-calendar',
-      skill: 'gcalendar',
-    });
+    expect(AGENT_GOOGLE_SERVICES.calendar).toMatchObject({ capability: 'google-calendar', skill: 'gcalendar' });
     expect(EXPOSED_GOOGLE_SKILLS).toEqual(['gcalendar', 'gmail', 'gpeople']);
   });
 
-  it('keeps the inbox-modifying Gmail scope off every service an agent can reach', () => {
-    const agentScopes = EXPOSED_GOOGLE_SERVICES.flatMap((id) => AGENT_GOOGLE_SERVICES[id].scopes);
-    expect(HOST_GOOGLE_SERVICES.gmail.scopes).toEqual(['https://www.googleapis.com/auth/gmail.modify']);
-    expect(agentScopes).not.toContain('https://www.googleapis.com/auth/gmail.modify');
+  it('adds Drive, Docs, Sheets, Slides and Forms under one Workspace key, each with its write scopes', () => {
+    expect(EXPOSED_GOOGLE_SERVICES).toEqual([
+      'calendar',
+      'gmail-read',
+      'directory',
+      'drive',
+      'docs',
+      'sheets',
+      'slides',
+      'forms',
+    ]);
+    const workspace = { capability: 'google-workspace', skill: 'gworkspace' };
+    expect(AGENT_GOOGLE_SERVICES.drive).toEqual({ ...workspace, scopes: [DRIVE] });
+    expect(AGENT_GOOGLE_SERVICES.docs).toEqual({ ...workspace, scopes: ['https://www.googleapis.com/auth/documents'] });
+    expect(AGENT_GOOGLE_SERVICES.sheets).toEqual({
+      ...workspace,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    expect(AGENT_GOOGLE_SERVICES.slides).toEqual({
+      ...workspace,
+      scopes: ['https://www.googleapis.com/auth/presentations'],
+    });
+    expect(AGENT_GOOGLE_SERVICES.forms).toEqual({
+      ...workspace,
+      scopes: [
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/forms.responses.readonly',
+      ],
+    });
+  });
+
+  it('publishes one credential per Google host, Drive riding with Calendar under its old vault name', () => {
+    expect(AGENT_GOOGLE_CREDENTIALS).toEqual([
+      { host: 'www.googleapis.com', secretName: 'google-calendar', services: ['calendar', 'drive'] },
+      { host: 'gmail.googleapis.com', secretName: 'google-gmail-read', services: ['gmail-read'] },
+      { host: 'people.googleapis.com', secretName: 'google-directory', services: ['directory'] },
+      { host: 'docs.googleapis.com', secretName: 'google-docs', services: ['docs'] },
+      { host: 'sheets.googleapis.com', secretName: 'google-sheets', services: ['sheets'] },
+      { host: 'slides.googleapis.com', secretName: 'google-slides', services: ['slides'] },
+      { host: 'forms.googleapis.com', secretName: 'google-forms', services: ['forms'] },
+    ]);
+    expect(new Set(AGENT_GOOGLE_HOSTS).size).toBe(AGENT_GOOGLE_CREDENTIALS.length);
+    expect(AGENT_GOOGLE_HOSTS).toEqual(AGENT_GOOGLE_CREDENTIALS.map((credential) => credential.host));
+    expect(new Set(AGENT_GOOGLE_CREDENTIALS.map((credential) => credential.secretName)).size).toBe(
+      AGENT_GOOGLE_CREDENTIALS.length,
+    );
+    // Every exposed service is served by exactly one credential.
+    for (const id of EXPOSED_GOOGLE_SERVICES) {
+      expect(
+        AGENT_GOOGLE_CREDENTIALS.filter((credential) => credential.services.includes(id)),
+        id,
+      ).toHaveLength(1);
+    }
+    expect(googleCredentialFor('drive')).toBe(googleCredentialFor('calendar'));
+    expect(googleCredentialFor('forms').host).toBe('forms.googleapis.com');
+  });
+
+  it("asks for each credential's scopes the grant holds, and nothing on a host it holds none for", () => {
+    const www = googleCredentialFor('calendar');
+    const docs = googleCredentialFor('docs');
+    expect(credentialScopes(www, [...GOOGLE_SIGN_IN_SCOPES])).toEqual([
+      ...AGENT_GOOGLE_SERVICES.calendar.scopes,
+      DRIVE,
+    ]);
+
+    const beforeThisRelease = [
+      'openid',
+      ...AGENT_GOOGLE_SERVICES.calendar.scopes,
+      ...HOST_GOOGLE_SERVICES.gmail.scopes,
+    ];
+    expect(credentialScopes(www, beforeThisRelease)).toEqual(AGENT_GOOGLE_SERVICES.calendar.scopes);
+    expect(credentialScopes(docs, beforeThisRelease)).toEqual([]);
+    expect(credentialScopes(googleCredentialFor('forms'), [WORKSPACE_SCOPES[4]!])).toEqual([WORKSPACE_SCOPES[4]]);
+  });
+
+  it('keeps every host-only scope off every credential an agent can reach', () => {
+    const agentScopes = new Set(
+      AGENT_GOOGLE_CREDENTIALS.flatMap((credential) => credentialScopes(credential, [...GOOGLE_SIGN_IN_SCOPES])),
+    );
+    const hostOnly = Object.values(HOST_GOOGLE_SERVICES)
+      .flatMap((service) => service.scopes)
+      .filter((scope) => !EXPOSED_GOOGLE_SERVICES.some((id) => GOOGLE_SERVICES[id].scopes.includes(scope)));
+    expect(hostOnly).toEqual(['https://www.googleapis.com/auth/gmail.modify']);
+    for (const scope of hostOnly) expect(agentScopes.has(scope), scope).toBe(false);
     // A host-only service names no gateway credential, so nothing could publish it.
-    expect(HOST_GOOGLE_SERVICES.gmail).not.toHaveProperty('secretName');
+    for (const service of Object.values(HOST_GOOGLE_SERVICES)) expect(service).not.toHaveProperty('secretName');
+  });
+
+  it("holds Drive for the host's own use with the same scope agents' Calendar credential carries", () => {
+    expect(HOST_GOOGLE_SERVICES['drive-host']).toEqual({ scopes: [DRIVE] });
+    expect(HOST_GOOGLE_SERVICES['calendar-host']).toEqual({ scopes: AGENT_GOOGLE_SERVICES.calendar.scopes });
   });
 });

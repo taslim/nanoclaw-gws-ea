@@ -1,15 +1,15 @@
 /**
- * GWS-EA's Google access for agents (KTD1, KTD2, KTD6). Each agent-facing
- * Google service is a capability: a group holding the key is handed the
+ * GWS-EA's Google access for agents (KTD1, KTD2, KTD6). Each Google service
+ * agents are taught is a capability: a group holding the key is handed the
  * service's skill and gog's commands for it, and a group without it gets
  * neither. The keys are on by default, so a group
  * on `all`, `main` among them, holds every one. Nothing here rewrites a
  * group's configuration.
  *
  * On a GWS-EA instance the host is also told where the assistant's grant
- * file is; while the host runs it publishes the agent-facing tokens through
- * the selected gateway's credential connection, and holds host-only tokens
- * in memory.
+ * file is; while the host runs it publishes one token per agent credential's
+ * host through the selected gateway's credential connection, and holds
+ * host-only tokens in memory.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -21,10 +21,10 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import {
   AGENT_GOOGLE_SERVICES,
-  EXPOSED_GOOGLE_SERVICES,
   GOOGLE_GRANT_FILE_ENV,
-  type AgentGoogleServiceId,
+  TAUGHT_GOOGLE_SERVICES,
   type HostGoogleServiceId,
+  type TaughtGoogleServiceId,
 } from './grant.js';
 import { readGoogleGrantFile } from './grant-file.js';
 import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleTokenRefresher } from './refresher.js';
@@ -32,7 +32,7 @@ import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleToken
 /** How often the host checks whether a token needs renewing. */
 const TICK_MS = 60_000;
 
-const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = {
+const CAPABILITY_DESCRIPTIONS: Readonly<Record<TaughtGoogleServiceId, string>> = {
   calendar:
     "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, create_event and change_guests, and the host's find_conflicts and people_stats",
   'gmail-read': "the assistant's Gmail, read-only: the gmail skill and a gmail.readonly token",
@@ -49,7 +49,7 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = 
  * off. gog cannot list the principal as an accepted guest, so events are
  * created through the host's `create_event` and `calendar.create` is off.
  */
-const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = {
+const GOG_COMMANDS: Readonly<Record<TaughtGoogleServiceId, readonly string[]>> = {
   calendar: [
     'calendar.calendars',
     'calendar.subscribe',
@@ -65,7 +65,7 @@ const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = 
   directory: ['people.search'],
 };
 
-for (const id of EXPOSED_GOOGLE_SERVICES) {
+for (const id of TAUGHT_GOOGLE_SERVICES) {
   const service = AGENT_GOOGLE_SERVICES[id];
   registerCapability(service.capability, {
     description: CAPABILITY_DESCRIPTIONS[id],
@@ -85,7 +85,7 @@ for (const id of EXPOSED_GOOGLE_SERVICES) {
  * gog to what the group's skills teach.
  */
 registerContainerEnv('gws-ea-google:gog', ({ capabilities }): Record<string, string> => {
-  const commands = EXPOSED_GOOGLE_SERVICES.filter((id) =>
+  const commands = TAUGHT_GOOGLE_SERVICES.filter((id) =>
     capabilities.has(AGENT_GOOGLE_SERVICES[id].capability),
   ).flatMap((id) => GOG_COMMANDS[id]);
   if (commands.length === 0) return {};
@@ -135,9 +135,11 @@ onHostStart(async ({ signal }) => {
 });
 
 /**
- * A live token for a host-only Google service (KTD6), such as the Gmail
- * token for the assistant's own inbox: minted on demand and held only in
- * this host's memory, never in a gateway or a container.
+ * A live token for a host-only Google service (KTD1, KTD6), such as the
+ * Gmail token for the assistant's own inbox or the Drive token for the home
+ * folder: minted on demand and held only in this host's memory, never in a
+ * gateway or a container. A service whose scopes the grant does not hold
+ * fails with `GoogleScopeNotGrantedError` without asking Google.
  */
 export function hostGoogleAccessToken(service: HostGoogleServiceId): Promise<string> {
   if (!active) return Promise.reject(new Error('Google access is off on this host: it has no Google sign-in'));

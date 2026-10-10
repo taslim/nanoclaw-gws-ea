@@ -10,7 +10,7 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import type { AgentGroup, Session } from '../../types.js';
-import { AGENT_GOOGLE_SERVICES, EXPOSED_GOOGLE_SERVICES, type AgentGoogleServiceId } from './grant.js';
+import { AGENT_GOOGLE_SERVICES, TAUGHT_GOOGLE_SERVICES, type TaughtGoogleServiceId } from './grant.js';
 import '../capabilities/index.js';
 import './index.js';
 
@@ -19,7 +19,7 @@ const SKILLS_DIR = path.resolve('container', 'skills');
 const GOOGLE_KEYS = ['google-calendar', 'google-mail-read', 'google-directory'];
 
 /** The exact gog commands each service's key enables. A change here changes what agents may run. */
-const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = {
+const GOG_COMMANDS: Readonly<Record<TaughtGoogleServiceId, readonly string[]>> = {
   calendar: [
     'calendar.calendars',
     'calendar.subscribe',
@@ -172,7 +172,7 @@ describe("the Google services' skills", () => {
   });
 
   it('ships each service skill under its own name, allowed to run gog', () => {
-    for (const id of EXPOSED_GOOGLE_SERVICES) {
+    for (const id of TAUGHT_GOOGLE_SERVICES) {
       const { skill } = AGENT_GOOGLE_SERVICES[id];
       const text = fs.readFileSync(path.join(SKILLS_DIR, skill, 'SKILL.md'), 'utf8');
       expect(text, skill).toMatch(
@@ -182,7 +182,7 @@ describe("the Google services' skills", () => {
   });
 
   it("teaches in each service's skill only the gog commands its key enables", () => {
-    for (const id of EXPOSED_GOOGLE_SERVICES) {
+    for (const id of TAUGHT_GOOGLE_SERVICES) {
       const { skill } = AGENT_GOOGLE_SERVICES[id];
       const taught = taughtGogCommands(skill);
       expect(taught.length, skill).toBeGreaterThan(0);
@@ -202,7 +202,7 @@ describe("gog's settings at spawn", () => {
   it('gives main, on `all`, exactly the commands of every Google service, with Gmail sending off', () => {
     expect(gogSettingsAtSpawn(resolveCapabilities('all', 'main'))).toEqual({
       GOG_ACCESS_TOKEN: 'gateway-managed',
-      GOG_ENABLE_COMMANDS_EXACT: EXPOSED_GOOGLE_SERVICES.flatMap((id) => GOG_COMMANDS[id]).join(','),
+      GOG_ENABLE_COMMANDS_EXACT: TAUGHT_GOOGLE_SERVICES.flatMap((id) => GOG_COMMANDS[id]).join(','),
       GOG_GMAIL_NO_SEND: '1',
       GOG_JSON: '1',
       GOG_WRAP_UNTRUSTED: '1',
