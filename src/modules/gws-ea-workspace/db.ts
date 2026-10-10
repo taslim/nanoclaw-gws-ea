@@ -1,8 +1,8 @@
 /**
  * The home folder's store (see migration.ts): the folder's Drive id, the
- * principal's addresses its grants were last reconciled against, and the
- * host's record of each address's grant. Every timestamp is passed in as an
- * ISO string; SQL never reads the clock.
+ * folder `main` was last told of, the principal's addresses its grants were
+ * last reconciled against, and the host's record of each address's grant.
+ * Every timestamp is passed in as an ISO string; SQL never reads the clock.
  */
 import { getDb } from '../../db/connection.js';
 
@@ -42,21 +42,39 @@ function toGrant(row: GrantRow): FolderGrant {
   return { email: row.email, state: row.state, permissionId: row.permission_id, hostMade: row.host_made === 1 };
 }
 
-/** The folder the host recorded, or null until it makes one. */
-export async function getHomeFolderId(): Promise<string | null> {
-  const row = await getDb().get<{ folder_id: string | null }>(
-    'SELECT folder_id FROM gws_ea_workspace_folder WHERE singleton = 1',
-  );
-  return row?.folder_id ?? null;
+export interface HomeFolderRecord {
+  /** The folder the host recorded, or null until it makes one. */
+  readonly folderId: string | null;
+  /** The folder `main` was last told of, or null until it is told of one. */
+  readonly toldFolderId: string | null;
 }
 
-/** Record a new folder. The grants recorded for the folder before it went with it. */
+export async function getHomeFolder(): Promise<HomeFolderRecord> {
+  const row = await getDb().get<{ folder_id: string | null; told_folder_id: string | null }>(
+    'SELECT folder_id, told_folder_id FROM gws_ea_workspace_folder WHERE singleton = 1',
+  );
+  return { folderId: row?.folder_id ?? null, toldFolderId: row?.told_folder_id ?? null };
+}
+
+/**
+ * Record a new folder. The grants recorded for the folder before it went
+ * with it; the folder `main` was told of stays until it is told of this one.
+ */
 export async function recordHomeFolder(folderId: string, at: string): Promise<void> {
   const db = getDb();
   await db.transaction(async () => {
     await db.run('UPDATE gws_ea_workspace_folder SET folder_id = ?, updated_at = ? WHERE singleton = 1', folderId, at);
     await db.run('DELETE FROM gws_ea_workspace_grants');
   });
+}
+
+/** Record that `main` has nothing left to hear about this folder. */
+export async function recordToldFolder(folderId: string, at: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_workspace_folder SET told_folder_id = ?, updated_at = ? WHERE singleton = 1',
+    folderId,
+    at,
+  );
 }
 
 /**

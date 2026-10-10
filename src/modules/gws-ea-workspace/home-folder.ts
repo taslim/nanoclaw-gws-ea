@@ -34,11 +34,12 @@ import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type { NoteForMain, NoteForMainResult } from '../gws-ea-profile/main-note.js';
 import {
   deleteFolderGrant,
-  getHomeFolderId,
+  getHomeFolder,
   listFolderGrants,
   recordAddressList,
   recordFolderGrant,
   recordHomeFolder,
+  recordToldFolder,
   type FolderGrant,
 } from './db.js';
 import { FOLDER_MIME_TYPE, isShareRefusal, type DriveApi, type DrivePermission } from './drive-api.js';
@@ -99,8 +100,29 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
     log.info(reason, { account: grant.account });
   }
 
+  /**
+   * A running session learns of the folder now; the next spawn carries it in
+   * its environment. Recorded only once the note is written or there is
+   * nobody to tell, so a note that failed is written again next tick. Its id
+   * is the folder's, so one that did reach main is never written twice.
+   */
+  async function tellMain(folderId: string, at: string): Promise<void> {
+    const { toldFolderId } = await getHomeFolder();
+    if (toldFolderId === folderId) return;
+    const told = await options.writeNote({
+      id: `gws-ea-workspace-home-folder-${folderId}`,
+      timestamp: at,
+      text: noteText(folderId, toldFolderId !== null),
+      wake: false,
+    });
+    if (told === 'no-main' || told === 'no-principal') {
+      log.info('Nobody to tell where the home folder is yet; main learns it when it next starts', { result: told });
+    }
+    await recordToldFolder(folderId, at);
+  }
+
   async function ensureFolder(name: string, at: string): Promise<string> {
-    const recorded = await getHomeFolderId();
+    const { folderId: recorded } = await getHomeFolder();
     if (recorded !== null) {
       const folder = await drive.getFile(recorded);
       if (folder !== undefined) {
@@ -117,16 +139,6 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
     await recordHomeFolder(made.id, at);
     current = made.id;
     log.info('Made the home folder', { folderId: made.id });
-    // A running session learns of it now; the next spawn carries it in its environment.
-    const told = await options.writeNote({
-      id: `gws-ea-workspace-home-folder-${made.id}`,
-      timestamp: at,
-      text: noteText(made.id, recorded !== null),
-      wake: false,
-    });
-    if (told === 'no-main' || told === 'no-principal') {
-      log.info('Nobody to tell where the home folder is yet; main learns it when it next starts', { result: told });
-    }
     return made.id;
   }
 
@@ -212,13 +224,14 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
     const name = homeFolderName(profile.principal_display_name, profile.assistant_display_name);
     const folderId = await ensureFolder(name, at);
     await shareWithPrincipal(folderId, profile.principal_emails, at);
+    await tellMain(folderId, at);
   }
 
   return {
     folderId: () => current,
 
     async load() {
-      current = (await getHomeFolderId()) ?? undefined;
+      current = (await getHomeFolder()).folderId ?? undefined;
     },
 
     async tick() {

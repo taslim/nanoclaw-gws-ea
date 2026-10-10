@@ -13,7 +13,7 @@ import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { addPrincipalAddress, reconcileGwsEaProfile, removePrincipalAddress } from '../gws-ea-profile/db.js';
 import type { NoteForMain } from '../gws-ea-profile/main-note.js';
 import { FOLDER_MIME_TYPE } from './drive-api.js';
-import { createHomeFolder, type HomeFolder } from './home-folder.js';
+import { createHomeFolder, type HomeFolder, type HomeFolderOptions } from './home-folder.js';
 import { delegatingDriveApi, FakeDrive } from './testing/fake-drive.js';
 import '../index.js';
 
@@ -48,9 +48,14 @@ type Logged = readonly [level: 'info' | 'warn', message: string, fields?: Record
 interface World {
   readonly drive: FakeDrive;
   readonly home: HomeFolder;
+  /** The notes that reached main. */
   readonly notes: NoteForMain[];
   readonly logs: Logged[];
   grant: GoogleGrant | undefined;
+  /** The next note fails to reach main with this error. */
+  failNextNote(error: Error): void;
+  /** The home folder as a restarted host makes it, over the same Drive, notes and logs. */
+  restart(): HomeFolder;
 }
 
 let world: World;
@@ -61,12 +66,15 @@ function setUp(): World {
   drive.addAccount(WORK, WORK_ALIAS);
   drive.addAccount('remy@acme.example');
   const notes: NoteForMain[] = [];
+  const noteFailures: Error[] = [];
   const logs: Logged[] = [];
   const state = { grant: GRANT as GoogleGrant | undefined };
-  const home = createHomeFolder({
+  const options: HomeFolderOptions = {
     drive,
     readGrant: async () => state.grant,
     writeNote: async (note) => {
+      const failure = noteFailures.shift();
+      if (failure !== undefined) throw failure;
       notes.push(note);
       return 'written';
     },
@@ -75,12 +83,14 @@ function setUp(): World {
       warn: (message, fields) => logs.push(['warn', message, fields]),
     },
     now: () => new Date(AT),
-  });
+  };
   return {
     drive,
-    home,
+    home: createHomeFolder(options),
     notes,
     logs,
+    failNextNote: (error) => noteFailures.push(error),
+    restart: () => createHomeFolder(options),
     get grant() {
       return state.grant;
     },
@@ -192,6 +202,54 @@ describe('the home folder', () => {
         wake: false,
       },
     ]);
+  });
+
+  it('shares the folder though the note failed, tells main on a later tick, after a host restart too, and stops once main is told', async () => {
+    await setUpProfile();
+    world.failNextNote(new Error('database is locked'));
+    await world.home.tick();
+    const id = folderId();
+    expect(world.notes).toEqual([]);
+    expect(world.logs).toContainEqual(['warn', expect.stringMatching(/next tick/u), { error: 'database is locked' }]);
+    // A note that fails never holds up the principal's access.
+    expect(sharedWith()).toHaveLength(2);
+
+    // A running main outlives a host restart, so what it was told is kept in the database.
+    const restarted = world.restart();
+    await restarted.load();
+    await restarted.tick();
+    await restarted.tick();
+
+    expect(world.notes).toEqual([
+      {
+        id: `gws-ea-workspace-home-folder-${id}`,
+        timestamp: AT,
+        text: expect.stringContaining(`\`${id}\``),
+        wake: false,
+      },
+    ]);
+    expect(world.notes[0].text).not.toMatch(/deleted/u);
+    expect(world.drive.calls.filter((call) => call.op === 'createFile')).toHaveLength(1);
+    expect(sharedWith()).toHaveLength(2);
+  });
+
+  it('tells main of a folder made anew on a later tick when the note failed', async () => {
+    await setUpProfile();
+    await world.home.tick();
+    const old = folderId();
+    world.drive.deleteForever(old);
+    world.failNextNote(new Error('database is locked'));
+
+    await world.home.tick();
+    await world.home.tick();
+    await world.home.tick();
+
+    const id = folderId();
+    expect(world.notes.map((note) => note.id)).toEqual([
+      `gws-ea-workspace-home-folder-${old}`,
+      `gws-ea-workspace-home-folder-${id}`,
+    ]);
+    expect(world.notes[1].text).toMatch(/deleted/u);
   });
 
   it('makes no Drive writes on a tick where nothing changed', async () => {
@@ -423,12 +481,7 @@ describe('the home folder', () => {
     await world.home.tick();
     const id = folderId();
 
-    const restarted = createHomeFolder({
-      drive: world.drive,
-      readGrant: async () => GRANT,
-      writeNote: async () => 'written',
-      log: { info: () => undefined, warn: () => undefined },
-    });
+    const restarted = world.restart();
     expect(restarted.folderId()).toBeUndefined();
     await restarted.load();
     expect(restarted.folderId()).toBe(id);

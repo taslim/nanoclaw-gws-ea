@@ -91,8 +91,8 @@ describe('the workspace migrations', () => {
 
   it('start with one empty folder row and no grants', async () => {
     const db = await freshInstall();
-    expect(await db.all('SELECT singleton, folder_id, address_list, updated_at FROM gws_ea_workspace_folder')).toEqual([
-      { singleton: 1, folder_id: null, address_list: null, updated_at: null },
+    expect(await db.all('SELECT * FROM gws_ea_workspace_folder')).toEqual([
+      { singleton: 1, folder_id: null, told_folder_id: null, address_list: null, updated_at: null },
     ]);
     expect(await db.all('SELECT * FROM gws_ea_workspace_grants')).toEqual([]);
   });
