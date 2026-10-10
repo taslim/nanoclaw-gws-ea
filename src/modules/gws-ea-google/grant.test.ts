@@ -13,7 +13,6 @@ import {
   HOST_GOOGLE_SERVICES,
   missingGoogleScopes,
   parseGoogleGrant,
-  TAUGHT_GOOGLE_SERVICES,
 } from './grant.js';
 
 const DRIVE = 'https://www.googleapis.com/auth/drive';
@@ -81,8 +80,7 @@ describe("the assistant's Google grant", () => {
 });
 
 describe('the Google services agents reach', () => {
-  it('keeps the services agents are taught, each on its own key and skill', () => {
-    expect(TAUGHT_GOOGLE_SERVICES).toEqual(['calendar', 'gmail-read', 'directory']);
+  it('keeps Calendar, Gmail and the directory each on its own key and skill', () => {
     expect(AGENT_GOOGLE_SERVICES['gmail-read']).toEqual({
       capability: 'google-mail-read',
       scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
@@ -94,7 +92,10 @@ describe('the Google services agents reach', () => {
       skill: 'gpeople',
     });
     expect(AGENT_GOOGLE_SERVICES.calendar).toMatchObject({ capability: 'google-calendar', skill: 'gcalendar' });
-    expect(EXPOSED_GOOGLE_SKILLS).toEqual(['gcalendar', 'gmail', 'gpeople']);
+  });
+
+  it('teaches every exposed service, each skill once', () => {
+    expect(EXPOSED_GOOGLE_SKILLS).toEqual(['gcalendar', 'gmail', 'gpeople', 'gworkspace']);
   });
 
   it('adds Drive, Docs, Sheets, Slides and Forms under one Workspace key, each with its write scopes', () => {

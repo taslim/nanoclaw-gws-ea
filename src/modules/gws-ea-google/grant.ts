@@ -127,9 +127,11 @@ export const GOOGLE_SERVICES: Readonly<Record<GoogleServiceId, GoogleServiceScop
 };
 
 /**
- * The services whose tokens reach agents: each credential carries the
- * scopes of its exposed services that the grant holds, so a scope reaches
- * agents only once its service is listed here and the operator has granted it.
+ * The services agents reach. Each credential carries the scopes of its
+ * exposed services that the grant holds, so a scope reaches agents only once
+ * its service is listed here and the operator has granted it. Each service
+ * also brings its capability, its skill, and gog's commands for it to the
+ * groups holding the capability.
  */
 export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = [
   'calendar',
@@ -142,22 +144,16 @@ export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = [
   'forms',
 ];
 
-/**
- * The exposed services agents are taught: each brings its capability, its
- * skill, and gog's commands for it to the groups holding the capability.
- * Drive, Docs, Sheets, Slides and Forms are not taught yet.
- */
-export const TAUGHT_GOOGLE_SERVICES = [
-  'calendar',
-  'gmail-read',
-  'directory',
-] as const satisfies readonly AgentGoogleServiceId[];
-export type TaughtGoogleServiceId = (typeof TAUGHT_GOOGLE_SERVICES)[number];
+/** The capability key of a Google service agents reach. */
+export type GoogleCapability = (typeof AGENT_GOOGLE_SERVICES)[AgentGoogleServiceId]['capability'];
 
-/** The skills of the taught services; each reaches only a group holding its service's capability. */
-export const EXPOSED_GOOGLE_SKILLS: readonly string[] = TAUGHT_GOOGLE_SERVICES.map(
-  (id) => AGENT_GOOGLE_SERVICES[id].skill,
-);
+/**
+ * The exposed services' skills, each once, since Drive, Docs, Sheets, Slides
+ * and Forms share one. Each reaches only a group holding its capability.
+ */
+export const EXPOSED_GOOGLE_SKILLS: readonly string[] = [
+  ...new Set(EXPOSED_GOOGLE_SERVICES.map((id) => AGENT_GOOGLE_SERVICES[id].skill)),
+];
 
 /** The scopes of `wanted` that `granted` holds, each once, in `wanted`'s order. */
 export function grantedScopes(wanted: readonly string[], granted: readonly string[]): string[] {

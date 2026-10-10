@@ -25,13 +25,15 @@ import { listCapabilityKeys, parseStoredCapabilities, resolveCapabilities } from
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import '../../cli/resources/groups.js';
+import type { ContainerConfig } from '../../container-config.js';
+import { composeSessionSpec } from '../../container-runner.js';
 import '../../cli/resources/tasks.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-compose.js';
 import { unknownToolNames } from '../../test-utils/runner-tools.js';
-import type { AgentGroup } from '../../types.js';
+import type { AgentGroup, Session } from '../../types.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { EXTERNAL_EMAIL_TOOLS_CAPABILITY, MAIN_EMAIL_CAPABILITY } from './group.js';
@@ -166,6 +168,32 @@ describe('external-email at host start', () => {
     await startHost();
     expect(await centralState()).toEqual(before);
     expect(await getDb().get('SELECT COUNT(*) AS count FROM agent_groups')).toEqual({ count: 1 });
+  });
+
+  it('gives it no Google tool at spawn, whoever main is', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await startHost();
+    const ee = await externalEmail();
+    const capabilities = resolveCapabilities(
+      parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name),
+      ee.name,
+    );
+
+    const [agent] = composeSessionSpec({
+      agentGroup: ee,
+      session: { id: 'session-1', agent_group_id: ee.id } as Session,
+      containerName: `nanoclaw-v2-${ee.id}-1700000000000`,
+      mounts: [],
+      containerConfig: { capabilities } as unknown as ContainerConfig,
+      mailboxEnvironment: {},
+      contribution: {},
+      gateway: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
+    }).containers;
+
+    expect(capabilities).not.toContain('google-workspace');
+    expect(Object.keys({ ...agent.env, ...agent.contributedEnv }).filter((key) => key.startsWith('GOG_'))).toEqual([]);
   });
 
   it('gives an assistant from before this plan the group, and leaves its main as it was', async () => {
