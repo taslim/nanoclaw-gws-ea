@@ -184,7 +184,7 @@ function mainHeard(): string[] {
   return rows.map((row) => (JSON.parse(row.content) as { text: string }).text);
 }
 
-/** The bookings live on the principal's primary calendar. */
+/** The bookings on PRINCIPAL's calendar, which main set for threads A and B. */
 function bookings(): StoredEvent[] {
   return calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'booking');
 }
@@ -193,6 +193,19 @@ function bookings(): StoredEvent[] {
 function gone(label: string): string {
   return `${label}: no longer free. Call free_time for times to offer instead.`;
 }
+
+/** What `free_time` adds while main has set no calendar for the thread's bookings (R12). */
+const NO_CALENDAR_YET =
+  "No calendar is set for this thread's bookings yet: ask main with tell_main which calendar to book on, before a time is agreed.";
+/** What `book` answers while main has set no calendar for the thread's bookings (R12). */
+const BOOKS_NOTHING_YET =
+  "No calendar is set for this thread's bookings yet, so nothing was booked: ask main with tell_main which calendar to book on, and book once it answers.";
+/** What `book` answers when the calendar main set can no longer be booked on (R8). */
+const CANNOT_BOOK_THERE =
+  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: ask main with tell_main which calendar to book on, and book once it answers.";
+/** What a change or cancellation answers when Google no longer shows the booking's calendar's events (R14). */
+const BOOKING_OUT_OF_SIGHT =
+  'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: ask main with tell_main.';
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
@@ -221,10 +234,18 @@ function overlaps(a: { start: number; end: number }, b: { start: number; end: nu
   return a.start < b.end && a.end > b.start;
 }
 
-/** An email thread with these people on it, and external-email's session for it. */
-async function thread(addresses: readonly string[]): Promise<{ key: string; session: Session }> {
+/**
+ * An email thread with these people on it, and external-email's session for
+ * it, booking on the calendar main set for it: PRINCIPAL's unless named, or
+ * none yet.
+ */
+async function thread(
+  addresses: readonly string[],
+  bookingCalendar: string | null = PRINCIPAL,
+): Promise<{ key: string; session: Session }> {
   const { threadKey } = await createThread(null, now());
   await recordThreadAddresses(threadKey, addresses, 'message', now());
+  if (bookingCalendar !== null) await setThreadBookingCalendar(threadKey, bookingCalendar);
   const { session } = await resolveSession('ag-external', 'mg-inbox', threadKey, 'per-thread');
   return { key: threadKey, session };
 }
@@ -306,6 +327,9 @@ beforeEach(async () => {
     summary: PRINCIPAL,
     conferenceTypes: ['hangoutsMeet'],
   });
+
+  // The calendar poll recorded the principal's calendar for busy time.
+  await replacePrincipalCalendars([PRINCIPAL], now());
 
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
   ({ key: threadA, session: sessionA } = await thread([REMY, JANE, PRINCIPAL, JUNO]));
@@ -479,9 +503,9 @@ describe('free_time', () => {
 
 describe('busy time on the principal’s other calendars', () => {
   it.each([
-    { on: 'their primary calendar', bookingCalendar: null },
-    { on: 'a calendar main named', bookingCalendar: TEAM },
-  ])('is neither offered nor booked when the thread books on $on', async ({ bookingCalendar }) => {
+    { on: 'the calendar of their address', bookingCalendar: PRINCIPAL },
+    { on: 'another calendar of theirs', bookingCalendar: TEAM },
+  ])('is neither offered nor booked when main set $on for the thread', async ({ bookingCalendar }) => {
     calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
     await setThreadBookingCalendar(threadA, bookingCalendar);
     await replacePrincipalCalendars([PRINCIPAL, PERSONAL], now());
@@ -819,23 +843,27 @@ describe('book', () => {
     expect(mainHeard()).toHaveLength(1);
   });
 
-  it('goes on the calendar main named for the thread, and refuses one the assistant cannot write to', async () => {
+  it('goes on the calendar main set for the thread, and never on another of theirs when that one cannot be written to', async () => {
     calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
     await setThreadBookingCalendar(threadA, TEAM);
     data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }));
     expect(calendar.live(TEAM)).toHaveLength(1);
 
+    // PRINCIPAL's own calendar stays writable: it never stands in for the one main set.
     calendar.calendars.set('shared@group.calendar.google.com', {
       id: 'shared@group.calendar.google.com',
       accessRole: 'reader',
       dataOwner: PRINCIPAL,
     });
     await setThreadBookingCalendar(threadA, 'shared@group.calendar.google.com');
+    const writes = calendar.writes.length;
     expect(
       refusal(
         await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
       ),
-    ).toMatch(/cannot write to the calendar main named/u);
+    ).toBe(CANNOT_BOOK_THERE);
+    expect(calendar.writes).toHaveLength(writes);
+    expect(bookings()).toEqual([]);
   });
 
   it('books on a calendar Google names by another Gmail spelling of a listed address, inviting no spelling of the principal (R1)', async () => {
@@ -847,22 +875,68 @@ describe('book', () => {
     const booked = data(await send(session, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
     expect(invited(calendar.event('patlee@gmail.com', String(booked.booking)))).toEqual([REMY]);
   });
+});
 
-  it('goes on the principal’s primary calendar alone: refused, never placed on another of theirs, when it cannot be written to', async () => {
-    // A second address, given later: its calendar is the principal's, but not their primary one.
-    vi.setSystemTime(new Date(NOW.getTime() + 60_000));
+describe('the calendar a thread books on is main’s to set (R11, R12)', () => {
+  it('offers times before main sets one, saying none is set, books nothing until it does, then books there alone (AE3)', async () => {
+    // A stranger wrote to the assistant, copying the principal; main has set no calendar for the thread.
+    const { key, session } = await thread([STRANGER, PRINCIPAL], null);
     await addPrincipalAddress(PERSONAL);
     calendar.calendars.set(PERSONAL, { id: PERSONAL, accessRole: 'owner', summary: PERSONAL });
-    calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'reader', summary: PRINCIPAL });
+    await replacePrincipalCalendars([PRINCIPAL, PERSONAL], now());
+    calendar.put({ ...busy('evt-wed', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'), calendarId: PERSONAL });
+    const wednesdayMorning = { from: '2026-10-07T09:00:00+01:00', to: '2026-10-07T12:00:00+01:00', minutes: 30 };
 
-    for (const [action, fields] of [
-      ['free_time', { ...RANGE, minutes: 30 }],
-      ['book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }],
-    ] as const) {
-      expect(refusal(await send(sessionA, action, fields))).toBe(
-        "The assistant cannot write to the principal's primary calendar, so it can book nothing: tell main with tell_main.",
-      );
-    }
+    const offered = data(await send(session, 'free_time', wednesdayMorning)) as { windows: Free[]; message: string };
+    // Busy time on every calendar of theirs counts, with none set for the thread.
+    expect(offered.windows.map((free) => free.principal_time)).toEqual([
+      'Wednesday 7 Oct, 09:00–10:00 BST',
+      'Wednesday 7 Oct, 11:00–12:00 BST',
+    ]);
+    expect(offered.message.split('\n').at(-1)).toBe(NO_CALENDAR_YET);
+    // Nor does a range with nothing free leave it out.
+    calendar.put(busy('evt-wed-all', '2026-10-07T08:00:00.000Z', '2026-10-07T11:00:00.000Z'));
+    expect(
+      (data(await send(session, 'free_time', wednesdayMorning)) as { message: string }).message.split('\n'),
+    ).toEqual([
+      'Nothing in that range is free for 30 minutes: ask for another range, or tell main with tell_main.',
+      NO_CALENDAR_YET,
+    ]);
+
+    const request = { start: THURSDAY_2PM, minutes: 30, title: 'Intro', invitees: [STRANGER] };
+    expect(refusal(await send(session, 'book', request))).toBe(BOOKS_NOTHING_YET);
+    expect(calendar.writes).toEqual([]);
+
+    // main sets PERSONAL for the thread: the booking lands there and nowhere else.
+    await setThreadBookingCalendar(key, PERSONAL);
+    expect((data(await send(session, 'free_time', wednesdayMorning)) as { message: string }).message).not.toContain(
+      NO_CALENDAR_YET,
+    );
+    const booked = data(await send(session, 'book', request));
+    expect(calendar.event(PERSONAL, String(booked.booking))).toMatchObject({ start: { dateTime: THURSDAY_2PM } });
+    expect(calendar.writes.map((write) => write.calendarId)).toEqual([PERSONAL]);
+  });
+
+  it('still offers times when the calendar main set is no longer shared, and books nothing there or anywhere else', async () => {
+    calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
+    await setThreadBookingCalendar(threadA, TEAM);
+    // The principal unshared it: it left the assistant's list, and Google answers 404 for its events.
+    calendar.calendars.delete(TEAM);
+    const listEvents = calendar.listEvents.bind(calendar);
+    calendar.listEvents = async (calendarId, timeMin, timeMax) => {
+      if (calendarId === TEAM) throw new GoogleApiError(404, `Google refused /calendars/${TEAM}/events: Not Found`);
+      return listEvents(calendarId, timeMin, timeMax);
+    };
+
+    const { windows, message } = data(await send(sessionA, 'free_time', { ...RANGE, minutes: 30 })) as {
+      windows: Free[];
+      message: string;
+    };
+    expect(windows.length).toBeGreaterThan(0);
+    expect(message).not.toContain(NO_CALENDAR_YET);
+    expect(
+      refusal(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+    ).toBe(CANNOT_BOOK_THERE);
     expect(calendar.writes).toEqual([]);
   });
 });
@@ -1057,17 +1131,83 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     });
   });
 
-  it('forgets a booking whose event was deleted from the calendar, refusing to change it', async () => {
+  it.each([
+    { how: 'as cancelled', gone: (event: StoredEvent) => calendar.put({ ...event, status: 'cancelled' }) },
+    // Google answers 404 once a deleted event is gone for good.
+    { how: 'not at all', gone: (event: StoredEvent) => calendar.remove(event.calendarId, event.id) },
+  ])(
+    'forgets a booking whose event Google, still showing its calendar, reads $how, refusing to change it',
+    async ({ gone: deleted }) => {
+      const booked = data(
+        await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
+      );
+      const [event] = bookings();
+      deleted(event);
+
+      expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
+        /no longer on the principal/u,
+      );
+      expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
+    },
+  );
+
+  it.each([
+    { how: 'left the assistant’s calendar list', access: undefined },
+    { how: 'was narrowed to free/busy only', access: 'freeBusyReader' },
+  ])(
+    'keeps a booking whose calendar $how, telling external-email to ask main, so it still stands once shared back (R14)',
+    async ({ access }) => {
+      const booked = data(
+        await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
+      );
+      const [event] = bookings();
+      const entry = calendar.calendars.get(PRINCIPAL);
+      if (entry === undefined) throw new Error('no PRINCIPAL calendar');
+      if (access === undefined) calendar.calendars.delete(PRINCIPAL);
+      else calendar.calendars.set(PRINCIPAL, { ...entry, accessRole: access });
+      // Google answers 404 for every event on a calendar it shows the assistant no events of.
+      calendar.remove(PRINCIPAL, event.id);
+      const writes = calendar.writes.length;
+
+      for (const [action, fields] of [
+        ['change_booking', { booking: booked.booking, start: THURSDAY_2PM }],
+        ['cancel_booking', { booking: booked.booking }],
+      ] as const) {
+        expect(refusal(await send(sessionA, action, fields))).toBe(BOOKING_OUT_OF_SIGHT);
+      }
+      expect(calendar.writes).toHaveLength(writes);
+
+      // The principal shares it back: the booking was never forgotten, so the thread still cancels it.
+      calendar.calendars.set(PRINCIPAL, entry);
+      calendar.put(event);
+      expect(data(await send(sessionA, 'cancel_booking', { booking: booked.booking })).message).toMatch(
+        /^Cancelled: /u,
+      );
+      expect(calendar.event(PRINCIPAL, event.id)?.status).toBe('cancelled');
+    },
+  );
+
+  it('changes and cancels a booking on the calendar it was made on, whatever main set for the thread since', async () => {
     const booked = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
-    const [event] = bookings();
-    calendar.put({ ...event, status: 'cancelled' });
+    // main set another calendar for the thread, which the principal then unshared.
+    calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
+    await setThreadBookingCalendar(threadA, TEAM);
+    calendar.calendars.delete(TEAM);
 
-    expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
-      /no longer on the principal/u,
-    );
-    expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
+    data(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }));
+    data(await send(sessionA, 'cancel_booking', { booking: booked.booking }));
+
+    expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject({
+      status: 'cancelled',
+      start: { dateTime: THURSDAY_2PM },
+    });
+    expect(calendar.writes.map((write) => [write.op, write.calendarId])).toEqual([
+      ['insert', PRINCIPAL],
+      ['patch', PRINCIPAL],
+      ['delete', PRINCIPAL],
+    ]);
   });
 
   it('refuses to move or lengthen it into busy time, and moves it into protected time when asked', async () => {

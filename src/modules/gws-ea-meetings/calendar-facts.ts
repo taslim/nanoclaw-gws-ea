@@ -25,7 +25,10 @@
  *   principal (each of their addresses, by the one rule that recognizes
  *   them), the assistant (in every spelling of its address), rooms, and
  *   meetings of more than eight people are left out, and a meeting on several
- *   calendars counts once.
+ *   calendars counts once. Each person's meetings are also counted by the
+ *   calendar they sit on, each calendar whose copy counts on its own: where
+ *   the principal meets them, which main weighs in choosing where to book
+ *   (R13).
  *
  * Every time comes with a label ready to write on the principal's clock.
  * Titles and names other people wrote come back capped and wrapped as
@@ -95,6 +98,11 @@ export interface PersonStats {
   /** Wrapped as untrusted; null when no counted meeting carried one. */
   readonly display_name: string | null;
   readonly meetings: number;
+  /**
+   * Those meetings by the principal calendar they sit on, most first: one on
+   * several calendars counts on each where its own copy counts.
+   */
+  readonly meetings_by_calendar: Readonly<Record<string, number>>;
   /** Meetings with the principal and this person alone; the assistant does not count. */
   readonly one_on_ones: number;
   readonly recurring_series: number;
@@ -296,26 +304,39 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       attendees_omitted: 0,
     };
     // One meeting per key: the first copy that counts stands for it, else the first copy.
-    const meetings = new Map<string, { copy: Copy; outcome: Outcome }>();
+    // It sits on each calendar whose own copy counts.
+    interface Meeting {
+      readonly copy: Copy;
+      readonly outcome: Outcome;
+      readonly calendars: Set<string>;
+    }
+    const meetings = new Map<string, Meeting>();
     for (const copy of copies) {
       const outcome = outcomeOf(copy);
       const seen = meetings.get(copy.meeting);
       if (seen === undefined) {
-        meetings.set(copy.meeting, { copy, outcome });
+        meetings.set(copy.meeting, {
+          copy,
+          outcome,
+          calendars: new Set(outcome === 'counted' ? [copy.calendarId] : []),
+        });
         continue;
       }
       counts.duplicate_copies++;
-      if (seen.outcome !== 'counted' && outcome === 'counted') meetings.set(copy.meeting, { copy, outcome });
+      if (outcome !== 'counted') continue;
+      seen.calendars.add(copy.calendarId);
+      if (seen.outcome !== 'counted') meetings.set(copy.meeting, { ...seen, copy, outcome });
     }
-    const counted: Copy[] = [];
-    for (const { copy, outcome } of meetings.values()) {
-      counts[outcome]++;
-      if (outcome === 'counted') counted.push(copy);
+    const counted: Meeting[] = [];
+    for (const meeting of meetings.values()) {
+      counts[meeting.outcome]++;
+      if (meeting.outcome === 'counted') counted.push(meeting);
     }
-    counted.sort((a, b) => a.span.start - b.span.start || a.meeting.localeCompare(b.meeting));
+    counted.sort((a, b) => a.copy.span.start - b.copy.span.start || a.copy.meeting.localeCompare(b.copy.meeting));
 
     interface Tally {
       meetings: number;
+      byCalendar: Map<string, number>;
       oneOnOnes: number;
       series: Set<string>;
       first: number;
@@ -323,7 +344,10 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       name: string | undefined;
     }
     const tallies = new Map<string, Tally>();
-    for (const { event, span } of counted) {
+    for (const {
+      copy: { event, span },
+      calendars,
+    } of counted) {
       const others = new Map<string, DetailedAttendee>();
       for (const attendee of event.attendees ?? []) {
         const email = attendee.email;
@@ -334,6 +358,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       for (const [email, attendee] of others) {
         const tally = tallies.get(email) ?? {
           meetings: 0,
+          byCalendar: new Map<string, number>(),
           oneOnOnes: 0,
           series: new Set<string>(),
           first: span.start,
@@ -341,6 +366,8 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
           name: undefined,
         };
         tally.meetings++;
+        for (const calendarId of calendars)
+          tally.byCalendar.set(calendarId, (tally.byCalendar.get(calendarId) ?? 0) + 1);
         if (others.size === 1) tally.oneOnOnes++;
         if (event.recurringEventId !== undefined) tally.series.add(event.recurringEventId);
         tally.last = span.start;
@@ -357,6 +384,9 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
           identity: `email:${email}`,
           display_name: tally?.name === undefined ? null : untrustedLine(tally.name, MAX_NAME_CHARS, CALENDAR_SOURCE),
           meetings: tally?.meetings ?? 0,
+          meetings_by_calendar: Object.fromEntries(
+            [...(tally?.byCalendar ?? [])].sort(([a, inA], [b, inB]) => inB - inA || a.localeCompare(b)),
+          ),
           one_on_ones: tally?.oneOnOnes ?? 0,
           recurring_series: tally?.series.size ?? 0,
           first_meeting: tally === undefined ? null : dayLabel(tally.first, view.timezone),

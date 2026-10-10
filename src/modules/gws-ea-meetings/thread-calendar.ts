@@ -1,8 +1,8 @@
 /**
  * What each email thread placed on the principal's calendar (KTD7): its
- * bookings, which it alone may change or cancel; and the calendar its
- * bookings go on when `main` named one. The tables are described in
- * gws-ea-inbox/migration.ts.
+ * bookings, which it alone may change or cancel; and the calendar `main` set
+ * for its bookings, without which it books nothing. The tables are described
+ * in gws-ea-inbox/migration.ts.
  *
  * Every timestamp is passed in as an ISO string; SQL never reads the clock.
  */
@@ -51,7 +51,7 @@ export async function deleteThreadBooking(calendarId: string, eventId: string): 
   await getDb().run('DELETE FROM gws_ea_thread_bookings WHERE calendar_id = ? AND event_id = ?', calendarId, eventId);
 }
 
-/** The calendar `main` named for the thread's bookings, or null when it named none. */
+/** The calendar `main` set for the thread's bookings, or null while it has set none. */
 export async function getThreadBookingCalendar(threadKey: string): Promise<string | null> {
   const row = await getDb().get<{ booking_calendar_id: string | null }>(
     'SELECT booking_calendar_id FROM gws_ea_threads WHERE thread_key = ?',
@@ -60,7 +60,7 @@ export async function getThreadBookingCalendar(threadKey: string): Promise<strin
   return row?.booking_calendar_id ?? null;
 }
 
-/** Name the calendar the thread's bookings go on; null goes back to the principal's primary calendar. */
-export async function setThreadBookingCalendar(threadKey: string, calendarId: string | null): Promise<void> {
+/** Set the calendar the thread's bookings go on. */
+export async function setThreadBookingCalendar(threadKey: string, calendarId: string): Promise<void> {
   await getDb().run('UPDATE gws_ea_threads SET booking_calendar_id = ? WHERE thread_key = ?', calendarId, threadKey);
 }

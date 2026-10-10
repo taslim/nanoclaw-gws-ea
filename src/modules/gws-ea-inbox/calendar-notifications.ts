@@ -193,7 +193,7 @@ export function isBookableCalendar(entry: CalendarListEntry, principal: Principa
 }
 
 /** Whether Google shows the assistant a calendar's events, not only when it is busy. */
-function isReadable(entry: CalendarListEntry): boolean {
+export function isReadable(entry: CalendarListEntry): boolean {
   return entry.accessRole === 'reader' || entry.accessRole === 'writer' || entry.accessRole === 'owner';
 }
 
