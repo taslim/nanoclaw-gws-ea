@@ -509,6 +509,7 @@ function refusalClause(reason: PrincipalRefusal, address: string): string {
       return "Gmail's own check of it is missing";
     case 'sender-differs':
       return 'it names a different Sender';
+    // Mail with a List-Id is archived before any notice (KTD3), so this stays only to cover every reason the check gives.
     case 'mailing-list':
       return 'it came through a mailing list';
     case 'no-own-dkim':

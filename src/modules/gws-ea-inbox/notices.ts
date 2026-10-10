@@ -58,6 +58,7 @@ function unsignedFix(reason: PrincipalRefusal, domain: string): string {
       return `whoever runs email for ${domain} needs to publish a DMARC policy for it so I can tell it's yours.`;
     case 'sender-differs':
       return 'send it straight from that address rather than through a service that sends it for you.';
+    // Mail with a List-Id is archived before any notice (KTD3), so this stays only to cover every reason the check gives.
     case 'mailing-list':
       return 'send it to me straight from that address rather than through a mailing list.';
     case 'no-gmail-results':
