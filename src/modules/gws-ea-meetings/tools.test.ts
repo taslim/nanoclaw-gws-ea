@@ -535,6 +535,20 @@ describe('busy time on the principal’s other calendars', () => {
     expect(calendar.live(TEAM)).toEqual([]);
   });
 
+  it('is never booked over on the calendar main set, though the calendar poll has not listed it among theirs yet', async () => {
+    calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
+    await setThreadBookingCalendar(threadA, TEAM);
+    // The poll has recorded only PRINCIPAL's calendar so far.
+    calendar.put({ ...busy('evt-team', WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'), calendarId: TEAM });
+
+    expect(
+      refusal(
+        await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+      ),
+    ).toBe(gone('Wednesday 7 Oct, 10:00–10:30 BST'));
+    expect(calendar.live(TEAM).map((event) => event.id)).toEqual(['evt-team']);
+  });
+
   it('never reads the assistant’s own calendar: an event there takes the principal’s time only through the copy its invitation put on theirs (R10, R19)', async () => {
     calendar.calendars.set(JUNO, { id: JUNO, accessRole: 'owner' });
     await replacePrincipalCalendars([PRINCIPAL], now());
@@ -868,8 +882,10 @@ describe('book', () => {
 
   it('books on a calendar Google names by another Gmail spelling of a listed address, inviting no spelling of the principal (R1)', async () => {
     await addPrincipalAddress('pat.lee@gmail.com');
+    // A second Gmail address of theirs, whose calendar this booking is not on: only the principal rule leaves it off.
+    await addPrincipalAddress('pat.home@gmail.com');
     calendar.calendars.set('patlee@gmail.com', { id: 'patlee@gmail.com', accessRole: 'owner', summary: 'Pat' });
-    const { key, session } = await thread([REMY, 'pat.lee+trip@googlemail.com']);
+    const { key, session } = await thread([REMY, 'pat.lee+trip@googlemail.com', 'pathome+trip@googlemail.com']);
     await setThreadBookingCalendar(key, 'patlee@gmail.com');
 
     const booked = data(await send(session, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));

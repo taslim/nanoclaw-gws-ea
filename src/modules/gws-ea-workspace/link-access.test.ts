@@ -484,6 +484,8 @@ describe("the host's own check", () => {
       ['morgan+trip@ellery.example', 'others'],
       ['morgan.fixture@gmail.com.evil.example', 'others'],
       ['m\u043Ergan@ellery.example', 'others'],
+      // Both read a recipient as written: one that only trimming would make the principal's is not theirs.
+      [' morgan@ellery.example', 'others'],
     ] as const) {
       expect(await audienceForAddresses([recipient]), recipient).toBe(audience);
       const checked = await checkLinksOpenable({ texts: [link], recipients: [recipient], writer: 'main' });

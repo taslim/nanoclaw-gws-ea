@@ -1469,18 +1469,25 @@ describe("unsigned mail in the principal's name", () => {
     expect(await unsignedRecords()).toEqual([{ address: PRINCIPAL, reason: 'no-own-dkim' }]);
   });
 
-  it('notifies again after Gmail verifies mail from that address, which clears the record', async () => {
-    gmail.receive({ from: `Pat <${PRINCIPAL}>`, auth: 'none', subject: 'One' });
+  it('notifies again after Gmail verifies mail from that address, in any spelling, which clears the record', async () => {
+    await addPrincipalAddress('firstlast@gmail.com');
+    gmail.receive({ from: 'Pat <First.Last+news@gmail.com>', auth: 'none', subject: 'One' });
     await inbox.tick();
     expect(chatSends).toHaveLength(1);
 
-    gmail.receive({ from: `Pat <${PRINCIPAL}>`, auth: 'principal', subject: 'Signed', body: 'This one is me.' });
+    // Verified from another spelling: the record is the listed address's, so this clears it.
+    gmail.receive({
+      from: 'Pat <first.last@gmail.com>',
+      auth: 'principal',
+      subject: 'Signed',
+      body: 'This one is me.',
+    });
     await inbox.tick();
     expect(principalMail()).toHaveLength(1);
     expect(await unsignedRecords()).toEqual([]);
     expect(chatSends).toHaveLength(1);
 
-    gmail.receive({ from: `Pat <${PRINCIPAL}>`, auth: 'none', subject: 'Two' });
+    gmail.receive({ from: 'Pat <firstlast@googlemail.com>', auth: 'none', subject: 'Two' });
     await inbox.tick();
     expect(chatSends).toHaveLength(2);
     expect(notes(UNSIGNED)).toHaveLength(2);
@@ -2261,6 +2268,9 @@ describe('calendar access per address', () => {
   it('takes the calendar it added out of the list when its address is removed, once', async () => {
     calendar.share(WORK, 'writer');
     await addPrincipalAddress(WORK);
+    await inbox.tick();
+    // A later poll finds it already in the list: the host still added it.
+    later(60_000);
     await inbox.tick();
 
     await removePrincipalAddress(WORK);

@@ -625,6 +625,24 @@ describe('change_guests', () => {
     );
     expect(calendar.writes).toEqual([]);
     expect(unchanged.message).toBe(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
+
+    // Named in another Gmail spelling on their calendar of that address, the principal is still already on it (R1).
+    await addPrincipalAddress('morgan.ellery@gmail.com');
+    calendar.calendars.set(GMAIL_CALENDAR, { id: GMAIL_CALENDAR, accessRole: 'owner' });
+    calendar.put({
+      ...teamSync([{ email: GMAIL_CALENDAR, responseStatus: 'accepted', organizer: true }]),
+      calendarId: GMAIL_CALENDAR,
+      organizer: { email: GMAIL_CALENDAR },
+    });
+    const respelled = data(
+      await send(main, 'change_guests', {
+        calendar: GMAIL_CALENDAR,
+        event: 'teamsync01',
+        add: ['Morgan.Ellery+notes@gmail.com'],
+      }),
+    );
+    expect(calendar.writes).toEqual([]);
+    expect(respelled.message).toBe('Nothing changed: the principal is already on it.');
   });
 
   it('tells the guests only of a change to who it invites, never of the principal alone', async () => {

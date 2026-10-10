@@ -265,14 +265,32 @@ describe('a new principal address once the inbox exists', () => {
     expect(notes(main).at(-1)).toMatch(/rejected/i);
   });
 
-  it('keeps out an approved address that became another spelling of a listed one while the card waited', async () => {
-    await run('principal-addresses-add', { email: 'Morgan.Ellery@gmail.com' }, agent(main));
+  it.each([
+    [
+      'another spelling of a listed one',
+      'morgan.ellery@gmail.com',
+      () => run('principal-addresses-add', { email: 'morganellery@gmail.com' }),
+      /another spelling of morganellery@gmail\.com/u,
+    ],
+    [
+      "the assistant's own in another spelling",
+      NEW_ADDRESS,
+      () =>
+        reconcileGwsEaProfile({
+          assistantDisplayName: 'Aya',
+          assistantWorkspaceEmail: 'morgan+aya@new.example.test',
+          mainAgentGroupId: 'ag-main',
+        }),
+      /assistant's own/u,
+    ],
+  ])('keeps out an approved address that became %s while the card waited', async (_case, email, meanwhile, refusal) => {
+    await run('principal-addresses-add', { email }, agent(main));
     const [approval] = await pendingApprovals();
-    await run('principal-addresses-add', { email: 'morganellery@gmail.com' });
+    await meanwhile();
 
     await click(approval!, 'approve');
-    expect(await addresses()).not.toContain('morgan.ellery@gmail.com');
-    expect(notes(main).at(-1)).toMatch(/another spelling of morganellery@gmail\.com/u);
+    expect(await addresses()).not.toContain(email);
+    expect(notes(main).at(-1)).toMatch(refusal);
   });
 
   it('lets the operator add an address directly', async () => {
