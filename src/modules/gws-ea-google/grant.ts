@@ -209,6 +209,11 @@ export const GOOGLE_GRANT_FILE_NAME = 'google-grant.json';
 /** The host's environment key naming the grant file. */
 export const GOOGLE_GRANT_FILE_ENV = 'GWS_EA_GOOGLE_GRANT_FILE';
 
+/** A sign-in's identity: a new sign-in, even of the same account, is a new identity. */
+export function googleGrantIdentity(grant: GoogleGrant): string {
+  return `${grant.account}\0${grant.granted_at}`;
+}
+
 function requireText(value: unknown, label: string, maximum = 4_096): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maximum || hasControlCharacters(value)) {
     throw new Error(`Google grant ${label} is invalid`);

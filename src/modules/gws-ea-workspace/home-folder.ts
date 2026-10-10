@@ -23,7 +23,12 @@
  * sign-in, as revocation does. Any other failure is logged, and the next
  * tick tries again from what the last one recorded.
  */
-import { grantedScopes, HOST_GOOGLE_SERVICES, type GoogleGrant } from '../gws-ea-google/grant.js';
+import {
+  googleGrantIdentity as grantIdentity,
+  grantedScopes,
+  HOST_GOOGLE_SERVICES,
+  type GoogleGrant,
+} from '../gws-ea-google/grant.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError } from '../gws-ea-google/tokens.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type { NoteForMain, NoteForMainResult } from '../gws-ea-profile/main-note.js';
@@ -64,11 +69,6 @@ export interface HomeFolder {
 }
 
 const DRIVE_SCOPES = HOST_GOOGLE_SERVICES['drive-host'].scopes;
-
-/** A sign-in, as the refresher identifies one: a new sign-in is a new identity. */
-function grantIdentity(grant: GoogleGrant): string {
-  return `${grant.account}\0${grant.granted_at}`;
-}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

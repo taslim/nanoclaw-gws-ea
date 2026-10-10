@@ -215,8 +215,7 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
   }
 
   if (WORKSPACE_NOTIFICATION_SENDERS.has(from.address)) {
-    const googleDkimPass = passed(results, 'dkim', (result) => WORKSPACE_SIGNING_DOMAINS.has(dkimDomain(result) ?? ''));
-    if (soleSender && !hasListId && googleDkimPass && dmarcPass) {
+    if (soleSender && !hasListId && [...WORKSPACE_SIGNING_DOMAINS].some(ownDkimPass) && dmarcPass) {
       return { kind: 'workspace-notification', address: from.address };
     }
     return unauthenticated('a Docs or Drive notification Google did not sign');

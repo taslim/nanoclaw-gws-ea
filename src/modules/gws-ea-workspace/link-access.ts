@@ -124,6 +124,8 @@ export interface LinkAccess {
 
 /** The waits before each brief retry of a read Google could not answer. */
 const RETRY_DELAYS_MS: readonly number[] = [250, 1_000];
+/** How many addresses' permission ids the check keeps between messages. */
+const MAX_CACHED_PERMISSION_IDS = 1000;
 /** Files read at once. */
 const READS_AT_ONCE = 4;
 const OPERATOR_REASON = "the assistant's Google sign-in doesn't include Drive yet; the operator needs to reconnect it";
@@ -216,7 +218,11 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
   const sleep = options.sleep ?? ((ms: number) => delay(ms));
   const now = options.now ?? (() => new Date());
   const principalAddresses = options.principalAddresses ?? readPrincipalAddresses;
-  /** The permission id Drive gives each address, once read; a read in flight is shared. */
+  /**
+   * The permission id Drive gives each address, once read; a read in flight
+   * is shared. The oldest entry goes once it holds more addresses than
+   * `MAX_CACHED_PERMISSION_IDS`, so a long-running host never grows it without end.
+   */
   const permissionIds = new Map<string, Promise<string | undefined>>();
 
   /** `read`, asked again briefly while Google is unavailable; the last failure is thrown. */
@@ -247,6 +253,10 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
     if (pending === undefined) {
       pending = briefly(() => drive.permissionId(address));
       permissionIds.set(address, pending);
+      if (permissionIds.size > MAX_CACHED_PERMISSION_IDS) {
+        const oldest = permissionIds.keys().next().value;
+        if (oldest !== undefined) permissionIds.delete(oldest);
+      }
     }
     try {
       return await pending;

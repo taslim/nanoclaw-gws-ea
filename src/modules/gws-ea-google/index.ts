@@ -17,18 +17,16 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { registerCapability } from '../../capabilities.js';
 import { registerContainerEnv } from '../../container-env.js';
 import { getGatewayProvider } from '../../gateway-providers/index.js';
-import { readEnvFile } from '../../env.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { knownMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
   AGENT_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SERVICES,
-  GOOGLE_GRANT_FILE_ENV,
   type GoogleCapability,
   type HostGoogleServiceId,
 } from './grant.js';
-import { readGoogleGrantFile } from './grant-file.js';
+import { googleGrantFilePath, readGoogleGrantFile } from './grant-file.js';
 import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleTokenRefresher } from './refresher.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 
@@ -121,8 +119,7 @@ registerContainerEnv('gws-ea-google:gog', ({ agentGroupId, capabilities }): Reco
 let active: GoogleTokenRefresher | undefined;
 
 onHostStart(async ({ signal }) => {
-  const env = readEnvFile([GOOGLE_GRANT_FILE_ENV]);
-  const grantFile = process.env[GOOGLE_GRANT_FILE_ENV] || env[GOOGLE_GRANT_FILE_ENV];
+  const grantFile = googleGrantFilePath();
   if (!grantFile) return;
   const gateway = getGatewayProvider();
   const credentials = gateway.credentials;

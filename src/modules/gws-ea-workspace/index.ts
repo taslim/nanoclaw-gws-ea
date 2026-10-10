@@ -19,11 +19,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { registerContainerEnv } from '../../container-env.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { readEnvFile } from '../../env.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
-import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
-import { readGoogleGrantFile } from '../gws-ea-google/grant-file.js';
+import { googleGrantFilePath, readGoogleGrantFile } from '../gws-ea-google/grant-file.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { knownMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
@@ -48,7 +46,7 @@ registerContainerEnv('gws-ea-workspace:home-folder', ({ agentGroupId }): Record<
 });
 
 onHostStart(async ({ signal }) => {
-  const grantFile = process.env[GOOGLE_GRANT_FILE_ENV] || readEnvFile([GOOGLE_GRANT_FILE_ENV])[GOOGLE_GRANT_FILE_ENV];
+  const grantFile = googleGrantFilePath();
   if (!grantFile) return;
   const db = getDb();
   if (!(await db.hasTable('gws_ea_profile')) || !(await db.hasTable('gws_ea_workspace_folder'))) return;

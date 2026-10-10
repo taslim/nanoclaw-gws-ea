@@ -18,7 +18,12 @@ import type {
   GatewayCredentialTarget,
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
-import { AGENT_GOOGLE_CREDENTIALS, type GoogleGrant, type HostGoogleServiceId } from './grant.js';
+import {
+  AGENT_GOOGLE_CREDENTIALS,
+  googleGrantIdentity as grantIdentity,
+  type GoogleGrant,
+  type HostGoogleServiceId,
+} from './grant.js';
 import {
   GoogleGrantRevokedError,
   mintCredentialToken,
@@ -65,11 +70,6 @@ export interface GoogleTokenRefresher {
 interface Published {
   readonly expiresAt: number;
   readonly partial: boolean;
-}
-
-/** A grant is identified by its sign-in, so a new sign-in clears a revoked one. */
-function grantIdentity(grant: GoogleGrant): string {
-  return `${grant.account}\0${grant.granted_at}`;
 }
 
 function message(error: unknown): string {

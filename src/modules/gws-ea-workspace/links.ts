@@ -54,7 +54,6 @@ function isEditor(segment: string | undefined): segment is (typeof EDITORS)[numb
   return EDITORS.some((editor) => editor === segment);
 }
 
-/** A URL as the link check reads one: https on a checked host, with no userinfo and no port. */
 /**
  * A URL on exactly one of the three hosts, over http or https. How it was
  * written (http, userinfo, a port) doesn't excuse it from the check: the
