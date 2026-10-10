@@ -45,12 +45,19 @@ const INVALID_CREDENTIAL = 'invalid_gchat_credential';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
 const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
-/** The Workspace APIs the assistant's own Google sign-in calls (KTD2); enabled by the Google connection. */
+/**
+ * The Workspace APIs the assistant's own Google sign-in holds scopes for
+ * (KTD2), enabled by the Google connection. Nothing calls Drive Activity or
+ * Drive Labels yet; they are enabled now so a capability that does needs no
+ * new connection.
+ */
 export const GOOGLE_WORKSPACE_APIS = [
   'calendar-json.googleapis.com',
   'gmail.googleapis.com',
   'people.googleapis.com',
   'drive.googleapis.com',
+  'driveactivity.googleapis.com',
+  'drivelabels.googleapis.com',
   'docs.googleapis.com',
   'sheets.googleapis.com',
   'slides.googleapis.com',
@@ -783,7 +790,7 @@ function enabledApisResource(
   };
 }
 
-/** The Workspace APIs the assistant's sign-in calls, in its own project. */
+/** The Workspace APIs the assistant's sign-in holds scopes for, in its own project. */
 export function googleWorkspaceApisResource(dependencies: GcloudDependencies = {}): StepResource<GcpProjectContext> {
   return enabledApisResource('the Google Workspace APIs', GOOGLE_WORKSPACE_APIS, dependencies);
 }

@@ -32,13 +32,27 @@ const SECRETS = path.join(ROOT, 'secrets');
 const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
 const DRIVE = 'https://www.googleapis.com/auth/drive';
-const WORKSPACE_SCOPES = [
+/** The scopes this release adds to the sign-in, in the order it asks for them: Workspace's, then the ceiling. */
+const THIS_RELEASE_SCOPES = [
   DRIVE,
   'https://www.googleapis.com/auth/documents',
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/presentations',
   'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.responses.readonly',
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.settings.basic',
+  'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.labels.readonly',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body.readonly',
 ];
 /** The scopes an assistant signed in before Drive, Docs, Sheets, Slides and Forms holds. */
 const BEFORE_WORKSPACE = [
@@ -259,6 +273,8 @@ describe("connecting the assistant's Google account", () => {
       'gmail.googleapis.com',
       'people.googleapis.com',
       'drive.googleapis.com',
+      'driveactivity.googleapis.com',
+      'drivelabels.googleapis.com',
       'docs.googleapis.com',
       'sheets.googleapis.com',
       'slides.googleapis.com',
@@ -402,7 +418,7 @@ describe("connecting the assistant's Google account", () => {
     expect(world.vaultWrites).toEqual([]);
   });
 
-  it('signs in again when the grant on disk lacks the Workspace scopes', async () => {
+  it("signs in again when the grant on disk lacks this release's scopes", async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant({ granted_at: '2026-10-09T18:00:00.000Z' }));
     fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
@@ -412,13 +428,13 @@ describe("connecting the assistant's Google account", () => {
 
     expect(await resources[2]!.observe(context(signIn))).toEqual({
       status: 'absent',
-      reason: `the sign-in lacks ${WORKSPACE_SCOPES.join(', ')}`,
+      reason: `the sign-in lacks ${THIS_RELEASE_SCOPES.join(', ')}`,
     });
     await expect(connect(resources, context(signIn))).resolves.toBeUndefined();
 
     expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT, account: ACCOUNT }));
     expect(JSON.parse(fs.readFileSync(path.join(SECRETS, 'google-grant.json'), 'utf8'))).toMatchObject({
-      scopes: expect.arrayContaining(WORKSPACE_SCOPES) as unknown,
+      scopes: expect.arrayContaining(THIS_RELEASE_SCOPES) as unknown,
     });
   });
 
@@ -532,7 +548,7 @@ describe('observing the Google connection for status', () => {
     });
   });
 
-  it('names the missing Workspace scopes and the connect-google repair for an assistant signed in before them', async () => {
+  it("names this release's missing scopes and the connect-google repair for an assistant signed in before them", async () => {
     const world = new World();
     world.publish(BEFORE_WORKSPACE);
     fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
@@ -542,7 +558,7 @@ describe('observing the Google connection for status', () => {
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
       status: 'degraded',
       account: ACCOUNT,
-      reason: `the sign-in lacks ${WORKSPACE_SCOPES.join(', ')}; ${repair}`,
+      reason: `the sign-in lacks ${THIS_RELEASE_SCOPES.join(', ')}; ${repair}`,
     });
   });
 

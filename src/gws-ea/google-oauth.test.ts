@@ -223,22 +223,25 @@ describe('signing in as the assistant', () => {
       fetch: g.fetch,
     }).catch((caught: unknown) => caught);
 
-    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(
-      expect.arrayContaining([
-        'https://www.googleapis.com/auth/drive',
-        'https://www.googleapis.com/auth/documents',
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/presentations',
-        'https://www.googleapis.com/auth/forms.body',
-        'https://www.googleapis.com/auth/forms.responses.readonly',
-      ]),
-    );
+    // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the read-only variants the ceiling adds.
+    const workspaceScopes = [
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/presentations',
+      'https://www.googleapis.com/auth/forms.body',
+      'https://www.googleapis.com/auth/forms.responses.readonly',
+      'https://www.googleapis.com/auth/drive.readonly',
+      'https://www.googleapis.com/auth/drive.activity.readonly',
+      'https://www.googleapis.com/auth/drive.labels.readonly',
+      'https://www.googleapis.com/auth/documents.readonly',
+      'https://www.googleapis.com/auth/spreadsheets.readonly',
+      'https://www.googleapis.com/auth/presentations.readonly',
+      'https://www.googleapis.com/auth/forms.body.readonly',
+    ];
+    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(expect.arrayContaining(workspaceScopes));
     expect(error).toMatchObject({ code: 'google_scope_missing' });
-    expect(String(error)).toContain(
-      'https://www.googleapis.com/auth/drive, https://www.googleapis.com/auth/documents, ' +
-        'https://www.googleapis.com/auth/spreadsheets, https://www.googleapis.com/auth/presentations, ' +
-        'https://www.googleapis.com/auth/forms.body, https://www.googleapis.com/auth/forms.responses.readonly',
-    );
+    expect(String(error)).toContain(`did not grant ${workspaceScopes.join(', ')};`);
   });
 
   it('refuses a sign-in that returns no refresh token', async () => {

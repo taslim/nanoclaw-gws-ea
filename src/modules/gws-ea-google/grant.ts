@@ -172,12 +172,47 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
   return grantedScopes(wanted, granted);
 }
 
-/** What the sign-in asks for, each once: the account's identity, and every service, agent-facing and host-only. */
-export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [
-  ...new Set(['openid', 'email', ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes)]),
+/**
+ * What the sign-in asks for beyond its services' scopes. The grant never
+ * leaves the host and is the assistant's own account, so the sign-in holds
+ * every supported product's broadest scopes and the read-only variants a
+ * narrower token can be cut to. A new capability then needs no new sign-in,
+ * and each token still carries only what its services want. The read-only
+ * variants are asked for by name because minting asks Google for an exact
+ * subset of the granted scopes: a token wanting `drive.readonly` gets it only
+ * from a grant that lists it.
+ */
+const SIGN_IN_CEILING: readonly string[] = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.settings.basic',
+  'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.labels.readonly',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body.readonly',
 ];
 
-/** The scopes a grant must hold: the identity scopes Google reports in full form, and every service's. */
+/**
+ * What the sign-in asks for, each once: the account's identity, every
+ * service's scopes (agent-facing and host-only), and the ceiling beyond them.
+ * A grant lacking any of them needs a new sign-in.
+ */
+export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [
+  ...new Set([
+    'openid',
+    'email',
+    ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes),
+    ...SIGN_IN_CEILING,
+  ]),
+];
+
+/** The scopes a grant must hold: the identity scopes Google reports in full form, and the rest of the sign-in's. */
 const IDENTITY_SCOPE_FORMS: Readonly<Record<string, readonly string[]>> = {
   openid: ['openid'],
   email: ['email', 'https://www.googleapis.com/auth/userinfo.email'],

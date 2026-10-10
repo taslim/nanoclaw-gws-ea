@@ -24,6 +24,22 @@ const WORKSPACE_SCOPES = [
   'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.responses.readonly',
 ];
+/** What the sign-in asks for beyond its services' scopes: each product's broadest, and its read-only variants. */
+const CEILING = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.settings.basic',
+  'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.labels.readonly',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body.readonly',
+];
 
 const VALID = {
   schema_version: 1,
@@ -50,7 +66,7 @@ describe("the assistant's Google grant", () => {
     expect(() => parseGoogleGrant(value)).toThrow(/Google grant/);
   });
 
-  it('asks in one sign-in for identity and every service, agent-facing and host-only, each scope once', () => {
+  it('asks in one sign-in for identity, every service, and the ceiling beyond them, each scope once', () => {
     expect(GOOGLE_SIGN_IN_SCOPES).toEqual([
       'openid',
       'email',
@@ -61,11 +77,12 @@ describe("the assistant's Google grant", () => {
       'https://www.googleapis.com/auth/directory.readonly',
       ...WORKSPACE_SCOPES,
       'https://www.googleapis.com/auth/gmail.modify',
+      ...CEILING,
     ]);
     expect(new Set(GOOGLE_SIGN_IN_SCOPES).size).toBe(GOOGLE_SIGN_IN_SCOPES.length);
   });
 
-  it("names each required scope a grant lacks, accepting Google's long form of email", () => {
+  it("names each required scope a grant lacks, the ceiling's too, accepting Google's long form of email", () => {
     const beforeThisRelease = [
       'openid',
       'https://www.googleapis.com/auth/userinfo.email',
@@ -74,7 +91,10 @@ describe("the assistant's Google grant", () => {
       ...AGENT_GOOGLE_SERVICES.directory.scopes,
       ...HOST_GOOGLE_SERVICES.gmail.scopes,
     ];
-    expect(missingGoogleScopes(beforeThisRelease)).toEqual(WORKSPACE_SCOPES);
+    expect(missingGoogleScopes(beforeThisRelease)).toEqual([...WORKSPACE_SCOPES, ...CEILING]);
+    expect(missingGoogleScopes(GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== 'https://mail.google.com/'))).toEqual([
+      'https://mail.google.com/',
+    ]);
     expect(missingGoogleScopes([...GOOGLE_SIGN_IN_SCOPES])).toEqual([]);
   });
 });

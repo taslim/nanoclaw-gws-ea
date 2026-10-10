@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, googleCredentialFor, type GoogleGrant } from './grant.js';
+import {
+  AGENT_GOOGLE_CREDENTIALS,
+  AGENT_GOOGLE_SERVICES,
+  GOOGLE_SIGN_IN_SCOPES,
+  googleCredentialFor,
+  type GoogleGrant,
+} from './grant.js';
 import {
   GOOGLE_TOKEN_ENDPOINT,
   GoogleGrantRevokedError,
@@ -143,6 +149,67 @@ describe("minting an agent credential's token", () => {
       scopes: [...AGENT_GOOGLE_SERVICES.calendar.scopes, DRIVE],
     });
     expect(token).not.toHaveProperty('fallback');
+  });
+
+  it("asks for exactly each credential's own scopes on a grant holding the whole ceiling, never a broader one", async () => {
+    const grant: GoogleGrant = {
+      ...GRANT,
+      scopes: [
+        'openid',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/calendar.events',
+        'https://www.googleapis.com/auth/calendar.calendarlist',
+        'https://www.googleapis.com/auth/calendar.freebusy',
+        READONLY,
+        'https://www.googleapis.com/auth/directory.readonly',
+        DRIVE,
+        'https://www.googleapis.com/auth/documents',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/presentations',
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/forms.responses.readonly',
+        MODIFY,
+        // The ceiling: each product's broadest scopes, and their read-only variants.
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/calendar.readonly',
+        'https://www.googleapis.com/auth/calendar.events.readonly',
+        'https://mail.google.com/',
+        'https://www.googleapis.com/auth/gmail.settings.basic',
+        'https://www.googleapis.com/auth/gmail.settings.sharing',
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/drive.activity.readonly',
+        'https://www.googleapis.com/auth/drive.labels.readonly',
+        'https://www.googleapis.com/auth/documents.readonly',
+        'https://www.googleapis.com/auth/spreadsheets.readonly',
+        'https://www.googleapis.com/auth/presentations.readonly',
+        'https://www.googleapis.com/auth/forms.body.readonly',
+      ],
+    };
+    const asked: Record<string, string[]> = {};
+    for (const credential of AGENT_GOOGLE_CREDENTIALS) {
+      const world = google();
+      await mintCredentialToken(grant, credential, { fetch: world.fetch });
+      asked[credential.host] = world.asked;
+    }
+
+    expect(asked).toEqual({
+      'www.googleapis.com': [
+        [
+          'https://www.googleapis.com/auth/calendar.events',
+          'https://www.googleapis.com/auth/calendar.calendarlist',
+          'https://www.googleapis.com/auth/calendar.freebusy',
+          DRIVE,
+        ].join(' '),
+      ],
+      'gmail.googleapis.com': [READONLY],
+      'people.googleapis.com': ['https://www.googleapis.com/auth/directory.readonly'],
+      'docs.googleapis.com': ['https://www.googleapis.com/auth/documents'],
+      'sheets.googleapis.com': ['https://www.googleapis.com/auth/spreadsheets'],
+      'slides.googleapis.com': ['https://www.googleapis.com/auth/presentations'],
+      'forms.googleapis.com': [
+        'https://www.googleapis.com/auth/forms.body https://www.googleapis.com/auth/forms.responses.readonly',
+      ],
+    });
   });
 
   it("asks for Calendar's scopes alone on a grant from before Drive, and nothing for a host it holds none for", async () => {
