@@ -362,6 +362,7 @@ async function startInbox(): Promise<void> {
   inbox = createInbox({
     gmail,
     calendar: { list: async () => [], patchNotifications: async () => undefined },
+    drive,
     sleep: async () => undefined,
   });
   registerChannelAdapter('email', { factory: () => inbox.adapter, defaults: EMAIL_CHANNEL_DEFAULTS });
