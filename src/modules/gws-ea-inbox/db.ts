@@ -1,10 +1,13 @@
 /**
  * The inbox's own tables (see migration.ts): its state, each message seen,
- * each sender's hourly count, and the principal's calendars. The thread map
- * has its own module (thread-map.ts). Every timestamp is passed in as an ISO
- * string; SQL never reads the clock.
+ * each sender's hourly count, the principal's calendars, what the assistant
+ * can do with each principal address's calendar, and the unsigned mail in
+ * the principal's name they were told of. The thread map has its own module
+ * (thread-map.ts). Every timestamp is passed in as an ISO string; SQL never
+ * reads the clock.
  */
 import { getDb } from '../../db/connection.js';
+import type { PrincipalRefusal } from './authentication.js';
 
 // ---------------------------------------------------------------------------
 // State
@@ -179,4 +182,150 @@ export async function replacePrincipalCalendars(calendarIds: readonly string[], 
       );
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Each principal address's calendar
+// ---------------------------------------------------------------------------
+
+/**
+ * What the assistant can do with a principal address's main calendar, by
+ * Google's access role for it in the assistant's calendar list: book on it
+ * (`writer` or `owner`), read its events (`reader`), see only when it is busy
+ * (`freeBusyReader`), or nothing, because it is not shared with the
+ * assistant or not in its list.
+ */
+export type CalendarAccess = 'bookable' | 'readable' | 'free-busy' | 'none';
+
+/** One address's calendar access as the calendar poll keeps it (see migration.ts). */
+export interface CalendarAccessRecord {
+  /** The address as the principal listed it. */
+  readonly address: string;
+  /** Google's id for the calendar while it is in the assistant's list; null while it is not. */
+  readonly calendarId: string | null;
+  readonly access: CalendarAccess;
+  /** Whether the host put the calendar in the list: only then does it take it out. */
+  readonly hostAdded: boolean;
+  /** When Google last answered for it. */
+  readonly checkedAt: string;
+  /** When its access last changed. */
+  readonly changedAt: string;
+  /** The access main is taken to know: the first reading and every rise, and a drop once main is told of it. */
+  readonly toldAccess: CalendarAccess;
+}
+
+interface CalendarAccessRow {
+  readonly address: string;
+  readonly calendar_id: string | null;
+  readonly access: CalendarAccess;
+  readonly host_added: number;
+  readonly checked_at: string;
+  readonly changed_at: string;
+  readonly told_access: CalendarAccess;
+}
+
+export async function listCalendarAccess(): Promise<CalendarAccessRecord[]> {
+  const rows = await getDb().all<CalendarAccessRow>('SELECT * FROM gws_ea_inbox_calendar_access ORDER BY address');
+  return rows.map((row) => ({
+    address: row.address,
+    calendarId: row.calendar_id,
+    access: row.access,
+    hostAdded: row.host_added === 1,
+    checkedAt: row.checked_at,
+    changedAt: row.changed_at,
+    toldAccess: row.told_access,
+  }));
+}
+
+/**
+ * What the assistant can do with the calendar `calendarId`, as the calendar
+ * poll last recorded it for the principal address it belongs to; undefined
+ * when no address's record names it, as for a secondary calendar, or one no
+ * longer in the assistant's list.
+ */
+export async function calendarAccessOf(calendarId: string): Promise<CalendarAccess | undefined> {
+  if (!(await getDb().hasTable('gws_ea_inbox_calendar_access'))) return undefined;
+  const row = await getDb().get<{ access: CalendarAccess }>(
+    'SELECT access FROM gws_ea_inbox_calendar_access WHERE lower(calendar_id) = ? LIMIT 1',
+    calendarId.toLowerCase(),
+  );
+  return row?.access;
+}
+
+export async function recordCalendarAccess(record: CalendarAccessRecord): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_inbox_calendar_access
+       (address, calendar_id, access, host_added, checked_at, changed_at, told_access)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (address) DO UPDATE
+          SET calendar_id = excluded.calendar_id, access = excluded.access, host_added = excluded.host_added,
+              checked_at = excluded.checked_at, changed_at = excluded.changed_at, told_access = excluded.told_access`,
+    record.address,
+    record.calendarId,
+    record.access,
+    record.hostAdded ? 1 : 0,
+    record.checkedAt,
+    record.changedAt,
+    record.toldAccess,
+  );
+}
+
+/** Main was told that `address`'s calendar access dropped to `access`. */
+export async function recordToldCalendarAccess(address: string, access: CalendarAccess): Promise<void> {
+  await getDb().run('UPDATE gws_ea_inbox_calendar_access SET told_access = ? WHERE address = ?', access, address);
+}
+
+export async function deleteCalendarAccess(address: string): Promise<void> {
+  await getDb().run('DELETE FROM gws_ea_inbox_calendar_access WHERE address = ?', address);
+}
+
+/** One principal address's calendar access as main and status read it. */
+export interface AddressCalendarAccess {
+  readonly address: string;
+  /** `unchecked` until the calendar poll first reads it. */
+  readonly access: CalendarAccess | 'unchecked';
+  /** When Google last answered for it; null while unchecked. */
+  readonly checkedAt: string | null;
+}
+
+/**
+ * Each of the `listed` addresses, in order, with its calendar access as the
+ * calendar poll last read it from Google. The store alone, never Google: main
+ * listing the addresses and status reading the inbox's health see the same
+ * facts. Without the inbox's tables, every address is unchecked.
+ */
+export async function principalCalendarAccess(listed: readonly string[]): Promise<AddressCalendarAccess[]> {
+  const records = (await getDb().hasTable('gws_ea_inbox_calendar_access')) ? await listCalendarAccess() : [];
+  const byAddress = new Map(records.map((record) => [record.address, record]));
+  return listed.map((address) => {
+    const record = byAddress.get(address);
+    return record === undefined
+      ? { address, access: 'unchecked', checkedAt: null }
+      : { address, access: record.access, checkedAt: record.checkedAt };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Unsigned mail in the principal's name
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that the principal is told of unsigned mail from `address`, as they
+ * listed it, for `reason`. True when the record is new and they are to be
+ * told; false when they already were.
+ */
+export async function recordUnsignedNotice(address: string, reason: PrincipalRefusal, at: string): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT INTO gws_ea_inbox_unsigned_notices (address, reason, notified_at) VALUES (?, ?, ?)
+       ON CONFLICT (address, reason) DO NOTHING`,
+    address,
+    reason,
+    at,
+  );
+  return result.changes > 0;
+}
+
+/** Gmail verified mail from `address`, as listed: the next failure from it is told again. */
+export async function clearUnsignedNotices(address: string): Promise<void> {
+  await getDb().run('DELETE FROM gws_ea_inbox_unsigned_notices WHERE address = ?', address);
 }

@@ -7,8 +7,9 @@
  * called where a message reaches someone other than the principal:
  * `sendToOutside` on an outside email's final recipients, the bridge's
  * handoff admission, and `assertInvitationShareable`. It reads only what
- * the assistant wrote, and never checks the principal's addresses, so
- * nothing `main` sends the principal is checked.
+ * the assistant wrote, and never checks the principal's addresses, which it
+ * tells apart exactly as the privacy check does (R1), so nothing `main`
+ * sends the principal is checked.
  *
  * "Confirmed" means a signal Google gives exactly, per link and recipient:
  *
@@ -52,12 +53,11 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { getDb } from '../../db/connection.js';
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
-import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { createDriveApi, isDriveRateLimit, type DriveApi, type DriveFile, type DrivePermission } from './drive-api.js';
 import { fileProbeUrl, googleLinksIn, type GoogleLink } from './links.js';
 import { probeLink, ProbeUnavailableError, type ProbeTarget, type ProbeVerdict } from './probe.js';
@@ -112,7 +112,7 @@ export interface LinkAccessOptions {
   /** The signed-out visit. */
   readonly probe: (target: ProbeTarget) => Promise<ProbeVerdict>;
   /** The principal's addresses, as the profile holds them. */
-  readonly principalAddresses?: () => Promise<ReadonlySet<string>>;
+  readonly principalAddresses?: () => Promise<PrincipalRecognizer>;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => Date;
 }
@@ -204,11 +204,6 @@ async function inTurn<T, R>(items: readonly T[], limit: number, work: (item: T) 
   return results;
 }
 
-async function readPrincipalAddresses(): Promise<ReadonlySet<string>> {
-  if (!(await getDb().hasTable('gws_ea_principal_addresses'))) return new Set();
-  return new Set((await listPrincipalAddresses()).map((address) => address.email));
-}
-
 function normalized(address: string): string {
   return normalizePrincipalEmail(address) ?? address.trim().toLowerCase();
 }
@@ -217,7 +212,7 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
   const { drive, probe } = options;
   const sleep = options.sleep ?? ((ms: number) => delay(ms));
   const now = options.now ?? (() => new Date());
-  const principalAddresses = options.principalAddresses ?? readPrincipalAddresses;
+  const principalAddresses = options.principalAddresses ?? loadPrincipalRecognizer;
   /**
    * The permission id Drive gives each address, once read; a read in flight
    * is shared. The oldest entry goes once it holds more addresses than
@@ -374,7 +369,8 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
       const links = googleLinksIn(request.texts);
       if (links.length === 0) return { allowed: true };
       const principal = await principalAddresses();
-      const recipients = [...new Set(request.recipients.map(normalized))].filter((address) => !principal.has(address));
+      // Told apart as written, as the privacy check reads the same recipients.
+      const recipients = [...new Set(request.recipients.filter((address) => !principal.has(address)).map(normalized))];
       if (recipients.length === 0) return { allowed: true };
       const outcomes = await inTurn(links, READS_AT_ONCE, (link) => outcomesFor(link, recipients));
       const refused: Refused[] = [];
@@ -416,7 +412,7 @@ function listed(items: readonly string[]): string {
 const CHOICES = 'leave them out, or send it without the link.';
 
 /** One sentence for `main`: who cannot open which link, why, and what it can do. */
-function sentenceForMain(url: string, who: string, why: Unconfirmed, principal: ReadonlySet<string>): string {
+function sentenceForMain(url: string, who: string, why: Unconfirmed, principal: PrincipalRecognizer): string {
   switch (why.kind) {
     case 'not-shared':
       return why.group
@@ -426,7 +422,7 @@ function sentenceForMain(url: string, who: string, why: Unconfirmed, principal: 
       return `${who} can't open ${url}: it is in the trash. Restore it, or send it without the link.`;
     case 'view-only': {
       const owner = why.owners[0];
-      const isPrincipal = owner !== undefined && principal.has(owner.toLowerCase());
+      const isPrincipal = principal.has(owner);
       const belongs = owner === undefined ? 'someone else' : isPrincipal ? `the principal (${owner})` : owner;
       const ask = owner === undefined ? 'its owner' : isPrincipal ? 'the principal' : owner;
       return `${who} may not be able to open ${url}: it belongs to ${belongs}, and the assistant can only view it, so it can't see who else may open it or share it. Ask ${ask} to share it with them, ${CHOICES}`;
@@ -464,7 +460,7 @@ function whyKey(why: Unconfirmed): string {
   return JSON.stringify(why);
 }
 
-function reasonForMain(refused: readonly Refused[], principal: ReadonlySet<string>): string {
+function reasonForMain(refused: readonly Refused[], principal: PrincipalRecognizer): string {
   const groups = new Map<string, { url: string; why: Unconfirmed; recipients: string[] }>();
   for (const { link, recipient, why } of refused) {
     const key = `${link.url}\u0000${whyKey(why)}`;

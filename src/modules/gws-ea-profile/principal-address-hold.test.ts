@@ -265,6 +265,34 @@ describe('a new principal address once the inbox exists', () => {
     expect(notes(main).at(-1)).toMatch(/rejected/i);
   });
 
+  it.each([
+    [
+      'another spelling of a listed one',
+      'morgan.ellery@gmail.com',
+      () => run('principal-addresses-add', { email: 'morganellery@gmail.com' }),
+      /another spelling of morganellery@gmail\.com/u,
+    ],
+    [
+      "the assistant's own in another spelling",
+      NEW_ADDRESS,
+      () =>
+        reconcileGwsEaProfile({
+          assistantDisplayName: 'Aya',
+          assistantWorkspaceEmail: 'morgan+aya@new.example.test',
+          mainAgentGroupId: 'ag-main',
+        }),
+      /assistant's own/u,
+    ],
+  ])('keeps out an approved address that became %s while the card waited', async (_case, email, meanwhile, refusal) => {
+    await run('principal-addresses-add', { email }, agent(main));
+    const [approval] = await pendingApprovals();
+    await meanwhile();
+
+    await click(approval!, 'approve');
+    expect(await addresses()).not.toContain(email);
+    expect(notes(main).at(-1)).toMatch(refusal);
+  });
+
   it('lets the operator add an address directly', async () => {
     expect(await run('principal-addresses-add', { email: NEW_ADDRESS })).toMatchObject({
       ok: true,
@@ -284,13 +312,18 @@ describe('a new principal address once the inbox exists', () => {
   });
 
   it('sends no card for an address already held, or one refused before it could be added', async () => {
+    await run('principal-addresses-add', { email: 'morganellery@gmail.com' });
     expect(await run('principal-addresses-add', { email: 'Morgan@Example.test' }, agent(main))).toMatchObject({
       ok: true,
       data: { email: 'morgan@example.test', added: false },
     });
-    for (const email of ['not-an-email', 'AYA@example.test']) {
+    for (const email of ['not-an-email', 'AYA@example.test', 'aya+x@example.test', 'Morgan.Ellery@gmail.com']) {
       expect(await run('principal-addresses-add', { email }, agent(main)), email).toMatchObject({ ok: false });
     }
+    expect(await run('principal-addresses-add', { email: 'morgan.ellery+x@gmail.com' }, agent(main))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining('another spelling of morganellery@gmail.com') },
+    });
     expect(await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(research))).toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/only main/i) },

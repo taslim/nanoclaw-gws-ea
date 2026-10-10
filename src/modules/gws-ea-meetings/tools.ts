@@ -19,7 +19,10 @@
  *   `slots.ts`). The agent picks the times; each window is labeled, ready to
  *   write, in the principal's time zone and, when given, the counterpart's,
  *   inside whose waking day it falls, with a fit note from a fixed vocabulary
- *   that never echoes a preference, protected time included.
+ *   that never echoes a preference, protected time included. It reads busy
+ *   time on the principal's calendars alone, never adding the thread's, so a
+ *   calendar no longer shared never fails it, and says when the thread has
+ *   no calendar yet, so external-email asks main early.
  * - Nothing reserves a time before someone agrees to it: a time offered in
  *   one thread is any thread's until booked, and a booking blocks time as
  *   any other event of the principal's does (`blocksTime` in `slots.ts`).
@@ -36,12 +39,14 @@
  *   (`guestsOn`); who a booking invites never counts them.
  * - `main` hears in one fact when a booking is made, changed or cancelled.
  *
- * Bookings go on the calendar `main` named for the thread, else on the
- * principal's primary calendar: the calendar of the first address they
- * gave. Either way it must be a principal calendar the assistant can write
- * to; no other calendar stands in for it.
+ * Bookings go only on the calendar `main` set for the thread (R11), while it
+ * is a principal calendar the assistant can write to; no other calendar
+ * stands in for it. Until there is one, `book` refuses with word to ask
+ * main. `change_booking` and `cancel_booking` act on the calendar the
+ * booking's record names, whatever the thread's calendar is now.
  * A booking is the thread's when its record names it and its event still
- * carries the booking tag the host gave it.
+ * carries the booking tag the host gave it. It is forgotten once its event
+ * is gone, but never because its calendar went out of sight (R14).
  *
  * Each request is answered once, a refusal or failure included. A replayed
  * request writes nothing twice: a booking's event id derives from the
@@ -52,13 +57,18 @@ import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-ac
 import { resolveGroupTimezone } from '../../container-config.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { isBookableCalendar, isReadable, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import {
+  getGwsEaProfile,
+  getMainAgentGroupId,
+  principalRecognizer,
+  type PrincipalRecognizer,
+} from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
@@ -125,6 +135,11 @@ const BOOKING_ID = /^[0-9a-f]{64}$/u;
 const PRIVATE_DETAIL_ADVICE =
   "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, tell main with tell_main.";
 
+/** What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13). */
+const ASK_FOR_CALENDAR = 'ask main with tell_main which calendar to book on';
+/** What `free_time` adds while main has set no calendar for the thread. */
+const NO_CALENDAR_YET = `No calendar is set for this thread's bookings yet: ${ASK_FOR_CALENDAR}, before a time is agreed.`;
+
 // ---------------------------------------------------------------------------
 // The request's fields
 // ---------------------------------------------------------------------------
@@ -160,22 +175,15 @@ interface Principal {
   readonly timezone: string;
   readonly rules: SchedulingRules;
   /** Their addresses, which also name their own calendars. */
-  readonly addresses: ReadonlySet<string>;
-  /** Their primary calendar: that of the first address they gave, while they have one. */
-  readonly primaryCalendar: string | undefined;
-  readonly assistantName: string | null;
+  readonly addresses: PrincipalRecognizer;
 }
 
 async function principalView(): Promise<Principal> {
   const profile = await getGwsEaProfile();
-  const addresses = await listPrincipalAddresses();
-  const [first] = [...addresses].sort((a, b) => a.added_at.localeCompare(b.added_at) || a.email.localeCompare(b.email));
   return {
     timezone: profile.principal_timezone ?? TIMEZONE,
     rules: schedulingRules(await getSchedulingPreferenceValues()),
-    addresses: new Set(addresses.map((address) => address.email)),
-    primaryCalendar: first?.email,
-    assistantName: profile.assistant_display_name,
+    addresses: principalRecognizer(profile.principal_emails),
   };
 }
 
@@ -204,45 +212,36 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * The calendar the thread books on: the one main named for it, else the
-   * principal's primary calendar. Either way it must be a principal calendar
-   * the assistant can write to; refused, saying so, when it is not, rather
-   * than placing the meeting on some other calendar of theirs.
+   * The calendar the thread books on: the one main set for it, while it is a
+   * principal calendar the assistant can write to. Refused, with word to ask
+   * main, until there is one, and never placed on some other calendar of
+   * theirs instead.
    */
   async function bookingCalendarOf(view: ThreadView): Promise<CalendarEntry> {
-    const named = await getThreadBookingCalendar(view.threadKey);
-    const calendarId = named ?? view.principal.primaryCalendar;
-    const entry = calendarId === undefined ? undefined : await calendar().getCalendar(calendarId);
-    if (
-      entry !== undefined &&
-      isPrincipalCalendar(entry, view.principal.addresses) &&
-      (entry.accessRole === 'writer' || entry.accessRole === 'owner')
-    ) {
-      return entry;
+    const calendarId = await getThreadBookingCalendar(view.threadKey);
+    if (calendarId === null) {
+      throw forbidden(
+        `No calendar is set for this thread's bookings yet, so nothing was booked: ${ASK_FOR_CALENDAR}, and book once it answers.`,
+      );
     }
+    const entry = await calendar().getCalendar(calendarId);
+    if (entry !== undefined && isBookableCalendar(entry, view.principal.addresses)) return entry;
     throw forbidden(
-      named === null
-        ? "The assistant cannot write to the principal's primary calendar, so it can book nothing: tell main with tell_main."
-        : 'The assistant cannot write to the calendar main named for this thread, so it can book nothing: tell main with tell_main.',
+      `The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: ${ASK_FOR_CALENDAR}, and book once it answers.`,
     );
   }
 
   /**
-   * Time taken in `span`, read now from the principal's calendars and the
-   * one the thread books on: every event that blocks their time, the
+   * Time taken in `span`, read now from the principal's calendars and, for a
+   * write, the calendar it goes on: every event that blocks their time, the
    * assistant's own included, apart from those in `ignore`: the event a
    * write is itself moving or retrying.
    */
-  async function busyIn(
-    view: ThreadView,
-    calendarId: string,
-    span: Span,
-    ignore: ReadonlySet<string>,
-  ): Promise<Span[]> {
+  async function busyIn(view: ThreadView, span: Span, ignore: ReadonlySet<string>, writing?: string): Promise<Span[]> {
     const { principal } = view;
     const margin = principal.rules.bufferMinutes * MINUTE + READ_MARGIN_MS;
     const ids = new Map<string, string>();
-    for (const id of [...(await listPrincipalCalendars()), calendarId]) {
+    for (const id of [...(await listPrincipalCalendars()), ...(writing === undefined ? [] : [writing])]) {
       if (!ids.has(id.toLowerCase())) ids.set(id.toLowerCase(), id);
     }
     const listings = await Promise.all(
@@ -277,7 +276,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       start: Math.min(...spans.map((span) => span.start)),
       end: Math.max(...spans.map((span) => span.end)),
     };
-    const busy = await busyIn(view, calendarId, covering, ignore);
+    const busy = await busyIn(view, covering, ignore, calendarId);
     const taken = spans.filter((span) => !isClear(span, busy));
     if (taken.length > 0) {
       throw forbidden(`${taken.map(label).join('; ')}: no longer free. Call free_time for times to offer instead.`);
@@ -415,9 +414,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     if (to <= Date.now()) throw invalidArgs('That range has already passed: ask for one in the future.');
     const view = await viewOf(session);
     const { timezone, rules } = view.principal;
-    const bookingCalendar = await bookingCalendarOf(view);
     const window = { start: Math.max(from, Date.now()), end: to };
-    const busy = window.start < window.end ? await busyIn(view, bookingCalendar.id, window, new Set()) : [];
+    const busy = window.start < window.end ? await busyIn(view, window, new Set()) : [];
     const found = freeWindows({ timezone, counterpartTimezone: theirs, lengthMinutes: minutes, window, busy, rules });
     const windows = found.slice(0, MAX_WINDOWS).map((free) => ({
       start: iso(free.start),
@@ -436,17 +434,21 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           (theirs === undefined ? '' : `; for them, ${windows[index].their_time}`) +
           ` (${free.fit})`,
       );
+    const answer =
+      windows.length === 0
+        ? [
+            `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`,
+          ]
+        : [
+            `Free for ${minutes} minutes: any start that ends by a window's end.`,
+            ...lines,
+            ...(unlisted > 0 ? [`${unlisted} later windows are not listed: ask from the last one on for more.`] : []),
+          ];
+    const unset = (await getThreadBookingCalendar(view.threadKey)) === null;
     return {
       windows,
       windows_not_listed: unlisted,
-      message:
-        windows.length === 0
-          ? `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`
-          : [
-              `Free for ${minutes} minutes: any start that ends by a window's end.`,
-              ...lines,
-              ...(unlisted > 0 ? [`${unlisted} later windows are not listed: ask from the last one on for more.`] : []),
-            ].join('\n'),
+      message: [...answer, ...(unset ? [NO_CALENDAR_YET] : [])].join('\n'),
     };
   };
 
@@ -606,14 +608,25 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * The thread's booking named, with its event as Google holds it now:
    * refused unless this thread booked it, the event is still on the
    * calendar, and it still carries the booking tag. A booking whose event is
-   * gone is forgotten.
+   * gone is forgotten. Google answers 404 alike for an event gone and for
+   * every event on a calendar it no longer shows the assistant the events
+   * of, so on a 404 the calendar is read now: unless its events can still be
+   * read, the booking is kept, with word to ask main (R14).
    */
   async function ownBooking(content: Record<string, unknown>, view: ThreadView) {
     const eventId = bookingIdOf(content.booking);
     const booking = await getThreadBooking(view.threadKey, eventId);
     if (!booking) throw forbidden(`This thread has no booking ${eventId}: use a booking id book gave you here.`);
     const event = await calendar().getEvent(booking.calendarId, eventId);
-    if (!event || event.status === 'cancelled') {
+    if (event === undefined) {
+      const entry = await calendar().getCalendar(booking.calendarId);
+      if (entry === undefined || !isReadable(entry)) {
+        throw forbidden(
+          'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: ask main with tell_main.',
+        );
+      }
+    }
+    if (event === undefined || event.status === 'cancelled') {
       await deleteThreadBooking(booking.calendarId, eventId);
       throw forbidden('That booking is no longer on the principal’s calendar, so there is nothing to change.');
     }

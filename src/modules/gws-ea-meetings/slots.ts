@@ -25,7 +25,7 @@ import {
   type SchedulingPreferenceValues,
   type Weekday,
 } from '../gws-ea-preferences/db.js';
-import { identityMatchKey } from '../../gws-ea/validation.js';
+import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { EventAttendee, ListedEvent } from './calendar-api.js';
 
 /** An interval of instants, in milliseconds since the epoch; `end` is exclusive. */
@@ -243,17 +243,9 @@ export function eventSpan(event: Pick<ListedEvent, 'start' | 'end'>, timezone: s
 /** How strongly an answer commits the principal; the strongest across their addresses stands. */
 const ANSWER_RANK: Readonly<Record<string, number>> = { accepted: 3, tentative: 2, needsAction: 1, declined: 0 };
 
-/** Whether an address reaches one of the principal's mailboxes, in any spelling Gmail delivers to them. */
-export function isPrincipalAddress(email: string | undefined, principal: ReadonlySet<string>): boolean {
-  if (email === undefined) return false;
-  const key = identityMatchKey(`email:${email}`);
-  for (const address of principal) if (identityMatchKey(`email:${address}`) === key) return true;
-  return false;
-}
-
 /** Whether a guest-list entry speaks for the principal on this copy: the calendar's own entry, or one of their addresses. */
-export function isPrincipalAttendee(attendee: EventAttendee, principal: ReadonlySet<string>): boolean {
-  return attendee.self === true || isPrincipalAddress(attendee.email, principal);
+export function isPrincipalAttendee(attendee: EventAttendee, principal: PrincipalRecognizer): boolean {
+  return attendee.self === true || principal.has(attendee.email);
 }
 
 /**
@@ -263,15 +255,13 @@ export function isPrincipalAttendee(attendee: EventAttendee, principal: Readonly
  */
 export function principalAnswer(
   event: { readonly attendees?: readonly EventAttendee[] },
-  principal: ReadonlySet<string>,
+  principal: PrincipalRecognizer,
 ): string | undefined {
   const attendees = event.attendees ?? [];
   const own = attendees.find((attendee) => attendee.self === true);
   if (own) return own.responseStatus;
   return strongestAnswer(
-    attendees
-      .filter((attendee) => isPrincipalAddress(attendee.email, principal))
-      .map((attendee) => attendee.responseStatus),
+    attendees.filter((attendee) => principal.has(attendee.email)).map((attendee) => attendee.responseStatus),
   );
 }
 
@@ -288,7 +278,7 @@ export function strongestAnswer(answers: readonly (string | undefined)[]): strin
 /** Whether an event takes the principal's time: not cancelled, not free, not declined by them on its calendar. */
 export function blocksTime(
   event: Pick<ListedEvent, 'status' | 'transparency' | 'attendees'>,
-  principal: ReadonlySet<string>,
+  principal: PrincipalRecognizer,
 ): boolean {
   if (event.status === 'cancelled' || event.transparency === 'transparent') return false;
   return principalAnswer(event, principal) !== 'declined';

@@ -31,6 +31,7 @@ import {
   installProductionBootstrapManifest,
   loadProductionBootstrapManifest,
   removeProductionBootstrapManifest,
+  resolveProvisionSource,
   runProductionProvision,
   type ProductionBootstrapManifest,
   type ProductionProvisionContext,
@@ -54,6 +55,7 @@ import {
   googleChatProjectNumberFile,
   instanceHostConfiguration,
   instanceServiceDefinitionFile,
+  loadInstanceRuntimeConfig,
   persistInstanceRuntime,
   readInstanceHostEnvironment,
   type HostStatusHelpers,
@@ -821,6 +823,48 @@ describe('production bootstrap trust boundary', () => {
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
 
+  it("reads the principal's name and timezone only from main's published profile, a leftover setup file notwithstanding", async () => {
+    const { paths, reserved } = await startedInstance({ gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION });
+    const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(reserved.instance_id));
+    const manifest = bootstrapManifest(paths);
+    const resolve = (leftover: ProductionBootstrapManifest | undefined) =>
+      withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        resolveProvisionSource(operation, reserved, runtime, leftover),
+      );
+
+    // Until main is published, create's setup file seeds the profile with the principal.
+    await expect(resolve(manifest)).resolves.toMatchObject({
+      identity: {
+        principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
+      },
+      principalDisplayName: 'Principal',
+    });
+
+    // Main is published, and the principal has since changed their name and timezone through it.
+    const central = new Database(path.join(runtime.state_root, 'data', 'v2.db'));
+    try {
+      central.exec(`
+        CREATE TABLE gws_ea_profile (
+          singleton INTEGER PRIMARY KEY, assistant_display_name TEXT, assistant_workspace_email TEXT,
+          principal_display_name TEXT, principal_timezone TEXT, main_agent_group_id TEXT, updated_at TEXT
+        );
+        INSERT INTO gws_ea_profile VALUES
+          (1, 'Aya', 'assistant@example.com', 'Juno Hale', 'Europe/London', 'ag-main', '2026-10-10T09:00:00.000Z');
+      `);
+    } finally {
+      central.close();
+    }
+
+    for (const leftover of [manifest, undefined]) {
+      const source = await resolve(leftover);
+      expect(source?.identity, leftover ? 'with the setup file' : 'without it').toEqual({
+        assistantDisplayName: 'Aya',
+        assistantWorkspaceEmail: 'assistant@example.com',
+      });
+      expect(source?.principalDisplayName).toBe('Juno Hale');
+    }
+  });
+
   it('resumes past a release receipt whose OneCLI cohort differs from this launcher’s pins', async () => {
     // An earlier release's receipt also records the OneCLI CLI it pinned, which nothing reads any more.
     const { paths, reserved } = await startedInstance({ gateway: '1.41.0', cli: '2.2.4', sdk: '2.2.0' });
@@ -897,9 +941,9 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
       identity: {
         assistantDisplayName: 'Aya',
         assistantWorkspaceEmail: reserved.exclusive_resource_claims.workspace_email,
-        principalDisplayName: 'Principal',
-        principalTimezone: 'America/Los_Angeles',
+        principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
       },
+      principalDisplayName: 'Principal',
       adapterInstance: 'gchat',
       provisioningStartedAt: '2026-09-18T18:00:00.000Z',
       chatConfigured: false,
@@ -973,6 +1017,10 @@ interface ProbeIdentityState {
   agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
   /** Every OneCLI request, as `<method> <path>`. */
   readonly onecliCalls: string[];
+  /** The principal as the profile holds them; as create declared them by default. */
+  principal?: { readonly name: string; readonly timezone: string };
+  /** Main's container timezone; the profile's by default. */
+  mainTimezone?: string | null;
 }
 
 function probeIdentityDependencies(
@@ -981,18 +1029,22 @@ function probeIdentityDependencies(
 ): MainIdentityDependencies {
   return {
     runNcl: async (_runtime, args) => {
+      const principal = state.principal ?? { name: 'Principal', timezone: 'America/Los_Angeles' };
       if (args[0] === 'gws-ea-profile' && args[1] === 'get') {
         return {
           assistant_display_name: context.input.identity.assistantDisplayName,
           assistant_workspace_email: context.input.identity.assistantWorkspaceEmail,
-          principal_display_name: context.input.identity.principalDisplayName,
-          principal_timezone: context.input.identity.principalTimezone,
+          principal_display_name: principal.name,
+          principal_timezone: principal.timezone,
           main_agent_group_id: 'ag-main',
         };
       }
       if (args[0] === 'groups' && args[1] === 'get') return { id: 'ag-main', name: 'main' };
       if (args[0] === 'groups' && args[1] === 'config' && args[2] === 'get') {
-        return { provider: context.input.runtime.selected_provider };
+        return {
+          provider: context.input.runtime.selected_provider,
+          timezone: state.mainTimezone === undefined ? principal.timezone : state.mainTimezone,
+        };
       }
       throw new Error(`Unexpected ncl probe call: ${args.join(' ')}`);
     },
@@ -1206,6 +1258,35 @@ describe('production provision step composition', () => {
       state.onecliCalls.length = 0;
       await expect(phase.observe(context)).resolves.toEqual(ABSENT);
       expect(state.onecliCalls).toEqual(['GET /v1/agents']);
+    });
+  });
+
+  it("observes main's identity from the profile alone: the principal's own changes stand, and main runs in the profile's timezone", async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      // The principal changed their name and timezone through main after create.
+      const state: ProbeIdentityState = {
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        onecliCalls: [],
+        principal: { name: 'Juno Hale', timezone: 'Europe/London' },
+      };
+      const { principal: _seed, ...published } = base.input.identity;
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, identity: published, identityDependencies: probeIdentityDependencies(base, state) },
+      };
+      const phase = createProductionProvisionSteps(context).start_nanoclaw.resources[1]!;
+
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
+
+      // Main's container drifted from the profile's timezone, so the identity is repaired.
+      for (const drifted of ['America/Los_Angeles', null]) {
+        state.mainTimezone = drifted;
+        await expect(phase.observe(context), String(drifted)).resolves.toEqual(ABSENT);
+      }
     });
   });
 

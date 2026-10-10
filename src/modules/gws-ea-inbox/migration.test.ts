@@ -36,6 +36,8 @@ const CREATE_INBOX = 'module:gws-ea-inbox:create-inbox';
 const EMAIL_CHANNEL = 'module:gws-ea-inbox:email-channel';
 const DROP_THREAD_HOLDS = 'module:gws-ea-inbox:drop-thread-holds';
 const RELATIVE_FILE_PATHS = 'module:gws-ea-inbox:relative-file-paths';
+const UNSIGNED_NOTICES = 'module:gws-ea-inbox:unsigned-notices';
+const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 
 /** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
 const INBOX_TABLES = [
@@ -50,6 +52,9 @@ const INBOX_TABLES = [
   'gws_ea_thread_sends',
   'gws_ea_threads',
 ];
+
+/** Every table the inbox's migrations leave: the Slice 4 tables and those added since. */
+const ALL_INBOX_TABLES = [...INBOX_TABLES, 'gws_ea_inbox_unsigned_notices', 'gws_ea_inbox_calendar_access'].sort();
 
 /** The banned constructs of `src/db/migrations/portability.test.ts`, which covers built-in migrations only. */
 const BANNED_PORTABLE_SQL = [
@@ -189,11 +194,18 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's four, in order, and the meetings store registers none", () => {
+  it("are the inbox's six, in order, and the meetings store registers none", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
-    expect(names).toEqual([CREATE_INBOX, EMAIL_CHANNEL, DROP_THREAD_HOLDS, RELATIVE_FILE_PATHS]);
+    expect(names).toEqual([
+      CREATE_INBOX,
+      EMAIL_CHANNEL,
+      DROP_THREAD_HOLDS,
+      RELATIVE_FILE_PATHS,
+      UNSIGNED_NOTICES,
+      CALENDAR_ACCESS,
+    ]);
   });
 
   it('are portable: async, and free of every banned construct', () => {
@@ -215,8 +227,8 @@ describe('squashed migrations', () => {
   it.each([
     ['a fresh install', freshInstall],
     ['an install updated from the earlier chain', updatedInstall],
-  ])('leave %s only the Slice 4 tables, and no Slice 2 table', async (_install, install) => {
-    expect(inboxTables(await install())).toEqual(INBOX_TABLES);
+  ])('leave %s only the inbox tables of Slice 4 and since, and no Slice 2 table', async (_install, install) => {
+    expect(inboxTables(await install())).toEqual(ALL_INBOX_TABLES);
   });
 
   it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row', async () => {
@@ -228,7 +240,12 @@ describe('squashed migrations', () => {
 
     await runMigrations(db);
 
-    expect((await appliedNames(db)).slice(earlier.length)).toEqual([DROP_THREAD_HOLDS, RELATIVE_FILE_PATHS]);
+    expect((await appliedNames(db)).slice(earlier.length)).toEqual([
+      DROP_THREAD_HOLDS,
+      RELATIVE_FILE_PATHS,
+      UNSIGNED_NOTICES,
+      CALENDAR_ACCESS,
+    ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual(before);
     // A retry still finds its send in flight, and the thread still owns its booking.

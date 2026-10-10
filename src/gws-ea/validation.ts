@@ -50,8 +50,8 @@ const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
  * One identity in every spelling that reaches the same mailbox: an email
  * handle lowercased, without its `+tag`, and, at Gmail, without the dots
  * Gmail ignores. Other handles are already canonical. Used only to widen a
- * protection (a fingerprint, a refusal, a release to the principal), never
- * to grant a level to a different handle.
+ * protection (a fingerprint, a refusal), never to grant a level to a
+ * different handle; who the principal is goes by `principalMatchKey`.
  */
 export function identityMatchKey(handle: string): string {
   if (!handle.toLowerCase().startsWith('email:')) return handle;
@@ -68,6 +68,72 @@ export function identityMatchKey(handle: string): string {
     domain = 'gmail.com';
   }
   return `email:${local}@${domain}`;
+}
+
+/** Visible ASCII: the only characters whose case `principalMatchKey` folds. */
+const FOLDABLE = /^[\x21-\x7e]+$/u;
+
+/**
+ * A principal address's key under the one rule every comparison with the
+ * principal's addresses uses (R1): at gmail.com and googlemail.com, which
+ * Gmail delivers alike, lowercased, without its `+tag` or the dots Gmail
+ * ignores; at any other domain, lowercased only, so the principal lists each
+ * spelling they use there. Only those two domains exactly count, never a
+ * subdomain or a lookalike, and only ASCII folds: an address with any other
+ * character keys as written. Unlike `identityMatchKey`, it decides who the
+ * principal is, so it never strips a `+tag` another provider may deliver to
+ * a different mailbox.
+ */
+export function principalMatchKey(address: string): string {
+  if (!FOLDABLE.test(address)) return address;
+  const lowered = address.toLowerCase();
+  const at = lowered.lastIndexOf('@');
+  if (at <= 0 || !GMAIL_DOMAINS.has(lowered.slice(at + 1))) return lowered;
+  let local = lowered.slice(0, at);
+  const plus = local.indexOf('+');
+  if (plus > 0) local = local.slice(0, plus);
+  return `${local.replaceAll('.', '') || local}@gmail.com`;
+}
+
+/**
+ * The spelling in `listed` that `address` reaches under R1
+ * (`principalMatchKey`), the one written exactly when it is listed;
+ * undefined when it reaches none of them.
+ */
+export function resolvePrincipalAddress(address: string, listed: readonly string[]): string | undefined {
+  if (listed.includes(address)) return address;
+  const key = principalMatchKey(address);
+  return listed.find((email) => principalMatchKey(email) === key);
+}
+
+/**
+ * Why `email` cannot be one of the principal's addresses beside `listed`, or
+ * undefined when it can (R3): it is the assistant's own in any spelling that
+ * reaches the assistant's mailbox (`identityMatchKey`, which widens a
+ * refusal), or another spelling of a listed address under R1. The same
+ * spelling again is no conflict.
+ */
+export function principalAddressConflict(
+  email: string,
+  listed: readonly string[],
+  assistant: string | null,
+): string | undefined {
+  if (assistant !== null && identityMatchKey(`email:${email}`) === identityMatchKey(`email:${assistant}`)) {
+    return `${email} is the assistant's own address, not one of the principal's`;
+  }
+  const match = resolvePrincipalAddress(email, listed);
+  return match === undefined || match === email
+    ? undefined
+    : `${email} is another spelling of ${match}, already one of the principal's addresses`;
+}
+
+/** The first conflict (`principalAddressConflict`) in a list of addresses, each judged against those before it. */
+export function principalAddressesConflict(emails: readonly string[], assistant: string | null): string | undefined {
+  for (const [index, email] of emails.entries()) {
+    const conflict = principalAddressConflict(email, emails.slice(0, index), assistant);
+    if (conflict !== undefined) return conflict;
+  }
+  return undefined;
 }
 
 /** `value` trimmed, refused unless it is one line of 1 to `maxLength` characters; `label` names it in the refusal. */

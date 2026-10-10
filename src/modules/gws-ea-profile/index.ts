@@ -12,10 +12,12 @@ import type { AgentGroup } from '../../types.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
-import { getInboxState } from '../gws-ea-inbox/db.js';
+import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
+import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
 import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
 import {
   addPrincipalAddress,
+  assertMainCaller,
   bindVerifiedPrincipalUser,
   ensureMainAgentGroupIdLoaded,
   getGwsEaProfile,
@@ -24,12 +26,16 @@ import {
   listPrincipalAddresses,
   loadMainAgentGroupId,
   principalApproverUserId,
+  principalNameAndTimezone,
   projectDocAudience,
   proposedPrincipalAddress,
   reconcileGwsEaProfile,
   removePrincipalAddress,
+  setPrincipalNameAndTimezone,
   validateGwsEaProfileInput,
+  type PublishedNameAndTimezone,
 } from './db.js';
+import { escapeMarkdownInline } from './markdown.js';
 import {
   gwsEaExternalEmailPointerMigration,
   gwsEaPrincipalAddressesMigration,
@@ -52,17 +58,12 @@ registerSessionAdmissionPolicy('gws-ea-profile:main-known', async ({ disposition
   if (disposition === 'create') await ensureMainAgentGroupIdLoaded();
 });
 
-function escapeMarkdownInline(value: string): string {
-  const special = new Set(['\\', '`', '*', '_', '{', '}', '[', ']', '<', '>', '#']);
-  return [...value].map((character) => (special.has(character) ? `\\${character}` : character)).join('');
-}
-
-const ADDRESS_LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 /** Addresses hold no backtick (the profile refuses one), so each is quoted exactly in a code span. */
 function principalAddressesSentence(principal: string, emails: readonly string[]): string {
   if (emails.length === 0) return '';
-  const quoted = ADDRESS_LIST.format(emails.map((email) => `\`${email}\``));
+  const quoted = LIST.format(emails.map((email) => `\`${email}\``));
   return emails.length === 1
     ? ` ${principal}'s email address is ${quoted}.`
     : ` ${principal}'s email addresses are ${quoted}.`;
@@ -76,12 +77,13 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
 }
 
 /**
- * Main changes the principal's addresses mid-conversation, so it reads them
- * live: a copy composed when its container started would go stale the moment
- * it adds one.
+ * Main changes the principal's addresses mid-conversation, and the calendar
+ * poll keeps each one's calendar access, so it reads both live: a copy
+ * composed when its container started would go stale the moment either
+ * changed (R9).
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
-  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list` before you decide whose a calendar is: the list is the only current copy, and an address may have been added or removed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card; the command says when it does, and you are told the result.";
+  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card; the command says when it does, and you are told the result.";
 
 /**
  * Who the assistant and the principal are, for each audience (KTD14). Main
@@ -147,12 +149,14 @@ register({
       if (typeof value !== 'string' || value.length === 0) throw new Error(`--${key} is required`);
       return value;
     };
+    // The principal's name and timezone seed the profile: create declares them, and nothing after it.
+    const seed = (key: string): string | undefined => (raw[key] === undefined ? undefined : required(key));
     const principalEmails = raw['principal-emails'];
     return validateGwsEaProfileInput({
       assistantDisplayName: required('assistant-display-name'),
       assistantWorkspaceEmail: required('assistant-workspace-email'),
-      principalDisplayName: required('principal-display-name'),
-      principalTimezone: required('principal-timezone'),
+      principalDisplayName: seed('principal-display-name'),
+      principalTimezone: seed('principal-timezone'),
       mainAgentGroupId: required('main-agent-group-id'),
       ...(principalEmails === undefined ? {} : { principalEmails: parsePrincipalEmails(principalEmails) }),
     });
@@ -335,6 +339,21 @@ async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
   }
 }
 
+/**
+ * Each address with what the assistant can do with its main calendar, as
+ * the inbox's calendar poll last read it from Google: the facts status shows
+ * too. Adding or removing an address calls no one; the next poll acts on it.
+ */
+async function listAddresses() {
+  const addresses = await listPrincipalAddresses();
+  const access = await principalCalendarAccess(addresses.map((address) => address.email));
+  return addresses.map((address, index) => ({
+    ...address,
+    calendar_access: access[index].access,
+    calendar_checked_at: access[index].checkedAt,
+  }));
+}
+
 const EMAIL_ARGUMENT = {
   name: 'email',
   type: 'string',
@@ -356,9 +375,10 @@ registerResource({
   customOperations: {
     list: {
       access: 'open',
-      description: "List the principal's email addresses.",
+      description:
+        "List the principal's email addresses, each with what the assistant can do with its main calendar (`calendar_access`), as the host last checked with Google (`calendar_checked_at`): `bookable` (it can book on it), `readable` (it can read its events but not book), `free-busy` (it sees only when the principal is busy, which still counts when offering times), `none` (it is not shared with the assistant), or `unchecked` (not checked yet). The host adds each address's calendar to the assistant's calendar list itself, and checks again every 15 minutes while it is not shared.",
       args: [],
-      handler: async () => listPrincipalAddresses(),
+      handler: listAddresses,
     },
     add: {
       access: 'open',
@@ -378,6 +398,102 @@ registerResource({
         await assertMayChangePrincipalAddresses(ctx);
         return removePrincipalAddress(emailArgument(args));
       },
+    },
+  },
+});
+
+// ---------------------------------------------------------------------------
+// The principal's name and home timezone: main changes them on their word.
+// ---------------------------------------------------------------------------
+
+/** What the refusal to any caller but main says `principal-profile` holds. */
+const NAME_AND_TIMEZONE = 'name and timezone';
+
+/** One field a `set` changed, from and to what the profile held. */
+interface ProfileChange {
+  readonly field: keyof PublishedNameAndTimezone;
+  readonly from: string;
+  readonly to: string;
+}
+
+function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAndTimezone): ProfileChange[] {
+  return (['name', 'timezone'] as const)
+    .filter((field) => after[field] !== before[field])
+    .map((field) => ({ field, from: before[field], to: after[field] }));
+}
+
+/**
+ * The principal's receipt: every change, old and new, so a change they did
+ * not ask for cannot pass unseen (KTD9).
+ */
+function receiptText(changes: readonly ProfileChange[]): string {
+  const described = changes.map(({ field, from, to }) =>
+    field === 'name' ? `your name is now ${to} (it was ${from})` : `your home time zone is now ${to} (it was ${from})`,
+  );
+  return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
+}
+
+/** What follows the change, and when: the host's readers now, main's own copies on its next start. */
+const TAKES_EFFECT =
+  "The host's email signatures and free_time use the new values now; your own clock and the identity text in your instructions follow on your next start.";
+
+async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerContext) {
+  await assertMainCaller(ctx, NAME_AND_TIMEZONE);
+  const name = typeof args.name === 'string' ? args.name : undefined;
+  const timezone = typeof args.timezone === 'string' ? args.timezone : undefined;
+  if (name === undefined && timezone === undefined) throw new Error('Give --name, --timezone, or both');
+  const { before, after } = await setPrincipalNameAndTimezone({ name, timezone });
+  const changes = profileChanges(before, after);
+  const answer = { name: after.name, timezone: after.timezone, changed: changes.map(({ field }) => field) };
+  if (changes.length === 0) return { ...answer, message: 'Nothing changed: the profile already holds these.' };
+  const delivered = await sendPrincipalNotice(receiptText(changes), 'principal-profile-changed');
+  return {
+    ...answer,
+    message: delivered
+      ? `Saved, and the principal was sent a receipt giving the old and new values. ${TAKES_EFFECT}`
+      : `Saved, but the receipt could not reach the principal: tell them what changed. ${TAKES_EFFECT}`,
+  };
+}
+
+const NAME_ARGUMENT = {
+  name: 'name',
+  type: 'string',
+  description:
+    "The principal's name as they want it used, such as in the signature on the assistant's email. A person's name only: no address, link, domain or markup, and at most 80 characters.",
+} as const;
+
+const TIMEZONE_ARGUMENT = {
+  name: 'timezone',
+  type: 'string',
+  description: 'Their home time zone, as an IANA id such as Europe/London.',
+} as const;
+
+registerResource({
+  name: 'principal profile',
+  plural: 'principal-profile',
+  // Custom verbs only: the generic CRUD handlers that read `table` and `idColumn` are not enabled.
+  table: 'gws_ea_profile',
+  idColumn: 'singleton',
+  description: "The principal's name and home time zone, as the assistant uses them. Only main may use them.",
+  columns: [NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+  operations: {},
+  customOperations: {
+    get: {
+      access: 'open',
+      description: "Read the principal's name and home time zone.",
+      args: [],
+      handler: async (_args, ctx) => {
+        await assertMainCaller(ctx, NAME_AND_TIMEZONE);
+        return principalNameAndTimezone();
+      },
+    },
+    set: {
+      access: 'open',
+      description:
+        "Change the principal's name, home time zone, or both, when the principal tells you to. No card is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
+      args: [NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+      examples: ['ncl principal-profile set --name "Juno Hale"', 'ncl principal-profile set --timezone Europe/London'],
+      handler: setPrincipalProfile,
     },
   },
 });

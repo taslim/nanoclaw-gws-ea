@@ -263,6 +263,29 @@ describe("external-email's project document", () => {
     expect(taught).not.toContain('conversations/');
   });
 
+  it("escapes the principal's name wherever its document names them", async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Juno *Hale* [Jr] #1_',
+      principalTimezone: 'Europe/London',
+      mainAgentGroupId: main.id,
+      principalEmails: ['juno@example.test'],
+    });
+    await startHost();
+    const ee = await externalEmail();
+    const groupDir = path.join(GROUPS_DIR, ee.folder);
+
+    await composeGroupProjectDoc(ee, groupDir, DEFAULT_PROJECT_DOC);
+    const composed = sections(fs.readFileSync(path.join(groupDir, DEFAULT_PROJECT_DOC.fileName), 'utf8'));
+
+    const escaped = 'Juno \\*Hale\\* \\[Jr\\] \\#1\\_';
+    expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose time zone is Europe/London.`);
+    expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
+  });
+
   it('names no link, address or emoji', () => {
     expect(GUIDANCE_TEXT).not.toMatch(/https?:\/\//i);
     expect(GUIDANCE_TEXT).not.toMatch(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/);

@@ -126,7 +126,8 @@ export const emailHandoff = requestTool({
     files: { ...FILES, description: `${FILES.description} external-email may attach them in this thread only.` },
     calendar: {
       type: 'string',
-      description: "The principal's calendar its bookings go on, when not their primary one.",
+      description:
+        "Which of the principal's calendars this thread's bookings go on, by its ID. Until one is set, external-email can offer times but books nothing.",
     },
   },
   required: ['message'],

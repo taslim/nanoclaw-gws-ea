@@ -19,16 +19,18 @@
  * - an expired cursor (404) resyncs from the newest INBOX messages, which
  *   the settled record keeps from routing twice.
  *
- * Each poll also keeps calendar notifications on for the principal's
- * calendars. Calendar's notifications, and Docs' and Drive's, each become one
- * note for `main` after the poll's messages are routed; Drive failing as
- * that note is written costs the note detail, never the poll.
+ * Each poll also keeps the assistant's calendar list first: each principal
+ * address's calendar in it, its access recorded, and notifications on for
+ * the principal's calendars (calendar-notifications.ts). Calendar's
+ * notifications, and Docs' and Drive's, each become one note for `main`
+ * after the poll's messages are routed; Drive failing as that note is
+ * written costs the note detail, never the poll.
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
 import type { DriveApi } from '../gws-ea-workspace/drive-api.js';
 import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
-import { syncCalendarNotifications, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
+import { syncCalendarList, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
 import {
   getInboxState,
   isSettled,
@@ -93,7 +95,7 @@ export interface InboxDeps {
 
 export interface Inbox {
   readonly adapter: ChannelAdapter;
-  /** One poll: calendar notification settings, then mail. Never throws. */
+  /** One poll: the calendar list, then mail. Never throws. */
   tick(): Promise<void>;
 }
 
@@ -263,7 +265,7 @@ export function createInbox(deps: InboxDeps): Inbox {
     /* eslint-disable no-catch-all/no-catch-all -- the poll loop never stops: each failure is recorded and the next poll retries */
     try {
       const { auth } = await loadRoutingContext(await assistantAddresses(), at);
-      await syncCalendarNotifications(deps.calendar, auth.principalAddresses, at.toISOString());
+      await syncCalendarList(deps.calendar, auth.principalAddresses, at.toISOString());
       try {
         // The assistant's own Gmail address is never "someone else" on a message.
         await runtime.gmailAddress();

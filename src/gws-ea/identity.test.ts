@@ -44,10 +44,15 @@ interface FakeState {
   persona: string;
   groupCreateArgs: Array<readonly string[]>;
   provider: string | null;
+  /** Every `groups config update` main's reconcile ran. */
+  configWriteArgs: Array<readonly string[]>;
   /** Main's container timezone as its container config holds it; null follows the install's. */
   timezone: string | null;
   profileWrites: number;
   profileWriteArgs: Array<readonly string[]>;
+  /** The principal's name and timezone as the profile holds them. */
+  principalDisplayName: string | null;
+  principalTimezone: string | null;
   /** The principal's addresses as the profile holds them. */
   principalEmails: readonly string[];
   /** The agents OneCLI holds; one without a secret mode is as a OneCLI from 1.43 on lists it. */
@@ -68,8 +73,8 @@ function harness(
   options: {
     failAfterSecretModeOnce?: boolean;
     neverApplySecretMode?: boolean;
-    /** A NanoClaw whose config update leaves the timezone as it was. */
-    ignoreTimezone?: boolean;
+    /** A NanoClaw whose config update leaves the provider as it was. */
+    ignoreProvider?: boolean;
     /** A release whose main reconcile leaves main on every shared skill. */
     ignoreSkills?: boolean;
     /** OneCLI's list does not yet show main's agent, which a create then finds there (409). */
@@ -84,9 +89,12 @@ function harness(
     persona: 'stamped from the template',
     groupCreateArgs: [],
     provider: null,
+    configWriteArgs: [],
     timezone: null,
     profileWrites: 0,
     profileWriteArgs: [],
+    principalDisplayName: null,
+    principalTimezone: null,
     principalEmails: [],
     agents: [],
     secretModeWrites: 0,
@@ -117,18 +125,24 @@ function harness(
       return { group, plugin: 'gws-ea-main', applied: apply, changes, report: [], note: apply ? 'applied' : 'DRY RUN' };
     }
     if (args[0] === 'groups' && args[1] === 'config') {
-      state.provider = flagValue(args, '--provider') ?? state.provider;
-      if (!options.ignoreTimezone) state.timezone = flagValue(args, '--timezone') ?? state.timezone;
+      state.configWriteArgs.push(args);
+      if (!options.ignoreProvider) state.provider = flagValue(args, '--provider') ?? state.provider;
+      state.timezone = flagValue(args, '--timezone') ?? state.timezone;
       return { agent_group_id: GROUP_ID, provider: state.provider, timezone: state.timezone };
     }
     if (args[0] === 'gws-ea-profile' && args[1] === 'reconcile') {
       state.profileWrites += 1;
       state.profileWriteArgs.push(args);
+      state.principalDisplayName = flagValue(args, '--principal-display-name') ?? state.principalDisplayName;
+      state.principalTimezone = flagValue(args, '--principal-timezone') ?? state.principalTimezone;
       const declared = flagValue(args, '--principal-emails');
       if (declared !== undefined) state.principalEmails = JSON.parse(declared) as string[];
+      // As the host does: main's container runs in the timezone the profile holds.
+      state.timezone = state.principalTimezone;
       return {
         main_agent_group_id: GROUP_ID,
-        principal_timezone: flagValue(args, '--principal-timezone'),
+        principal_display_name: state.principalDisplayName,
+        principal_timezone: state.principalTimezone,
         principal_emails: state.principalEmails,
       };
     }
@@ -173,12 +187,17 @@ function harness(
   return { state, dependencies: { runNcl, onecliAdmin } };
 }
 
+/** Main once it is published: the profile holds the principal, and a reconcile names none. */
 const input = {
   assistantDisplayName: 'Aya',
   assistantWorkspaceEmail: 'aya@example.test',
-  principalDisplayName: 'Morgan',
-  principalTimezone: 'America/Los_Angeles',
 };
+
+/** Who the principal is, as create declared them. */
+const seed = { displayName: 'Morgan', timezone: 'America/Los_Angeles', emails: ['morgan@example.test'] };
+
+/** Main's first publication, which seeds the profile with the principal. */
+const create = { ...input, principal: seed };
 
 describe('main identity reconciliation', () => {
   it('rejects invalid profile input before mutating NanoClaw or OneCLI', async () => {
@@ -187,7 +206,7 @@ describe('main identity reconciliation', () => {
     await expect(
       reconcileMainIdentity(
         runtimeConfig(),
-        { ...input, assistantWorkspaceEmail: 'not-an-email', principalTimezone: 'Not/A-Timezone' },
+        { ...input, assistantWorkspaceEmail: 'not-an-email', principal: { ...seed, timezone: 'Not/A-Timezone' } },
         dependencies,
       ),
     ).rejects.toThrow(/email/i);
@@ -198,7 +217,7 @@ describe('main identity reconciliation', () => {
   it('stamps one main group, selects its provider, verifies all secret mode, then publishes the profile', async () => {
     const { state, dependencies } = harness();
 
-    const result = await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    const result = await reconcileMainIdentity(runtimeConfig(), create, dependencies);
     await reconcileMainIdentity(runtimeConfig(), { ...input, assistantDisplayName: 'Aya Renamed' }, dependencies);
 
     expect(result).toEqual({ agentGroupId: GROUP_ID, onecliAgentId: 'oc-main' });
@@ -211,13 +230,13 @@ describe('main identity reconciliation', () => {
 
   it('never restamps an existing main, so repairing a changed profile keeps its edited persona', async () => {
     const { state, dependencies } = harness();
-    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    await reconcileMainIdentity(runtimeConfig(), create, dependencies);
     state.persona = 'edited by the principal';
 
     // A resume that finds the profile different repairs the identity.
     const repaired = await reconcileMainIdentity(
       runtimeConfig(),
-      { ...input, principalTimezone: 'Europe/London' },
+      { ...input, assistantDisplayName: 'Aya Renamed' },
       dependencies,
     );
 
@@ -233,7 +252,7 @@ describe('main identity reconciliation', () => {
 
   it('refuses an answer that says the existing main was restamped', async () => {
     const { state, dependencies } = harness();
-    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    await reconcileMainIdentity(runtimeConfig(), create, dependencies);
     const runNcl = dependencies.runNcl!;
     const restamping: MainIdentityDependencies = {
       ...dependencies,
@@ -249,10 +268,10 @@ describe('main identity reconciliation', () => {
     state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
     state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toMatchObject({
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toMatchObject({
       code: 'onecli_request_failed',
     });
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toMatchObject({
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).resolves.toMatchObject({
       agentGroupId: GROUP_ID,
       onecliAgentId: 'oc-main',
     });
@@ -274,7 +293,7 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness({ listLagsCreate: true });
     state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toEqual({
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).resolves.toEqual({
       agentGroupId: GROUP_ID,
       onecliAgentId: 'oc-main',
     });
@@ -286,7 +305,7 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness();
     state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toMatchObject({
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).resolves.toMatchObject({
       onecliAgentId: 'oc-main',
     });
     expect(state.secretModeWrites).toBe(0);
@@ -297,7 +316,7 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness({ neverApplySecretMode: true });
     state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/all secret mode/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/all secret mode/i);
     expect(state.profileWrites).toBe(0);
   });
 
@@ -305,33 +324,81 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness();
     state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'main', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/collision/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/collision/i);
     expect(state.profileWrites).toBe(0);
   });
 
-  it("sets main's container timezone to the profile's, and changes it when the profile changes", async () => {
+  it("seeds the profile with the principal's name, timezone and addresses when it first publishes main", async () => {
     const { state, dependencies } = harness();
 
-    await reconcileMainIdentity(runtimeConfig(), { ...input, principalTimezone: 'Africa/Lagos' }, dependencies);
-    expect(state.timezone).toBe('Africa/Lagos');
-    expect(flagValue(state.profileWriteArgs.at(-1)!, '--principal-timezone')).toBe('Africa/Lagos');
+    await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, principal: { ...seed, timezone: 'Africa/Lagos' } },
+      dependencies,
+    );
 
-    await reconcileMainIdentity(runtimeConfig(), { ...input, principalTimezone: 'America/New_York' }, dependencies);
-    expect(state.timezone).toBe('America/New_York');
-    expect(flagValue(state.profileWriteArgs.at(-1)!, '--principal-timezone')).toBe('America/New_York');
+    const [published] = state.profileWriteArgs;
+    expect(flagValue(published!, '--principal-display-name')).toBe('Morgan');
+    expect(flagValue(published!, '--principal-timezone')).toBe('Africa/Lagos');
+    expect(flagValue(published!, '--principal-emails')).toBe(JSON.stringify(['morgan@example.test']));
   });
 
-  it("fails before publishing the profile when main's container timezone does not persist", async () => {
-    const { state, dependencies } = harness({ ignoreTimezone: true });
+  it("seeds the principal's timezone in the zone's own spelling, since main's container runs in it", async () => {
+    const { state, dependencies } = harness();
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/did not persist/i);
+    await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, principal: { ...seed, timezone: 'europe/london' } },
+      dependencies,
+    );
+
+    expect(flagValue(state.profileWriteArgs[0]!, '--principal-timezone')).toBe('Europe/London');
+  });
+
+  it("rejects a UTC offset as the principal's timezone before mutating NanoClaw or OneCLI", async () => {
+    const { state, dependencies } = harness();
+
+    await expect(
+      reconcileMainIdentity(runtimeConfig(), { ...input, principal: { ...seed, timezone: '+05:30' } }, dependencies),
+    ).rejects.toMatchObject({ code: 'invalid_identity', message: 'Principal timezone is invalid' });
+    expect(state).toMatchObject({ groupCreated: 0, provider: null, timezone: null, profileWrites: 0, agents: [] });
+  });
+
+  it("writes none of the principal's profile once main is published, and leaves main's container timezone to the host", async () => {
+    const { state, dependencies } = harness();
+    await reconcileMainIdentity(runtimeConfig(), create, dependencies);
+    // The principal changed their name and timezone through main since.
+    state.principalDisplayName = 'Juno Hale';
+    state.principalTimezone = 'Europe/London';
+    state.timezone = 'Europe/London';
+
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+
+    const updated = state.profileWriteArgs.at(-1)!;
+    for (const flag of ['--principal-display-name', '--principal-timezone', '--principal-emails']) {
+      expect(updated, flag).not.toContain(flag);
+    }
+    expect(state).toMatchObject({
+      principalDisplayName: 'Juno Hale',
+      principalTimezone: 'Europe/London',
+      timezone: 'Europe/London',
+    });
+    // The host derives main's container timezone from the profile; the control plane never sets it.
+    expect(state.configWriteArgs).toHaveLength(2);
+    for (const args of state.configWriteArgs) expect(args).not.toContain('--timezone');
+  });
+
+  it("fails before publishing the profile when main's provider does not persist", async () => {
+    const { state, dependencies } = harness({ ignoreProvider: true });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/did not persist/i);
     expect(state.profileWrites).toBe(0);
   });
 
   it("gives main the release's skills before the profile publishes it", async () => {
     const { state, dependencies } = harness();
 
-    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    await reconcileMainIdentity(runtimeConfig(), create, dependencies);
 
     expect(state.skills).toEqual(['agent-browser']);
     expect(state.calls.indexOf('gws-ea-main reconcile')).toBeGreaterThan(state.calls.indexOf('groups create'));
@@ -341,7 +408,7 @@ describe('main identity reconciliation', () => {
   it("fails before publishing the profile when main's skills stay NanoClaw's full set", async () => {
     const { state, dependencies } = harness({ ignoreSkills: true });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/skills/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/skills/i);
     expect(state.profileWrites).toBe(0);
   });
 
@@ -350,7 +417,10 @@ describe('main identity reconciliation', () => {
 
     await reconcileMainIdentity(
       runtimeConfig(),
-      { ...input, principalEmails: ['Morgan@Example.test', 'morgan@work.example.test', 'morgan@example.test'] },
+      {
+        ...input,
+        principal: { ...seed, emails: ['Morgan@Example.test', 'morgan@work.example.test', 'morgan@example.test'] },
+      },
       dependencies,
     );
 
@@ -360,7 +430,7 @@ describe('main identity reconciliation', () => {
     expect(state.principalEmails).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
-  it("leaves the principal's addresses to the profile when a reconcile declares none", async () => {
+  it("leaves the principal's addresses to the profile when a reconcile declares no principal", async () => {
     const { state, dependencies } = harness();
     state.principalEmails = ['added-by-the-principal@example.test'];
 
@@ -374,13 +444,45 @@ describe('main identity reconciliation', () => {
     ['a malformed address', ['morgan@example.test', 'not-an-email']],
     ['no address', []],
     ["the assistant's own address", ['morgan@example.test', 'AYA@example.test']],
+    ["a plus-addressed spelling of the assistant's own", ['morgan@example.test', 'aya+x@example.test']],
+    ['two spellings of one Gmail address', ['morganellery@gmail.com', 'Morgan.Ellery@gmail.com']],
   ])('rejects principal addresses with %s before mutating NanoClaw or OneCLI', async (_case, principalEmails) => {
     const { state, dependencies } = harness();
 
     await expect(
-      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails }, dependencies),
+      reconcileMainIdentity(
+        runtimeConfig(),
+        { ...input, principal: { ...seed, emails: principalEmails } },
+        dependencies,
+      ),
     ).rejects.toMatchObject({ code: 'invalid_identity' });
     expect(state).toMatchObject({ groupCreated: 0, provider: null, timezone: null, profileWrites: 0, agents: [] });
+  });
+
+  it("names the conflict: a dotted spelling of the assistant's Gmail, or the listed spelling another repeats", async () => {
+    const { dependencies } = harness();
+    const gmailAssistant = { ...input, assistantWorkspaceEmail: 'ayaassistant@gmail.com' };
+
+    await expect(
+      reconcileMainIdentity(
+        runtimeConfig(),
+        { ...gmailAssistant, principal: { ...seed, emails: ['Aya.Assistant@gmail.com'] } },
+        dependencies,
+      ),
+    ).rejects.toMatchObject({
+      code: 'invalid_identity',
+      message: "aya.assistant@gmail.com is the assistant's own address, not one of the principal's",
+    });
+    await expect(
+      reconcileMainIdentity(
+        runtimeConfig(),
+        { ...input, principal: { ...seed, emails: ['morganellery@gmail.com', 'Morgan.Ellery@gmail.com'] } },
+        dependencies,
+      ),
+    ).rejects.toMatchObject({
+      message:
+        "morgan.ellery@gmail.com is another spelling of morganellery@gmail.com, already one of the principal's addresses",
+    });
   });
 
   it("fails when the profile does not hold the principal's declared addresses", async () => {
@@ -394,8 +496,8 @@ describe('main identity reconciliation', () => {
       },
     };
 
-    await expect(
-      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails: ['morgan@example.test'] }, forgetful),
-    ).rejects.toMatchObject({ code: 'profile_mismatch' });
+    await expect(reconcileMainIdentity(runtimeConfig(), create, forgetful)).rejects.toMatchObject({
+      code: 'profile_mismatch',
+    });
   });
 });

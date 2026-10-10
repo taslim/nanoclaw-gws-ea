@@ -5,7 +5,7 @@
  */
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
-import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { GmailApi } from './gmail-api.js';
 import { threadAddresses } from './thread-map.js';
 
@@ -57,7 +57,7 @@ export async function assistantAddresses(): Promise<ReadonlySet<string>> {
  * written about in it.
  */
 export async function conversationPeople(threadKey: string): Promise<string[]> {
-  const principal = new Set((await listPrincipalAddresses()).map((address) => address.email));
+  const principal = await loadPrincipalRecognizer();
   const assistant = await assistantAddresses();
   const people = (await threadAddresses(threadKey)).flatMap((entry) =>
     entry.source === 'written' ? [] : [entry.address],

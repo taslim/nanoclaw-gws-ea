@@ -9,14 +9,18 @@ import {
   type CreatePromptContext,
   type CreateSetupAnswers,
 } from '../src/gws-ea/create-input.js';
-import { normalizePrincipalEmail } from '../src/gws-ea/validation.js';
+import {
+  normalizePrincipalEmail,
+  principalAddressConflict,
+  principalAddressesConflict,
+} from '../src/gws-ea/validation.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
 import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
-import { isValidTimezone, resolveTimezone } from '../src/timezone.js';
+import { ianaTimezone, resolveTimezone } from '../src/timezone.js';
 import { brightSelect } from './lib/bright-select.js';
 import { listSetupProviders, type SetupProviderEntry, type SetupProviderProvisioning } from './providers/registry.js';
 
@@ -171,18 +175,18 @@ function workspaceEmailProblem(value: string): string | undefined {
 
 /**
  * The principal's addresses from `--principal-email`, or asked for when a
- * person is present. Never the assistant's own address.
+ * person is present. Never the assistant's own address, and never two
+ * spellings of one address (`principalAddressConflict`).
  */
 async function principalEmailsInput(source: InputSource, assistantWorkspaceEmail: string): Promise<string[]> {
   const assistant = assistantWorkspaceEmail.trim().toLowerCase();
   const provided = source.context.providedPrincipalEmails;
   if (provided.length > 0) {
-    if (provided.includes(assistant)) {
-      throw new GwsEaError(
-        'invalid_arguments',
-        `--${PRINCIPAL_EMAIL_FLAG}: ${assistant} is the assistant's own address; give the principal's addresses`,
-        { details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` } },
-      );
+    const conflict = principalAddressesConflict(provided, assistant);
+    if (conflict !== undefined) {
+      throw new GwsEaError('invalid_arguments', `--${PRINCIPAL_EMAIL_FLAG}: ${conflict}`, {
+        details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` },
+      });
     }
     return [...provided];
   }
@@ -210,7 +214,8 @@ function principalEmailsFrom(value: string, assistant: string): { emails: string
   for (const entry of entries) {
     const email = normalizePrincipalEmail(entry);
     if (email === undefined) return { emails: [], problem: `${entry} is not an email address` };
-    if (email === assistant) return { emails: [], problem: `${email} is the assistant's own address` };
+    const conflict = principalAddressConflict(email, emails, assistant);
+    if (conflict !== undefined) return { emails: [], problem: conflict };
     if (!emails.includes(email)) emails.push(email);
   }
   return { emails };
@@ -455,10 +460,13 @@ export async function collectGwsEaCreateInput(
     optional: true,
     placeholder: 'Optional',
   });
-  const principalTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
+  const givenTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
     initialValue: detectedTimezone,
-    validate: (value) => (isValidTimezone(value) ? undefined : 'Enter a valid IANA timezone'),
+    validate: (value) => (ianaTimezone(value) === undefined ? 'Enter a valid IANA timezone' : undefined),
   });
+  // Held in the zone's own spelling, since main's container runs in it.
+  const principalTimezone = ianaTimezone(givenTimezone);
+  if (principalTimezone === undefined) throw invalidFlag('principal-timezone', 'Enter a valid IANA timezone');
   const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
     validate: workspaceEmailProblem,
   });

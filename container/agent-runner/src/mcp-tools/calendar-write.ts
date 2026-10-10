@@ -1,8 +1,11 @@
 /**
  * main's calendar tools that go through the host. gog cannot list the
- * principal as an accepted guest, so creating an event and changing who an
- * event invites go to the host, which keeps the principal on every event it
- * writes (src/modules/gws-ea-meetings/principal-events.ts). Whether a time is
+ * principal as an accepted guest, nor check an invitation for their private
+ * details, so creating an event and changing who an event invites go to the
+ * host, on the principal's calendars or the assistant's own. It keeps the
+ * principal on every event it writes on theirs, and puts them on one of the
+ * assistant's only when main invites them
+ * (src/modules/gws-ea-meetings/principal-events.ts). Whether a time is
  * free and who the principal meets are counted by the host from every page
  * of their calendars (src/modules/gws-ea-meetings/calendar-facts.ts), so no
  * model copies events to count them. Everything else on the calendar stays
@@ -19,7 +22,7 @@ export const CALENDAR_REQUEST_TIMEOUT_MS = 120_000;
 
 const CALENDAR = {
   type: 'string',
-  description: "The calendar's ID: the principal's address for their primary calendar.",
+  description: "The calendar's ID: the principal's address for their primary calendar, or your own address for yours.",
 } as const;
 const ADDRESSES = { type: 'array', items: { type: 'string' } } as const;
 const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it, such as 2026-10-12T09:00:00-07:00';
@@ -27,7 +30,7 @@ const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it
 export const createEvent = requestTool({
   name: 'create_event',
   description:
-    "Put an event on one of the principal's calendars. The principal is always on its guest list, accepted, as on an event they made themselves; anyone you name in guests is invited too, and Google sends them the invitation. Answers with the event's id.",
+    "Put an event on one of the principal's calendars or on your own. On theirs, the principal is always on its guest list, accepted, as on an event they made themselves. On yours, the principal is a guest, and the event takes their time, only if you name them in guests; anyone your calendar is shared with, colleagues in a company Workspace among them, sees its details unless it is private. Anyone you name in guests is invited, and Google sends them the invitation. Answers with the event's id.",
   properties: {
     calendar: CALENDAR,
     title: { type: 'string', description: 'What the event is called.' },
@@ -54,7 +57,7 @@ export const createEvent = requestTool({
 export const changeGuests = requestTool({
   name: 'change_guests',
   description:
-    "Invite people to an event the principal organizes, or take them off it. Everyone's answer stays as it was, and the principal stays on it: accepted, unless they answered otherwise. Google tells the guests when someone other than the principal joins or leaves.",
+    "Invite people to an event the principal organizes or one you organize on your own calendar, or take them off it. Everyone's answer stays as it was, and the principal stays on their own events: accepted, unless they answered otherwise. Google tells the guests whenever someone joins or leaves, except the principal on their own events.",
   properties: {
     calendar: CALENDAR,
     event: {
@@ -89,7 +92,7 @@ export const findConflicts = requestTool({
 export const peopleStats = requestTool({
   name: 'people_stats',
   description:
-    'Who the principal has met over the last six months, counted by the host from meetings they organized or accepted: meetings, one-on-ones, recurring series, and the first and last day met, for the people met most or the people you name. Names come wrapped as untrusted text.',
+    'Who the principal has met over the last six months, counted by the host from meetings they organized or accepted: meetings, and on which of their calendars, one-on-ones, recurring series, and the first and last day met, for the people met most or the people you name. Names come wrapped as untrusted text.',
   properties: {
     people: { ...ADDRESSES, description: 'Email addresses to report on, each listed even with no meetings.' },
   },

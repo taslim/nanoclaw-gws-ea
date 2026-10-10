@@ -1,15 +1,29 @@
 /**
  * Who a message is from, decided only from Gmail's own authentication
- * results (KTD4, R21, R22). These are pure checks on a message's headers.
+ * results (KTD4, R21, R22), why a message is not verified, as a fixed code
+ * (KTD3), and whether Google signed it (KTD12). These are pure checks on a
+ * message's headers.
  */
 import { describe, expect, it } from 'vitest';
 
-import { authenticateSender, type AuthContext } from './authentication.js';
+import { principalRecognizer } from '../gws-ea-profile/db.js';
+import {
+  authenticateSender,
+  refusedPrincipalAddress,
+  signedByGoogle,
+  type AuthContext,
+  type UnauthenticatedReason,
+} from './authentication.js';
 import type { MailHeader } from './mime.js';
 
 const PRINCIPAL = 'pat@principal.example';
 const CONTEXT: AuthContext = {
-  principalAddresses: new Set([PRINCIPAL, 'pat@home.example', 'pat.principal@gmail.com', 'pat@outlook.com']),
+  principalAddresses: principalRecognizer([
+    PRINCIPAL,
+    'pat@home.example',
+    'pat.principal@gmail.com',
+    'pat@outlook.com',
+  ]),
 };
 
 interface MessageOptions {
@@ -79,19 +93,54 @@ describe('the principal', () => {
     ).toMatchObject({ kind: 'principal', address });
   });
 
+  it.each([
+    ['dots, a +tag and capitals at Gmail', 'Pat.Principal+news@gmail.com', 'gmail.com'],
+    ['the googlemail spelling, signed by googlemail.com', 'PatPrincipal@googlemail.com', 'googlemail.com'],
+    ['capitals at another domain', 'Pat@Principal.Example', 'principal.example'],
+  ])('is recognized from %s, and named by the address as they listed it (AE1)', (_label, from, domain) => {
+    expect(
+      authenticateSender(message({ from: `Pat <${from}>`, results: results(domain, '20230601') }), CONTEXT),
+    ).toEqual({
+      kind: 'principal',
+      address: domain === 'principal.example' ? PRINCIPAL : 'pat.principal@gmail.com',
+      displayName: 'Pat',
+    });
+  });
+
+  it('checks the signature for the domain the From is written with', () => {
+    // A googlemail From is Gmail's, but only a googlemail.com signature aligns with it.
+    expect(
+      authenticateSender(
+        message({ from: 'Pat <patprincipal@googlemail.com>', results: results('gmail.com', '20230601') }),
+        CONTEXT,
+      ),
+    ).toMatchObject({ kind: 'unauthenticated', address: 'patprincipal@googlemail.com', reason: 'no-own-dkim' });
+  });
+
+  it.each([
+    ['a +tag at another domain', 'pat+x@principal.example', 'principal.example'],
+    ['a subdomain of gmail.com', 'pat.principal@mail.gmail.com', 'mail.gmail.com'],
+    ['a domain that only begins with gmail.com', 'pat.principal@gmail.com.evil.example', 'gmail.com.evil.example'],
+  ])('takes %s, signed by its own domain, for an ordinary sender (R1)', (_label, address, domain) => {
+    expect(
+      authenticateSender(message({ from: `Pat <${address}>`, results: results(domain, 'google') }), CONTEXT),
+    ).toMatchObject({ kind: 'authenticated', address });
+  });
+
   it('accepts a Sender equal to From', () => {
     expect(authenticateSender(message({ extra: [{ name: 'Sender', value: `<${PRINCIPAL}>` }] }), CONTEXT).kind).toBe(
       'principal',
     );
   });
 
-  it.each<[string, MessageOptions]>([
+  it.each<[string, MessageOptions, UnauthenticatedReason]>([
     [
       'a forged result lower in the message, with no result of Gmail above it',
       {
         withoutGmailResults: true,
         extra: [{ name: 'Authentication-Results', value: results('principal.example', 'google') }],
       },
+      'no-gmail-results',
     ],
     [
       "a forged result written above the sender's headers when Gmail's own says fail",
@@ -99,14 +148,16 @@ describe('the principal', () => {
         results: results('principal.example', 'google', 'fail', 'fail'),
         senderHeaders: [{ name: 'Authentication-Results', value: results('principal.example', 'google') }],
       },
+      'no-own-dkim',
     ],
     [
       'a result from another server',
       { results: results('principal.example', 'google').replace('mx.google.com', 'mx.evil.example') },
+      'no-gmail-results',
     ],
-    ['dmarc=bestguesspass', { results: results('principal.example', 'google', 'bestguesspass') }],
-    ['dmarc=fail', { results: results('principal.example', 'google', 'fail') }],
-    ['a failed DKIM signature', { results: results('principal.example', 'google', 'pass', 'fail') }],
+    ['dmarc=bestguesspass', { results: results('principal.example', 'google', 'bestguesspass') }, 'no-dmarc'],
+    ['dmarc=fail', { results: results('principal.example', 'google', 'fail') }, 'no-dmarc'],
+    ['a failed DKIM signature', { results: results('principal.example', 'google', 'pass', 'fail') }, 'no-own-dkim'],
     [
       'a DMARC pass whose only DKIM pass is another domain’s',
       {
@@ -115,6 +166,7 @@ describe('the principal', () => {
           'header.i=@mailer.example',
         ),
       },
+      'no-own-dkim',
     ],
     [
       'a DMARC pass whose only DKIM pass is a subdomain’s',
@@ -124,12 +176,23 @@ describe('the principal', () => {
           'header.i=@news.principal.example',
         ),
       },
+      'no-own-dkim',
     ],
-    ['a differing Sender', { extra: [{ name: 'Sender', value: 'Bulk <bulk@principal.example>' }] }],
-    ['a List-Id', { extra: [{ name: 'List-Id', value: '<team.principal.example>' }] }],
-    ['two From mailboxes', { from: `${PRINCIPAL}, other@principal.example` }],
-  ])('is unauthenticated, never an ordinary sender, with %s', (_label, options) => {
-    expect(authenticateSender(message(options), CONTEXT).kind).toBe('unauthenticated');
+    [
+      "Google's signature alone, as Google Calendar sends mail in their name",
+      {
+        results: results('principal.example', 'google', 'fail').replace(
+          'header.i=@principal.example',
+          'header.i=@google.com',
+        ),
+      },
+      'no-own-dkim',
+    ],
+    ['a differing Sender', { extra: [{ name: 'Sender', value: 'Bulk <bulk@principal.example>' }] }, 'sender-differs'],
+    ['a List-Id', { extra: [{ name: 'List-Id', value: '<team.principal.example>' }] }, 'mailing-list'],
+    ['two From mailboxes', { from: `${PRINCIPAL}, other@principal.example` }, 'not-one-mailbox'],
+  ])('is unauthenticated, never an ordinary sender, with %s', (_label, options, reason) => {
+    expect(authenticateSender(message(options), CONTEXT)).toMatchObject({ kind: 'unauthenticated', reason });
   });
 
   it.each([
@@ -144,10 +207,31 @@ describe('the principal', () => {
     });
   });
 
+  it('names a refused address as they listed it, whatever spelling the From wrote, and no one else’s', () => {
+    const unverified = (from: string) => {
+      const verdict = authenticateSender(
+        message({ from, results: results('example.invalid', 's1', 'none', 'none') }),
+        CONTEXT,
+      );
+      if (verdict.kind !== 'unauthenticated') throw new Error(`Expected no verified sender, got ${verdict.kind}`);
+      return verdict;
+    };
+    expect(refusedPrincipalAddress(unverified('Pat <Pat.Principal+news@gmail.com>'), CONTEXT)).toEqual({
+      address: 'pat.principal@gmail.com',
+      reason: 'no-own-dkim',
+    });
+    expect(refusedPrincipalAddress(unverified('Sam <sam@acme.example>'), CONTEXT)).toBeUndefined();
+    expect(refusedPrincipalAddress(unverified(`${PRINCIPAL}, other@principal.example`), CONTEXT)).toBeUndefined();
+  });
+
   it('is unauthenticated when a non-Gmail header sits above the topmost result', () => {
     const headers = message();
     headers.unshift({ name: 'X-Injected', value: 'yes' });
-    expect(authenticateSender(headers, CONTEXT).kind).toBe('unauthenticated');
+    expect(authenticateSender(headers, CONTEXT)).toMatchObject({
+      kind: 'unauthenticated',
+      address: PRINCIPAL,
+      reason: 'no-gmail-results',
+    });
   });
 });
 
@@ -172,7 +256,10 @@ describe('Google Calendar notifications', () => {
     ],
     ['a differing Sender', { extra: [{ name: 'Sender', value: 'someone@google.com' }] }],
   ])('are unauthenticated, never an ordinary sender, with %s', (_label, options) => {
-    expect(authenticateSender(notification(options), CONTEXT).kind).toBe('unauthenticated');
+    expect(authenticateSender(notification(options), CONTEXT)).toMatchObject({
+      kind: 'unauthenticated',
+      reason: 'unsigned-calendar-notification',
+    });
   });
 });
 
@@ -241,9 +328,18 @@ describe('Google Docs and Drive notifications', () => {
     ['a share signed by another domain', share({ results: google({ signer: 'evil.example', from: 'google.com' }) })],
     ['a share with a differing Sender', share({ extra: [{ name: 'Sender', value: 'drive@google.com' }] })],
     ['a share through a mailing list', share({ extra: [{ name: 'List-Id', value: '<team.google.com>' }] })],
-    ['a share with no results of Gmail’s own', share({ withoutGmailResults: true })],
   ])('are unauthenticated, never an ordinary sender, for %s', (_label, headers) => {
-    expect(authenticateSender(headers, CONTEXT)).toMatchObject({ kind: 'unauthenticated' });
+    expect(authenticateSender(headers, CONTEXT)).toMatchObject({
+      kind: 'unauthenticated',
+      reason: 'unsigned-workspace-notification',
+    });
+  });
+
+  it('are unauthenticated, as any message is, with no results of Gmail’s own', () => {
+    expect(authenticateSender(share({ withoutGmailResults: true }), CONTEXT)).toMatchObject({
+      kind: 'unauthenticated',
+      reason: 'no-gmail-results',
+    });
   });
 });
 
@@ -280,6 +376,77 @@ describe('anyone else', () => {
       { from: 'sam@acme.example', results: results('acme.example', 's1', 'bestguesspass', 'none') },
     ],
   ])('is not authenticated with %s', (_label, options) => {
-    expect(authenticateSender(message(options), CONTEXT).kind).toBe('unauthenticated');
+    expect(authenticateSender(message(options), CONTEXT)).toMatchObject({
+      kind: 'unauthenticated',
+      reason: 'no-aligned-pass',
+    });
+  });
+});
+
+describe("Google's signature (KTD12)", () => {
+  /**
+   * Gmail's results for mail Google Calendar sends in someone's name: signed
+   * by google.com, from Google's own servers, so DMARC fails for the From
+   * domain. No Sender header is assumed.
+   */
+  function inTheirName(fromDomain: string, dkim = 'pass'): string {
+    return (
+      `mx.google.com;\r\n       dkim=${dkim} header.i=@google.com header.s=20230601 header.b=Q2FsZW5k;\r\n` +
+      '       spf=pass (google.com: domain of 3remy@calendar-server.bounces.google.com designates 209.85.220.73 as permitted sender) smtp.mailfrom=3remy@calendar-server.bounces.google.com;\r\n' +
+      `       dmarc=fail (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=${fromDomain}`
+    );
+  }
+  const guest = (options: MessageOptions = {}) =>
+    message({ from: 'Remy Vance <remy@partner.example>', results: inTheirName('partner.example'), ...options });
+
+  it.each<[string, MailHeader[]]>([
+    ["a guest's answer, from their own address", guest()],
+    ["the principal's own answer", message({ results: inTheirName('principal.example') })],
+    [
+      'a Sender naming Google Calendar',
+      guest({ extra: [{ name: 'Sender', value: 'Google Calendar <calendar-notification@google.com>' }] }),
+    ],
+    [
+      "Google Calendar's own notification",
+      message({ from: 'calendar-notification@google.com', results: results('google.com', 'x') }),
+    ],
+  ])("is found on %s, signed by google.com in Gmail's own results", (_label, headers) => {
+    expect(signedByGoogle(headers)).toBe(true);
+  });
+
+  it.each<[string, MailHeader[]]>([
+    ['a failed signature', guest({ results: inTheirName('partner.example', 'fail') })],
+    ["only the sender's own domain's signature", guest({ results: results('partner.example', 's1') })],
+    [
+      'a signature from a Google subdomain',
+      guest({ results: inTheirName('partner.example').replace('@google.com', '@calendar.google.com') }),
+    ],
+    ['a mailing list', guest({ extra: [{ name: 'List-Id', value: '<team.partner.example>' }] })],
+    [
+      "no results of Gmail's own",
+      guest({
+        withoutGmailResults: true,
+        extra: [{ name: 'Authentication-Results', value: inTheirName('partner.example') }],
+      }),
+    ],
+    [
+      'a result from another server',
+      guest({ results: inTheirName('partner.example').replace('mx.google.com', 'mx.evil.example') }),
+    ],
+    [
+      'a Sender naming Google Calendar, unsigned',
+      guest({
+        results: results('partner.example', 's1', 'fail', 'fail'),
+        extra: [{ name: 'Sender', value: 'calendar-notification@google.com' }],
+      }),
+    ],
+  ])('is not found with %s', (_label, headers) => {
+    expect(signedByGoogle(headers)).toBe(false);
+  });
+
+  it("is not found when Google's result sits below a header that is not Gmail's", () => {
+    const headers = guest();
+    headers.unshift({ name: 'X-Injected', value: 'yes' });
+    expect(signedByGoogle(headers)).toBe(false);
   });
 });

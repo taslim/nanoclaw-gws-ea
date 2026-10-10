@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Weekday } from '../gws-ea-preferences/db.js';
+import { principalRecognizer } from '../gws-ea-profile/db.js';
 import type { CalendarEvent } from './calendar-api.js';
 import {
   blocksTime,
@@ -26,7 +27,7 @@ const LONDON = 'Europe/London';
 const NEW_YORK = 'America/New_York';
 const LOS_ANGELES = 'America/Los_Angeles';
 const BERLIN = 'Europe/Berlin';
-const PRINCIPAL = new Set(['pat@principal.example']);
+const PRINCIPAL = principalRecognizer(['pat@principal.example']);
 
 function at(iso: string): number {
   return Date.parse(iso);
@@ -287,7 +288,7 @@ describe('which events block time', () => {
   });
 
   it("reads the principal's answer from the calendar's own entry first, then from any spelling of their addresses", () => {
-    const work = new Set(['pat@principal.example', 'pat.lee@gmail.com']);
+    const work = principalRecognizer(['pat@principal.example', 'pat.lee@gmail.com']);
     // Accepted on this calendar, declined from another address: this calendar's own answer stands.
     expect(
       blocksTime(
@@ -307,6 +308,10 @@ describe('which events block time', () => {
     expect(
       blocksTime(event({ attendees: [{ email: 'pat.lee+cal@googlemail.com', responseStatus: 'declined' }] }), work),
     ).toBe(false);
+    // Another provider may deliver a +tag elsewhere, so it is not the principal's answer (R1).
+    expect(
+      blocksTime(event({ attendees: [{ email: 'pat+cal@principal.example', responseStatus: 'declined' }] }), work),
+    ).toBe(true);
   });
 
   it("reads an all-day event as the principal's whole local days, however long the clocks make them", () => {

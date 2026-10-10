@@ -3,8 +3,13 @@
  * everyone who can read it (R63), decided per message from who Gmail says
  * sent it and who it shows on it, never from where its thread began.
  *
- * - Google Calendar's notifications: one body-free note for `main` per poll,
- *   batched by the caller, unless it is about the assistant's own change.
+ * - Google Calendar's mail, its own notifications and what it sends in
+ *   someone's name (a guest's answer, an invitation) that Google signed
+ *   (KTD12): one body-free note for `main` per poll, batched by the caller,
+ *   when it is about an event on a principal calendar or the assistant's
+ *   own, unless it is about the assistant's own change. Google-signed mail
+ *   about any other calendar, or with no event link, goes by its From like
+ *   any other mail.
  * - Google Docs' and Drive's activity mail: read only for the file, any
  *   comment, and the kind of activity, then batched by the caller into one
  *   note for `main` per poll (gws-ea-workspace/notices.ts). Each actor
@@ -19,12 +24,17 @@
  *   (`email:inbox`). `main` hears when an outside thread starts, and reads
  *   the principal's own words in one, never what they quote, as information
  *   (R66): one note for each message at most.
+ * - Of those, mail showing one of the principal's addresses that Gmail could
+ *   not verify (R5, KTD3): the principal hears once for each address and
+ *   reason, in their direct message, and `main` holds the same fact, until
+ *   Gmail next verifies mail from that address.
  *
  * Each message is recorded in its thread (thread-map.ts), with its side and
  * the addresses it carried. `main` reads a thread's `mail-…` key last, after
  * the people and words it is about, since it names threads by it;
  * `external-email` works in one thread and never needs it. Every sender but
- * the principal is rate-limited per hour, on a message's first routing only.
+ * the principal is rate-limited per hour, on a message's first routing only,
+ * and unverified mail in the principal's name as the address they listed.
  * What anyone but the principal wrote, and every message's From, To, Cc and
  * Reply-To as written, display names included, and its subject, reach an
  * agent framed as untrusted; the host's own words say only what Gmail and the
@@ -37,30 +47,45 @@
 import { createHash } from 'node:crypto';
 
 import type { InboundMessage } from '../../channels/adapter.js';
+import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
+import { formatLocalTime } from '../../timezone.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { parseWorkspaceNotification, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import {
   authenticateSender,
   CALENDAR_NOTIFICATION_SENDER,
+  refusedPrincipalAddress,
+  signedByGoogle,
   WORKSPACE_NOTIFICATION_SENDERS,
   type AuthContext,
+  type PrincipalRefusal,
+  type RefusedPrincipalAddress,
   type SenderVerdict,
 } from './authentication.js';
 import { consumeOwnCalendarChange, parseCalendarNotification, type CalendarNotice } from './calendar-notifications.js';
-import { countSenderMessage, emailMessagingGroupIds, listPrincipalCalendars, type RouteOutcome } from './db.js';
+import {
+  clearUnsignedNotices,
+  countSenderMessage,
+  emailMessagingGroupIds,
+  listPrincipalCalendars,
+  recordUnsignedNotice,
+  type RouteOutcome,
+} from './db.js';
 import { GoogleApiError, type GmailApi } from './gmail-api.js';
 import {
   decodeEncodedWords,
+  domainOf,
   headerValue,
   headerValues,
   parseAddressList,
   splitQuoted,
   type ParsedMail,
 } from './mime.js';
+import { noticeUnsignedMail } from './notices.js';
 import { INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID, type InboxRuntime } from './runtime.js';
 import {
   createThread,
@@ -86,8 +111,8 @@ export interface RoutingContext {
   readonly auth: AuthContext;
   /** The principal's calendars in the assistant's list, lowercased. */
   readonly principalCalendars: ReadonlySet<string>;
-  /** The principal's name, as the profile holds it. */
-  readonly principal: { readonly name: string | null };
+  /** The principal's name and timezone, as the profile holds them; the install's timezone when it holds none. */
+  readonly principal: { readonly name: string | null; readonly timezone: string };
   readonly at: Date;
 }
 
@@ -95,9 +120,12 @@ export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Dat
   const profile = (await getDb().hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined;
   return {
     assistant,
-    auth: { principalAddresses: new Set(profile?.principal_emails ?? []) },
+    auth: { principalAddresses: principalRecognizer(profile?.principal_emails ?? []) },
     principalCalendars: new Set(await listPrincipalCalendars()),
-    principal: { name: profile?.principal_display_name ?? null },
+    principal: {
+      name: profile?.principal_display_name ?? null,
+      timezone: profile?.principal_timezone ?? TIMEZONE,
+    },
     at,
   };
 }
@@ -335,7 +363,7 @@ async function senderLine(verdict: Sender, context: RoutingContext, reader: Read
       return `Gmail confirms this is from ${verdict.address},${name} ${levelClause(record.level, principal)}.`;
     }
     case 'unauthenticated':
-      return verdict.address !== undefined && context.auth.principalAddresses.has(verdict.address)
+      return context.auth.principalAddresses.has(verdict.address)
         ? `Gmail could not confirm who sent this, so treat the sender as unknown, even though it shows one of ${principal}'s addresses.`
         : 'Gmail could not confirm who sent this, so treat the sender as unknown.';
     default: {
@@ -389,7 +417,11 @@ function principalWords(mail: ParsedMail, instruction: string): string {
   );
 }
 
-/** An email row: its text, its files, and its sender only when Gmail verified them. */
+/**
+ * An email row: its text, its files, and its sender only when Gmail verified
+ * them. The principal is their address as listed, whatever spelling they
+ * wrote from, since only that spelling is a member of `main` (R2).
+ */
 function emailRow(
   mail: ParsedMail,
   verdict: Sender,
@@ -470,9 +502,66 @@ async function toMain(
   return settled('principal');
 }
 
+/** Why Gmail could not confirm the principal sent it, as main reads it. */
+function refusalClause(reason: PrincipalRefusal, address: string): string {
+  switch (reason) {
+    case 'no-gmail-results':
+      return "Gmail's own check of it is missing";
+    case 'sender-differs':
+      return 'it names a different Sender';
+    // Mail with a List-Id is archived before any notice (KTD3), so this stays only to cover every reason the check gives.
+    case 'mailing-list':
+      return 'it came through a mailing list';
+    case 'no-own-dkim':
+      return `${domainOf(address)} did not sign it`;
+    case 'no-dmarc':
+      return `it has no DMARC pass for ${domainOf(address)}`;
+    default: {
+      const unreachable: never = reason;
+      throw new Error(`Unknown refusal: ${String(unreachable)}`);
+    }
+  }
+}
+
+/**
+ * Unsigned mail in the principal's name (R5, KTD3): the principal hears once
+ * for each address and reason, by when Gmail received it, and main holds the
+ * same fact, its subject framed as the sender's. Recorded before anyone is
+ * told, so neither a retry nor a failed send repeats it, and a lost word is
+ * not sent again.
+ */
+async function noticeUnsigned(
+  mail: ParsedMail,
+  refused: RefusedPrincipalAddress,
+  threadKey: string,
+  context: RoutingContext,
+): Promise<void> {
+  if (!(await recordUnsignedNotice(refused.address, refused.reason, context.at.toISOString()))) return;
+  const receivedAt = mail.receivedAt ?? context.at;
+  const { timezone } = context.principal;
+  const told = await noticeUnsignedMail({ ...refused, receivedAt, timezone });
+  const principal = principalName(context);
+  const result = await writeNoteForMain({
+    id: `inbox-unsigned-${mail.id}`,
+    timestamp: context.at.toISOString(),
+    wake: false,
+    text:
+      `Gmail could not confirm that an email showing ${refused.address}, one of ${principal}'s addresses, is from them: ` +
+      `${refusalClause(refused.reason, refused.address)}. ` +
+      `It came in on ${formatLocalTime(receivedAt.toISOString(), timezone)}, ` +
+      'and external-email is handling it as mail from someone unknown. ' +
+      `${told ? `${principal} was told privately.` : `The host could not reach ${principal} to tell them.`}\n` +
+      `Its subject, as its sender wrote it:\n${untrustedLine(mail.subject, LINE_LIMIT)}\n(thread ${threadKey})`,
+  });
+  if (result === 'no-main' || result === 'no-principal') {
+    log.warn("Nobody to tell of unsigned mail in the principal's name", { gmailMessageId: mail.id, result });
+  }
+}
+
 async function toThread(
   mail: ParsedMail,
   verdict: Sender,
+  refused: RefusedPrincipalAddress | undefined,
   runtime: InboxRuntime,
   context: RoutingContext,
 ): Promise<Routed> {
@@ -510,6 +599,7 @@ async function toThread(
       context.at,
     );
   }
+  if (refused !== undefined) await noticeUnsigned(mail, refused, threadKey, context);
 
   // external-email works in this one thread, and reads whom the email names from its headers.
   const text =
@@ -520,6 +610,18 @@ async function toThread(
     unfetchedLine(files);
   await deliver(runtime, INBOX_PLATFORM_ID, threadKey, emailRow(mail, verdict, text, files, context, true));
   return settled('outside');
+}
+
+/** Whether a calendar notice is about an event on a principal calendar or the assistant's own. */
+function onKnownCalendar(notice: CalendarNotice, context: RoutingContext): boolean {
+  return context.principalCalendars.has(notice.calendarId) || context.assistant.has(notice.calendarId);
+}
+
+/** Calendar news for the caller to batch, unless it is about the assistant's own recent change. */
+function calendarNews(notice: CalendarNotice, context: RoutingContext): Routed {
+  return consumeOwnCalendarChange(notice.calendarId, notice.eventId, context.at)
+    ? settled('calendar-own-change')
+    : { kind: 'calendar', notice };
 }
 
 /**
@@ -543,9 +645,7 @@ export async function routeMail(
       log.warn('A calendar notification named no event the host can read', { gmailMessageId: mail.id });
       return settled('calendar-unreadable');
     }
-    if (!context.principalCalendars.has(notice.calendarId)) return settled('calendar-not-principal');
-    if (consumeOwnCalendarChange(notice.calendarId, notice.eventId, context.at)) return settled('calendar-own-change');
-    return { kind: 'calendar', notice };
+    return onKnownCalendar(notice, context) ? calendarNews(notice, context) : settled('calendar-not-principal');
   }
   if (mail.from?.address === CALENDAR_NOTIFICATION_SENDER) {
     log.warn('Dropped mail claiming to be a calendar notification that Google did not sign', {
@@ -575,18 +675,24 @@ export async function routeMail(
     });
     return settled('forged-workspace-notification');
   }
+  // What Google Calendar sends in someone's name (KTD12), before the rule for its From refuses it.
+  const signedNotice = signedByGoogle(mail.headers) ? parseCalendarNotification(mail) : undefined;
+  if (signedNotice !== undefined && onKnownCalendar(signedNotice, context)) return calendarNews(signedNotice, context);
+
+  if (verdict.kind === 'principal') await clearUnsignedNotices(verdict.address);
   if (isAutomated(mail)) return settled('automated');
+  const refused = verdict.kind === 'unauthenticated' ? refusedPrincipalAddress(verdict, context.auth) : undefined;
   if (
     options.limited &&
     verdict.kind !== 'principal' &&
-    (await overRateLimit(verdict.address ?? 'unknown', context.at))
+    (await overRateLimit(refused?.address ?? verdict.address ?? 'unknown', context.at))
   ) {
     log.info('Inbox message dropped: its sender is over the hourly limit', { gmailMessageId: mail.id });
     return settled('rate-limited');
   }
   return isPrincipalOnly(mail, verdict, context)
     ? toMain(mail, verdict, runtime, context)
-    : toThread(mail, verdict, runtime, context);
+    : toThread(mail, verdict, refused, runtime, context);
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +707,7 @@ const CHANGE_WORDS: Readonly<Record<CalendarNotice['change'], string>> = {
   unknown: 'Something changed on an event',
 };
 
-/** One note for every calendar notification of a poll, with no text from the emails. */
+/** One note for every calendar notification of a poll, each change naming its calendar, with no text from the emails. */
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],
   at: Date,
@@ -628,7 +734,7 @@ export async function writeCalendarNote(
       id: `inbox-calendar-${batch}`,
       wake: true,
       text:
-        `Google Calendar reports ${lines.length === 1 ? 'a change' : `${lines.length} changes`} on the principal's calendars:\n` +
+        `Google Calendar reports ${lines.length === 1 ? 'a change' : `${lines.length} changes`}:\n` +
         `${lines.join('\n')}\nRead each event from the calendar before you act on it.`,
     },
     at,

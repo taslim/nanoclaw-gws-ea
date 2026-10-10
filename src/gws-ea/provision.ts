@@ -151,6 +151,8 @@ export interface ProductionProvisionInput {
   readonly providerCredentialMetadata?: ProviderCredentialMetadata;
   readonly requestProviderCredential?: () => Promise<ProviderCredential>;
   readonly identity: MainIdentityInput;
+  /** The principal's name in the operator's messages: the published profile's, or create's before. */
+  readonly principalDisplayName: string;
   readonly adapterInstance: string;
   /** The journal's start: only principal messages after it count. */
   readonly provisioningStartedAt: string;
@@ -445,7 +447,12 @@ async function listOnecliAgents(context: ProductionProvisionContext): Promise<re
   return (await admin(context.input.runtime)).listAgents();
 }
 
-/** Main exists as published, and its OneCLI agent injects every matching secret (all mode). */
+/**
+ * Main exists as published, runs in the principal's timezone as the profile
+ * holds it, and its OneCLI agent injects every matching secret (all mode).
+ * The principal's name and timezone are theirs to change through main, so
+ * only the profile's own values count (KTD9).
+ */
 async function defaultObserveMainIdentity(context: ProductionProvisionContext): Promise<Observation> {
   try {
     const profileValue = unwrapData(await runNanoclawProbeNcl(context, ['gws-ea-profile', 'get']));
@@ -454,9 +461,7 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     if (
       !mainAgentGroupId ||
       profileValue.assistant_display_name !== context.input.identity.assistantDisplayName ||
-      profileValue.assistant_workspace_email !== context.input.identity.assistantWorkspaceEmail.toLowerCase() ||
-      profileValue.principal_display_name !== context.input.identity.principalDisplayName ||
-      profileValue.principal_timezone !== context.input.identity.principalTimezone
+      profileValue.assistant_workspace_email !== context.input.identity.assistantWorkspaceEmail.toLowerCase()
     ) {
       return ABSENT;
     }
@@ -468,7 +473,9 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
       !isRecord(groupValue) ||
       groupValue.name !== 'main' ||
       !isRecord(configValue) ||
-      configValue.provider !== context.input.runtime.selected_provider
+      configValue.provider !== context.input.runtime.selected_provider ||
+      !optionalString(profileValue.principal_timezone) ||
+      configValue.timezone !== profileValue.principal_timezone
     ) {
       return ABSENT;
     }
@@ -703,7 +710,7 @@ async function principalResult(
         'bind_principal',
         'principal_dm_required',
         'Ask the principal to send a direct message to the configured Google Chat app.',
-        `Principal: ${context.input.identity.principalDisplayName} (not bound yet)`,
+        `Principal: ${context.input.principalDisplayName} (not bound yet)`,
       )),
       settled: async () =>
         (
@@ -1083,7 +1090,7 @@ export function createProductionProvisionSteps(
               'verify_conversation',
               result.reason,
               CONVERSATION_PAUSES[result.reason],
-              `Bound principal: ${principal.senderName ?? value.input.identity.principalDisplayName} (${principal.userId})`,
+              `Bound principal: ${principal.senderName ?? value.input.principalDisplayName} (${principal.userId})`,
             );
             if (result.reason !== 'later_principal_message_missing') return pause;
             return {
@@ -1256,7 +1263,6 @@ interface PersistedProfileIdentity {
   readonly assistant_display_name: string;
   readonly assistant_workspace_email: string;
   readonly principal_display_name: string;
-  readonly principal_timezone: string;
   readonly main_agent_group_id: string;
   readonly updated_at: string;
 }
@@ -1278,7 +1284,7 @@ function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileI
     return database
       .prepare(
         `SELECT assistant_display_name, assistant_workspace_email,
-                principal_display_name, principal_timezone, main_agent_group_id, updated_at
+                principal_display_name, main_agent_group_id, updated_at
            FROM gws_ea_profile
           WHERE singleton = 1 AND main_agent_group_id IS NOT NULL`,
       )
@@ -1300,13 +1306,23 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
 interface ProvisionSource {
   readonly providerCredentialMetadata: ProviderCredentialMetadata;
   readonly identity: MainIdentityInput;
+  /** The principal's name in the operator's messages. */
+  readonly principalDisplayName: string;
   /** The messaging group create's bootstrap input selected, if any. */
   readonly bootstrapMessagingGroupId: string | null;
   /** Main's published profile, once there is one. */
   readonly profile: PersistedProfileIdentity | undefined;
 }
 
-async function resolveProvisionSource(
+/**
+ * Create's principal seeds the profile once (KTD9). After main is
+ * published, the profile is the one source of the principal's name,
+ * timezone and addresses: the principal changes them through main and the
+ * operator through `gws-ea ncl`, so they are read only from there. A
+ * manifest that outlived publication (its removal was interrupted) seeds
+ * nothing, so it cannot undo a change made since.
+ */
+export async function resolveProvisionSource(
   operation: InstanceOperation,
   reservation: InstanceReservation,
   runtime: InstanceRuntimeConfig,
@@ -1314,19 +1330,24 @@ async function resolveProvisionSource(
 ): Promise<ProvisionSource> {
   if (manifest) {
     const profile = readPersistedProfile(runtime);
+    const { identity } = manifest;
     return {
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
       profile,
       identity: {
-        assistantDisplayName: manifest.identity.assistant_display_name,
+        assistantDisplayName: identity.assistant_display_name,
         assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
-        principalDisplayName: manifest.identity.principal_display_name,
-        principalTimezone: manifest.identity.principal_timezone,
-        // Create's addresses seed the profile once. A manifest that outlived
-        // publication (its removal was interrupted) must not replace
-        // addresses the principal or operator changed since.
-        ...(profile ? {} : { principalEmails: manifest.identity.principal_emails }),
+        ...(profile
+          ? {}
+          : {
+              principal: {
+                displayName: identity.principal_display_name,
+                timezone: identity.principal_timezone,
+                emails: identity.principal_emails,
+              },
+            }),
       },
+      principalDisplayName: profile?.principal_display_name ?? identity.principal_display_name,
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
   }
@@ -1343,13 +1364,11 @@ async function resolveProvisionSource(
   return {
     providerCredentialMetadata: preflight.providerCredential,
     profile,
-    // No principal addresses: once main is published, the profile holds them and the principal and operator change them.
     identity: {
       assistantDisplayName: profile.assistant_display_name,
       assistantWorkspaceEmail: profile.assistant_workspace_email,
-      principalDisplayName: profile.principal_display_name,
-      principalTimezone: profile.principal_timezone,
     },
+    principalDisplayName: profile.principal_display_name,
     bootstrapMessagingGroupId: null,
   };
 }
@@ -1510,6 +1529,7 @@ export async function runProductionProvision(
           }
         : {}),
       identity: source.identity,
+      principalDisplayName: source.principalDisplayName,
       adapterInstance: 'gchat',
       provisioningStartedAt,
       chatConfigured: journal.decisions.chat_configuration_confirmed_at !== undefined,

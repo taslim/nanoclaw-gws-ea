@@ -1,7 +1,6 @@
 /**
  * GWS-EA's inbox: the assistant's Gmail as an `email` channel with two
- * messaging groups (KTD1), and Google Calendar's notification emails as
- * calendar news.
+ * messaging groups (KTD1), and Google Calendar's mail as calendar news.
  *
  * - Inbound mail is routed per message to the part allowed to write to its
  *   readers (route-mail.ts): what only the principal and the assistant can
@@ -15,7 +14,9 @@
  *   recipients.ts). `email_send` lets either write in a thread at any time,
  *   each by its own rules.
  * - Mail is the principal's only when Gmail verified that the domain of one
- *   of their addresses sent it (authentication.ts).
+ *   of their addresses sent it (authentication.ts). Mail in their name that
+ *   Gmail could not verify is outside mail, and the principal hears of it
+ *   once for each address and reason.
  * - Google Docs' and Drive's activity mail becomes one note for `main` per
  *   poll, read from Drive with the host's own Drive token
  *   (gws-ea-workspace/notices.ts).
@@ -53,10 +54,12 @@ import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
 import {
+  gwsEaInboxCalendarAccessMigration,
   gwsEaInboxDropThreadHoldsMigration,
   gwsEaInboxEmailChannelMigration,
   gwsEaInboxMigration,
   gwsEaInboxRelativeFilePathsMigration,
+  gwsEaInboxUnsignedNoticesMigration,
 } from './migration.js';
 import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
 import { paceDeadline } from './pace.js';
@@ -66,11 +69,13 @@ import { emailWords, sendKey } from './send.js';
 import { deleteSends, deleteThreadAddresses, threadsWithAddresses, type SendScope } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
-// The inbox's own state, then its thread map (migration.ts).
+// The inbox's own state, its thread map, then what was added since (migration.ts).
 registerMigration(gwsEaInboxMigration);
 registerMigration(gwsEaInboxEmailChannelMigration);
 registerMigration(gwsEaInboxDropThreadHoldsMigration);
 registerMigration(gwsEaInboxRelativeFilePathsMigration);
+registerMigration(gwsEaInboxUnsignedNoticesMigration);
+registerMigration(gwsEaInboxCalendarAccessMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;

@@ -9,12 +9,14 @@
  * `Authentication-Results` header of their own, but only below Gmail's, so a
  * header with anything but Gmail's trace headers above it is never trusted.
  *
- * - The principal: one of their addresses as the single From mailbox, a
- *   `dkim=pass` from exactly that address's domain, `dmarc=pass` (never
+ * - The principal: one of their addresses, in any spelling the one rule
+ *   recognizes (R1), as the single From mailbox, a `dkim=pass` from exactly
+ *   the domain the From is written with, `dmarc=pass` (never
  *   `bestguesspass`), no differing Sender, and no List-Id: Gmail verified
- *   that the address's own domain sent it, whichever provider that is. A
- *   principal address that fails this is unauthenticated, never an ordinary
- *   sender, so it can neither instruct nor be mistaken for a counterpart.
+ *   that the address's own domain sent it, whichever provider that is. The
+ *   verdict names the address as the principal listed it (R2). A principal
+ *   address that fails this is unauthenticated, never an ordinary sender, so
+ *   it can neither instruct nor be mistaken for a counterpart.
  *   Anything the domain lets sign for it counts, a sending service included
  *   (accepted 2026-10-03 over per-domain selector pins the operator kept).
  * - Google Calendar's notifications: the same rule for `google.com`.
@@ -24,16 +26,56 @@
  *   signs that mail with.
  * - Anyone else: `dmarc=pass` for the From domain, or a `dkim=pass` whose
  *   domain is aligned to it.
+ *
+ * Why a message is not verified is one of a fixed set of codes (KTD3); the
+ * principal hears, once, of each code their own address fails with.
+ *
+ * Separately, `signedByGoogle` says whether Google itself signed a message
+ * (KTD12): Google Calendar sends invitations and answers in the person's own
+ * name, signed by google.com, so the route tells that mail apart before the
+ * rule for its From applies.
  */
+import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { domainOf, headerValues, parseAddressList, type MailHeader, type Mailbox } from './mime.js';
 
 export interface AuthContext {
-  /** The principal's addresses, lowercased. */
-  readonly principalAddresses: ReadonlySet<string>;
+  /** The principal's addresses, by the one rule that recognizes them (R1). */
+  readonly principalAddresses: PrincipalRecognizer;
 }
 
+const PRINCIPAL_REFUSALS = ['no-gmail-results', 'sender-differs', 'mailing-list', 'no-own-dkim', 'no-dmarc'] as const;
+
+/**
+ * Why the rule refuses mail from one of the principal's addresses (R4): no
+ * results of Gmail's own at the top of the message, a differing Sender, a
+ * mailing list, no DKIM pass from the From's own domain, or no DMARC pass.
+ */
+export type PrincipalRefusal = (typeof PRINCIPAL_REFUSALS)[number];
+
+/**
+ * Why Gmail's results verify no one: a refusal of a principal address, or a
+ * From that is not one mailbox, mail claiming one of Google's senders that
+ * Google did not sign, or anyone else's mail with neither a DMARC pass nor an
+ * aligned DKIM pass.
+ */
+export type UnauthenticatedReason =
+  | PrincipalRefusal
+  | 'not-one-mailbox'
+  | 'unsigned-calendar-notification'
+  | 'unsigned-workspace-notification'
+  | 'no-aligned-pass';
+
 export type SenderVerdict =
-  | { readonly kind: 'principal'; readonly address: string; readonly displayName?: string }
+  | {
+      readonly kind: 'principal';
+      /**
+       * The principal's address as they listed it, which the From reached
+       * (R2): the sender's identity. The From as written stays on the
+       * message, which is answered at it.
+       */
+      readonly address: string;
+      readonly displayName?: string;
+    }
   | { readonly kind: 'calendar-notification' }
   | { readonly kind: 'workspace-notification'; readonly address: string }
   | { readonly kind: 'authenticated'; readonly address: string; readonly displayName?: string }
@@ -42,7 +84,7 @@ export type SenderVerdict =
       /** The From address as written, unverified; undefined when From is not one mailbox. */
       readonly address: string | undefined;
       readonly displayName?: string;
-      readonly reason: string;
+      readonly reason: UnauthenticatedReason;
     };
 
 export const CALENDAR_NOTIFICATION_SENDER = 'calendar-notification@google.com';
@@ -177,16 +219,16 @@ function named(mailbox: Mailbox): { readonly displayName?: string } {
 export function authenticateSender(headers: readonly MailHeader[], context: AuthContext): SenderVerdict {
   const from = singleMailbox(headers, 'From');
   if (from === 'absent' || from === 'invalid') {
-    return { kind: 'unauthenticated', address: undefined, reason: 'From is not one mailbox' };
+    return { kind: 'unauthenticated', address: undefined, reason: 'not-one-mailbox' };
   }
-  const unauthenticated = (reason: string): SenderVerdict => ({
+  const unauthenticated = (reason: UnauthenticatedReason): SenderVerdict => ({
     kind: 'unauthenticated',
     address: from.address,
     ...named(from),
     reason,
   });
   const results = gmailResults(headers);
-  if (results === undefined) return unauthenticated("no authentication results of Gmail's own");
+  if (results === undefined) return unauthenticated('no-gmail-results');
 
   const domain = domainOf(from.address);
   const sender = singleMailbox(headers, 'Sender');
@@ -199,26 +241,27 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
   );
   const ownDkimPass = (forDomain: string) => passed(results, 'dkim', (result) => dkimDomain(result) === forDomain);
 
-  if (context.principalAddresses.has(from.address)) {
-    if (!soleSender) return unauthenticated('a Sender differs from From');
-    if (hasListId) return unauthenticated('sent through a mailing list');
-    if (!ownDkimPass(domain)) return unauthenticated('no DKIM pass from its own domain');
-    if (!dmarcPass) return unauthenticated('no DMARC pass');
-    return { kind: 'principal', address: from.address, ...named(from) };
+  const listed = context.principalAddresses.resolve(from.address);
+  if (listed !== undefined) {
+    if (!soleSender) return unauthenticated('sender-differs');
+    if (hasListId) return unauthenticated('mailing-list');
+    if (!ownDkimPass(domain)) return unauthenticated('no-own-dkim');
+    if (!dmarcPass) return unauthenticated('no-dmarc');
+    return { kind: 'principal', address: listed, ...named(from) };
   }
 
   if (from.address === CALENDAR_NOTIFICATION_SENDER) {
     if (soleSender && !hasListId && ownDkimPass(GOOGLE_DOMAIN) && dmarcPass) {
       return { kind: 'calendar-notification' };
     }
-    return unauthenticated('a calendar notification Google did not sign');
+    return unauthenticated('unsigned-calendar-notification');
   }
 
   if (WORKSPACE_NOTIFICATION_SENDERS.has(from.address)) {
     if (soleSender && !hasListId && [...WORKSPACE_SIGNING_DOMAINS].some(ownDkimPass) && dmarcPass) {
       return { kind: 'workspace-notification', address: from.address };
     }
-    return unauthenticated('a Docs or Drive notification Google did not sign');
+    return unauthenticated('unsigned-workspace-notification');
   }
 
   const alignedDkimPass = passed(results, 'dkim', (result) => {
@@ -227,5 +270,41 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
   });
   return dmarcPass || alignedDkimPass
     ? { kind: 'authenticated', address: from.address, ...named(from) }
-    : unauthenticated('no DMARC pass and no aligned DKIM pass');
+    : unauthenticated('no-aligned-pass');
+}
+
+/** One of the principal's addresses that an unverified message shows as its From, as they listed it, and why the rule refused it. */
+export interface RefusedPrincipalAddress {
+  readonly address: string;
+  readonly reason: PrincipalRefusal;
+}
+
+function isPrincipalRefusal(reason: UnauthenticatedReason): reason is PrincipalRefusal {
+  return PRINCIPAL_REFUSALS.some((refusal) => refusal === reason);
+}
+
+/** The principal's address an unverified message's From reaches, and why it was refused; undefined for anyone else's. */
+export function refusedPrincipalAddress(
+  verdict: Extract<SenderVerdict, { kind: 'unauthenticated' }>,
+  context: AuthContext,
+): RefusedPrincipalAddress | undefined {
+  const address = context.principalAddresses.resolve(verdict.address);
+  return address !== undefined && isPrincipalRefusal(verdict.reason) ? { address, reason: verdict.reason } : undefined;
+}
+
+/**
+ * Whether Google itself signed the message, by Gmail's own results: a DKIM
+ * pass from google.com, with no List-Id (KTD12). Google Calendar sends
+ * invitations and guests' answers this way, in the person's own name, so
+ * neither a DMARC pass for the From's domain nor any Sender is asked for:
+ * Google's signature is what no one else can make. Only with an event link to
+ * a calendar the route knows is such a message calendar mail.
+ */
+export function signedByGoogle(headers: readonly MailHeader[]): boolean {
+  const results = gmailResults(headers);
+  return (
+    results !== undefined &&
+    headerValues(headers, 'List-Id').length === 0 &&
+    passed(results, 'dkim', (result) => dkimDomain(result) === GOOGLE_DOMAIN)
+  );
 }

@@ -182,6 +182,12 @@ describe('the email tools', () => {
     expect(Object.keys(handoff.request).sort()).toEqual(['action', 'message', 'messageId', 'people', 'requestId']);
   });
 
+  it('tell main that a thread books only on the calendar a handoff sets, with no calendar standing in for it', () => {
+    const calendar = emailHandoff.tool.inputSchema.properties?.calendar as { readonly description: string };
+    expect(calendar.description).toContain('Until one is set, external-email can offer times but books nothing.');
+    expect(calendar.description).not.toMatch(/primary/iu);
+  });
+
   it('leave a handoff that names no thread and no one for the host to judge', async () => {
     await emailHandoff.handler({ message: 'Find Remy 30 minutes.' }, { signal: AbortSignal.timeout(50) });
     expect(getUndeliveredMessages().map((row) => JSON.parse(row.content) as unknown)).toMatchObject([

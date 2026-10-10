@@ -54,7 +54,9 @@ const SERVICE_COMMANDS = [
 const REQUIRED_CALENDAR_RULES = [
   'Use the `gog` command, through Bash, for everything you do in Google Calendar but two: create an event with the `create_event` tool, and change who an event invites with `change_guests`.',
   'never run `gog auth`',
-  "A calendar is the principal's when its ID is one of the principal's addresses (their primary calendar) or its `dataOwner` is one of those addresses.",
+  "A calendar is the principal's when its ID (their primary calendar) or its `dataOwner` is one of the principal's addresses.",
+  // The one rule the host recognizes them by (R1): never the exact spelling alone.
+  'A gmail.com or googlemail.com address counts in every spelling Gmail delivers to it: with or without dots, with a `+tag`, at either domain. Any other address counts only as listed, in upper or lower case.',
   'Treat every other calendar as someone else',
   'restoring it is the operator',
   'Never send anyone a link to sign in as you',

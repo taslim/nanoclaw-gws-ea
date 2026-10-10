@@ -1,8 +1,16 @@
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
-import { isValidTimezone } from '../../timezone.js';
+import {
+  EMAIL_PATTERN,
+  hasControlCharacters,
+  normalizePrincipalEmail,
+  principalAddressConflict,
+  principalAddressesConflict,
+  resolvePrincipalAddress,
+} from '../../gws-ea/validation.js';
+import { ianaTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
 import { addMember, getMembers, removeMember } from '../permissions/db/agent-group-members.js';
@@ -31,8 +39,14 @@ export type ProjectDocAudience = 'main' | 'external-email' | 'other';
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
   readonly assistantWorkspaceEmail: string;
-  readonly principalDisplayName: string;
-  readonly principalTimezone: string;
+  /**
+   * The principal's name and timezone as create declared them, which seed
+   * the profile. Absent once main is published: the principal then changes
+   * them through main (`setPrincipalNameAndTimezone`), and a reconcile keeps
+   * what the profile holds.
+   */
+  readonly principalDisplayName?: string;
+  readonly principalTimezone?: string;
   readonly mainAgentGroupId: string;
   /**
    * The principal's addresses as create declared them; the profile then holds
@@ -52,12 +66,82 @@ export interface PrincipalAddress {
   readonly added_at: string;
 }
 
+/** The principal's name and home timezone, as the profile holds them; null until create seeds them. */
+export interface PrincipalNameAndTimezone {
+  readonly name: string | null;
+  readonly timezone: string | null;
+}
+
+/** The principal's name and home timezone once main is published, when the profile holds both. */
+export interface PublishedNameAndTimezone {
+  readonly name: string;
+  readonly timezone: string;
+}
+
+/**
+ * The principal's addresses as every comparison with them reads them (R1,
+ * R2): an address is theirs when it reaches one they listed
+ * (`principalMatchKey`), and identity and bookkeeping use the spelling they
+ * listed, never the one a message or a calendar wrote.
+ */
+export interface PrincipalRecognizer {
+  /** The listed spelling `address` reaches under R1, or undefined when it is none of the principal's. */
+  resolve(address: string | undefined): string | undefined;
+  /** Whether `address` reaches one of the principal's listed addresses under R1. */
+  has(address: string | undefined): boolean;
+  /** The listed addresses, sorted, as the profile holds them. */
+  readonly listed: readonly string[];
+}
+
 function displayName(value: string, label: string): string {
   const normalized = value.trim();
   if (!normalized || normalized.length > 120 || hasControlCharacters(normalized)) {
     throw new Error(`${label} is invalid`);
   }
   return normalized;
+}
+
+/**
+ * The longest name `main` may set for the principal. A name with titles and
+ * a suffix fits well within it, and it keeps a sentence of instructions out
+ * of every signature the name reaches.
+ */
+const PRINCIPAL_NAME_MAX_LENGTH = 80;
+
+/**
+ * Why `name` could not be a person's name, or undefined when it could
+ * (KTD9). The name reaches every outgoing signature and external-email's
+ * instructions, so it carries no address, link or markup: a dot directly
+ * before two letters is a domain, which mail clients turn into a link.
+ */
+function personalNameProblem(name: string): string | undefined {
+  if (!name) return 'it is empty';
+  if (name.length > PRINCIPAL_NAME_MAX_LENGTH) return `it is longer than ${PRINCIPAL_NAME_MAX_LENGTH} characters`;
+  if (hasControlCharacters(name)) return 'it holds a control character';
+  if (/@|:\/\/|www\.|\//iu.test(name)) return 'it holds an address or a link';
+  if (/[<>`]/u.test(name)) return 'it holds markup';
+  if (/\.\p{L}{2}/u.test(name)) return 'it holds a domain name, which mail turns into a link';
+  return undefined;
+}
+
+function personalName(value: string): string {
+  const name = value.trim();
+  const problem = personalNameProblem(name);
+  if (problem !== undefined) throw new Error(`${JSON.stringify(value)} cannot be a person's name: ${problem}`);
+  return name;
+}
+
+/**
+ * `value` as the principal changes it through main, held as main's container
+ * runs in it (`ianaTimezone`): an IANA zone, correctly cased. Refused when it
+ * is no zone or a UTC offset.
+ */
+function principalTimezone(value: string): string {
+  const zone = ianaTimezone(value);
+  if (zone === undefined) {
+    throw new Error(`Principal timezone is not an IANA time zone such as Europe/London: ${JSON.stringify(value)}`);
+  }
+  return zone;
 }
 
 function identifier(value: string, label: string): string {
@@ -74,17 +158,20 @@ function principalEmail(value: string): string {
   return email;
 }
 
-/** The assistant and the principal are separate people, so no address is both. */
-function assertNotAssistant(email: string, assistantWorkspaceEmail: string | null): void {
-  if (email === assistantWorkspaceEmail) {
-    throw new Error(`${email} is the assistant's own address, not one of the principal's`);
-  }
+/**
+ * The assistant and the principal are separate people, so no address is
+ * both, and an address is listed in one spelling (R3).
+ */
+function assertMayList(email: string, listed: readonly string[], assistantWorkspaceEmail: string | null): void {
+  const conflict = principalAddressConflict(email, listed, assistantWorkspaceEmail);
+  if (conflict !== undefined) throw new Error(conflict);
 }
 
 function principalEmails(values: readonly string[], assistantWorkspaceEmail: string): readonly string[] {
   const emails = [...new Set(values.map(principalEmail))];
   if (emails.length === 0) throw new Error('The principal needs at least one email address');
-  for (const email of emails) assertNotAssistant(email, assistantWorkspaceEmail);
+  const conflict = principalAddressesConflict(emails, assistantWorkspaceEmail);
+  if (conflict !== undefined) throw new Error(conflict);
   return emails;
 }
 
@@ -93,12 +180,18 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
   if (!EMAIL_PATTERN.test(assistantWorkspaceEmail) || assistantWorkspaceEmail.length > 254) {
     throw new Error('Assistant Workspace email is invalid');
   }
-  if (!isValidTimezone(input.principalTimezone)) throw new Error('Principal timezone is invalid');
+  // The seed is held as main's container runs in it, as a change through main is (`principalTimezone`).
+  const seedTimezone = input.principalTimezone === undefined ? undefined : ianaTimezone(input.principalTimezone);
+  if (input.principalTimezone !== undefined && seedTimezone === undefined) {
+    throw new Error('Principal timezone is invalid');
+  }
   return {
     assistantDisplayName: displayName(input.assistantDisplayName, 'Assistant display name'),
     assistantWorkspaceEmail,
-    principalDisplayName: displayName(input.principalDisplayName, 'Principal display name'),
-    principalTimezone: input.principalTimezone,
+    ...(input.principalDisplayName === undefined
+      ? {}
+      : { principalDisplayName: displayName(input.principalDisplayName, 'Principal display name') }),
+    ...(seedTimezone === undefined ? {} : { principalTimezone: seedTimezone }),
     mainAgentGroupId: identifier(input.mainAgentGroupId, 'Main agent group ID'),
     ...(input.principalEmails === undefined
       ? {}
@@ -108,6 +201,25 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
 
 export async function listPrincipalAddresses(): Promise<PrincipalAddress[]> {
   return getDb().all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
+}
+
+/** The addresses the profile holds, as listed and sorted. */
+async function heldAddresses(): Promise<string[]> {
+  return (await listPrincipalAddresses()).map((address) => address.email);
+}
+
+/** The recognizer for the principal's `listed` addresses: one value every comparison with them goes through. */
+export function principalRecognizer(listed: readonly string[]): PrincipalRecognizer {
+  const addresses = [...listed].sort();
+  const resolve = (address: string | undefined): string | undefined =>
+    address === undefined ? undefined : resolvePrincipalAddress(address, addresses);
+  return { resolve, has: (address) => resolve(address) !== undefined, listed: addresses };
+}
+
+/** The recognizer for the addresses the profile holds now; before its table exists, it recognizes no one. */
+export async function loadPrincipalRecognizer(): Promise<PrincipalRecognizer> {
+  if (!(await getDb().hasTable('gws_ea_principal_addresses'))) return principalRecognizer([]);
+  return principalRecognizer(await heldAddresses());
 }
 
 /** The canonical main's agent group, or null until setup names one. */
@@ -209,7 +321,7 @@ export async function getGwsEaProfile(): Promise<GwsEaProfile> {
       WHERE singleton = 1`,
   );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
-  return { ...profile, principal_emails: (await listPrincipalAddresses()).map((address) => address.email) };
+  return { ...profile, principal_emails: await heldAddresses() };
 }
 
 /** Mail from an address speaks as the identity `email:<address>`, as the inbox names every sender. */
@@ -260,6 +372,29 @@ export async function syncPrincipalMembers(): Promise<void> {
   });
 }
 
+/**
+ * Main's container runs in the principal's home timezone (KTD7), which the
+ * profile holds: its container config's copy is derived here, whenever the
+ * profile is reconciled or the principal changes it, so after either the two
+ * agree. Written only when it differs, so a reconcile that changes nothing
+ * leaves main's config as it was.
+ */
+async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: string): Promise<void> {
+  const config = await getContainerConfig(mainAgentGroupId);
+  if (config !== undefined && config.timezone !== timezone) {
+    await updateContainerConfigScalars(mainAgentGroupId, { timezone });
+  }
+}
+
+/** The principal's name and home timezone, as the profile holds them. */
+export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
+  const row = await getDb().get<{ principal_display_name: string | null; principal_timezone: string | null }>(
+    'SELECT principal_display_name, principal_timezone FROM gws_ea_profile WHERE singleton = 1',
+  );
+  if (!row) throw new Error('GWS-EA profile singleton is missing');
+  return { name: row.principal_display_name, timezone: row.principal_timezone };
+}
+
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
 async function replacePrincipalAddresses(emails: readonly string[], addedAt: string): Promise<void> {
   const db = getDb();
@@ -288,23 +423,68 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
       `UPDATE gws_ea_profile
           SET assistant_display_name = ?,
               assistant_workspace_email = ?,
-              principal_display_name = ?,
-              principal_timezone = ?,
+              principal_display_name = COALESCE(?, principal_display_name),
+              principal_timezone = COALESCE(?, principal_timezone),
               main_agent_group_id = ?,
               updated_at = ?
         WHERE singleton = 1`,
       validated.assistantDisplayName,
       validated.assistantWorkspaceEmail,
-      validated.principalDisplayName,
-      validated.principalTimezone,
+      validated.principalDisplayName ?? null,
+      validated.principalTimezone ?? null,
       validated.mainAgentGroupId,
       now,
     );
+    const principal = await principalNameAndTimezone();
+    if (principal.name === null || principal.timezone === null) {
+      throw new Error("A profile that names main needs the principal's name and timezone");
+    }
+    await keepMainInPrincipalTimezone(validated.mainAgentGroupId, principal.timezone);
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
   knownMainAgentGroup = validated.mainAgentGroupId;
   return getGwsEaProfile();
+}
+
+/**
+ * Change the principal's name, home timezone, or both, on the principal's
+ * word (R16). The profile is their one source: main's container timezone is
+ * derived from it in the same transaction. A name must be one a person could
+ * have (`personalNameProblem`). What the profile already holds is not
+ * written again. Returns the values before and after.
+ */
+export async function setPrincipalNameAndTimezone(change: {
+  readonly name?: string;
+  readonly timezone?: string;
+}): Promise<{ readonly before: PublishedNameAndTimezone; readonly after: PublishedNameAndTimezone }> {
+  const name = change.name === undefined ? undefined : personalName(change.name);
+  const timezone = change.timezone === undefined ? undefined : principalTimezone(change.timezone);
+  const db = getDb();
+  return db.transaction(async () => {
+    const mainAgentGroupId = await getMainAgentGroupId();
+    const held = await principalNameAndTimezone();
+    // A profile that names main holds both (`reconcileGwsEaProfile`).
+    if (mainAgentGroupId === null || held.name === null || held.timezone === null) {
+      throw new Error("Main is not published yet, so the principal's name and timezone are not set");
+    }
+    const before = { name: held.name, timezone: held.timezone };
+    const after = { name: name ?? before.name, timezone: timezone ?? before.timezone };
+    if (after.name !== before.name || after.timezone !== before.timezone) {
+      await db.run(
+        `UPDATE gws_ea_profile
+            SET principal_display_name = ?,
+                principal_timezone = ?,
+                updated_at = ?
+          WHERE singleton = 1`,
+        after.name,
+        after.timezone,
+        new Date().toISOString(),
+      );
+    }
+    await keepMainInPrincipalTimezone(mainAgentGroupId, after.timezone);
+    return { before, after };
+  });
 }
 
 async function assistantWorkspaceEmail(): Promise<string | null> {
@@ -315,19 +495,17 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
 }
 
 /**
- * `value` as the profile would hold it, refused when it is malformed or the
- * assistant's own address; `held` says whether the profile holds it already.
+ * `value` as the profile would hold it, refused when it is malformed, the
+ * assistant's own address, or another spelling of one the profile holds;
+ * `held` says whether the profile holds it already.
  */
 export async function proposedPrincipalAddress(
   value: string,
 ): Promise<{ readonly email: string; readonly held: boolean }> {
   const email = principalEmail(value);
-  assertNotAssistant(email, await assistantWorkspaceEmail());
-  const row = await getDb().get<{ present: number }>(
-    'SELECT 1 AS present FROM gws_ea_principal_addresses WHERE email = ?',
-    email,
-  );
-  return { email, held: row !== undefined };
+  const held = await heldAddresses();
+  assertMayList(email, held, await assistantWorkspaceEmail());
+  return { email, held: held.includes(email) };
 }
 
 /** A verified principal identity and its direct message with the assistant. */
@@ -376,7 +554,7 @@ export async function addPrincipalAddress(value: string): Promise<{ readonly ema
   const email = principalEmail(value);
   const db = getDb();
   return db.transaction(async () => {
-    assertNotAssistant(email, await assistantWorkspaceEmail());
+    assertMayList(email, await heldAddresses(), await assistantWorkspaceEmail());
     const added = await holdPrincipalAddress(email, new Date().toISOString());
     await syncPrincipalMembers();
     return { email, added };
@@ -390,7 +568,7 @@ export async function removePrincipalAddress(
   const email = principalEmail(value);
   const db = getDb();
   return db.transaction(async () => {
-    const held = (await listPrincipalAddresses()).map((address) => address.email);
+    const held = await heldAddresses();
     if (!held.includes(email)) throw new Error(`${email} is not one of the principal's addresses`);
     if (held.length === 1) {
       throw new Error(`${email} is the principal's last address; add another before removing it`);
