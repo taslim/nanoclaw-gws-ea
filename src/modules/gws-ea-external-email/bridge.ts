@@ -14,6 +14,11 @@
  *   them on an email as it judges; only `main` brings someone new in (R68).
  *   Before anything crosses, the message, the people it names, each file's
  *   name, and each file that is text pass the private-values check (R67).
+ *   Then every Google link in main's words and text files must open for
+ *   everyone on the thread and everyone main names, the principal aside
+ *   (Slice 6 KTD4), so main hears at once who cannot open which link and
+ *   what it can do; the check when external-email sends stays the
+ *   guarantee.
  *   Files are read only from the request's own outbox in the calling
  *   session, never from a path `main` names. Core stages them into the
  *   thread session's inbox, and each is recorded for the thread by its
@@ -77,6 +82,7 @@ import { setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js'
 import { checkOutbound } from '../gws-ea-privacy/index.js';
 import { getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { checkLinksOpenable, LinkCheckUnavailableError, LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
 
 /** `main`'s action, which the runner's tool of the same name sends. */
 export const EMAIL_HANDOFF_ACTION = 'email_handoff';
@@ -308,10 +314,36 @@ interface Admitted {
   readonly context: RoutingContext;
 }
 
+/** Everyone a handoff's words may reach: the people on the thread's messages, and everyone main named for it. */
+async function threadPeople(target: Target): Promise<string[]> {
+  const known =
+    target.kind === 'thread'
+      ? (await threadAddresses(target.threadKey))
+          .filter((entry) => entry.source !== 'written')
+          .map((entry) => entry.address)
+      : [];
+  return [...new Set([...known, ...target.people])];
+}
+
+/**
+ * Every Google link in main's words opens for everyone they may reach, so
+ * main hears now, in its own words, who cannot open which link.
+ */
+async function assertLinksOpenable(texts: readonly string[], target: Target): Promise<void> {
+  const links = await checkLinksOpenable({ texts, recipients: await threadPeople(target), writer: 'main' }).catch(
+    (error: unknown) => {
+      throw error instanceof LinkCheckUnavailableError
+        ? forbidden(`Nothing was handed over: ${LINKS_UNCHECKED}`)
+        : error;
+    },
+  );
+  if (!links.allowed) throw forbidden(`Nothing was handed over: ${links.reason}`);
+}
+
 /**
  * Check everything a handoff carries before anything is written: its
  * fields, its thread or people, its files, the private-values check over
- * every part that crosses, and its calendar.
+ * every part that crosses, the link check, and its calendar.
  */
 async function admit(content: Record<string, unknown>, session: Session, requestId: string): Promise<Admitted> {
   const message = messageOf(content.message);
@@ -320,15 +352,13 @@ async function admit(content: Record<string, unknown>, session: Session, request
   const context = await loadRoutingContext(await assistantAddresses(), new Date());
   const target = await targetOf(content, context);
   const files = stagedFiles(session, requestId, names, 'Nothing was handed over');
-  const check = await checkOutbound(
-    [
-      message,
-      ...target.people,
-      ...files.flatMap((file) => [file.filename, ...(isUtf8(file.data) ? [file.data.toString('utf8')] : [])]),
-    ],
-    'others',
-  );
+  const fileTexts = files.flatMap((file) => [
+    file.filename,
+    ...(isUtf8(file.data) ? [file.data.toString('utf8')] : []),
+  ]);
+  const check = await checkOutbound([message, ...target.people, ...fileTexts], 'others');
   if (!check.allowed) throw forbidden(`Nothing was handed over: ${check.reason}`);
+  await assertLinksOpenable([message, ...fileTexts], target);
   const bookingCalendar = calendarId === undefined ? undefined : await bookingCalendarOf(calendarId, context);
   return { target, message, files, bookingCalendar, context };
 }

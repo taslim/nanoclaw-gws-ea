@@ -117,6 +117,11 @@ const RATE_LIMITS: ReadonlySet<string> = new Set([
   'dailyLimitExceeded',
 ]);
 
+/** Whether Drive refused a call only to ask the caller to slow down: a 403 naming a rate limit. */
+export function isDriveRateLimit(error: unknown): boolean {
+  return error instanceof GoogleApiError && error.status === 403 && RATE_LIMITS.has(error.reason ?? '');
+}
+
 /**
  * Whether a failed share is Google's final answer for that address: a 400,
  * such as `invalidSharingRequest` for an address with no Google account, or
@@ -126,7 +131,7 @@ const RATE_LIMITS: ReadonlySet<string> = new Set([
  */
 export function isShareRefusal(error: unknown): boolean {
   if (!(error instanceof GoogleApiError)) return false;
-  return error.status === 400 || (error.status === 403 && !RATE_LIMITS.has(error.reason ?? ''));
+  return error.status === 400 || (error.status === 403 && !isDriveRateLimit(error));
 }
 
 // ---------------------------------------------------------------------------

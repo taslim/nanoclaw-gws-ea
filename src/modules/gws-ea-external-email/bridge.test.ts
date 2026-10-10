@@ -54,6 +54,23 @@ vi.mock('../gws-ea-meetings/calendar-api.js', async (importOriginal) => {
   };
 });
 
+/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
+vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
+  const { delegatingDriveApi } = await import('../gws-ea-workspace/testing/fake-drive.js');
+  return {
+    ...actual,
+    createDriveApi: () =>
+      delegatingDriveApi(() => workspace.drive as import('../gws-ea-workspace/drive-api.js').DriveApi),
+  };
+});
+// Nothing in these tests is public: a signed-out visit always meets a sign-in.
+vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-workspace/probe.js')>()),
+  probeLink: async () => 'sign-in',
+}));
+
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -87,6 +104,9 @@ import {
 import { MAX_ATTACHMENT_BYTES } from '../gws-ea-inbox/route-mail.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { getThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
+import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
+import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import './index.js';
 
 const JUNO = 'juno@assistant.example';
@@ -100,9 +120,11 @@ const TEAM_CALENDAR = 'team@group.calendar.google.com';
 const SHARED_CALENDAR = 'family@group.calendar.google.com';
 /** Jane's team calendar, which the assistant can write to and is not the principal's. */
 const PARTNER_CALENDAR = 'partner-team@group.calendar.google.com';
+const STRANGER = 'noel@archer.example';
 
 let main: Session;
 let calendar: FakeCalendar;
+let drive: FakeDrive;
 let inbox: string;
 
 function now(): string {
@@ -278,6 +300,11 @@ beforeEach(async () => {
   calendar.calendars.set(TEAM_CALENDAR, { id: TEAM_CALENDAR, accessRole: 'writer', dataOwner: PRINCIPAL });
   calendar.calendars.set(SHARED_CALENDAR, { id: SHARED_CALENDAR, accessRole: 'reader', dataOwner: PRINCIPAL });
   calendar.calendars.set(PARTNER_CALENDAR, { id: PARTNER_CALENDAR, accessRole: 'writer', dataOwner: JANE });
+
+  // Everyone gets the same Drive permission id in every test, so an id the link check cached stays true.
+  drive = new FakeDrive(JUNO);
+  for (const person of [PRINCIPAL, REMY, JANE, STRANGER]) drive.addAccount(person);
+  workspace.drive = drive;
 });
 
 afterEach(async () => {
@@ -583,6 +610,63 @@ describe('email_handoff', () => {
 // ---------------------------------------------------------------------------
 // tell_main
 // ---------------------------------------------------------------------------
+
+describe('a Google link in a handoff (Slice 6 R4, R18, KTD4)', () => {
+  const docUrl = (id: string) => `https://docs.google.com/document/d/${id}/edit`;
+
+  async function shared(name: string, people: readonly string[]): Promise<string> {
+    const { id } = await drive.createFile({ name, mimeType: 'application/vnd.google-apps.document' });
+    for (const person of people) await drive.createPermission(id, { emailAddress: person, role: 'reader' });
+    return id;
+  }
+
+  it("refuses the principal's deck the assistant can only view, naming the principal as its owner, and hands nothing over (AE3)", async () => {
+    const deck = drive.shareWithAssistant({
+      name: 'Board deck',
+      owner: PRINCIPAL,
+      role: 'reader',
+      mimeType: 'application/vnd.google-apps.presentation',
+    });
+    const url = `https://docs.google.com/presentation/d/${deck}/edit`;
+    expect(refusal(await handoff({ people: [REMY], message: `Remy asked for the board deck: send ${url}` }))).toBe(
+      `Nothing was handed over: ${REMY} may not be able to open ${url}: it belongs to the principal (${PRINCIPAL}), and the assistant can only view it, so it can't see who else may open it or share it. Ask the principal to share it with them, leave them out, or send it without the link.`,
+    );
+    expect(await count('gws_ea_threads')).toBe(0);
+    expect(await externalEmailSessions()).toBe(0);
+  });
+
+  it('checks everyone on the thread: someone an outsider copied in is offered to main to leave out', async () => {
+    const { key, session } = await inboundThread('g-coffee', JANE);
+    // Jane's email copied in someone the agenda was never shared with.
+    await recordThreadAddresses(key, [STRANGER], 'message', now());
+    const agenda = await shared('Agenda', [JANE]);
+
+    expect(refusal(await handoff({ thread_key: key, message: `Send Jane the agenda: ${docUrl(agenda)}` }))).toBe(
+      `Nothing was handed over: ${STRANGER} can't open ${docUrl(agenda)}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    );
+    expect(texts(session)).toEqual([]);
+
+    // main shares it with them, view-only, and hands it over.
+    await drive.createPermission(agenda, { emailAddress: STRANGER, role: 'reader' });
+    expect(keyOf(await handoff({ thread_key: key, message: `Send Jane the agenda: ${docUrl(agenda)}` }))).toBe(key);
+  });
+
+  it('checks the people main names, never the principal among them', async () => {
+    const agenda = await shared('Agenda', [REMY]);
+    const frame = await handoff({ people: [REMY, PRINCIPAL], message: `Share the agenda: ${docUrl(agenda)}` });
+    expect(texts(await requireThreadSession(keyOf(frame)))).toHaveLength(1);
+  });
+
+  it('answers that main can try again shortly when Drive is briefly down', async () => {
+    const agenda = await shared('Agenda', [REMY]);
+    for (let attempt = 0; attempt < 3; attempt += 1)
+      drive.failNext('getFile', new GoogleApiError(503, 'Backend Error'));
+    expect(refusal(await handoff({ people: [REMY], message: `Share the agenda: ${docUrl(agenda)}` }))).toBe(
+      `Nothing was handed over: ${LINKS_UNCHECKED}`,
+    );
+    expect(await externalEmailSessions()).toBe(0);
+  });
+});
 
 describe('tell_main', () => {
   it('reaches main framed untrusted, stamped with the thread key and its people, the sender’s subject inside the frame', async () => {

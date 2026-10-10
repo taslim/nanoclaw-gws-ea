@@ -32,6 +32,14 @@
  * show them a private value, and the email does not go at all when its
  * subject or people would.
  *
+ * Then the link check (gws-ea-workspace's `checkLinksOpenable`, Slice 6
+ * KTD4): every Google link in what the assistant wrote, its subject, words
+ * and text files, must open for everyone the email reaches but the
+ * principal. The quote is never read: its links are other people's. A
+ * refusal tells external-email only who cannot open a link, and to tell
+ * main. When Google is briefly unavailable, a reply waits for delivery's own
+ * retry, and `email_send` answers that it can be tried again shortly.
+ *
  * A send Gmail already took is answered from Gmail before anything is
  * checked again (send.ts), so a check that would refuse it now never reports
  * a sent email as unsent.
@@ -71,6 +79,12 @@ import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { audienceForAddresses, checkOutbound, PRIVACY_GUARD_ID } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  checkLinksOpenable,
+  LINK_ACCESS_REFUSER,
+  LinkCheckUnavailableError,
+  LINKS_UNCHECKED,
+} from '../gws-ea-workspace/link-access.js';
 import { buildMime, encodeRaw, normalizeAddress, parseGmailMessage, type ParsedMail } from './mime.js';
 import { replyAll, threadRecipients, type Recipients } from './recipients.js';
 import { emailSignature, quotedBy, renderEmail, type QuotedMessage } from './render.js';
@@ -298,6 +312,13 @@ export async function sendToOutside(
     );
     if (!written.allowed) throw new OutboundRefusedError(PRIVACY_GUARD_ID, written.reason);
     const quote = anchor === undefined ? undefined : await carriedOver(anchor, placed, runtime);
+    // Every Google link it wrote opens for everyone it reaches; the quote's links are its writer's.
+    const links = await checkLinksOpenable({
+      texts: [email.subject ?? '', email.text, ...filesText(attachments)],
+      recipients: [...placed.to, ...placed.cc],
+      writer: 'external-email',
+    });
+    if (!links.allowed) throw new OutboundRefusedError(LINK_ACCESS_REFUSER, links.reason);
     const body = renderEmail({
       markdown: email.text,
       signature: emailSignature(await getGwsEaProfile()),
@@ -441,8 +462,10 @@ const emailSend: ActionAnswer = async (content, session, requestId) => {
       ? await toPrincipal(content, session, requestId)
       : await inThread(content, session, requestId);
   } catch (error) {
-    // An outbound guard refused the email as written.
-    throw error instanceof OutboundRefusedError ? forbidden(`Your email was not sent: ${error.reason}`) : error;
+    // An outbound guard refused the email as written, or Google was too briefly unavailable to check its links.
+    if (error instanceof OutboundRefusedError) throw forbidden(`Your email was not sent: ${error.reason}`);
+    if (error instanceof LinkCheckUnavailableError) throw forbidden(`Your email was not sent: ${LINKS_UNCHECKED}`);
+    throw error;
   }
 };
 

@@ -365,3 +365,21 @@ export class FakeDrive implements DriveApi {
     };
   }
 }
+
+/**
+ * A Drive client that hands every call to whichever Drive `current` names
+ * when it is made, so a test can mock the host's client factory once and
+ * give each test its own fake.
+ */
+export function delegatingDriveApi(current: () => DriveApi): DriveApi {
+  return {
+    getFile: (fileId) => current().getFile(fileId),
+    createFile: (input) => current().createFile(input),
+    updateFile: (fileId, changes) => current().updateFile(fileId, changes),
+    listPermissions: (fileId) => current().listPermissions(fileId),
+    createPermission: (fileId, input) => current().createPermission(fileId, input),
+    deletePermission: (fileId, permissionId) => current().deletePermission(fileId, permissionId),
+    permissionId: (emailAddress) => current().permissionId(emailAddress),
+    listAccessProposals: (fileId) => current().listAccessProposals(fileId),
+  };
+}
