@@ -165,13 +165,13 @@ afterEach(async () => {
 });
 
 describe('the home folder', () => {
-  it('is made on the first tick, named for the principal and the assistant, and shared with every principal address so a Doc made in it opens from each (AE1)', async () => {
+  it('is made on the first tick, named for the assistant alone, and shared with every principal address so a Doc made in it opens from each (AE1)', async () => {
     await setUpProfile();
     await world.home.tick();
 
     const id = folderId();
     expect(world.drive.file(id)).toMatchObject({
-      name: 'Morgan Ellery · Juno',
+      name: 'Principal · Juno',
       mimeType: FOLDER_MIME_TYPE,
       trashed: false,
       parents: [],
@@ -502,6 +502,23 @@ describe('the home folder', () => {
     expect(world.notes[1].text).toMatch(/deleted/u);
   });
 
+  it("keeps a folder's name: one made before this release, or before the principal's name changed, is never renamed", async () => {
+    await setUpProfile();
+    // A folder an earlier release made, named for the principal.
+    const earlier = await world.drive.createFile({ name: 'Morgan Ellery · Juno', mimeType: FOLDER_MIME_TYPE });
+    await getDb().run('UPDATE gws_ea_workspace_folder SET folder_id = ? WHERE singleton = 1', earlier.id);
+    await world.home.load();
+    await world.home.tick();
+    await getDb().run("UPDATE gws_ea_profile SET principal_display_name = 'Juno Hale' WHERE singleton = 1");
+    const mark = world.drive.calls.length;
+    await world.home.tick();
+
+    expect(folderId()).toBe(earlier.id);
+    expect(world.drive.file(earlier.id)?.name).toBe('Morgan Ellery · Juno');
+    expect(world.drive.calls.filter((call) => call.op === 'updateFile')).toEqual([]);
+    expect(writesSince(mark)).toEqual([]);
+  });
+
   it('reads the recorded folder at load, as the host starts', async () => {
     await setUpProfile();
     await world.home.tick();
@@ -534,12 +551,12 @@ describe('the home folder tick', () => {
     expect(world.home.folderId()).toBeDefined();
   });
 
-  it('does nothing before the assistant signs in, or before the profile names the principal and the assistant', async () => {
+  it('does nothing before the assistant signs in, or before the profile names the assistant', async () => {
     world.grant = undefined;
     await setUpProfile();
     await world.home.tick();
     world.grant = GRANT;
-    await getDb().run('UPDATE gws_ea_profile SET principal_display_name = NULL WHERE singleton = 1');
+    await getDb().run('UPDATE gws_ea_profile SET assistant_display_name = NULL WHERE singleton = 1');
     await world.home.tick();
 
     expect(world.drive.calls).toEqual([]);

@@ -2,18 +2,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { lookup } from '../../cli/registry.js';
+import { setDeliveryAdapter } from '../../delivery.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { emailSignature } from '../gws-ea-inbox/render.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
 import {
   bindVerifiedPrincipalUser,
   getExternalEmailAgentGroupId,
@@ -259,6 +262,45 @@ describe('GWS-EA profile module', () => {
         resolved_at: '2026-09-18T02:00:00.000Z',
       },
     ]);
+  });
+
+  it("seeds the principal's name and timezone when the profile publishes main, and derives main's container timezone from it", async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    const published = {
+      'assistant-display-name': 'Aya',
+      'assistant-workspace-email': 'aya@example.test',
+      'main-agent-group-id': main.id,
+    };
+    const reconcile = (args: Record<string, unknown>) =>
+      dispatch({ id: 'reconcile', command: 'gws-ea-profile-reconcile', args }, { caller: 'host' });
+
+    // A profile that names main names the principal.
+    expect(await reconcile(published)).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/name and timezone/u) },
+    });
+    expect((await getGwsEaProfile()).main_agent_group_id).toBeNull();
+
+    expect(
+      await reconcile({
+        ...published,
+        'principal-display-name': 'Morgan Ellery',
+        'principal-timezone': 'Africa/Lagos',
+      }),
+    ).toMatchObject({
+      ok: true,
+      data: { principal_display_name: 'Morgan Ellery', principal_timezone: 'Africa/Lagos' },
+    });
+    const config = await getContainerConfig(main.id);
+    expect(config?.timezone).toBe('Africa/Lagos');
+
+    // A reconcile after publication names no principal: the profile keeps theirs, and main's config is left as it was.
+    expect(await reconcile(published)).toMatchObject({
+      ok: true,
+      data: { principal_display_name: 'Morgan Ellery', principal_timezone: 'Africa/Lagos' },
+    });
+    expect(await getContainerConfig(main.id)).toEqual(config);
   });
 
   it('accepts only canonical UTC timestamps for verified principal bindings', async () => {
@@ -601,5 +643,269 @@ describe("external-email's pointer and audience", () => {
     const [other] = await getRequiredProjectDocSections(research);
     expect(other?.body).toContain('`morgan@example.test`');
     expect(other?.body).toContain('`aya@example.test`');
+  });
+});
+
+describe("the principal's name and timezone (R16, KTD9)", () => {
+  const main = group('ag-main');
+  const research = group('ag-research', 'research');
+  const HOST: CallerContext = { caller: 'host' };
+  const PRINCIPAL = 'gchat:users/principal';
+  const DM = { channelType: 'gchat', platformId: 'gchat:spaces/dm' } as const;
+  const published = {
+    'assistant-display-name': 'Aya',
+    'assistant-workspace-email': 'aya@example.test',
+    'main-agent-group-id': main.id,
+  };
+
+  /** What the principal's direct message received. */
+  let sent: string[];
+
+  function agent(agentGroupId: string): CallerContext {
+    return { caller: 'agent', sessionId: `session-${agentGroupId}`, agentGroupId, messagingGroupId: 'mg-dm' };
+  }
+
+  function run(command: string, args: Record<string, unknown> = {}, ctx: CallerContext = HOST) {
+    return dispatch({ id: command, command, args }, ctx);
+  }
+
+  async function nameAndTimezone(): Promise<unknown> {
+    const profile = await getGwsEaProfile();
+    return { name: profile.principal_display_name, timezone: profile.principal_timezone };
+  }
+
+  async function mainTimezone(): Promise<string | null | undefined> {
+    return (await getContainerConfig(main.id))?.timezone;
+  }
+
+  beforeEach(async () => {
+    sent = [];
+    for (const candidate of [main, research]) {
+      await createGroup(candidate);
+      // Binding the principal grants main global CLI scope (init-first-agent's owner grant).
+      await updateContainerConfigScalars(candidate.id, { cli_scope: 'global' });
+    }
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Morgan Ellery',
+      principalTimezone: 'America/Los_Angeles',
+      mainAgentGroupId: main.id,
+      principalEmails: ['morgan@example.test'],
+    });
+    await createMessagingGroup({
+      id: 'mg-dm',
+      channel_type: DM.channelType,
+      platform_id: DM.platformId,
+      instance: 'gchat',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: '2026-10-10T08:00:00.000Z',
+    });
+    await createUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: '2026-10-10T08:00:00.000Z' });
+    await bindVerifiedPrincipalUser(PRINCIPAL, '2026-10-10T08:00:00.000Z');
+    await upsertUserDm({
+      user_id: PRINCIPAL,
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-dm',
+      resolved_at: '2026-10-10T08:00:00.000Z',
+    });
+    setDeliveryAdapter({
+      async deliver(channelType, platformId, _threadId, _kind, content) {
+        expect({ channelType, platformId }).toEqual(DM);
+        sent.push((JSON.parse(content) as { text: string }).text);
+        return 'platform-message';
+      },
+    });
+  });
+
+  it('registers get and set for main and the operator, beside the hidden control-plane commands', () => {
+    for (const verb of ['get', 'set']) {
+      const command = lookup(`principal-profile-${verb}`);
+      expect(command, verb).toMatchObject({ access: 'open', resource: 'principal-profile' });
+      expect(command?.hostOnly, verb).toBeFalsy();
+    }
+    expect(lookup('gws-ea-profile-get')).toMatchObject({ access: 'hidden', hostOnly: true });
+    expect(lookup('gws-ea-profile-reconcile')).toMatchObject({ access: 'hidden', hostOnly: true });
+  });
+
+  it('gives main the name and timezone only', async () => {
+    expect(await run('principal-profile-get', {}, agent(main.id))).toEqual({
+      id: 'principal-profile-get',
+      ok: true,
+      data: { name: 'Morgan Ellery', timezone: 'America/Los_Angeles' },
+    });
+  });
+
+  it("changes the name on main's word: live readers use it at once, and the principal gets one receipt", async () => {
+    const response = await run('principal-profile-set', { name: 'Juno Hale' }, agent(main.id));
+
+    expect(response).toMatchObject({
+      ok: true,
+      data: {
+        name: 'Juno Hale',
+        timezone: 'America/Los_Angeles',
+        changed: ['name'],
+        message: expect.stringMatching(/next start/u),
+      },
+    });
+    expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
+    // The signature reads the profile at each send.
+    expect(emailSignature(await getGwsEaProfile())).toEqual(['Aya', 'Assistant to Juno Hale']);
+    // main's identity text is composed at its next start, from the profile.
+    const [section] = await getRequiredProjectDocSections(main);
+    expect(section?.body).toContain('Juno Hale is the principal.');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('Morgan Ellery');
+    expect(sent[0]).toContain('Juno Hale');
+    expect(await mainTimezone()).toBe('America/Los_Angeles');
+  });
+
+  it("changes the timezone in the profile and main's container config together, with one receipt", async () => {
+    const response = await run('principal-profile-set', { timezone: 'Europe/London' }, agent(main.id));
+
+    expect(response).toMatchObject({
+      ok: true,
+      data: { name: 'Morgan Ellery', timezone: 'Europe/London', changed: ['timezone'] },
+    });
+    // free_time and the other host-side labels read the profile's timezone at each call.
+    expect((await getGwsEaProfile()).principal_timezone).toBe('Europe/London');
+    expect(await mainTimezone()).toBe('Europe/London');
+    expect((await getContainerConfig(research.id))?.timezone).toBeNull();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('America/Los_Angeles');
+    expect(sent[0]).toContain('Europe/London');
+  });
+
+  it('changes both in one receipt, and a set that changes nothing writes nothing and sends nothing', async () => {
+    expect(
+      await run('principal-profile-set', { name: 'Juno Hale', timezone: 'Africa/Lagos' }, agent(main.id)),
+    ).toMatchObject({ ok: true, data: { changed: ['name', 'timezone'] } });
+    expect(sent).toHaveLength(1);
+    for (const value of ['Morgan Ellery', 'Juno Hale', 'America/Los_Angeles', 'Africa/Lagos']) {
+      expect(sent[0]).toContain(value);
+    }
+    const { updated_at: updatedAt } = await getGwsEaProfile();
+
+    expect(
+      await run('principal-profile-set', { name: 'Juno Hale', timezone: 'Africa/Lagos' }, agent(main.id)),
+    ).toMatchObject({ ok: true, data: { changed: [], message: expect.stringMatching(/nothing changed/iu) } });
+    expect(sent).toHaveLength(1);
+    expect((await getGwsEaProfile()).updated_at).toBe(updatedAt);
+  });
+
+  it('tells main to tell the principal itself when the receipt cannot reach them', async () => {
+    await getDb().run('DELETE FROM user_dms');
+
+    expect(await run('principal-profile-set', { name: 'Juno Hale' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { changed: ['name'], message: expect.stringMatching(/could not reach the principal/u) },
+    });
+    expect(sent).toEqual([]);
+  });
+
+  it.each([
+    ['an address', 'Juno Hale juno@example.com'],
+    ['a link', 'Juno https://pay.example'],
+    ['a link without a scheme', 'Juno www.pay'],
+    ['a path', 'Juno/Hale'],
+    ['a bare domain', 'Juno Hale pay-juno.example'],
+    ['markup', 'Juno <b>Hale</b>'],
+    ['a code span', 'Juno `Hale`'],
+    ['too many characters', `Juno ${'Hale'.repeat(20)}`],
+    ['nothing', '   '],
+    ['a line break', 'Juno\nHale'],
+  ])('refuses a name holding %s and changes nothing', async (_case, name) => {
+    const response = await run('principal-profile-set', { name, timezone: 'Europe/London' }, agent(main.id));
+
+    expect(response).toMatchObject({ ok: false, error: { message: expect.stringMatching(/person's name/u) } });
+    expect(await nameAndTimezone()).toEqual({ name: 'Morgan Ellery', timezone: 'America/Los_Angeles' });
+    expect(await mainTimezone()).toBe('America/Los_Angeles');
+    expect(sent).toEqual([]);
+  });
+
+  it.each(['J.R. Hale', 'Dr. Juno Hale', 'Noël Archer-Ford', "Lena O'Ford Jr."])('accepts %s', async (name) => {
+    expect(await run('principal-profile-set', { name }, agent(main.id))).toMatchObject({ ok: true, data: { name } });
+  });
+
+  it('refuses a timezone that is not an IANA zone, and a set that names nothing', async () => {
+    expect(await run('principal-profile-set', { timezone: 'Not/A-Timezone' }, agent(main.id))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/timezone/iu) },
+    });
+    expect(await run('principal-profile-set', {}, agent(main.id))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/--name.*--timezone/u) },
+    });
+    expect(await nameAndTimezone()).toEqual({ name: 'Morgan Ellery', timezone: 'America/Los_Angeles' });
+    expect(sent).toEqual([]);
+  });
+
+  it("refuses a UTC offset, which a container's TZ reads with its sign flipped, and keeps a zone in its own spelling", async () => {
+    expect(await run('principal-profile-set', { timezone: '+05:30' }, agent(main.id))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/timezone/iu) },
+    });
+    expect(sent).toEqual([]);
+
+    // A miscased name reads as UTC in a container's TZ, so the profile holds the zone's own spelling.
+    expect(await run('principal-profile-set', { timezone: 'europe/london' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { timezone: 'Europe/London' },
+    });
+    expect(await nameAndTimezone()).toEqual({ name: 'Morgan Ellery', timezone: 'Europe/London' });
+
+    // A zone's other name, cased as the zone database writes it, stays the principal's own words.
+    expect(await run('principal-profile-set', { timezone: 'Asia/Kolkata' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { timezone: 'Asia/Kolkata' },
+    });
+  });
+
+  it("refuses every caller but main and the operator, and leaves the control plane's profile read as it was", async () => {
+    for (const [command, args] of [
+      ['principal-profile-get', {}],
+      ['principal-profile-set', { name: 'Juno Hale' }],
+    ] as const) {
+      expect(await run(command, args, agent(research.id)), command).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/only to main/u) },
+      });
+    }
+    expect(await run('principal-profile-set', { timezone: 'Europe/London' }, HOST)).toMatchObject({ ok: true });
+    expect(sent).toHaveLength(1);
+
+    expect(await run('gws-ea-profile-get', {}, agent(main.id))).toMatchObject({
+      ok: false,
+      error: { code: 'forbidden' },
+    });
+    const read = await run('gws-ea-profile-get');
+    expect(read).toMatchObject({ ok: true, data: { principal_display_name: 'Morgan Ellery' } });
+    expect(read.ok && Object.keys(read.data as object).sort()).toEqual(
+      [
+        'assistant_display_name',
+        'assistant_workspace_email',
+        'external_email_agent_group_id',
+        'main_agent_group_id',
+        'principal_display_name',
+        'principal_emails',
+        'principal_timezone',
+        'updated_at',
+      ].sort(),
+    );
+  });
+
+  it('keeps what main set through a control-plane reconcile, which derives main’s container timezone from the profile', async () => {
+    await run('principal-profile-set', { name: 'Juno Hale', timezone: 'Europe/London' }, agent(main.id));
+    // Drift from elsewhere: the reconcile puts main back in the principal's timezone.
+    await updateContainerConfigScalars(main.id, { timezone: 'Asia/Tokyo' });
+
+    expect(await run('gws-ea-profile-reconcile', published)).toMatchObject({
+      ok: true,
+      data: { principal_display_name: 'Juno Hale', principal_timezone: 'Europe/London' },
+    });
+    expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'Europe/London' });
+    expect(await mainTimezone()).toBe('Europe/London');
   });
 });

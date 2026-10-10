@@ -1,5 +1,6 @@
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   EMAIL_PATTERN,
@@ -38,8 +39,14 @@ export type ProjectDocAudience = 'main' | 'external-email' | 'other';
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
   readonly assistantWorkspaceEmail: string;
-  readonly principalDisplayName: string;
-  readonly principalTimezone: string;
+  /**
+   * The principal's name and timezone as create declared them, which seed
+   * the profile. Absent once main is published: the principal then changes
+   * them through main (`setPrincipalNameAndTimezone`), and a reconcile keeps
+   * what the profile holds.
+   */
+  readonly principalDisplayName?: string;
+  readonly principalTimezone?: string;
   readonly mainAgentGroupId: string;
   /**
    * The principal's addresses as create declared them; the profile then holds
@@ -57,6 +64,18 @@ export interface VerifiedPrincipalUser {
 export interface PrincipalAddress {
   readonly email: string;
   readonly added_at: string;
+}
+
+/** The principal's name and home timezone, as the profile holds them; null until create seeds them. */
+export interface PrincipalNameAndTimezone {
+  readonly name: string | null;
+  readonly timezone: string | null;
+}
+
+/** The principal's name and home timezone once main is published, when the profile holds both. */
+export interface PublishedNameAndTimezone {
+  readonly name: string;
+  readonly timezone: string;
 }
 
 /**
@@ -80,6 +99,54 @@ function displayName(value: string, label: string): string {
     throw new Error(`${label} is invalid`);
   }
   return normalized;
+}
+
+/**
+ * The longest name `main` may set for the principal. A name with titles and
+ * a suffix fits well within it, and it keeps a sentence of instructions out
+ * of every signature the name reaches.
+ */
+const PRINCIPAL_NAME_MAX_LENGTH = 80;
+
+/**
+ * Why `name` could not be a person's name, or undefined when it could
+ * (KTD9). The name reaches every outgoing signature and external-email's
+ * instructions, so it carries no address, link or markup: a dot directly
+ * before two letters is a domain, which mail clients turn into a link.
+ */
+function personalNameProblem(name: string): string | undefined {
+  if (!name) return 'it is empty';
+  if (name.length > PRINCIPAL_NAME_MAX_LENGTH) return `it is longer than ${PRINCIPAL_NAME_MAX_LENGTH} characters`;
+  if (hasControlCharacters(name)) return 'it holds a control character';
+  if (/@|:\/\/|www\.|\//iu.test(name)) return 'it holds an address or a link';
+  if (/[<>`]/u.test(name)) return 'it holds markup';
+  if (/\.\p{L}{2}/u.test(name)) return 'it holds a domain name, which mail turns into a link';
+  return undefined;
+}
+
+function personalName(value: string): string {
+  const name = value.trim();
+  const problem = personalNameProblem(name);
+  if (problem !== undefined) throw new Error(`${JSON.stringify(value)} cannot be a person's name: ${problem}`);
+  return name;
+}
+
+/**
+ * `value` as an IANA zone, correctly cased, since main's container runs in
+ * it: a container's TZ reads a UTC offset such as `+05:30` with its sign
+ * flipped, and a miscased name as UTC. A name already cased as the zone
+ * database writes it stays as given, even when it is another name for a
+ * zone (`Asia/Kolkata`); a miscased one takes the zone's own spelling.
+ * Refused when it is no zone.
+ */
+function principalTimezone(value: string): string {
+  const zone = value.trim();
+  if (!/^[A-Za-z]/u.test(zone) || !isValidTimezone(zone)) {
+    throw new Error(`Principal timezone is not an IANA time zone such as Europe/London: ${JSON.stringify(value)}`);
+  }
+  const resolved = new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
+  if (resolved.toLowerCase() === zone.toLowerCase()) return resolved;
+  return zone.split('/').every((part) => /^[A-Z]/u.test(part)) ? zone : resolved;
 }
 
 function identifier(value: string, label: string): string {
@@ -118,12 +185,16 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
   if (!EMAIL_PATTERN.test(assistantWorkspaceEmail) || assistantWorkspaceEmail.length > 254) {
     throw new Error('Assistant Workspace email is invalid');
   }
-  if (!isValidTimezone(input.principalTimezone)) throw new Error('Principal timezone is invalid');
+  if (input.principalTimezone !== undefined && !isValidTimezone(input.principalTimezone)) {
+    throw new Error('Principal timezone is invalid');
+  }
   return {
     assistantDisplayName: displayName(input.assistantDisplayName, 'Assistant display name'),
     assistantWorkspaceEmail,
-    principalDisplayName: displayName(input.principalDisplayName, 'Principal display name'),
-    principalTimezone: input.principalTimezone,
+    ...(input.principalDisplayName === undefined
+      ? {}
+      : { principalDisplayName: displayName(input.principalDisplayName, 'Principal display name') }),
+    ...(input.principalTimezone === undefined ? {} : { principalTimezone: input.principalTimezone }),
     mainAgentGroupId: identifier(input.mainAgentGroupId, 'Main agent group ID'),
     ...(input.principalEmails === undefined
       ? {}
@@ -304,6 +375,29 @@ export async function syncPrincipalMembers(): Promise<void> {
   });
 }
 
+/**
+ * Main's container runs in the principal's home timezone (KTD7), which the
+ * profile holds: its container config's copy is derived here, whenever the
+ * profile is reconciled or the principal changes it, so after either the two
+ * agree. Written only when it differs, so a reconcile that changes nothing
+ * leaves main's config as it was.
+ */
+async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: string): Promise<void> {
+  const config = await getContainerConfig(mainAgentGroupId);
+  if (config !== undefined && config.timezone !== timezone) {
+    await updateContainerConfigScalars(mainAgentGroupId, { timezone });
+  }
+}
+
+/** The principal's name and home timezone, as the profile holds them. */
+export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
+  const row = await getDb().get<{ principal_display_name: string | null; principal_timezone: string | null }>(
+    'SELECT principal_display_name, principal_timezone FROM gws_ea_profile WHERE singleton = 1',
+  );
+  if (!row) throw new Error('GWS-EA profile singleton is missing');
+  return { name: row.principal_display_name, timezone: row.principal_timezone };
+}
+
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
 async function replacePrincipalAddresses(emails: readonly string[], addedAt: string): Promise<void> {
   const db = getDb();
@@ -332,23 +426,68 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
       `UPDATE gws_ea_profile
           SET assistant_display_name = ?,
               assistant_workspace_email = ?,
-              principal_display_name = ?,
-              principal_timezone = ?,
+              principal_display_name = COALESCE(?, principal_display_name),
+              principal_timezone = COALESCE(?, principal_timezone),
               main_agent_group_id = ?,
               updated_at = ?
         WHERE singleton = 1`,
       validated.assistantDisplayName,
       validated.assistantWorkspaceEmail,
-      validated.principalDisplayName,
-      validated.principalTimezone,
+      validated.principalDisplayName ?? null,
+      validated.principalTimezone ?? null,
       validated.mainAgentGroupId,
       now,
     );
+    const principal = await principalNameAndTimezone();
+    if (principal.name === null || principal.timezone === null) {
+      throw new Error("A profile that names main needs the principal's name and timezone");
+    }
+    await keepMainInPrincipalTimezone(validated.mainAgentGroupId, principal.timezone);
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
   knownMainAgentGroup = validated.mainAgentGroupId;
   return getGwsEaProfile();
+}
+
+/**
+ * Change the principal's name, home timezone, or both, on the principal's
+ * word (R16). The profile is their one source: main's container timezone is
+ * derived from it in the same transaction. A name must be one a person could
+ * have (`personalNameProblem`). What the profile already holds is not
+ * written again. Returns the values before and after.
+ */
+export async function setPrincipalNameAndTimezone(change: {
+  readonly name?: string;
+  readonly timezone?: string;
+}): Promise<{ readonly before: PublishedNameAndTimezone; readonly after: PublishedNameAndTimezone }> {
+  const name = change.name === undefined ? undefined : personalName(change.name);
+  const timezone = change.timezone === undefined ? undefined : principalTimezone(change.timezone);
+  const db = getDb();
+  return db.transaction(async () => {
+    const mainAgentGroupId = await getMainAgentGroupId();
+    const held = await principalNameAndTimezone();
+    // A profile that names main holds both (`reconcileGwsEaProfile`).
+    if (mainAgentGroupId === null || held.name === null || held.timezone === null) {
+      throw new Error("Main is not published yet, so the principal's name and timezone are not set");
+    }
+    const before = { name: held.name, timezone: held.timezone };
+    const after = { name: name ?? before.name, timezone: timezone ?? before.timezone };
+    if (after.name !== before.name || after.timezone !== before.timezone) {
+      await db.run(
+        `UPDATE gws_ea_profile
+            SET principal_display_name = ?,
+                principal_timezone = ?,
+                updated_at = ?
+          WHERE singleton = 1`,
+        after.name,
+        after.timezone,
+        new Date().toISOString(),
+      );
+    }
+    await keepMainInPrincipalTimezone(mainAgentGroupId, after.timezone);
+    return { before, after };
+  });
 }
 
 async function assistantWorkspaceEmail(): Promise<string | null> {

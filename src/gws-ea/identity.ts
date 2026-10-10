@@ -17,18 +17,25 @@ export const MAIN_TEMPLATE = 'gws-ea/main';
 export const MAIN_GROUP_NAME = 'main';
 export const MAIN_PLUGIN_NAME = 'gws-ea-main';
 
+/** The principal as create declared them, which seeds the profile when it first publishes main. */
+export interface PrincipalSeed {
+  readonly displayName: string;
+  /** Their home timezone; main's container runs in it, as the host derives it from the profile (KTD7). */
+  readonly timezone: string;
+  /** One or more addresses; the profile then holds exactly these. */
+  readonly emails: readonly string[];
+}
+
 export interface MainIdentityInput {
   readonly assistantDisplayName: string;
   readonly assistantWorkspaceEmail: string;
-  readonly principalDisplayName: string;
-  /** Main's container runs in it: the profile's principal timezone is the one source (KTD7). */
-  readonly principalTimezone: string;
   /**
-   * The principal's addresses create declared, which the profile then holds
-   * exactly. Absent once main is published: the profile holds them, and the
-   * principal and the operator change them there.
+   * The principal, until main is published. Absent after: the profile is the
+   * one source of their name, timezone and addresses, which the principal
+   * changes through main and the operator through `gws-ea ncl`, and nothing
+   * here writes them again (KTD9).
    */
-  readonly principalEmails?: readonly string[];
+  readonly principal?: PrincipalSeed;
 }
 
 export interface MainIdentityResult {
@@ -90,21 +97,25 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
     'Assistant Workspace email',
     254,
   );
-  const principalTimezone = safeString(input.principalTimezone, 'Principal timezone', 120);
   if (!EMAIL_PATTERN.test(assistantWorkspaceEmail)) {
     throw new GwsEaError('invalid_identity', 'Assistant Workspace email is invalid');
-  }
-  if (!isValidTimezone(principalTimezone)) {
-    throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
   }
   return {
     assistantDisplayName: safeString(input.assistantDisplayName.trim(), 'Assistant display name', 120),
     assistantWorkspaceEmail,
-    principalDisplayName: safeString(input.principalDisplayName.trim(), 'Principal display name', 120),
-    principalTimezone,
-    ...(input.principalEmails === undefined
+    ...(input.principal === undefined
       ? {}
-      : { principalEmails: validatePrincipalEmails(input.principalEmails, assistantWorkspaceEmail) }),
+      : { principal: validatePrincipalSeed(input.principal, assistantWorkspaceEmail) }),
+  };
+}
+
+function validatePrincipalSeed(seed: PrincipalSeed, assistantWorkspaceEmail: string): PrincipalSeed {
+  const timezone = safeString(seed.timezone, 'Principal timezone', 120);
+  if (!isValidTimezone(timezone)) throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
+  return {
+    displayName: safeString(seed.displayName.trim(), 'Principal display name', 120),
+    timezone,
+    emails: validatePrincipalEmails(seed.emails, assistantWorkspaceEmail),
   };
 }
 
@@ -159,9 +170,12 @@ async function reconcileAllSecretMode(admin: OnecliAdmin, agentGroupId: string):
 /**
  * Reconcile the canonical main group and its credential boundary. The profile
  * pointer is published last, so principal binding cannot observe a canonical
- * main until its provider, its container timezone, its shared skills, and
- * instance-vault-wide OneCLI access have been verified. Main's container runs in the principal
- * timezone the profile publishes, so every reconcile sets it (KTD7).
+ * main until its provider, its shared skills, and instance-vault-wide OneCLI
+ * access have been verified. Main's container runs in the principal's
+ * timezone, which the host derives from the profile in the same transaction
+ * that publishes or reconciles it (KTD7), so nothing here sets it. The
+ * principal seeds the profile only with main's first publication: after it,
+ * a reconcile writes none of the principal's profile (KTD9).
  * Main is stamped from its template only when no group carries it yet: an
  * existing main is found, never restamped, so a customized template survives
  * every repair (R11, KTD12).
@@ -180,25 +194,14 @@ export async function reconcileMainIdentity(
     await runNcl(config, ['groups', 'create', '--template', MAIN_TEMPLATE, '--name', MAIN_GROUP_NAME]),
   );
   const updatedConfig = unwrapData(
-    await runNcl(config, [
-      'groups',
-      'config',
-      'update',
-      '--id',
-      group.id,
-      '--provider',
-      config.selected_provider,
-      '--timezone',
-      input.principalTimezone,
-    ]),
+    await runNcl(config, ['groups', 'config', 'update', '--id', group.id, '--provider', config.selected_provider]),
   );
   if (
     !isRecord(updatedConfig) ||
     updatedConfig.agent_group_id !== group.id ||
-    updatedConfig.provider !== config.selected_provider ||
-    updatedConfig.timezone !== input.principalTimezone
+    updatedConfig.provider !== config.selected_provider
   ) {
-    throw new GwsEaError('main_group_mismatch', 'Canonical main provider and timezone reconciliation did not persist');
+    throw new GwsEaError('main_group_mismatch', 'Canonical main provider reconciliation did not persist');
   }
 
   // Main's shared skills are the release's own list (KTD13), and this
@@ -215,6 +218,7 @@ export async function reconcileMainIdentity(
   }
 
   const onecliAgentId = await reconcileAllSecretMode(await onecliAdmin(config), group.id);
+  const { principal } = input;
   const profile = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',
@@ -223,19 +227,24 @@ export async function reconcileMainIdentity(
       input.assistantDisplayName,
       '--assistant-workspace-email',
       input.assistantWorkspaceEmail,
-      '--principal-display-name',
-      input.principalDisplayName,
-      '--principal-timezone',
-      input.principalTimezone,
       '--main-agent-group-id',
       group.id,
-      ...(input.principalEmails === undefined ? [] : ['--principal-emails', JSON.stringify(input.principalEmails)]),
+      ...(principal === undefined
+        ? []
+        : [
+            '--principal-display-name',
+            principal.displayName,
+            '--principal-timezone',
+            principal.timezone,
+            '--principal-emails',
+            JSON.stringify(principal.emails),
+          ]),
     ]),
   );
   if (!isRecord(profile) || profile.main_agent_group_id !== group.id) {
     throw new GwsEaError('profile_mismatch', 'GWS-EA profile did not retain canonical main');
   }
-  if (input.principalEmails !== undefined && !sameAddresses(profile.principal_emails, input.principalEmails)) {
+  if (principal !== undefined && !sameAddresses(profile.principal_emails, principal.emails)) {
     throw new GwsEaError('profile_mismatch', "GWS-EA profile did not retain the principal's email addresses");
   }
 

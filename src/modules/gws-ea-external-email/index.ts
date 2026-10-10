@@ -42,6 +42,7 @@ import { registerRequiredProjectDocSection } from '../../project-doc-sections.js
 import { resolveTimezone } from '../../timezone.js';
 import { getGwsEaProfile, getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
+import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
 import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
@@ -81,15 +82,15 @@ registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ k
 });
 
 // Whom it works for, once, rather than on every email it reads: the
-// principal's name and time zone, never their addresses.
+// principal's name, escaped as the identity section escapes it, and time
+// zone, never their addresses.
 registerRequiredProjectDocSection('gws-ea-external-email:principal', async (group) => {
   if (group.id !== (await getExternalEmailAgentGroupId())) return undefined;
   const profile = await getGwsEaProfile();
   const timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
-  return {
-    name: 'Principal',
-    body: `You work for ${profile.principal_display_name ?? 'the principal'}, whose time zone is ${timezone}.`,
-  };
+  const principal =
+    profile.principal_display_name === null ? 'the principal' : escapeMarkdownInline(profile.principal_display_name);
+  return { name: 'Principal', body: `You work for ${principal}, whose time zone is ${timezone}.` };
 });
 
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */

@@ -75,9 +75,13 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Named for the principal and the assistant, as both see it in Drive. */
-function homeFolderName(principal: string, assistant: string): string {
-  return `${principal} · ${assistant}`;
+/**
+ * Named for the assistant alone: an assistant has one principal, and nothing
+ * in Drive follows the principal's name, which they can change (R16). The
+ * name is given once, when the folder is made; the host never renames one.
+ */
+function homeFolderName(assistant: string): string {
+  return `Principal · ${assistant}`;
 }
 
 function noteText(folderId: string, replacing: boolean): string {
@@ -219,10 +223,9 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
 
   async function reconcile(): Promise<void> {
     const profile = await getGwsEaProfile();
-    if (profile.principal_display_name === null || profile.assistant_display_name === null) return;
+    if (profile.assistant_display_name === null) return;
     const at = now().toISOString();
-    const name = homeFolderName(profile.principal_display_name, profile.assistant_display_name);
-    const folderId = await ensureFolder(name, at);
+    const folderId = await ensureFolder(homeFolderName(profile.assistant_display_name), at);
     await shareWithPrincipal(folderId, principalRecognizer(profile.principal_emails), at);
     await tellMain(folderId, at);
   }
