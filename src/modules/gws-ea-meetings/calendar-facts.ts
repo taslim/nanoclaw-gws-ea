@@ -41,7 +41,7 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
-import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { DetailedAttendee, DetailedEvent, EventTime, MeetingsCalendarApi } from './calendar-api.js';
 import { dayLabel, spanLabel } from './calendar-actions.js';
 import { addressesOf, instantOf, lineOf } from './fields.js';
@@ -164,16 +164,15 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
   const calendar = () => deps.calendar();
 
   async function viewOf(): Promise<FactsView> {
-    const addresses = await loadPrincipalRecognizer();
-    const calendars = (await calendar().listCalendars())
-      .filter((entry) => isPrincipalCalendar(entry, addresses))
-      .map((entry) => entry.id);
+    const [profile, listed] = await Promise.all([getGwsEaProfile(), calendar().listCalendars()]);
+    const addresses = principalRecognizer(profile.principal_emails);
+    const calendars = listed.filter((entry) => isPrincipalCalendar(entry, addresses)).map((entry) => entry.id);
     if (calendars.length === 0) {
       throw forbidden(
         "None of the calendars you can see is the principal's yet, so there is nothing to count: the host adds each of their addresses' calendars to yours once they share it with you.",
       );
     }
-    return { timezone: (await getGwsEaProfile()).principal_timezone ?? TIMEZONE, addresses, calendars };
+    return { timezone: profile.principal_timezone ?? TIMEZONE, addresses, calendars };
   }
 
   /**

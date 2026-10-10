@@ -58,12 +58,12 @@ registerSessionAdmissionPolicy('gws-ea-profile:main-known', async ({ disposition
   if (disposition === 'create') await ensureMainAgentGroupIdLoaded();
 });
 
-const ADDRESS_LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 /** Addresses hold no backtick (the profile refuses one), so each is quoted exactly in a code span. */
 function principalAddressesSentence(principal: string, emails: readonly string[]): string {
   if (emails.length === 0) return '';
-  const quoted = ADDRESS_LIST.format(emails.map((email) => `\`${email}\``));
+  const quoted = LIST.format(emails.map((email) => `\`${email}\``));
   return emails.length === 1
     ? ` ${principal}'s email address is ${quoted}.`
     : ` ${principal}'s email addresses are ${quoted}.`;
@@ -422,8 +422,6 @@ function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAn
     .map((field) => ({ field, from: before[field], to: after[field] }));
 }
 
-const CHANGE_LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
-
 /**
  * The principal's receipt: every change, old and new, so a change they did
  * not ask for cannot pass unseen (KTD9).
@@ -432,7 +430,7 @@ function receiptText(changes: readonly ProfileChange[]): string {
   const described = changes.map(({ field, from, to }) =>
     field === 'name' ? `your name is now ${to} (it was ${from})` : `your home time zone is now ${to} (it was ${from})`,
   );
-  return `I updated your profile: ${CHANGE_LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
+  return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
 /** What follows the change, and when: the host's readers now, main's own copies on its next start. */
