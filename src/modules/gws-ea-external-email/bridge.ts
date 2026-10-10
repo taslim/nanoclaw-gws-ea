@@ -67,7 +67,7 @@ import { readOutboxFiles, resolveSession, sessionDir, writeSessionMessage } from
 import type { Session } from '../../types.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isBookableCalendar } from '../gws-ea-inbox/calendar-notifications.js';
-import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
+import { calendarAccessOf, emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { pendingDeadline } from '../gws-ea-inbox/pace.js';
 import { listed, loadRoutingContext, MAX_ATTACHMENT_BYTES, type RoutingContext } from '../gws-ea-inbox/route-mail.js';
@@ -514,15 +514,22 @@ function peopleForMain(addresses: readonly ThreadAddress[], context: RoutingCont
 }
 
 /**
- * The calendar the thread books on, as main reads it: none yet; one of the
- * principal's calendars the calendar poll finds; or one it no longer finds
- * among theirs, as when they stopped sharing it.
+ * The calendar the thread books on, as main reads it (R8): none yet; one the
+ * assistant can book on; or one it no longer can, because the principal
+ * stopped sharing it or narrowed it to reading or free/busy. An address's
+ * main calendar is judged by the access the calendar poll recorded for it,
+ * as `book` judges it, and any other by whether the poll still finds it
+ * among the principal's. Read from the host's store alone, so it answers
+ * while Google Calendar is down.
  */
-function bookingCalendarWords(calendarId: string | null, context: RoutingContext): string {
+async function bookingCalendarWords(calendarId: string | null, context: RoutingContext): Promise<string> {
   if (calendarId === null) return 'The thread has no booking calendar yet.';
-  return context.principalCalendars.has(calendarId.toLowerCase())
+  const access = await calendarAccessOf(calendarId);
+  const bookable =
+    access === undefined ? context.principalCalendars.has(calendarId.toLowerCase()) : access === 'bookable';
+  return bookable
     ? `The thread books on ${calendarId}.`
-    : `The thread's booking calendar, ${calendarId}, is no longer the principal's.`;
+    : `The thread's booking calendar, ${calendarId}, is no longer one the assistant can book on.`;
 }
 
 /** The host's words before external-email's: the thread, its people, how many files came with them, and its calendar. */
@@ -550,7 +557,7 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
   const files = filesForMain(session, requestId, names);
   const context = await loadRoutingContext(await assistantAddresses(), new Date());
   const people = peopleForMain(await threadAddresses(threadKey), context);
-  const bookingCalendar = bookingCalendarWords(await getThreadBookingCalendar(threadKey), context);
+  const bookingCalendar = await bookingCalendarWords(await getThreadBookingCalendar(threadKey), context);
   const result = await writeNoteForMain({
     id: `tell-main-${session.id}-${requestId}`,
     timestamp: context.at.toISOString(),

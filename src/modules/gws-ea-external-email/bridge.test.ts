@@ -92,7 +92,7 @@ import {
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-preferences/index.js';
 import { ensureInbox, ensurePrincipalConversation, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
-import { emailMessagingGroupIds, replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
+import { emailMessagingGroupIds, recordCalendarAccess, replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { threadRecipients } from '../gws-ea-inbox/recipients.js';
 import {
   createThread,
@@ -742,7 +742,26 @@ describe('tell_main', () => {
 
     // The principal unshares it, so the poll no longer finds it among theirs.
     await replacePrincipalCalendars([PRINCIPAL], now());
-    expect(await stamp()).toContain(` The thread's booking calendar, ${TEAM_CALENDAR}, is no longer the principal's. `);
+    expect(await stamp()).toContain(
+      ` The thread's booking calendar, ${TEAM_CALENDAR}, is no longer one the assistant can book on. `,
+    );
+
+    // main moves the thread to the principal's own calendar, which the poll later finds narrowed to read-only:
+    // it is still theirs and still listed, but book refuses it, so main is not told it books there.
+    data(await handoff({ thread_key: key, message: 'Book on their own calendar.', calendar: PRINCIPAL }));
+    expect(await stamp()).toContain(` The thread books on ${PRINCIPAL}. `);
+    await recordCalendarAccess({
+      address: PRINCIPAL,
+      calendarId: PRINCIPAL,
+      access: 'readable',
+      hostAdded: false,
+      checkedAt: now(),
+      changedAt: now(),
+      toldAccess: 'readable',
+    });
+    expect(await stamp()).toContain(
+      ` The thread's booking calendar, ${PRINCIPAL}, is no longer one the assistant can book on. `,
+    );
   });
 
   it('writes one note and wakes main once when a request is replayed', async () => {

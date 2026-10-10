@@ -237,6 +237,21 @@ export async function listCalendarAccess(): Promise<CalendarAccessRecord[]> {
   }));
 }
 
+/**
+ * What the assistant can do with the calendar `calendarId`, as the calendar
+ * poll last recorded it for the principal address it belongs to; undefined
+ * when no address's record names it, as for a secondary calendar, or one no
+ * longer in the assistant's list.
+ */
+export async function calendarAccessOf(calendarId: string): Promise<CalendarAccess | undefined> {
+  if (!(await getDb().hasTable('gws_ea_inbox_calendar_access'))) return undefined;
+  const row = await getDb().get<{ access: CalendarAccess }>(
+    'SELECT access FROM gws_ea_inbox_calendar_access WHERE lower(calendar_id) = ? LIMIT 1',
+    calendarId.toLowerCase(),
+  );
+  return row?.access;
+}
+
 export async function recordCalendarAccess(record: CalendarAccessRecord): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_inbox_calendar_access
