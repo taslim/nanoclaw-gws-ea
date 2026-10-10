@@ -39,6 +39,7 @@ const ALL = [
   'google-calendar',
   'google-mail-read',
   'google-directory',
+  'google-workspace',
 ];
 
 /** Exactly the keys the host stamps external-email with (src/modules/gws-ea-external-email/group.ts). */
@@ -113,6 +114,8 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['gws-ea-reminders', ['gws-ea-reminders'], REMINDER_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
+    // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
+    ['google-workspace', ['google-workspace'], []],
     [
       "external-email's keys",
       EXTERNAL_EMAIL,

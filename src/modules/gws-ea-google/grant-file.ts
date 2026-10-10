@@ -4,8 +4,14 @@
  * reached without a link.
  */
 import { isErrno } from '../../community-portal/errors.js';
+import { readEnvFile } from '../../env.js';
 import { readOwnerOnlyJson } from '../../gws-ea/secrets.js';
-import { parseGoogleGrant, type GoogleGrant } from './grant.js';
+import { GOOGLE_GRANT_FILE_ENV, parseGoogleGrant, type GoogleGrant } from './grant.js';
+
+/** Where the host finds the grant file: its environment, else the install's `.env`. Undefined without a sign-in setup. */
+export function googleGrantFilePath(): string | undefined {
+  return process.env[GOOGLE_GRANT_FILE_ENV] || readEnvFile([GOOGLE_GRANT_FILE_ENV])[GOOGLE_GRANT_FILE_ENV] || undefined;
+}
 
 /** The grant, or undefined before the assistant has signed in. */
 export async function readGoogleGrantFile(file: string): Promise<GoogleGrant | undefined> {

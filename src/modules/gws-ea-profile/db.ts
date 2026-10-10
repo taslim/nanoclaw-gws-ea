@@ -119,6 +119,42 @@ export async function getMainAgentGroupId(): Promise<string | null> {
 }
 
 /**
+ * main's agent group as this host last read or named it, for code that must
+ * answer synchronously, such as a container's environment at spawn (KTD2):
+ * read as the host starts (`loadMainAgentGroupId`) and by any spawn that
+ * comes first (`ensureMainAgentGroupIdLoaded`), and set when the profile
+ * names main (`reconcileGwsEaProfile`), so a main named after the host
+ * started is known on its next spawn. Undefined until this host reads it.
+ * Main is never rebound, so it cannot go stale.
+ */
+let knownMainAgentGroup: string | null | undefined;
+
+/** main's agent group as this host knows it, or null before the profile names one. */
+export function knownMainAgentGroupId(): string | null {
+  return knownMainAgentGroup ?? null;
+}
+
+async function readMainAgentGroupId(): Promise<string | null> {
+  return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
+}
+
+/** Read main's agent group from the profile into `knownMainAgentGroupId`, as the host starts. */
+export async function loadMainAgentGroupId(): Promise<void> {
+  knownMainAgentGroup = await readMainAgentGroupId();
+}
+
+/**
+ * Read main's agent group only if this host has not yet, as a spawn does
+ * before its environment is composed. What the host's start read or the
+ * profile named while this read ran stands.
+ */
+export async function ensureMainAgentGroupIdLoaded(): Promise<void> {
+  if (knownMainAgentGroup !== undefined) return;
+  const read = await readMainAgentGroupId();
+  knownMainAgentGroup ??= read;
+}
+
+/**
  * Refuse every caller but the host and the canonical main. A resource's
  * guard admits any agent whose CLI scope reaches it, so a resource that is
  * main's alone checks here; `resource` names it in the refusal.
@@ -267,6 +303,7 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
+  knownMainAgentGroup = validated.mainAgentGroupId;
   return getGwsEaProfile();
 }
 

@@ -3,8 +3,9 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  AGENT_GOOGLE_CREDENTIALS,
   AGENT_GOOGLE_SERVICES,
-  EXPOSED_GOOGLE_SERVICES,
+  credentialScopes,
   GOOGLE_SIGN_IN_SCOPES,
   HOST_GOOGLE_SERVICES,
   type GoogleGrant,
@@ -14,6 +15,7 @@ import type { AssistantGoogleSignInRequest } from './events.js';
 import { GOOGLE_WORKSPACE_APIS, type GcpProjectInput } from './gcloud.js';
 import { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 import {
+  DRIVE_ABOUT_URL,
   GOOGLE_CLIENT_FILE_FLAG,
   googleConnectionResources,
   observeGoogleConnection,
@@ -29,6 +31,58 @@ const ROOT = '/tmp/nanoclaw-gws-ea-google-connection-test';
 const SECRETS = path.join(ROOT, 'secrets');
 const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
+const DRIVE = 'https://www.googleapis.com/auth/drive';
+/** The scopes this release adds to the sign-in, in the order it asks for them: Workspace's, then the ceiling. */
+const THIS_RELEASE_SCOPES = [
+  DRIVE,
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/presentations',
+  'https://www.googleapis.com/auth/forms.body',
+  'https://www.googleapis.com/auth/forms.responses.readonly',
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://www.googleapis.com/auth/calendar.events.owned',
+  'https://www.googleapis.com/auth/calendar.events.owned.readonly',
+  'https://www.googleapis.com/auth/calendar.events.freebusy',
+  'https://www.googleapis.com/auth/calendar.events.public.readonly',
+  'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+  'https://www.googleapis.com/auth/calendar.calendars',
+  'https://www.googleapis.com/auth/calendar.calendars.readonly',
+  'https://www.googleapis.com/auth/calendar.acls',
+  'https://www.googleapis.com/auth/calendar.acls.readonly',
+  'https://www.googleapis.com/auth/calendar.settings.readonly',
+  'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.metadata',
+  'https://www.googleapis.com/auth/gmail.compose',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.insert',
+  'https://www.googleapis.com/auth/gmail.labels',
+  'https://www.googleapis.com/auth/gmail.settings.basic',
+  'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.metadata',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
+  'https://www.googleapis.com/auth/drive.activity',
+  'https://www.googleapis.com/auth/drive.activity.readonly',
+  'https://www.googleapis.com/auth/drive.labels',
+  'https://www.googleapis.com/auth/drive.labels.readonly',
+  'https://www.googleapis.com/auth/drive.meet.readonly',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body.readonly',
+];
+/** The scopes an assistant signed in before Drive, Docs, Sheets, Slides and Forms holds. */
+const BEFORE_WORKSPACE = [
+  'openid',
+  'email',
+  ...AGENT_GOOGLE_SERVICES.calendar.scopes,
+  ...AGENT_GOOGLE_SERVICES['gmail-read'].scopes,
+  ...AGENT_GOOGLE_SERVICES.directory.scopes,
+  ...HOST_GOOGLE_SERVICES.gmail.scopes,
+];
 
 function runtime(): InstanceRuntimeConfig {
   return {
@@ -67,29 +121,41 @@ const GCP: GcpProjectInput = {
 };
 
 /**
- * Google Cloud, Google's OAuth and Calendar endpoints, and OneCLI's secrets
- * API, in memory. The vault is read-only to this step: only the host's
- * refresher publishes, which `publish()` stands in for.
+ * Google Cloud, Google's OAuth, Calendar and Drive endpoints, and OneCLI's
+ * secrets API, in memory. The vault is read-only to this step: only the
+ * host's refresher publishes, which `publish()` stands in for.
  */
 class World {
   enabledApis = new Set<string>(['chat.googleapis.com']);
   secrets: { id: string; name: string; hostPattern: string }[] = [];
   calendarStatus = 200;
   calendarId = ACCOUNT;
+  driveStatus = 200;
+  driveAccount = ACCOUNT;
+  /** The OAuth error Google answers a token request asking for Drive with, though the grant lists it. */
+  driveRefusal: string | undefined;
   minted = 0;
+  /** The scopes of each access token Google minted. */
+  readonly tokenScopes = new Map<string, readonly string[]>();
   readonly gcloudCalls: string[] = [];
   /** Every request to OneCLI other than a read of its secret metadata. */
   readonly vaultWrites: string[] = [];
 
   revoked = false;
 
-  /** What the host's refresher does once it sees a sign-in: one secret per agent-facing service. */
-  publish(): void {
-    for (const id of EXPOSED_GOOGLE_SERVICES) {
-      const service = AGENT_GOOGLE_SERVICES[id];
-      if (this.secrets.some((secret) => secret.name === service.secretName)) continue;
-      this.secrets.push({ id: `sec-${id}`, name: service.secretName, hostPattern: service.hostPattern });
+  /** What the host's refresher does once it sees a sign-in: one secret per credential the grant holds scopes for. */
+  publish(granted: readonly string[] = GOOGLE_SIGN_IN_SCOPES): void {
+    for (const credential of AGENT_GOOGLE_CREDENTIALS) {
+      if (credentialScopes(credential, granted).length === 0) continue;
+      if (this.secrets.some((secret) => secret.name === credential.secretName)) continue;
+      this.secrets.push({ id: `sec-${credential.host}`, name: credential.secretName, hostPattern: credential.host });
     }
+  }
+
+  /** Whether the request carries a token Google minted with `scope`. */
+  private carries(init: RequestInit | undefined, scope: string): boolean {
+    const auth = new Headers(init?.headers).get('authorization') ?? '';
+    return auth.startsWith('Bearer ') && (this.tokenScopes.get(auth.slice('Bearer '.length))?.includes(scope) ?? false);
   }
 
   readonly runCommand = vi.fn(async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
@@ -110,14 +176,20 @@ class World {
     const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status });
     if (url === GOOGLE_TOKEN_ENDPOINT) {
       if (this.revoked) return json({ error: 'invalid_grant' }, 400);
-      this.minted += 1;
       const scope = new URLSearchParams(String(init?.body)).get('scope') ?? '';
-      return json({ access_token: `ya29.calendar-${this.minted}`, expires_in: 3599, scope });
+      if (this.driveRefusal && scope.split(' ').includes(DRIVE)) return json({ error: this.driveRefusal }, 400);
+      this.minted += 1;
+      const token = `ya29.token-${this.minted}`;
+      this.tokenScopes.set(token, scope.split(' '));
+      return json({ access_token: token, expires_in: 3599, scope });
     }
     if (url === PRIMARY_CALENDAR_URL) {
-      const auth = new Headers(init?.headers).get('authorization') ?? '';
-      if (!auth.startsWith('Bearer ya29.calendar-')) return json({}, 401);
+      if (!this.carries(init, 'https://www.googleapis.com/auth/calendar.calendarlist')) return json({}, 403);
       return json({ id: this.calendarId, accessRole: 'owner' }, this.calendarStatus);
+    }
+    if (url === DRIVE_ABOUT_URL) {
+      if (!this.carries(init, DRIVE)) return json({}, 403);
+      return json({ user: { emailAddress: this.driveAccount } }, this.driveStatus);
     }
     const route = new URL(url).pathname;
     if (new Headers(init?.headers).get('authorization') !== 'Bearer oc_admin_key') return json({}, 401);
@@ -216,8 +288,19 @@ describe("connecting the assistant's Google account", () => {
 
     const pause = await connect(resources, context(signIn));
 
+    expect(GOOGLE_WORKSPACE_APIS).toEqual([
+      'calendar-json.googleapis.com',
+      'gmail.googleapis.com',
+      'people.googleapis.com',
+      'drive.googleapis.com',
+      'driveactivity.googleapis.com',
+      'drivelabels.googleapis.com',
+      'docs.googleapis.com',
+      'sheets.googleapis.com',
+      'slides.googleapis.com',
+      'forms.googleapis.com',
+    ]);
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
-    expect(GOOGLE_WORKSPACE_APIS).toContain('people.googleapis.com');
     expect(pause).toMatchObject({
       phase: 'connect_google',
       code: 'google_client_required',
@@ -247,7 +330,7 @@ describe("connecting the assistant's Google account", () => {
     expect(signIn).toHaveBeenCalledTimes(1);
   });
 
-  it("waits for the host to publish each service's secret before the step is done", async () => {
+  it("waits for the host to publish each credential's secret before the step is done", async () => {
     const world = new World();
     const resources = resourcesFor(world, 3);
     await connect(
@@ -258,7 +341,9 @@ describe("connecting the assistant's Google account", () => {
 
     expect(await access.observe(context(async () => grant()))).toEqual({
       status: 'absent',
-      reason: 'OneCLI has no google-calendar, google-gmail-read, or google-directory secret yet',
+      reason:
+        'OneCLI has no google-calendar, google-gmail-read, google-directory, google-docs, google-sheets, ' +
+        'google-slides, or google-forms secret yet',
     });
     await expect(access.apply(context(async () => grant()))).resolves.toBeUndefined();
 
@@ -353,24 +438,23 @@ describe("connecting the assistant's Google account", () => {
     expect(world.vaultWrites).toEqual([]);
   });
 
-  it('signs in again when a release asks for a scope the grant lacks', async () => {
+  it("signs in again when the grant on disk lacks this release's scopes", async () => {
     const world = new World();
-    const signIn = vi.fn(async () => grant());
-    fs.writeFileSync(
-      path.join(SECRETS, 'google-grant.json'),
-      JSON.stringify(
-        grant({
-          scopes: ['openid', 'email', ...AGENT_GOOGLE_SERVICES.calendar.scopes, ...HOST_GOOGLE_SERVICES.gmail.scopes],
-        }),
-      ),
-      { mode: 0o600 },
-    );
+    const signIn = vi.fn(async () => grant({ granted_at: '2026-10-09T18:00:00.000Z' }));
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+      mode: 0o600,
+    });
     const resources = resourcesFor(world);
 
     expect(await resources[2]!.observe(context(signIn))).toEqual({
       status: 'absent',
-      reason:
-        'the sign-in lacks https://www.googleapis.com/auth/gmail.readonly, https://www.googleapis.com/auth/directory.readonly',
+      reason: `the sign-in lacks ${THIS_RELEASE_SCOPES.join(', ')}`,
+    });
+    await expect(connect(resources, context(signIn))).resolves.toBeUndefined();
+
+    expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT, account: ACCOUNT }));
+    expect(JSON.parse(fs.readFileSync(path.join(SECRETS, 'google-grant.json'), 'utf8'))).toMatchObject({
+      scopes: expect.arrayContaining(THIS_RELEASE_SCOPES) as unknown,
     });
   });
 
@@ -395,6 +479,48 @@ describe("connecting the assistant's Google account", () => {
         context(async () => grant(), writeDownloadedClient()),
       ),
     ).rejects.toThrow(/did not return the assistant's own calendar/);
+  });
+
+  it("reads the assistant's own Drive with the token agents get on www.googleapis.com", async () => {
+    const world = new World();
+    await connect(
+      resourcesFor(world),
+      context(async () => grant(), writeDownloadedClient()),
+    );
+
+    const driveReads = vi.mocked(world.fetch).mock.calls.filter(([url]) => String(url) === DRIVE_ABOUT_URL);
+    expect(driveReads.length).toBeGreaterThan(0);
+    const auth = new Headers(driveReads[0]![1]?.headers).get('authorization') ?? '';
+    expect(world.tokenScopes.get(auth.replace('Bearer ', ''))).toEqual([
+      ...AGENT_GOOGLE_SERVICES.calendar.scopes,
+      DRIVE,
+    ]);
+  });
+
+  it.each([
+    [
+      'answers as someone else',
+      (world: World) => (world.driveAccount = 'someone-else@example.test'),
+      'Google Drive did not answer as the assistant',
+    ],
+    ['refuses the read', (world: World) => (world.driveStatus = 403), 'Google Drive answered HTTP 403'],
+    [
+      'refuses Drive at the token endpoint',
+      (world: World) => (world.driveRefusal = 'invalid_scope'),
+      `Google refuses ${DRIVE} for the assistant's sign-in (invalid_scope)`,
+    ],
+  ])("reports the Drive check's reason when Google %s", async (_label, arrange, reason) => {
+    const world = new World();
+    const resources = resourcesFor(world);
+    await connect(
+      resources,
+      context(async () => grant(), writeDownloadedClient()),
+    );
+    arrange(world);
+
+    const observed = await resources[4]!.observe(context(async () => grant()));
+    expect(observed).toMatchObject({ status: 'absent' });
+    expect(observed.status === 'absent' ? observed.reason : undefined).toContain(reason);
   });
 });
 
@@ -430,7 +556,9 @@ describe('observing the Google connection for status', () => {
 
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toMatchObject({
       status: 'degraded',
-      reason: `agents have no Google access: OneCLI has no google-calendar, google-gmail-read, or google-directory secret yet; ${repair}`,
+      reason:
+        'agents have no Google access: OneCLI has no google-calendar, google-gmail-read, google-directory, ' +
+        `google-docs, google-sheets, google-slides, or google-forms secret yet; ${repair}`,
     });
     world.revoked = true;
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
@@ -440,23 +568,59 @@ describe('observing the Google connection for status', () => {
     });
   });
 
-  it('names the missing scopes and the connect-google repair for an assistant signed in before this release', async () => {
+  it("names this release's missing scopes and the connect-google repair for an assistant signed in before them", async () => {
     const world = new World();
-    world.publish();
-    fs.writeFileSync(
-      path.join(SECRETS, 'google-grant.json'),
-      JSON.stringify(
-        grant({
-          scopes: ['openid', 'email', ...AGENT_GOOGLE_SERVICES.calendar.scopes, ...HOST_GOOGLE_SERVICES.gmail.scopes],
-        }),
-      ),
-      { mode: 0o600 },
-    );
+    world.publish(BEFORE_WORKSPACE);
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+      mode: 0o600,
+    });
 
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
       status: 'degraded',
       account: ACCOUNT,
-      reason: `the sign-in lacks https://www.googleapis.com/auth/gmail.readonly, https://www.googleapis.com/auth/directory.readonly; ${repair}`,
+      reason: `the sign-in lacks ${THIS_RELEASE_SCOPES.join(', ')}; ${repair}`,
+    });
+  });
+
+  it('reports a revoked sign-in as revoked, not as missing scopes, even from before the Workspace scopes', async () => {
+    const world = new World();
+    world.revoked = true;
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+      mode: 0o600,
+    });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason: `Google no longer accepts the sign-in; ${repair}`,
+    });
+  });
+
+  it('names Drive when Google refuses it while the sign-in lists it, and agents keep Calendar', async () => {
+    const world = new World();
+    world.publish();
+    world.driveRefusal = 'invalid_scope';
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason:
+        `Google refuses ${DRIVE} for the assistant's sign-in (invalid_scope), so agents have Calendar without it; ` +
+        `check that the Workspace admin allows the app, then ${repair}`,
+    });
+  });
+
+  it("reports agents' access as partial, naming the one secret the host has not published", async () => {
+    const world = new World();
+    world.publish();
+    world.secrets = world.secrets.filter((secret) => secret.name !== 'google-docs');
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason: `agents have only part of their Google access: OneCLI has no google-docs secret yet; ${repair}`,
     });
   });
 

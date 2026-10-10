@@ -35,6 +35,7 @@ import './gws-ea-people/index.js';
 import './gws-ea-notices/index.js';
 import './gws-ea-privacy/index.js';
 import './gws-ea-dates/index.js';
+import './gws-ea-workspace/index.js';
 import './gws-ea-external-email/index.js';
 import './gws-ea-inbox/index.js';
 import './gws-ea-meetings/index.js';

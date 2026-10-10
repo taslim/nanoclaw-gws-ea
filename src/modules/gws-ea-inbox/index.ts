@@ -16,6 +16,9 @@
  *   each by its own rules.
  * - Mail is the principal's only when Gmail verified that the domain of one
  *   of their addresses sent it (authentication.ts).
+ * - Google Docs' and Drive's activity mail becomes one note for `main` per
+ *   poll, read from Drive with the host's own Drive token
+ *   (gws-ea-workspace/notices.ts).
  *
  * The host starts the inbox after `external-email` exists: it creates both
  * messaging groups and their wirings when absent, brings `main`'s members in
@@ -43,6 +46,7 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
+import { createDriveApi } from '../gws-ea-workspace/drive-api.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
@@ -84,6 +88,7 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
     live = createInbox({
       gmail: createGmailApi({ token: () => hostGoogleAccessToken('gmail') }),
       calendar: createCalendarListApi({ token: () => hostGoogleAccessToken('calendar-host') }),
+      drive: createDriveApi({ token: () => hostGoogleAccessToken('drive-host') }),
     });
     return live.adapter;
   },

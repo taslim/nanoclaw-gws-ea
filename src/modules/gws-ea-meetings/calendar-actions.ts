@@ -7,7 +7,8 @@
  *   guest, accepted (`guestsOn`): Google then shows them on the guest list
  *   as its organizer, as it does for an event they made themselves.
  * - An invitation shows no one Google sends it to a private detail of the
- *   principal's, and names no weekday beside a date it does not fall on
+ *   principal's, names no weekday beside a date it does not fall on, and
+ *   carries no Google link a guest other than the principal cannot open
  *   (`assertInvitationShareable`).
  * - An event's id derives from what it is for (`eventIdFor`), so a retry
  *   after a partial failure finds the event it made (`ensureEvent`), and an
@@ -26,6 +27,12 @@ import { log } from '../../log.js';
 import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
+import {
+  checkLinksOpenable,
+  LinkCheckUnavailableError,
+  LINKS_UNCHECKED,
+  type LinkWriter,
+} from '../gws-ea-workspace/link-access.js';
 import type {
   CalendarEvent,
   EventConference,
@@ -78,14 +85,18 @@ export interface Invitation {
   readonly shown: readonly (string | undefined)[];
   /** Who Google sends it to. The principal may see anything; nobody at all sees nothing. */
   readonly recipients: readonly string[];
+  /** Who writes it, so a refused link is explained in words fitted to them. */
+  readonly writer: LinkWriter;
 }
 
 /**
  * Refuse, writing nothing, an invitation whose words name a weekday beside a
- * date it does not fall on, or which would show anyone Google sends it to
- * one of the principal's private details. `refused` leads the refusal and
- * `advice` ends one for a private detail, saying what to do about it; the
- * refusal names the detail's kind, never the detail.
+ * date it does not fall on, which would show anyone Google sends it to
+ * one of the principal's private details, or which carries a Google link
+ * one of them other than the principal cannot open. `refused` leads the
+ * refusal and `advice` ends one for a private detail, saying what to do
+ * about it; the refusal names the detail's kind, never the detail. A link is
+ * read in everything the guests see, what the event already says included.
  */
 export async function assertInvitationShareable(
   invitation: Invitation,
@@ -104,6 +115,14 @@ export async function assertInvitationShareable(
       `${refused}: as its guests would see it, the invitation carries one of the principal's private details (${check.kind}). ${advice}`,
     );
   }
+  const links = await checkLinksOpenable({
+    texts: [...invitation.texts, ...invitation.shown].flatMap((text) => text ?? []),
+    recipients: invitation.recipients,
+    writer: invitation.writer,
+  }).catch((error: unknown) => {
+    throw error instanceof LinkCheckUnavailableError ? forbidden(`${refused}: ${LINKS_UNCHECKED}`) : error;
+  });
+  if (!links.allowed) throw forbidden(`${refused}: ${links.reason}`);
 }
 
 /** Whether the event Google holds already says what the write would: its time, and each guest with any answer it gives them. */

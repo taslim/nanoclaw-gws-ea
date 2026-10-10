@@ -4,8 +4,8 @@
  * existing assistant. In order: the Workspace APIs in the assistant's
  * project, the OAuth client the operator downloads, the assistant's own
  * sign-in, agents' Google access, and a live check that the sign-in reaches
- * the assistant's own calendar. Each observes before it changes anything, so
- * running them again changes nothing.
+ * the assistant's own calendar and Drive. Each observes before it changes
+ * anything, so running them again changes nothing.
  *
  * This step writes only the grant file. The running host's refresher is the
  * only writer of the gateway's Google secrets: it publishes them from a new
@@ -19,13 +19,18 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
-  AGENT_GOOGLE_SERVICES,
-  EXPOSED_GOOGLE_SERVICES,
+  AGENT_GOOGLE_CREDENTIALS,
+  googleCredentialFor,
   missingGoogleScopes,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
-import { GoogleGrantRevokedError, mintServiceToken, type TokenOptions } from '../modules/gws-ea-google/tokens.js';
+import {
+  GoogleGrantRevokedError,
+  mintCredentialToken,
+  type CredentialFallback,
+  type TokenOptions,
+} from '../modules/gws-ea-google/tokens.js';
 import type { AssistantGoogleSignInRequest } from './events.js';
 import { googleWorkspaceApisResource, type GcloudDependencies, type GcpProjectContext } from './gcloud.js';
 import {
@@ -47,6 +52,9 @@ export const GOOGLE_CLIENT_FILE_FLAG = '--google-client-file';
 
 /** Where the assistant's own primary calendar is read to prove the connection. */
 export const PRIMARY_CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/users/me/calendarList/primary';
+
+/** Where the assistant's own Drive says whose it is, read to prove the connection reaches Drive. */
+export const DRIVE_ABOUT_URL = 'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)';
 
 export interface GoogleConnectionInput {
   readonly runtime: InstanceRuntimeConfig;
@@ -130,14 +138,23 @@ function injectsOn(pattern: string, host: string): boolean {
   return pattern.startsWith('*.') && host.endsWith(pattern.slice(1));
 }
 
-/** Whether `grant` is the declared account's, with every scope this release asks for; else why not. */
-export function grantProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
+/** Whether the assistant has signed in as the declared account; else why not. */
+function signInProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
   if (!grant) return 'the assistant has not signed in to Google yet';
-  if (grant.account !== account.toLowerCase()) {
-    return `Google is signed in as ${grant.account}, not the assistant's account ${account}`;
-  }
+  return grant.account === account.toLowerCase()
+    ? undefined
+    : `Google is signed in as ${grant.account}, not the assistant's account ${account}`;
+}
+
+/** Which scopes this release asks for that `grant` lacks, as a reason, or undefined when it holds them all. */
+function scopeProblem(grant: GoogleGrant): string | undefined {
   const missing = missingGoogleScopes(grant.scopes);
   return missing.length > 0 ? `the sign-in lacks ${missing.join(', ')}` : undefined;
+}
+
+/** Whether `grant` is the declared account's, with every scope this release asks for; else why not. */
+export function grantProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
+  return signInProblem(grant, account) ?? (grant && scopeProblem(grant));
 }
 
 function listed(names: readonly string[]): string {
@@ -145,23 +162,32 @@ function listed(names: readonly string[]): string {
   return `${names.slice(0, -1).join(', ')}, or ${names.at(-1)}`;
 }
 
+/** Why agents' published Google access falls short; `partial` when they hold the rest of it. */
+type AccessProblem = { readonly reason: string; readonly partial: boolean };
+
 /**
- * Why the secrets the host publishes do not each inject exactly one token on
- * their service's host, or undefined when they do. Secrets the host has not
- * published yet are named together.
+ * Why the secrets the host publishes for agents do not each inject exactly one
+ * token on their credential's host, or undefined when they do. Asked only of a
+ * grant holding every scope this release asks for, from which the host
+ * publishes every credential. Secrets it has not published yet are named
+ * together, and agents hold the rest when it has published any.
  */
-function publishedAccessProblem(secrets: readonly VaultSecret[]): string | undefined {
+function publishedAccessProblem(secrets: readonly VaultSecret[]): AccessProblem | undefined {
   const missing: string[] = [];
-  for (const id of EXPOSED_GOOGLE_SERVICES) {
-    const service = AGENT_GOOGLE_SERVICES[id];
-    const named = secrets.filter((secret) => secret.name === service.secretName);
-    if (named.length === 0) missing.push(service.secretName);
-    else if (named.length > 1) return `OneCLI holds ${named.length} secrets named ${service.secretName}`;
-    else if (named[0]!.hostPattern !== service.hostPattern) {
-      return `OneCLI's ${service.secretName} secret is on ${named[0]!.hostPattern}`;
+  for (const credential of AGENT_GOOGLE_CREDENTIALS) {
+    const named = secrets.filter((secret) => secret.name === credential.secretName);
+    if (named.length === 0) missing.push(credential.secretName);
+    else if (named.length > 1) {
+      return { reason: `OneCLI holds ${named.length} secrets named ${credential.secretName}`, partial: false };
+    } else if (named[0]!.hostPattern !== credential.host) {
+      return { reason: `OneCLI's ${credential.secretName} secret is on ${named[0]!.hostPattern}`, partial: false };
     }
   }
-  return missing.length > 0 ? `OneCLI has no ${listed(missing)} secret yet` : undefined;
+  if (missing.length === 0) return undefined;
+  return {
+    reason: `OneCLI has no ${listed(missing)} secret yet`,
+    partial: missing.length < AGENT_GOOGLE_CREDENTIALS.length,
+  };
 }
 
 /**
@@ -171,11 +197,11 @@ function publishedAccessProblem(secrets: readonly VaultSecret[]): string | undef
  * one is flagged.
  */
 function gmailModifyProblem(secrets: readonly VaultSecret[]): string | undefined {
-  const readOnly = AGENT_GOOGLE_SERVICES['gmail-read'];
+  const readOnly = googleCredentialFor('gmail-read');
   const broader = secrets.find(
     (secret) =>
       injectsOn(secret.hostPattern, GMAIL_HOST) &&
-      !(secret.name === readOnly.secretName && secret.hostPattern === readOnly.hostPattern),
+      !(secret.name === readOnly.secretName && secret.hostPattern === readOnly.host),
   );
   return broader
     ? `OneCLI holds ${broader.name} on ${broader.hostPattern}, which an agent could use to reach Gmail beyond ` +
@@ -183,15 +209,35 @@ function gmailModifyProblem(secrets: readonly VaultSecret[]): string | undefined
     : undefined;
 }
 
-/** Whether Google still honors `grant`: a revoked or expired sign-in is absent, so applying signs in again. */
-async function grantAccepted(grant: GoogleGrant, tokenOptions: TokenOptions): Promise<boolean> {
+/** How Google answers for the credential Calendar rides on, as the host would mint it. */
+type CalendarCredentialAnswer =
+  | { readonly revoked: true }
+  | { readonly revoked: false; readonly fallback?: CredentialFallback };
+
+/**
+ * Whether Google still honors `grant`, asked by minting the credential
+ * agents' Calendar rides on: a revoked or expired sign-in is refused, and a
+ * Drive refusal leaves Calendar alone in the token the host publishes (KTD1).
+ */
+async function calendarCredentialAnswer(
+  grant: GoogleGrant,
+  tokenOptions: TokenOptions,
+): Promise<CalendarCredentialAnswer> {
   try {
-    await mintServiceToken(grant, 'calendar', tokenOptions);
-    return true;
+    const token = await mintCredentialToken(grant, googleCredentialFor('calendar'), tokenOptions);
+    return token?.fallback ? { revoked: false, fallback: token.fallback } : { revoked: false };
   } catch (error) {
-    if (error instanceof GoogleGrantRevokedError) return false;
+    if (error instanceof GoogleGrantRevokedError) return { revoked: true };
     throw error;
   }
+}
+
+/** What Google refused of the credential Calendar rides on, which agents then have without. */
+function refusedBesideCalendar(fallback: CredentialFallback): string {
+  return (
+    `Google refuses ${fallback.refused.join(', ')} for the assistant's sign-in (${fallback.reason}), ` +
+    'so agents have Calendar without it'
+  );
 }
 
 async function requireGrant(context: GoogleConnectionContext): Promise<GoogleGrant> {
@@ -211,8 +257,11 @@ export function googleConnectionResources(
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
     ...(dependencies.now ? { now: dependencies.now } : {}),
   };
-  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> =>
-    publishedAccessProblem(await listVaultSecrets(context.input.google.runtime, fetchImpl));
+  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
+    const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
+    await requireGrant(context);
+    return publishedAccessProblem(secrets)?.reason;
+  };
   return [
     googleWorkspaceApisResource(dependencies.gcloud),
     {
@@ -239,9 +288,9 @@ export function googleConnectionResources(
         if (problem || !grant) return { status: 'absent', reason: problem };
         // A grant on disk proves nothing once Google revokes it; the host's
         // refresher picks up a new sign-in on its next tick.
-        return (await grantAccepted(grant, tokenOptions))
-          ? PRESENT
-          : { status: 'absent', reason: 'Google no longer accepts the sign-in' };
+        return (await calendarCredentialAnswer(grant, tokenOptions)).revoked
+          ? { status: 'absent', reason: 'Google no longer accepts the sign-in' }
+          : PRESENT;
       },
       apply: async (context) => {
         const google = context.input.google;
@@ -288,22 +337,39 @@ export function googleConnectionResources(
       },
     },
     {
-      name: "the assistant's own calendar",
+      name: "the assistant's own calendar and Drive",
       observe: async (context): Promise<Observation> => {
         const grant = await requireGrant(context);
-        const token = await mintServiceToken(grant, 'calendar', tokenOptions);
-        const response = await (fetchImpl ?? globalThis.fetch)(PRIMARY_CALENDAR_URL, {
-          headers: { authorization: `Bearer ${token.accessToken}` },
-          signal: AbortSignal.timeout(15_000),
-        });
-        const body = await readJson(response);
-        if (!response.ok) return { status: 'absent', reason: `Google Calendar answered HTTP ${response.status}` };
-        const id = isRecord(body) ? body.id : undefined;
-        return id === grant.account
+        // The token agents get on www.googleapis.com, which carries Calendar and Drive together.
+        // `requireGrant` holds every scope, so the grant always yields one.
+        const token = await mintCredentialToken(grant, googleCredentialFor('calendar'), tokenOptions);
+        if (!token) throw new GwsEaError('google_not_signed_in', 'Cannot reach Google: the sign-in grants no Calendar');
+        if (token.fallback) return { status: 'absent', reason: refusedBesideCalendar(token.fallback) };
+        const read = async (url: string): Promise<{ readonly response: Response; readonly body: unknown }> => {
+          const response = await (fetchImpl ?? globalThis.fetch)(url, {
+            headers: { authorization: `Bearer ${token.accessToken}` },
+            signal: AbortSignal.timeout(15_000),
+          });
+          return { response, body: await readJson(response) };
+        };
+        const calendar = await read(PRIMARY_CALENDAR_URL);
+        if (!calendar.response.ok) {
+          return { status: 'absent', reason: `Google Calendar answered HTTP ${calendar.response.status}` };
+        }
+        if (!isRecord(calendar.body) || calendar.body.id !== grant.account) {
+          return { status: 'absent', reason: "Google Calendar did not return the assistant's own calendar" };
+        }
+        const drive = await read(DRIVE_ABOUT_URL);
+        if (!drive.response.ok) {
+          return { status: 'absent', reason: `Google Drive answered HTTP ${drive.response.status}` };
+        }
+        const user = isRecord(drive.body) ? drive.body.user : undefined;
+        const email = isRecord(user) && typeof user.emailAddress === 'string' ? user.emailAddress.toLowerCase() : '';
+        return email === grant.account
           ? PRESENT
-          : { status: 'absent', reason: "Google Calendar did not return the assistant's own calendar" };
+          : { status: 'absent', reason: 'Google Drive did not answer as the assistant' };
       },
-      // Nothing to change: a Calendar API that was just enabled can take a minute to answer.
+      // Nothing to change: an API that was just enabled can take a minute to answer.
       apply: async () => undefined,
     },
   ];
@@ -316,9 +382,10 @@ export type GoogleConnectionReport =
 
 /**
  * Observe the connection without changing it: the grant is the declared
- * account's with every scope, Google still accepts it, no secret lets an
- * agent modify Gmail, and OneCLI holds each secret the host publishes for
- * agents. Each problem names what repairs it.
+ * account's, Google still accepts it, it holds every scope, no secret lets an
+ * agent modify Gmail, OneCLI holds each secret the host publishes for agents,
+ * and Google grants agents' Calendar credential in full rather than Calendar
+ * alone (KTD1). Each problem names what repairs it.
  */
 export async function observeGoogleConnection(
   runtime: InstanceRuntimeConfig,
@@ -327,18 +394,28 @@ export async function observeGoogleConnection(
 ): Promise<GoogleConnectionReport> {
   const repair = `connect it with gws-ea connect-google --id ${runtime.instance_id}`;
   const grant = await readGoogleGrantFile(googleGrantFile(runtime));
-  const problem = grantProblem(grant, declaredEmail);
-  if (problem || !grant)
+  const problem = signInProblem(grant, declaredEmail);
+  if (problem || !grant) {
     return { status: 'degraded', account: grant?.account ?? null, reason: `${problem}; ${repair}` };
-  if (!(await grantAccepted(grant, dependencies.fetch ? { fetch: dependencies.fetch } : {}))) {
-    return { status: 'degraded', account: grant.account, reason: `Google no longer accepts the sign-in; ${repair}` };
   }
+  const degraded = (reason: string): GoogleConnectionReport => ({ status: 'degraded', account: grant.account, reason });
+  // Revocation first, so a revoked grant reads as revoked even when it also lacks this release's scopes.
+  const calendar = await calendarCredentialAnswer(grant, dependencies.fetch ? { fetch: dependencies.fetch } : {});
+  if (calendar.revoked) return degraded(`Google no longer accepts the sign-in; ${repair}`);
+  const scopes = scopeProblem(grant);
+  if (scopes) return degraded(`${scopes}; ${repair}`);
   const secrets = await listVaultSecrets(runtime, dependencies.fetch);
   const modify = gmailModifyProblem(secrets);
-  if (modify) return { status: 'degraded', account: grant.account, reason: modify };
+  if (modify) return degraded(modify);
   const access = publishedAccessProblem(secrets);
   if (access) {
-    return { status: 'degraded', account: grant.account, reason: `agents have no Google access: ${access}; ${repair}` };
+    const held = access.partial ? 'only part of their' : 'no';
+    return degraded(`agents have ${held} Google access: ${access.reason}; ${repair}`);
+  }
+  if (calendar.fallback) {
+    return degraded(
+      `${refusedBesideCalendar(calendar.fallback)}; check that the Workspace admin allows the app, then ${repair}`,
+    );
   }
   return { status: 'connected', account: grant.account };
 }

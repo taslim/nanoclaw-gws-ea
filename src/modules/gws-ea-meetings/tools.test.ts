@@ -46,6 +46,23 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
+/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
+vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
+  const { delegatingDriveApi } = await import('../gws-ea-workspace/testing/fake-drive.js');
+  return {
+    ...actual,
+    createDriveApi: () =>
+      delegatingDriveApi(() => workspace.drive as import('../gws-ea-workspace/drive-api.js').DriveApi),
+  };
+});
+// Nothing in these tests is public: a signed-out visit always meets a sign-in.
+vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-workspace/probe.js')>()),
+  probeLink: async () => 'sign-in',
+}));
+
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
@@ -80,6 +97,7 @@ import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-
 import './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
+import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { setThreadBookingCalendar } from './thread-calendar.js';
 
 const JUNO = 'juno@northwind.example';
@@ -669,6 +687,28 @@ describe('book', () => {
       expect(calendar.writes).toEqual([]);
     },
   );
+
+  it('refuses a booking whose notes link a pre-read an invitee cannot open, telling external-email to tell main (Slice 6 R4)', async () => {
+    const drive = new FakeDrive(JUNO);
+    for (const person of [PRINCIPAL, REMY]) drive.addAccount(person);
+    workspace.drive = drive;
+    const { id } = await drive.createFile({ name: 'Pre-read', mimeType: 'application/vnd.google-apps.document' });
+    const url = `https://docs.google.com/document/d/${id}/edit`;
+
+    const answer = refusal(
+      await send(sessionA, 'book', {
+        start: TUESDAY_10AM,
+        minutes: 30,
+        title: 'Catch-up',
+        invitees: [REMY],
+        notes: `Pre-read: ${url}`,
+      }),
+    );
+    expect(answer).toBe(
+      `The booking was not made: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`,
+    );
+    expect(calendar.writes).toEqual([]);
+  });
 
   it('leaves no half-made event when Google fails, and the agent sees the failure', async () => {
     calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error'), afterApplying: true });

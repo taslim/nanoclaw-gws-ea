@@ -5,6 +5,12 @@
  *
  * - Google Calendar's notifications: one body-free note for `main` per poll,
  *   batched by the caller, unless it is about the assistant's own change.
+ * - Google Docs' and Drive's activity mail: read only for the file, any
+ *   comment, and the kind of activity, then batched by the caller into one
+ *   note for `main` per poll (gws-ea-workspace/notices.ts). Each actor
+ *   Google's Reply-To names but the principal is rate-limited.
+ * - Mail claiming either kind of Google sender that Google did not sign:
+ *   dropped as forged.
  * - Auto-submitted mail, bounces, mailing lists, and bulk mail: archived.
  * - The principal, as Gmail verified them, with no one but their addresses
  *   and the assistant on To and Cc: `main`, in the principal's own email
@@ -36,9 +42,11 @@ import { log } from '../../log.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { parseWorkspaceNotification, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import {
   authenticateSender,
   CALENDAR_NOTIFICATION_SENDER,
+  WORKSPACE_NOTIFICATION_SENDERS,
   type AuthContext,
   type SenderVerdict,
 } from './authentication.js';
@@ -96,14 +104,15 @@ export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Dat
 
 export type Routed =
   | { readonly kind: 'settled'; readonly outcome: RouteOutcome }
-  | { readonly kind: 'calendar'; readonly notice: CalendarNotice };
+  | { readonly kind: 'calendar'; readonly notice: CalendarNotice }
+  | { readonly kind: 'workspace'; readonly notice: WorkspaceNotice };
 
 function settled(outcome: RouteOutcome): Routed {
   return { kind: 'settled', outcome };
 }
 
 type Principal = Extract<SenderVerdict, { kind: 'principal' }>;
-type Sender = Exclude<SenderVerdict, { kind: 'calendar-notification' }>;
+type Sender = Exclude<SenderVerdict, { kind: 'calendar-notification' | 'workspace-notification' }>;
 
 /** Precedence values of mail sent in bulk rather than written to the assistant. */
 const BULK_PRECEDENCE: ReadonlySet<string> = new Set(['bulk', 'list', 'junk']);
@@ -514,9 +523,10 @@ async function toThread(
 }
 
 /**
- * Route one inbox message. A calendar notification comes back for the
- * caller to batch. `limited` counts the sender against the hourly limit: a
- * message's first routing does, a retry of one already counted does not.
+ * Route one inbox message. A calendar notification, or a Docs or Drive one,
+ * comes back for the caller to batch. `limited` counts the sender against the
+ * hourly limit: a message's first routing does, a retry of one already
+ * counted does not.
  */
 export async function routeMail(
   mail: ParsedMail,
@@ -543,6 +553,27 @@ export async function routeMail(
       ...(verdict.kind === 'unauthenticated' ? { reason: verdict.reason } : {}),
     });
     return settled('forged-calendar-notification');
+  }
+  if (verdict.kind === 'workspace-notification') {
+    const notice = parseWorkspaceNotification(mail, verdict.address, context.assistant);
+    if (!notice) {
+      log.warn('A Docs or Drive notification named no file the host can read', { gmailMessageId: mail.id });
+      return settled('workspace-unreadable');
+    }
+    // Google's Reply-To names who acted; with none, the notices share their sender's limit.
+    const actor = notice.actor?.address ?? verdict.address;
+    if (options.limited && !context.auth.principalAddresses.has(actor) && (await overRateLimit(actor, context.at))) {
+      log.info('A Docs or Drive notification dropped: who acted is over the hourly limit', { gmailMessageId: mail.id });
+      return settled('rate-limited');
+    }
+    return { kind: 'workspace', notice };
+  }
+  if (mail.from !== undefined && WORKSPACE_NOTIFICATION_SENDERS.has(mail.from.address)) {
+    log.warn('Dropped mail claiming to be a Docs or Drive notification that Google did not sign', {
+      gmailMessageId: mail.id,
+      ...(verdict.kind === 'unauthenticated' ? { reason: verdict.reason } : {}),
+    });
+    return settled('forged-workspace-notification');
   }
   if (isAutomated(mail)) return settled('automated');
   if (

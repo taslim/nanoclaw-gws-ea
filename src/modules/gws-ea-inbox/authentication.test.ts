@@ -176,6 +176,77 @@ describe('Google Calendar notifications', () => {
   });
 });
 
+describe('Google Docs and Drive notifications', () => {
+  /** Gmail's results for Google's activity mail, sent through doclist.bounces.google.com and signed by `signer`. */
+  function google(input: { readonly signer: string; readonly from: string; readonly dmarc?: string }): string {
+    return (
+      `mx.google.com;\r\n       dkim=pass header.i=@${input.signer} header.s=20230601 header.b=Qm9vT2x;\r\n` +
+      '       spf=pass (google.com: domain of 3qhUHaQ8KBtcXbHf.UVCNOLYa@doclist.bounces.google.com designates 209.85.220.69 as permitted sender) smtp.mailfrom=3qhUHaQ8KBtcXbHf.UVCNOLYa@doclist.bounces.google.com;\r\n' +
+      `       dmarc=${input.dmarc ?? 'pass'} (p=REJECT sp=REJECT dis=NONE) header.from=${input.from}`
+    );
+  }
+  const COMMENTS = 'comments-noreply@docs.google.com';
+  const SHARES = 'drive-shares-dm-noreply@google.com';
+  const actor = { name: 'Reply-To', value: 'Morgan Ellery <morgan.fixture@gmail.com>' };
+  const comment = (options: MessageOptions = {}) =>
+    message({
+      from: `"Morgan Ellery (Google Docs)" <${COMMENTS}>`,
+      results: google({ signer: 'docs.google.com', from: 'docs.google.com' }),
+      ...options,
+      extra: [actor, ...(options.extra ?? [])],
+    });
+  const share = (options: MessageOptions = {}) =>
+    message({
+      from: `"Morgan Ellery (via Google Docs)" <${SHARES}>`,
+      results: google({ signer: 'google.com', from: 'google.com' }),
+      ...options,
+      extra: [actor, ...(options.extra ?? [])],
+    });
+
+  it.each([
+    ['a comment, signed by docs.google.com', comment(), COMMENTS],
+    [
+      'a comment, signed by google.com',
+      comment({ results: google({ signer: 'google.com', from: 'docs.google.com' }) }),
+      COMMENTS,
+    ],
+    ['a share, signed by google.com', share(), SHARES],
+    [
+      'a share, signed by docs.google.com',
+      share({ results: google({ signer: 'docs.google.com', from: 'google.com' }) }),
+      SHARES,
+    ],
+    [
+      "a share from Drive's older sender",
+      share({ from: '"Morgan Ellery (via Google Drive)" <drive-shares-noreply@google.com>' }),
+      'drive-shares-noreply@google.com',
+    ],
+  ])('are recognized for %s, with a DMARC pass for the sender’s own domain', (_label, headers, address) => {
+    expect(authenticateSender(headers, CONTEXT)).toEqual({ kind: 'workspace-notification', address });
+  });
+
+  it.each<[string, MailHeader[]]>([
+    [
+      'a comment without a DMARC pass',
+      comment({ results: google({ signer: 'docs.google.com', from: 'docs.google.com', dmarc: 'fail' }) }),
+    ],
+    [
+      'a comment whose DMARC pass is for google.com, not docs.google.com',
+      comment({ results: google({ signer: 'google.com', from: 'google.com' }) }),
+    ],
+    [
+      'a comment whose only DKIM pass is a Google subdomain’s',
+      comment({ results: google({ signer: 'doclist.bounces.google.com', from: 'docs.google.com' }) }),
+    ],
+    ['a share signed by another domain', share({ results: google({ signer: 'evil.example', from: 'google.com' }) })],
+    ['a share with a differing Sender', share({ extra: [{ name: 'Sender', value: 'drive@google.com' }] })],
+    ['a share through a mailing list', share({ extra: [{ name: 'List-Id', value: '<team.google.com>' }] })],
+    ['a share with no results of Gmail’s own', share({ withoutGmailResults: true })],
+  ])('are unauthenticated, never an ordinary sender, for %s', (_label, headers) => {
+    expect(authenticateSender(headers, CONTEXT)).toMatchObject({ kind: 'unauthenticated' });
+  });
+});
+
 describe('anyone else', () => {
   it('is authenticated by a DMARC pass for its From domain', () => {
     expect(

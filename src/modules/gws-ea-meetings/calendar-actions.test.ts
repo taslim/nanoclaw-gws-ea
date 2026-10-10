@@ -1,12 +1,44 @@
 /**
  * How a time reads in an email: its day, its times and its zone as people
- * write them; and how an event the assistant writes tells its guests: on
- * its first write alone. The bookings themselves are covered with the
- * scheduling tools that make them (tools.test.ts).
+ * write them; how an event the assistant writes tells its guests: on its
+ * first write alone; and that an invitation carries no Google link its
+ * guests cannot open (Slice 6 R4, KTD4). The bookings themselves are covered
+ * with the scheduling tools that make them (tools.test.ts).
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureEvent, guestsOn, slotLabel, TAG_ROLE } from './calendar-actions.js';
+/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
+vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
+  const { delegatingDriveApi } = await import('../gws-ea-workspace/testing/fake-drive.js');
+  return {
+    ...actual,
+    createDriveApi: () =>
+      delegatingDriveApi(() => workspace.drive as import('../gws-ea-workspace/drive-api.js').DriveApi),
+  };
+});
+// Nothing in these tests is public: a signed-out visit always meets a sign-in.
+vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-workspace/probe.js')>()),
+  probeLink: async () => 'sign-in',
+}));
+
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import '../gws-ea-profile/index.js';
+import { addPrincipalAddress } from '../gws-ea-profile/db.js';
+import '../gws-ea-privacy/index.js';
+import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
+import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
+import {
+  assertInvitationShareable,
+  ensureEvent,
+  guestsOn,
+  slotLabel,
+  TAG_ROLE,
+  type Invitation,
+} from './calendar-actions.js';
 import { FakeCalendar } from './testing/fake-calendar.js';
 
 describe('a slot as people write it', () => {
@@ -67,5 +99,92 @@ describe('an event the assistant writes', () => {
       { op: 'patch', sendUpdates: 'all' },
     ]);
     expect(calendar.event(PRINCIPAL, 'intro01')).toMatchObject({ status: 'confirmed' });
+  });
+});
+
+describe('an invitation carrying a Google link', () => {
+  const MORGAN = 'morgan.fixture@gmail.com';
+  const REMY = 'remy@vance.example';
+  let drive: FakeDrive;
+
+  beforeEach(async () => {
+    await runMigrations(await initTestDb());
+    await addPrincipalAddress(MORGAN);
+    drive = new FakeDrive('juno@northwind.example');
+    for (const person of [MORGAN, REMY]) drive.addAccount(person);
+    workspace.drive = drive;
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  async function preRead(): Promise<{ readonly id: string; readonly url: string }> {
+    const { id } = await drive.createFile({ name: 'Pre-read', mimeType: 'application/vnd.google-apps.document' });
+    return { id, url: `https://docs.google.com/document/d/${id}/edit` };
+  }
+
+  const invitation = (url: string, writer: Invitation['writer']): Invitation => ({
+    texts: ['Intro', `Pre-read: ${url}`, undefined],
+    shown: [],
+    recipients: [MORGAN, REMY],
+    writer,
+  });
+
+  it('is refused, writing nothing, when a guest cannot open a pre-read it links, in words fitted to who wrote it', async () => {
+    const { id, url } = await preRead();
+    await expect(
+      assertInvitationShareable(invitation(url, 'main'), 'The event was not added', 'Write it without that detail.'),
+    ).rejects.toMatchObject({
+      code: 'forbidden',
+      message: `The event was not added: ${REMY} can't open ${url}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    });
+    await expect(
+      assertInvitationShareable(invitation(url, 'external-email'), 'The booking was not made', 'Tell main.'),
+    ).rejects.toMatchObject({
+      code: 'forbidden',
+      message: `The booking was not made: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`,
+    });
+
+    await drive.createPermission(id, { emailAddress: REMY, role: 'reader' });
+    await expect(
+      assertInvitationShareable(invitation(url, 'external-email'), 'The booking was not made', 'Tell main.'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('reads the links in what the event already shows its guests, not only in what the write says', async () => {
+    const { url } = await preRead();
+    // A guest joining an existing event reads its description, as change_guests passes it.
+    await expect(
+      assertInvitationShareable(
+        { texts: [], shown: ['Intro', `Pre-read: ${url}`], recipients: [MORGAN, REMY], writer: 'main' },
+        'The guests were not changed',
+        'Ask the principal.',
+      ),
+    ).rejects.toMatchObject({
+      code: 'forbidden',
+      message: `The guests were not changed: ${REMY} can't open ${url}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    });
+  });
+
+  it('answers that it can be tried again shortly when Drive is briefly down', async () => {
+    const { url } = await preRead();
+    for (let attempt = 0; attempt < 3; attempt += 1)
+      drive.failNext('getFile', new GoogleApiError(503, 'Backend Error'));
+    await expect(
+      assertInvitationShareable(invitation(url, 'main'), 'The event was not added', 'Write it without that detail.'),
+    ).rejects.toMatchObject({ code: 'forbidden', message: `The event was not added: ${LINKS_UNCHECKED}` });
+  });
+
+  it('is never checked for the principal alone', async () => {
+    const { url } = await preRead();
+    await expect(
+      assertInvitationShareable(
+        { ...invitation(url, 'main'), recipients: [MORGAN] },
+        'The event was not added',
+        'Write it without that detail.',
+      ),
+    ).resolves.toBeUndefined();
+    expect(drive.calls.filter((call) => call.op !== 'createFile')).toEqual([]);
   });
 });

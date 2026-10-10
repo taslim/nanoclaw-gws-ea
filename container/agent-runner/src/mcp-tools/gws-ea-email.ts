@@ -10,9 +10,10 @@
  *   of their threads with `email_principal`.
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
  *   thread with `email_send`, tells main what main should know with
- *   `tell_main`, and schedules on the principal's calendar with `free_time`,
- *   `book`, `change_booking` and `cancel_booking`, each bound by the host to
- *   the thread whose session calls it.
+ *   `tell_main`, passing on files that came in the thread, and schedules on
+ *   the principal's calendar with `free_time`, `book`, `change_booking` and
+ *   `cancel_booking`, each bound by the host to the thread whose session
+ *   calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -20,7 +21,9 @@
  *
  * A file goes with a request the way `send_file` sends one: copied into the
  * session's outbox under the request's id before the request is written, and
- * read by the host from there alone, never from a path the agent names.
+ * read by the host from there alone, never from a path the agent names. A
+ * file for main must be one that came in the thread: in the session's inbox,
+ * where mail's attachments and main's handed files land.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,13 +38,31 @@ const EXTERNAL_CAPABILITY = 'gws-ea-email-external';
 export const EMAIL_REQUEST_TIMEOUT_MS = 120_000;
 
 const WORKSPACE = '/workspace/agent';
+/** The session's inbox: the files that came in its thread, from mail or from main. */
+const INBOX = '/workspace/inbox';
 const MAX_FILES = 10;
+
+/** Whether `file`, after every link, is inside the folder `root`. */
+function isWithin(root: string, file: string): boolean {
+  try {
+    const relative = path.relative(fs.realpathSync(root), fs.realpathSync(file));
+    return relative !== '' && relative.split(path.sep)[0] !== '..' && !path.isAbsolute(relative);
+  } catch {
+    // A folder or file that is not there holds nothing.
+    return false;
+  }
+}
 
 /**
  * Copy the files a request names into its outbox, each by its file name, and
  * send those names. Every file is checked first, so a refusal stages nothing.
+ * With `fromInbox`, each must be one that came in the session's thread.
  */
-function stageFiles(fields: Record<string, unknown>, requestId: string): Record<string, unknown> | string {
+function stageFiles(
+  fields: Record<string, unknown>,
+  requestId: string,
+  fromInbox = false,
+): Record<string, unknown> | string {
   const listed = fields.files;
   if (listed === undefined) return fields;
   if (
@@ -54,6 +75,10 @@ function stageFiles(fields: Record<string, unknown>, requestId: string): Record<
   const sources = listed.map((item) => (path.isAbsolute(item) ? item : path.resolve(WORKSPACE, item)));
   const missing = listed.find((_, index) => fs.statSync(sources[index], { throwIfNoEntry: false })?.isFile() !== true);
   if (missing !== undefined) return `No file at ${missing}`;
+  const outside = fromInbox ? listed.find((_, index) => !isWithin(INBOX, sources[index])) : undefined;
+  if (outside !== undefined) {
+    return `${outside} did not come in this thread: only files under ${INBOX}/ can go to main.`;
+  }
   const names = sources.map((source) => path.basename(source));
   const repeated = names.find((name, index) => names.indexOf(name) !== index);
   if (repeated !== undefined) return `Two of the files are named ${repeated}: send them in separate requests.`;
@@ -152,10 +177,17 @@ export const tellMain = requestTool({
   ...common,
   name: 'tell_main',
   description:
-    'Tell main something from this thread: what happened, what someone asks of the principal, or what you need. main reads it as information from this thread, and any answer comes here as a new message. Answers once main has it.',
-  properties: { message: { type: 'string', description: 'What main should know, in plain language.' } },
+    'Tell main something from this thread: what happened, what someone asks of the principal, or what you need, with any files from the thread main should have. main reads it as information from this thread, and any answer comes here as a new message. Answers once main has it.',
+  properties: {
+    message: { type: 'string', description: 'What main should know, in plain language.' },
+    files: {
+      ...FILES,
+      description: `Paths of files that came in this thread, under ${INBOX}/, for main to have, such as an invoice someone sent. Up to 10.`,
+    },
+  },
   required: ['message'],
   repeatable: false,
+  prepare: (fields, requestId) => stageFiles(fields, requestId, true),
 });
 
 /** The other side's zone: an answer then gives each time in it too, ready to write. */

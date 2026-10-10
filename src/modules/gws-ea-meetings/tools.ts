@@ -517,6 +517,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         texts: [wanted.title, wanted.notes, wanted.location],
         shown: [bookingCalendar.summary],
         recipients: wanted.invitees,
+        writer: 'external-email',
       },
       'The booking was not made',
       PRIVATE_DETAIL_ADVICE,
@@ -660,7 +661,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const entry = texted || linking ? await calendar().getCalendar(booking.calendarId) : undefined;
     if (texted) {
       await assertInvitationShareable(
-        { texts: [title, notes, location], shown: [entry?.summary], recipients: invitees },
+        { texts: [title, notes, location], shown: [entry?.summary], recipients: invitees, writer: 'external-email' },
         'The booking was not changed',
         PRIVATE_DETAIL_ADVICE,
       );

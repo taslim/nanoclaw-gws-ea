@@ -137,8 +137,8 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/\b(?:AI|artificial intelligence|language model|chatbot|bot)\b/iu);
   });
 
-  it('stays within 1,800 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(1_800);
+  it('stays within 2,000 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_000);
   });
 
   it("teaches main its email and reminder tools, and none of external-email's", async () => {
@@ -167,9 +167,28 @@ describe("main's skills", () => {
       { caller: 'host' },
     );
 
-    const skills = ['agent-browser', 'gcalendar', 'gmail', 'gpeople'];
+    const skills = ['agent-browser', 'gcalendar', 'gmail', 'gpeople', 'gworkspace'];
     expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills } });
     expect(await skillsOf(main.id)).toEqual(skills);
+  });
+
+  it("puts the Calendar and Workspace rules in main's document once its skills are the release's", async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-skills', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const groupDir = path.join(TEST_ROOT, main.folder);
+
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+
+    for (const skill of ['gcalendar', 'gworkspace']) {
+      const rules = fs.readFileSync(path.resolve('container', 'skills', skill, 'instructions.md'), 'utf8').trim();
+      expect(document, skill).toContain(`# NanoClaw Skill: ${skill}\n\n${rules}`);
+    }
   });
 
   it('refuses a group with no container config, and an unknown flag', async () => {

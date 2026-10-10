@@ -1,11 +1,16 @@
 /**
- * The host's Google tokens (KTD6). Each tick publishes a live token for
- * every agent-facing service through the selected gateway's credential
+ * The host's Google tokens (KTD1, KTD6). Each tick publishes a live token for
+ * every agent credential through the selected gateway's credential
  * connection, renewing one close to expiry, so the first tick after the host
- * starts, or after the machine wakes, puts a fresh one in place. The host is
- * the only writer of these credentials. Tokens for host-only services are
- * minted on demand and held in this process's memory alone.
+ * starts, or after the machine wakes, puts a fresh one in place. A credential
+ * carries the scopes its services want that the grant holds, and a host the
+ * grant holds nothing for gets nothing. The host is the only writer of these
+ * credentials. Tokens for host-only services are minted on demand and held in
+ * this process's memory alone.
  *
+ * When Google refuses part of a credential while the grant still works, its
+ * first service is published alone, so Calendar keeps working when Drive is
+ * refused, and every tick asks for the full set again until Google grants it.
  * A revoked sign-in is reported once and not retried until a new grant is
  * written; any other failure is retried on the next tick.
  */
@@ -14,18 +19,23 @@ import type {
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
 import {
-  AGENT_GOOGLE_SERVICES,
-  EXPOSED_GOOGLE_SERVICES,
-  type AgentGoogleServiceId,
+  AGENT_GOOGLE_CREDENTIALS,
+  googleGrantIdentity as grantIdentity,
   type GoogleGrant,
   type HostGoogleServiceId,
 } from './grant.js';
-import { GoogleGrantRevokedError, mintServiceToken, type ServiceToken, type TokenOptions } from './tokens.js';
+import {
+  GoogleGrantRevokedError,
+  mintCredentialToken,
+  mintServiceToken,
+  type ServiceToken,
+  type TokenOptions,
+} from './tokens.js';
 
 /** Renew a token this long before Google expires it. */
 export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
 
-/** What agents' tools send in place of a token; the gateway replaces it on the service's host. */
+/** What agents' tools send in place of a token; the gateway replaces it on the credential's host. */
 export const GATEWAY_TOKEN_PLACEHOLDER = 'gateway-managed';
 
 const BEARER = { headerName: 'Authorization', valueFormat: 'Bearer {value}' } as const;
@@ -56,9 +66,10 @@ export interface GoogleTokenRefresher {
   hostAccessToken(service: HostGoogleServiceId): Promise<string>;
 }
 
-/** A grant is identified by its sign-in, so a new sign-in clears a revoked one. */
-function grantIdentity(grant: GoogleGrant): string {
-  return `${grant.account}\0${grant.granted_at}`;
+/** A credential's token in the gateway: when it expires, and whether it carries its first service alone. */
+interface Published {
+  readonly expiresAt: number;
+  readonly partial: boolean;
 }
 
 function message(error: unknown): string {
@@ -68,7 +79,7 @@ function message(error: unknown): string {
 export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTokenRefresher {
   const now = options.now ?? Date.now;
   const tokenOptions: TokenOptions = { ...(options.fetch ? { fetch: options.fetch } : {}), now };
-  const expiresAt = new Map<AgentGoogleServiceId, number>();
+  const published = new Map<string, Published>();
   const hostTokens = new Map<HostGoogleServiceId, { identity: string; token: ServiceToken }>();
   const minting = new Map<HostGoogleServiceId, Promise<string>>();
   let revoked: string | undefined;
@@ -110,23 +121,33 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
       if (identity !== current) {
         // A new sign-in: every token is minted from it afresh.
         current = identity;
-        expiresAt.clear();
+        published.clear();
       }
       if (revoked === identity) return;
 
-      for (const id of EXPOSED_GOOGLE_SERVICES) {
-        const service = AGENT_GOOGLE_SERVICES[id];
-        if ((expiresAt.get(id) ?? 0) - now() > RENEW_BEFORE_EXPIRY_MS) continue;
+      for (const credential of AGENT_GOOGLE_CREDENTIALS) {
+        const held = published.get(credential.host);
+        const fresh = held !== undefined && held.expiresAt - now() > RENEW_BEFORE_EXPIRY_MS;
+        if (fresh && !held.partial) continue;
+        // A fresh token carrying its first service alone stays until Google grants the full set.
+        const retrying = fresh;
         try {
-          const token = await mintServiceToken(grant, id, tokenOptions);
-          const connection = options.connection(bearerTarget(service.secretName, service.hostPattern));
+          const token = await mintCredentialToken(grant, credential, { ...tokenOptions, fallBack: !retrying });
+          if (!token) continue;
+          const connection = options.connection(bearerTarget(credential.secretName, credential.host));
           await connection.find();
           await connection.save(token.accessToken);
-          expiresAt.set(id, token.expiresAt);
-          options.log.info('Renewed Google access for agents', {
-            service: id,
-            expiresAt: new Date(token.expiresAt).toISOString(),
-          });
+          published.set(credential.host, { expiresAt: token.expiresAt, partial: token.fallback !== undefined });
+          const fields = { host: credential.host, expiresAt: new Date(token.expiresAt).toISOString() };
+          if (token.fallback) {
+            options.log.warn("Google refused part of agents' access; publishing the rest", {
+              ...fields,
+              refused: token.fallback.refused,
+              reason: token.fallback.reason,
+            });
+          } else {
+            options.log.info('Renewed Google access for agents', fields);
+          }
           /* eslint-disable-next-line no-catch-all/no-catch-all -- A revoked grant stops; any other failure is logged and the next tick retries. */
         } catch (error) {
           if (error instanceof GoogleGrantRevokedError) {
@@ -134,8 +155,9 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
             options.log.error(error.message, { account: grant.account });
             return;
           }
+          if (retrying) continue;
           options.log.warn('Could not renew Google access for agents; retrying', {
-            service: id,
+            host: credential.host,
             error: message(error),
           });
         }
