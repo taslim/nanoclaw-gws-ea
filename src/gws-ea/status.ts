@@ -187,7 +187,11 @@ export interface AssistantProbes {
    * calendar notifications on for the principal's calendars.
    */
   readonly inbox: ProbeResult & InboxFacts;
-  /** The assistant's own Google sign-in, accepted by Google, with Calendar access in OneCLI for agents. */
+  /**
+   * The assistant's own Google sign-in, accepted by Google with every scope
+   * this release asks for, and agents' token for each Google host in OneCLI,
+   * Calendar's carrying Drive rather than Calendar alone.
+   */
   readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
   readonly principal: ProbeResult;

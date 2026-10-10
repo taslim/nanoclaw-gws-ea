@@ -136,6 +136,15 @@ function rendered(text: string): { readonly words: string; readonly targets: rea
 }
 
 /**
+ * The targets of a markdown text's links as a reader's mail client renders
+ * them, an autolinked address and a link behind its words alike. The
+ * workspace's link check reads them beside the text as written.
+ */
+export function linkTargets(text: string): readonly string[] {
+  return rendered(text).targets;
+}
+
+/**
  * These texts as their readers receive them, each reading its own stream:
  * as written (an email's plain-text part, a calendar's fields), as a mail
  * client renders them, and the targets of their links. Within a reading the

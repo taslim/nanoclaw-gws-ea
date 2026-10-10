@@ -45,6 +45,23 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
+/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
+vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
+  const { delegatingDriveApi } = await import('../gws-ea-workspace/testing/fake-drive.js');
+  return {
+    ...actual,
+    createDriveApi: () =>
+      delegatingDriveApi(() => workspace.drive as import('../gws-ea-workspace/drive-api.js').DriveApi),
+  };
+});
+// Nothing in these tests is public: a signed-out visit always meets a sign-in.
+vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-workspace/probe.js')>()),
+  probeLink: async () => 'sign-in',
+}));
+
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
@@ -59,6 +76,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-inbox/index.js';
 import './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
+import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 
 const PRINCIPAL = 'morgan@northwind.example';
 /** A calendar of the principal's that the assistant may only read. */
@@ -316,6 +334,23 @@ describe('create_event', () => {
       expect(calendar.events).toEqual([]);
     },
   );
+
+  it('refuses, before anything reaches Google, notes that link a pre-read a guest cannot open (Slice 6 R4)', async () => {
+    const drive = new FakeDrive('juno@northwind.example');
+    for (const person of [PRINCIPAL, REMY]) drive.addAccount(person);
+    workspace.drive = drive;
+    const { id } = await drive.createFile({ name: 'Pre-read', mimeType: 'application/vnd.google-apps.document' });
+    const url = `https://docs.google.com/document/d/${id}/edit`;
+
+    expect(refusal(await send(main, 'create_event', { ...FOCUS, guests: [REMY], notes: `Pre-read: ${url}` }))).toBe(
+      `The event was not added: ${REMY} can't open ${url}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    );
+    expect(calendar.writes).toEqual([]);
+
+    await drive.createPermission(id, { emailAddress: REMY, role: 'reader' });
+    data(await send(main, 'create_event', { ...FOCUS, guests: [REMY], notes: `Pre-read: ${url}` }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'all' })]);
+  });
 
   it('adds an event that holds a private detail when only the principal will see it', async () => {
     await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });

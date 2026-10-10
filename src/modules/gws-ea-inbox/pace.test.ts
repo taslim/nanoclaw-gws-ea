@@ -26,6 +26,7 @@ vi.mock('../../container-runner.js', () => ({
   getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
+  registerSessionAdmissionPolicy: vi.fn(),
   wakeContainer: vi.fn().mockResolvedValue(true),
 }));
 

@@ -136,6 +136,11 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
     /capabilities/,
   ],
   [
+    'Google Workspace beside its list',
+    (g) => updateContainerConfigJson(g.id, 'capabilities', [...EXTERNAL_EMAIL_CAPABILITIES, 'google-workspace']),
+    /capabilities/,
+  ],
+  [
     'the list an earlier release stamped',
     (g) =>
       updateContainerConfigJson(g.id, 'capabilities', ['reply', 'time', 'request-status', 'gws-ea-meetings-external']),

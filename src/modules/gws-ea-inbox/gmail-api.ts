@@ -8,13 +8,17 @@ import { isRecord } from '../../gws-ea/validation.js';
 
 /** A Google API answered with an error status, or could not be reached (status 0). */
 export class GoogleApiError extends Error {
+  /** Google's machine-readable reason, such as Drive's `invalidSharingRequest`, when its answer names one. */
+  readonly reason: string | undefined;
+
   constructor(
     readonly status: number,
     message: string,
-    options?: { cause?: unknown },
+    options?: { readonly cause?: unknown; readonly reason?: string },
   ) {
-    super(message, options);
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'GoogleApiError';
+    this.reason = options?.reason;
   }
 
   /** Worth retrying: unreachable, rate-limited, or a server error. */
@@ -104,7 +108,8 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * One JSON call to a Google API. With `allowNotFound`, a 404 returns
- * undefined; every other failure throws a `GoogleApiError`. With `ifMatch`,
+ * undefined; every other failure throws a `GoogleApiError`, with Google's
+ * reason when its answer names one. With `ifMatch`,
  * a write applies only to the version of the resource that etag names, and
  * Google refuses it with 412 when the resource has changed since.
  */
@@ -138,13 +143,19 @@ export async function googleJson(
   if (response.status === 404 && init.allowNotFound === true) return undefined;
   const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
-    const reason =
-      isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
-        ? payload.error.message
-        : `HTTP ${response.status}`;
-    throw new GoogleApiError(response.status, `Google refused ${new URL(url).pathname}: ${reason}`);
+    const error = isRecord(payload) && isRecord(payload.error) ? payload.error : undefined;
+    const message = typeof error?.message === 'string' ? error.message : `HTTP ${response.status}`;
+    throw new GoogleApiError(response.status, `Google refused ${new URL(url).pathname}: ${message}`, {
+      ...errorReason(error),
+    });
   }
   return payload;
+}
+
+/** The reason Google's error body names first (`error.errors[0].reason`), as Drive and Calendar word one. */
+function errorReason(error: Record<string, unknown> | undefined): { readonly reason?: string } {
+  const first: unknown = Array.isArray(error?.errors) ? error.errors[0] : undefined;
+  return isRecord(first) && typeof first.reason === 'string' ? { reason: first.reason } : {};
 }
 
 // ---------------------------------------------------------------------------

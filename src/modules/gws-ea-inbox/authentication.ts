@@ -18,6 +18,10 @@
  *   Anything the domain lets sign for it counts, a sending service included
  *   (accepted 2026-10-03 over per-domain selector pins the operator kept).
  * - Google Calendar's notifications: the same rule for `google.com`.
+ * - Google Docs' comment mail and Drive's share and access-request mail
+ *   (KTD6): the same rule, with a DMARC pass for the sender's exact domain
+ *   and a DKIM pass from `google.com` or `docs.google.com`, whichever Google
+ *   signs that mail with.
  * - Anyone else: `dmarc=pass` for the From domain, or a `dkim=pass` whose
  *   domain is aligned to it.
  */
@@ -31,6 +35,7 @@ export interface AuthContext {
 export type SenderVerdict =
   | { readonly kind: 'principal'; readonly address: string; readonly displayName?: string }
   | { readonly kind: 'calendar-notification' }
+  | { readonly kind: 'workspace-notification'; readonly address: string }
   | { readonly kind: 'authenticated'; readonly address: string; readonly displayName?: string }
   | {
       readonly kind: 'unauthenticated';
@@ -41,7 +46,17 @@ export type SenderVerdict =
     };
 
 export const CALENDAR_NOTIFICATION_SENDER = 'calendar-notification@google.com';
+/** Google Docs' mail about comments: new ones, replies, mentions, and assignments. */
+export const DOCS_COMMENTS_SENDER = 'comments-noreply@docs.google.com';
+/** Google's senders of Docs and Drive activity mail; Drive's shares and access requests come from the other two. */
+export const WORKSPACE_NOTIFICATION_SENDERS: ReadonlySet<string> = new Set([
+  DOCS_COMMENTS_SENDER,
+  'drive-shares-dm-noreply@google.com',
+  'drive-shares-noreply@google.com',
+]);
 const GOOGLE_DOMAIN = 'google.com';
+/** The domains Google signs Docs and Drive activity mail with. */
+const WORKSPACE_SIGNING_DOMAINS: ReadonlySet<string> = new Set([GOOGLE_DOMAIN, 'docs.google.com']);
 const GMAIL_AUTHSERV_ID = 'mx.google.com';
 
 /**
@@ -197,6 +212,13 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
       return { kind: 'calendar-notification' };
     }
     return unauthenticated('a calendar notification Google did not sign');
+  }
+
+  if (WORKSPACE_NOTIFICATION_SENDERS.has(from.address)) {
+    if (soleSender && !hasListId && [...WORKSPACE_SIGNING_DOMAINS].some(ownDkimPass) && dmarcPass) {
+      return { kind: 'workspace-notification', address: from.address };
+    }
+    return unauthenticated('a Docs or Drive notification Google did not sign');
   }
 
   const alignedDkimPass = passed(results, 'dkim', (result) => {

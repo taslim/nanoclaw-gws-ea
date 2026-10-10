@@ -27,6 +27,7 @@ vi.mock('../../container-runner.js', () => ({
   getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
+  registerSessionAdmissionPolicy: vi.fn(),
   wakeContainer: vi.fn().mockResolvedValue(true),
 }));
 
@@ -242,6 +243,16 @@ describe('a new principal address once the inbox exists', () => {
       ),
     ]);
     for (const question of questions) expect(question).not.toMatch(/\bmain\b/);
+  });
+
+  it("tells the principal the address also gets the assistant's folder, what it is trusted with beside their mail", async () => {
+    await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main));
+
+    const [card] = sent;
+    const { question } = JSON.parse(card!.content) as { question: string };
+    expect(question).toMatch(/treated as yours, with your authority/u);
+    expect(question).toMatch(/can open the Google Drive folder where the assistant keeps what it makes for you/u);
+    expect(question).toMatch(/approve only if this address is yours\.$/u);
   });
 
   it('keeps the address out when the principal rejects the card', async () => {

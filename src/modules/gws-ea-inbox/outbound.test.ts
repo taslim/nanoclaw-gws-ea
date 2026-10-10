@@ -29,6 +29,7 @@ vi.mock('../../container-runner.js', () => ({
   getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
+  registerSessionAdmissionPolicy: vi.fn(),
   wakeContainer: vi.fn().mockResolvedValue(true),
 }));
 
@@ -36,6 +37,29 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue
 
 vi.mock('../gws-ea-external-email/index.js', () => ({
   getExternalEmailAgentGroupId: vi.fn(async () => 'ag-external'),
+}));
+
+/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+const workspace = vi.hoisted(() => ({
+  drive: undefined as unknown,
+  visits: [] as string[],
+}));
+vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
+  const { delegatingDriveApi } = await import('../gws-ea-workspace/testing/fake-drive.js');
+  return {
+    ...actual,
+    createDriveApi: () =>
+      delegatingDriveApi(() => workspace.drive as import('../gws-ea-workspace/drive-api.js').DriveApi),
+  };
+});
+vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-workspace/probe.js')>()),
+  // Nothing in these tests is public: a signed-out visit always meets a sign-in.
+  probeLink: async ({ url }: { readonly url: string }) => {
+    workspace.visits.push(url);
+    return 'sign-in';
+  },
 }));
 
 import type { ChannelSetup } from '../../channels/adapter.js';
@@ -77,6 +101,8 @@ import {
 } from './index.js';
 import { emailMessagingGroupIds } from './db.js';
 import { createThread, findThreadFor, getThread, recordThreadAddresses, threadMessages } from './thread-map.js';
+import { LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
+import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 
 const JUNO = 'juno@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -303,6 +329,7 @@ class FakeGmail implements GmailApi {
 let gmail: FakeGmail;
 let inbox: Inbox;
 let main: Session;
+let drive: FakeDrive;
 
 function now(): string {
   return new Date().toISOString();
@@ -336,6 +363,7 @@ async function startInbox(): Promise<void> {
   inbox = createInbox({
     gmail,
     calendar: { list: async () => [], patchNotifications: async () => undefined },
+    drive,
     sleep: async () => undefined,
   });
   registerChannelAdapter('email', { factory: () => inbox.adapter, defaults: EMAIL_CHANNEL_DEFAULTS });
@@ -546,6 +574,12 @@ beforeEach(async () => {
   );
   await addPrincipalAddress(PRINCIPAL);
   await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+
+  // Everyone gets the same Drive permission id in every test, so an id the link check cached stays true.
+  drive = new FakeDrive(JUNO);
+  for (const person of [PRINCIPAL, SAM, SALES, JANE, REMY, STRANGER]) drive.addAccount(person);
+  workspace.drive = drive;
+  workspace.visits.length = 0;
 
   gmail = new FakeGmail();
   await ensureInbox('ag-external');
@@ -1104,5 +1138,140 @@ describe('every email to outsiders', () => {
     expect(gmail.sent).toEqual([]);
     await emailSend(session, { subject: 'Lunch', text: 'Hello.' });
     expect(gmail.sent.map((sent) => sent.to)).toEqual([[REMY]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Google links (Slice 6 R4, KTD4, KTD5)
+// ---------------------------------------------------------------------------
+
+describe('a Google link in an email to outsiders', () => {
+  const DOC = 'application/vnd.google-apps.document';
+  const docUrl = (id: string) => `https://docs.google.com/document/d/${id}/edit`;
+  const driveReads = () => drive.calls.filter((call) => call.op !== 'createFile' && call.op !== 'createPermission');
+
+  /** A file the assistant made, shared with these people. */
+  async function shared(name: string, people: readonly string[]): Promise<string> {
+    const { id } = await drive.createFile({ name, mimeType: DOC });
+    for (const person of people) await drive.createPermission(id, { emailAddress: person, role: 'reader' });
+    return id;
+  }
+
+  it('is refused when one of three recipients cannot open it, telling external-email only who, and to tell main', async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, cc: [JANE, SALES], body: 'Agenda?' });
+    const agenda = await shared('Acme agenda', [SAM, JANE]);
+
+    await reply(session, key, `Here it is: ${docUrl(agenda)}`);
+    expect(gmail.sent).toEqual([]);
+    expect(refusals(session)).toEqual([
+      `Your message was not sent: ${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`,
+    ]);
+    expect(refusalOf(await emailSend(session, { text: `The agenda: ${docUrl(agenda)}` }))).toBe(
+      `Your email was not sent: ${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`,
+    );
+
+    await drive.createPermission(agenda, { emailAddress: SALES, role: 'reader' });
+    await reply(session, key, `Here it is: ${docUrl(agenda)}`);
+    expect(gmail.sent).toHaveLength(1);
+    expect(gmail.sent[0].text).toContain(docUrl(agenda));
+  });
+
+  it('reads every link the assistant wrote: in a first email’s subject, and in the text of a file it sends', async () => {
+    const { key, session } = await handedOver([REMY]);
+    const agenda = await shared('Acme agenda', []);
+    const refused = `Your email was not sent: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`;
+
+    expect(
+      refusalOf(await emailSend(session, { subject: `Agenda ${docUrl(agenda)}`, text: 'The agenda for Tuesday.' })),
+    ).toBe(refused);
+    const notes = Buffer.from(`The agenda is at ${docUrl(agenda)}.`);
+    await handFile(key, 'Notes.txt', notes);
+    expect(
+      refusalOf(await emailSend(session, { subject: 'Agenda', text: 'Notes attached.' }, { 'notes.txt': notes })),
+    ).toBe(refused);
+    expect(gmail.sent).toEqual([]);
+  });
+
+  it('meets the private-values check first, and the link check reads the email written again', async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Where do we meet?' });
+    const directions = await shared('Directions', []);
+
+    await reply(session, key, `Come to ${HOME}; directions: ${docUrl(directions)}`);
+    expect(refusals(session)).toEqual([expect.stringMatching(/private address/u)]);
+    expect(driveReads()).toEqual([]);
+
+    await reply(session, key, `Directions: ${docUrl(directions)}`);
+    expect(refusals(session)).toEqual([
+      expect.stringMatching(/private address/u),
+      `Your message was not sent: ${SAM} can't open a Google link in it. Tell main which link, and who can't open it.`,
+    ]);
+    expect(gmail.sent).toEqual([]);
+  });
+
+  it('reads only what the assistant wrote: a link in the quoted email is theirs, and no link means no Drive call', async () => {
+    const { key, session } = await arrives({
+      threadId: 'g-1',
+      from: SAM,
+      body: 'Our deck: https://docs.google.com/presentation/d/1SamAcmeDeck/edit',
+    });
+    await reply(session, key, 'Thank you, Pat will take a look.');
+    expect(gmail.sent).toHaveLength(1);
+    expect(gmail.sent[0].text).toContain('1SamAcmeDeck');
+    expect(drive.calls).toEqual([]);
+    expect(workspace.visits).toEqual([]);
+  });
+
+  it("waits for delivery's retry when Drive is briefly down, and email_send says to try again shortly", async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Agenda?' });
+    const agenda = await shared('Acme agenda', [SAM]);
+
+    for (let attempt = 0; attempt < 3; attempt += 1)
+      drive.failNext('getFile', new GoogleApiError(503, 'Backend Error'));
+    const id = await reply(session, key, `Here it is: ${docUrl(agenda)}`);
+    expect(gmail.sent).toEqual([]);
+    expect(refusals(session)).toEqual([]);
+    expect(deliveryStatus(session, id)).toBeUndefined();
+    // Drive answers on delivery's next pass.
+    await deliverSessionMessages(session);
+    expect(deliveryStatus(session, id)).toBe('delivered');
+    expect(gmail.sent).toHaveLength(1);
+
+    for (let attempt = 0; attempt < 3; attempt += 1)
+      drive.failNext('getFile', new GoogleApiError(503, 'Backend Error'));
+    expect(refusalOf(await emailSend(session, { text: `Again: ${docUrl(agenda)}` }))).toBe(
+      `Your email was not sent: ${LINKS_UNCHECKED}`,
+    );
+    expect(gmail.sent).toHaveLength(1);
+  });
+
+  it('never checks what main sends the principal: its email carries any Google link untouched', async () => {
+    gmail.receive({
+      threadId: 'g-p',
+      from: `Pat <${PRINCIPAL}>`,
+      principal: true,
+      subject: 'Fwd: Agenda',
+      body: 'Juno, take a look.',
+    });
+    await inbox.tick();
+    const agenda = await shared('Agenda', []);
+    expect(
+      await emailSend(main, { thread_key: await threadOf('g-p'), text: `Here it is: ${docUrl(agenda)}` }),
+    ).toMatchObject({ ok: true });
+    expect(gmail.sent.map((sent) => sent.to)).toEqual([[PRINCIPAL]]);
+    expect(driveReads()).toEqual([]);
+    expect(workspace.visits).toEqual([]);
+  });
+
+  it('does not check the principal when they are on an email to outsiders', async () => {
+    const { key, session } = await arrives({
+      threadId: 'g-1',
+      from: `Pat <${PRINCIPAL}>`,
+      principal: true,
+      cc: [SAM],
+      body: 'Juno, send Sam the agenda.',
+    });
+    const agenda = await shared('Agenda', [SAM]);
+    await reply(session, key, `Sam, the agenda: ${docUrl(agenda)}`);
+    expect(gmail.sent.map((sent) => [sent.to, sent.cc])).toEqual([[[PRINCIPAL], [SAM]]]);
   });
 });

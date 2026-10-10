@@ -729,14 +729,30 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     expect((await dockerfileInstructions()).filter((line) => /^ENV\b.*\bGOG_/u.test(line))).toEqual([]);
 
     await freshInstall();
+    const db = await import('../db/index.js');
+    // The capability column and the profile, which names main, as the host's module barrel registers them.
+    await import('../modules/capabilities/index.js');
+    await import('../modules/gws-ea-profile/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
     const { resolveCapabilities } = await import('../capabilities.js');
     await import('../modules/gws-ea-google/index.js');
+    const { WORKSPACE_GOG_COMMANDS } = await import('../modules/gws-ea-google/workspace-commands.js');
     const { composeSessionSpec } = await import('../container-runner.js');
-    const spawnEnv = (capabilities: readonly string[]) =>
+    const { reconcileGwsEaProfile } = await import('../modules/gws-ea-profile/db.js');
+    for (const id of ['ag-main', 'ag-research']) await db.createAgentGroup(agentGroup(id));
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Juno',
+      assistantWorkspaceEmail: 'juno@northwind.example',
+      principalDisplayName: 'Morgan Ellery',
+      principalTimezone: 'Europe/London',
+      mainAgentGroupId: 'ag-main',
+    });
+    const spawnEnv = (agentGroupId: string, capabilities: readonly string[]) =>
       composeSessionSpec({
-        agentGroup: { id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: '' },
-        session: { id: 'session-1', agent_group_id: 'ag-main' } as never,
-        containerName: 'nanoclaw-v2-main-1700000000000',
+        agentGroup: agentGroup(agentGroupId),
+        session: { id: 'session-1', agent_group_id: agentGroupId } as never,
+        containerName: `nanoclaw-v2-${agentGroupId}-1700000000000`,
         mounts: [],
         containerConfig: { capabilities: [...capabilities] } as never,
         mailboxEnvironment: {},
@@ -744,30 +760,32 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
         gateway: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
       }).containers[0].contributedEnv ?? {};
 
-    const main = spawnEnv(resolveCapabilities('all', 'main'));
-    const commands = main.GOG_ENABLE_COMMANDS_EXACT?.split(',');
-    expect(commands).toEqual(
-      expect.arrayContaining([
-        'calendar.events',
-        'calendar.update',
-        'calendar.delete',
-        'calendar.respond',
-        'gmail.search',
-        'gmail.thread.get',
-        'people.search',
-      ]),
-    );
-    for (const off of [
-      'calendar.conflicts',
-      'calendar.create',
-      'gmail.send',
-      'gmail.thread.modify',
-      'gmail.drafts.create',
-    ]) {
-      expect(commands).not.toContain(off);
-    }
+    const main = spawnEnv('ag-main', resolveCapabilities('all', 'main'));
+    // Calendar without gog's create, and without its conflict check: main
+    // creates events and checks overlaps through the host. Gmail read-only,
+    // the directory's search, and the whole of Drive, Docs, Sheets, Slides and Forms.
+    const services = [
+      'calendar.calendars',
+      'calendar.subscribe',
+      'calendar.unsubscribe',
+      'calendar.events',
+      'calendar.event',
+      'calendar.freebusy',
+      'calendar.update',
+      'calendar.delete',
+      'calendar.respond',
+      'gmail.search',
+      'gmail.messages.search',
+      'gmail.thread.get',
+      'gmail.get',
+      'people.search',
+    ];
+    expect(main.GOG_ENABLE_COMMANDS_EXACT?.split(',')).toEqual([...services, ...WORKSPACE_GOG_COMMANDS]);
     expect(main).toMatchObject({ GOG_ACCESS_TOKEN: 'gateway-managed', GOG_GMAIL_NO_SEND: '1' });
-    expect(Object.keys(spawnEnv(['reply', 'shell'])).filter((key) => key.startsWith('GOG_'))).toEqual([]);
+    expect(
+      spawnEnv('ag-research', resolveCapabilities('all', 'research')).GOG_ENABLE_COMMANDS_EXACT?.split(','),
+    ).toEqual(services);
+    expect(Object.keys(spawnEnv('ag-main', ['reply', 'shell'])).filter((key) => key.startsWith('GOG_'))).toEqual([]);
   });
 });
 

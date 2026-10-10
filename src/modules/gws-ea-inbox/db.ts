@@ -83,6 +83,8 @@ export type RouteOutcome =
   | 'calendar-not-principal'
   | 'calendar-own-change'
   | 'forged-calendar-notification'
+  | 'workspace-unreadable'
+  | 'forged-workspace-notification'
   | 'automated'
   | 'principal'
   | 'outside'
@@ -90,6 +92,7 @@ export type RouteOutcome =
   | 'gone'
   | 'not-in-inbox'
   | 'calendar-note'
+  | 'workspace-note'
   | 'set-aside';
 
 /** Record where a message was routed. Its routing attempts end here. */

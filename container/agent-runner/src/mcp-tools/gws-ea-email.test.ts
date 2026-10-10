@@ -396,6 +396,96 @@ describe('files that go with a request', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
+  describe('to main', () => {
+    // The session's own folders, /workspace/inbox and /workspace/agent, exist
+    // only in a container, so their files are looked up under a local copy.
+    let workspace: string;
+    // Taken before each test records the outbox's folders in its place.
+    const mkdirSync = fs.mkdirSync;
+
+    beforeEach(() => {
+      workspace = path.join(dir, 'workspace');
+      for (const [file, contents] of [
+        ['inbox/mail-1/invoice.pdf', 'invoice'],
+        ['inbox/handoff-act-1/terms.txt', 'terms'],
+        ['agent/notes.txt', 'notes'],
+      ] as const) {
+        mkdirSync(path.dirname(path.join(workspace, file)), { recursive: true });
+        fs.writeFileSync(path.join(workspace, file), contents);
+      }
+      // A link in the inbox to a file elsewhere in the session.
+      fs.symlinkSync(path.join(workspace, 'agent', 'notes.txt'), path.join(workspace, 'inbox', 'mail-1', 'linked.txt'));
+
+      const statSync = fs.statSync;
+      const realpathSync = fs.realpathSync;
+      const realWorkspace = realpathSync(workspace);
+      const local = (target: fs.PathLike): string => {
+        const file = String(target);
+        return file.startsWith('/workspace/') ? path.join(workspace, file.slice('/workspace/'.length)) : file;
+      };
+      spies.push(
+        spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike) =>
+          statSync(local(target), { throwIfNoEntry: false })) as typeof fs.statSync),
+        spyOn(fs, 'realpathSync').mockImplementation(((target: fs.PathLike) => {
+          const real = realpathSync(local(target));
+          const relative = path.relative(realWorkspace, real);
+          return relative.startsWith('..') || path.isAbsolute(relative) ? real : path.join('/workspace', relative);
+        }) as typeof fs.realpathSync),
+      );
+    });
+
+    it("are files that came in this thread, staged from its inbox under the request's own id by their file names", async () => {
+      const { request } = await call(tellMain, {
+        message: 'Acme sent its invoice for the pilot, with its terms.',
+        files: ['/workspace/inbox/mail-1/invoice.pdf', '/workspace/inbox/handoff-act-1/terms.txt'],
+      });
+      expect(request.files).toEqual(['invoice.pdf', 'terms.txt']);
+      const outbox = path.join('/workspace/outbox', String(request.requestId));
+      expect(made).toEqual([outbox]);
+      expect(copies).toEqual([
+        ['/workspace/inbox/mail-1/invoice.pdf', path.join(outbox, 'invoice.pdf')],
+        ['/workspace/inbox/handoff-act-1/terms.txt', path.join(outbox, 'terms.txt')],
+      ]);
+      expect(sentAtCopy).toEqual([0, 0]);
+    });
+
+    it('refuse any file that did not come in this thread, staging nothing and sending nothing', async () => {
+      const elsewhere = path.join(dir, 'deck.pdf');
+      for (const files of [
+        ['/workspace/agent/notes.txt'],
+        // Relative to /workspace/agent, as every file path is.
+        ['notes.txt'],
+        ['/workspace/inbox/../agent/notes.txt'],
+        ['/workspace/inbox/mail-1/linked.txt'],
+        [elsewhere],
+        ['/workspace/inbox/mail-1/invoice.pdf', '/workspace/agent/notes.txt'],
+      ]) {
+        const result = await tellMain.handler(
+          { message: 'Acme sent its invoice.', files },
+          { signal: AbortSignal.timeout(100) },
+        );
+        const label = JSON.stringify(files);
+        expect(result.isError, label).toBe(true);
+        expect(text(result), label).toMatch(
+          /did not come in this thread: only files under \/workspace\/inbox\/ can go to main/,
+        );
+      }
+      expect(made).toEqual([]);
+      expect(copies).toEqual([]);
+      expect(getUndeliveredMessages()).toHaveLength(0);
+    });
+
+    it('refuse a file missing from the inbox as any tool does', async () => {
+      const result = await tellMain.handler(
+        { message: 'Acme sent its invoice.', files: ['/workspace/inbox/mail-1/missing.pdf'] },
+        { signal: AbortSignal.timeout(100) },
+      );
+      expect(text(result)).toMatch(/No file at \/workspace\/inbox\/mail-1\/missing\.pdf/);
+      expect(copies).toEqual([]);
+      expect(getUndeliveredMessages()).toHaveLength(0);
+    });
+  });
+
   it('stage nothing and send nothing for a call cancelled before it starts', async () => {
     const result = await emailSend.handler(
       { text: 'Here is the deck.', files: [path.join(dir, 'deck.pdf')] },

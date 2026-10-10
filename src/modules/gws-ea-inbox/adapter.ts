@@ -20,10 +20,14 @@
  *   the settled record keeps from routing twice.
  *
  * Each poll also keeps calendar notifications on for the principal's
- * calendars.
+ * calendars. Calendar's notifications, and Docs' and Drive's, each become one
+ * note for `main` after the poll's messages are routed; Drive failing as
+ * that note is written costs the note detail, never the poll.
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
+import type { DriveApi } from '../gws-ea-workspace/drive-api.js';
+import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import { syncCalendarNotifications, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
 import {
   getInboxState,
@@ -34,6 +38,7 @@ import {
   settleMessage,
   unsettledMessages,
   updateInboxState,
+  type RouteOutcome,
 } from './db.js';
 import { GoogleApiError, type GmailApi, type GmailHistoryRecord } from './gmail-api.js';
 import { recordPollFailure, recordPollSuccess } from './health.js';
@@ -80,6 +85,8 @@ export const EMAIL_CHANNEL_DEFAULTS: ChannelDefaults = { dm: EMAIL_CONTEXT, grou
 export interface InboxDeps {
   readonly gmail: GmailApi;
   readonly calendar: CalendarListApi;
+  /** Drive as the host's own Drive token reaches it, for the details of Docs and Drive activity. */
+  readonly drive: DriveApi;
   readonly now?: () => Date;
   readonly sleep?: (ms: number) => Promise<void>;
 }
@@ -133,8 +140,9 @@ export function createInbox(deps: InboxDeps): Inbox {
   async function routeBatch(ids: readonly string[], context: RoutingContext, limited: boolean): Promise<boolean> {
     const at = context.at.toISOString();
     const calendar: { gmailMessageId: string; notice: CalendarNotice }[] = [];
+    const workspace: { gmailMessageId: string; notice: WorkspaceNotice }[] = [];
     let complete = true;
-    // Each message set aside, as it was read; a calendar notification's is not kept.
+    // Each message set aside, as it was read; a batched notification's is not kept.
     const setAside: (ParsedMail | undefined)[] = [];
 
     const failed = async (
@@ -168,6 +176,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       try {
         const routed = await routeMail(mail, runtime, context, { limited });
         if (routed.kind === 'calendar') calendar.push({ gmailMessageId: id, notice: routed.notice });
+        else if (routed.kind === 'workspace') workspace.push({ gmailMessageId: id, notice: routed.notice });
         else await settleMessage(id, routed.outcome, at);
       } catch (error) {
         if (error instanceof GoogleApiError) throw error;
@@ -178,18 +187,26 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
     }
 
-    if (calendar.length > 0) {
+    /** Write one batch's note, then settle its notifications; failing to write it is each one's failed attempt. */
+    const writeBatch = async (
+      entries: readonly { readonly gmailMessageId: string }[],
+      write: () => Promise<void>,
+      outcome: RouteOutcome,
+    ): Promise<void> => {
+      if (entries.length === 0) return;
       /* eslint-disable no-catch-all/no-catch-all -- any failure to write the note is each notification's failed attempt */
       try {
-        await writeCalendarNote(calendar, context.at);
-        for (const entry of calendar) await settleMessage(entry.gmailMessageId, 'calendar-note', at);
+        await write();
+        for (const entry of entries) await settleMessage(entry.gmailMessageId, outcome, at);
       } catch (error) {
-        for (const entry of calendar) {
+        for (const entry of entries) {
           if ((await failed(entry.gmailMessageId, error)) === 'retry') complete = false;
         }
       }
       /* eslint-enable no-catch-all/no-catch-all */
-    }
+    };
+    await writeBatch(calendar, () => writeCalendarNote(calendar, context.at), 'calendar-note');
+    await writeBatch(workspace, () => writeWorkspaceNote(workspace, deps.drive, context.at), 'workspace-note');
     if (setAside.length > 0) await noticeSetAside(setAside);
     return complete;
   }
