@@ -25,12 +25,20 @@
  *   (`enforceDiscoveryMethodPolicy` in `internal/cmd/api.go`); it reaches
  *   what gog has no command for, and `api describe` shows what a method takes.
  *
- * Nothing is left out by choice. When gog or an API changes, regenerate the
- * list the same way and update the counts its test pins.
+ * A command that calls a Google host with no agent credential is left out.
+ * The gateway injects main's token only on `AGENT_GOOGLE_HOSTS` (`grant.ts`),
+ * so such a command can only fail with a 401, which main's rules read as a
+ * connection only the operator can restore. That leaves out `drive activity
+ * query`, on driveactivity.googleapis.com, and the five `drive labels`
+ * commands, on drivelabels.googleapis.com. Drive v3's own label methods,
+ * `api.drive.files.listlabels` and `api.drive.files.modifylabels`, are on
+ * www.googleapis.com and stay.
+ *
+ * Nothing else is left out by choice. When gog or an API changes, regenerate
+ * the list the same way and update the counts its test pins.
  */
 export const WORKSPACE_GOG_COMMANDS: readonly string[] = [
   // Drive
-  'drive.activity.query',
   'drive.audit.sharing',
   'drive.audit.user',
   'drive.bulk.remove-public',
@@ -56,11 +64,6 @@ export const WORKSPACE_GOG_COMMANDS: readonly string[] = [
   'drive.du',
   'drive.get',
   'drive.inventory',
-  'drive.labels.file.apply',
-  'drive.labels.file.list',
-  'drive.labels.file.remove',
-  'drive.labels.get',
-  'drive.labels.list',
   'drive.ls',
   'drive.mkdir',
   'drive.move',

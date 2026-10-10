@@ -130,7 +130,7 @@ A local image you put in a doc or deck (`gog docs insert-image <docId> --file <p
 
 ## Remove
 
-`gog drive delete <fileId> --force` moves a file to the trash, where it can be restored for 30 days. Delete it permanently with `--permanent` when the principal wants it gone for good.
+`gog drive delete <fileId> --force` moves a file to the trash, where it can be restored for 30 days. Delete it permanently with `--permanent` when the principal wants it gone for good. Bring a trashed file back, such as one a message still links to, with `gog api call drive v3 drive.files.update --params '{"fileId":"<fileId>"}' --body '{"trashed":false}' --allow-write --force`.
 
 ## What Google can't do
 

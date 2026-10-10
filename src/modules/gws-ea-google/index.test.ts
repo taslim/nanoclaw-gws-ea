@@ -181,11 +181,12 @@ describe("Workspace's commands", () => {
   const count = (prefix: string): number =>
     WORKSPACE_GOG_COMMANDS.filter((command) => command.startsWith(prefix)).length;
 
-  it('are every command gog 0.43.0 has under Drive, Docs, Sheets, Slides and Forms, and every method of their five APIs', () => {
+  it('are every command gog 0.43.0 has under Drive, Docs, Sheets, Slides and Forms that main can reach, and every method of their five APIs', () => {
     expect(new Set(WORKSPACE_GOG_COMMANDS).size).toBe(WORKSPACE_GOG_COMMANDS.length);
     for (const command of WORKSPACE_GOG_COMMANDS) expect(command).toMatch(/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/u);
     // gog 0.43.0's command index: each product's runnable commands, Slides' and
-    // Forms' batch-submit permissions among them, and `batch`'s six.
+    // Forms' batch-submit permissions among them, and `batch`'s six. Drive's
+    // leave out the six that call a host with no agent credential.
     expect({
       drive: count('drive.'),
       docs: count('docs.'),
@@ -193,7 +194,7 @@ describe("Workspace's commands", () => {
       slides: count('slides.'),
       forms: count('forms.'),
       batch: count('batch.'),
-    }).toEqual({ drive: 47, docs: 72, sheets: 67, slides: 48, forms: 18, batch: 6 });
+    }).toEqual({ drive: 41, docs: 72, sheets: 67, slides: 48, forms: 18, batch: 6 });
     // Every method of the Discovery documents of Drive v3, Docs v1, Sheets v4, Slides v1 and Forms v1.
     expect({
       drive: count('api.drive.'),
@@ -202,7 +203,7 @@ describe("Workspace's commands", () => {
       slides: count('api.slides.'),
       forms: count('api.forms.'),
     }).toEqual({ drive: 64, docs: 3, sheets: 17, slides: 5, forms: 10 });
-    expect(WORKSPACE_GOG_COMMANDS).toHaveLength(359);
+    expect(WORKSPACE_GOG_COMMANDS).toHaveLength(353);
   });
 
   it('include what gog has no command for, through a Discovery call', () => {
