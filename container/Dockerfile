@@ -62,11 +62,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
-# Chromium path for agent-browser / Playwright consumers
-ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
-# ~300MB Chromium. We've already installed the system one above.
+# ~300MB Chromium. We've already installed the system one above, which browser
+# consumers start through the launch wrapper installed below.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # ---- Bun runtime -------------------------------------------------------------
@@ -149,6 +147,16 @@ RUN case "$TARGETARCH" in \
     tar -xzf /tmp/gogcli.tar.gz -C /tmp ./gog && \
     install -m 0755 /tmp/gog /usr/local/bin/gog && \
     rm -f /tmp/gogcli.tar.gz /tmp/gog
+
+# ---- Chromium launch wrapper -------------------------------------------------
+# agent-browser and Playwright consumers start the system Chromium through
+# chromium-launch.sh, which puts it behind the gateway with every host that
+# carries the assistant's Google tokens on its proxy-bypass list, so no page can
+# call those APIs as the assistant. It sits this late so a change to the host
+# list rebuilds only the layers after it.
+COPY --chmod=0755 chromium-launch.sh /usr/local/bin/chromium-launch
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium-launch
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/local/bin/chromium-launch
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
