@@ -2,10 +2,13 @@
  * Whether the inbox is working. Polling that keeps failing makes it
  * unhealthy: the principal hears one plain sentence, and status shows it
  * through `gws-ea-inbox health`. The first good poll makes it healthy again.
+ * Beside it, status shows what the assistant can do with each principal
+ * address's calendar: a fact, never a fault.
  */
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
-import { getInboxState, updateInboxState } from './db.js';
+import { loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
+import { getInboxState, principalCalendarAccess, updateInboxState, type AddressCalendarAccess } from './db.js';
 import { noticeUnhealthy } from './notices.js';
 
 /** Consecutive failed polls, a minute apart, before the inbox counts as unhealthy. */
@@ -18,8 +21,10 @@ export interface InboxHealth {
   readonly since: string | null;
   readonly lastSuccessAt: string | null;
   readonly consecutiveFailures: number;
-  /** Turning on calendar notifications for the principal's calendars. */
+  /** Keeping the assistant's calendar list: notifications on, and each principal address's calendar in it. */
   readonly calendarNotifications: { readonly state: 'unknown' | 'ok' | 'failing'; readonly reason: string | null };
+  /** What the assistant can do with each principal address's main calendar, as main lists it. */
+  readonly calendarAccess: readonly AddressCalendarAccess[];
 }
 
 /** The inbox's health, as status reads it. */
@@ -32,6 +37,7 @@ export async function getInboxHealth(): Promise<InboxHealth> {
     lastSuccessAt: state.last_success_at,
     consecutiveFailures: state.consecutive_failures,
     calendarNotifications: { state: state.calendar_sync, reason: state.calendar_sync_reason },
+    calendarAccess: await principalCalendarAccess((await loadPrincipalRecognizer()).listed),
   };
 }
 

@@ -146,6 +146,13 @@ export interface CalendarNotificationsView {
   readonly state: 'unknown' | 'ok' | 'failing';
   readonly reason: string | null;
 }
+/** What the assistant can do with one principal address's main calendar, as the inbox last read it from Google. */
+export interface CalendarAccessView {
+  readonly address: string;
+  readonly access: 'unchecked' | 'bookable' | 'readable' | 'free-busy' | 'none';
+  /** When Google last answered for it; null while unchecked. */
+  readonly checked_at: string | null;
+}
 export interface InboxFacts {
   /** The inbox's polling, as the host records it. */
   readonly state: 'healthy' | 'unhealthy' | null;
@@ -154,6 +161,8 @@ export interface InboxFacts {
   /** When a poll last succeeded. */
   readonly last_success_at: string | null;
   readonly calendar_notifications: CalendarNotificationsView | null;
+  /** Each principal address's calendar access, the facts main lists: shown, never a fault. */
+  readonly calendar_access: readonly CalendarAccessView[] | null;
 }
 export interface ConnectorFacts {
   readonly drift: string | null;
@@ -184,7 +193,8 @@ export interface AssistantProbes {
   readonly external_email: ProbeResult & ExternalEmailFacts;
   /**
    * The assistant's inbox as the host reports it: polling healthy, and
-   * calendar notifications on for the principal's calendars.
+   * calendar notifications on for the principal's calendars. Beside it,
+   * what the assistant can do with each principal address's calendar.
    */
   readonly inbox: ProbeResult & InboxFacts;
   /**
@@ -782,6 +792,7 @@ async function externalEmailProbe(subject: Subject): Promise<ProbeResult & Exter
 
 const INBOX_STATES = ['healthy', 'unhealthy'] as const;
 const CALENDAR_NOTIFICATION_STATES = ['unknown', 'ok', 'failing'] as const;
+const CALENDAR_ACCESS = ['unchecked', 'bookable', 'readable', 'free-busy', 'none'] as const;
 
 function oneOf<T extends string>(values: readonly T[], value: unknown): value is T {
   return typeof value === 'string' && (values as readonly string[]).includes(value);
@@ -798,6 +809,26 @@ interface InboxHealthReport {
   readonly since: string | null;
   readonly lastSuccessAt: string | null;
   readonly calendarNotifications: CalendarNotificationsView;
+  /** Null from a release that reports none: one from before calendar access. */
+  readonly calendarAccess: readonly CalendarAccessView[] | null;
+}
+
+/** Each address's calendar access as the host reports it, or undefined when any of it is malformed. */
+function parseCalendarAccess(value: unknown): CalendarAccessView[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const views: CalendarAccessView[] = [];
+  for (const item of value) {
+    if (
+      !isRecord(item) ||
+      typeof item.address !== 'string' ||
+      !oneOf(CALENDAR_ACCESS, item.access) ||
+      !nullableString(item.checkedAt)
+    ) {
+      return undefined;
+    }
+    views.push({ address: item.address, access: item.access, checked_at: item.checkedAt });
+  }
+  return views;
 }
 
 function parseInboxHealth(value: unknown): InboxHealthReport {
@@ -805,13 +836,16 @@ function parseInboxHealth(value: unknown): InboxHealthReport {
   if (!isRecord(value) || !isRecord(value.calendarNotifications)) throw invalid();
   const { state, reason, since, lastSuccessAt } = value;
   const calendar = value.calendarNotifications;
+  // A release from before calendar access sends none; its inbox still reads as it is.
+  const calendarAccess = value.calendarAccess === undefined ? null : parseCalendarAccess(value.calendarAccess);
   if (
     !oneOf(INBOX_STATES, state) ||
     !nullableString(reason) ||
     !nullableString(since) ||
     !nullableString(lastSuccessAt) ||
     !oneOf(CALENDAR_NOTIFICATION_STATES, calendar.state) ||
-    !nullableString(calendar.reason)
+    !nullableString(calendar.reason) ||
+    calendarAccess === undefined
   ) {
     throw invalid();
   }
@@ -821,6 +855,7 @@ function parseInboxHealth(value: unknown): InboxHealthReport {
     since,
     lastSuccessAt,
     calendarNotifications: { state: calendar.state, reason: calendar.reason },
+    calendarAccess,
   };
 }
 
@@ -831,7 +866,10 @@ function because(clause: string, reason: string | null): string {
 
 /**
  * The assistant's inbox as the running host reports it: polling Gmail without
- * failing, and calendar notifications on for the principal's calendars.
+ * failing, and calendar notifications on for the principal's calendars. Each
+ * principal address's calendar access is reported beside it and never
+ * degrades it: a calendar not shared is a fact, and only a failing sync is a
+ * fault.
  */
 async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
   const runtime = requireRuntime(subject.runtime);
@@ -841,6 +879,7 @@ async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
     since: health.since,
     last_success_at: health.lastSuccessAt,
     calendar_notifications: health.calendarNotifications,
+    calendar_access: health.calendarAccess,
   };
   const problems: string[] = [];
   if (health.state === 'unhealthy') problems.push(because('the inbox is unhealthy', health.reason));
@@ -1139,6 +1178,7 @@ export async function observeAssistantStatus(
       since: null,
       last_success_at: null,
       calendar_notifications: null,
+      calendar_access: null,
     }),
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
@@ -1362,6 +1402,30 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
   }
 }
 
+/** One probe's line: its status, its name, and what it saw. */
+function probeLine(status: string, name: string, detail: string): string {
+  return `  ${status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd();
+}
+
+const ACCESS_WORDS: Readonly<Record<CalendarAccessView['access'], string>> = {
+  unchecked: 'not checked yet',
+  bookable: 'bookable',
+  readable: 'readable, not bookable',
+  'free-busy': 'free/busy only',
+  none: 'no access',
+};
+
+/** Under the inbox's line, each principal address's calendar access, whatever the probe saw. */
+function calendarAccessLines(views: readonly CalendarAccessView[] | null, timezone: string): string[] {
+  return (views ?? []).map(({ address, access, checked_at: checkedAt }) =>
+    probeLine(
+      '',
+      '',
+      `calendar of ${address}: ${ACCESS_WORDS[access]}${checkedAt === null ? '' : ` (checked ${formatLocalTime(checkedAt, timezone)})`}`,
+    ),
+  );
+}
+
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
@@ -1386,8 +1450,8 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   for (const name of PROBE_NAMES) {
     const result = status.probes[name];
     if (!result) continue;
-    const detail = result.reason ?? probeDetail(name, status.probes, timezone);
-    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
+    lines.push(probeLine(result.status, name, result.reason ?? probeDetail(name, status.probes, timezone)));
+    if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
   return lines;
@@ -1414,10 +1478,11 @@ export const STATUS_USAGE: readonly string[] = [
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
   '       probes: checkout, image (tag), service, host, onecli, main_identity, external_email, inbox (state,',
-  '       since, last_success_at, calendar_notifications), workspace (account), principal, route, connector',
-  '       (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a',
-  '       reason. list and status exit 0 once they observed, whatever the health; status exits 1 for an',
-  '       unknown ID.',
+  '       since, last_success_at, calendar_notifications, calendar_access: each principal address with its',
+  "       calendar's access, unchecked|bookable|readable|free-busy|none, and checked_at), workspace",
+  '       (account), principal, route, connector (managed Cloudflare only, with drift), delivery; each probe',
+  '       has status ok|degraded|unknown and a reason. list and status exit 0 once they observed, whatever',
+  '       the health; status exits 1 for an unknown ID.',
 ];
 
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {

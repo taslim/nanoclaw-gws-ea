@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { formatLocalTime } from '../timezone.js';
 import { acquireInstanceOperation, recordPrincipalSelection, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
@@ -506,6 +507,7 @@ const HEALTHY_INBOX = {
   lastSuccessAt: '2026-09-28T14:29:00.000Z',
   consecutiveFailures: 0,
   calendarNotifications: { state: 'ok', reason: null },
+  calendarAccess: [{ address: 'morgan@example.test', access: 'bookable', checkedAt: '2026-09-28T14:29:00.000Z' }],
 } as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
@@ -627,6 +629,9 @@ describe('status', () => {
       since: null,
       last_success_at: HEALTHY_INBOX.lastSuccessAt,
       calendar_notifications: { state: 'ok', reason: null },
+      calendar_access: [
+        { address: 'morgan@example.test', access: 'bookable', checked_at: HEALTHY_INBOX.lastSuccessAt },
+      ],
     });
     // A shared connector's drift is reported, never counted against this assistant (KTD11).
     expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
@@ -832,6 +837,9 @@ describe('status', () => {
       since: unhealthySince,
       last_success_at: HEALTHY_INBOX.lastSuccessAt,
       calendar_notifications: { state: 'failing', reason: 'the calendar list refused the change' },
+      calendar_access: [
+        { address: 'morgan@example.test', access: 'bookable', checked_at: HEALTHY_INBOX.lastSuccessAt },
+      ],
     });
     for (const name of Object.keys(failing.status.probes).filter((probe) => probe !== 'inbox')) {
       expect(failing.status.probes[name], name).toMatchObject({ status: 'ok' });
@@ -850,15 +858,83 @@ describe('status', () => {
       state: 'healthy',
     });
 
-    const invalid = await statusJson(host, state, reservation.instance_id, reporting({ ...HEALTHY_INBOX, reason: 42 }));
-    expect(invalid.status.probes.inbox).toEqual({
-      status: 'degraded',
-      reason: 'ncl returned an invalid inbox report',
-      state: null,
-      since: null,
-      last_success_at: null,
-      calendar_notifications: null,
+    // A release from before calendar access reports none: the inbox reads as it is, with no access lines.
+    const earlierRelease = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({ ...HEALTHY_INBOX, calendarAccess: undefined }),
+    );
+    expect(earlierRelease.status.probes.inbox).toMatchObject({ status: 'ok', state: 'healthy', calendar_access: null });
+
+    for (const report of [
+      { ...HEALTHY_INBOX, reason: 42 },
+      { ...HEALTHY_INBOX, calendarAccess: null },
+      { ...HEALTHY_INBOX, calendarAccess: [{ address: 'morgan@example.test', access: 'owner', checkedAt: null }] },
+      { ...HEALTHY_INBOX, calendarAccess: [{ address: 'morgan@example.test', access: 'none', checkedAt: 7 }] },
+    ]) {
+      const invalid = await statusJson(host, state, reservation.instance_id, reporting(report));
+      expect(invalid.status.probes.inbox).toEqual({
+        status: 'degraded',
+        reason: 'ncl returned an invalid inbox report',
+        state: null,
+        since: null,
+        last_success_at: null,
+        calendar_notifications: null,
+        calendar_access: null,
+      });
+    }
+  });
+
+  it("shows each principal address's calendar access in every state, and never counts it against the inbox (AE4)", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const checkedAt = '2026-09-28T14:29:00.000Z';
+    const report = {
+      ...HEALTHY_INBOX,
+      calendarAccess: [
+        { address: 'morgan@example.test', access: 'bookable', checkedAt },
+        { address: 'morgan@home.example.test', access: 'readable', checkedAt },
+        { address: 'morgan@work.example.test', access: 'free-busy', checkedAt },
+        { address: 'morgan@old.example.test', access: 'none', checkedAt },
+        { address: 'morgan@new.example.test', access: 'unchecked', checkedAt: null },
+      ],
+    };
+    const observers = {
+      ...healthy,
+      ncl: (async (runtime, args) =>
+        args.join(' ') === 'gws-ea-inbox health'
+          ? report
+          : healthy.ncl(runtime, args)) satisfies StatusObservers['ncl'],
+    };
+
+    const { status } = await statusJson(host, state, reservation.instance_id, observers);
+    expect(status.probes.inbox).toMatchObject({
+      status: 'ok',
+      reason: null,
+      calendar_access: [
+        { address: 'morgan@example.test', access: 'bookable', checked_at: checkedAt },
+        { address: 'morgan@home.example.test', access: 'readable', checked_at: checkedAt },
+        { address: 'morgan@work.example.test', access: 'free-busy', checked_at: checkedAt },
+        { address: 'morgan@old.example.test', access: 'none', checked_at: checkedAt },
+        { address: 'morgan@new.example.test', access: 'unchecked', checked_at: null },
+      ],
     });
+
+    const shown = command(host, state, observers);
+    await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false });
+    const inboxLine = shown.output.stdout.findIndex((line) => /^ {2}ok {8}inbox /u.test(line));
+    const checked = formatLocalTime(checkedAt, 'America/New_York');
+    expect(shown.output.stdout.slice(inboxLine + 1, inboxLine + 6)).toEqual([
+      `${' '.repeat(28)}calendar of morgan@example.test: bookable (checked ${checked})`,
+      `${' '.repeat(28)}calendar of morgan@home.example.test: readable, not bookable (checked ${checked})`,
+      `${' '.repeat(28)}calendar of morgan@work.example.test: free/busy only (checked ${checked})`,
+      `${' '.repeat(28)}calendar of morgan@old.example.test: no access (checked ${checked})`,
+      `${' '.repeat(28)}calendar of morgan@new.example.test: not checked yet`,
+    ]);
   });
 
   it("reports an assistant behind the tool's release with both commits", async () => {
@@ -1452,6 +1528,7 @@ describe('help', () => {
       'drift',
       'last_success_at',
       'calendar_notifications',
+      'calendar_access',
     ]) {
       expect(help, field).toContain(field);
     }

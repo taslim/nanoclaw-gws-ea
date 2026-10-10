@@ -12,6 +12,26 @@ export function isValidTimezone(tz: string): boolean {
 }
 
 /**
+ * `value`, trimmed, as an IANA zone correctly cased, or undefined when it is
+ * no zone or a UTC offset. For a timezone a container runs in as its `TZ`,
+ * which reads an offset such as `+05:30` with its sign flipped (POSIX counts
+ * west of Greenwich as positive) and a miscased name (`europe/london`) as
+ * UTC, though `Intl` accepts both. A name already cased as the zone database
+ * writes it stays as given, even when it is another name for a zone
+ * (`Asia/Kolkata`, `Etc/GMT+5`); a miscased one takes the zone's own
+ * spelling. Each part of such a name opens with a capital and holds no two
+ * in a row (`US/Pacific` aside, which takes its zone's spelling), so a part
+ * in capitals is miscased.
+ */
+export function ianaTimezone(value: string): string | undefined {
+  const zone = value.trim();
+  if (!/^[A-Za-z]/u.test(zone) || !isValidTimezone(zone)) return undefined;
+  const resolved = new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
+  if (resolved.toLowerCase() === zone.toLowerCase()) return resolved;
+  return zone.split('/').every((part) => /^[A-Z]/u.test(part) && !/[A-Z]{2}/u.test(part)) ? zone : resolved;
+}
+
+/**
  * Return the given timezone if valid IANA, otherwise fall back to UTC.
  */
 export function resolveTimezone(tz: string): string {

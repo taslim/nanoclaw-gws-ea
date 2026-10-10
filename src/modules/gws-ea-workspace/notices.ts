@@ -21,8 +21,9 @@
  *   is the account Drive says shared that file; that account is one the home
  *   folder recorded for a current principal address; and Drive says it was
  *   shared when the email came. Identity comes from Drive's fields, never a
- *   display name. Titles, whom Google says acted, and anyone else's words
- *   reach `main` framed untrusted.
+ *   display name, and the note names the principal by their address as
+ *   listed. Titles, whom Google says acted, and anyone else's words reach
+ *   `main` framed untrusted.
  *
  * A leaf (KTD4): it loads no module's entry point.
  */
@@ -34,7 +35,7 @@ import { DOCS_COMMENTS_SENDER } from '../gws-ea-inbox/authentication.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { headerValues, oneLine, parseAddressList, type Mailbox, type ParsedMail } from '../gws-ea-inbox/mime.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { listFolderGrants } from './db.js';
 import type { DriveAccessProposal, DriveApi, DriveFile } from './drive-api.js';
@@ -258,25 +259,30 @@ function noteReader(drive: DriveApi): NoteReader {
 export interface NoticeContext {
   /** The principal as main reads them: by name, or as "the principal". */
   readonly principalName: string;
-  /** The principal's addresses, lowercased. */
-  readonly principalAddresses: ReadonlySet<string>;
-  /** The Drive permission ids the home folder recorded for the principal's current addresses. */
-  readonly principalPermissionIds: ReadonlySet<string>;
+  /** The principal's addresses, by the one rule that recognizes them (R1). */
+  readonly principalAddresses: PrincipalRecognizer;
+  /**
+   * The Drive permission ids the home folder recorded for the principal's
+   * current addresses, each with the address it was recorded for, as listed.
+   */
+  readonly principalPermissionIds: ReadonlyMap<string, string>;
 }
 
 /** The principal as the profile and the home folder's grants know them now. */
 export async function loadNoticeContext(): Promise<NoticeContext> {
   const db = getDb();
   const profile = (await db.hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined;
-  const addresses = new Set(profile?.principal_emails ?? []);
+  const principal = principalRecognizer(profile?.principal_emails ?? []);
   const grants = (await db.hasTable('gws_ea_workspace_grants')) ? await listFolderGrants() : [];
   return {
     principalName: profile?.principal_display_name ?? 'the principal',
-    principalAddresses: addresses,
+    principalAddresses: principal,
     // An address no longer the principal's no longer vouches for its account.
-    principalPermissionIds: new Set(
+    principalPermissionIds: new Map(
       grants.flatMap((grant) =>
-        addresses.has(grant.email) && grant.permissionId !== null ? [grant.permissionId] : [],
+        principal.listed.includes(grant.email) && grant.permissionId !== null
+          ? [[grant.permissionId, grant.email] as const]
+          : [],
       ),
     ),
   };
@@ -345,19 +351,25 @@ function shareMessage(
   return { text: body.join('\n'), isolated: isTitle(end < 0 ? undefined : lines[end]?.replace(ANY_LINK, '')) };
 }
 
-/** The principal's address Drive confirms shared the file, when every check holds. */
+/**
+ * The principal's address Drive confirms shared the file, as they listed it,
+ * when every check holds: the one Drive's spelling reaches, else the one the
+ * home folder recorded the sharer's account for.
+ */
 function principalSharer(notice: WorkspaceNotice, file: DriveFile, context: NoticeContext): string | undefined {
   const sharer = file.sharingUser;
   const address = sharer?.emailAddress?.toLowerCase();
   if (!notice.toAssistant || notice.fileCount !== 1 || address === undefined || notice.actor?.address !== address) {
     return undefined;
   }
-  if (sharer?.permissionId === undefined || !context.principalPermissionIds.has(sharer.permissionId)) return undefined;
+  const recorded =
+    sharer?.permissionId === undefined ? undefined : context.principalPermissionIds.get(sharer.permissionId);
+  if (recorded === undefined) return undefined;
   const sharedAt = file.sharedWithMeTime === undefined ? Number.NaN : Date.parse(file.sharedWithMeTime);
   if (notice.receivedAt === undefined || !(Math.abs(notice.receivedAt.getTime() - sharedAt) <= SHARE_WINDOW_MS)) {
     return undefined;
   }
-  return address;
+  return context.principalAddresses.resolve(address) ?? recorded;
 }
 
 async function describeComment(notice: WorkspaceNotice, reader: NoteReader): Promise<string> {
@@ -402,7 +414,7 @@ function proposalLine(proposal: DriveAccessProposal, context: NoticeContext): st
   const who =
     requester === undefined
       ? 'Someone'
-      : context.principalAddresses.has(requester)
+      : context.principalAddresses.has(proposal.requesterEmailAddress)
         ? `${requester}, one of ${context.principalName}'s addresses,`
         : requester;
   const roles = [
@@ -480,7 +492,7 @@ export async function workspaceNoteText(
       notices.map((notice) => [`${notice.activity}\u0000${notice.fileId}\u0000${notice.commentId ?? ''}`, notice]),
     ).values(),
   ];
-  const byPrincipal = (notice: WorkspaceNotice): boolean => context.principalAddresses.has(notice.actor?.address ?? '');
+  const byPrincipal = (notice: WorkspaceNotice): boolean => context.principalAddresses.has(notice.actor?.address);
   const ordered = [...unique.filter(byPrincipal), ...unique.filter((notice) => !byPrincipal(notice))];
   const listed = ordered.slice(0, MAX_NOTE_ITEMS);
   const reader = noteReader(drive);

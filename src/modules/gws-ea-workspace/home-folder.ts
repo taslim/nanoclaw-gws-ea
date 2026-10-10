@@ -30,7 +30,7 @@ import {
   type GoogleGrant,
 } from '../gws-ea-google/grant.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError } from '../gws-ea-google/tokens.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { NoteForMain, NoteForMainResult } from '../gws-ea-profile/main-note.js';
 import {
   deleteFolderGrant,
@@ -75,9 +75,13 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Named for the principal and the assistant, as both see it in Drive. */
-function homeFolderName(principal: string, assistant: string): string {
-  return `${principal} · ${assistant}`;
+/**
+ * Named for the assistant alone: an assistant has one principal, and nothing
+ * in Drive follows the principal's name, which they can change (R16). The
+ * name is given once, when the folder is made; the host never renames one.
+ */
+function homeFolderName(assistant: string): string {
+  return `Principal · ${assistant}`;
 }
 
 function noteText(folderId: string, replacing: boolean): string {
@@ -142,8 +146,8 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
     return made.id;
   }
 
-  async function shareWithPrincipal(folderId: string, addresses: readonly string[], at: string): Promise<void> {
-    await recordAddressList(addresses, at);
+  async function shareWithPrincipal(folderId: string, principal: PrincipalRecognizer, at: string): Promise<void> {
+    await recordAddressList(principal.listed, at);
     const grants = new Map((await listFolderGrants()).map((grant) => [grant.email, grant]));
     const access = new Map(
       (await drive.listPermissions(folderId))
@@ -160,7 +164,7 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
         (grant) => grant.state === 'granted' && grant.permissionId === permissionId && grant.hostMade,
       );
 
-    for (const email of addresses) {
+    for (const email of principal.listed) {
       const grant = grants.get(email);
       if (grant !== undefined) {
         if (grant.state !== 'granted' || access.has(grant.permissionId)) continue;
@@ -173,7 +177,7 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
       const permissionId = await drive.permissionId(email);
       const held =
         (permissionId === undefined ? undefined : access.get(permissionId)) ??
-        [...access.values()].find((permission) => permission.emailAddress?.toLowerCase() === email);
+        [...access.values()].find((permission) => principal.resolve(permission.emailAddress) === email);
       if (held !== undefined) {
         await record({ email, state: 'granted', permissionId: held.id, hostMade: madeByHost(held.id) });
         continue;
@@ -197,7 +201,7 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
       log.info("Shared the home folder with one of the principal's addresses", { email });
     }
 
-    const wanted = new Set(addresses);
+    const wanted = new Set(principal.listed);
     const stillWanted = (permissionId: string): boolean =>
       [...grants.values()].some(
         (grant) => wanted.has(grant.email) && grant.state === 'granted' && grant.permissionId === permissionId,
@@ -219,11 +223,10 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
 
   async function reconcile(): Promise<void> {
     const profile = await getGwsEaProfile();
-    if (profile.principal_display_name === null || profile.assistant_display_name === null) return;
+    if (profile.assistant_display_name === null) return;
     const at = now().toISOString();
-    const name = homeFolderName(profile.principal_display_name, profile.assistant_display_name);
-    const folderId = await ensureFolder(name, at);
-    await shareWithPrincipal(folderId, profile.principal_emails, at);
+    const folderId = await ensureFolder(homeFolderName(profile.assistant_display_name), at);
+    await shareWithPrincipal(folderId, principalRecognizer(profile.principal_emails), at);
     await tellMain(folderId, at);
   }
 

@@ -477,6 +477,7 @@ describe('people_stats', () => {
       {
         identity: `email:${ALICE}`,
         meetings: 4,
+        meetings_by_calendar: { [WORK]: 4 },
         one_on_ones: 3,
         recurring_series: 1,
         first_meeting: 'Tuesday 1 Sept',
@@ -485,6 +486,7 @@ describe('people_stats', () => {
       {
         identity: `email:${BOB}`,
         meetings: 2,
+        meetings_by_calendar: { [WORK]: 2 },
         one_on_ones: 1,
         recurring_series: 0,
         first_meeting: 'Thursday 10 Sept',
@@ -536,6 +538,43 @@ describe('people_stats', () => {
       more_than_eight: 1,
       attendees_omitted: 0,
     });
+  });
+
+  it('says on which of the principal’s calendars they met each person, counting a meeting on several once in total (R13)', async () => {
+    /** One meeting, with a copy on each principal calendar invited, each answering as given. */
+    const meeting = (id: string, day: string, on: ReadonlyArray<readonly [string, string]>) => {
+      for (const [calendarId] of on) {
+        calendar.put(
+          timed(calendarId, `${day}T11:00:00+01:00`, `${day}T12:00:00+01:00`, {
+            id,
+            iCalUID: `${id}@google.com`,
+            organizer: { email: CAROL },
+            attendees: [
+              guest(CAROL),
+              ...on.map(([other, answer]) => (other === calendarId ? own(other, answer) : guest(other, answer))),
+            ],
+          }),
+        );
+      }
+    };
+    // Both addresses invited and both accepted; then work alone; then both invited, declined on the personal calendar.
+    meeting('both', '2026-09-01', [
+      [WORK, 'accepted'],
+      [HOME, 'accepted'],
+    ]);
+    meeting('work-only', '2026-09-08', [[WORK, 'accepted']]);
+    meeting('declined-at-home', '2026-09-15', [
+      [WORK, 'accepted'],
+      [HOME, 'declined'],
+    ]);
+
+    const result = await stats({ people: [CAROL, 'nobody@else.example'] });
+
+    expect(result.people.map((person) => [person.identity, person.meetings, person.meetings_by_calendar])).toEqual([
+      [`email:${CAROL}`, 3, { [WORK]: 3, [HOME]: 1 }],
+      ['email:nobody@else.example', 0, {}],
+    ]);
+    expect(result.events).toMatchObject({ received: 5, counted: 3, duplicate_copies: 2 });
   });
 
   it("never builds a record from a stranger's unanswered, declined, or maybe invitations", async () => {
@@ -608,6 +647,7 @@ describe('people_stats', () => {
         identity: `email:${CAROL}`,
         display_name: null,
         meetings: 1,
+        meetings_by_calendar: { [WORK]: 1 },
         one_on_ones: 1,
         recurring_series: 0,
         first_meeting: 'Tuesday 29 Sept',
@@ -617,6 +657,7 @@ describe('people_stats', () => {
         identity: 'email:nobody@else.example',
         display_name: null,
         meetings: 0,
+        meetings_by_calendar: {},
         one_on_ones: 0,
         recurring_series: 0,
         first_meeting: null,

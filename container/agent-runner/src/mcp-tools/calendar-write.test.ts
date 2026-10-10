@@ -62,6 +62,23 @@ describe("main's calendar writes", () => {
     expect(text(result)).toBe('Its guests now: noel@friends.example.');
   });
 
+  it('tell main it may write on its own calendar, where the principal is a guest only when invited and others may see its details', () => {
+    const create = createEvent.tool.description ?? '';
+    expect(create).toStartWith("Put an event on one of the principal's calendars or on your own.");
+    expect(create).toContain(
+      'the principal is a guest, and the event takes their time, only if you name them in guests',
+    );
+    expect(create).toContain(
+      'anyone your calendar is shared with, colleagues in a company Workspace among them, sees its details unless it is private',
+    );
+    expect(createEvent.tool.inputSchema.properties?.calendar).toMatchObject({
+      description: expect.stringContaining('or your own address for yours'),
+    });
+    expect(changeGuests.tool.description).toStartWith(
+      'Invite people to an event the principal organizes or one you organize on your own calendar',
+    );
+  });
+
   it('refuse a call missing what it needs, sending nothing', async () => {
     for (const [tool, args, problem] of [
       [createEvent, { title: 'Focus', start: '2026-10-08', end: '2026-10-08' }, /calendar is required/],
