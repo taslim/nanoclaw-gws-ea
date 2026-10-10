@@ -119,6 +119,26 @@ export async function getMainAgentGroupId(): Promise<string | null> {
 }
 
 /**
+ * main's agent group as this host last read or named it, for code that must
+ * answer synchronously, such as a container's environment at spawn (KTD2):
+ * seeded as the host starts (`loadMainAgentGroupId`), and set when the
+ * profile names main (`reconcileGwsEaProfile`), so a main named after the
+ * host started is known on its next spawn. Main is never rebound, so it
+ * cannot go stale.
+ */
+let knownMainAgentGroup: string | null = null;
+
+/** main's agent group as this host knows it, or null before the profile names one. */
+export function knownMainAgentGroupId(): string | null {
+  return knownMainAgentGroup;
+}
+
+/** Read main's agent group from the profile into `knownMainAgentGroupId`, as the host starts. */
+export async function loadMainAgentGroupId(): Promise<void> {
+  knownMainAgentGroup = (await getDb().hasTable('gws_ea_profile')) ? await getMainAgentGroupId() : null;
+}
+
+/**
  * Refuse every caller but the host and the canonical main. A resource's
  * guard admits any agent whose CLI scope reaches it, so a resource that is
  * main's alone checks here; `resource` names it in the refusal.
@@ -267,6 +287,7 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
+  knownMainAgentGroup = validated.mainAgentGroupId;
   return getGwsEaProfile();
 }
 

@@ -2,6 +2,7 @@ import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
+import { onHostStart } from '../../host-lifecycle.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -19,6 +20,7 @@ import {
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
   listPrincipalAddresses,
+  loadMainAgentGroupId,
   principalApproverUserId,
   projectDocAudience,
   proposedPrincipalAddress,
@@ -37,6 +39,10 @@ import './wiring-policy.js';
 registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
 registerMigration(gwsEaExternalEmailPointerMigration);
+
+// What a spawn reads synchronously: main's group, as the profile names it.
+// Start callbacks run in module import order, so it is read before any later module's start.
+onHostStart(() => loadMainAgentGroupId());
 
 function escapeMarkdownInline(value: string): string {
   const special = new Set(['\\', '`', '*', '_', '{', '}', '[', ']', '<', '>', '#']);
@@ -259,7 +265,7 @@ async function requestAddAddressCard(ctx: CallerContext, email: string, approver
     action: ADD_ADDRESS_APPROVAL,
     payload: addAddressPayload(email),
     title: 'Add one of your email addresses?',
-    asks: `to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, so approve only if this address is yours.`,
+    asks: `to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, and each of them can open the Google Drive folder where the assistant keeps what it makes for you, so approve only if this address is yours.`,
   });
   return {
     email,
