@@ -152,6 +152,21 @@ describe('an invitation carrying a Google link', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('reads the links in what the event already shows its guests, not only in what the write says', async () => {
+    const { url } = await preRead();
+    // A guest joining an existing event reads its description, as change_guests passes it.
+    await expect(
+      assertInvitationShareable(
+        { texts: [], shown: ['Intro', `Pre-read: ${url}`], recipients: [MORGAN, REMY], writer: 'main' },
+        'The guests were not changed',
+        'Ask the principal.',
+      ),
+    ).rejects.toMatchObject({
+      code: 'forbidden',
+      message: `The guests were not changed: ${REMY} can't open ${url}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    });
+  });
+
   it('answers that it can be tried again shortly when Drive is briefly down', async () => {
     const { url } = await preRead();
     for (let attempt = 0; attempt < 3; attempt += 1)

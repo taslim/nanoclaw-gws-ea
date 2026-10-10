@@ -163,14 +163,22 @@ describe('the Drive client', () => {
     expect(request.body).toEqual({ type: 'user', role: 'writer', emailAddress: 'morgan.fixture@gmail.com' });
   });
 
-  it('removes a permission, and says when it was already gone', async () => {
-    const { api, requests } = stubGoogle((request) =>
-      request.url.pathname.endsWith('/0812') ? { status: 204 } : { status: 404 },
-    );
+  it('removes a permission, says when it was already gone, and never reads a refusal as gone', async () => {
+    const { api, requests } = stubGoogle((request) => {
+      if (request.url.pathname.endsWith('/0812')) return { status: 204 };
+      if (request.url.pathname.endsWith('/0813')) {
+        return driveError(403, 'insufficientFilePermissions', 'The user does not have sufficient permissions.');
+      }
+      if (request.url.pathname.endsWith('/0814')) return driveError(500, 'backendError', 'Backend Error');
+      return { status: 404 };
+    });
     expect(await api.deletePermission('folder-1', '0812')).toBe(true);
     expect(await api.deletePermission('folder-1', '0899')).toBe(false);
     expect(requests[0].method).toBe('DELETE');
     expect(requests[0].url.pathname).toBe('/drive/v3/files/folder-1/permissions/0812');
+    // Access Drive kept is not gone: the caller must hear the failure, not a quiet false.
+    await expect(api.deletePermission('folder-1', '0813')).rejects.toMatchObject({ status: 403 });
+    await expect(api.deletePermission('folder-1', '0814')).rejects.toMatchObject({ status: 500 });
   });
 
   it("finds an address's permission id through Drive v2, and nothing when Drive knows none", async () => {

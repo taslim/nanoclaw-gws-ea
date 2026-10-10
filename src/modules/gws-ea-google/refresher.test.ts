@@ -260,7 +260,8 @@ describe('the Google token refresher', () => {
     const before = w.minted.length;
     await r.tick();
     expect(w.asked().slice(before, before + 2)).toEqual([`${CALENDAR} ${DRIVE}`, CALENDAR]);
-    expect(w.vault.get('google-calendar')?.value).not.toBe(calendarOnly);
+    const renewedAlone = w.vault.get('google-calendar')?.value;
+    expect(renewedAlone).not.toBe(calendarOnly);
 
     // Google stops refusing: the next tick replaces the token with the full set.
     refusing = false;
@@ -268,6 +269,8 @@ describe('the Google token refresher', () => {
     const recovered = w.minted.length;
     await r.tick();
     expect(w.asked().slice(recovered)).toEqual([`${CALENDAR} ${DRIVE}`]);
+    // The only token minted this tick, the full set, is what agents now get.
+    expect(w.vault.get('google-calendar')?.value).not.toBe(renewedAlone);
     expect(log.info).toHaveBeenLastCalledWith(
       'Renewed Google access for agents',
       expect.objectContaining({ host: 'www.googleapis.com' }),

@@ -6,16 +6,22 @@
  * agent that wrote the message: `main` hears its choices, `external-email`
  * only who cannot open a link, and to tell main.
  *
- * Drive is in memory (`testing/fake-drive.ts`) and the visit is a stub.
+ * Drive is in memory (`testing/fake-drive.ts`) and the visit is a stub,
+ * except for the host's own check, whose Drive token is a mock and whose
+ * signed-out visit goes through a stubbed `fetch`.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../gws-ea-google/index.js', () => ({ hostGoogleAccessToken: vi.fn() }));
+
+import { closeDb, initTestDb } from '../../db/index.js';
+import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import {
+  checkLinksOpenable,
   createLinkAccess,
   LinkCheckUnavailableError,
-  NoGoogleSignInError,
   type LinkCheck,
   type LinkCheckRequest,
 } from './link-access.js';
@@ -176,14 +182,36 @@ describe('a file the assistant can only view (AE3)', () => {
 });
 
 describe('a file the assistant cannot see', () => {
-  it('passes only when anyone with the link opens it', async () => {
-    const { answers, check } = world();
-    const unseen = docUrl('1RemyVanceOwnDocument');
+  it('passes only when anyone with the link opens it, visiting the page Google serves it on, never the link as written', async () => {
+    const { visits, answers, check } = world();
+    const unseen = 'https://drive.google.com/open?id=1RemyVanceOwnDocument';
+    const page = 'https://drive.google.com/file/d/1RemyVanceOwnDocument/view';
     expect(refusal(await check({ texts: [unseen] }))).toBe(
       `${REMY} may not be able to open ${unseen}: the assistant can't open it either, so it can't tell who can. Leave them out, or send it without the link.`,
     );
-    answers.set(unseen, ['opens']);
+    answers.set(page, ['opens']);
     expect(await check({ texts: [unseen] })).toEqual({ allowed: true });
+    expect(visits).toEqual([
+      { url: page, form: false },
+      { url: page, form: false },
+    ]);
+  });
+});
+
+describe('a file published to the web', () => {
+  it('passes while it opens for anyone signed out, visited as a page rather than a form, and is refused once it does not', async () => {
+    const { drive, visits, answers, check } = world();
+    const published = 'https://docs.google.com/document/d/e/2PACX-1vRemyVanceMinutes/pub';
+    answers.set(published, ['opens', 'not-found']);
+    expect(await check({ texts: [published] })).toEqual({ allowed: true });
+    expect(refusal(await check({ texts: [published] }))).toBe(
+      `${published} doesn't open for anyone signed out: it may not be published, or may no longer exist. Check the link, or send it without it.`,
+    );
+    expect(visits).toEqual([
+      { url: published, form: false },
+      { url: published, form: false },
+    ]);
+    expect(drive.calls).toEqual([]);
   });
 });
 
@@ -358,7 +386,6 @@ describe('when the host has no Drive access', () => {
   it.each([
     ['a sign-in without Drive', new GoogleScopeNotGrantedError('drive-host')],
     ['a revoked sign-in', new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in")],
-    ['no sign-in at all', new NoGoogleSignInError(new Error('The assistant is not signed in to Google yet'))],
     [
       'a refused token',
       new GoogleTokenError('Google refused a drive-host token (admin_policy_enforced)', 'admin_policy_enforced', true),
@@ -383,5 +410,46 @@ describe('when the host has no Drive access', () => {
     expect(refusal(await check({ texts: [docUrl(id)], writer: 'external-email' }))).toBe(
       `a Google link in it can't be checked, because ${OPERATOR}. Tell main.`,
     );
+  });
+});
+
+describe("the host's own check", () => {
+  /** Every request made with `fetch`: a signed-out visit, or a Drive call. */
+  let requests: string[];
+
+  beforeEach(async () => {
+    await initTestDb();
+    requests = [];
+    // Google asks anyone signed out to sign in first.
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      requests.push(input instanceof Request ? input.url : String(input));
+      return new Response(null, { status: 302, headers: { location: 'https://accounts.google.com/ServiceLogin' } });
+    });
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.mocked(hostGoogleAccessToken).mockReset();
+    await closeDb();
+  });
+
+  it('refuses a link that is not public with the operator reason when the host has no Google sign-in', async () => {
+    vi.mocked(hostGoogleAccessToken).mockRejectedValue(new Error('The assistant is not signed in to Google yet'));
+    const link = docUrl('1MorganTripPlan');
+    expect(refusal(await checkLinksOpenable({ texts: [link], recipients: [REMY], writer: 'main' }))).toBe(
+      `the host can't check who may open ${link}, because ${OPERATOR}. Until then, send it without the link.`,
+    );
+    // No Drive call went out: only the signed-out visit.
+    expect(requests).toEqual([link]);
+  });
+
+  it('throws for a retry when the token endpoint is out of reach, rather than blaming the sign-in', async () => {
+    vi.mocked(hostGoogleAccessToken).mockRejectedValue(new TypeError('fetch failed'));
+    await expect(
+      checkLinksOpenable({ texts: [docUrl('1MorganBudget')], recipients: [REMY], writer: 'main' }),
+    ).rejects.toBeInstanceOf(LinkCheckUnavailableError);
+    // Asked again briefly, then left to the caller's retry.
+    expect(hostGoogleAccessToken).toHaveBeenCalledTimes(3);
+    expect(requests).toEqual([]);
   });
 });

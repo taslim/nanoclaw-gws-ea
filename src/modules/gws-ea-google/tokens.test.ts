@@ -194,6 +194,8 @@ describe("minting an agent credential's token", () => {
     await expect(
       mintCredentialToken(GRANT, googleCredentialFor('sheets'), { fetch: world.fetch }),
     ).rejects.toMatchObject({ refused: true });
+    // Sheets is its credential's only service, so there is nothing narrower to ask for.
+    expect(world.asked).toEqual(['https://www.googleapis.com/auth/spreadsheets']);
 
     const drive = google(refusingDrive({ status: 400, error: 'invalid_scope' }));
     await expect(mintCredentialToken(GRANT, www, { fetch: drive.fetch, fallBack: false })).rejects.toMatchObject({

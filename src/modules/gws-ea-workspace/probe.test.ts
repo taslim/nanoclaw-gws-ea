@@ -90,9 +90,25 @@ describe('a signed-out visit', () => {
 });
 
 describe('a form', () => {
-  it('passes when its responder page offers the form to answer', async () => {
+  it('passes when its responder page offers the form to answer, even with the form split across chunks', async () => {
     const { fetch } = fakeFetch({ [FORM]: () => new Response(ACCEPTING) });
     expect(await probeLink({ url: FORM, form: true }, { fetch })).toBe('opens');
+
+    // Neither half alone holds the form's tag.
+    const split = ACCEPTING.indexOf('formResponse') + 'form'.length;
+    const halves = [ACCEPTING.slice(0, split), ACCEPTING.slice(split)].map((half) => new TextEncoder().encode(half));
+    const streamed = fakeFetch({
+      [FORM]: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const half of halves) controller.enqueue(half);
+              controller.close();
+            },
+          }),
+        ),
+    });
+    expect(await probeLink({ url: FORM, form: true }, { fetch: streamed.fetch })).toBe('opens');
   });
 
   it('is not accepting when its page offers no form, or Google moves it to its closed page', async () => {

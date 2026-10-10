@@ -1175,6 +1175,22 @@ describe('a Google link in an email to outsiders', () => {
     expect(gmail.sent[0].text).toContain(docUrl(agenda));
   });
 
+  it('reads every link the assistant wrote: in a first email’s subject, and in the text of a file it sends', async () => {
+    const { key, session } = await handedOver([REMY]);
+    const agenda = await shared('Acme agenda', []);
+    const refused = `Your email was not sent: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`;
+
+    expect(
+      refusalOf(await emailSend(session, { subject: `Agenda ${docUrl(agenda)}`, text: 'The agenda for Tuesday.' })),
+    ).toBe(refused);
+    const notes = Buffer.from(`The agenda is at ${docUrl(agenda)}.`);
+    await handFile(key, 'Notes.txt', notes);
+    expect(
+      refusalOf(await emailSend(session, { subject: 'Agenda', text: 'Notes attached.' }, { 'notes.txt': notes })),
+    ).toBe(refused);
+    expect(gmail.sent).toEqual([]);
+  });
+
   it('meets the private-values check first, and the link check reads the email written again', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Where do we meet?' });
     const directions = await shared('Directions', []);

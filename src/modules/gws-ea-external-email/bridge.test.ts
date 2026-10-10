@@ -639,6 +639,8 @@ describe('a Google link in a handoff (Slice 6 R4, R18, KTD4)', () => {
     const { key, session } = await inboundThread('g-coffee', JANE);
     // Jane's email copied in someone the agenda was never shared with.
     await recordThreadAddresses(key, [STRANGER], 'message', now());
+    // An address Jane only wrote in her words is on no email, so the handoff's words never reach it.
+    await recordThreadAddresses(key, ['pat.assistant@elsewhere.example'], 'written', now());
     const agenda = await shared('Agenda', [JANE]);
 
     expect(refusal(await handoff({ thread_key: key, message: `Send Jane the agenda: ${docUrl(agenda)}` }))).toBe(
