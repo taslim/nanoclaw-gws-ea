@@ -1,9 +1,9 @@
 /**
  * The Google links the link check reads (KTD5): exactly the Docs, Sheets,
  * Slides, Forms, Drawings and Drive shapes on exactly docs.google.com,
- * drive.google.com and forms.gle, however the scheme, userinfo or port was
- * written, since a visit only ever goes to an https address rebuilt from
- * the id.
+ * drive.google.com and forms.gle, however the scheme, userinfo, port or a
+ * trailing dot on the host was written, since a visit only ever goes to an
+ * https address rebuilt from the id.
  *
  * - A file link names a Drive item by its id: a Doc, Sheet, deck, form or
  *   drawing to edit, a Drive file (on either host) or folder, or `open?id=`
@@ -55,16 +55,19 @@ function isEditor(segment: string | undefined): segment is (typeof EDITORS)[numb
 }
 
 /**
- * A URL on exactly one of the three hosts, over http or https. How it was
- * written (http, userinfo, a port) doesn't excuse it from the check: the
- * check reads only the file id or form it names, and any visit goes to an
- * https address rebuilt from that id, never to the URL as written.
+ * A URL on exactly one of the three hosts, over http or https, with the host
+ * it names. How it was written (http, userinfo, a port, or the host's
+ * fully-qualified spelling with one trailing dot, which a browser opens as
+ * the host itself) doesn't excuse it from the check: the check reads only
+ * the file id or form it names, and any visit goes to an https address
+ * rebuilt from that id, never to the URL as written.
  */
-function checkedUrl(candidate: string): URL | undefined {
+function checkedUrl(candidate: string): { readonly url: URL; readonly host: string } | undefined {
   const url = URL.parse(candidate);
   if (url === null) return undefined;
-  const exact = url.hostname === DOCS || url.hostname === DRIVE || url.hostname === SHORT_FORMS;
-  return (url.protocol === 'https:' || url.protocol === 'http:') && exact ? url : undefined;
+  const host = url.hostname.replace(/\.$/u, '');
+  const exact = host === DOCS || host === DRIVE || host === SHORT_FORMS;
+  return (url.protocol === 'https:' || url.protocol === 'http:') && exact ? { url, host } : undefined;
 }
 
 /** A path's segments without the `/a/<domain>/` and `/u/N/` prefixes Google adds for an account. */
@@ -132,15 +135,16 @@ function driveLink(url: URL, written: string, segments: readonly string[]): Goog
 
 /** The checked Google link `candidate` is, or undefined for any URL the check leaves untouched. */
 export function googleLinkOf(candidate: string): GoogleLink | undefined {
-  const url = checkedUrl(candidate);
-  if (url === undefined) return undefined;
+  const checked = checkedUrl(candidate);
+  if (checked === undefined) return undefined;
+  const { url, host } = checked;
   const segments = segmentsOf(url.pathname);
-  if (url.hostname === SHORT_FORMS) {
+  if (host === SHORT_FORMS) {
     const [code, rest] = segments;
     if (code === undefined || rest !== undefined || !SHORT_CODE.test(code)) return undefined;
     return { kind: 'form', url: candidate, probeUrl: `https://${SHORT_FORMS}/${code}` };
   }
-  return url.hostname === DOCS ? docsLink(url, candidate, segments) : driveLink(url, candidate, segments);
+  return host === DOCS ? docsLink(url, candidate, segments) : driveLink(url, candidate, segments);
 }
 
 /** An address as written in prose: up to whitespace or a character no URL is written with. */

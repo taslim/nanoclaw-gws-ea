@@ -575,7 +575,7 @@ describe('observing the Google connection for status', () => {
     });
   });
 
-  it("names a Workspace host's secret the host has not published", async () => {
+  it("reports agents' access as partial, naming the one secret the host has not published", async () => {
     const world = new World();
     world.publish();
     world.secrets = world.secrets.filter((secret) => secret.name !== 'google-docs');
@@ -584,7 +584,7 @@ describe('observing the Google connection for status', () => {
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
       status: 'degraded',
       account: ACCOUNT,
-      reason: `agents have no Google access: OneCLI has no google-docs secret yet; ${repair}`,
+      reason: `agents have only part of their Google access: OneCLI has no google-docs secret yet; ${repair}`,
     });
   });
 

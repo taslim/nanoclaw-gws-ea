@@ -1,9 +1,9 @@
 /**
  * Which links the link check reads (KTD5): exactly the Docs, Sheets,
  * Slides, Forms, Drawings and Drive shapes on docs.google.com,
- * drive.google.com and forms.gle, however their scheme, userinfo or port is
- * written. Every other URL passes untouched, and a redirector is never read
- * through.
+ * drive.google.com and forms.gle, however their scheme, userinfo, port or a
+ * trailing dot on the host is written. Every other URL passes untouched, and
+ * a redirector is never read through.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -98,7 +98,24 @@ describe('a Google file link', () => {
   });
 
   it.each([
+    [
+      'the Docs host',
+      `https://docs.google.com./document/d/${DOC}/edit`,
+      { kind: 'file', fileId: DOC, product: 'document' },
+    ],
+    ['the Drive host', `https://drive.google.com./file/d/${DOC}/view`, { kind: 'file', fileId: DOC, product: 'file' }],
+    [
+      'the short form host',
+      'https://forms.gle./Rsvp7NoelArcher',
+      { kind: 'form', probeUrl: 'https://forms.gle/Rsvp7NoelArcher' },
+    ],
+  ])('checks %s written with a trailing dot as the host itself', (_name, url, link) => {
+    expect(googleLinkOf(url)).toEqual({ url, ...link });
+  });
+
+  it.each([
     ['a lookalike host', `https://docs.google.com.northwind.example/document/d/${DOC}/edit`],
+    ['a host written with two trailing dots', `https://docs.google.com../document/d/${DOC}/edit`],
     ['another host carrying the path', `https://northwind.example/docs.google.com/document/d/${DOC}`],
     ['the google.com/url redirector', `https://www.google.com/url?q=https://docs.google.com/document/d/${DOC}/edit`],
     ['a Meet link', 'https://meet.google.com/abc-defg-hij'],

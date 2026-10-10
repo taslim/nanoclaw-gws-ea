@@ -162,24 +162,32 @@ function listed(names: readonly string[]): string {
   return `${names.slice(0, -1).join(', ')}, or ${names.at(-1)}`;
 }
 
+/** Why agents' published Google access falls short; `partial` when they hold the rest of it. */
+type AccessProblem = { readonly reason: string; readonly partial: boolean };
+
 /**
  * Why the secrets the host publishes for agents do not each inject exactly one
  * token on their credential's host, or undefined when they do. Asked only of a
  * grant holding every scope this release asks for, from which the host
  * publishes every credential. Secrets it has not published yet are named
- * together.
+ * together, and agents hold the rest when it has published any.
  */
-function publishedAccessProblem(secrets: readonly VaultSecret[]): string | undefined {
+function publishedAccessProblem(secrets: readonly VaultSecret[]): AccessProblem | undefined {
   const missing: string[] = [];
   for (const credential of AGENT_GOOGLE_CREDENTIALS) {
     const named = secrets.filter((secret) => secret.name === credential.secretName);
     if (named.length === 0) missing.push(credential.secretName);
-    else if (named.length > 1) return `OneCLI holds ${named.length} secrets named ${credential.secretName}`;
-    else if (named[0]!.hostPattern !== credential.host) {
-      return `OneCLI's ${credential.secretName} secret is on ${named[0]!.hostPattern}`;
+    else if (named.length > 1) {
+      return { reason: `OneCLI holds ${named.length} secrets named ${credential.secretName}`, partial: false };
+    } else if (named[0]!.hostPattern !== credential.host) {
+      return { reason: `OneCLI's ${credential.secretName} secret is on ${named[0]!.hostPattern}`, partial: false };
     }
   }
-  return missing.length > 0 ? `OneCLI has no ${listed(missing)} secret yet` : undefined;
+  if (missing.length === 0) return undefined;
+  return {
+    reason: `OneCLI has no ${listed(missing)} secret yet`,
+    partial: missing.length < AGENT_GOOGLE_CREDENTIALS.length,
+  };
 }
 
 /**
@@ -252,7 +260,7 @@ export function googleConnectionResources(
   const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
     const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
     await requireGrant(context);
-    return publishedAccessProblem(secrets);
+    return publishedAccessProblem(secrets)?.reason;
   };
   return [
     googleWorkspaceApisResource(dependencies.gcloud),
@@ -400,7 +408,10 @@ export async function observeGoogleConnection(
   const modify = gmailModifyProblem(secrets);
   if (modify) return degraded(modify);
   const access = publishedAccessProblem(secrets);
-  if (access) return degraded(`agents have no Google access: ${access}; ${repair}`);
+  if (access) {
+    const held = access.partial ? 'only part of their' : 'no';
+    return degraded(`agents have ${held} Google access: ${access.reason}; ${repair}`);
+  }
   if (calendar.fallback) {
     return degraded(
       `${refusedBesideCalendar(calendar.fallback)}; check that the Workspace admin allows the app, then ${repair}`,
