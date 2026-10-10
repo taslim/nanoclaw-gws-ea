@@ -13,6 +13,8 @@ import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { recordCalendarAccess } from '../gws-ea-inbox/db.js';
+import { gwsEaInboxCalendarAccessMigration } from '../gws-ea-inbox/migration.js';
 import { emailSignature } from '../gws-ea-inbox/render.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
@@ -428,6 +430,57 @@ describe("the principal's email addresses", () => {
       'morgan@work.example.test',
       'third@example.test',
     ]);
+  });
+
+  it("lists each address with its calendar access as the inbox's calendar poll last read it, unchecked until then", async () => {
+    // Before the inbox's store exists, no calendar has been checked.
+    const before = await run('principal-addresses-list');
+    expect(before).toMatchObject({
+      ok: true,
+      data: [
+        { email: 'morgan@example.test', calendar_access: 'unchecked', calendar_checked_at: null },
+        { email: 'morgan@work.example.test', calendar_access: 'unchecked', calendar_checked_at: null },
+      ],
+    });
+
+    await runMigrations(getDb(), [gwsEaInboxCalendarAccessMigration]);
+    const checkedAt = '2026-10-10T09:00:00.000Z';
+    await recordCalendarAccess({
+      address: 'morgan@work.example.test',
+      calendarId: 'morgan@work.example.test',
+      access: 'free-busy',
+      hostAdded: true,
+      checkedAt,
+      changedAt: checkedAt,
+      toldAccess: 'free-busy',
+    });
+    await run('principal-addresses-add', { email: 'third@example.test' });
+
+    const listed = await run('principal-addresses-list', {}, agent(main.id));
+    expect(listed).toEqual({
+      id: 'principal-addresses-list',
+      ok: true,
+      data: [
+        {
+          email: 'morgan@example.test',
+          added_at: expect.any(String),
+          calendar_access: 'unchecked',
+          calendar_checked_at: null,
+        },
+        {
+          email: 'morgan@work.example.test',
+          added_at: expect.any(String),
+          calendar_access: 'free-busy',
+          calendar_checked_at: checkedAt,
+        },
+        {
+          email: 'third@example.test',
+          added_at: expect.any(String),
+          calendar_access: 'unchecked',
+          calendar_checked_at: null,
+        },
+      ],
+    });
   });
 
   it("releases a person's identity that matches an address made the principal's, and keeps the person", async () => {

@@ -39,14 +39,21 @@ vi.mock('../gws-ea-external-email/index.js', () => ({
   getExternalEmailAgentGroupId: vi.fn(async () => 'ag-external'),
 }));
 
-/** Session writes whose message id is listed here fail, standing in for a message the host cannot route. */
+/**
+ * Session writes whose message id is listed here, or starts with a listed
+ * prefix, fail, standing in for a message or note the host cannot write.
+ */
 const poisoned = new Set<string>();
+const poisonedPrefixes = new Set<string>();
 vi.mock('../../session-manager.js', async () => {
   const actual = await vi.importActual<typeof import('../../session-manager.js')>('../../session-manager.js');
   return {
     ...actual,
     writeSessionMessage: vi.fn(async (...args: Parameters<typeof actual.writeSessionMessage>) => {
-      if (poisoned.has(args[2].id)) throw new Error('session write failed');
+      const { id } = args[2];
+      if (poisoned.has(id) || [...poisonedPrefixes].some((prefix) => id.startsWith(prefix))) {
+        throw new Error('session write failed');
+      }
       return actual.writeSessionMessage(...args);
     }),
   };
@@ -108,7 +115,8 @@ import {
   type Inbox,
 } from './index.js';
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
-import { emailMessagingGroupIds, recordFailedAttempt } from './db.js';
+import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
+import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
 import { threadAddresses, threadMessages } from './thread-map.js';
 
@@ -455,9 +463,20 @@ class FakeGmail implements GmailApi {
   }
 }
 
+/**
+ * The assistant's calendar list (`entries`), and the calendars shared with
+ * the assistant (`shared`, each with its access role), which it can add to
+ * the list. Adding one that is not shared answers as Google does, with
+ * nothing (404).
+ */
 class FakeCalendar implements CalendarListApi {
   entries: CalendarListEntry[] = [];
+  readonly shared = new Map<string, string>();
   readonly patches: Array<{ calendarId: string; notifications: readonly CalendarNotification[] }> = [];
+  readonly subscribed: string[] = [];
+  readonly unsubscribed: string[] = [];
+  /** The Google error each call answers with next, once. */
+  readonly failNext: { subscribe?: GoogleApiError; unsubscribe?: GoogleApiError } = {};
 
   async list() {
     return this.entries.map((entry) => ({ ...entry }));
@@ -468,6 +487,42 @@ class FakeCalendar implements CalendarListApi {
     this.entries = this.entries.map((entry) =>
       entry.id === calendarId ? { ...entry, notificationSettings: { notifications: [...notifications] } } : entry,
     );
+  }
+
+  async subscribe(calendarId: string) {
+    this.subscribed.push(calendarId);
+    const failure = this.failNext.subscribe;
+    if (failure) {
+      delete this.failNext.subscribe;
+      throw failure;
+    }
+    const accessRole = this.shared.get(calendarId);
+    if (accessRole === undefined) return undefined;
+    const entry: CalendarListEntry = { id: calendarId, accessRole };
+    this.entries.push(entry);
+    return { ...entry };
+  }
+
+  async unsubscribe(calendarId: string) {
+    this.unsubscribed.push(calendarId);
+    const failure = this.failNext.unsubscribe;
+    if (failure) {
+      delete this.failNext.unsubscribe;
+      throw failure;
+    }
+    this.entries = this.entries.filter((entry) => entry.id !== calendarId);
+  }
+
+  /** Its owner shares a calendar with the assistant, or changes how; the list follows when it holds it. */
+  share(calendarId: string, accessRole: string): void {
+    this.shared.set(calendarId, accessRole);
+    this.entries = this.entries.map((entry) => (entry.id === calendarId ? { ...entry, accessRole } : entry));
+  }
+
+  /** Its owner stops sharing a calendar with the assistant, and it leaves the list. */
+  unshare(calendarId: string): void {
+    this.shared.delete(calendarId);
+    this.entries = this.entries.filter((entry) => entry.id !== calendarId);
   }
 }
 
@@ -481,9 +536,16 @@ let drive: FakeDrive;
 let inbox: Inbox;
 let main: Session;
 let chatSends: string[];
+/** How far the inbox's clock runs ahead of the real one. */
+let clockOffsetMs = 0;
 
 function now(): string {
   return new Date().toISOString();
+}
+
+/** Let `ms` pass on the inbox's clock. */
+function later(ms: number): void {
+  clockOffsetMs += ms;
 }
 
 const hostSetup: ChannelSetup = {
@@ -527,7 +589,13 @@ function chatAdapter(): ChannelAdapter {
 
 async function startInbox(): Promise<void> {
   await teardownChannelAdapters();
-  inbox = createInbox({ gmail, calendar, drive, sleep: async () => undefined });
+  inbox = createInbox({
+    gmail,
+    calendar,
+    drive,
+    now: () => new Date(Date.now() + clockOffsetMs),
+    sleep: async () => undefined,
+  });
   registerChannelAdapter('email', { factory: () => inbox.adapter, defaults: EMAIL_CHANNEL_DEFAULTS });
   registerChannelAdapter('gchat', { factory: chatAdapter });
   await initChannelAdapters(() => hostSetup);
@@ -633,7 +701,9 @@ beforeEach(async () => {
   await runMigrations(await initTestDb());
   vi.mocked(requestWake).mockClear();
   poisoned.clear();
+  poisonedPrefixes.clear();
   chatSends = [];
+  clockOffsetMs = 0;
 
   for (const [id, name] of [
     ['ag-main', 'main'],
@@ -2059,11 +2129,12 @@ describe('health', () => {
 });
 
 describe('calendar notifications', () => {
-  it("are turned on for each principal calendar in the assistant's list, and for one added later", async () => {
+  it("are turned on for each principal calendar in the assistant's list it can read, and for one added later", async () => {
     calendar.patches.length = 0;
     calendar.entries = [
       { id: PRINCIPAL, accessRole: 'writer' },
       { id: 'team@group.calendar.google.com', accessRole: 'writer', dataOwner: PRINCIPAL_HOME },
+      { id: 'pat-family@group.calendar.google.com', accessRole: 'freeBusyReader', dataOwner: PRINCIPAL },
       { id: 'someone@else.example', accessRole: 'reader' },
       { id: JUNO, accessRole: 'owner', primary: true },
     ];
@@ -2071,6 +2142,8 @@ describe('calendar notifications', () => {
     expect(calendar.patches.map((p) => p.calendarId).sort()).toEqual(
       [PRINCIPAL, 'team@group.calendar.google.com'].sort(),
     );
+    // A free/busy-only calendar shows no events to be told of; its busy time still counts.
+    expect(await listPrincipalCalendars()).toContain('pat-family@group.calendar.google.com');
     expect(calendar.patches[0].notifications).toEqual(
       expect.arrayContaining([
         { type: 'eventCreation', method: 'email' },
@@ -2086,5 +2159,258 @@ describe('calendar notifications', () => {
     await inbox.tick();
     expect(calendar.patches.map((p) => p.calendarId)).toContain('pat-travel@group.calendar.google.com');
     expect(calendar.patches).toHaveLength(3);
+  });
+});
+
+describe('calendar access per address', () => {
+  const WORK = 'pat@work.example';
+  const ACCESS_DROPPED = /^The calendar of \S+, one of the principal's addresses, dropped from /u;
+
+  /** Each principal address's calendar access as main lists it, checked to be what status reads. */
+  async function access(): Promise<Record<string, string>> {
+    const listed = await dispatch({ id: 'l', command: 'principal-addresses-list', args: {} }, { caller: 'host' });
+    if (!listed.ok) throw new Error(listed.error.message);
+    const rows = listed.data as Array<{ email: string; calendar_access: string; calendar_checked_at: string | null }>;
+    const asListed = Object.fromEntries(rows.map((row) => [row.email, row.calendar_access]));
+    const reported = (await getInboxHealth()).calendarAccess;
+    expect(Object.fromEntries(reported.map((row) => [row.address, row.access]))).toEqual(asListed);
+    expect(reported.map((row) => row.checkedAt)).toEqual(rows.map((row) => row.calendar_checked_at));
+    return asListed;
+  }
+
+  function asked(address: string): number {
+    return calendar.subscribed.filter((id) => id === address).length;
+  }
+
+  function inList(): string[] {
+    return calendar.entries.map((entry) => entry.id);
+  }
+
+  it('records a free/busy-only work calendar as free/busy, turns nothing on for it, and counts its busy time (AE4)', async () => {
+    calendar.share(WORK, 'freeBusyReader');
+    calendar.patches.length = 0;
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+
+    expect(asked(WORK)).toBe(1);
+    expect(await access()).toMatchObject({ [WORK]: 'free-busy' });
+    expect(calendar.patches).toEqual([]);
+    expect(await listPrincipalCalendars()).toContain(WORK);
+    expect(await getInboxHealth()).toMatchObject({ calendarNotifications: { state: 'ok', reason: null } });
+  });
+
+  it('shows an owner calendar as bookable, a reader calendar as readable, and a new address as unchecked until the next poll', async () => {
+    calendar.share(PRINCIPAL, 'owner');
+    calendar.share(WORK, 'reader');
+    await addPrincipalAddress(WORK);
+    expect(await access()).toEqual({ [PRINCIPAL_HOME]: 'none', [PRINCIPAL]: 'bookable', [WORK]: 'unchecked' });
+    expect((await getInboxHealth()).calendarAccess).toContainEqual({
+      address: WORK,
+      access: 'unchecked',
+      checkedAt: null,
+    });
+
+    await inbox.tick();
+    expect(await access()).toEqual({ [PRINCIPAL_HOME]: 'none', [PRINCIPAL]: 'bookable', [WORK]: 'readable' });
+    expect(calendar.patches.map((patch) => patch.calendarId)).toContain(WORK);
+  });
+
+  it("adds a new address's calendar on the next poll; one not shared is none without failing the sync, and a later share is picked up on retry", async () => {
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+    expect(asked(WORK)).toBe(1);
+    expect(await access()).toMatchObject({ [WORK]: 'none' });
+    expect(await getInboxHealth()).toMatchObject({ calendarNotifications: { state: 'ok', reason: null } });
+
+    // Asked again once the wait is over, not on every poll.
+    calendar.share(WORK, 'writer');
+    await inbox.tick();
+    expect(asked(WORK)).toBe(1);
+    later(UNSHARED_RETRY_MS);
+    await inbox.tick();
+    expect(asked(WORK)).toBe(2);
+    expect(await access()).toMatchObject({ [WORK]: 'bookable' });
+    expect(inList()).toContain(WORK);
+    expect(notes(ACCESS_DROPPED)).toEqual([]);
+  });
+
+  it('records a calendar it added that leaves the list as none, and adds it back on retry once it is shared again', async () => {
+    calendar.share(WORK, 'writer');
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+    expect(await access()).toMatchObject({ [WORK]: 'bookable' });
+
+    calendar.unshare(WORK);
+    later(60_000);
+    await inbox.tick();
+    expect(await access()).toMatchObject({ [WORK]: 'none' });
+    expect(notes(ACCESS_DROPPED).map((note) => note.text)).toEqual([
+      "The calendar of pat@work.example, one of the principal's addresses, dropped from bookable to no access: " +
+        'bookings can no longer land on it, its events can no longer be read, and its busy time no longer counts when times are offered. ' +
+        "The host adds it back to the assistant's calendar list once it is shared again.",
+    ]);
+
+    calendar.share(WORK, 'writer');
+    later(UNSHARED_RETRY_MS);
+    await inbox.tick();
+    expect(await access()).toMatchObject({ [WORK]: 'bookable' });
+    expect(inList()).toContain(WORK);
+    expect(notes(ACCESS_DROPPED)).toHaveLength(1);
+  });
+
+  it('takes the calendar it added out of the list when its address is removed, once', async () => {
+    calendar.share(WORK, 'writer');
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+
+    await removePrincipalAddress(WORK);
+    await inbox.tick();
+    expect(calendar.unsubscribed).toEqual([WORK]);
+    expect(inList()).not.toContain(WORK);
+    expect(await listPrincipalCalendars()).not.toContain(WORK);
+    expect(Object.keys(await access())).not.toContain(WORK);
+
+    await inbox.tick();
+    expect(calendar.unsubscribed).toEqual([WORK]);
+    expect(notes(ACCESS_DROPPED)).toEqual([]);
+  });
+
+  it('records a calendar already in the list when its address is first seen as not added by the host, and never takes it out', async () => {
+    calendar.entries.push({ id: WORK, accessRole: 'reader' });
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+    expect(asked(WORK)).toBe(0);
+    expect(await access()).toMatchObject({ [WORK]: 'readable' });
+
+    await removePrincipalAddress(WORK);
+    await inbox.tick();
+    expect(calendar.unsubscribed).toEqual([]);
+    expect(inList()).toContain(WORK);
+    expect(Object.keys(await access())).not.toContain(WORK);
+  });
+
+  it('tells main once, without waking it, when access drops; never for a first reading or a rise; again after a restore and a new drop', async () => {
+    // The first poll read PRINCIPAL as bookable and PRINCIPAL_HOME as none: first readings.
+    expect(notes(ACCESS_DROPPED)).toEqual([]);
+
+    calendar.share(PRINCIPAL, 'freeBusyReader');
+    later(60_000);
+    await inbox.tick();
+    later(60_000);
+    await inbox.tick();
+    const [note, ...more] = notes(ACCESS_DROPPED);
+    expect(more).toEqual([]);
+    expect(note?.text).toBe(
+      "The calendar of pat@principal.example, one of the principal's addresses, dropped from bookable to free/busy only: " +
+        'bookings can no longer land on it and its events can no longer be read.',
+    );
+    expect(note?.row.trigger).toBe(0);
+    expect(requestWake).not.toHaveBeenCalled();
+
+    calendar.share(PRINCIPAL, 'writer');
+    later(60_000);
+    await inbox.tick();
+    expect(notes(ACCESS_DROPPED)).toHaveLength(1);
+
+    calendar.share(PRINCIPAL, 'freeBusyReader');
+    later(60_000);
+    await inbox.tick();
+    expect(notes(ACCESS_DROPPED)).toHaveLength(2);
+  });
+
+  it('writes the note again on the next poll when writing it failed, and counts main as told only once it lands', async () => {
+    poisonedPrefixes.add('inbox-calendar-access-');
+    calendar.share(PRINCIPAL, 'reader');
+    later(60_000);
+    await inbox.tick();
+    expect(notes(ACCESS_DROPPED)).toEqual([]);
+    // What main and status read is Google's answer meanwhile, and the poll carried on.
+    expect(await access()).toMatchObject({ [PRINCIPAL]: 'readable' });
+    expect(await getInboxHealth()).toMatchObject({
+      state: 'healthy',
+      calendarNotifications: { state: 'ok', reason: null },
+    });
+
+    poisonedPrefixes.clear();
+    later(60_000);
+    await inbox.tick();
+    expect(notes(ACCESS_DROPPED).map((note) => note.text)).toEqual([
+      "The calendar of pat@principal.example, one of the principal's addresses, dropped from bookable to readable: " +
+        'bookings can no longer land on it.',
+    ]);
+    later(60_000);
+    await inbox.tick();
+    expect(notes(ACCESS_DROPPED)).toHaveLength(1);
+  });
+
+  it('fails the sync on a Google error adding or removing a calendar, and tries again next poll', async () => {
+    calendar.share(WORK, 'writer');
+    calendar.failNext.subscribe = new GoogleApiError(
+      500,
+      'Google refused /calendar/v3/users/me/calendarList: Backend Error',
+    );
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+    expect(await getInboxHealth()).toMatchObject({
+      calendarNotifications: { state: 'failing', reason: expect.stringContaining('Backend Error') },
+    });
+    expect(await access()).toMatchObject({ [WORK]: 'unchecked' });
+
+    await inbox.tick();
+    expect(await access()).toMatchObject({ [WORK]: 'bookable' });
+    expect(await getInboxHealth()).toMatchObject({ calendarNotifications: { state: 'ok', reason: null } });
+
+    await removePrincipalAddress(WORK);
+    calendar.failNext.unsubscribe = new GoogleApiError(
+      503,
+      'Google refused /calendar/v3/users/me/calendarList: Unavailable',
+    );
+    await inbox.tick();
+    expect(await getInboxHealth()).toMatchObject({
+      calendarNotifications: { state: 'failing', reason: expect.stringContaining('Unavailable') },
+    });
+    expect(inList()).toContain(WORK);
+
+    await inbox.tick();
+    expect(inList()).not.toContain(WORK);
+    expect(await getInboxHealth()).toMatchObject({ calendarNotifications: { state: 'ok', reason: null } });
+  });
+
+  it('asks Google to add a calendar by its id and to take one out, reading a 404 as a calendar not shared or already gone', async () => {
+    const requests: Array<{ url: string; method: string; body: unknown }> = [];
+    const notFound = () =>
+      new Response(JSON.stringify({ error: { code: 404, message: 'Not Found' } }), { status: 404 });
+    const answers = [
+      new Response(JSON.stringify({ kind: 'calendar#calendarListEntry', id: WORK, accessRole: 'freeBusyReader' })),
+      notFound(),
+      new Response(null, { status: 204 }),
+      notFound(),
+    ];
+    const api = createCalendarListApi({
+      token: async () => 'token',
+      fetch: async (input, init) => {
+        requests.push({
+          url: String(input),
+          method: init?.method ?? 'GET',
+          body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+        });
+        const answer = answers.shift();
+        if (answer === undefined) throw new Error('unexpected request');
+        return answer;
+      },
+    });
+
+    expect(await api.subscribe(WORK)).toEqual({ id: WORK, accessRole: 'freeBusyReader' });
+    expect(await api.subscribe('lena@unshared.example')).toBeUndefined();
+    await api.unsubscribe(WORK);
+    await api.unsubscribe(WORK);
+
+    const list = 'https://www.googleapis.com/calendar/v3/users/me/calendarList';
+    expect(requests).toEqual([
+      { url: list, method: 'POST', body: { id: WORK } },
+      { url: list, method: 'POST', body: { id: 'lena@unshared.example' } },
+      { url: `${list}/pat%40work.example`, method: 'DELETE', body: undefined },
+      { url: `${list}/pat%40work.example`, method: 'DELETE', body: undefined },
+    ]);
   });
 });

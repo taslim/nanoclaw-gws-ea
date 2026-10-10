@@ -54,6 +54,7 @@ import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
 import {
+  gwsEaInboxCalendarAccessMigration,
   gwsEaInboxDropThreadHoldsMigration,
   gwsEaInboxEmailChannelMigration,
   gwsEaInboxMigration,
@@ -74,6 +75,7 @@ registerMigration(gwsEaInboxEmailChannelMigration);
 registerMigration(gwsEaInboxDropThreadHoldsMigration);
 registerMigration(gwsEaInboxRelativeFilePathsMigration);
 registerMigration(gwsEaInboxUnsignedNoticesMigration);
+registerMigration(gwsEaInboxCalendarAccessMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;

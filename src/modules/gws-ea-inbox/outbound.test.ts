@@ -362,7 +362,12 @@ async function startInbox(): Promise<void> {
   await teardownChannelAdapters();
   inbox = createInbox({
     gmail,
-    calendar: { list: async () => [], patchNotifications: async () => undefined },
+    calendar: {
+      list: async () => [],
+      patchNotifications: async () => undefined,
+      subscribe: async () => undefined,
+      unsubscribe: async () => undefined,
+    },
     drive,
     sleep: async () => undefined,
   });

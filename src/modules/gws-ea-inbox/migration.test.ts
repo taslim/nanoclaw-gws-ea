@@ -37,6 +37,7 @@ const EMAIL_CHANNEL = 'module:gws-ea-inbox:email-channel';
 const DROP_THREAD_HOLDS = 'module:gws-ea-inbox:drop-thread-holds';
 const RELATIVE_FILE_PATHS = 'module:gws-ea-inbox:relative-file-paths';
 const UNSIGNED_NOTICES = 'module:gws-ea-inbox:unsigned-notices';
+const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 
 /** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
 const INBOX_TABLES = [
@@ -53,7 +54,7 @@ const INBOX_TABLES = [
 ];
 
 /** Every table the inbox's migrations leave: the Slice 4 tables and those added since. */
-const ALL_INBOX_TABLES = [...INBOX_TABLES, 'gws_ea_inbox_unsigned_notices'].sort();
+const ALL_INBOX_TABLES = [...INBOX_TABLES, 'gws_ea_inbox_unsigned_notices', 'gws_ea_inbox_calendar_access'].sort();
 
 /** The banned constructs of `src/db/migrations/portability.test.ts`, which covers built-in migrations only. */
 const BANNED_PORTABLE_SQL = [
@@ -193,11 +194,18 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's five, in order, and the meetings store registers none", () => {
+  it("are the inbox's six, in order, and the meetings store registers none", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
-    expect(names).toEqual([CREATE_INBOX, EMAIL_CHANNEL, DROP_THREAD_HOLDS, RELATIVE_FILE_PATHS, UNSIGNED_NOTICES]);
+    expect(names).toEqual([
+      CREATE_INBOX,
+      EMAIL_CHANNEL,
+      DROP_THREAD_HOLDS,
+      RELATIVE_FILE_PATHS,
+      UNSIGNED_NOTICES,
+      CALENDAR_ACCESS,
+    ]);
   });
 
   it('are portable: async, and free of every banned construct', () => {
@@ -236,6 +244,7 @@ describe('squashed migrations', () => {
       DROP_THREAD_HOLDS,
       RELATIVE_FILE_PATHS,
       UNSIGNED_NOTICES,
+      CALENDAR_ACCESS,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual(before);

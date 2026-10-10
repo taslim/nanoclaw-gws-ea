@@ -12,7 +12,7 @@ import type { AgentGroup } from '../../types.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
-import { getInboxState } from '../gws-ea-inbox/db.js';
+import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
 import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
 import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
 import {
@@ -338,6 +338,21 @@ async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
   }
 }
 
+/**
+ * Each address with what the assistant can do with its main calendar, as
+ * the inbox's calendar poll last read it from Google: the facts status shows
+ * too. Adding or removing an address calls no one; the next poll acts on it.
+ */
+async function listAddresses() {
+  const addresses = await listPrincipalAddresses();
+  const access = await principalCalendarAccess(addresses.map((address) => address.email));
+  return addresses.map((address, index) => ({
+    ...address,
+    calendar_access: access[index].access,
+    calendar_checked_at: access[index].checkedAt,
+  }));
+}
+
 const EMAIL_ARGUMENT = {
   name: 'email',
   type: 'string',
@@ -359,9 +374,10 @@ registerResource({
   customOperations: {
     list: {
       access: 'open',
-      description: "List the principal's email addresses.",
+      description:
+        "List the principal's email addresses, each with what the assistant can do with its main calendar (`calendar_access`), as the host last checked with Google (`calendar_checked_at`): `bookable` (it can book on it), `readable` (it can read its events but not book), `free-busy` (it sees only when the principal is busy, which still counts when offering times), `none` (it is not shared with the assistant), or `unchecked` (not checked yet). The host adds each address's calendar to the assistant's calendar list itself, and checks again every 15 minutes while it is not shared.",
       args: [],
-      handler: async () => listPrincipalAddresses(),
+      handler: listAddresses,
     },
     add: {
       access: 'open',

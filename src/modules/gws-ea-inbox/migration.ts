@@ -225,3 +225,32 @@ export const gwsEaInboxUnsignedNoticesMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * What the assistant can do with each principal address's main calendar (R7,
+ * R8, KTD4), as the calendar poll last read it from Google: one row per
+ * listed address, written by the poll alone, from its first reading until
+ * the address is removed. A row holds Google's id for the calendar while it
+ * is in the assistant's calendar list, whether the host put it there (only
+ * then does the host take it out), when Google last answered for it and when
+ * its access last changed, and the access `main` is taken to know, which
+ * stays above a drop until main is told of it.
+ */
+export const gwsEaInboxCalendarAccessMigration: ModuleMigration = {
+  version: 6,
+  name: 'module:gws-ea-inbox:calendar-access',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_inbox_calendar_access (
+        address      TEXT PRIMARY KEY CHECK (address <> '' AND address = lower(address)),
+        calendar_id  TEXT CHECK (calendar_id <> ''),
+        access       TEXT NOT NULL CHECK (access IN ('bookable', 'readable', 'free-busy', 'none')),
+        host_added   INTEGER NOT NULL CHECK (host_added IN (0, 1)),
+        checked_at   TEXT NOT NULL,
+        changed_at   TEXT NOT NULL,
+        told_access  TEXT NOT NULL CHECK (told_access IN ('bookable', 'readable', 'free-busy', 'none')),
+        CHECK (host_added = 0 OR calendar_id IS NOT NULL)
+      );
+    `);
+  },
+};
