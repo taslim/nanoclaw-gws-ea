@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 vi.mock('../gws-ea-google/index.js', () => ({
   hostGoogleAccessToken: vi.fn(async () => {
@@ -74,8 +74,8 @@ async function startHost(): Promise<void> {
 }
 
 /** The folder a spawn of this group is told about, from the real composition. */
-function folderAtSpawn(agentGroupId: string): string | undefined {
-  const [agent] = composeSessionSpec({
+function folderAtSpawn(agentGroupId: string, compose = composeSessionSpec): string | undefined {
+  const [agent] = compose({
     agentGroup: group(agentGroupId),
     session: { id: 'session-1', agent_group_id: agentGroupId } as Session,
     containerName: `nanoclaw-v2-${agentGroupId}-1700000000000`,
@@ -140,6 +140,38 @@ describe("the home folder's environment", () => {
     expect(knownMainAgentGroupId()).toBe('ag-main-restarted');
     expect(folderAtSpawn('ag-main-restarted')).toBe(FOLDER);
     expect(folderAtSpawn('ag-main')).toBeUndefined();
+  });
+
+  it("reaches a main spawned before the host's start reads the folder, as a restart releases held messages first", async () => {
+    // A restarted host: modules loaded afresh, and this module's start not run yet.
+    vi.resetModules();
+    const db = await import('../../db/index.js');
+    const { loadMainAgentGroupId } = await import('../gws-ea-profile/db.js');
+    const { recordHomeFolder: recordFolder } = await import('./db.js');
+    await import('../gws-ea-profile/index.js');
+    await import('./index.js');
+    const runner = await import('../../container-runner.js');
+    await db.runMigrations(await db.initTestDb());
+    onTestFinished(() => db.closeDb());
+    await db.createAgentGroup(group('ag-main'));
+    // The profile and the folder an earlier host process wrote.
+    await db.getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+    await recordFolder(FOLDER, AT);
+    // main as the profile's start reads it, which runs before this module's;
+    // a spawn reading it first is the profile's own test.
+    await loadMainAgentGroupId();
+    const admit = (disposition: 'create' | 'adopt') =>
+      runner.assertSessionAdmitted({
+        disposition,
+        key: { installSlug: 'install', agentGroupId: 'ag-main', sessionId: 'session-1' },
+      });
+
+    // An adopted container keeps the environment it started with, so adoption reads nothing.
+    await admit('adopt');
+    expect(folderAtSpawn('ag-main', runner.composeSessionSpec)).toBeUndefined();
+
+    await admit('create');
+    expect(folderAtSpawn('ag-main', runner.composeSessionSpec)).toBe(FOLDER);
   });
 
   it('reaches a main named after the host started, on its next spawn', async () => {

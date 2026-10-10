@@ -1,3 +1,4 @@
+import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -16,6 +17,7 @@ import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
 import {
   addPrincipalAddress,
   bindVerifiedPrincipalUser,
+  ensureMainAgentGroupIdLoaded,
   getGwsEaProfile,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
@@ -43,6 +45,12 @@ registerMigration(gwsEaExternalEmailPointerMigration);
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.
 onHostStart(() => loadMainAgentGroupId());
+// The host releases the messages its channels held before it starts its
+// modules, so a spawn can come first: it reads main's group itself before its
+// environment is composed. An adopted container keeps the environment it has.
+registerSessionAdmissionPolicy('gws-ea-profile:main-known', async ({ disposition }) => {
+  if (disposition === 'create') await ensureMainAgentGroupIdLoaded();
+});
 
 function escapeMarkdownInline(value: string): string {
   const special = new Set(['\\', '`', '*', '_', '{', '}', '[', ']', '<', '>', '#']);
