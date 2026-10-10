@@ -343,6 +343,27 @@ describe('main identity reconciliation', () => {
     expect(flagValue(published!, '--principal-emails')).toBe(JSON.stringify(['morgan@example.test']));
   });
 
+  it("seeds the principal's timezone in the zone's own spelling, since main's container runs in it", async () => {
+    const { state, dependencies } = harness();
+
+    await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, principal: { ...seed, timezone: 'europe/london' } },
+      dependencies,
+    );
+
+    expect(flagValue(state.profileWriteArgs[0]!, '--principal-timezone')).toBe('Europe/London');
+  });
+
+  it("rejects a UTC offset as the principal's timezone before mutating NanoClaw or OneCLI", async () => {
+    const { state, dependencies } = harness();
+
+    await expect(
+      reconcileMainIdentity(runtimeConfig(), { ...input, principal: { ...seed, timezone: '+05:30' } }, dependencies),
+    ).rejects.toMatchObject({ code: 'invalid_identity', message: 'Principal timezone is invalid' });
+    expect(state).toMatchObject({ groupCreated: 0, provider: null, timezone: null, profileWrites: 0, agents: [] });
+  });
+
   it("writes none of the principal's profile once main is published, and leaves main's container timezone to the host", async () => {
     const { state, dependencies } = harness();
     await reconcileMainIdentity(runtimeConfig(), create, dependencies);

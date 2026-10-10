@@ -10,7 +10,7 @@ import {
   principalAddressesConflict,
   resolvePrincipalAddress,
 } from '../../gws-ea/validation.js';
-import { isValidTimezone } from '../../timezone.js';
+import { ianaTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
 import { addMember, getMembers, removeMember } from '../permissions/db/agent-group-members.js';
@@ -132,23 +132,16 @@ function personalName(value: string): string {
 }
 
 /**
- * `value` as an IANA zone, correctly cased, since main's container runs in
- * it: a container's TZ reads a UTC offset such as `+05:30` with its sign
- * flipped, and a miscased name as UTC. A name already cased as the zone
- * database writes it stays as given, even when it is another name for a
- * zone (`Asia/Kolkata`); a miscased one takes the zone's own spelling.
- * Each part of such a name opens with one capital and runs in lowercase
- * (`US/Pacific` aside, which takes its zone's spelling), so a part in
- * capitals is miscased. Refused when it is no zone.
+ * `value` as the principal changes it through main, held as main's container
+ * runs in it (`ianaTimezone`): an IANA zone, correctly cased. Refused when it
+ * is no zone or a UTC offset.
  */
 function principalTimezone(value: string): string {
-  const zone = value.trim();
-  if (!/^[A-Za-z]/u.test(zone) || !isValidTimezone(zone)) {
+  const zone = ianaTimezone(value);
+  if (zone === undefined) {
     throw new Error(`Principal timezone is not an IANA time zone such as Europe/London: ${JSON.stringify(value)}`);
   }
-  const resolved = new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
-  if (resolved.toLowerCase() === zone.toLowerCase()) return resolved;
-  return zone.split('/').every((part) => /^[A-Z]/u.test(part) && !/[A-Z]{2}/u.test(part)) ? zone : resolved;
+  return zone;
 }
 
 function identifier(value: string, label: string): string {
@@ -187,7 +180,9 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
   if (!EMAIL_PATTERN.test(assistantWorkspaceEmail) || assistantWorkspaceEmail.length > 254) {
     throw new Error('Assistant Workspace email is invalid');
   }
-  if (input.principalTimezone !== undefined && !isValidTimezone(input.principalTimezone)) {
+  // The seed is held as main's container runs in it, as a change through main is (`principalTimezone`).
+  const seedTimezone = input.principalTimezone === undefined ? undefined : ianaTimezone(input.principalTimezone);
+  if (input.principalTimezone !== undefined && seedTimezone === undefined) {
     throw new Error('Principal timezone is invalid');
   }
   return {
@@ -196,7 +191,7 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
     ...(input.principalDisplayName === undefined
       ? {}
       : { principalDisplayName: displayName(input.principalDisplayName, 'Principal display name') }),
-    ...(input.principalTimezone === undefined ? {} : { principalTimezone: input.principalTimezone }),
+    ...(seedTimezone === undefined ? {} : { principalTimezone: seedTimezone }),
     mainAgentGroupId: identifier(input.mainAgentGroupId, 'Main agent group ID'),
     ...(input.principalEmails === undefined
       ? {}

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { formatLocalTime, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+import { formatLocalTime, ianaTimezone, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
 
 // --- formatLocalTime ---
 
@@ -49,6 +49,30 @@ describe('isValidTimezone', () => {
   it('rejects empty and garbage strings', () => {
     expect(isValidTimezone('')).toBe(false);
     expect(isValidTimezone('NotATimezone')).toBe(false);
+  });
+});
+
+describe('ianaTimezone', () => {
+  it('keeps a zone cased as the zone database writes it, trimmed', () => {
+    expect(ianaTimezone('Europe/London')).toBe('Europe/London');
+    expect(ianaTimezone(' Europe/London ')).toBe('Europe/London');
+    expect(ianaTimezone('UTC')).toBe('UTC');
+    expect(ianaTimezone('Etc/GMT+5')).toBe('Etc/GMT+5');
+  });
+
+  it('keeps another name for a zone in its own words when it is correctly cased', () => {
+    expect(ianaTimezone('Asia/Kolkata')).toBe('Asia/Kolkata');
+  });
+
+  it("gives a miscased name the zone's own spelling, which a container's TZ would read as UTC", () => {
+    expect(ianaTimezone('europe/london')).toBe('Europe/London');
+    expect(ianaTimezone('Asia/KOLKATA')).toBe('Asia/Calcutta');
+    expect(ianaTimezone('US/PACIFIC')).toBe('America/Los_Angeles');
+  });
+
+  it("refuses a UTC offset, which a container's TZ reads with its sign flipped, and anything that is no zone", () => {
+    expect(ianaTimezone('+05:30')).toBeUndefined();
+    expect(ianaTimezone('Not/A_Zone')).toBeUndefined();
   });
 });
 

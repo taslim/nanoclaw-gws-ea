@@ -20,7 +20,7 @@ import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
-import { isValidTimezone, resolveTimezone } from '../src/timezone.js';
+import { ianaTimezone, resolveTimezone } from '../src/timezone.js';
 import { brightSelect } from './lib/bright-select.js';
 import { listSetupProviders, type SetupProviderEntry, type SetupProviderProvisioning } from './providers/registry.js';
 
@@ -460,10 +460,13 @@ export async function collectGwsEaCreateInput(
     optional: true,
     placeholder: 'Optional',
   });
-  const principalTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
+  const givenTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
     initialValue: detectedTimezone,
-    validate: (value) => (isValidTimezone(value) ? undefined : 'Enter a valid IANA timezone'),
+    validate: (value) => (ianaTimezone(value) === undefined ? 'Enter a valid IANA timezone' : undefined),
   });
+  // Held in the zone's own spelling, since main's container runs in it.
+  const principalTimezone = ianaTimezone(givenTimezone);
+  if (principalTimezone === undefined) throw invalidFlag('principal-timezone', 'Enter a valid IANA timezone');
   const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
     validate: workspaceEmailProblem,
   });

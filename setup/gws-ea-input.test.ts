@@ -261,6 +261,8 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(validators.get('Principal timezone')?.('Not/A_Timezone')).toMatch(/valid IANA timezone/u);
+    // Main's container runs in it, and a container's TZ reads an offset with its sign flipped.
+    expect(validators.get('Principal timezone')?.('+05:30')).toMatch(/valid IANA timezone/u);
     expect(validators.get('Assistant Google Workspace email')?.('not-an-email')).toMatch(/valid email/u);
     expect(validators.get('Existing Google Chat webhook endpoint')?.('https://example.test/not-webhook')).toMatch(
       /webhook\/gchat/u,
@@ -554,6 +556,12 @@ describe('GWS-EA unattended create input', () => {
       principal_emails: ['morgan@example.test'],
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
+  });
+
+  it("holds the principal's timezone in the zone's own spelling, which a container's TZ reads", async () => {
+    const result = await unattended({ ...FLAGS, 'principal-timezone': 'europe/london' });
+
+    expect(result.bootstrapManifest.identity.principal_timezone).toBe('Europe/London');
   });
 
   it('names --principal-email when no principal address is given', async () => {

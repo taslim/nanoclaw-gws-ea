@@ -10,7 +10,7 @@ import {
   requireString,
   unwrapData,
 } from './validation.js';
-import { isValidTimezone } from '../timezone.js';
+import { ianaTimezone } from '../timezone.js';
 
 /** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
 export const MAIN_TEMPLATE = 'gws-ea/main';
@@ -109,9 +109,15 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
   };
 }
 
+/**
+ * The principal as the profile is seeded with them. Their timezone is held as
+ * main's container runs in it (`ianaTimezone`), the host deriving that from
+ * the profile (KTD7): an offset or a miscased name would put main's clock on
+ * the wrong offset or on UTC.
+ */
 function validatePrincipalSeed(seed: PrincipalSeed, assistantWorkspaceEmail: string): PrincipalSeed {
-  const timezone = safeString(seed.timezone, 'Principal timezone', 120);
-  if (!isValidTimezone(timezone)) throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
+  const timezone = ianaTimezone(safeString(seed.timezone, 'Principal timezone', 120));
+  if (timezone === undefined) throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
   return {
     displayName: safeString(seed.displayName.trim(), 'Principal display name', 120),
     timezone,

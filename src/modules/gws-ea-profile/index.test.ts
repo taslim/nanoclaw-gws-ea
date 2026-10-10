@@ -305,6 +305,41 @@ describe('GWS-EA profile module', () => {
     expect(await getContainerConfig(main.id)).toEqual(config);
   });
 
+  it("seeds the principal's timezone in the zone's own spelling, and refuses an offset, since main's container runs in it", async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    const reconcile = (timezone: string) =>
+      dispatch(
+        {
+          id: 'reconcile',
+          command: 'gws-ea-profile-reconcile',
+          args: {
+            'assistant-display-name': 'Aya',
+            'assistant-workspace-email': 'aya@example.test',
+            'principal-display-name': 'Morgan Ellery',
+            'principal-timezone': timezone,
+            'main-agent-group-id': main.id,
+          },
+        },
+        { caller: 'host' },
+      );
+
+    // A container's TZ reads an offset with its sign flipped, so it is no seed.
+    expect(await reconcile('+05:30')).toMatchObject({
+      ok: false,
+      error: { message: 'Principal timezone is invalid' },
+    });
+    expect(await getGwsEaProfile()).toMatchObject({ main_agent_group_id: null, principal_timezone: null });
+    expect((await getContainerConfig(main.id))?.timezone).toBeNull();
+
+    // It reads a miscased name as UTC, so the profile and main's container hold the zone's own spelling.
+    expect(await reconcile('europe/london')).toMatchObject({
+      ok: true,
+      data: { principal_timezone: 'Europe/London' },
+    });
+    expect((await getContainerConfig(main.id))?.timezone).toBe('Europe/London');
+  });
+
   it('accepts only canonical UTC timestamps for verified principal bindings', async () => {
     const user: User = {
       id: 'gchat:users/canonical-time',
