@@ -1,14 +1,14 @@
 /**
  * The Google links the link check reads (KTD5): exactly the Docs, Sheets,
- * Slides, Forms and Drive shapes on exactly docs.google.com,
+ * Slides, Forms, Drawings and Drive shapes on exactly docs.google.com,
  * drive.google.com and forms.gle, however the scheme, userinfo or port was
  * written, since a visit only ever goes to an https address rebuilt from
  * the id.
  *
- * - A file link names a Drive item by its id: a Doc, Sheet, deck or form to
- *   edit, a Drive file or folder, or `open?id=` and `uc?id=`. The `/u/N/`
- *   account and `/a/<domain>/` prefixes are read past, and a resource key is
- *   kept exactly.
+ * - A file link names a Drive item by its id: a Doc, Sheet, deck, form or
+ *   drawing to edit, a Drive file (on either host) or folder, or `open?id=`
+ *   and `uc?id=`. The `/u/N/` account and `/a/<domain>/` prefixes are read
+ *   past, and a resource key is kept exactly.
  * - A form's responder link, `/forms/d/e/<id>/…`, a `/viewform` by file id,
  *   or a `forms.gle` short link, names who may answer through the form's own
  *   settings, not through Drive, so only a signed-out visit can judge it.
@@ -25,7 +25,7 @@
 import { linkTargets } from '../gws-ea-privacy/index.js';
 
 /** What a file link's path says it is: a Docs editor's file, or a Drive file or folder. */
-export type LinkedProduct = 'document' | 'spreadsheets' | 'presentation' | 'forms' | 'file' | 'folder';
+export type LinkedProduct = 'document' | 'spreadsheets' | 'presentation' | 'forms' | 'drawings' | 'file' | 'folder';
 
 export type GoogleLink =
   /** A Drive item by its id, which Drive can say who may open. */
@@ -44,7 +44,7 @@ export type GoogleLink =
 const DOCS = 'docs.google.com';
 const DRIVE = 'drive.google.com';
 const SHORT_FORMS = 'forms.gle';
-const EDITORS = ['document', 'spreadsheets', 'presentation', 'forms'] as const;
+const EDITORS = ['document', 'spreadsheets', 'presentation', 'forms', 'drawings'] as const;
 const RESPONDER_PAGES: ReadonlySet<string> = new Set(['viewform', 'formResponse']);
 const PUBLISHED_PAGES: ReadonlySet<string> = new Set(['pub', 'pubhtml']);
 const ID = /^[A-Za-z0-9_-]+$/u;
@@ -94,6 +94,8 @@ function fileLink(url: URL, written: string, fileId: string, product: LinkedProd
 
 function docsLink(url: URL, written: string, segments: readonly string[]): GoogleLink | undefined {
   const [product, d, first, second, third] = segments;
+  // The Docs host's older `/file/d/<id>` is a Drive file link.
+  if (product === 'file') return driveLink(url, written, segments);
   if (!isEditor(product) || d !== 'd' || first === undefined) return undefined;
   if (first === 'e') {
     if (second === undefined || !ID.test(second)) return undefined;
@@ -172,6 +174,7 @@ const EDITOR_MIME_TYPES: Readonly<Record<string, LinkedProduct>> = {
   'application/vnd.google-apps.spreadsheet': 'spreadsheets',
   'application/vnd.google-apps.presentation': 'presentation',
   'application/vnd.google-apps.form': 'forms',
+  'application/vnd.google-apps.drawing': 'drawings',
   'application/vnd.google-apps.folder': 'folder',
 };
 

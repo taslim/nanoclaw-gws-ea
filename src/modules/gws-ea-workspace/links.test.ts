@@ -1,8 +1,9 @@
 /**
  * Which links the link check reads (KTD5): exactly the Docs, Sheets,
- * Slides, Forms and Drive shapes on docs.google.com, drive.google.com and
- * forms.gle, however their scheme, userinfo or port is written. Every other
- * URL passes untouched, and a redirector is never read through.
+ * Slides, Forms, Drawings and Drive shapes on docs.google.com,
+ * drive.google.com and forms.gle, however their scheme, userinfo or port is
+ * written. Every other URL passes untouched, and a redirector is never read
+ * through.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -19,7 +20,9 @@ describe('a Google file link', () => {
     ['a copy link', `https://docs.google.com/document/d/${DOC}/copy`, 'document'],
     ['a bare /d/ link', `https://docs.google.com/document/d/${DOC}`, 'document'],
     ['a form to edit', `https://docs.google.com/forms/d/${DOC}/edit`, 'forms'],
+    ['a Drawing', `https://docs.google.com/drawings/d/${DOC}/edit`, 'drawings'],
     ['a Drive file', `https://drive.google.com/file/d/${DOC}/view?usp=sharing`, 'file'],
+    ['a Drive file on the Docs host', `https://docs.google.com/file/d/${DOC}/view`, 'file'],
     ['a Drive folder', `https://drive.google.com/drive/folders/${DOC}`, 'folder'],
     ['an open?id= link', `https://drive.google.com/open?id=${DOC}`, undefined],
     ['a uc?id= link', `https://drive.google.com/uc?id=${DOC}&export=download`, undefined],
@@ -102,7 +105,6 @@ describe('a Google file link', () => {
     ['a Calendar link', 'https://calendar.google.com/calendar/event?eid=abc'],
     ['a Maps link', 'https://maps.google.com/?q=Northwind'],
     ['a Google API host', `https://www.googleapis.com/drive/v3/files/${DOC}`],
-    ['a Drawing', `https://docs.google.com/drawings/d/${DOC}/edit`],
     ['a Docs page that names no file', 'https://docs.google.com/document/u/0/'],
   ])('passes %s untouched', (_name, url) => {
     expect(googleLinkOf(url)).toBeUndefined();
@@ -147,11 +149,16 @@ describe('where a signed-out visit to a file goes', () => {
   it('opens a file the way Google serves it to someone with only the link, resource key included', () => {
     const doc = googleLinkOf(`https://docs.google.com/document/d/${DOC}/copy?resourcekey=0-Rk`);
     const drive = googleLinkOf(`https://drive.google.com/open?id=${DOC}`);
-    if (doc?.kind !== 'file' || drive?.kind !== 'file') throw new Error('not read as files');
+    const onDocs = googleLinkOf(`https://docs.google.com/file/d/${DOC}/edit`);
+    if (doc?.kind !== 'file' || drive?.kind !== 'file' || onDocs?.kind !== 'file') throw new Error('not read as files');
     expect(fileProbeUrl(doc)).toBe(`https://docs.google.com/document/d/${DOC}/edit?resourcekey=0-Rk`);
     expect(fileProbeUrl(drive)).toBe(`https://drive.google.com/file/d/${DOC}/view`);
+    expect(fileProbeUrl(onDocs)).toBe(`https://drive.google.com/file/d/${DOC}/view`);
     expect(fileProbeUrl(drive, 'application/vnd.google-apps.spreadsheet')).toBe(
       `https://docs.google.com/spreadsheets/d/${DOC}/edit`,
+    );
+    expect(fileProbeUrl(drive, 'application/vnd.google-apps.drawing')).toBe(
+      `https://docs.google.com/drawings/d/${DOC}/edit`,
     );
     expect(fileProbeUrl(drive, 'application/vnd.google-apps.folder')).toBe(
       `https://drive.google.com/drive/folders/${DOC}`,

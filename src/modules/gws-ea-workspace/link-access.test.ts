@@ -267,6 +267,14 @@ describe('a message with many links and recipients', () => {
       refusal(await check({ texts: [docUrl(id)], recipients: [REMY, NOEL, SALES], writer: 'external-email' })),
     ).toBe(`${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`);
   });
+
+  it('names to main, in one sentence, every recipient who cannot open a link for the same reason', async () => {
+    const { check, owned } = world();
+    const id = await owned();
+    expect(refusal(await check({ texts: [docUrl(id)], recipients: [REMY, NOEL] }))).toBe(
+      `${REMY} and ${NOEL} can't open ${docUrl(id)}: it isn't shared with them. Share it with them (view-only, unless they need more), leave them out, or send it without the link.`,
+    );
+  });
 });
 
 describe('the principal', () => {
