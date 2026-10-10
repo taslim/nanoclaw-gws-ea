@@ -8,7 +8,8 @@
  * within a minute, and a setting someone turned off is turned back on.
  *
  * A calendar is the principal's when its ID is one of their addresses (their
- * primary calendar) or its `dataOwner` is.
+ * primary calendar) or its `dataOwner` is, in any spelling the one rule
+ * recognizes (R1).
  *
  * Each authenticated notification is read for one thing: the event link's
  * `eid`, which carries the event ID and its calendar. `main` hears only the
@@ -17,6 +18,7 @@
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
+import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { googleJson, GoogleApiError, type GoogleClientOptions } from './gmail-api.js';
 import { replacePrincipalCalendars } from './db.js';
 import { recordCalendarSync } from './health.js';
@@ -126,11 +128,9 @@ export function createCalendarListApi(options: GoogleClientOptions): CalendarLis
 }
 
 /** Whether a calendar is the principal's, by the two facts that decide it. */
-export function isPrincipalCalendar(entry: CalendarListEntry, principalAddresses: ReadonlySet<string>): boolean {
+export function isPrincipalCalendar(entry: CalendarListEntry, principal: PrincipalRecognizer): boolean {
   if (entry.deleted === true) return false;
-  return (
-    principalAddresses.has(entry.id.toLowerCase()) || principalAddresses.has((entry.dataOwner ?? '').toLowerCase())
-  );
+  return principal.has(entry.id) || principal.has(entry.dataOwner);
 }
 
 function hasWanted(entry: CalendarListEntry): boolean {
@@ -148,7 +148,7 @@ function hasWanted(entry: CalendarListEntry): boolean {
  */
 export async function syncCalendarNotifications(
   api: CalendarListApi,
-  principalAddresses: ReadonlySet<string>,
+  principal: PrincipalRecognizer,
   at: string,
 ): Promise<void> {
   let entries: CalendarListEntry[];
@@ -161,9 +161,9 @@ export async function syncCalendarNotifications(
     await recordCalendarSync('failing', reason);
     return;
   }
-  const principal = entries.filter((entry) => isPrincipalCalendar(entry, principalAddresses));
+  const calendars = entries.filter((entry) => isPrincipalCalendar(entry, principal));
   const failures: string[] = [];
-  for (const entry of principal) {
+  for (const entry of calendars) {
     if (hasWanted(entry)) continue;
     const kept = (entry.notificationSettings?.notifications ?? []).filter(
       (notification) => !WANTED_NOTIFICATIONS.some((wanted) => wanted.type === notification.type),
@@ -179,7 +179,7 @@ export async function syncCalendarNotifications(
     }
   }
   await replacePrincipalCalendars(
-    principal.map((entry) => entry.id.toLowerCase()),
+    calendars.map((entry) => entry.id.toLowerCase()),
     at,
   );
   await recordCalendarSync(failures.length === 0 ? 'ok' : 'failing', failures[0] ?? null);

@@ -583,4 +583,11 @@ describe('the shared check', () => {
     expect(await audienceForAddresses(['p.a.t@example.com'])).toBe('others');
     expect(await audienceForAddresses([])).toBe('others');
   });
+
+  it('counts a Gmail spelling of a principal address as the principal, and a +tag at another domain as others (R1)', async () => {
+    await addPrincipalAddress('patlee@gmail.com');
+    expect(await audienceForAddresses(['Pat.Lee+trip@googlemail.com', 'PAT@example.com'])).toBe('principal');
+    expect(await audienceForAddresses(['pat+trip@example.com'])).toBe('others');
+    expect(await audienceForAddresses(['patlee@gmail.com.evil.example'])).toBe('others');
+  });
 });

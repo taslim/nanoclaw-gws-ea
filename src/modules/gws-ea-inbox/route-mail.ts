@@ -40,7 +40,7 @@ import type { InboundMessage } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { parseWorkspaceNotification, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import {
@@ -95,7 +95,7 @@ export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Dat
   const profile = (await getDb().hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined;
   return {
     assistant,
-    auth: { principalAddresses: new Set(profile?.principal_emails ?? []) },
+    auth: { principalAddresses: principalRecognizer(profile?.principal_emails ?? []) },
     principalCalendars: new Set(await listPrincipalCalendars()),
     principal: { name: profile?.principal_display_name ?? null },
     at,
@@ -335,7 +335,7 @@ async function senderLine(verdict: Sender, context: RoutingContext, reader: Read
       return `Gmail confirms this is from ${verdict.address},${name} ${levelClause(record.level, principal)}.`;
     }
     case 'unauthenticated':
-      return verdict.address !== undefined && context.auth.principalAddresses.has(verdict.address)
+      return context.auth.principalAddresses.has(verdict.address)
         ? `Gmail could not confirm who sent this, so treat the sender as unknown, even though it shows one of ${principal}'s addresses.`
         : 'Gmail could not confirm who sent this, so treat the sender as unknown.';
     default: {
@@ -389,7 +389,11 @@ function principalWords(mail: ParsedMail, instruction: string): string {
   );
 }
 
-/** An email row: its text, its files, and its sender only when Gmail verified them. */
+/**
+ * An email row: its text, its files, and its sender only when Gmail verified
+ * them. The principal is their address as listed, whatever spelling they
+ * wrote from, since only that spelling is a member of `main` (R2).
+ */
 function emailRow(
   mail: ParsedMail,
   verdict: Sender,

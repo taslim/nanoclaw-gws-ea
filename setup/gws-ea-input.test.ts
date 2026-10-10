@@ -129,6 +129,51 @@ describe('GWS-EA interactive create input', () => {
     });
   });
 
+  it("asks again for the principal's addresses when one reaches the assistant or repeats another's spelling", async () => {
+    const text = vi
+      .fn()
+      .mockResolvedValueOnce('Ada')
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('Morgan')
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('UTC')
+      .mockResolvedValueOnce('morganellery@gmail.com');
+
+    await collectGwsEaCreateInput(
+      {
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: [],
+        secrets: NO_SECRETS,
+        track: 'dogfood',
+        provided: { endpoint: 'https://assistant.example.test/webhook/gchat', 'workspace-email': 'ada@example.test' },
+      },
+      {
+        providers: [provider('claude', 'Claude')],
+        detectedTimezone: 'UTC',
+        prompts: {
+          note: vi.fn(),
+          text,
+          password: vi.fn(),
+          confirm: vi.fn(),
+          select: vi.fn(),
+          isCancel: () => false,
+          logInfo: vi.fn(),
+        },
+      },
+    );
+
+    const [{ validate }] = text.mock.calls[5] as [{ validate: (value: string) => string | undefined }];
+    expect(validate('morgan@example.test, Ada+x@Example.test')).toBe(
+      "ada+x@example.test is the assistant's own address, not one of the principal's",
+    );
+    expect(validate('morganellery@gmail.com, Morgan.Ellery@gmail.com')).toBe(
+      "morgan.ellery@gmail.com is another spelling of morganellery@gmail.com, already one of the principal's addresses",
+    );
+    expect(validate('morgan@example.test, morgan+x@example.test')).toBeUndefined();
+  });
+
   it('offers only composed providers and uses the selected provider metadata', async () => {
     const claude = provider('claude', 'Claude');
     const codex = provider('codex', 'Codex');
@@ -522,6 +567,24 @@ describe('GWS-EA unattended create input', () => {
     await expect(unattended(FLAGS, NO_SECRETS, {}, ['aya@example.test'])).rejects.toMatchObject({
       code: 'invalid_arguments',
       message: expect.stringContaining('--principal-email'),
+    });
+  });
+
+  it.each([
+    [
+      "a plus-addressed spelling of the assistant's own",
+      ['morgan@example.test', 'aya+x@example.test'],
+      /assistant's own/u,
+    ],
+    [
+      'two spellings of one Gmail address',
+      ['morganellery@gmail.com', 'morgan.ellery+x@googlemail.com'],
+      /another spelling of morganellery@gmail\.com/u,
+    ],
+  ])('refuses principal addresses with %s, naming --principal-email', async (_case, emails, message) => {
+    await expect(unattended(FLAGS, NO_SECRETS, {}, emails)).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: expect.stringMatching(new RegExp(`^--principal-email: .*${message.source}`, 'u')),
     });
   });
 

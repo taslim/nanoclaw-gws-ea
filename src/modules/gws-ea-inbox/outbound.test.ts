@@ -1274,4 +1274,19 @@ describe('a Google link in an email to outsiders', () => {
     await reply(session, key, `Sam, the agenda: ${docUrl(agenda)}`);
     expect(gmail.sent.map((sent) => [sent.to, sent.cc])).toEqual([[[PRINCIPAL], [SAM]]]);
   });
+
+  it('answers the principal at the Gmail spelling they wrote from, and checks no link for it (R2)', async () => {
+    await addPrincipalAddress('firstlast@gmail.com');
+    const { key, session } = await arrives({
+      threadId: 'g-2',
+      from: 'Pat <First.Last+news@gmail.com>',
+      principal: true,
+      cc: [SAM],
+      body: 'Juno, send Sam the agenda.',
+    });
+    const agenda = await shared('Agenda', [SAM]);
+    await reply(session, key, `Sam, the agenda: ${docUrl(agenda)}`);
+    expect(refusals(session)).toEqual([]);
+    expect(gmail.sent.map((sent) => [sent.to, sent.cc])).toEqual([[['first.last+news@gmail.com'], [SAM]]]);
+  });
 });

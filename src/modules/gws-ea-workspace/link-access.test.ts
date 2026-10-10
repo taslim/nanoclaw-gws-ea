@@ -14,10 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../gws-ea-google/index.js', () => ({ hostGoogleAccessToken: vi.fn() }));
 
-import { closeDb, initTestDb } from '../../db/index.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { registerMigration } from '../../db/migrations/index.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { audienceForAddresses } from '../gws-ea-privacy/audience.js';
+import { addPrincipalAddress, principalRecognizer } from '../gws-ea-profile/db.js';
+import { gwsEaPrincipalAddressesMigration, gwsEaProfileMigration } from '../gws-ea-profile/migration.js';
 import {
   checkLinksOpenable,
   createLinkAccess,
@@ -42,6 +46,10 @@ const DECK_TYPE = 'application/vnd.google-apps.presentation';
 const RSVP = 'https://docs.google.com/forms/d/e/1FAIpQLSdRsvpSpring/viewform';
 const OPERATOR = "the assistant's Google sign-in doesn't include Drive yet; the operator needs to reconnect it";
 
+// The profile's tables alone, so the host's own check reads the principal's addresses as the privacy check does.
+registerMigration(gwsEaProfileMigration);
+registerMigration(gwsEaPrincipalAddressesMigration);
+
 const docUrl = (id: string) => `https://docs.google.com/document/d/${id}/edit`;
 const deckUrl = (id: string) => `https://docs.google.com/presentation/d/${id}/edit`;
 
@@ -63,7 +71,7 @@ function world(reach: (drive: FakeDrive) => DriveApi = (drive) => drive) {
       if (answer instanceof Error) throw answer;
       return answer;
     },
-    principalAddresses: async () => new Set([MORGAN, MORGAN_WORK]),
+    principalAddresses: async () => principalRecognizer([MORGAN, MORGAN_WORK]),
     sleep: async (ms) => {
       slept.push(ms);
     },
@@ -288,6 +296,19 @@ describe('the principal', () => {
     expect(visits).toEqual([]);
   });
 
+  it('is every spelling the one rule recognizes, and never a +tag at another domain (R1)', async () => {
+    const { drive, check, owned } = world();
+    const id = await owned();
+    expect(
+      await check({ texts: [docUrl(id)], recipients: ['Morgan.Fixture+trip@googlemail.com', 'MORGAN@Ellery.example'] }),
+    ).toEqual({ allowed: true });
+    expect(drive.calls.filter((call) => call.op !== 'createFile')).toEqual([]);
+
+    expect(refusal(await check({ texts: [docUrl(id)], recipients: ['morgan+trip@ellery.example'] }))).toMatch(
+      /^morgan\+trip@ellery\.example can't open/u,
+    );
+  });
+
   it('is left out of who a refusal names when others share the message', async () => {
     const { check, owned } = world();
     const id = await owned();
@@ -449,6 +470,25 @@ describe("the host's own check", () => {
     );
     // No Drive call went out: only the signed-out visit.
     expect(requests).toEqual([link]);
+  });
+
+  it('passes exactly the recipients the privacy check counts as the principal, and checks every other', async () => {
+    await runMigrations(getDb());
+    for (const email of [MORGAN, MORGAN_WORK]) await addPrincipalAddress(email);
+    vi.mocked(hostGoogleAccessToken).mockRejectedValue(new Error('The assistant is not signed in to Google yet'));
+    const link = docUrl('1MorganTripPlan');
+
+    for (const [recipient, audience] of [
+      ['Morgan.Fixture+trip@googlemail.com', 'principal'],
+      ['MORGAN@Ellery.example', 'principal'],
+      ['morgan+trip@ellery.example', 'others'],
+      ['morgan.fixture@gmail.com.evil.example', 'others'],
+      ['m\u043Ergan@ellery.example', 'others'],
+    ] as const) {
+      expect(await audienceForAddresses([recipient]), recipient).toBe(audience);
+      const checked = await checkLinksOpenable({ texts: [link], recipients: [recipient], writer: 'main' });
+      expect(checked.allowed, recipient).toBe(audience === 'principal');
+    }
   });
 
   it('throws for a retry when the token endpoint is out of reach, rather than blaming the sign-in', async () => {

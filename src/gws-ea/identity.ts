@@ -2,7 +2,14 @@ import { instanceOnecliAdmin, validateRuntimeConfig, type InstanceRuntimeConfig 
 import { runInstanceNclJson } from './ncl.js';
 import type { OnecliAdmin, OnecliAgent } from './onecli-admin.js';
 import { GwsEaError } from './types.js';
-import { EMAIL_PATTERN, isRecord, normalizePrincipalEmail, requireString, unwrapData } from './validation.js';
+import {
+  EMAIL_PATTERN,
+  isRecord,
+  normalizePrincipalEmail,
+  principalAddressesConflict,
+  requireString,
+  unwrapData,
+} from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 /** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
@@ -101,7 +108,10 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
   };
 }
 
-/** One or more addresses, lowercased and each once; the assistant's own is never one of the principal's. */
+/**
+ * One or more addresses, lowercased and each once, none the assistant's own
+ * or another spelling of one before it (`principalAddressesConflict`).
+ */
 function validatePrincipalEmails(values: readonly string[], assistantWorkspaceEmail: string): readonly string[] {
   const emails = [
     ...new Set(
@@ -113,9 +123,8 @@ function validatePrincipalEmails(values: readonly string[], assistantWorkspaceEm
     ),
   ];
   if (emails.length === 0) throw new GwsEaError('invalid_identity', 'The principal needs at least one email address');
-  if (emails.includes(assistantWorkspaceEmail)) {
-    throw new GwsEaError('invalid_identity', "The principal's email addresses include the assistant's own");
-  }
+  const conflict = principalAddressesConflict(emails, assistantWorkspaceEmail);
+  if (conflict !== undefined) throw new GwsEaError('invalid_identity', conflict);
   return emails;
 }
 

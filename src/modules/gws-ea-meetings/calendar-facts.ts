@@ -22,7 +22,8 @@
  * - `people_stats` counts, over the last six months, the meetings the
  *   principal organized or accepted with each person: an invitation they
  *   left unanswered, declined, or marked maybe never builds a record. The
- *   principal (every spelling of their addresses), the assistant, rooms, and
+ *   principal (each of their addresses, by the one rule that recognizes
+ *   them), the assistant (in every spelling of its address), rooms, and
  *   meetings of more than eight people are left out, and a meeting on several
  *   calendars counts once.
  *
@@ -37,14 +38,13 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
-import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { DetailedAttendee, DetailedEvent, EventTime, MeetingsCalendarApi } from './calendar-api.js';
 import { dayLabel, spanLabel } from './calendar-actions.js';
 import { addressesOf, instantOf, lineOf } from './fields.js';
 import {
   blocksTime,
   eventSpan,
-  isPrincipalAddress,
   isPrincipalAttendee,
   iso,
   principalAnswer,
@@ -128,10 +128,10 @@ interface Copy {
   readonly meeting: string;
 }
 
-/** Whose calendars, on whose clock, and who the principal is in every spelling. */
+/** Whose calendars, on whose clock, and who the principal is. */
 interface FactsView {
   readonly timezone: string;
-  readonly addresses: ReadonlySet<string>;
+  readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
 }
 
@@ -143,7 +143,7 @@ function overlap(a: Span, b: Span): number {
   return Math.min(a.end, b.end) - Math.max(a.start, b.start);
 }
 
-/** An address's key across the spellings that reach one mailbox. */
+/** An address's key across the spellings that reach one mailbox: who is the assistant, never who is the principal. */
 function mailbox(email: string): string {
   return identityMatchKey(`email:${email}`);
 }
@@ -156,7 +156,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
   const calendar = () => deps.calendar();
 
   async function viewOf(): Promise<FactsView> {
-    const addresses = new Set((await listPrincipalAddresses()).map((address) => address.email.toLowerCase()));
+    const addresses = await loadPrincipalRecognizer();
     const calendars = (await calendar().listCalendars())
       .filter((entry) => isPrincipalCalendar(entry, addresses))
       .map((entry) => entry.id);
@@ -280,7 +280,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
         return 'more_than_eight';
       }
       const organizer = event.organizer;
-      const organized = organizer?.self === true || isPrincipalAddress(organizer?.email, view.addresses);
+      const organized = organizer?.self === true || view.addresses.has(organizer?.email);
       return organized || principalAnswer(event, view.addresses) === 'accepted'
         ? 'counted'
         : 'not_organized_or_accepted';

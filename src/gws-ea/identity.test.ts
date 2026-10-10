@@ -374,6 +374,8 @@ describe('main identity reconciliation', () => {
     ['a malformed address', ['morgan@example.test', 'not-an-email']],
     ['no address', []],
     ["the assistant's own address", ['morgan@example.test', 'AYA@example.test']],
+    ["a plus-addressed spelling of the assistant's own", ['morgan@example.test', 'aya+x@example.test']],
+    ['two spellings of one Gmail address', ['morganellery@gmail.com', 'Morgan.Ellery@gmail.com']],
   ])('rejects principal addresses with %s before mutating NanoClaw or OneCLI', async (_case, principalEmails) => {
     const { state, dependencies } = harness();
 
@@ -381,6 +383,32 @@ describe('main identity reconciliation', () => {
       reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails }, dependencies),
     ).rejects.toMatchObject({ code: 'invalid_identity' });
     expect(state).toMatchObject({ groupCreated: 0, provider: null, timezone: null, profileWrites: 0, agents: [] });
+  });
+
+  it("names the conflict: a dotted spelling of the assistant's Gmail, or the listed spelling another repeats", async () => {
+    const { dependencies } = harness();
+    const gmailAssistant = { ...input, assistantWorkspaceEmail: 'ayaassistant@gmail.com' };
+
+    await expect(
+      reconcileMainIdentity(
+        runtimeConfig(),
+        { ...gmailAssistant, principalEmails: ['Aya.Assistant@gmail.com'] },
+        dependencies,
+      ),
+    ).rejects.toMatchObject({
+      code: 'invalid_identity',
+      message: "aya.assistant@gmail.com is the assistant's own address, not one of the principal's",
+    });
+    await expect(
+      reconcileMainIdentity(
+        runtimeConfig(),
+        { ...input, principalEmails: ['morganellery@gmail.com', 'Morgan.Ellery@gmail.com'] },
+        dependencies,
+      ),
+    ).rejects.toMatchObject({
+      message:
+        "morgan.ellery@gmail.com is another spelling of morganellery@gmail.com, already one of the principal's addresses",
+    });
   });
 
   it("fails when the profile does not hold the principal's declared addresses", async () => {

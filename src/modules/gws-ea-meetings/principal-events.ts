@@ -38,7 +38,7 @@ import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
-import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
 import {
   assertInvitationShareable,
@@ -46,6 +46,7 @@ import {
   dayLabel,
   eventIdFor,
   guestsOn,
+  isOwnerAddress,
   readConference,
   spanLabel,
 } from './calendar-actions.js';
@@ -187,16 +188,17 @@ function guestChange(
   add: readonly string[],
   remove: readonly string[],
 ): GuestChange {
-  const owner = calendarId.toLowerCase();
-  const isOwner = (guest: GuestRecord): boolean => emailOf(guest) === owner;
+  const isOwner = (address: string | undefined): boolean => isOwnerAddress(calendarId, address);
   const listed = new Set(guests.flatMap((guest) => emailOf(guest) ?? []));
-  const adding = add.filter((address) => address !== owner && !listed.has(address));
-  const ownerEntry = guests.find(isOwner);
+  const adding = add.filter((address) => !isOwner(address) && !listed.has(address));
+  const ownerEntry = guests.find((guest) => isOwner(emailOf(guest)));
   const answered = answerOf(ownerEntry);
 
   const kept = guests
     .filter((guest) => !remove.includes(emailOf(guest) ?? ''))
-    .map((guest) => (isOwner(guest) && answered === undefined ? { ...guest, responseStatus: 'accepted' } : guest));
+    .map((guest) =>
+      isOwner(emailOf(guest)) && answered === undefined ? { ...guest, responseStatus: 'accepted' } : guest,
+    );
   const next: GuestRecord[] = [
     ...(ownerEntry === undefined ? [{ email: calendarId, responseStatus: 'accepted' }] : []),
     ...kept,
@@ -210,11 +212,11 @@ function guestChange(
     // A room booked on the event stays on it as it is, but is no one invited.
     invited: next.flatMap((guest) => {
       const email = emailOf(guest);
-      return email === undefined || email === owner || guest.resource === true ? [] : [email];
+      return email === undefined || isOwner(email) || guest.resource === true ? [] : [email];
     }),
     answer: answered ?? 'accepted',
     absent: remove.filter((address) => !listed.has(address)),
-    already: add.filter((address) => address !== owner && listed.has(address)),
+    already: add.filter((address) => !isOwner(address) && listed.has(address)),
   };
 }
 
@@ -232,13 +234,12 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
 
   /**
    * The calendar named, refused unless it is the principal's and Google lets
-   * the assistant change it, with the principal's addresses, lowercased.
+   * the assistant change it, with the principal's addresses.
    */
   async function principalCalendarOf(
     calendarId: string,
-  ): Promise<{ readonly entry: CalendarEntry; readonly principal: ReadonlySet<string> }> {
-    const [entry, addresses] = await Promise.all([calendar().getCalendar(calendarId), listPrincipalAddresses()]);
-    const principal = new Set(addresses.map((address) => address.email.toLowerCase()));
+  ): Promise<{ readonly entry: CalendarEntry; readonly principal: PrincipalRecognizer }> {
+    const [entry, principal] = await Promise.all([calendar().getCalendar(calendarId), loadPrincipalRecognizer()]);
     if (entry === undefined || !isPrincipalCalendar(entry, principal)) {
       throw forbidden(
         `${calendarId} is not one of the principal's calendars in your list: put their events on one of theirs.`,
@@ -289,7 +290,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
 
     const { entry, principal } = await principalCalendarOf(calendarId);
     const attendees = guestsOn(entry.id, guests);
-    const invited = guests.filter((address) => address !== entry.id.toLowerCase());
+    const invited = guests.filter((address) => !isOwnerAddress(entry.id, address));
     // Google tells the guests only when one of them is someone other than the principal.
     const outside = invited.filter((address) => !principal.has(address));
     const tellsGuests = outside.length > 0;
@@ -373,7 +374,9 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     }
     const { entry, principal } = await principalCalendarOf(calendarId);
     const owner = entry.id.toLowerCase();
-    if (remove.includes(owner)) throw forbidden('The principal stays on their own events: they organize them.');
+    if (remove.some((address) => isOwnerAddress(entry.id, address))) {
+      throw forbidden('The principal stays on their own events: they organize them.');
+    }
 
     // The list is written back only over the version of the event it was
     // read from, so a guest's answer, or anyone's change, that lands in

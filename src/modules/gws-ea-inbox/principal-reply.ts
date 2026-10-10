@@ -19,7 +19,7 @@
  */
 import type { OutboundMessage } from '../../channels/adapter.js';
 import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
-import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { authenticateSender } from './authentication.js';
 import { buildMime, encodeRaw, parseGmailMessage, type Mailbox, type ParsedMail } from './mime.js';
 import { emailSignature, renderEmail } from './render.js';
@@ -43,7 +43,7 @@ interface Anchor {
 async function principalAnchor(runtime: InboxRuntime, threadKey: string): Promise<Anchor | undefined> {
   await runtime.gmailAddress();
   const assistant = await assistantAddresses();
-  const auth = { principalAddresses: new Set((await listPrincipalAddresses()).map((address) => address.email)) };
+  const auth = { principalAddresses: await loadPrincipalRecognizer() };
   for (const message of (await threadMessages(threadKey, 'principal')).reverse()) {
     if (message.gmailMessageId === null) continue;
     const found = await runtime.gmail.getMessage(message.gmailMessageId, 'full');

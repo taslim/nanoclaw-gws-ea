@@ -23,6 +23,7 @@
 import { createHash } from 'node:crypto';
 
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
+import { principalMatchKey } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
@@ -60,16 +61,23 @@ export interface OwnerTag {
 }
 
 /**
+ * Whether `address` is the owner's of the principal's calendar
+ * `calendarId`, in any spelling the one rule gives their addresses (R1).
+ */
+export function isOwnerAddress(calendarId: string, address: string | undefined): boolean {
+  return address !== undefined && principalMatchKey(address) === principalMatchKey(calendarId);
+}
+
+/**
  * The guests of an event the assistant writes on `calendarId`: the
- * calendar's owner first, accepted, then everyone `invitees` names. Google
- * gives the owner no answer of their own (`needsAction`) unless the write
- * does, and lists them as the event's organizer.
+ * calendar's owner first, accepted, then everyone else `invitees` names.
+ * Google gives the owner no answer of their own (`needsAction`) unless the
+ * write does, and lists them as the event's organizer.
  */
 export function guestsOn(calendarId: string, invitees: readonly string[]): GuestWrite[] {
-  const owner = calendarId.toLowerCase();
   return [
     { email: calendarId, responseStatus: 'accepted' },
-    ...invitees.filter((address) => address.toLowerCase() !== owner).map((email) => ({ email })),
+    ...invitees.filter((address) => !isOwnerAddress(calendarId, address)).map((email) => ({ email })),
   ];
 }
 

@@ -264,26 +264,26 @@ describe('the home folder', () => {
   });
 
   it('records an alias whose permission id already holds access, and never shares with it', async () => {
-    await setUpProfile([GMAIL]);
+    await setUpProfile([WORK]);
     await world.home.tick();
-    const [primary] = world.drive.file(folderId())?.permissions.filter((p) => p.emailAddress === GMAIL) ?? [];
+    const [primary] = world.drive.file(folderId())?.permissions.filter((p) => p.emailAddress === WORK) ?? [];
 
-    await addPrincipalAddress(GMAIL_ALIAS);
+    await addPrincipalAddress(WORK_ALIAS);
     const mark = world.drive.calls.length;
     await world.home.tick();
     await world.home.tick();
 
     expect(writesSince(mark)).toEqual([]);
     expect(await grants()).toEqual([
-      { email: GMAIL, permission_id: primary.id, state: 'granted', host_made: 1 },
-      { email: GMAIL_ALIAS, permission_id: primary.id, state: 'granted', host_made: 1 },
+      { email: WORK_ALIAS, permission_id: primary.id, state: 'granted', host_made: 1 },
+      { email: WORK, permission_id: primary.id, state: 'granted', host_made: 1 },
     ]);
 
     // The account stays shared while one of its addresses is still the principal's.
-    await removePrincipalAddress(GMAIL_ALIAS);
+    await removePrincipalAddress(WORK_ALIAS);
     await world.home.tick();
-    expect(sharedWith()).toEqual([{ type: 'user', role: 'writer', email: GMAIL }]);
-    expect(await grants()).toEqual([{ email: GMAIL, permission_id: primary.id, state: 'granted', host_made: 1 }]);
+    expect(sharedWith()).toEqual([{ type: 'user', role: 'writer', email: WORK }]);
+    expect(await grants()).toEqual([{ email: WORK, permission_id: primary.id, state: 'granted', host_made: 1 }]);
   });
 
   it('records an address Google refuses once, and asks again only when the addresses change', async () => {
@@ -351,7 +351,7 @@ describe('the home folder', () => {
     ]);
     expect(shares()).toHaveLength(2);
 
-    await addPrincipalAddress(GMAIL_ALIAS);
+    await addPrincipalAddress(WORK_ALIAS);
     await world.home.tick();
     expect(sharedWith()).toEqual([
       { type: 'user', role: 'writer', email: GMAIL },
@@ -437,6 +437,32 @@ describe('the home folder', () => {
     await home.tick();
     expect(world.drive.calls.filter((call) => call.op === 'deletePermission')).toEqual([]);
     expect(sharedWith(id)).toContainEqual({ type: 'user', role: 'writer', email: WORK });
+  });
+
+  it('finds access Drive names by another Gmail spelling of a listed address, and shares nothing again (R1)', async () => {
+    // Drive knows no permission id for the address, so only the access Drive lists can show it is held.
+    const home = createHomeFolder({
+      drive: { ...delegatingDriveApi(() => world.drive), permissionId: async () => undefined },
+      readGrant: async () => GRANT,
+      writeNote: async () => 'written',
+      log: { info: () => undefined, warn: () => undefined },
+      now: () => new Date(AT),
+    });
+    await setUpProfile([WORK]);
+    await home.tick();
+    const id = home.folderId() ?? '';
+    world.drive.share(id, { id: '0802', type: 'user', role: 'writer', emailAddress: GMAIL });
+    const mark = world.drive.calls.length;
+
+    await addPrincipalAddress(GMAIL_ALIAS);
+    await home.tick();
+    expect(writesSince(mark)).toEqual([]);
+    expect(await grants()).toContainEqual({
+      email: GMAIL_ALIAS,
+      permission_id: '0802',
+      state: 'granted',
+      host_made: 0,
+    });
   });
 
   it('restores a trashed folder in place', async () => {

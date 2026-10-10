@@ -362,6 +362,12 @@ describe('GWS-EA people store', () => {
     ['a principal address', 'email:Morgan@Example.test', /principal's own/i],
     ['a Gmail spelling of a principal address', 'email:Morgan.Fixture+news@gmail.com', /principal's own/i],
     ['another Gmail spelling', 'm.o.r.g.a.n.fixture@googlemail.com', /principal's own/i],
+    // Wider than who the principal is: a +tag at another provider is still kept out of the store.
+    [
+      'a plus-addressed form of a principal address at another provider',
+      'morgan+news@example.test',
+      /principal's own/i,
+    ],
     ["the principal's verified chat identity", 'gchat:users/principal', /principal's own/i],
     ["the assistant's address", 'email:Juno@example.test', /assistant's own/i],
     ["a plus-addressed form of the assistant's address", 'juno+calendar@example.test', /assistant's own/i],

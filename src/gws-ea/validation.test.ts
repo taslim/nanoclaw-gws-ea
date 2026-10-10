@@ -5,10 +5,14 @@ import {
   canonicalTimestamp,
   EMAIL_PATTERN,
   hasControlCharacters,
+  principalAddressConflict,
+  principalAddressesConflict,
+  principalMatchKey,
   requireCanonicalTimestamp,
   requireDockerEndpoint,
   requirePath,
   requireString,
+  resolvePrincipalAddress,
   unixSocketPath,
 } from './validation.js';
 
@@ -161,6 +165,74 @@ describe('GWS-EA shared validation', () => {
       ['a trailing newline', 'assistant@example.com\n'],
     ])('rejects an address with %s', (_form, email) => {
       expect(EMAIL_PATTERN.test(email)).toBe(false);
+    });
+  });
+
+  describe("the principal's addresses (R1)", () => {
+    const LISTED = ['firstlast@gmail.com', 'pat@corp.example'];
+
+    it.each([
+      ['a Gmail address with dots, a +tag and capitals', 'First.Last+news@gmail.com', 'firstlast@gmail.com'],
+      ['the googlemail spelling', 'first.last@googlemail.com', 'firstlast@gmail.com'],
+      ['another domain in other capitals', 'Pat@Corp.Example', 'pat@corp.example'],
+      ['the listed spelling itself', 'pat@corp.example', 'pat@corp.example'],
+    ])('resolves %s to the spelling the principal listed', (_case, address, listed) => {
+      expect(resolvePrincipalAddress(address, LISTED)).toBe(listed);
+    });
+
+    it.each([
+      ['a +tag at another domain', 'pat+x@corp.example'],
+      ['dots at another domain', 'p.at@corp.example'],
+      ['a subdomain of gmail.com', 'firstlast@sub.gmail.com'],
+      ['a domain that only starts with gmail.com', 'firstlast@gmail.com.evil.example'],
+      ['a lookalike with a Cyrillic letter', 'firstlаst@gmail.com'],
+      ['padding', ' pat@corp.example'],
+    ])('resolves %s to none of them', (_case, address) => {
+      expect(resolvePrincipalAddress(address, LISTED)).toBeUndefined();
+    });
+
+    it('folds only ASCII: a non-ASCII address matches exactly or not at all', () => {
+      expect(principalMatchKey('Kate@corp.example')).toBe('Kate@corp.example');
+      expect(resolvePrincipalAddress('Kate@corp.example', ['kate@corp.example'])).toBeUndefined();
+      expect(resolvePrincipalAddress('ünal@corp.example', ['ünal@corp.example'])).toBe('ünal@corp.example');
+      expect(resolvePrincipalAddress('Ünal@corp.example', ['ünal@corp.example'])).toBeUndefined();
+    });
+
+    it('keeps a +tag or dots that are all a Gmail handle has, as identityMatchKey does', () => {
+      expect(principalMatchKey('+news@gmail.com')).toBe('+news@gmail.com');
+      expect(principalMatchKey('...@googlemail.com')).toBe('...@gmail.com');
+    });
+
+    it('prefers the spelling written exactly when two listed spellings match', () => {
+      expect(resolvePrincipalAddress('first.last@gmail.com', ['firstlast@gmail.com', 'first.last@gmail.com'])).toBe(
+        'first.last@gmail.com',
+      );
+    });
+
+    it("refuses the assistant's own address in any spelling that reaches its mailbox (R3)", () => {
+      expect(principalAddressConflict('ea+x@corp.example', [], 'ea@corp.example')).toBe(
+        "ea+x@corp.example is the assistant's own address, not one of the principal's",
+      );
+      expect(principalAddressConflict('e.a@gmail.com', [], 'ea@gmail.com')).toMatch(/assistant's own/u);
+      expect(principalAddressConflict('pat@corp.example', [], null)).toBeUndefined();
+    });
+
+    it('refuses another spelling of a listed address, naming it, but not the same spelling again (R3)', () => {
+      expect(principalAddressConflict('first.last@gmail.com', LISTED, 'ea@corp.example')).toBe(
+        "first.last@gmail.com is another spelling of firstlast@gmail.com, already one of the principal's addresses",
+      );
+      expect(principalAddressConflict('firstlast@gmail.com', LISTED, 'ea@corp.example')).toBeUndefined();
+      expect(principalAddressConflict('pat+x@corp.example', LISTED, 'ea@corp.example')).toBeUndefined();
+    });
+
+    it('judges each address of a list against those before it', () => {
+      expect(principalAddressesConflict(['pat@corp.example', 'pat@corp.example'], 'ea@corp.example')).toBeUndefined();
+      expect(principalAddressesConflict(['firstlast@gmail.com', 'first.last@gmail.com'], null)).toBe(
+        "first.last@gmail.com is another spelling of firstlast@gmail.com, already one of the principal's addresses",
+      );
+      expect(principalAddressesConflict(['pat@corp.example', 'EA@corp.example'], 'ea@corp.example')).toMatch(
+        /assistant's own/u,
+      );
     });
   });
 });

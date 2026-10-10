@@ -9,12 +9,14 @@
  * `Authentication-Results` header of their own, but only below Gmail's, so a
  * header with anything but Gmail's trace headers above it is never trusted.
  *
- * - The principal: one of their addresses as the single From mailbox, a
- *   `dkim=pass` from exactly that address's domain, `dmarc=pass` (never
+ * - The principal: one of their addresses, in any spelling the one rule
+ *   recognizes (R1), as the single From mailbox, a `dkim=pass` from exactly
+ *   the domain the From is written with, `dmarc=pass` (never
  *   `bestguesspass`), no differing Sender, and no List-Id: Gmail verified
- *   that the address's own domain sent it, whichever provider that is. A
- *   principal address that fails this is unauthenticated, never an ordinary
- *   sender, so it can neither instruct nor be mistaken for a counterpart.
+ *   that the address's own domain sent it, whichever provider that is. The
+ *   verdict names the address as the principal listed it (R2). A principal
+ *   address that fails this is unauthenticated, never an ordinary sender, so
+ *   it can neither instruct nor be mistaken for a counterpart.
  *   Anything the domain lets sign for it counts, a sending service included
  *   (accepted 2026-10-03 over per-domain selector pins the operator kept).
  * - Google Calendar's notifications: the same rule for `google.com`.
@@ -25,15 +27,25 @@
  * - Anyone else: `dmarc=pass` for the From domain, or a `dkim=pass` whose
  *   domain is aligned to it.
  */
+import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { domainOf, headerValues, parseAddressList, type MailHeader, type Mailbox } from './mime.js';
 
 export interface AuthContext {
-  /** The principal's addresses, lowercased. */
-  readonly principalAddresses: ReadonlySet<string>;
+  /** The principal's addresses, by the one rule that recognizes them (R1). */
+  readonly principalAddresses: PrincipalRecognizer;
 }
 
 export type SenderVerdict =
-  | { readonly kind: 'principal'; readonly address: string; readonly displayName?: string }
+  | {
+      readonly kind: 'principal';
+      /**
+       * The principal's address as they listed it, which the From reached
+       * (R2): the sender's identity. The From as written stays on the
+       * message, which is answered at it.
+       */
+      readonly address: string;
+      readonly displayName?: string;
+    }
   | { readonly kind: 'calendar-notification' }
   | { readonly kind: 'workspace-notification'; readonly address: string }
   | { readonly kind: 'authenticated'; readonly address: string; readonly displayName?: string }
@@ -199,12 +211,13 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
   );
   const ownDkimPass = (forDomain: string) => passed(results, 'dkim', (result) => dkimDomain(result) === forDomain);
 
-  if (context.principalAddresses.has(from.address)) {
+  const listed = context.principalAddresses.resolve(from.address);
+  if (listed !== undefined) {
     if (!soleSender) return unauthenticated('a Sender differs from From');
     if (hasListId) return unauthenticated('sent through a mailing list');
     if (!ownDkimPass(domain)) return unauthenticated('no DKIM pass from its own domain');
     if (!dmarcPass) return unauthenticated('no DMARC pass');
-    return { kind: 'principal', address: from.address, ...named(from) };
+    return { kind: 'principal', address: listed, ...named(from) };
   }
 
   if (from.address === CALENDAR_NOTIFICATION_SENDER) {

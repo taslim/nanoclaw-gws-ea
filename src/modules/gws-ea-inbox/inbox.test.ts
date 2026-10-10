@@ -1196,6 +1196,42 @@ describe('routing by audience', () => {
     );
   });
 
+  it('takes another Gmail spelling of a listed address to main as the listed one, and answers the spelling they wrote (AE1)', async () => {
+    await addPrincipalAddress('firstlast@gmail.com');
+    gmail.receive({
+      threadId: 'g-dinner',
+      from: 'Pat <First.Last+news@gmail.com>',
+      auth: 'principal',
+      subject: 'Dinner',
+      body: 'Book dinner for Friday.',
+    });
+    await inbox.tick();
+
+    // main's conversation admits only its members, and only the listed spelling is one.
+    const [email, ...more] = principalMail();
+    expect(more).toEqual([]);
+    expect(email.sender).toBe('firstlast@gmail.com');
+    expect(email.text.split('\n')[0]).toBe(
+      'Pat emailed you directly, and Gmail confirms it is from them (firstlast@gmail.com).',
+    );
+    const threadKey = email.row.thread_id ?? '';
+    expect((await threadAddresses(threadKey)).map((entry) => entry.address)).toContain('first.last+news@gmail.com');
+    expect(await outsideMail()).toEqual([]);
+
+    expect(deliveryStatus(main, await mainReplies(threadKey, 'Booked for 7pm.'))).toBe('delivered');
+    expect(gmail.sent.map((sent) => sent.envelope)).toEqual([['first.last+news@gmail.com']]);
+  });
+
+  it('takes a +tag at a non-Gmail domain for someone else, never the principal (R1)', async () => {
+    gmail.receive({ from: 'Pat <pat+news@principal.example>', auth: 'principal', subject: 'Hi', body: 'Hello.' });
+    await inbox.tick();
+    expect(principalMail()).toEqual([]);
+    const [outside] = await outsideMail();
+    expect(hostText(outside.text)).toContain(
+      "Gmail confirms this is from pat+news@principal.example; Pat hasn't dealt with them before.",
+    );
+  });
+
   it('archives mailing lists, bulk mail, bounces, and auto-replies, in no thread', async () => {
     gmail.receive({
       from: 'news@digest.example',

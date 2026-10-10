@@ -798,6 +798,16 @@ describe('book', () => {
     ).toMatch(/cannot write to the calendar main named/u);
   });
 
+  it('books on a calendar Google names by another Gmail spelling of a listed address, inviting no spelling of the principal (R1)', async () => {
+    await addPrincipalAddress('pat.lee@gmail.com');
+    calendar.calendars.set('patlee@gmail.com', { id: 'patlee@gmail.com', accessRole: 'owner', summary: 'Pat' });
+    const { key, session } = await thread([REMY, 'pat.lee+trip@googlemail.com']);
+    await setThreadBookingCalendar(key, 'patlee@gmail.com');
+
+    const booked = data(await send(session, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
+    expect(invited(calendar.event('patlee@gmail.com', String(booked.booking)))).toEqual([REMY]);
+  });
+
   it('goes on the principal’s primary calendar alone: refused, never placed on another of theirs, when it cannot be written to', async () => {
     // A second address, given later: its calendar is the principal's, but not their primary one.
     vi.setSystemTime(new Date(NOW.getTime() + 60_000));

@@ -84,6 +84,8 @@ const READ_ONLY = 'morgan.family@northwind.example';
 /** A colleague's calendar the assistant can write to, which is not the principal's. */
 const COLLEAGUE_CALENDAR = 'lena@northwind.example';
 const REMY = 'remy@northwind.example';
+/** A principal calendar Google names by the undotted spelling of a Gmail address the principal listed dotted. */
+const GMAIL_CALENDAR = 'morganellery@gmail.com';
 const NOEL = 'noel@friends.example';
 const PACIFIC = 'America/Los_Angeles';
 /** The principal's home, which they keep private. */
@@ -284,6 +286,26 @@ describe('create_event', () => {
       expect.objectContaining({ op: 'insert', eventId: own.event, sendUpdates: 'none' }),
     ]);
     expect(own.message).toMatch(new RegExp(`Its guests: ${READ_ONLY}; Google emailed no one\\.`, 'u'));
+  });
+
+  it('takes a calendar whose ID is another Gmail spelling of a listed address, its owner in any spelling the principal (R1)', async () => {
+    await addPrincipalAddress('morgan.ellery@gmail.com');
+    calendar.calendars.set(GMAIL_CALENDAR, { id: GMAIL_CALENDAR, accessRole: 'owner' });
+
+    const created = data(
+      await send(main, 'create_event', {
+        ...FOCUS,
+        calendar: GMAIL_CALENDAR,
+        guests: ['Morgan.Ellery+focus@gmail.com', PRINCIPAL],
+      }),
+    );
+    // Named again in another spelling, the owner is still listed once, and nobody but the principal is told.
+    expect(calendar.event(GMAIL_CALENDAR, String(created.event))?.attendees).toEqual([
+      { email: GMAIL_CALENDAR, responseStatus: 'accepted', organizer: true },
+      { email: PRINCIPAL, responseStatus: 'needsAction' },
+    ]);
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'none' })]);
+    expect(created.message).toMatch(new RegExp(`Its guests: ${PRINCIPAL}; Google emailed no one\\.`, 'u'));
   });
 
   it('tells its guests once: a replayed request writes nothing more, and keeps what changed since', async () => {
@@ -735,6 +757,23 @@ describe('change_guests', () => {
     calendar.put(teamSync([{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }]));
     expect(
       refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', remove: [PRINCIPAL] })),
+    ).toMatch(/The principal stays on their own events/u);
+
+    await addPrincipalAddress('morgan.ellery@gmail.com');
+    calendar.calendars.set(GMAIL_CALENDAR, { id: GMAIL_CALENDAR, accessRole: 'owner' });
+    calendar.put({
+      ...teamSync([{ email: GMAIL_CALENDAR, responseStatus: 'accepted', organizer: true }]),
+      calendarId: GMAIL_CALENDAR,
+      organizer: { email: GMAIL_CALENDAR },
+    });
+    expect(
+      refusal(
+        await send(main, 'change_guests', {
+          calendar: GMAIL_CALENDAR,
+          event: 'teamsync01',
+          remove: ['Morgan.Ellery@gmail.com'],
+        }),
+      ),
     ).toMatch(/The principal stays on their own events/u);
 
     expect(

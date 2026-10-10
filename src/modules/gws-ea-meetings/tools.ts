@@ -58,7 +58,13 @@ import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import {
+  getGwsEaProfile,
+  getMainAgentGroupId,
+  listPrincipalAddresses,
+  principalRecognizer,
+  type PrincipalRecognizer,
+} from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
@@ -160,7 +166,7 @@ interface Principal {
   readonly timezone: string;
   readonly rules: SchedulingRules;
   /** Their addresses, which also name their own calendars. */
-  readonly addresses: ReadonlySet<string>;
+  readonly addresses: PrincipalRecognizer;
   /** Their primary calendar: that of the first address they gave, while they have one. */
   readonly primaryCalendar: string | undefined;
   readonly assistantName: string | null;
@@ -173,7 +179,7 @@ async function principalView(): Promise<Principal> {
   return {
     timezone: profile.principal_timezone ?? TIMEZONE,
     rules: schedulingRules(await getSchedulingPreferenceValues()),
-    addresses: new Set(addresses.map((address) => address.email)),
+    addresses: principalRecognizer(addresses.map((address) => address.email)),
     primaryCalendar: first?.email,
     assistantName: profile.assistant_display_name,
   };

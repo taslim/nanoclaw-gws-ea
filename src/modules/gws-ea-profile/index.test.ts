@@ -339,6 +339,12 @@ describe("the principal's email addresses", () => {
     ['a malformed address', ['morgan@example.test', 'not-an-email'], /email address is invalid/i],
     ['no address', [], /at least one/i],
     ["the assistant's own address", ['Aya@Example.test'], /assistant's own/i],
+    ["a plus-addressed spelling of the assistant's own", ['Aya+x@Example.test'], /assistant's own/i],
+    [
+      'two spellings of one Gmail address',
+      ['morganellery@gmail.com', 'Morgan.Ellery@googlemail.com'],
+      /morgan\.ellery@googlemail\.com is another spelling of morganellery@gmail\.com/i,
+    ],
   ])('refuses a reconcile that declares %s, changing nothing', async (_case, principalEmails, message) => {
     const response = await run('gws-ea-profile-reconcile', {
       ...identity,
@@ -412,11 +418,57 @@ describe("the principal's email addresses", () => {
     expect(await getPerson(sam.id)).toMatchObject({ name: 'Sam O', identities: [] });
   });
 
-  it('refuses to add a malformed address or the assistant’s own', async () => {
-    for (const email of ['not-an-email', 'AYA@example.test']) {
+  it('refuses to add a malformed address or the assistant’s own, in any spelling that reaches it', async () => {
+    for (const email of ['not-an-email', 'AYA@example.test', 'aya+x@example.test']) {
       expect(await run('principal-addresses-add', { email }), email).toMatchObject({ ok: false });
     }
     expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
+  });
+
+  it("refuses a dotted spelling of an assistant's Gmail address", async () => {
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'ayaassistant@gmail.com',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+    });
+
+    expect(await run('principal-addresses-add', { email: 'Aya.Assistant@gmail.com' })).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/assistant's own/i) },
+    });
+    expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
+  });
+
+  it('refuses another spelling of a listed address, naming the listed one, and holds the same spelling once', async () => {
+    expect(await run('principal-addresses-add', { email: 'morganellery@gmail.com' })).toMatchObject({ ok: true });
+
+    for (const email of ['Morgan.Ellery@gmail.com', 'morganellery+news@googlemail.com']) {
+      expect(await run('principal-addresses-add', { email }, agent(main.id)), email).toMatchObject({
+        ok: false,
+        error: {
+          message: expect.stringContaining(
+            "another spelling of morganellery@gmail.com, already one of the principal's",
+          ),
+        },
+      });
+    }
+    expect(await run('principal-addresses-add', { email: 'MorganEllery@gmail.com' })).toMatchObject({
+      ok: true,
+      data: { email: 'morganellery@gmail.com', added: false },
+    });
+    // Another domain matches by case alone, so a +tag there is an address of its own.
+    expect(await run('principal-addresses-add', { email: 'morgan+news@example.test' })).toMatchObject({
+      ok: true,
+      data: { added: true },
+    });
+    expect(await addresses()).toEqual([
+      'morgan+news@example.test',
+      'morgan@example.test',
+      'morgan@work.example.test',
+      'morganellery@gmail.com',
+    ]);
   });
 
   it('reports an address it does not hold on remove, and refuses to remove the last one', async () => {

@@ -4,12 +4,18 @@
  */
 import { describe, expect, it } from 'vitest';
 
+import { principalRecognizer } from '../gws-ea-profile/db.js';
 import { authenticateSender, type AuthContext } from './authentication.js';
 import type { MailHeader } from './mime.js';
 
 const PRINCIPAL = 'pat@principal.example';
 const CONTEXT: AuthContext = {
-  principalAddresses: new Set([PRINCIPAL, 'pat@home.example', 'pat.principal@gmail.com', 'pat@outlook.com']),
+  principalAddresses: principalRecognizer([
+    PRINCIPAL,
+    'pat@home.example',
+    'pat.principal@gmail.com',
+    'pat@outlook.com',
+  ]),
 };
 
 interface MessageOptions {
@@ -77,6 +83,40 @@ describe('the principal', () => {
     expect(
       authenticateSender(message({ from: `Pat <${address}>`, results: results(domain, selector) }), CONTEXT),
     ).toMatchObject({ kind: 'principal', address });
+  });
+
+  it.each([
+    ['dots, a +tag and capitals at Gmail', 'Pat.Principal+news@gmail.com', 'gmail.com'],
+    ['the googlemail spelling, signed by googlemail.com', 'PatPrincipal@googlemail.com', 'googlemail.com'],
+    ['capitals at another domain', 'Pat@Principal.Example', 'principal.example'],
+  ])('is recognized from %s, and named by the address as they listed it (AE1)', (_label, from, domain) => {
+    expect(
+      authenticateSender(message({ from: `Pat <${from}>`, results: results(domain, '20230601') }), CONTEXT),
+    ).toEqual({
+      kind: 'principal',
+      address: domain === 'principal.example' ? PRINCIPAL : 'pat.principal@gmail.com',
+      displayName: 'Pat',
+    });
+  });
+
+  it('checks the signature for the domain the From is written with', () => {
+    // A googlemail From is Gmail's, but only a googlemail.com signature aligns with it.
+    expect(
+      authenticateSender(
+        message({ from: 'Pat <patprincipal@googlemail.com>', results: results('gmail.com', '20230601') }),
+        CONTEXT,
+      ),
+    ).toMatchObject({ kind: 'unauthenticated', address: 'patprincipal@googlemail.com' });
+  });
+
+  it.each([
+    ['a +tag at another domain', 'pat+x@principal.example', 'principal.example'],
+    ['a subdomain of gmail.com', 'pat.principal@mail.gmail.com', 'mail.gmail.com'],
+    ['a domain that only begins with gmail.com', 'pat.principal@gmail.com.evil.example', 'gmail.com.evil.example'],
+  ])('takes %s, signed by its own domain, for an ordinary sender (R1)', (_label, address, domain) => {
+    expect(
+      authenticateSender(message({ from: `Pat <${address}>`, results: results(domain, 'google') }), CONTEXT),
+    ).toMatchObject({ kind: 'authenticated', address });
   });
 
   it('accepts a Sender equal to From', () => {
