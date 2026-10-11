@@ -111,7 +111,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * undefined; every other failure throws a `GoogleApiError`, with Google's
  * reason when its answer names one. With `ifMatch`,
  * a write applies only to the version of the resource that etag names, and
- * Google refuses it with 412 when the resource has changed since.
+ * Google refuses it with 412 when the resource has changed since. With
+ * `signal`, the call ends when it aborts instead of after 30 seconds, as a
+ * long-poll that Google may hold open longer needs.
  */
 export async function googleJson(
   options: GoogleClientOptions,
@@ -121,6 +123,7 @@ export async function googleJson(
     readonly body?: unknown;
     readonly allowNotFound?: boolean;
     readonly ifMatch?: string;
+    readonly signal?: AbortSignal;
   } = {},
 ): Promise<unknown> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
@@ -135,7 +138,7 @@ export async function googleJson(
         ...(init.ifMatch === undefined ? {} : { 'if-match': init.ifMatch }),
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
     throw new GoogleApiError(0, `Google could not be reached (${new URL(url).pathname})`, { cause: error });
