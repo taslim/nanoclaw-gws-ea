@@ -29,6 +29,13 @@ describe('a next look', () => {
     });
   });
 
+  it('allows a look four times a day on the days the clocks change', () => {
+    const cron = '0 0,6,12,18 * * *';
+    for (const now of [new Date('2027-03-13T12:00:00Z'), new Date('2026-10-31T12:00:00Z')]) {
+      expect(parseNextLook({ cron }, 'America/New_York', now)).toEqual({ kind: 'repeat', cron });
+    }
+  });
+
   it('is absent when neither kind is given', () => {
     expect(parseNextLook({}, LAGOS, NOW)).toBeUndefined();
   });
@@ -43,6 +50,9 @@ describe('a next look', () => {
     ['a cron expression with a sixth field', { cron: '0 0 9 * * 1' }, /five fields/],
     ['a cron expression for a date that never comes', { cron: '0 9 30 2 *' }, /is not a cron expression/],
     ['a cron expression that fires five times a day', { cron: '0 8,11,14,17,20 * * *' }, /more than 4 times a day/],
+    // NOW is a Saturday: the day after it holds no run, the Monday after holds nine.
+    ['a cron expression that fires hourly on weekdays', { cron: '0 9-17 * * 1-5' }, /more than 4 times a day/],
+    ['a cron expression that fires every five minutes on Mondays', { cron: '*/5 * * * 1' }, /more than 4 times a day/],
     ['a cron expression on two lines', { cron: '0 9 * *\n1' }, /must be one line/],
   ])('refuses %s', (_label, input, message) => {
     expect(() => parseNextLook(input, LAGOS, NOW)).toThrow(message);

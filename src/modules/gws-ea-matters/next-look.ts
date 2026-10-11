@@ -24,7 +24,7 @@ export interface NextLookInput {
 const DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$/u;
 const LOOK_MAX_LENGTH = 40;
 const CRON_MAX_LENGTH = 120;
-const DAY_MS = 24 * 60 * 60 * 1000;
+const YEAR_MS = 366 * 24 * 60 * 60 * 1000;
 
 function notATime(value: string): Error {
   return new Error(
@@ -69,7 +69,10 @@ function nextRun(interval: CronExpression, cron: string): number {
  * A repeating look comes back at most as often as core lets a task repeat
  * without a gate. Core lets a task with a script repeat faster because the
  * script can skip a run; a look's script wakes `main` whenever its matter
- * is open, so the limit holds for looks too.
+ * is open, so the limit holds for looks too. It holds on every day of the
+ * year ahead, counted on the principal's calendar, so a cron that comes back
+ * often only on weekdays is refused on a Saturday too, and one that comes
+ * back four times a day stays allowed on the day the clocks change.
  */
 function repeating(value: string, timezone: string, now: Date): NextLook {
   if (value.length > CRON_MAX_LENGTH || hasControlCharacters(value)) {
@@ -89,15 +92,23 @@ function repeating(value: string, timezone: string, now: Date): NextLook {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`--look-cron ${JSON.stringify(cron)} is not a cron expression: ${reason}`, { cause: error });
   }
-  const horizon = now.getTime() + DAY_MS;
-  let fires = 0;
+  const horizon = now.getTime() + YEAR_MS;
+  const dayOf = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const firesOn = new Map<string, number>();
   for (let run = nextRun(interval, cron); run <= horizon; run = nextRun(interval, cron)) {
-    fires += 1;
+    const day = dayOf.format(run);
+    const fires = (firesOn.get(day) ?? 0) + 1;
     if (fires > MAX_DAILY_FIRES) {
       throw new Error(
         `--look-cron ${JSON.stringify(cron)} would come back more than ${MAX_DAILY_FIRES} times a day: set a one-off --look for what needs a closer eye`,
       );
     }
+    firesOn.set(day, fires);
   }
   return { kind: 'repeat', cron };
 }
