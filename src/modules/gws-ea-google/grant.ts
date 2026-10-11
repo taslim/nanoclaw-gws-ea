@@ -2,8 +2,8 @@
  * The assistant's one Google sign-in (KTD2), shared by the control plane,
  * which writes it at setup, and the host, which refreshes it. The grant file
  * holds the OAuth client, the refresh token, the scopes Google granted, and
- * the account; it lives in the instance's owner-only `secrets/` directory and
- * never in a container.
+ * the account with its Google ID; it lives in the instance's owner-only
+ * `secrets/` directory and never in a container.
  */
 import { canonicalTimestamp, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 
@@ -110,12 +110,31 @@ export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleC
  * The host's Drive token keeps the home folder, checks links, and enriches
  * activity notices; it has the scope agents' `www.googleapis.com` token
  * carries, so it keeps a token out of the gateway but is no privilege
- * boundary.
+ * boundary. The same holds for the host's directory token, which names the
+ * people the assistant meets in Chat.
+ *
+ * Chat is the host's alone: it is how the assistant talks, as its own account,
+ * so no agent holds a Chat scope. Its token carries the narrowest scopes
+ * covering what the host does there: `chat.messages` sends, reads, and edits
+ * messages, adds, lists, and removes reactions, downloads attachments, and is
+ * the scope the Workspace Events subscription to message and reaction events
+ * rests on; `chat.spaces.readonly` reads a space and finds a DM;
+ * `chat.spaces.create` opens one; and `chat.memberships.readonly` reads who
+ * is in a space.
  */
 export const HOST_GOOGLE_SERVICES = {
   gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
   'calendar-host': { scopes: AGENT_GOOGLE_SERVICES.calendar.scopes },
   'drive-host': { scopes: AGENT_GOOGLE_SERVICES.drive.scopes },
+  chat: {
+    scopes: [
+      'https://www.googleapis.com/auth/chat.messages',
+      'https://www.googleapis.com/auth/chat.spaces.readonly',
+      'https://www.googleapis.com/auth/chat.spaces.create',
+      'https://www.googleapis.com/auth/chat.memberships.readonly',
+    ],
+  },
+  'directory-host': { scopes: AGENT_GOOGLE_SERVICES.directory.scopes },
 } as const satisfies Record<string, GoogleServiceScopes>;
 
 export type HostGoogleServiceId = keyof typeof HOST_GOOGLE_SERVICES;
@@ -175,18 +194,20 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
 /**
  * What the sign-in asks for beyond its services' scopes. The grant never
  * leaves the host and is the assistant's own account, so the sign-in lists
- * every scope of each supported product that could be handed to an agent: a
- * new capability or a narrower agent then needs no new sign-in, and each
- * token still carries only what its services want. Each scope is listed by
- * name because Google mints only scopes the grant lists, even when a broader
- * granted scope covers them: checked live on 2026-10-10, a refresh for
- * `calendar.events.readonly` from a grant holding `calendar.events` was
- * refused as `invalid_scope`. Left out are add-on scopes, which apply only
- * inside a Workspace add-on; app-scoped ones (`drive.file`, `drive.appdata`,
- * `drive.appfolder`, `drive.install`, `drive.apps.readonly`,
- * `calendar.app.created`), which cannot tell agents apart because every agent
- * shares one OAuth client; and admin and Apps Script scopes, which lie outside
- * the products.
+ * every scope of each supported product that could be handed to an agent or
+ * to the host: a new capability or a narrower token then needs no new
+ * sign-in, and each token still carries only what its services want. Each
+ * scope is listed by name because Google mints only scopes the grant lists,
+ * even when a broader granted scope covers them: checked live on 2026-10-10,
+ * a refresh for `calendar.events.readonly` from a grant holding
+ * `calendar.events` was refused as `invalid_scope`. Left out are add-on
+ * scopes, which apply only inside a Workspace add-on; app-scoped ones
+ * (`drive.file`, `drive.appdata`, `drive.appfolder`, `drive.install`,
+ * `drive.apps.readonly`, `calendar.app.created`), which cannot tell agents
+ * apart because every agent shares one OAuth client; Chat's app scopes
+ * (`chat.bot`, `chat.app.*`), which only a Chat app's service account holds,
+ * and `chat.import`, which only an app with domain-wide delegation can use;
+ * and admin and Apps Script scopes, which lie outside the products.
  */
 const SIGN_IN_CEILING: readonly string[] = [
   'https://www.googleapis.com/auth/calendar',
@@ -234,6 +255,26 @@ const SIGN_IN_CEILING: readonly string[] = [
   'https://www.googleapis.com/auth/forms.body.readonly',
   'https://www.googleapis.com/auth/forms.responses.readonly',
   'https://www.googleapis.com/auth/directory.readonly',
+  'https://www.googleapis.com/auth/chat.spaces',
+  'https://www.googleapis.com/auth/chat.spaces.readonly',
+  'https://www.googleapis.com/auth/chat.spaces.create',
+  'https://www.googleapis.com/auth/chat.delete',
+  'https://www.googleapis.com/auth/chat.memberships',
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
+  'https://www.googleapis.com/auth/chat.memberships.app',
+  'https://www.googleapis.com/auth/chat.messages',
+  'https://www.googleapis.com/auth/chat.messages.readonly',
+  'https://www.googleapis.com/auth/chat.messages.create',
+  'https://www.googleapis.com/auth/chat.messages.reactions',
+  'https://www.googleapis.com/auth/chat.messages.reactions.readonly',
+  'https://www.googleapis.com/auth/chat.messages.reactions.create',
+  'https://www.googleapis.com/auth/chat.users.readstate',
+  'https://www.googleapis.com/auth/chat.users.readstate.readonly',
+  'https://www.googleapis.com/auth/chat.users.spacesettings',
+  'https://www.googleapis.com/auth/chat.users.sections',
+  'https://www.googleapis.com/auth/chat.users.sections.readonly',
+  'https://www.googleapis.com/auth/chat.customemojis',
+  'https://www.googleapis.com/auth/chat.customemojis.readonly',
 ];
 
 /**
@@ -262,12 +303,22 @@ export function missingGoogleScopes(granted: readonly string[]): string[] {
   return GOOGLE_SIGN_IN_SCOPES.filter((scope) => !(IDENTITY_SCOPE_FORMS[scope] ?? [scope]).some((f) => held.has(f)));
 }
 
-export const GOOGLE_GRANT_SCHEMA_VERSION = 1 as const;
+export const GOOGLE_GRANT_SCHEMA_VERSION = 2 as const;
+
+/**
+ * Google's ID for an account, the OpenID `sub`: the number Chat names the
+ * account by (`users/{sub}`) and the People API by (`people/{sub}`).
+ */
+export function isGoogleAccountId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9]{1,255}$/u.test(value);
+}
 
 export interface GoogleGrant {
   readonly schema_version: typeof GOOGLE_GRANT_SCHEMA_VERSION;
   /** The signed-in account, lowercased: the assistant's own Workspace address. */
   readonly account: string;
+  /** The signed-in account's Google ID, by which Chat knows the assistant as `users/{sub}`. */
+  readonly sub: string;
   readonly client_id: string;
   readonly client_secret: string;
   readonly refresh_token: string;
@@ -302,9 +353,11 @@ export function parseGoogleGrant(value: unknown): GoogleGrant {
   if (!Array.isArray(scopes) || scopes.length === 0) throw new Error('Google grant scopes are invalid');
   const grantedAt = requireText(value.granted_at, 'time', 64);
   if (canonicalTimestamp(grantedAt) === undefined) throw new Error('Google grant time is invalid');
+  if (!isGoogleAccountId(value.sub)) throw new Error('Google grant account ID is invalid');
   return {
     schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
     account: requireText(value.account, 'account', 254).toLowerCase(),
+    sub: value.sub,
     client_id: requireText(value.client_id, 'client ID', 512),
     client_secret: requireText(value.client_secret, 'client secret', 512),
     refresh_token: requireText(value.refresh_token, 'refresh token'),

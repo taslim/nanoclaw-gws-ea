@@ -120,9 +120,20 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       instance?: string,
       status?: string,
       statusKind?: 'auto' | 'agent',
+      anchor?: string,
     ): Promise<void> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
-      await adapter?.setTyping?.(platformId, threadId, status, statusKind);
+      await adapter?.setTyping?.(platformId, threadId, status, statusKind, anchor);
+    },
+    async endTyping(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      anchor: string,
+      instance?: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      await adapter?.endTyping?.(platformId, threadId, anchor);
     },
   };
 }

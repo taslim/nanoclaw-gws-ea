@@ -7,7 +7,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { isErrno } from '../community-portal/errors.js';
 import type { ForgottenFingerprint } from '../modules/gws-ea-people/forget-handoff.js';
 import type { SnapshotManifest } from './operation.js';
-import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
+import { principalWelcomeEventId, type PrincipalBinding } from './principal.js';
 import { redact } from './redact.js';
 import { hostLogFiles, type InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
@@ -89,9 +89,8 @@ interface PrincipalBindingRow {
 export interface PrincipalBindingVerificationInput {
   readonly runtime: Pick<InstanceRuntimeConfig, 'state_root' | 'instance_id'>;
   readonly adapterInstance: string;
+  /** Only a principal bound since provisioning began counts. */
   readonly provisioningStartedAt: string;
-  readonly selectedMessagingGroupId?: string;
-  readonly selectedCandidate?: PrincipalCandidate;
 }
 
 export type PrincipalBindingVerificationResult =
@@ -99,7 +98,7 @@ export type PrincipalBindingVerificationResult =
   | {
       readonly status: 'matched';
       readonly agentGroupId: string;
-      readonly candidate: PrincipalCandidate;
+      readonly principal: PrincipalBinding;
       readonly welcomeEventId: string;
     };
 
@@ -186,21 +185,13 @@ function openReadonly(file: string): Database.Database {
 
 /**
  * Read the authoritative principal binding and queued bootstrap welcome without
- * invoking the mutating bootstrap command. This is the bind phase postcondition.
+ * invoking the mutating bootstrap command. This is the bind phase postcondition:
+ * exactly one Google Chat principal bound since provisioning began, with the
+ * DM the assistant opened wired to main, and main's welcome queued there.
  */
 export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput): PrincipalBindingVerificationResult {
   const adapterInstance = safeIdentifier(input.adapterInstance, 'adapter instance');
   const provisioningStartedAt = timestamp(input.provisioningStartedAt, 'provisioning timestamp');
-  const candidate = input.selectedCandidate;
-  if (!candidate || candidate.authenticatedMessageAt < provisioningStartedAt) return { status: 'absent' };
-  const selectedMessagingGroupId = input.selectedMessagingGroupId;
-  if (selectedMessagingGroupId !== undefined) safeIdentifier(selectedMessagingGroupId, 'messaging group ID');
-  if (selectedMessagingGroupId !== undefined && selectedMessagingGroupId !== candidate.messagingGroupId) {
-    throw new GwsEaError(
-      'principal_selection_mismatch',
-      'Principal selection does not match the requested conversation',
-    );
-  }
   const stateRoot = path.resolve(input.runtime.state_root);
   const central = openReadonly(path.join(stateRoot, 'data', 'v2.db'));
   let row: PrincipalBindingRow | undefined;
@@ -213,39 +204,28 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
                 pu.verified_at,
                 mg.id AS messaging_group_id,
                 mg.platform_id
-           FROM gws_ea_profile p
-           JOIN gws_ea_principal_users pu ON pu.user_id = ?
+           FROM gws_ea_principal_users pu
            JOIN user_dms ud ON ud.user_id = pu.user_id AND ud.channel_type = ?
            JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+           JOIN gws_ea_profile p ON p.singleton = 1
            JOIN messaging_group_agents mga
              ON mga.messaging_group_id = mg.id AND mga.agent_group_id = p.main_agent_group_id
            JOIN agent_group_members member
              ON member.user_id = pu.user_id AND member.agent_group_id = p.main_agent_group_id
-          WHERE p.singleton = 1
-            -- A global role's NULL group escapes the key, so a retried grant can repeat the owner row.
-            AND EXISTS (
+          -- A global role's NULL group escapes the key, so a retried grant can repeat the owner row.
+          WHERE EXISTS (
               SELECT 1 FROM user_roles owner
                WHERE owner.user_id = pu.user_id AND owner.role = 'owner' AND owner.agent_group_id IS NULL
             )
             AND p.main_agent_group_id IS NOT NULL
             AND mg.channel_type = ?
             AND mg.instance = ?
-            AND mg.id = ?
-            AND mg.platform_id = ?
             AND mg.is_group = 0
             AND mga.sender_scope = 'known'
             AND mga.session_mode = 'agent-shared'
-            AND pu.verified_at = ?`,
+            AND pu.verified_at >= ?`,
       )
-      .all(
-        candidate.userId,
-        GCHAT_CHANNEL_TYPE,
-        GCHAT_CHANNEL_TYPE,
-        adapterInstance,
-        candidate.messagingGroupId,
-        candidate.platformId,
-        candidate.authenticatedMessageAt,
-      ) as PrincipalBindingRow[];
+      .all(GCHAT_CHANNEL_TYPE, GCHAT_CHANNEL_TYPE, adapterInstance, provisioningStartedAt) as PrincipalBindingRow[];
     if (rows.length !== 1) return { status: 'absent' };
     [row] = rows;
     sessionId = mainSessionId(central, row.main_agent_group_id);
@@ -254,7 +234,13 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
   }
 
   if (!row || !sessionId) return { status: 'absent' };
-  const welcomeEventId = principalWelcomeEventId(input.runtime, row.main_agent_group_id, candidate);
+  const principal: PrincipalBinding = {
+    userId: row.user_id,
+    messagingGroupId: row.messaging_group_id,
+    platformId: row.platform_id,
+    boundAt: row.verified_at,
+  };
+  const welcomeEventId = principalWelcomeEventId(input.runtime, row.main_agent_group_id, principal);
   const inbound = openReadonly(
     path.join(stateRoot, 'data', 'v2-sessions', row.main_agent_group_id, sessionId, 'inbound.db'),
   );
@@ -265,17 +251,12 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
           WHERE id = ? AND timestamp >= ? AND channel_type = ? AND platform_id = ?
             AND kind IN ('chat', 'chat-sdk') AND trigger = 1`,
       )
-      .get(
-        `${welcomeEventId}:${row.main_agent_group_id}`,
-        candidate.authenticatedMessageAt,
-        GCHAT_CHANNEL_TYPE,
-        row.platform_id,
-      );
+      .get(`${welcomeEventId}:${row.main_agent_group_id}`, principal.boundAt, GCHAT_CHANNEL_TYPE, principal.platformId);
     if (!welcome) return { status: 'absent' };
   } finally {
     inbound.close();
   }
-  return { status: 'matched', agentGroupId: row.main_agent_group_id, candidate, welcomeEventId };
+  return { status: 'matched', agentGroupId: row.main_agent_group_id, principal, welcomeEventId };
 }
 
 function exactDeliveredReply(

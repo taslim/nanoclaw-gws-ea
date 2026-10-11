@@ -1,6 +1,6 @@
 /**
- * gws-ea's version pins: the OneCLI gateway and the cloudflared image. They
- * live in `src/gws-ea/versions.json`, outside the upstream-owned root
+ * gws-ea's version pin: the OneCLI gateway. It lives in
+ * `src/gws-ea/versions.json`, outside the upstream-owned root
  * `versions.json`. A release carries its own copy, from which release
  * preflight reads the gateway its receipt records.
  */
@@ -12,17 +12,14 @@ import { GwsEaError } from './types.js';
 import { requireRecord } from './validation.js';
 
 export const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
-const CLOUDFLARED_IMAGE_PATTERN = /^cloudflare\/cloudflared:\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?@sha256:[0-9a-f]{64}$/u;
 
 export interface GwsEaPins {
   readonly onecliGateway: string;
-  readonly cloudflaredImage: string;
 }
 
 /** What each pin is called where an operator reads it. */
 export const PIN_NAMES: Readonly<Record<keyof GwsEaPins, string>> = {
   onecliGateway: 'OneCLI gateway',
-  cloudflaredImage: 'cloudflared image',
 };
 
 export function exactVersion(value: unknown, label: string): string {
@@ -32,27 +29,15 @@ export function exactVersion(value: unknown, label: string): string {
   return value;
 }
 
-export function validateCloudflaredImagePin(value: unknown): string {
-  if (typeof value !== 'string' || !CLOUDFLARED_IMAGE_PATTERN.test(value)) {
-    throw new GwsEaError(
-      'invalid_release_pin',
-      'cloudflared must be pinned to an exact version and immutable sha256 manifest digest',
-    );
-  }
-  return value;
-}
-
 export function parsePins(value: unknown, label = 'gws-ea versions.json'): GwsEaPins {
   const pins = requireRecord(value, label, 'invalid_release_pin');
   return {
     onecliGateway: exactVersion(pins['onecli-gateway'], PIN_NAMES.onecliGateway),
-    cloudflaredImage: validateCloudflaredImagePin(pins.cloudflared),
   };
 }
 
 export const LAUNCHER_PINS = parsePins(launcherPins);
 export const ONECLI_GATEWAY_VERSION = LAUNCHER_PINS.onecliGateway;
-export const CLOUDFLARED_IMAGE = LAUNCHER_PINS.cloudflaredImage;
 
 /** The OneCLI SDK is pinned by the checkout's own package.json. */
 const packageManifest: unknown = createRequire(import.meta.url)('../../package.json');

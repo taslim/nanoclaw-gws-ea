@@ -16,16 +16,21 @@ import {
   LinkButton,
   type CardChild,
   type Adapter,
+  type AdapterPostableMessage,
   type AssistantContextChangedEvent,
   type AssistantThreadStartedEvent,
+  type Author,
   type ConcurrencyStrategy,
+  type EmojiValue,
   type Message as ChatMessage,
+  type StateAdapter,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
-import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import { approveRejectRequest, normalizeOptions, type NormalizedOption } from './ask-question.js';
+import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import { createAnswers, indexPostedRequest, POSTED_REQUEST_KEPT_MS, type Answers } from './answers.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
 
@@ -48,6 +53,81 @@ interface ConnectionAwareAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+  /** The platform's id for the message replied to, when the platform names it. */
+  id?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Reactions an adapter reads itself
+// ---------------------------------------------------------------------------
+
+/** A reaction someone placed on a message, as an adapter read it from its platform. */
+export interface InboundReaction {
+  /** The reaction's own id, the same each time the platform delivers it. */
+  readonly reactionName: string;
+  readonly emoji: EmojiValue;
+  /** Who reacted. */
+  readonly user: Author;
+  /** The message reacted to, read as an inbound message is: `author.isMe` marks the assistant's own. */
+  readonly message: ChatMessage;
+  /** The SDK thread of the message reacted to. */
+  readonly threadId: string;
+  readonly reactedAt: Date;
+}
+
+/**
+ * An adapter that reads its platform's reactions itself and hands each one to
+ * the bridge, awaiting the promise: it resolves once the reaction is routed
+ * and rejects when routing fails, so a platform that redelivers hands the
+ * reaction over again. The SDK's own reaction dispatch is fire-and-forget,
+ * which such a platform cannot use. The adapter drops its own reactions.
+ */
+export interface ReactionSource {
+  readonly setReactionHandler: (handler: (reaction: InboundReaction) => Promise<void>) => void;
+}
+
+function isReactionSource(adapter: Adapter): adapter is Adapter & ReactionSource {
+  return typeof (adapter as Partial<ReactionSource>).setReactionHandler === 'function';
+}
+
+// ---------------------------------------------------------------------------
+// A working mark on the message a turn works on
+// ---------------------------------------------------------------------------
+
+/**
+ * An adapter that marks the message a turn works on while the turn runs, as
+ * the Google Chat assistant's 👀 does. The bridge hands it each typing pulse
+ * that carries an anchor (ChannelAdapter.setTyping) and each anchor's end
+ * (ChannelAdapter.endTyping); the adapter decides when to show its mark.
+ */
+export interface WorkingIndicator {
+  /** A turn is working on the message: called on every typing pulse that names it. */
+  readonly workingOn: (threadId: string, messageId: string) => Promise<void>;
+  /** The work on the message ended; the mark comes off. */
+  readonly endWorking: (threadId: string, messageId: string) => Promise<void>;
+}
+
+function isWorkingIndicator(adapter: Adapter): adapter is Adapter & WorkingIndicator {
+  const candidate = adapter as Partial<WorkingIndicator>;
+  return typeof candidate.workingOn === 'function' && typeof candidate.endWorking === 'function';
+}
+
+/** How much of the message reacted to the agent sees with the reaction. */
+const REACTION_EXCERPT_CHARS = 200;
+
+function excerpt(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length <= REACTION_EXCERPT_CHARS ? trimmed : `${trimmed.slice(0, REACTION_EXCERPT_CHARS - 1)}…`;
+}
+
+/** The sender identity the platform transport asserts for an SDK author, never parsed from content. */
+function authenticatedSenderOf(author: Author): AuthenticatedSender | undefined {
+  if (typeof author.userId !== 'string' || author.userId.length === 0) return undefined;
+  return {
+    userId: author.userId,
+    displayName: author.fullName || author.userName || undefined,
+    kind: author.isBot === false ? 'human' : author.isBot === true ? 'bot' : 'unknown',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +425,12 @@ export interface ChatSdkBridgeConfig {
    */
   extractRawText?: RawTextExtractor;
   /**
+   * The platform may deliver a message again after the adapter handed it on,
+   * under the same message id: each inbound is marked `deduplicate`, so the
+   * router drops a copy already queued (InboundMessage.deduplicate).
+   */
+  redelivers?: boolean;
+  /**
    * Whether this platform uses threads as the primary conversation unit.
    * See `ChannelAdapter.supportsThreads`. Declared by the calling channel
    * skill, not inferred, because some platforms (Discord) can be used either
@@ -372,6 +458,129 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * The platform shows this account no cards (Google Chat under user
+   * authentication), so requests are text. A question or approval request
+   * posts as its title, the question, and how to answer it in words, with no
+   * codes; a display card posts as text with its links. Every request is
+   * left as posted until the handler that resolves an answer edits it to its
+   * outcome: the bridge never edits one itself. Each request it posts is
+   * recorded by its message, by its question (readPostedRequest), and in its
+   * conversation, so an answer and the handler's edit both find it. A reply
+   * or reaction that answers a request (src/channels/answers.ts) goes to its
+   * handler through onAction instead of to the agent. Unset, requests post
+   * as cards.
+   */
+  textRequests?: {
+    /** When the platform recorded a message the adapter posted, read from postMessage's raw response. */
+    readonly postedAt: (raw: unknown) => Date | undefined;
+  };
+}
+
+/** A request the bridge posted as text (ChatSdkBridgeConfig.textRequests). */
+export interface PostedRequest {
+  /** The question id of its pending row. */
+  readonly questionId: string;
+  /** The conversation it was posted in, as the bridge's platform id. */
+  readonly platformId: string;
+  /** When the platform recorded it, as ISO-8601; absent when the platform reported no time. */
+  readonly postedAt?: string;
+}
+
+function postedRequestKey(adapterName: string, messageId: string): string {
+  return `text-request:${adapterName}:message:${messageId}`;
+}
+
+function requestMessageKey(adapterName: string, questionId: string): string {
+  return `text-request:${adapterName}:question:${questionId}`;
+}
+
+/** The request the bridge posted as this message, while it takes answers. */
+export async function readPostedRequest(
+  state: StateAdapter,
+  adapterName: string,
+  messageId: string,
+): Promise<PostedRequest | undefined> {
+  return (await state.get<PostedRequest>(postedRequestKey(adapterName, messageId))) ?? undefined;
+}
+
+/**
+ * How a request asks for its answer in words. An approve/reject request is
+ * answered yes or no, by a quote or 👍/👎, with the reason after the no when
+ * its rejection takes one; any other request lists its options by number.
+ */
+function howToAnswer(options: readonly NormalizedOption[]): string {
+  const approval = approveRejectRequest(options);
+  if (approval) {
+    const yesOrNo = 'Quote this message with yes or no, or react 👍 or 👎.';
+    return approval.takesReason ? `${yesOrNo} To say why, quote it with no and your reason.` : yesOrNo;
+  }
+  if (options.length === 0) return '';
+  const list = options.map((option, index) => `${index + 1}. ${option.label}`).join('\n');
+  return `${list}\n\nQuote this message with the number or name of your choice.`;
+}
+
+/** A question or approval request as text: its title, the question, and how to answer it. */
+function textRequest(title: string, question: string, options: readonly NormalizedOption[]): string {
+  return [`**${title}**`, question, howToAnswer(options)].filter(Boolean).join('\n\n');
+}
+
+/** An answered request as text: what was asked, and its outcome where the answer was asked for. */
+function textOutcome({ title, question, resolution }: TerminalApprovalCard): string {
+  return [`**${title}**`, question, resolution].filter(Boolean).join('\n\n');
+}
+
+/** A display card's content (send_card), as both of its renderings read it. */
+interface DisplayCard {
+  readonly title: string;
+  /** Its description, then each text child. */
+  readonly texts: readonly string[];
+  readonly links: ReadonlyArray<{ label: string; url: string; style?: 'primary' | 'danger' | 'default' }>;
+}
+
+/**
+ * Read a display card. Non-URL actions are dropped: send_card's contract is
+ * fire-and-forget, so a callback button would have nowhere to land. The
+ * runner filters actions against LINK_ACTION_SCHEMA before writing the row;
+ * the checks here still stand because any producer can write this payload.
+ */
+function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
+  const texts: string[] = [];
+  if (typeof spec.description === 'string' && spec.description) texts.push(spec.description);
+  if (Array.isArray(spec.children)) {
+    for (const child of spec.children) {
+      if (typeof child === 'string' && child) {
+        texts.push(child);
+      } else if (child && typeof child === 'object' && typeof (child as Record<string, unknown>).text === 'string') {
+        texts.push((child as Record<string, string>).text);
+      }
+    }
+  }
+  const links = Array.isArray(spec.actions)
+    ? (spec.actions as Array<Record<string, unknown> | null | undefined>)
+        .filter(
+          (a): a is Record<string, unknown> =>
+            !!a &&
+            typeof a === 'object' &&
+            typeof a.url === 'string' &&
+            !!a.url &&
+            typeof a.label === 'string' &&
+            !!a.label,
+        )
+        .map((a) => {
+          const style = a.style;
+          const safeStyle: 'primary' | 'danger' | 'default' | undefined =
+            style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
+          return { label: a.label as string, url: a.url as string, style: safeStyle };
+        })
+    : [];
+  return { title: (spec.title as string) || '', texts, links };
+}
+
+/** A display card as text: its title, its texts, and each link by its label. */
+function textDisplayCard({ title, texts, links }: DisplayCard): string {
+  const linkLines = links.map((link) => `[${link.label}](${link.url})`).join('\n');
+  return [title ? `**${title}**` : '', ...texts, linkLines].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -426,6 +635,24 @@ function terminalApprovalMessage(spec: TerminalApprovalCard) {
   };
 }
 
+function isTerminalCard(card: Partial<TerminalApprovalCard> | undefined): card is TerminalApprovalCard {
+  return (
+    card !== undefined &&
+    typeof card.title === 'string' &&
+    typeof card.question === 'string' &&
+    typeof card.resolution === 'string'
+  );
+}
+
+/**
+ * Hand a click to the host without holding the platform's interaction on the
+ * answer's handler. The host logs a handler that fails, and a click is never
+ * delivered again, so nothing here waits on it.
+ */
+function handOnClick(setup: ChannelSetup, ...click: Parameters<ChannelSetup['onAction']>): void {
+  void Promise.resolve(setup.onAction(...click)).catch(() => {});
+}
+
 export function splitForLimit(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -477,10 +704,99 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   /** Registry/routing key for this bridge — also the app-context cache
    *  namespace. Default instances key by the platform name. */
   const instanceKey = config.instance ?? adapter.name;
+  /** The adapter's working mark, when it shows one. */
+  const working = isWorkingIndicator(adapter) ? adapter : undefined;
+  /** Set when requests are text on this platform (ChatSdkBridgeConfig.textRequests). */
+  const textRequests = config.textRequests;
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
+  /** Takes answers in words, when requests are text. */
+  let answers: Answers | undefined;
   let gatewayAbort: AbortController | null = null;
+
+  /** Post a request; when requests are text, remember it, so an answer and its outcome find it. */
+  async function postRequest(
+    tid: string,
+    platformId: string,
+    questionId: string,
+    message: AdapterPostableMessage,
+  ): Promise<string | undefined> {
+    const result = await adapter.postMessage(tid, message);
+    if (textRequests && result?.id) {
+      const at = textRequests.postedAt(result.raw);
+      const request: PostedRequest = {
+        questionId,
+        platformId,
+        ...(at !== undefined && !Number.isNaN(at.getTime()) ? { postedAt: at.toISOString() } : {}),
+      };
+      await state.set(postedRequestKey(adapter.name, result.id), request, POSTED_REQUEST_KEPT_MS);
+      await state.set(requestMessageKey(adapter.name, questionId), result.id, POSTED_REQUEST_KEPT_MS);
+      await indexPostedRequest(state, adapter.name, platformId, result.id, request.postedAt);
+    }
+    return result?.id;
+  }
+
+  /**
+   * Whether a message answered a request, which then goes to the request's
+   * handler and is not routed. Only when requests are text; a handler that
+   * fails rejects, so the platform delivers the message again.
+   */
+  async function answeredBy(message: ChatMessage, threadId: string, isDM: boolean): Promise<boolean> {
+    if (!answers) return false;
+    const quote = config.extractReplyContext && message.raw ? config.extractReplyContext(message.raw) : null;
+    return answers.takeMessage({
+      id: message.id,
+      platformId: adapter.channelIdFromThreadId(threadId),
+      userId: message.author.userId,
+      isMe: message.author.isMe === true,
+      isDM,
+      at: message.metadata.dateSent,
+      text: message.text,
+      ...(quote === null ? {} : { quote: quote.id === undefined ? {} : { messageId: quote.id } }),
+    });
+  }
+
+  /**
+   * The message an outcome for this question goes on: the one the handler
+   * named, when this question was posted as it, or else the question's
+   * newest posting.
+   */
+  async function requestMessage(questionId: string, named: string | undefined): Promise<string | undefined> {
+    if (named !== undefined && (await readPostedRequest(state, adapter.name, named))?.questionId === questionId) {
+      return named;
+    }
+    return (await state.get<string>(requestMessageKey(adapter.name, questionId))) ?? named;
+  }
+
+  /**
+   * Edit a request posted as text to the outcome its handler sent, addressed
+   * by its question id. Showing its outcome, the message takes no answer
+   * after this.
+   */
+  async function editRequestOutcome(tid: string, questionId: string, content: Record<string, unknown>): Promise<void> {
+    const messageId = await requestMessage(
+      questionId,
+      typeof content.messageId === 'string' ? content.messageId : undefined,
+    );
+    if (messageId === undefined) {
+      log.warn('No posted request to show its outcome on', { questionId });
+      return;
+    }
+    const terminal = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
+    const render = await resolveQuestionRender(questionId);
+    const outcome: AdapterPostableMessage =
+      render?.renderTerminal && typeof terminal?.resolution === 'string'
+        ? render.renderTerminal(terminal.resolution)
+        : isTerminalCard(terminal)
+          ? { markdown: transformText(textOutcome(terminal)) }
+          : { markdown: transformText((content.text as string) || (content.markdown as string) || '') };
+    await adapter.editMessage(tid, messageId, outcome);
+    await state.delete(postedRequestKey(adapter.name, messageId));
+    if ((await state.get<string>(requestMessageKey(adapter.name, questionId))) === messageId) {
+      await state.delete(requestMessageKey(adapter.name, questionId));
+    }
+  }
 
   async function messageToInbound(
     message: ChatMessage,
@@ -549,14 +865,45 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       timestamp: message.metadata.dateSent.toISOString(),
       isMention,
       isGroup,
-      authenticatedSender:
-        typeof message.author.userId === 'string' && message.author.userId.length > 0
-          ? {
-              userId: message.author.userId,
-              displayName: message.author.fullName || message.author.userName || undefined,
-              kind: message.author.isBot === false ? 'human' : message.author.isBot === true ? 'bot' : 'unknown',
-            }
-          : undefined,
+      authenticatedSender: authenticatedSenderOf(message.author),
+      ...(config.redelivers === true ? { deduplicate: true } : {}),
+    };
+  }
+
+  /**
+   * A reaction as the router takes it (InboundMessage.reaction): its own id,
+   * so a redelivery is dropped, and quiet unless it is on the assistant's own
+   * message. Its content names who reacted, the emoji by the name
+   * add_reaction takes, and the message reacted to as an excerpt; it carries
+   * no text, so nothing reads it as something written.
+   */
+  function reactionToInbound(reaction: InboundReaction, isGroup: boolean | undefined): InboundMessage {
+    const reactor = reaction.user.fullName || reaction.user.userName || reaction.user.userId;
+    const target = reaction.message.author;
+    const self = target.isMe === true;
+    return {
+      id: reaction.reactionName,
+      kind: 'chat-sdk',
+      content: {
+        sender: reactor,
+        senderId: reaction.user.userId,
+        senderName: reactor,
+        reaction: {
+          emoji: reaction.emoji.name,
+          target: {
+            self,
+            sender: target.fullName || target.userName || target.userId,
+            excerpt: excerpt(reaction.message.text),
+          },
+        },
+      },
+      timestamp: reaction.reactedAt.toISOString(),
+      isMention: false,
+      isGroup,
+      authenticatedSender: authenticatedSenderOf(reaction.user),
+      reaction: true,
+      ...(self ? {} : { quiet: true }),
+      ...(config.redelivers === true ? { deduplicate: true } : {}),
     };
   }
 
@@ -582,6 +929,25 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // keyspace — prefixing the default would orphan every live install's
       // chat_sdk_subscriptions/kv/locks/lists rows.
       state = new SqliteStateAdapter(config.instance && config.instance !== adapter.name ? config.instance : undefined);
+      if (textRequests) {
+        answers = createAnswers({
+          state,
+          adapterName: adapter.name,
+          postedRequest: (messageId) => readPostedRequest(state, adapter.name, messageId),
+          render: resolveQuestionRender,
+          // The answering conversation and the request's message, so a durable gateway hold checks its own address.
+          dispatch: async (answer) => {
+            await setupConfig.onAction(
+              answer.questionId,
+              answer.value,
+              answer.userId,
+              { instance: instanceKey, messageId: answer.messageId, platformId: answer.platformId },
+              { deferResolution: true, ...(answer.reason === undefined ? {} : { reason: answer.reason }) },
+            );
+          },
+          ...(adapter.userName ? { selfMention: `@${adapter.userName}` } : {}),
+        });
+      }
 
       chat = new Chat({
         adapters: { [adapter.name]: adapter },
@@ -602,6 +968,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(
           channelId,
@@ -612,6 +979,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
       });
@@ -630,6 +998,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
+        if (await answeredBy(message, thread.id, true)) return;
         const inbound = await messageToInbound(message, true, false);
         // Agent-mode app context: DM-only by platform design.
         attachAppContext(
@@ -654,6 +1023,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
       });
@@ -705,12 +1075,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
         const selectedOption = resolveSelectedOption(render, event.value, tail);
-        if (render?.deferResolution) {
-          setupConfig.onAction(questionId, selectedOption, userId, {
-            instance: instanceKey,
-            messageId: event.messageId,
-            platformId: adapter.channelIdFromThreadId(event.threadId),
-          });
+        const address = {
+          instance: instanceKey,
+          messageId: event.messageId,
+          platformId: adapter.channelIdFromThreadId(event.threadId),
+        };
+        // The handler that authorizes the answer shows its outcome: a
+        // presentation that defers resolution asks for that, and text
+        // requests always do.
+        if (render?.deferResolution || textRequests) {
+          await setupConfig.onAction(questionId, selectedOption, userId, address, { deferResolution: true });
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -733,12 +1107,34 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           log.warn('Failed to update card after action', { err });
         }
 
-        setupConfig.onAction(questionId, selectedOption, userId, {
-          instance: instanceKey,
-          messageId: event.messageId,
-          platformId: adapter.channelIdFromThreadId(event.threadId),
-        });
+        await setupConfig.onAction(questionId, selectedOption, userId, address);
       });
+
+      // Reactions the adapter reads itself (ReactionSource), registered
+      // before initialize starts its reading. Awaited: a reaction the router
+      // or an answer's handler could not take rejects back to the adapter.
+      // One that answers a request goes to its handler, not the router. In a
+      // DM, the thread is the reacted message's own, as a direct message's is.
+      if (isReactionSource(adapter)) {
+        adapter.setReactionHandler(async (reaction) => {
+          const platformId = adapter.channelIdFromThreadId(reaction.threadId);
+          const answered = await answers?.takeReaction({
+            id: reaction.reactionName,
+            platformId,
+            userId: reaction.user.userId,
+            isMe: reaction.user.isMe === true,
+            emoji: reaction.emoji.name,
+            messageId: reaction.message.id,
+          });
+          if (answered === true) return;
+          const isDM = adapter.isDM?.(reaction.threadId);
+          await setupConfig.onInbound(
+            platformId,
+            isDM === true ? normalizeDmThreadId(reaction.threadId, reaction.message.id) : reaction.threadId,
+            reactionToInbound(reaction, isDM === undefined ? undefined : !isDM),
+          );
+        });
+      }
 
       await chat.initialize();
 
@@ -829,7 +1225,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const tid = threadId ?? platformId;
       const content = message.content as Record<string, unknown>;
 
+      // A request's outcome, from the handler that resolved an answer to it.
+      if (textRequests && content.operation === 'edit' && typeof content.questionId === 'string') {
+        await editRequestOutcome(tid, content.questionId, content);
+        return;
+      }
+
       if (content.operation === 'edit' && content.messageId) {
+        // An open text request still takes answers as posted, so rewording it
+        // would have its approver decide something other than what they read.
+        // Only its handler's outcome, addressed by question id, edits it.
+        if (textRequests && (await readPostedRequest(state, adapter.name, content.messageId as string))) {
+          throw new Error(`refused an edit to the open request posted as ${String(content.messageId)}`);
+        }
         const render =
           typeof content.questionId === 'string' ? await resolveQuestionRender(content.questionId) : undefined;
         if (render?.renderTerminal && content.terminalCard) {
@@ -838,17 +1246,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           return;
         }
         const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
-        if (
-          terminalCard &&
-          typeof terminalCard.title === 'string' &&
-          typeof terminalCard.question === 'string' &&
-          typeof terminalCard.resolution === 'string'
-        ) {
-          await adapter.editMessage(
-            tid,
-            content.messageId as string,
-            terminalApprovalMessage(terminalCard as TerminalApprovalCard),
-          );
+        if (isTerminalCard(terminalCard)) {
+          await adapter.editMessage(tid, content.messageId as string, terminalApprovalMessage(terminalCard));
         } else {
           await adapter.editMessage(tid, content.messageId as string, {
             markdown: transformText((content.text as string) || (content.markdown as string) || ''),
@@ -862,7 +1261,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return;
       }
 
-      // Ask question card — render as Card with buttons
+      // Ask question — a Card with buttons, or words when requests are text
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
         const title = content.title as string;
@@ -873,11 +1272,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
         const render = content.requirePresentation ? await resolveQuestionRender(questionId) : undefined;
         if (render?.renderMessage) {
-          const result = await adapter.postMessage(tid, render.renderMessage(questionId));
-          return result?.id;
+          return postRequest(tid, platformId, questionId, render.renderMessage(questionId));
         }
         if (content.requirePresentation) throw new Error('Approval presentation adapter is unavailable');
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        if (textRequests) {
+          const words = textRequest(title, typeof question === 'string' ? question : '', options);
+          return postRequest(tid, platformId, questionId, { markdown: transformText(words) });
+        }
         const card = Card({
           title,
           children: [
@@ -902,64 +1304,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       // Display card (send_card MCP tool) — returns immediately, no callback flow.
-      // Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
-      // callback button would have nowhere to land. URL actions render as link buttons.
-      // The runner filters these against LINK_ACTION_SCHEMA before writing the row;
-      // the checks below still stand because any producer can write this payload.
+      // URL actions render as link buttons, or as links when requests are text.
       if (content.type === 'card' && content.card && typeof content.card === 'object') {
         const cardSpec = content.card as Record<string, unknown>;
-        const title = (cardSpec.title as string) || '';
-        const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
-
-        const cardChildren: CardChild[] = [];
-        if (typeof cardSpec.description === 'string' && cardSpec.description) {
-          cardChildren.push(CardText(cardSpec.description));
-        }
-        if (Array.isArray(cardSpec.children)) {
-          for (const child of cardSpec.children) {
-            if (typeof child === 'string' && child) {
-              cardChildren.push(CardText(child));
-            } else if (
-              child &&
-              typeof child === 'object' &&
-              typeof (child as Record<string, unknown>).text === 'string'
-            ) {
-              cardChildren.push(CardText((child as Record<string, string>).text));
-            }
-          }
-        }
-        if (Array.isArray(cardSpec.actions)) {
-          const linkButtons = (cardSpec.actions as Array<Record<string, unknown> | null | undefined>)
-            .filter(
-              (a): a is Record<string, unknown> =>
-                !!a &&
-                typeof a === 'object' &&
-                typeof a.url === 'string' &&
-                !!a.url &&
-                typeof a.label === 'string' &&
-                !!a.label,
-            )
-            .map((a) => {
-              const style = a.style;
-              const safeStyle: 'primary' | 'danger' | 'default' | undefined =
-                style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
-              return LinkButton({
-                label: a.label as string,
-                url: a.url as string,
-                style: safeStyle,
-              });
-            });
-          if (linkButtons.length > 0) {
-            cardChildren.push(Actions(linkButtons));
-          }
-        }
-
-        if (cardChildren.length === 0 && !title) {
+        const display = readDisplayCard(cardSpec);
+        if (display.texts.length === 0 && display.links.length === 0 && !display.title) {
           log.warn('send_card payload empty, skipping delivery');
           return;
         }
+        if (textRequests) {
+          const result = await adapter.postMessage(tid, { markdown: transformText(textDisplayCard(display)) });
+          return result?.id;
+        }
 
-        const card = Card({ title, children: cardChildren });
+        const fallbackText =
+          (content.fallbackText as string) || (cardSpec.description as string) || display.title || '';
+        const cardChildren: CardChild[] = display.texts.map((child) => CardText(child));
+        if (display.links.length > 0) cardChildren.push(Actions(display.links.map((link) => LinkButton(link))));
+        const card = Card({ title: display.title, children: cardChildren });
         const result = await adapter.postMessage(tid, { card, fallbackText });
         return result?.id;
       }
@@ -1001,9 +1363,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(
+      platformId: string,
+      threadId: string | null,
+      _status?: string,
+      _statusKind?: 'auto' | 'agent',
+      anchor?: string,
+    ) {
       const tid = threadId ?? platformId;
       await adapter.startTyping(tid);
+      if (anchor !== undefined && working) await working.workingOn(tid, anchor);
     },
 
     async teardown() {
@@ -1026,6 +1395,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await state.subscribe(threadId);
     },
   };
+
+  // Only an adapter that marks the message a turn works on has an end to take.
+  if (working) {
+    bridge.endTyping = async (platformId: string, threadId: string | null, anchor: string): Promise<void> => {
+      await working.endWorking(threadId ?? platformId, anchor);
+    };
+  }
 
   // Only expose openDM when the underlying Chat SDK adapter implements it.
   // Delegate straight to adapter.openDM rather than going through chat.openDM:
@@ -1152,10 +1528,17 @@ async function handleForwardedEvent(
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 6 }),
         });
-        setupConfig.onAction(questionId, selectedOption, user?.id || '', {
-          messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
-          platformId: interaction.channel_id as string | undefined,
-        });
+        handOnClick(
+          setupConfig,
+          questionId,
+          selectedOption,
+          user?.id || '',
+          {
+            messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
+            platformId: interaction.channel_id as string | undefined,
+          },
+          { deferResolution: true },
+        );
         return;
       }
       const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
@@ -1187,7 +1570,7 @@ async function handleForwardedEvent(
 
       // Dispatch to host
       if (questionId && selectedOption) {
-        setupConfig.onAction(questionId, selectedOption, user?.id || '', {
+        handOnClick(setupConfig, questionId, selectedOption, user?.id || '', {
           messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
           platformId: interaction.channel_id as string | undefined,
         });

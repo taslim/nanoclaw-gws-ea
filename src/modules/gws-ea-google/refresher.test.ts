@@ -5,12 +5,13 @@ import type {
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
 import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from './grant.js';
-import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS } from './refresher.js';
-import { GOOGLE_TOKEN_ENDPOINT, GoogleScopeNotGrantedError } from './tokens.js';
+import { createGoogleTokenRefresher } from './refresher.js';
+import { GOOGLE_TOKEN_ENDPOINT, RENEW_BEFORE_EXPIRY_MS } from './tokens.js';
 
 const GRANT: GoogleGrant = {
-  schema_version: 1,
+  schema_version: 2,
   account: 'juno@example.test',
+  sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',
@@ -332,8 +333,6 @@ describe('the Google token refresher', () => {
     expect(w.asked()).toEqual([`${CALENDAR} ${DRIVE}`]);
     expect(log.error).toHaveBeenCalledTimes(1);
     expect(log.warn).not.toHaveBeenCalled();
-    await expect(r.hostAccessToken('drive-host')).rejects.toThrow(/no longer accepts/);
-    expect(w.minted).toHaveLength(1);
 
     grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-09-30T13:00:00.000Z' };
     await r.tick();
@@ -352,48 +351,6 @@ describe('the Google token refresher', () => {
       'Could not renew Google access for agents; retrying',
       expect.objectContaining({ host: 'gmail.googleapis.com' }),
     );
-  });
-
-  it("holds the host's Gmail token in memory only, renewing it near expiry", async () => {
-    const w = world();
-    const clock = { now: 0 };
-    const { refresher: r } = refresher(w, () => GRANT, clock);
-
-    const first = await r.hostAccessToken('gmail');
-    expect(await r.hostAccessToken('gmail')).toBe(first);
-    expect(w.asked()).toEqual([MODIFY]);
-    expect(w.connection).not.toHaveBeenCalled();
-
-    clock.now = renewalAfter(0);
-    expect(await r.hostAccessToken('gmail')).not.toBe(first);
-    await r.tick();
-    expect([...w.vault.values()].map((stored) => stored.value)).not.toContain(first);
-    expect(w.writes.some((write) => write.includes('gmail.modify') || write.endsWith(' google-gmail'))).toBe(false);
-  });
-
-  it("holds the host's own Drive token in memory, and refuses it without asking Google on a grant without Drive", async () => {
-    const w = world();
-    let grant = OLD_GRANT;
-    const { refresher: r } = refresher(w, () => grant, { now: 0 });
-
-    await expect(r.hostAccessToken('drive-host')).rejects.toBeInstanceOf(GoogleScopeNotGrantedError);
-    expect(w.fetch).not.toHaveBeenCalled();
-
-    grant = { ...GRANT, granted_at: '2026-10-09T18:00:00.000Z' };
-    await expect(r.hostAccessToken('drive-host')).resolves.toBe('ya29.token-1');
-    expect(w.asked()).toEqual([DRIVE]);
-    expect(w.connection).not.toHaveBeenCalled();
-  });
-
-  it('mints one host token for callers that ask at once, and refuses before the assistant signs in', async () => {
-    const w = world();
-    const { refresher: r } = refresher(w, () => GRANT, { now: 0 });
-    const [a, b] = await Promise.all([r.hostAccessToken('gmail'), r.hostAccessToken('gmail')]);
-    expect(a).toBe(b);
-    expect(w.minted).toHaveLength(1);
-
-    const unsigned = refresher(world(), () => undefined, { now: 0 }).refresher;
-    await expect(unsigned.hostAccessToken('gmail')).rejects.toThrow(/not signed in/);
   });
 
   it('never writes a token, the refresh token, or the client secret into a log line', async () => {

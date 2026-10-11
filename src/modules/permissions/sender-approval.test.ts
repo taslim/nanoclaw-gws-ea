@@ -146,6 +146,7 @@ function stranger(text: string) {
       kind: 'chat' as const,
       content: JSON.stringify({
         senderId: 'tg:stranger',
+        sender: 'Stranger',
         senderName: 'Stranger',
         text,
       }),
@@ -162,6 +163,37 @@ async function expectAsyncDelivery(action: () => Promise<void>): Promise<void> {
   });
 }
 
+/** A stranger's first message, and the approval request it raises: its id. */
+async function pendingApprovalFromStranger(): Promise<string> {
+  const { routeInbound } = await import('../../router.js');
+  await expectAsyncDelivery(() => routeInbound(stranger('may I join?')));
+  const { getDb } = await import('../../db/connection.js');
+  return (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!.id;
+}
+
+/** An answer in the owner's DM, by default from a channel that leaves the request as posted. */
+async function answer(
+  questionId: string,
+  value: string,
+  { userId = 'owner', deferResolution = true }: { userId?: string; deferResolution?: boolean } = {},
+): Promise<void> {
+  const { getResponseHandlers } = await import('../../response-registry.js');
+  for (const handler of getResponseHandlers()) {
+    const claimed = await handler({
+      questionId,
+      value,
+      userId,
+      channelType: 'telegram',
+      instance: 'telegram',
+      messageId: 'request-message',
+      platformId: 'dm-owner',
+      threadId: null,
+      deferResolution,
+    });
+    if (claimed) return;
+  }
+}
+
 describe('unknown-sender request_approval flow', () => {
   it('delivers an approval card on first unknown message', async () => {
     const { routeInbound } = await import('../../router.js');
@@ -176,7 +208,10 @@ describe('unknown-sender request_approval flow', () => {
     const payload = JSON.parse(content as string);
     expect(payload.type).toBe('ask_question');
     expect(payload.questionId).toMatch(/^nsa-/);
-    expect(payload.question).toContain(AGENT_ACCESS_SCOPE_WARNING);
+    expect(payload.title).toBe('👤 New sender');
+    expect(payload.question).toBe(
+      `tg:stranger ("Stranger") wants to talk to me in "Group Chat". ${AGENT_ACCESS_SCOPE_WARNING} Allow them?`,
+    );
 
     const { getDb } = await import('../../db/connection.js');
     const rows = await getDb().all('SELECT * FROM pending_sender_approvals');
@@ -350,5 +385,121 @@ describe('unknown-sender request_approval flow', () => {
       'ag-1',
     );
     expect(member).toBeDefined();
+  });
+});
+
+describe('unknown-sender approval answered on a channel that left it as posted', () => {
+  // Text requests: the request stays as posted until the handler that
+  // authorizes an answer edits it to its outcome, by question id.
+  function editsSinceRequest(): Array<{ platformId: unknown; instance: unknown; content: Record<string, unknown> }> {
+    return deliverMock.mock.calls
+      .slice(1)
+      .map(([, platformId, , , content, , instance]) => ({
+        platformId,
+        instance,
+        content: JSON.parse(content as string) as Record<string, unknown>,
+      }))
+      .filter((call) => call.content.operation === 'edit');
+  }
+
+  it("leaves it unedited for a bystander's answer, and edits it once its approver allows the sender", async () => {
+    const questionId = await pendingApprovalFromStranger();
+
+    await answer(questionId, 'approve', { userId: 'random-bystander' });
+    expect(editsSinceRequest()).toEqual([]);
+
+    await answer(questionId, 'approve');
+    expect(editsSinceRequest()).toEqual([
+      {
+        platformId: 'dm-owner',
+        instance: 'telegram',
+        content: expect.objectContaining({
+          operation: 'edit',
+          questionId,
+          messageId: 'request-message',
+          terminalCard: expect.objectContaining({ title: '👤 New sender', resolution: '✅ Allowed' }),
+        }),
+      },
+    ]);
+  });
+
+  it('edits it to its outcome when its approver denies the sender', async () => {
+    const questionId = await pendingApprovalFromStranger();
+
+    await answer(questionId, 'reject');
+
+    expect(editsSinceRequest().map((edit) => (edit.content.terminalCard as { resolution: string }).resolution)).toEqual(
+      ['❌ Denied'],
+    );
+  });
+});
+
+describe("a new sender in the context of the agent that works in the approver's DM", () => {
+  // ag-1 also works in the owner's DM, under one shared session, as main does.
+  let inboundDb: string;
+
+  beforeEach(async () => {
+    const { resolveSession, sessionDir } = await import('../../session-manager.js');
+    await createMessagingGroupAgent({
+      id: 'mga-dm-owner',
+      messaging_group_id: 'mg-dm-owner',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+    const { session } = await resolveSession('ag-1', 'mg-dm-owner', null, 'agent-shared');
+    inboundDb = `${sessionDir('ag-1', session.id)}/inbound.db`;
+  });
+
+  /** The quiet notes in ag-1's session, as fields. */
+  async function notes(): Promise<Array<Record<string, unknown>>> {
+    const Database = (await import('better-sqlite3')).default;
+    const inbound = new Database(inboundDb, { readonly: true });
+    try {
+      return (
+        inbound.prepare('SELECT trigger, content FROM messages_in WHERE trigger = 0 ORDER BY seq').all() as Array<{
+          content: string;
+        }>
+      ).map(
+        (row) =>
+          JSON.parse((JSON.parse(row.content) as { text: string }).text.split('\n')[1]!) as Record<string, unknown>,
+      );
+    } finally {
+      inbound.close();
+    }
+  }
+
+  it('notes the request, holding the names only as marked fields, and then its outcome', async () => {
+    const questionId = await pendingApprovalFromStranger();
+
+    const [posted] = await notes();
+    expect(posted).toMatchObject({
+      request: questionId,
+      about: 'new_sender',
+      title: '👤 New sender',
+      answer_from: 'telegram:owner',
+      answers: ['Allow', 'Deny'],
+      details: { sender: 'tg:stranger', conversation: 'a group conversation on telegram' },
+    });
+    const details = posted!.details as Record<string, string>;
+    expect(details.sender_name).toMatch(
+      /^<<<EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\nSource: telegram\n---\nStranger\n/u,
+    );
+    expect(details.conversation_name).toMatch(/\n---\nGroup Chat\n<<<END_EXTERNAL_UNTRUSTED_CONTENT/u);
+
+    // A card channel resolves the request itself; the note is the handler's either way.
+    await answer(questionId, 'reject', { deferResolution: false });
+
+    expect((await notes()).at(-1)).toEqual({
+      request: questionId,
+      about: 'new_sender',
+      title: '👤 New sender',
+      outcome: '❌ Denied',
+    });
   });
 });

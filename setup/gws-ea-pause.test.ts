@@ -38,32 +38,36 @@ function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPaus
   return {
     kind: 'human-action',
     phase: 'bind_principal',
-    code: 'principal_dm_required',
-    message: 'Ask the principal to send a direct message to the configured Google Chat app.',
-    details: ['Principal: Morgan Ellery (not bound yet)'],
+    code: 'principal_chat_request_pending',
+    message: "Morgan Ellery must accept the assistant's chat request in Google Chat, then resume.",
+    details: ['Principal: Morgan Ellery (morgan.ellery@example.test)'],
     ...overrides,
   };
 }
 
-const PRINCIPAL_CHOICE = pause({
-  code: 'principal_selection_required',
+const BILLING_CHOICE = pause({
+  phase: 'provision_gcp',
+  code: 'gcp_billing_account_choice_required',
+  message: 'Choose the billing account that pays for Google Cloud project gws-ea-juno.',
+  details: [],
   choices: [
-    { id: 'mg-1', label: 'Morgan Ellery (gchat:users/1)' },
-    { id: 'mg-2', label: 'Someone Else (gchat:users/2)' },
+    { id: '01A2B3-C4D5E6-F7A8B9', label: 'Northwind (01A2B3-C4D5E6-F7A8B9)' },
+    { id: '0B1C2D-3E4F5A-6B7C8D', label: 'Juno Hale personal (0B1C2D-3E4F5A-6B7C8D)' },
   ],
+  resumeFlag: '--billing-account',
 });
 
 const CHAT_CONFIGURATION = pause({
   phase: 'configure_channel',
   code: 'chat_configuration_required',
-  message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+  message: "Configure the Google Chat API for this assistant's project, then confirm it.",
   details: ['App name: Juno'],
   actionUrl: 'https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat',
   resumeFlag: '--chat-configured',
 });
 
 const GOOGLE_CLIENT = pause({
-  phase: 'connect_google',
+  phase: 'sign_in_google',
   code: 'google_client_required',
   message: "Create the assistant's Google sign-in client, then continue with its file.",
   details: ['Under Clients, create an OAuth client of type Desktop app and download its JSON.'],
@@ -105,7 +109,7 @@ describe('attending a pause at the terminal', () => {
     );
     expect(terminal.note).toHaveBeenCalledWith(
       expect.stringContaining('App name: Juno\nOpen: https://console.cloud.google.com/'),
-      'Google Chat app',
+      'Google Chat API',
     );
 
     await expect(
@@ -113,22 +117,42 @@ describe('attending a pause at the terminal', () => {
     ).resolves.toEqual({ kind: 'stop' });
   });
 
-  it('lets the person choose the principal conversation, or stop', async () => {
-    await expect(
-      attendPause(PRINCIPAL_CHOICE, new AbortController().signal, { prompts: prompts('mg-2') }),
-    ).resolves.toEqual({
+  it('lets the person make the choice a pause offers, as the decision its resume flag records, or stop', async () => {
+    const terminal = prompts('0B1C2D-3E4F5A-6B7C8D');
+
+    await expect(attendPause(BILLING_CHOICE, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
       kind: 'continue',
-      decisions: { messagingGroupId: 'mg-2' },
+      decisions: { billingAccount: '0B1C2D-3E4F5A-6B7C8D' },
     });
+    expect(terminal.select).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: BILLING_CHOICE.message,
+        options: [
+          { value: '01A2B3-C4D5E6-F7A8B9', label: 'Northwind (01A2B3-C4D5E6-F7A8B9)' },
+          { value: '0B1C2D-3E4F5A-6B7C8D', label: 'Juno Hale personal (0B1C2D-3E4F5A-6B7C8D)' },
+        ],
+      }),
+    );
     await expect(
-      attendPause(PRINCIPAL_CHOICE, new AbortController().signal, { prompts: prompts(CANCEL) }),
+      attendPause(BILLING_CHOICE, new AbortController().signal, { prompts: prompts(CANCEL) }),
     ).resolves.toEqual({
       kind: 'stop',
     });
   });
 
+  it('stops, asking nothing, at a choice whose resume flag records no decision', async () => {
+    const terminal = prompts('anything');
+
+    await expect(
+      attendPause({ ...BILLING_CHOICE, resumeFlag: '--unknown-choice' }, new AbortController().signal, {
+        prompts: terminal,
+      }),
+    ).resolves.toEqual({ kind: 'stop' });
+    expect(terminal.select).not.toHaveBeenCalled();
+  });
+
   it('closes an open question and stops when the wait is stopped, as by SIGTERM', async () => {
-    for (const open of [PRINCIPAL_CHOICE, CHAT_CONFIGURATION]) {
+    for (const open of [BILLING_CHOICE, CHAT_CONFIGURATION]) {
       const waiting = new AbortController();
       const attended = attendPause(open, waiting.signal, { prompts: clackPrompts() });
       waiting.abort();
@@ -168,10 +192,17 @@ describe('attending a pause at the terminal', () => {
       attendPause(pause({ settled: failing }), new AbortController().signal, { prompts: prompts(), sleep }),
     ).resolves.toEqual({ kind: 'stop' });
 
+    // A pause with nothing to choose, confirm, locate, or wait for: the person acts elsewhere, then resumes.
     const terminal = prompts();
-    await expect(
-      attendPause(pause({ code: 'existing_endpoint_required' }), new AbortController().signal, { prompts: terminal }),
-    ).resolves.toEqual({ kind: 'stop' });
+    const policyAdmin = pause({
+      phase: 'provision_gcp',
+      code: 'gcp_policy_permission_required',
+      message: 'Google Cloud refused to change the service-account key-creation policy on project gws-ea-juno.',
+      details: [],
+    });
+    await expect(attendPause(policyAdmin, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
+      kind: 'stop',
+    });
     expect(terminal.note).not.toHaveBeenCalled();
   });
 });

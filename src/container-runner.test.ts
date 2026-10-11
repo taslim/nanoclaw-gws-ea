@@ -179,11 +179,11 @@ describe('composeSessionSpec', () => {
   });
 
   it('does not copy host-only runtime values into the agent environment', () => {
-    vi.stubEnv('GCHAT_CREDENTIALS', 'gchat-secret-canary');
+    vi.stubEnv('GWS_EA_CHAT_SUBSCRIBER_KEY_FILE', '/state/secrets/gchat-subscriber-key.json');
     vi.stubEnv('ONECLI_API_KEY', 'onecli-secret-canary');
     try {
       const agent = compose().containers[0];
-      for (const key of ['GCHAT_CREDENTIALS', 'ONECLI_API_KEY']) {
+      for (const key of ['GWS_EA_CHAT_SUBSCRIBER_KEY_FILE', 'ONECLI_API_KEY']) {
         expect(agent.env).not.toHaveProperty(key);
         expect(agent.contributedEnv).not.toHaveProperty(key);
       }

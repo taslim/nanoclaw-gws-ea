@@ -23,7 +23,7 @@ async function instanceWithNcl(script: string): Promise<InstanceRuntimeConfig> {
   await writeFile(path.join(checkout, 'bin', 'ncl'), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   const project = `gws-ea-${INSTANCE_ID.replaceAll('-', '')}`.slice(0, 30);
   return {
-    schema_version: 2,
+    schema_version: 3,
     instance_id: INSTANCE_ID,
     install_id: INSTANCE_ID.replaceAll('-', ''),
     instance_root: root,
@@ -31,17 +31,16 @@ async function instanceWithNcl(script: string): Promise<InstanceRuntimeConfig> {
     state_root: path.join(root, 'state'),
     node_path: '/usr/bin/node',
     home_directory: root,
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     agent_egress_network: `${project}-agent-egress`,
     onecli_project: project,
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: `${project}-gateway-1`,
     selected_provider: 'claude',
-    endpoint_url: 'https://aya.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
-      gchat_credentials: path.join(secrets, 'gchat-service-account.json'),
+      gchat_subscriber_key: path.join(secrets, 'gchat-subscriber-key.json'),
       onecli_runtime_api_key: path.join(secrets, 'onecli-runtime-api-key'),
       onecli_admin_api_key: path.join(secrets, 'onecli-admin-api-key'),
     },

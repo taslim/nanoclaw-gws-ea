@@ -19,6 +19,21 @@ export interface QuestionRender {
   renderTerminal?: (resolution: string) => Parameters<Adapter['postMessage']>[1];
   /** The coordinator updates the card only after it authorizes and records the decision. */
   deferResolution?: boolean;
+  /**
+   * When it stops taking answers (ISO-8601 UTC): an agent's question at the
+   * deadline its asker stops waiting, an approval at its expiry. Absent when
+   * it has none.
+   */
+  expiresAt?: string;
+  /** Its status is no longer pending: an answer to it resolves nothing. */
+  resolved?: boolean;
+  /**
+   * Who asks: an agent's own question (ask_user_question), which in a DM may
+   * take a plain answer, or an approval, which takes only a quote or a
+   * reaction (src/channels/answers.ts). A render without one is taken as an
+   * approval.
+   */
+  kind?: 'question' | 'approval';
 }
 
 export type QuestionRenderResolver = (

@@ -150,6 +150,8 @@ export type RollbackOutcome =
       readonly to: ReleaseCoordinates;
       /** The snapshot restored in snapshot mode; in code-only mode, the one left unused. */
       readonly snapshotAt: string;
+      /** Why its Google Chat waits on a new sign-in, which the release was served through (KTD12); null otherwise. */
+      readonly signInNeeded: string | null;
     } & (
       | { readonly mode: 'code_only' }
       | {
@@ -488,10 +490,13 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
 /** What a finished rollback did, as one sentence tail, with times in `timezone`. */
 export function describeRollback(outcome: RollbackOutcome, timezone: string): string {
   switch (outcome.kind) {
-    case 'rolled_back':
-      return outcome.mode === 'code_only'
-        ? `the assistant runs ${releaseLine(outcome.to)} again, with everything it recorded since kept.`
-        : `the assistant runs ${releaseLine(outcome.to)} again on its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)}; what it recorded since is kept in ${outcome.keptAt}.`;
+    case 'rolled_back': {
+      const runs =
+        outcome.mode === 'code_only'
+          ? `the assistant runs ${releaseLine(outcome.to)} again, with everything it recorded since kept.`
+          : `the assistant runs ${releaseLine(outcome.to)} again on its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)}; what it recorded since is kept in ${outcome.keptAt}.`;
+      return outcome.signInNeeded ? `${runs} ${outcome.signInNeeded}.` : runs;
+    }
     case 'update_discarded':
       return `the update to ${releaseLine(outcome.discarded)} was discarded, and the assistant runs ${releaseLine(outcome.release)} again.`;
     case 'follow_ups_finished':
@@ -789,6 +794,7 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
   }
   let record = start;
   let definitionChanged = false;
+  let signInNeeded: string | null = null;
   try {
     if (record.phase === 'fenced' || record.phase === 'snapshotted' || record.phase === 'switched') {
       record = await refence(rollback, record);
@@ -828,14 +834,17 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
         case 'started': {
           const started = record;
           await reconcileMainSkills(rollback, started.stop?.graceful === false);
-          await runStep(reporter, { id: 'verify_release', label: 'Checking the previous release serves…' }, async () =>
-            verifyServingRelease(rollback, {
-              view: reservationAt(rollback.reservation, started.to),
-              pins: await pinsOf(rollback, started.to),
-              leaseHeld: started.stop?.graceful === false,
-              subject: 'The restored release',
-            }),
-          );
+          ({ signInNeeded } = await runStep(
+            reporter,
+            { id: 'verify_release', label: 'Checking the previous release serves…' },
+            async () =>
+              verifyServingRelease(rollback, {
+                view: reservationAt(rollback.reservation, started.to),
+                pins: await pinsOf(rollback, started.to),
+                leaseHeld: started.stop?.graceful === false,
+                subject: 'The restored release',
+              }),
+          ));
           record = await advanceOperation(operation, 'verified', {
             follow_ups: planFollowUps(record.follow_ups, releaseFollowUps(rollback.runtime)),
           });
@@ -847,10 +856,10 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
             await writeRollbackReceipt(rollback, verified);
             await commitOperationRelease(operation);
           });
-          return rolledBack(rollback, verified);
+          return rolledBack(rollback, verified, signInNeeded);
         }
         case 'committed':
-          return rolledBack(rollback, record);
+          return rolledBack(rollback, record, signInNeeded);
       }
     }
   } catch (error) {
@@ -877,13 +886,17 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
   }
 }
 
-async function rolledBack(rollback: Rollback, record: OperationRecord): Promise<RollbackOutcome> {
+async function rolledBack(
+  rollback: Rollback,
+  record: OperationRecord,
+  signInNeeded: string | null,
+): Promise<RollbackOutcome> {
   const mode = record.mode ?? 'code_only';
   const { from, to } = rollback;
   const snapshotAt = await snapshotTakenAt(rollback.layout, rollback.snapshot);
   return mode === 'snapshot'
-    ? { kind: 'rolled_back', from, to, mode, snapshotAt, keptAt: rollback.layout.quarantine(rollback.op) }
-    : { kind: 'rolled_back', from, to, mode, snapshotAt };
+    ? { kind: 'rolled_back', from, to, mode, snapshotAt, signInNeeded, keptAt: rollback.layout.quarantine(rollback.op) }
+    : { kind: 'rolled_back', from, to, mode, snapshotAt, signInNeeded };
 }
 
 /**

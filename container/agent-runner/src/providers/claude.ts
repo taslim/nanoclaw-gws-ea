@@ -209,7 +209,6 @@ const postToolUseHook: HookCallback = async () => {
 /**
  * After each batch of tool calls, the reminder to acknowledge a person left
  * waiting (acknowledge.ts). A subagent speaks to no one, so it gets none.
- * Removable with acknowledge.ts once the channel has a typing indicator.
  */
 const acknowledgeHook: HookCallback = async (input) => {
   const reminder = input.agent_id === undefined ? acknowledgmentReminder() : undefined;

@@ -126,6 +126,27 @@ describe('NanoClaw tool server capabilities', () => {
     expect(await served(grants)).toEqual(tools);
   });
 
+  it('describes no tool with cards, buttons, clicks or taps, which a chat may not have', async () => {
+    // In Google Chat a question is text the person answers in the conversation.
+    const controlWords = /\b(?:cards?|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
+    function descriptions(value: unknown): string[] {
+      if (Array.isArray(value)) return value.flatMap(descriptions);
+      if (typeof value !== 'object' || value === null) return [];
+      return Object.entries(value).flatMap(([key, field]) =>
+        key === 'description' && typeof field === 'string' ? [field] : descriptions(field),
+      );
+    }
+    const { client, close } = await connect(ALL);
+    try {
+      const { tools } = await client.listTools();
+      const told = tools.flatMap((tool) => descriptions(tool).map((text) => `${tool.name}: ${text}`));
+      expect(told.length).toBeGreaterThan(tools.length);
+      expect(told.filter((text) => text.match(controlWords) !== null)).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
     for (const tool of ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking']) {

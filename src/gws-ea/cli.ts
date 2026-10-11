@@ -10,7 +10,6 @@ import {
   type CommandOptions,
   type OptionSpec,
 } from './cli-read-only.js';
-import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
   loadSecretSource,
@@ -23,6 +22,7 @@ import {
 } from './create-input.js';
 import { finishFollowUps, type CutoverDependencies } from './cutover.js';
 import {
+  BILLING_ACCOUNT_FLAG,
   createInteraction,
   pendingActionOf,
   PauseRequired,
@@ -34,7 +34,7 @@ import {
   type RunEvent,
   type StepReporter,
 } from './events.js';
-import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
+import { deriveGcpClaims, GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
   loadCreatedRuntime,
@@ -236,7 +236,6 @@ export interface CliRuntime {
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-  managedIngressSetup?: RetainedManagedIngressSetupSession;
   /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies. */
   upsertEnvVars?: UpsertEnvVars;
   /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
@@ -290,10 +289,10 @@ const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
     repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
-    values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
+    values: ['id', 'billing-account', 'google-client-file', ...COMMON_OPTIONS],
     switches: ['chat-configured'],
   },
-  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes'] },
+  remove: { values: ['id', 'abandon'], switches: ['yes'] },
   'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: [] },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
@@ -368,6 +367,19 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/** `--billing-account`: the billing account a pause offered, as Google names it. */
+function parseBillingAccount(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!GCP_BILLING_ACCOUNT_PATTERN.test(value)) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      `${BILLING_ACCOUNT_FLAG}: ${JSON.stringify(value)} is not a billing account ID such as 01A2B3-C4D5E6-F7A8B9`,
+      { details: { flag: BILLING_ACCOUNT_FLAG } },
+    );
+  }
+  return value;
+}
+
 function isBusy(error: unknown): boolean {
   return error instanceof GwsEaError && error.code === 'instance_busy';
 }
@@ -435,28 +447,23 @@ function exitFact(details: GwsEaErrorDetails | undefined): string | undefined {
   return undefined;
 }
 
+/** A pause as the person reads it: what to do, and the command that continues; a choice gives one per option. */
 function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => string, log: string): StopReport {
-  const headline = `Paused at ${pause.phase}: ${pause.message}`;
-  if (pause.choices?.length) {
-    return {
-      outcome: 'paused',
-      headline,
-      details: [
-        'Eligible principal conversations:',
-        ...pause.choices.map(
-          (choice) => `  ${JSON.stringify(choice.label)}: ${resume(`--messaging-group-id ${shellQuote(choice.id)}`)}`,
-        ),
-        `Log: ${log}`,
-      ],
-    };
-  }
+  const { choices, resumeFlag } = pause;
   return {
     outcome: 'paused',
-    headline,
+    headline: `Paused at ${pause.phase}: ${pause.message}`,
     details: [
       ...(pause.details ?? []).map((detail) => `  ${detail}`),
       ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
-      `Continue with: ${resume(pause.resumeFlag)}`,
+      ...(choices?.length && resumeFlag
+        ? [
+            'Choose one:',
+            ...choices.map(
+              (choice) => `  ${JSON.stringify(choice.label)}: ${resume(`${resumeFlag} ${shellQuote(choice.id)}`)}`,
+            ),
+          ]
+        : [`Continue with: ${resume(resumeFlag)}`]),
       `Log: ${log}`,
     ],
   };
@@ -497,15 +504,13 @@ class Cli {
   readonly #paths: ControlPlanePaths;
   readonly #presenter: Presenter;
   readonly #runtime: CliRuntime;
-  readonly #managedIngressSetup: RetainedManagedIngressSetupSession;
   /** Set while a terminal waits on a pause: a signal then stops the wait, not the run. */
   #waiting: AbortController | undefined;
 
-  constructor(runtime: CliRuntime, presenter: Presenter, managedIngressSetup: RetainedManagedIngressSetupSession) {
+  constructor(runtime: CliRuntime, presenter: Presenter) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
     this.#presenter = presenter;
     this.#runtime = runtime;
-    this.#managedIngressSetup = managedIngressSetup;
   }
 
   /**
@@ -531,6 +536,7 @@ class Cli {
       }
       case 'resume': {
         const instanceId = targetInstance(options);
+        const billingAccount = parseBillingAccount(options['billing-account']);
         return () =>
           this.#attempt({
             command,
@@ -539,7 +545,7 @@ class Cli {
             instanceId,
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
-              ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+              ...(billingAccount ? { billingAccount } : {}),
               ...(options['google-client-file']
                 ? { googleClientFile: path.resolve(options['google-client-file']) }
                 : {}),
@@ -640,7 +646,6 @@ class Cli {
           `gws-ea remove --id ${state.instanceId}`,
           plan.options.yes ? '--yes' : undefined,
           abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
-          common,
         );
       }
       case 'start':
@@ -711,7 +716,6 @@ class Cli {
       serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
-      managedIngress: { setupSession: this.#managedIngressSetup },
     });
   }
 
@@ -754,10 +758,8 @@ class Cli {
         providedPrincipalEmails: principalEmails,
         secrets,
         prerequisites,
-        managedIngressSetup: this.#managedIngressSetup,
       }),
     );
-    run.userInput('ingress', setup.ingress.mode);
     run.userInput('provider', setup.bootstrapManifest.provider.id);
 
     const { release } = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
@@ -909,9 +911,9 @@ class Cli {
    */
   /**
    * Connect a created assistant's own Google account (KTD5): the same
-   * resources as create's `connect_google` step, outside the provision
-   * journal, so a lost or outdated sign-in is repaired without recreating
-   * the assistant.
+   * resources as create's `sign_in_google` and `connect_google` steps, outside
+   * the provision journal, so a lost or outdated sign-in is repaired without
+   * recreating the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
@@ -936,8 +938,8 @@ class Cli {
               instanceId,
               projectId: claims.gcp_project_id,
               account: claims.gcp_account,
-              serviceAccountEmail: claims.gchat_service_account,
-              credentialFile: runtime.secret_files.gchat_credentials,
+              serviceAccountEmail: claims.gchat_subscriber_account,
+              credentialFile: runtime.secret_files.gchat_subscriber_key,
               cwd: runtime.instance_root,
             },
             google: {
@@ -1314,15 +1316,12 @@ class Cli {
         command: plan.command,
         ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
         ...(plan.meta ? { meta: plan.meta } : {}),
-        secretDirectories: [
-          path.join(paths.cloudflareRoot, 'secrets'),
-          ...(plan.instanceId
-            ? [
-                path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
-                path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
-              ]
-            : []),
-        ],
+        secretDirectories: plan.instanceId
+          ? [
+              path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
+              path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
+            ]
+          : [],
       });
       const emit = (event: RunEvent): void => {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
@@ -1337,7 +1336,6 @@ class Cli {
         secrets,
         ...(this.#runtime.prompts ? { prompts: this.#runtime.prompts } : {}),
         terminal: presenter,
-        managedIngressSetup: this.#managedIngressSetup,
       });
       const outcome = await plan.work({ reporter, interaction, secrets, state });
       if (outcome.status === 'paused') {
@@ -1394,14 +1392,22 @@ class Cli {
   }
 }
 
+/** A release served through a broken Google sign-in says so after where it left the assistant (KTD12). */
+function signInDetails(signInNeeded: string | null): string[] {
+  return signInNeeded ? [`${signInNeeded}.`] : [];
+}
+
 /** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
     message: `Assistant ${instanceId} was updated to ${releaseLine(updated.to)}.`,
-    details: updated.rollbackTarget
-      ? [`Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`]
-      : ['It has no previous release to roll back to.'],
+    details: [
+      updated.rollbackTarget
+        ? `Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`
+        : 'It has no previous release to roll back to.',
+      ...signInDetails(updated.signInNeeded),
+    ],
   };
 }
 
@@ -1412,13 +1418,15 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
       return {
         status: 'ready',
         message: `Assistant ${instanceId} was rolled back to ${releaseLine(outcome.to)}.`,
-        details:
-          outcome.mode === 'code_only'
+        details: [
+          ...(outcome.mode === 'code_only'
             ? ['Only its code went back: every conversation, memory, and setting since the update was kept.']
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
                 `What it recorded since on ${releaseLine(outcome.from)} is kept in ${outcome.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
-              ],
+              ]),
+          ...signInDetails(outcome.signInNeeded),
+        ],
       };
     case 'update_discarded':
       return {
@@ -1635,7 +1643,6 @@ function createReservation(
   },
 ): InstanceReservationInput {
   const instanceId = production.instanceId;
-  const gcpProjectId = deriveGcpProjectId(instanceId);
   const input: InstanceReservationInput = {
     instance_id: instanceId,
     release_track: track,
@@ -1643,21 +1650,8 @@ function createReservation(
     deployed_commit: production.commit,
     allocated_ports: production.ports,
     exclusive_resource_claims: {
-      ingress:
-        setup.ingress.mode === 'existing'
-          ? { mode: 'existing', endpoint_url: setup.ingress.endpointUrl }
-          : {
-              mode: 'managed-cloudflare',
-              account_id: setup.ingress.accountId,
-              zone_id: setup.ingress.zoneId,
-              zone_name: setup.ingress.zoneName,
-              hostname: setup.ingress.hostname,
-              callback_url: setup.ingress.callbackUrl,
-              dns_record_id: null,
-            },
-      gcp_project_id: gcpProjectId,
+      ...deriveGcpClaims(instanceId),
       gcp_account: production.gcpAccount,
-      gchat_service_account: deriveGchatServiceAccountEmail(gcpProjectId),
       workspace_email: setup.assistantWorkspaceEmail,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -1666,47 +1660,33 @@ function createReservation(
 }
 
 function removalPreviewLines(preview: RemovalPreview): string[] {
-  const lines = [
+  return [
     `Assistant: ${preview.instanceId}`,
     `NanoClaw: ${preview.checkout}`,
     `OneCLI: ${preview.onecliProject}`,
     `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
   ];
-  if (preview.ingress.mode === 'existing') {
-    lines.push(`External endpoint: ${preview.ingress.endpoint} (operator-managed; disconnect separately)`);
-    return lines;
-  }
-  lines.push(
-    `Managed hostname: ${preview.ingress.hostname}`,
-    `Managed callback: ${preview.ingress.callback}`,
-    `Owned DNS record: ${preview.ingress.dnsRecordId ?? 'not created'}`,
-    `Owned tunnel route: ${preview.ingress.route}`,
-    preview.ingress.sharedIngress === 'retained-for-peers'
-      ? 'Shared Cloudflare ingress: retained for other assistants'
-      : 'Shared Cloudflare ingress: retired after this final managed callback',
-  );
-  return lines;
 }
 
 /** What the operator must know after removal: the project deletion, and anything left behind. */
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
   const project = `Google Cloud project ${preview.gcpProject}`;
-  const names: Readonly<Record<AbandonableResource, string>> = {
-    'gcp-project': project,
-    'cloudflare-dns':
-      preview.ingress.mode === 'managed-cloudflare' ? `DNS record ${preview.ingress.hostname}` : 'DNS record',
+  const unobserved = (name: string): string =>
+    `Left behind: ${name}, which removal could not observe; delete it yourself if it still exists.`;
+  const leftBehind: Readonly<Record<AbandonableResource, string>> = {
+    'gcp-project': unobserved(project),
+    'chat-subscription':
+      "Left behind: the assistant's Google Chat subscription, which removal could not delete without a working " +
+      'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
   };
   return [
     ...(outcome?.removed.includes('gcp-project')
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
       : []),
-    ...(outcome?.abandoned.map(
-      ({ resource }) =>
-        `Left behind: ${names[resource]}, which removal could not observe; delete it yourself if it still exists.`,
-    ) ?? []),
+    ...(outcome?.abandoned.map(({ resource }) => leftBehind[resource]) ?? []),
     ...(outcome?.keyPolicyUnrestored
       ? [
-          `The Google Chat key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
+          `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
         ]
       : []),
   ];
@@ -1718,11 +1698,12 @@ function printHelp(output: LineWriter): void {
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--principal-email <email>]...  (once per address the principal uses)');
+  output(
+    '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
+  );
   output('         [--workspace-email <email>] [--provider <id>]');
-  output('         [--ingress existing --endpoint <https-url>]');
-  output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
-  output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]');
   output(
     "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
   );
@@ -1754,13 +1735,13 @@ function printHelp(output: LineWriter): void {
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
-  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
+  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,chat-subscription]');
   output('  cleanup');
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
   );
-  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>]');
-  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
+  output('  create, resume: [--secrets-file <owner-only file under the config root>]');
+  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }
 
@@ -1803,25 +1784,20 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     printHelp(errorOutput);
     return EXIT_CODES.failed;
   }
-  const managedIngressSetup = runtime.managedIngressSetup ?? createManagedIngressSetupSession();
-  const cli = new Cli(runtime, presenter, managedIngressSetup);
+  const cli = new Cli(runtime, presenter);
+  let next: () => Promise<Attempt>;
   try {
-    let next: () => Promise<Attempt>;
-    try {
-      next = cli.prepare(command, args.slice(1));
-    } catch (error) {
-      if (!(error instanceof GwsEaError)) throw error;
-      presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
-      return EXIT_CODES.failed;
-    }
-    for (;;) {
-      const attempt = await next();
-      if (attempt.status === 'done') return attempt.exitCode;
-      if (!runtime.onFailure) return EXIT_CODES.failed;
-      if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
-      next = attempt.retry;
-    }
-  } finally {
-    managedIngressSetup.clearAccountToken();
+    next = cli.prepare(command, args.slice(1));
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
+    return EXIT_CODES.failed;
+  }
+  for (;;) {
+    const attempt = await next();
+    if (attempt.status === 'done') return attempt.exitCode;
+    if (!runtime.onFailure) return EXIT_CODES.failed;
+    if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
+    next = attempt.retry;
   }
 }

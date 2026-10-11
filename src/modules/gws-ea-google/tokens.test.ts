@@ -8,17 +8,20 @@ import {
   type GoogleGrant,
 } from './grant.js';
 import {
+  createHostTokenSource,
   GOOGLE_TOKEN_ENDPOINT,
   GoogleGrantRevokedError,
   GoogleScopeNotGrantedError,
   GoogleTokenError,
   mintCredentialToken,
   mintServiceToken,
+  RENEW_BEFORE_EXPIRY_MS,
 } from './tokens.js';
 
 const GRANT: GoogleGrant = {
-  schema_version: 1,
+  schema_version: 2,
   account: 'juno@example.test',
+  sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',
@@ -30,6 +33,12 @@ const READONLY = 'https://www.googleapis.com/auth/gmail.readonly';
 const MODIFY = 'https://www.googleapis.com/auth/gmail.modify';
 const DRIVE = 'https://www.googleapis.com/auth/drive';
 const CALENDAR = AGENT_GOOGLE_SERVICES.calendar.scopes.join(' ');
+const CHAT = [
+  'https://www.googleapis.com/auth/chat.messages',
+  'https://www.googleapis.com/auth/chat.spaces.readonly',
+  'https://www.googleapis.com/auth/chat.spaces.create',
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
+];
 
 /** A grant from before Drive, Docs, Sheets, Slides and Forms joined the sign-in. */
 const OLD_GRANT: GoogleGrant = {
@@ -289,5 +298,126 @@ describe("minting an agent credential's token", () => {
       refused: true,
     });
     expect(drive.asked).toEqual([`${CALENDAR} ${DRIVE}`]);
+  });
+});
+
+describe("the host's token source", () => {
+  /** Google's token endpoint, numbering the tokens it mints and answering each request with `answer(asked)`. */
+  function numbered(answer: (asked: string) => Answer = () => ({})) {
+    const world = google(answer);
+    let minted = 0;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const response = await world.fetch(input, init);
+      if (!response.ok) return response;
+      minted += 1;
+      const body = (await response.json()) as Record<string, unknown>;
+      return new Response(JSON.stringify({ ...body, access_token: `ya29.host-${minted}` }), { status: 200 });
+    }) as unknown as typeof globalThis.fetch;
+    return { fetch, asked: world.asked };
+  }
+
+  function source(world: ReturnType<typeof numbered>, grant: () => GoogleGrant | undefined, clock = { now: 0 }) {
+    return createHostTokenSource({ readGrant: async () => grant(), fetch: world.fetch, now: () => clock.now });
+  }
+
+  /** Past the point where a token minted at `minted` is renewed. */
+  const renewalAfter = (minted: number): number => minted + 3_599_000 - RENEW_BEFORE_EXPIRY_MS + 1;
+
+  it('holds each token in memory, renewing it only near expiry', async () => {
+    const world = numbered();
+    const clock = { now: 0 };
+    const tokens = source(world, () => GRANT, clock);
+
+    const first = await tokens.accessToken('gmail');
+    clock.now += 30 * 60_000;
+    expect(await tokens.accessToken('gmail')).toBe(first);
+    expect(world.asked).toEqual([MODIFY]);
+
+    clock.now = renewalAfter(0);
+    expect(await tokens.accessToken('gmail')).not.toBe(first);
+    expect(world.asked).toEqual([MODIFY, MODIFY]);
+  });
+
+  it('keeps one token per service', async () => {
+    const world = numbered();
+    const tokens = source(world, () => GRANT);
+
+    const chat = await tokens.accessToken('chat');
+    const directory = await tokens.accessToken('directory-host');
+
+    expect(chat).not.toBe(directory);
+    expect(world.asked).toEqual([CHAT.join(' '), 'https://www.googleapis.com/auth/directory.readonly']);
+    expect(await tokens.accessToken('chat')).toBe(chat);
+  });
+
+  it('mints one token for callers that ask at once', async () => {
+    const world = numbered();
+    const tokens = source(world, () => GRANT);
+
+    const [a, b] = await Promise.all([tokens.accessToken('chat'), tokens.accessToken('chat')]);
+
+    expect(a).toBe(b);
+    expect(world.asked).toHaveLength(1);
+  });
+
+  it('mints afresh from a new sign-in, even while the old token is fresh', async () => {
+    const world = numbered();
+    let grant = GRANT;
+    const tokens = source(world, () => grant);
+    const first = await tokens.accessToken('chat');
+
+    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-10-10T18:00:00.000Z' };
+
+    expect(await tokens.accessToken('chat')).not.toBe(first);
+    expect(world.asked).toHaveLength(2);
+  });
+
+  it('refuses before the assistant signs in, without asking Google', async () => {
+    const world = numbered();
+    await expect(source(world, () => undefined).accessToken('chat')).rejects.toThrow(/not signed in/);
+    expect(world.fetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses a service whose scopes the grant does not hold, without asking Google', async () => {
+    const world = numbered();
+    let grant = OLD_GRANT;
+    const tokens = source(world, () => grant);
+
+    await expect(tokens.accessToken('drive-host')).rejects.toBeInstanceOf(GoogleScopeNotGrantedError);
+    await expect(
+      source(world, () => ({ ...GRANT, scopes: GRANT.scopes.filter((scope) => !CHAT.includes(scope)) })).accessToken(
+        'chat',
+      ),
+    ).rejects.toMatchObject({ code: 'google_scope_not_granted', service: 'chat' });
+    expect(world.fetch).not.toHaveBeenCalled();
+
+    grant = { ...GRANT, granted_at: '2026-10-09T18:00:00.000Z' };
+    await expect(tokens.accessToken('drive-host')).resolves.toBe('ya29.host-1');
+    expect(world.asked).toEqual([DRIVE]);
+  });
+
+  it('stops asking Google after a revoked sign-in, until a new one is written', async () => {
+    const world = numbered(() => ({ status: 400, error: 'invalid_grant' }));
+    let grant = GRANT;
+    const tokens = source(world, () => grant);
+
+    await expect(tokens.accessToken('chat')).rejects.toBeInstanceOf(GoogleGrantRevokedError);
+    await expect(tokens.accessToken('gmail')).rejects.toThrow(/no longer accepts/);
+    expect(world.asked).toHaveLength(1);
+
+    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-10-10T18:00:00.000Z' };
+    await expect(tokens.accessToken('chat')).rejects.toBeInstanceOf(GoogleGrantRevokedError);
+    expect(world.asked).toHaveLength(2);
+  });
+
+  it('asks again on the next call after a failure worth retrying', async () => {
+    let failing = true;
+    const world = numbered(() => (failing ? { status: 503, error: 'backend_error' } : {}));
+    const tokens = source(world, () => GRANT);
+
+    await expect(tokens.accessToken('chat')).rejects.toBeInstanceOf(GoogleTokenError);
+    failing = false;
+    await expect(tokens.accessToken('chat')).resolves.toBe('ya29.host-1');
+    expect(world.asked).toHaveLength(2);
   });
 });

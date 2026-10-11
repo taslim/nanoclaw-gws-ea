@@ -1,6 +1,6 @@
 /**
- * Tests for the core MCP tools' routing context: the a2a reply stamp and the
- * thread an outbound row is addressed to.
+ * Tests for the core MCP tools' routing context: the a2a reply stamp, the
+ * thread an outbound row is addressed to, and the message a reaction lands on.
  *
  * The in_reply_to stamp is published through session_state in outbound.db, not
  * module state — the MCP server runs as a separate stdio subprocess from the
@@ -13,8 +13,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { getAgentMailbox } from '../mailbox/index.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { sendFile, sendMessage } from './core.js';
+import { addReaction, sendFile, sendMessage } from './core.js';
 
 /**
  * Publish the reply stamp the way the poll loop does: a direct write to
@@ -236,5 +237,83 @@ describe('send_message / send_file — a channel destination', () => {
       expect(path.basename(dest)).toBe('report.txt');
       expect(path.dirname(path.dirname(dest))).toBe('/workspace/outbox');
     });
+  });
+});
+
+describe('add_reaction — the message the platform reacts on', () => {
+  const DM = 'gchat:spaces/AAAA';
+
+  beforeEach(async () => {
+    // As the runner starts its mailbox: with the session's identity. The host
+    // stores each message it routes under the platform's id and this agent group.
+    await getAgentMailbox().start({ agentGroupId: 'ag-main', sessionId: 'sess-1', mailbox: null });
+  });
+
+  afterEach(async () => {
+    await getAgentMailbox().stop();
+  });
+
+  function seedRow(id: string): number {
+    hostSeq += 2;
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+         VALUES (?, ?, 'chat-sdk', ?, 'completed', ?, 'gchat', NULL, ?)`,
+      )
+      .run(id, hostSeq, new Date().toISOString(), DM, JSON.stringify({ sender: 'Morgan Ellery', text: 'thanks!' }));
+    return hostSeq;
+  }
+
+  /** React with 👍 on message #seq, and read back what the host is asked to do. */
+  async function reactedOn(seq: number): Promise<{ messageId: string; emoji: string; platformId: string | null }> {
+    const result = (await addReaction.handler({ messageId: seq, emoji: 'thumbs_up' })) as { isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const row = getUndeliveredMessages().at(-1)!;
+    const content = JSON.parse(row.content) as { operation: string; messageId: string; emoji: string };
+    expect(content.operation).toBe('reaction');
+    return { messageId: content.messageId, emoji: content.emoji, platformId: row.platform_id };
+  }
+
+  it("reacts on a person's message by the platform's name for it, without the host's agent-group suffix", async () => {
+    const seq = seedRow('spaces/AAAA/messages/BBBB.BBBB:ag-main');
+
+    expect(await reactedOn(seq)).toEqual({
+      messageId: 'spaces/AAAA/messages/BBBB.BBBB',
+      emoji: 'thumbs_up',
+      platformId: DM,
+    });
+  });
+
+  it('reacts on its own message by the name the platform gave it when it was posted', async () => {
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+         VALUES ('msg-1', 3, ?, 'chat', ?, 'gchat', NULL, ?)`,
+      )
+      .run(new Date().toISOString(), DM, JSON.stringify({ text: 'Booked Thursday 10:00.' }));
+    getInboundDb()
+      .prepare(
+        "INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES ('msg-1', ?, 'delivered', ?)",
+      )
+      .run('spaces/AAAA/messages/CCCC.CCCC', new Date().toISOString());
+
+    expect((await reactedOn(3)).messageId).toBe('spaces/AAAA/messages/CCCC.CCCC');
+  });
+
+  it('leaves an id the host wrote without the suffix as it was stored', async () => {
+    const hostNote = seedRow('qr-msg-17');
+
+    expect((await reactedOn(hostNote)).messageId).toBe('qr-msg-17');
+  });
+
+  it('refuses a message id the session does not have', async () => {
+    const result = (await addReaction.handler({ messageId: 41, emoji: 'thumbs_up' })) as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain('Message #41 not found');
+    expect(getUndeliveredMessages()).toEqual([]);
   });
 });

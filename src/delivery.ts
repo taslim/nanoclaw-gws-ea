@@ -15,6 +15,8 @@ import {
   getActiveSessions,
   getSession,
   createPendingQuestion,
+  getAskQuestionRender,
+  getPendingQuestion,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
@@ -35,7 +37,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { requestWake } from './request-wake.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
-import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { endTypingInConversation, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
@@ -144,6 +146,16 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     status?: string,
     statusKind?: 'auto' | 'agent',
+    /** The message the turn works on in this conversation (ChannelAdapter.setTyping). */
+    anchor?: string,
+  ): Promise<void>;
+  /** The work on the message `anchor` ended (ChannelAdapter.endTyping). */
+  endTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    anchor: string,
+    instance?: string,
   ): Promise<void>;
 }
 
@@ -225,7 +237,19 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
   return {
     async deliver(channelType, platformId, threadId, kind, content, files, instance) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
-      return adapter.deliver(channelType, platformId, threadId, kind, content, files, instance);
+      const platformMessageId = await adapter.deliver(
+        channelType,
+        platformId,
+        threadId,
+        kind,
+        content,
+        files,
+        instance,
+      );
+      // Whatever reached the conversation (a reply, a reaction, a host's
+      // approval request) ends the work each turn anchored there was showing.
+      endTypingInConversation(channelType, platformId, threadId, instance);
+      return platformMessageId;
     },
     ...(adapter.setTyping && { setTyping: adapter.setTyping.bind(adapter) }),
   };
@@ -686,18 +710,45 @@ async function deliverMessage(
     deliverInstance = mg.instance;
   }
 
+  // The agent names its own question, and an answer resolves by that id
+  // alone: getAskQuestionRender reads a pending question before any approval,
+  // so a question carrying an open request's id (an approval, a channel or
+  // sender approval, another question) would let a plain "yes" to it decide
+  // that request. Refused before anything is stored or posted. The one taken
+  // id it may carry is its own — the pending question this same row stored
+  // on an earlier attempt whose send then failed.
+  if (content.type === 'ask_question' && content.questionId) {
+    const questionId = content.questionId as string;
+    if (await getAskQuestionRender(questionId)) {
+      const stored = await getPendingQuestion(questionId);
+      if (stored?.session_id !== session.id || stored.message_out_id !== msg.id) {
+        throw new Error(`question id ${questionId} already names an open request (message ${msg.id})`);
+      }
+    }
+  }
+
   // Track pending questions for ask_user_question flow.
   // Guarded: without the interactive module, `pending_questions` doesn't
   // exist and we skip persistence — the card still delivers to the user,
   // but the response path has nowhere to land and will log unclaimed.
+  // The agent waits timeoutSeconds for the answer; past the deadline stored
+  // here, counted from now, the question takes no answer.
   if (content.type === 'ask_question' && content.questionId && (await hasTable(getDb(), 'pending_questions'))) {
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
-    if (!title || !Array.isArray(rawOptions)) {
-      log.error('ask_question missing required title/options — not persisting', {
+    const timeoutSeconds = content.timeoutSeconds as unknown;
+    if (
+      !title ||
+      !Array.isArray(rawOptions) ||
+      typeof timeoutSeconds !== 'number' ||
+      !Number.isFinite(timeoutSeconds) ||
+      timeoutSeconds <= 0
+    ) {
+      log.error('ask_question missing required title/options/timeoutSeconds — not persisting', {
         questionId: content.questionId,
       });
     } else {
+      const askedAt = Date.now();
       const inserted = await createPendingQuestion({
         question_id: content.questionId,
         session_id: session.id,
@@ -706,8 +757,10 @@ async function deliverMessage(
         channel_type: msg.channelType,
         thread_id: msg.threadId,
         title,
+        question: typeof content.question === 'string' ? content.question : '',
         options: normalizeOptions(rawOptions as never),
-        created_at: new Date().toISOString(),
+        deadline: new Date(askedAt + timeoutSeconds * 1000).toISOString(),
+        created_at: new Date(askedAt).toISOString(),
       });
       if (inserted) {
         log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });

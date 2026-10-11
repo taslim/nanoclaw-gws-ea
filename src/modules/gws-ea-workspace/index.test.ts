@@ -55,8 +55,9 @@ function writeGrant(scopes: readonly string[]): void {
   fs.writeFileSync(
     GRANT_FILE,
     JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       account: 'juno@northwind.example',
+      sub: '104857395723948572901',
       client_id: 'client.apps.googleusercontent.com',
       client_secret: 'client-secret',
       refresh_token: 'refresh-token',

@@ -1,12 +1,12 @@
 /**
- * The host's Google tokens (KTD1, KTD6). Each tick publishes a live token for
+ * Agents' Google tokens (KTD1, KTD6). Each tick publishes a live token for
  * every agent credential through the selected gateway's credential
  * connection, renewing one close to expiry, so the first tick after the host
  * starts, or after the machine wakes, puts a fresh one in place. A credential
  * carries the scopes its services want that the grant holds, and a host the
  * grant holds nothing for gets nothing. The host is the only writer of these
- * credentials. Tokens for host-only services are minted on demand and held in
- * this process's memory alone.
+ * credentials. The host's own tokens come from its token source
+ * (`createHostTokenSource`), which needs no gateway.
  *
  * When Google refuses part of a credential while the grant still works, its
  * first service is published alone, so Calendar keeps working when Drive is
@@ -18,22 +18,8 @@ import type {
   GatewayCredentialTarget,
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
-import {
-  AGENT_GOOGLE_CREDENTIALS,
-  googleGrantIdentity as grantIdentity,
-  type GoogleGrant,
-  type HostGoogleServiceId,
-} from './grant.js';
-import {
-  GoogleGrantRevokedError,
-  mintCredentialToken,
-  mintServiceToken,
-  type ServiceToken,
-  type TokenOptions,
-} from './tokens.js';
-
-/** Renew a token this long before Google expires it. */
-export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
+import { AGENT_GOOGLE_CREDENTIALS, googleGrantIdentity as grantIdentity, type GoogleGrant } from './grant.js';
+import { GoogleGrantRevokedError, mintCredentialToken, RENEW_BEFORE_EXPIRY_MS, type TokenOptions } from './tokens.js';
 
 /** What agents' tools send in place of a token; the gateway replaces it on the credential's host. */
 export const GATEWAY_TOKEN_PLACEHOLDER = 'gateway-managed';
@@ -62,8 +48,6 @@ export interface RefresherOptions {
 
 export interface GoogleTokenRefresher {
   tick(): Promise<void>;
-  /** A live token for a host-only service, held only in this process's memory. */
-  hostAccessToken(service: HostGoogleServiceId): Promise<string>;
 }
 
 /** A credential's token in the gateway: when it expires, and whether it carries its first service alone. */
@@ -80,31 +64,8 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
   const now = options.now ?? Date.now;
   const tokenOptions: TokenOptions = { ...(options.fetch ? { fetch: options.fetch } : {}), now };
   const published = new Map<string, Published>();
-  const hostTokens = new Map<HostGoogleServiceId, { identity: string; token: ServiceToken }>();
-  const minting = new Map<HostGoogleServiceId, Promise<string>>();
   let revoked: string | undefined;
   let current: string | undefined;
-
-  async function mintHostToken(service: HostGoogleServiceId): Promise<string> {
-    const grant = await options.readGrant();
-    if (!grant) throw new Error('The assistant is not signed in to Google yet');
-    const identity = grantIdentity(grant);
-    if (revoked === identity) {
-      throw new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again");
-    }
-    const held = hostTokens.get(service);
-    if (held && held.identity === identity && held.token.expiresAt - now() > RENEW_BEFORE_EXPIRY_MS) {
-      return held.token.accessToken;
-    }
-    try {
-      const token = await mintServiceToken(grant, service, tokenOptions);
-      hostTokens.set(service, { identity, token });
-      return token.accessToken;
-    } catch (error) {
-      if (error instanceof GoogleGrantRevokedError) revoked = identity;
-      throw error;
-    }
-  }
 
   return {
     async tick() {
@@ -162,15 +123,6 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
           });
         }
       }
-    },
-
-    hostAccessToken(service) {
-      // Callers asking at once share one mint.
-      const pending = minting.get(service);
-      if (pending) return pending;
-      const minted = mintHostToken(service).finally(() => minting.delete(service));
-      minting.set(service, minted);
-      return minted;
     },
   };
 }

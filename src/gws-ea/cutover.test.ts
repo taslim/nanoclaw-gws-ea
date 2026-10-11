@@ -2,17 +2,44 @@
  * Proving a stopped assistant quiet before its fence (KTD18): `ps`, Docker,
  * and `lsof` answer through a fake runner, except one check that the real
  * `lsof` finds a real idle opener, and Linux's process table is read from a
- * planted one.
+ * planted one. And the serving gate (KTD12): a started release serves only
+ * once its Google Chat receives, or when a broken Google sign-in is its only
+ * fault, on the fixture's assistants.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { assertInstanceQuiet, openFileHolders, type QuietInstance } from './cutover.js';
+import {
+  assertInstanceQuiet,
+  openCutoverHost,
+  openFileHolders,
+  verifyServingRelease,
+  type CutoverDependencies,
+  type QuietInstance,
+  type ServedRelease,
+} from './cutover.js';
+import { withInstanceOperation } from './journal.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { removeTemporaryRoots, temporaryRoot } from './testing/cutover-fixture.js';
+import { getInstanceReservation } from './registry.js';
+import { releaseName } from './release-layout.js';
+import type { InstanceRuntimeConfig } from './service.js';
+import {
+  assistant,
+  cli,
+  dependencies,
+  machine,
+  nextRelease,
+  release,
+  removeTemporaryRoots,
+  temporaryRoot,
+  world,
+  type Machine,
+  type World,
+} from './testing/cutover-fixture.js';
+import { releaseOf } from './types.js';
 
 afterEach(removeTemporaryRoots);
 
@@ -235,5 +262,110 @@ describe('finding what holds a directory open', () => {
       { pid: 11, command: 'node', file: `${data}/v2.db-shm` },
       { pid: 22, command: 'bash', file: data },
     ]);
+  });
+});
+
+/** The fixture's broken sign-in, as the host's report names it and the operator is told it. */
+function signInNeeded(instanceId: string): string {
+  return (
+    "Sign-in needed for Google Chat: Google no longer accepts the assistant's sign-in; sign in again. " +
+    `Sign the assistant in again with gws-ea connect-google --id ${instanceId}`
+  );
+}
+
+// Each case builds a git-backed machine and assistant, as the update and rollback cases below do.
+describe('the serving gate: a release serves once its Google Chat receives (KTD12)', { timeout: 90_000 }, () => {
+  /** Run the gate on the assistant's live release, as an update or rollback runs it once the release started. */
+  async function verifyLive(
+    host: Machine,
+    runtime: InstanceRuntimeConfig,
+    state: World,
+    overrides: Partial<CutoverDependencies> = {},
+  ): Promise<ServedRelease> {
+    const view = await getInstanceReservation(host.paths, runtime.instance_id);
+    const served = await withInstanceOperation(host.paths, runtime.instance_id, async (operation) =>
+      verifyServingRelease(
+        await openCutoverHost(operation, {
+          ...dependencies(state, { commit: host.first, tool: host.work }, runtime),
+          ...overrides,
+        }),
+        { view, pins: { gateway: '1.41.3' }, leaseHeld: false, subject: 'The release' },
+      ),
+    );
+    if (!served) throw new Error('The test instance operation was busy');
+    return served;
+  }
+
+  it('serves a release whose consumer is connected and subscription active', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+
+    expect(await verifyLive(host, runtime, world(runtime))).toEqual({ signInNeeded: null });
+  });
+
+  it('waits for a consumer that connects only after the host started, asking the host each time', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const state = world(runtime);
+    state.chatDown = true;
+    const fixtureNcl = dependencies(state, { commit: host.first, tool: host.work }, runtime).ncl!;
+    let asked = 0;
+    const ncl: NonNullable<CutoverDependencies['ncl']> = async (config, args, options) => {
+      if (args.join(' ') === 'gws-ea-chat health' && (asked += 1) === 3) delete state.chatDown;
+      return fixtureNcl(config, args, options);
+    };
+
+    expect(await verifyLive(host, runtime, state, { ncl })).toEqual({ signInNeeded: null });
+    expect(asked).toBe(3);
+  });
+
+  it('refuses a release whose consumer never connects, naming why and where its host logs', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const state = world(runtime);
+    state.chatDown = true;
+
+    await expect(verifyLive(host, runtime, state)).rejects.toMatchObject({
+      code: 'chat_not_receiving',
+      message:
+        "The release's host is up, but Google Chat is not receiving: its consumer is not connected " +
+        `(Pub/Sub refused the subscriber (HTTP 403)). Check ${path.join(runtime.instance_root, 'logs', 'nanoclaw.error.log')}.`,
+    });
+  });
+
+  it('refuses a broken sign-in beside any other fault', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const state = world(runtime);
+    state.chatSignInNeeded = true;
+    state.onecliObservation = { status: 'absent', reason: 'its gateway is not running' };
+
+    await expect(verifyLive(host, runtime, state)).rejects.toMatchObject({ code: 'onecli_not_serving' });
+  });
+});
+
+describe('update and rollback through the serving gate (KTD12)', { timeout: 90_000 }, () => {
+  it('serves an update and a rollback whose only fault is a broken Google sign-in, reporting the sign-in needed', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.chatSignInNeeded = true;
+    const id = runtime.instance_id;
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+    expect(out).toContain(`Assistant ${id} was updated to dogfood ${next.commit.slice(0, 12)}.`);
+    expect(out).toContain(`${signInNeeded(id)}.`);
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+    out.length = 0;
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    expect(out).toContain(`Assistant ${id} was rolled back to dogfood ${host.first.slice(0, 12)}.`);
+    expect(out).toContain(`${signInNeeded(id)}.`);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
   });
 });

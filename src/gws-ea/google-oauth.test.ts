@@ -90,7 +90,12 @@ interface GoogleFake {
   readonly exchanges: URLSearchParams[];
 }
 
-function google(answer: { email?: string; verified?: boolean; scope?: string; refresh?: boolean } = {}): GoogleFake {
+/** The assistant's Google account ID, which userinfo reports as `sub`. */
+const SUB = '104857395723948572901';
+
+function google(
+  answer: { email?: string; verified?: boolean; sub?: unknown; scope?: string; refresh?: boolean } = {},
+): GoogleFake {
   const exchanges: URLSearchParams[] = [];
   const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status });
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -111,7 +116,11 @@ function google(answer: { email?: string; verified?: boolean; scope?: string; re
     }
     if (url === GOOGLE_USERINFO_ENDPOINT) {
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer ya29.sign-in');
-      return json({ email: answer.email ?? 'Juno@Example.test', email_verified: answer.verified ?? true });
+      return json({
+        sub: 'sub' in answer ? answer.sub : SUB,
+        email: answer.email ?? 'Juno@Example.test',
+        email_verified: answer.verified ?? true,
+      });
     }
     return json({}, 404);
   }) as unknown as typeof globalThis.fetch;
@@ -166,8 +175,9 @@ describe('signing in as the assistant', () => {
     expect(challenge).toBe(auth.searchParams.get('code_challenge'));
 
     expect(parseGoogleGrant(grant)).toEqual({
-      schema_version: 1,
+      schema_version: 2,
       account: 'juno@example.test',
+      sub: SUB,
       client_id: CLIENT.client_id,
       client_secret: CLIENT.client_secret,
       refresh_token: '1//refresh',
@@ -186,6 +196,20 @@ describe('signing in as the assistant', () => {
     ).rejects.toMatchObject({
       code: 'google_account_mismatch',
       message: expect.stringMatching(/morgan@example\.test.*juno@example\.test/) as unknown,
+    });
+  });
+
+  it.each([
+    ['no account ID', undefined],
+    ["an account ID that is not Google's numeric one", 'users/104857395723948572901'],
+  ])('refuses a sign-in for which Google reports %s, and keeps nothing', async (_label, sub) => {
+    const g = google({ sub });
+    const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
+    await expect(
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
+    ).rejects.toMatchObject({
+      code: 'google_sign_in_failed',
+      message: 'Google did not say which account signed in',
     });
   });
 
@@ -208,46 +232,64 @@ describe('signing in as the assistant', () => {
     });
   });
 
-  it('asks for the Workspace scopes, and refuses a sign-in that leaves them unticked', async () => {
-    const workspace = /\/auth\/(drive|documents|spreadsheets|presentations|forms\.)/u;
-    const withoutWorkspace = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !workspace.test(scope)).map((scope) =>
-      scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
-    );
-    const g = google({ scope: withoutWorkspace.join(' ') });
-    const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
+  it.each([
+    [
+      'Workspace',
+      /\/auth\/(drive|documents|spreadsheets|presentations|forms\.)/u,
+      // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the rest of those products' scopes the ceiling adds.
+      [
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/presentations',
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/forms.responses.readonly',
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/drive.metadata',
+        'https://www.googleapis.com/auth/drive.metadata.readonly',
+        'https://www.googleapis.com/auth/drive.activity',
+        'https://www.googleapis.com/auth/drive.activity.readonly',
+        'https://www.googleapis.com/auth/drive.labels',
+        'https://www.googleapis.com/auth/drive.labels.readonly',
+        'https://www.googleapis.com/auth/drive.meet.readonly',
+        'https://www.googleapis.com/auth/documents.readonly',
+        'https://www.googleapis.com/auth/spreadsheets.readonly',
+        'https://www.googleapis.com/auth/presentations.readonly',
+        'https://www.googleapis.com/auth/forms.body.readonly',
+      ],
+    ],
+    [
+      'Chat',
+      /\/auth\/chat\.(messages|spaces\.readonly|spaces\.create|memberships\.readonly)$/u,
+      // The host's Chat token's scopes.
+      [
+        'https://www.googleapis.com/auth/chat.messages',
+        'https://www.googleapis.com/auth/chat.spaces.readonly',
+        'https://www.googleapis.com/auth/chat.spaces.create',
+        'https://www.googleapis.com/auth/chat.memberships.readonly',
+      ],
+    ],
+  ] as const)(
+    'asks for the %s scopes, and refuses a sign-in that leaves them unticked, naming them',
+    async (_product, unticked, scopes) => {
+      const granted = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !unticked.test(scope)).map((scope) =>
+        scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
+      );
+      const g = google({ scope: granted.join(' ') });
+      const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
 
-    const error = await signInAsAssistant({
-      client: CLIENT,
-      account: 'juno@example.test',
-      present: b.present,
-      fetch: g.fetch,
-    }).catch((caught: unknown) => caught);
+      const error = await signInAsAssistant({
+        client: CLIENT,
+        account: 'juno@example.test',
+        present: b.present,
+        fetch: g.fetch,
+      }).catch((caught: unknown) => caught);
 
-    // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the rest of those products' scopes the ceiling adds.
-    const workspaceScopes = [
-      'https://www.googleapis.com/auth/drive',
-      'https://www.googleapis.com/auth/documents',
-      'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/presentations',
-      'https://www.googleapis.com/auth/forms.body',
-      'https://www.googleapis.com/auth/forms.responses.readonly',
-      'https://www.googleapis.com/auth/drive.readonly',
-      'https://www.googleapis.com/auth/drive.metadata',
-      'https://www.googleapis.com/auth/drive.metadata.readonly',
-      'https://www.googleapis.com/auth/drive.activity',
-      'https://www.googleapis.com/auth/drive.activity.readonly',
-      'https://www.googleapis.com/auth/drive.labels',
-      'https://www.googleapis.com/auth/drive.labels.readonly',
-      'https://www.googleapis.com/auth/drive.meet.readonly',
-      'https://www.googleapis.com/auth/documents.readonly',
-      'https://www.googleapis.com/auth/spreadsheets.readonly',
-      'https://www.googleapis.com/auth/presentations.readonly',
-      'https://www.googleapis.com/auth/forms.body.readonly',
-    ];
-    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(expect.arrayContaining(workspaceScopes));
-    expect(error).toMatchObject({ code: 'google_scope_missing' });
-    expect(String(error)).toContain(`did not grant ${workspaceScopes.join(', ')};`);
-  });
+      expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(expect.arrayContaining([...scopes]));
+      expect(error).toMatchObject({ code: 'google_scope_missing' });
+      expect(String(error)).toContain(`did not grant ${scopes.join(', ')};`);
+    },
+  );
 
   it('refuses a sign-in that returns no refresh token', async () => {
     const g = google({ refresh: false });
@@ -360,8 +402,9 @@ describe('the grant file', () => {
   it('is written owner-only and atomically', async () => {
     const file = path.join(ROOT, 'secrets', 'google-grant.json');
     const grant = parseGoogleGrant({
-      schema_version: 1,
+      schema_version: 2,
       account: 'juno@example.test',
+      sub: SUB,
       ...CLIENT,
       refresh_token: '1//refresh',
       scopes: ['openid'],

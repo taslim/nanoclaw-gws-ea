@@ -1,5 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, utimes, writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:net';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -7,13 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NanoclawServiceHelpers } from './service-control.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
-import {
-  readProvisionJournal,
-  recordPrincipalSelection,
-  reserveInstance,
-  withInstanceOperation,
-  type InstanceOperation,
-} from './journal.js';
+import { deriveGcpClaims, deriveGcpProjectId } from './gcp-identity.js';
+import { readProvisionJournal, reserveInstance, withInstanceOperation, type InstanceOperation } from './journal.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
@@ -28,6 +22,7 @@ import {
 } from './phases.js';
 import {
   createProductionProvisionSteps,
+  fixPrincipalChatAddress,
   installProductionBootstrapManifest,
   loadProductionBootstrapManifest,
   removeProductionBootstrapManifest,
@@ -52,7 +47,6 @@ import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
-  googleChatProjectNumberFile,
   instanceHostConfiguration,
   instanceServiceDefinitionFile,
   loadInstanceRuntimeConfig,
@@ -62,7 +56,6 @@ import {
   type UpsertEnvVars,
   type WaitForHostOptions,
 } from './service.js';
-import type { ManagedTransport } from './cloudflare-ingress.js';
 import { KILLED_INSTALL_LEFTOVER, releaseRepository, stagingWorld } from './testing/release-fixture.js';
 import {
   GwsEaError,
@@ -72,7 +65,6 @@ import {
   type InstanceReservationInput,
   type ProvisionStepId,
 } from './types.js';
-import type { CloudflareZoneChoice } from './create-input.js';
 import type { ConversationNotReadyReason } from './verify.js';
 
 const roots: string[] = [];
@@ -88,62 +80,29 @@ async function testPaths(): Promise<ControlPlanePaths> {
   return resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') });
 }
 
+const INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
+const PROJECT = deriveGcpProjectId(INSTANCE_ID);
+
 function reservation(
-  allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
+  allocatedPorts: AllocatedPorts = { onecli_app: 3201, onecli_gateway: 3301 },
 ): InstanceReservationInput {
-  const instanceId = '11111111-1111-4111-8111-111111111111';
   return {
-    instance_id: instanceId,
+    instance_id: INSTANCE_ID,
     release_track: 'dogfood',
     source_remote: 'https://example.com/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
     allocated_ports: allocatedPorts,
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.com/webhook/gchat' },
-      gcp_project_id: 'gws-ea-dogfood',
+      ...deriveGcpClaims(INSTANCE_ID),
       gcp_account: 'operator@example.com',
-      gchat_service_account: 'gws-ea-chat@gws-ea-dogfood.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.com',
       onecli_project: 'gws_ea_1',
     },
   };
 }
 
-function managedReservation(
-  allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
-): InstanceReservationInput {
-  const input = reservation(allocatedPorts);
-  return {
-    ...input,
-    exclusive_resource_claims: {
-      ...input.exclusive_resource_claims,
-      ingress: {
-        mode: 'managed-cloudflare',
-        account_id: 'a'.repeat(32),
-        zone_id: 'b'.repeat(32),
-        zone_name: 'example.com',
-        hostname: 'assistant.example.com',
-        callback_url: 'https://assistant.example.com/webhook/gchat',
-        dns_record_id: null,
-      },
-    },
-  };
-}
-
-async function listen(server: Server, port: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
-  });
-}
-
-async function close(server: Server): Promise<void> {
-  if (!server.listening) return;
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-}
-
 function serviceAccount(overrides: Readonly<Record<string, string>> = {}): string {
-  const projectId = overrides.project_id ?? 'gws-ea-dogfood';
+  const projectId = overrides.project_id ?? PROJECT;
   return JSON.stringify({
     type: 'service_account',
     project_id: projectId,
@@ -158,6 +117,16 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
     universe_domain: 'googleapis.com',
     ...overrides,
   });
+}
+
+/** The Chat subscriber key `provision_gcp` publishes, owner-only in the runtime's secrets. */
+async function writeSubscriberKey(
+  context: ProductionProvisionContext,
+  overrides: Readonly<Record<string, string>> = {},
+): Promise<void> {
+  const file = context.input.runtime.secret_files.gchat_subscriber_key;
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, serviceAccount(overrides), { mode: 0o600 });
 }
 
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
@@ -184,8 +153,8 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       principal_display_name: 'Principal',
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['principal@example.test'],
+      principal_chat_email: 'principal@example.test',
     },
-    selected_messaging_group_id: null,
   };
 }
 
@@ -196,8 +165,8 @@ afterEach(async () => {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_dm_required',
-  message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+  code: 'principal_chat_request_pending',
+  message: "Juno Hale must accept the assistant's chat request in Google Chat, then resume.",
 };
 
 /** An in-memory world of named resources for exercising the step engine. */
@@ -257,29 +226,29 @@ function worldResource(world: World, name: string, unknown?: 'create-by-unique-i
   };
 }
 
-function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'): ProvisionSteps<World> {
+function worldSteps(world: World): ProvisionSteps<World> {
   const step = (id: ProvisionStepId, extra: Partial<ProvisionStep<World>> = {}): ProvisionStep<World> => ({
     label: `Running ${id}…`,
     resources: [worldResource(world, id)],
     ...extra,
   });
   const runtime = (id: ProvisionStepId): ProvisionStep<World> => step(id, { liveness: { label: `Checking ${id}…` } });
-  const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
+  const principalPauseNeeds = ['start_nanoclaw'] as const;
   return {
     materialize_checkout: step('materialize_checkout'),
     provision_gcp: step('provision_gcp'),
     start_onecli: runtime('start_onecli'),
     configure_provider: step('configure_provider'),
-    start_nanoclaw: runtime('start_nanoclaw'),
-    establish_transport: ingress === 'managed' ? runtime('establish_transport') : step('establish_transport'),
     configure_channel: step('configure_channel'),
+    sign_in_google: step('sign_in_google'),
+    start_nanoclaw: runtime('start_nanoclaw'),
     connect_google: step('connect_google'),
     bind_principal: step('bind_principal', { pauseNeeds: principalPauseNeeds }),
     verify_conversation: step('verify_conversation', { pauseNeeds: principalPauseNeeds }),
   };
 }
 
-async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
+async function engineFixture() {
   const paths = await testPaths();
   const reserved = await reserveInstance(paths, reservation());
   const world: World = {
@@ -296,7 +265,7 @@ async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
   const sleeps: number[] = [];
   const events: RunEvent[] = [];
   const signIns: string[] = [];
-  let steps = worldSteps(world, ingress);
+  let steps = worldSteps(world);
   let signIn: (() => Promise<void>) | undefined = async () => void signIns.push('signed in');
   return {
     paths,
@@ -596,8 +565,9 @@ describe('step engine', () => {
 
   it('checks completed runtime steps once per run, waiting on one that is still starting', async () => {
     const engine = await engineFixture();
-    const chat: ProvisionHumanPause = { ...DM_PAUSE, phase: 'configure_channel', code: 'chat_configuration_required' };
-    engine.world.pauseOnApply.set('configure_channel', chat);
+    // A pause after the host has started, so the next run re-checks both runtimes first.
+    const signIn: ProvisionHumanPause = { ...DM_PAUSE, phase: 'connect_google', code: 'google_sign_in_required' };
+    engine.world.pauseOnApply.set('connect_google', signIn);
     await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
 
     engine.world.pauseOnApply.clear();
@@ -629,11 +599,8 @@ describe('step engine', () => {
     expect(engine.world.applied.filter((name) => name === 'configure_provider')).toHaveLength(1);
   });
 
-  it.each([
-    ['existing', ['start_nanoclaw']],
-    ['managed', ['start_nanoclaw', 'establish_transport']],
-  ] as const)('before the DM pause re-checks only the host (and connector when %s)', async (ingress, rechecked) => {
-    const engine = await engineFixture(ingress);
+  it('before the DM pause re-checks only the host', async () => {
+    const engine = await engineFixture();
     engine.world.pauseOnApply.set('bind_principal', DM_PAUSE);
     await expect(engine.run()).resolves.toEqual({ status: 'paused', pause: DM_PAUSE });
 
@@ -641,7 +608,7 @@ describe('step engine', () => {
     await expect(engine.run()).resolves.toEqual({ status: 'paused', pause: DM_PAUSE });
 
     const afterPause = engine.world.observed.slice(engine.world.observed.lastIndexOf('bind_principal') + 1);
-    expect(afterPause).toEqual(rechecked);
+    expect(afterPause).toEqual(['start_nanoclaw']);
   });
 
   it('still names the pending human action when a failed re-check blocks the pause', async () => {
@@ -731,6 +698,62 @@ describe('production bootstrap trust boundary', () => {
     }
   });
 
+  it("keeps the principal's Google Chat address only as one of their addresses", async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    const manifest = bootstrapManifest(paths);
+    const load = async (principalChatEmail: unknown) => {
+      await writeFile(
+        file,
+        JSON.stringify({
+          ...manifest,
+          identity: {
+            ...manifest.identity,
+            principal_emails: ['principal@example.test', 'second@example.test'],
+            principal_chat_email: principalChatEmail,
+          },
+        }),
+        { mode: 0o600 },
+      );
+      return loadProductionBootstrapManifest(file);
+    };
+
+    await expect(load('Second@Example.test')).resolves.toMatchObject({
+      identity: { principal_chat_email: 'second@example.test' },
+    });
+    for (const invalid of [undefined, 'colleague@example.test', 'not-an-email', ['principal@example.test']]) {
+      await expect(load(invalid), JSON.stringify(invalid)).rejects.toMatchObject({
+        code: 'invalid_bootstrap_manifest',
+        message: expect.stringMatching(/Chat address/u),
+      });
+    }
+  });
+
+  it("fixes the principal's Chat address in the journal while create's setup file holds it, and reads it from there after", async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+    const manifest = {
+      ...bootstrapManifest(paths),
+      identity: {
+        ...bootstrapManifest(paths).identity,
+        principal_emails: ['principal@example.test', 'second@example.test'],
+        principal_chat_email: 'second@example.test',
+      },
+    };
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const journal = await readProvisionJournal(paths, reserved.instance_id);
+      await expect(fixPrincipalChatAddress(operation, journal, undefined)).rejects.toMatchObject({
+        code: 'bootstrap_required',
+      });
+      await expect(fixPrincipalChatAddress(operation, journal, manifest)).resolves.toBe('second@example.test');
+      // Main is published and the setup file is gone: the journal still holds it.
+      const fixed = await readProvisionJournal(paths, reserved.instance_id);
+      expect(fixed.decisions.principal_chat_email).toBe('second@example.test');
+      await expect(fixPrincipalChatAddress(operation, fixed, undefined)).resolves.toBe('second@example.test');
+    });
+  });
+
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
     const input = reservation();
@@ -798,7 +821,7 @@ describe('production bootstrap trust boundary', () => {
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
         runProductionProvision(operation, {
           upsertEnvVars: recordEnv,
-          hostStatus: servingHost(reserved),
+          hostStatus: servingHost(),
           serviceHelpers: UNUSED_SERVICE_HELPERS,
         }),
       ),
@@ -816,7 +839,7 @@ describe('production bootstrap trust boundary', () => {
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
         runProductionProvision(operation, {
           upsertEnvVars: recordEnv,
-          hostStatus: servingHost(reserved),
+          hostStatus: servingHost(),
           serviceHelpers: UNUSED_SERVICE_HELPERS,
         }),
       ),
@@ -874,7 +897,7 @@ describe('production bootstrap trust boundary', () => {
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
         runProductionProvision(operation, {
           upsertEnvVars: recordEnv,
-          hostStatus: servingHost(reserved),
+          hostStatus: servingHost(),
           serviceHelpers: UNUSED_SERVICE_HELPERS,
         }),
       ),
@@ -921,8 +944,8 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         instanceId: reserved.instance_id,
         projectId: reserved.exclusive_resource_claims.gcp_project_id,
         account: reserved.exclusive_resource_claims.gcp_account,
-        serviceAccountEmail: reserved.exclusive_resource_claims.gchat_service_account,
-        credentialFile: runtime.secret_files.gchat_credentials,
+        serviceAccountEmail: reserved.exclusive_resource_claims.gchat_subscriber_account,
+        credentialFile: runtime.secret_files.gchat_subscriber_key,
         cwd: runtime.instance_root,
       },
       providerCredentialMetadata: {
@@ -944,6 +967,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
       },
       principalDisplayName: 'Principal',
+      principalChatEmail: 'principal@example.test',
       adapterInstance: 'gchat',
       provisioningStartedAt: '2026-09-18T18:00:00.000Z',
       chatConfigured: false,
@@ -953,8 +977,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         homeDirectory: path.dirname(operation.paths.stateRoot),
         runningAsRoot: false,
       },
-      ingress: reserved.exclusive_resource_claims.ingress,
-      hostStatus: servingHost(reserved),
+      hostStatus: servingHost(),
       google: {
         runtime,
         assistantWorkspaceEmail: reserved.exclusive_resource_claims.workspace_email,
@@ -968,20 +991,21 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
 }
 
 /** What upstream `queryHost` returns for this checkout's running host. */
-function hostStatusOf(reserved: InstanceReservation, overrides: Readonly<Record<string, unknown>> = {}) {
+function hostStatusOf(overrides: Readonly<Record<string, unknown>> = {}) {
   return {
     pid: 4242,
     started_at: '2026-09-25T12:00:00.000Z',
     instance_id: 'host-instance-1',
-    webhook: { id: 'listener-1', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+    // Chat's events are pulled, so the host listens on no webhook.
+    webhook: null,
     channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
     ...overrides,
   };
 }
 
 /** Upstream's host-status helpers for a host that is up and connected. */
-function servingHost(reserved: InstanceReservation): HostStatusHelpers {
-  return { queryHost: async () => hostStatusOf(reserved), waitForHost: async () => hostStatusOf(reserved) };
+function servingHost(): HostStatusHelpers {
+  return { queryHost: async () => hostStatusOf(), waitForHost: async () => hostStatusOf() };
 }
 
 /** Write the release receipt create's preflight records, with the OneCLI cohort the release pinned. */
@@ -1168,18 +1192,16 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
 }
 
 describe('production provision step composition', () => {
-  it.each([
-    ['existing', ['start_onecli', 'start_nanoclaw']],
-    ['managed', ['start_onecli', 'start_nanoclaw', 'establish_transport']],
-  ] as const)('re-checks only runtime steps once complete (%s ingress)', async (mode, runtime) => {
+  it('re-checks only runtime steps once complete', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation() : reservation());
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const steps = createProductionProvisionSteps(productionContext(operation, reserved));
-      expect(PROVISION_STEPS.filter((id) => steps[id].liveness)).toEqual(runtime);
-      expect(steps.bind_principal.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
-      expect(steps.verify_conversation.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
+      expect(PROVISION_STEPS.filter((id) => steps[id].liveness)).toEqual(['start_onecli', 'start_nanoclaw']);
+      // Chat's events are pulled by the host, so the principal's pauses need only the host.
+      expect(steps.bind_principal.pauseNeeds).toEqual(['start_nanoclaw']);
+      expect(steps.verify_conversation.pauseNeeds).toEqual(['start_nanoclaw']);
       expect(steps.configure_channel.pauseNeeds).toBeUndefined();
     });
   });
@@ -1223,10 +1245,15 @@ describe('production provision step composition', () => {
 
       expect(resources.map((resource) => [resource.name, resource.unknown ?? 'wait'])).toEqual([
         ['the Google Cloud project', 'create-by-unique-id'],
+        ['the billing account link', 'wait'],
         ['the Google Cloud APIs', 'wait'],
-        ['the Google Chat service account', 'wait'],
-        ['the Google Chat credential', 'wait'],
-        ['the Google Chat key-creation policy', 'wait'],
+        ['the Google Chat events topic', 'wait'],
+        ['the Google Chat events subscription', 'wait'],
+        ['the publisher grant on the topic', 'wait'],
+        ['the Chat subscriber account', 'wait'],
+        ["the subscriber's grant on the subscription", 'wait'],
+        ['the Chat subscriber key', 'wait'],
+        ['the key-creation policy', 'wait'],
       ]);
     });
   });
@@ -1470,269 +1497,55 @@ describe('production provision step composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
-  it('hands the managed transport its instance, claim, and platform, and asks for the account token only through it', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation());
-    const claim = reserved.exclusive_resource_claims.ingress;
-    if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
-    const resources = [{ name: 'the managed transport', observe: async () => PRESENT, apply: async () => undefined }];
-    let transport: ManagedTransport | undefined;
-    const requested: string[] = [];
-    let retained: string | undefined;
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: {
-          ...base.input,
-          managedIngressSetup: {
-            discoverZones: vi.fn(),
-            retainAccountToken: vi.fn(),
-            clearAccountToken: vi.fn(),
-            requireAccountToken: (accountId) => {
-              if (retained === undefined) {
-                throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
-              }
-              expect(accountId).toBe(claim.account_id);
-              return retained;
-            },
-          },
-          requestCloudflareAccountToken: async (accountId, reason) => {
-            requested.push(`${accountId}:${reason}`);
-            return 'requested-account-token';
-          },
-        },
-      };
-      const step = createProductionProvisionSteps(context, {
-        managedTransportResources: (received) => {
-          transport = received;
-          return resources;
-        },
-      }).establish_transport;
-
-      expect(step.resources.slice(0, -1)).toMatchObject(resources.map(({ name, observe }) => ({ name, observe })));
-      expect(step.resources.at(-1)?.name).toBe('the Cloudflare token kept for setup');
-      expect(step.liveness).toBeDefined();
-      expect(transport).toMatchObject({
-        paths,
-        instanceId: reserved.instance_id,
-        claim,
-        platform: 'macos',
-        webhookPort: reserved.allocated_ports.nanoclaw_webhook,
-        dockerEndpoint: 'unix:///var/run/docker.sock',
-      });
-      await expect(transport!.accountToken('Cloudflare must route the callback')).resolves.toBe(
-        'requested-account-token',
-      );
-      retained = 'retained-account-token';
-      await expect(transport!.accountToken('Cloudflare must route the callback')).resolves.toBe(
-        'retained-account-token',
-      );
-    });
-
-    expect(requested).toEqual([`${claim.account_id}:Cloudflare must route the callback`]);
-  });
-
-  it('keeps the account token only until the route is set up, and asks again only when Cloudflare refuses it', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation());
-    const claim = reserved.exclusive_resource_claims.ingress;
-    if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
-    const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
-    const accepted = new Set(['first-token', 'second-token', 'third-token']);
-    const routable = new Set(['first-token', 'third-token']);
-    const asked: string[] = [];
-    let answering = true;
-    /** One run's token session: it holds a token only after listing its zones. */
-    const session = () => {
-      let held: string | undefined;
-      return {
-        discoverZones: vi.fn(async (token: string): Promise<readonly CloudflareZoneChoice[]> => {
-          if (!answering) throw new GwsEaError('cloudflare_unavailable', 'Cloudflare did not answer the request');
-          if (!accepted.has(token))
-            throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the token');
-          return [
-            {
-              zoneId: 'e'.repeat(32),
-              name: 'example.com',
-              accountId: claim.account_id,
-              accountName: 'A',
-              status: 'active',
-            },
-          ];
-        }),
-        retainAccountToken: vi.fn((token: string) => {
-          held = token;
-        }),
-        clearAccountToken: vi.fn(() => {
-          held = undefined;
-        }),
-        requireAccountToken: (accountId: string) => {
-          if (held === undefined || accountId !== claim.account_id) {
-            throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
-          }
-          return held;
-        },
-      };
-    };
-    const run = (answer: string) =>
-      withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-        const base = productionContext(operation, reserved);
-        let transport: ManagedTransport | undefined;
-        const steps = createProductionProvisionSteps(
-          {
-            ...base,
-            input: {
-              ...base.input,
-              managedIngressSetup: session(),
-              requestCloudflareAccountToken: async () => {
-                asked.push(answer);
-                return answer;
-              },
-            },
-          },
-          {
-            managedTransportResources: (received) => {
-              transport = received;
-              return [
-                {
-                  name: 'the Cloudflare route',
-                  observe: async () => ABSENT,
-                  apply: async () => {
-                    const token = await received.accountToken('Cloudflare must route the callback');
-                    if (!routable.has(token)) {
-                      throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the tunnel change');
-                    }
-                    return undefined;
-                  },
-                },
-              ];
-            },
-          },
-        );
-        return {
-          token: await transport!.accountToken('Cloudflare must route the callback'),
-          transport: transport!,
-          steps,
-          base,
-        };
-      });
-
-    // The first run asks, and keeps the answer owner-only for this create's later runs.
-    await expect(run('first-token')).resolves.toMatchObject({ token: 'first-token' });
-    expect(await readFile(kept, 'utf8')).toBe('first-token');
-    expect((await stat(kept)).mode & 0o777).toBe(0o600);
-
-    // A later run reuses it without asking.
-    await expect(run('unused')).resolves.toMatchObject({ token: 'first-token' });
-    expect(asked).toEqual(['first-token']);
-
-    // Cloudflare not answering is no refusal: the run stops, and the kept token stays for the next one.
-    answering = false;
-    await expect(run('unused')).rejects.toMatchObject({ code: 'cloudflare_unavailable' });
-    expect(asked).toEqual(['first-token']);
-    expect(await readFile(kept, 'utf8')).toBe('first-token');
-    answering = true;
-
-    // A kept token Cloudflare now refuses is forgotten, and the operator is asked again.
-    accepted.delete('first-token');
-    await expect(run('second-token')).resolves.toMatchObject({ token: 'second-token' });
-    expect(asked).toEqual(['first-token', 'second-token']);
-    expect(await readFile(kept, 'utf8')).toBe('second-token');
-
-    // A token that still lists zones but that Cloudflare refuses for the route change is forgotten
-    // too, held and kept, so the same run asks again.
-    const refused = await run('third-token');
-    if (!refused) throw new Error('the instance operation is busy');
-    const route = refused.steps.establish_transport.resources[0]!;
-    await expect(route.apply(refused.base)).rejects.toMatchObject({ code: 'cloudflare_capability_missing' });
-    await expect(stat(kept)).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(refused.transport.accountToken('Cloudflare must route the callback')).resolves.toBe('third-token');
-    expect(asked).toEqual(['first-token', 'second-token', 'third-token']);
-    await expect(route.apply(refused.base)).resolves.toBeUndefined();
-
-    // Once the route is set up, the step's last item deletes the kept token.
-    const last = await run('unused');
-    if (!last) throw new Error('the instance operation is busy');
-    const { steps, base } = last;
-    const forgotten = steps.establish_transport.resources.at(-1)!;
-    await expect(forgotten.observe(base)).resolves.toMatchObject({ status: 'absent' });
-    await forgotten.apply(base);
-    await expect(forgotten.observe(base)).resolves.toBe(PRESENT);
-    await expect(stat(kept)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {
+  it("pauses for the Chat API configuration: the assistant's name, avatar, and description, with interactive features off", async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
-    const managedTransportResources = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context, {
-        verifyRoute: async ({ endpointUrl }) => endpointUrl,
-        managedTransportResources,
-      }).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'existing_endpoint_required' });
-      expect(createProductionProvisionSteps(context).establish_transport.liveness).toBeUndefined();
-    });
-
-    expect(managedTransportResources).not.toHaveBeenCalled();
-  });
-
-  it('pauses with the exact project-scoped Chat configuration handoff', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation());
-    const verifyRoute = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context, { verifyRoute }).configure_channel.resources[0]!;
-
-      await expect(phase.observe(context)).resolves.toMatchObject({
-        status: 'pause',
-        pause: {
-          code: 'chat_configuration_required',
-          details: [
-            'App name: Aya',
-            expect.stringContaining('avatar'),
-            expect.stringContaining('Google Workspace add-on'),
-            expect.stringContaining('https://assistant.example.com/webhook/gchat'),
-            expect.stringContaining('visibility'),
-          ],
-          actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
-          resumeFlag: '--chat-configured',
-        },
-      });
-    });
-
-    expect(verifyRoute).not.toHaveBeenCalled();
-  });
-
-  it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
       const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
 
-      expect(context.input.runtime.endpoint_url).toBe('https://assistant.example.com/webhook/gchat');
-      await expect(phase.observe(context)).resolves.toMatchObject({
+      const observed = await phase.observe(context);
+      expect(observed).toEqual({
         status: 'pause',
         pause: {
-          details: expect.arrayContaining([expect.stringContaining('https://assistant.example.com/webhook/gchat')]),
+          kind: 'human-action',
+          phase: 'configure_channel',
+          code: 'chat_configuration_required',
+          message: "Configure the Google Chat API for this assistant's project, then confirm it.",
+          details: [
+            'App name: Aya',
+            'Avatar URL: a public HTTPS image of the assistant',
+            'Description: a short line, such as "Executive assistant to Principal"',
+            'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+          ],
+          actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
+          resumeFlag: '--chat-configured',
         },
       });
+      // No endpoint, callback, or add-on: Chat's events are pulled.
+      const shown = JSON.stringify(observed);
+      expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
+      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
+    });
+  });
+
+  it("takes the operator's confirmation as the Chat configuration", async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = { ...base, input: { ...base.input, chatConfigured: true } };
+      const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
     });
   });
 
   it.each([
     ['project', { project_id: 'different-project' }],
-    ['identity', { client_email: 'other@gws-ea-dogfood.iam.gserviceaccount.com' }],
+    ['identity', { client_email: `other@${PROJECT}.iam.gserviceaccount.com` }],
   ] as const)('rejects a service-account %s swap before starting NanoClaw', async (_label, credentialOverride) => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
@@ -1742,13 +1555,7 @@ describe('production provision step composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(credentialOverride), {
-        mode: 0o600,
-      });
+      await writeSubscriberKey(context, credentialOverride);
       const definitions = createProductionProvisionSteps(context, { reconcileInstanceRuntime: startRuntime });
 
       const host = definitions.start_nanoclaw.resources[0]!;
@@ -1767,7 +1574,7 @@ describe('production provision step composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
-      const queryHost = vi.fn(async () => hostStatusOf(reserved));
+      const queryHost = vi.fn(async () => hostStatusOf());
       const waitForHost = vi.fn();
       const context: ProductionProvisionContext = {
         ...base,
@@ -1796,123 +1603,61 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('waits with a reason, and raises no port error, while a host that holds its webhook port has not opened its socket', async () => {
+  it('waits with a reason while a started host has not opened its socket', async () => {
     const paths = await testPaths();
-    // The assistant's own host has bound its webhook port; only its ncl socket is still closed.
-    const webhook = createServer();
-    await listen(webhook, 0);
-    const port = (webhook.address() as { port: number }).port;
-    const bound = await reserveInstance(
-      paths,
-      reservation({ nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
-    );
+    const reserved = await reserveInstance(paths, reservation());
     const events: RunEvent[] = [];
     let socketOpen = false;
 
-    try {
-      await withInstanceOperation(paths, bound.instance_id, async (operation) => {
-        const base = productionContext(operation, bound);
-        const socketClosed = () =>
-          new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
-        const waitForHost = vi.fn(async (_root: string, _options?: WaitForHostOptions) => {
-          socketOpen = true;
-          return hostStatusOf(bound);
-        });
-        const context: ProductionProvisionContext = {
-          ...base,
-          input: {
-            ...base.input,
-            hostStatus: {
-              queryHost: async () => {
-                if (!socketOpen) throw socketClosed();
-                return hostStatusOf(bound);
-              },
-              waitForHost,
-            },
-          },
-        };
-        await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
-          recursive: true,
-          mode: 0o700,
-        });
-        await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
-        const findPortHolder = vi.fn();
-        const reconcileInstanceRuntime = vi.fn(async () => ({ pid: 4242 }) as never);
-        const step = createProductionProvisionSteps(
-          context,
-          {
-            getOwnedGcpProjectNumber: async () => '441811502258',
-            reconcileInstanceRuntime,
-            instanceServicePid: async () => undefined,
-            findPortHolder,
-            reconcileMainIdentity: vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' })),
-            observeMainIdentity: async () => (socketOpen ? PRESENT : ABSENT),
-          },
-          { emit: (event) => void events.push(event) },
-        ).start_nanoclaw;
-
-        await expect(
-          runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
-        ).resolves.toEqual({ status: 'ready' });
-        expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
-        expect(waitForHost).toHaveBeenCalledWith(paths.checkoutRoot(bound.instance_id), {
-          channel: 'gchat',
-          pid: 4242,
-          alive: expect.any(Function),
-          timeoutMs: expect.any(Number),
-        });
-        expect(events).toContainEqual({
-          type: 'step-waiting',
-          step: 'start_nanoclaw',
-          reason: 'Waiting for the assistant to connect Google Chat…',
-        });
-        expect(findPortHolder).not.toHaveBeenCalled();
-      });
-    } finally {
-      await close(webhook);
-    }
-  });
-
-  it('names a foreign process on the webhook port when the host does not become ready', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation());
-
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
-      const exited = new Error('NanoClaw exited before becoming ready. Check logs/nanoclaw.error.log.');
+      const socketClosed = () =>
+        new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
+      const waitForHost = vi.fn(async (_root: string, _options?: WaitForHostOptions) => {
+        socketOpen = true;
+        return hostStatusOf();
+      });
       const context: ProductionProvisionContext = {
         ...base,
         input: {
           ...base.input,
           hostStatus: {
             queryHost: async () => {
-              throw new Error('connect ECONNREFUSED data/ncl.sock');
+              if (!socketOpen) throw socketClosed();
+              return hostStatusOf();
             },
-            waitForHost: async () => {
-              throw exited;
-            },
+            waitForHost,
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
-      const findPortHolder = vi.fn(async () => ({ pid: 5150, command: 'python3' }));
-      const host = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
-        reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
-        instanceServicePid: async () => undefined,
-        findPortHolder,
-      }).start_nanoclaw.resources[0]!;
+      await writeSubscriberKey(context);
+      const reconcileInstanceRuntime = vi.fn(async () => ({ pid: 4242 }) as never);
+      const step = createProductionProvisionSteps(
+        context,
+        {
+          reconcileInstanceRuntime,
+          instanceServicePid: async () => undefined,
+          reconcileMainIdentity: vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' })),
+          observeMainIdentity: async () => (socketOpen ? PRESENT : ABSENT),
+        },
+        { emit: (event) => void events.push(event) },
+      ).start_nanoclaw;
 
-      const failure = await host.apply(context).catch((error: unknown) => error);
-
-      expect(findPortHolder).toHaveBeenCalledWith(reserved.allocated_ports.nanoclaw_webhook);
-      expect(failure).toMatchObject({
-        code: 'port_in_use',
-        message: expect.stringContaining(`python3 (pid 5150)`),
+      await expect(
+        runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
+      ).resolves.toEqual({ status: 'ready' });
+      expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
+      expect(waitForHost).toHaveBeenCalledWith(paths.checkoutRoot(reserved.instance_id), {
+        channel: 'gchat',
+        pid: 4242,
+        alive: expect.any(Function),
+        timeoutMs: expect.any(Number),
       });
-      expect((failure as Error).message).toContain(`127.0.0.1:${reserved.allocated_ports.nanoclaw_webhook}`);
-      expect((failure as Error).cause).toBe(exited);
+      expect(events).toContainEqual({
+        type: 'step-waiting',
+        step: 'start_nanoclaw',
+        reason: 'Waiting for the assistant to connect Google Chat…',
+      });
     });
   });
 
@@ -1927,20 +1672,16 @@ describe('production provision step composition', () => {
         input: {
           ...base.input,
           hostStatus: {
-            queryHost: async () => hostStatusOf(reserved),
+            queryHost: async () => hostStatusOf(),
             waitForHost: async () => {
               throw new Error('Channel gchat is not connected in the running host. Check logs/nanoclaw.error.log.');
             },
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       const host = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
         reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
-        // The host's own process holds its port: that is not a conflict.
-        findPortHolder: async () => ({ pid: 4242, command: 'node' }),
       }).start_nanoclaw.resources[0]!;
 
       await expect(host.apply(context)).rejects.toMatchObject({
@@ -1970,14 +1711,13 @@ describe('production provision step composition', () => {
             queryHost: async () => {
               if (typeof host === 'number') throw new Error('connect ENOENT data/ncl.sock');
               if (host === 'stopped') throw new Error('connect ECONNREFUSED data/ncl.sock');
-              return hostStatusOf(reserved);
+              return hostStatusOf();
             },
-            waitForHost: async () => hostStatusOf(reserved),
+            waitForHost: async () => hostStatusOf(),
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       const reconcileInstanceRuntime = vi.fn(async () => {
         host = 'serving';
         return { pid: 4242 } as never;
@@ -1985,7 +1725,6 @@ describe('production provision step composition', () => {
       const reconcileMainIdentity = vi.fn();
       const events: RunEvent[] = [];
       const step = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
         reconcileInstanceRuntime,
         reconcileMainIdentity,
         // The service runs a process while the host starts; its socket opens after `host` more looks.
@@ -2034,8 +1773,7 @@ describe('production provision step composition', () => {
         input: {
           ...base.input,
           hostStatus: {
-            queryHost: async () =>
-              hostStatusOf(reserved, { channels: [{ instance: 'gchat', type: 'gchat', connected: false }] }),
+            queryHost: async () => hostStatusOf({ channels: [{ instance: 'gchat', type: 'gchat', connected: false }] }),
             waitForHost: vi.fn(),
           },
         },
@@ -2102,7 +1840,6 @@ describe('create on the release layout', () => {
         const context = contextOf(operation);
         const steps = createProductionProvisionSteps(context, {
           stageRelease: (request) => stageRelease(request, staging.seams),
-          getOwnedGcpProjectNumber: async () => '441811502258',
         });
         return { value: await use(steps, context, operation) };
       });
@@ -2211,8 +1948,7 @@ describe('create on the release layout', () => {
       // Create's OneCLI step renders the Compose file itself before it reaches Docker.
       await expect(steps.start_onecli.resources[0]!.apply(context)).rejects.toThrow('Docker is not reached');
       // Create's service step installs the service definition when it starts the host.
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       await expect(steps.start_nanoclaw.resources[0]!.apply(context)).resolves.toBeUndefined();
 
       const kept = keptReleaseFiles(create.layout.kept(create.release));
@@ -2267,15 +2003,14 @@ interface ProductionHarness {
   readonly started: string[];
   readonly sleeps: number[];
   providerCredential: boolean;
-  routePublished: boolean;
   chatConfigured: boolean;
-  principal: 'waiting' | 'selection' | 'bound';
-  selectedMessagingGroupId?: string;
+  /** What opening the principal's DM finds: they have not accepted it yet, Google does not answer, or it opens. */
+  principal: 'awaiting_acceptance' | 'unavailable' | 'bound';
+  /** The address each bind opened the DM with, and the moment it bound them at. */
+  readonly binds: Array<{ readonly chatEmail: string; readonly verifiedAt: string }>;
   conversationReady: boolean;
   /** Not-ready answers the conversation check gives first, before `conversationReady` decides. */
   conversationReasons: ConversationNotReadyReason[];
-  /** Rows `ncl dropped-messages list` returns: authenticated first DMs awaiting a principal. */
-  droppedMessages: unknown[];
   /** The process dies right after the principal is bound, before the step completes. */
   crashAfterBinding: boolean;
   lastContext?: ProductionProvisionContext;
@@ -2284,12 +2019,12 @@ interface ProductionHarness {
 
 const PRINCIPAL = {
   messagingGroupId: 'mg-principal',
-  platformId: 'gchat:spaces/principal',
-  userId: 'gchat:users/principal',
-  senderName: 'Principal',
-  authenticatedMessageId: 'signed-first-dm',
-  authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
+  platformId: 'gchat:spaces/dm-2001',
+  userId: 'gchat:users/2001',
 } as const;
+
+/** One of the principal's addresses that create did not name for Google Chat. */
+const OTHER_ADDRESS = 'principal@home.example.test';
 
 /**
  * A release staged as `stageRelease` leaves it, without a checkout to build:
@@ -2327,7 +2062,8 @@ async function productionHarness(): Promise<ProductionHarness> {
   await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
   const resources = new Set<string>();
   const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
-  let principalBound = false;
+  /** When the principal was bound; undefined until they are. */
+  let boundAt: string | undefined;
 
   const harness: ProductionHarness = {
     paths,
@@ -2337,51 +2073,37 @@ async function productionHarness(): Promise<ProductionHarness> {
     sleeps: [],
     crashAfterBinding: false,
     providerCredential: true,
-    routePublished: true,
     chatConfigured: true,
-    principal: 'waiting',
+    principal: 'awaiting_acceptance',
+    binds: [],
     conversationReady: true,
     conversationReasons: [],
-    droppedMessages: [],
     run: () =>
       withInstanceOperation(paths, reserved.instance_id, async (operation) => {
         const base = productionContext(operation, reserved);
-        // As `runProductionProvision` does, a principal an earlier run fixed is this run's selection.
-        const { principal: selectedPrincipal } = (await readProvisionJournal(paths, reserved.instance_id)).decisions;
         const context: ProductionProvisionContext = {
           ...base,
           state: {},
           input: {
             ...base.input,
             ...(harness.providerCredential ? {} : { requestProviderCredential: undefined }),
-            ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
-            ...(selectedPrincipal ? { selectedPrincipal } : {}),
+            // The principal has another address; only the one create named for Chat may be opened.
+            identity: {
+              ...base.input.identity,
+              principal: { ...base.input.identity.principal!, emails: ['principal@example.test', OTHER_ADDRESS] },
+            },
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
-            principalDependencies: {
-              runNcl: async (_config, args) => {
-                if (args[0] !== 'dropped-messages') throw new Error(`Unexpected ncl ${args.join(' ')}`);
-                return { ok: true, data: harness.droppedMessages };
-              },
-              persistSelection: async (candidate) => {
-                await recordPrincipalSelection(operation, candidate);
-                return candidate;
-              },
-            },
             hostStatus: {
               queryHost: async () => {
-                if (resources.has('host')) return hostStatusOf(reserved);
+                if (resources.has('host')) return hostStatusOf();
                 throw new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
               },
-              waitForHost: async () => hostStatusOf(reserved),
+              waitForHost: async () => hostStatusOf(),
             },
           },
         };
-        await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
-          recursive: true,
-          mode: 0o700,
-        });
-        await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+        await writeSubscriberKey(context);
         harness.lastContext = context;
         const effect = (name: string, resource: string): void => {
           harness.effects.push(name);
@@ -2403,12 +2125,22 @@ async function productionHarness(): Promise<ProductionHarness> {
               },
             },
           ],
-          getOwnedGcpProjectNumber: async () => '441811502258',
-          googleConnectionResources: () => [
+          googleSignInResources: () => [
             {
-              name: "the assistant's Google account",
+              name: "the assistant's Google sign-in",
+              observe: async () => (resources.has('sign-in') ? PRESENT : ABSENT),
+              apply: async () => {
+                effect('signInGoogle', 'sign-in');
+                return undefined;
+              },
+            },
+          ],
+          googleAccessResources: () => [
+            {
+              name: "agents' Google access",
               observe: async () => (resources.has('google') ? PRESENT : ABSENT),
               apply: async () => {
+                if (!resources.has('host')) throw new Error("Agents' access is published by the running host");
                 effect('connectGoogle', 'google');
                 return undefined;
               },
@@ -2436,6 +2168,7 @@ async function productionHarness(): Promise<ProductionHarness> {
             return PRESENT;
           },
           reconcileInstanceRuntime: async () => {
+            if (!resources.has('sign-in')) throw new Error('The host talks in Chat as the assistant from its start');
             effect('reconcileInstanceRuntime', 'host');
             return { pid: 4242 } as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
           },
@@ -2444,32 +2177,35 @@ async function productionHarness(): Promise<ProductionHarness> {
             effect('reconcileMainIdentity', 'main');
             return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
           },
-          verifyRoute: async ({ endpointUrl }) => {
-            if (!harness.routePublished) throw new GwsEaError('endpoint_unreachable', 'Route is not published');
-            return endpointUrl;
-          },
-          // Like `verifyPrincipalBinding`, the binding is found only for the candidate it is asked about.
-          verifyPrincipalBinding: ({ selectedCandidate }) =>
-            principalBound && selectedCandidate?.messagingGroupId === PRINCIPAL.messagingGroupId
-              ? { status: 'matched', agentGroupId: 'ag-main', candidate: selectedCandidate, welcomeEventId: 'welcome' }
-              : { status: 'absent' },
-          reconcilePrincipal: async (_runtime, selection, dependencies) => {
-            harness.effects.push(`reconcilePrincipalDm:${harness.principal}`);
-            if (harness.principal === 'waiting') return { status: 'waiting' };
-            if (harness.principal === 'selection' && !selection.messagingGroupId) {
-              return {
-                status: 'selection-required',
-                candidates: [PRINCIPAL, { ...PRINCIPAL, messagingGroupId: 'mg-other', userId: 'gchat:users/other' }],
-              };
+          verifyPrincipalBinding: () =>
+            boundAt === undefined
+              ? { status: 'absent' }
+              : {
+                  status: 'matched',
+                  agentGroupId: 'ag-main',
+                  principal: { ...PRINCIPAL, boundAt },
+                  welcomeEventId: 'welcome',
+                },
+          bindPrincipal: async (_runtime, input) => {
+            harness.effects.push(`bindPrincipal:${harness.principal}`);
+            harness.binds.push({ chatEmail: input.chatEmail, verifiedAt: input.verifiedAt });
+            if (harness.principal === 'awaiting_acceptance') {
+              return { status: 'awaiting_acceptance', space: 'spaces/dm-2001' };
             }
-            // Like `reconcilePrincipalDm`, a newly chosen principal is fixed before it is bound.
-            if (!selection.selectedCandidate) await dependencies?.persistSelection?.(PRINCIPAL);
-            principalBound = true;
+            if (harness.principal === 'unavailable') {
+              return { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' };
+            }
+            boundAt = input.verifiedAt;
             if (harness.crashAfterBinding) {
               harness.crashAfterBinding = false;
               throw new Error('The process died after binding the principal');
             }
-            return { status: 'bound', candidate: PRINCIPAL, agentGroupId: 'ag-main', eventId: 'welcome' };
+            return {
+              status: 'bound',
+              principal: { ...PRINCIPAL, boundAt },
+              agentGroupId: 'ag-main',
+              eventId: 'welcome',
+            };
           },
           sleep: async (milliseconds) => void harness.sleeps.push(milliseconds),
           verifyConversation: () =>
@@ -2513,19 +2249,26 @@ describe('production step order and pause outcomes', () => {
     'provision_gcp',
     'start_onecli',
     'configure_provider',
-    'start_nanoclaw',
-    'establish_transport',
     'configure_channel',
+    'sign_in_google',
+    'start_nanoclaw',
     'connect_google',
     'bind_principal',
   ];
 
-  it('runs the steps in order and pauses for the principal DM, then for a selection, then completes', async () => {
+  it("signs in before the host starts, connects agents' access after it, then binds the principal through the DM the assistant opens", async () => {
     const harness = await productionHarness();
 
+    // A principal outside the assistant's organization must accept its DM first.
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
+      pause: {
+        phase: 'bind_principal',
+        code: 'principal_chat_request_pending',
+        message:
+          "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
+          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
+      },
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
@@ -2533,25 +2276,12 @@ describe('production step order and pause outcomes', () => {
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
+      'signInGoogle',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
-      'reconcilePrincipalDm:waiting',
+      'bindPrincipal:awaiting_acceptance',
     ]);
-
-    harness.principal = 'selection';
-    await expect(harness.run()).resolves.toMatchObject({
-      status: 'paused',
-      pause: {
-        phase: 'bind_principal',
-        code: 'principal_selection_required',
-        choices: [{ id: 'mg-principal' }, { id: 'mg-other' }],
-      },
-    });
-
-    expect(await readFile(googleChatProjectNumberFile(harness.lastContext!.input.runtime), 'utf8')).toBe(
-      '441811502258\n',
-    );
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -2560,23 +2290,28 @@ describe('production step order and pause outcomes', () => {
     ).resolves.toContain('"providerCredential"');
 
     harness.principal = 'bound';
-    harness.selectedMessagingGroupId = 'mg-principal';
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
     expect(harness.sleeps).toEqual([]);
-    expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
+    expect(harness.effects.filter((effect) => !effect.startsWith('bindPrincipal'))).toEqual([
       'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
+      'signInGoogle',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
+    ]);
+    // One address, the one create named; every attempt binds at the moment the step began.
+    const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
+    expect(harness.binds).toEqual([
+      { chatEmail: 'principal@example.test', verifiedAt: began },
+      { chatEmail: 'principal@example.test', verifiedAt: began },
     ]);
   });
 
   const blockers: ReadonlyArray<readonly [ProvisionStepId, string, (harness: ProductionHarness) => void]> = [
     ['configure_provider', 'provider_credential_required', (harness) => void (harness.providerCredential = false)],
-    ['establish_transport', 'existing_endpoint_required', (harness) => void (harness.routePublished = false)],
     ['configure_channel', 'chat_configuration_required', (harness) => void (harness.chatConfigured = false)],
   ];
 
@@ -2588,12 +2323,30 @@ describe('production step order and pause outcomes', () => {
     expect(harness.started.slice(0, ORDER.indexOf(step) + 1)).toEqual(ORDER.slice(0, ORDER.indexOf(step) + 1));
 
     harness.providerCredential = true;
-    harness.routePublished = true;
     harness.chatConfigured = true;
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
+      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
     });
+  });
+
+  it('pauses with the error when Google stays unavailable, trying no other address, and binds once it answers', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'unavailable';
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'bind_principal',
+      code: 'google_chat_unavailable',
+      message:
+        'Google Chat did not answer while the assistant opened its direct message with Principal ' +
+        '(Google refused /v1/spaces:setup: Backend error). Resume to try again.',
+    });
+    expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test']);
+
+    harness.principal = 'bound';
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test', 'principal@example.test']);
   });
 
   it('resumes after the principal was bound but before the step completed, without binding again', async () => {
@@ -2603,7 +2356,7 @@ describe('production step order and pause outcomes', () => {
 
     await expect(harness.run()).rejects.toThrow('The process died after binding the principal');
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
-    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+    expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 
   /** A NanoClaw log line as the host writes it: local time of day, colored level and message. */
@@ -2630,8 +2383,8 @@ describe('production step order and pause outcomes', () => {
       status: 'paused',
       pause: {
         phase: 'bind_principal',
-        code: 'principal_dm_required',
-        details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`],
+        code: 'principal_chat_request_pending',
+        details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
       },
     });
 
@@ -2650,7 +2403,7 @@ describe('production step order and pause outcomes', () => {
     const details = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
     const stamp = logLine(after, 'WARN', '').slice(0, 14);
     expect(details.pause.details).toEqual([
-      'Principal: Principal (not bound yet)',
+      'Principal: Principal (principal@example.test)',
       `Errors logged since ${began} in ${errorLog}:`,
       `  ${stamp} WARN Google Chat request rejected authorization="Bearer [REDACTED]"`,
       '      at verifyRequest (gchat.js:1:1)',
@@ -2670,7 +2423,9 @@ describe('production step order and pause outcomes', () => {
     );
 
     await expect(harness.run()).resolves.toMatchObject({
-      pause: { details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`] },
+      pause: {
+        details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
+      },
     });
   });
 
@@ -2690,7 +2445,7 @@ describe('production step order and pause outcomes', () => {
     const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
     expect(paused.pause).toMatchObject({ phase: 'verify_conversation', code: 'later_principal_message_missing' });
     expect(paused.pause.details).toEqual([
-      'Bound principal: Principal (gchat:users/principal)',
+      'Bound principal: Principal (gchat:users/2001)',
       `Errors logged since ${began} in ${errorLog}:`,
       `  ${logLine(new Date(start + 1_000), 'ERROR', '').slice(0, 14)} ERROR Delivery failed`,
     ]);
@@ -2706,7 +2461,7 @@ describe('production step order and pause outcomes', () => {
     expect(paused.pause).toMatchObject({
       phase: 'verify_conversation',
       code: 'later_principal_message_missing',
-      message: 'Send the assistant another message in Google Chat, such as a reply to its welcome.',
+      message: "Ask the principal to reply to the assistant's welcome in Google Chat.",
     });
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
 
@@ -2731,34 +2486,6 @@ describe('production step order and pause outcomes', () => {
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(30);
   });
 
-  it('watches for the principal DM without binding anything', async () => {
-    const harness = await productionHarness();
-
-    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
-    expect(paused.pause).toMatchObject({ phase: 'bind_principal', code: 'principal_dm_required' });
-    await expect(paused.pause.settled?.()).resolves.toBe(false);
-
-    const provisioningStartedAt = harness.lastContext!.input.provisioningStartedAt;
-    harness.droppedMessages = [
-      {
-        channel_type: 'gchat',
-        instance: harness.lastContext!.input.adapterInstance,
-        reason: 'no_agent_wired',
-        sender_authenticated: 1,
-        sender_kind: 'human',
-        is_group: 0,
-        authenticated_message_at: new Date(new Date(provisioningStartedAt).getTime() + 1_000).toISOString(),
-        authenticated_message_id: 'message-1',
-        messaging_group_id: 'mg-principal',
-        platform_id: 'gchat:spaces/principal',
-        user_id: 'gchat:users/principal',
-        sender_name: 'Principal',
-      },
-    ];
-    await expect(paused.pause.settled?.()).resolves.toBe(true);
-    expect(harness.effects.filter((effect) => effect.startsWith('reconcilePrincipalDm'))).toHaveLength(1);
-  });
-
   it('pauses at verify_conversation until a later principal message is answered', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
@@ -2771,6 +2498,6 @@ describe('production step order and pause outcomes', () => {
 
     harness.conversationReady = true;
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
-    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+    expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 });

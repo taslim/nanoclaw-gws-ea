@@ -13,6 +13,7 @@
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
  */
+import { REJECT_WITH_REASON_OPTION } from '../../channels/ask-question.js';
 import { requestWake } from '../../request-wake.js';
 import {
   deletePendingApproval,
@@ -20,14 +21,15 @@ import {
   getSession,
   transitionPendingApprovalStatus,
 } from '../../db/sessions.js';
-import type { ResponsePayload } from '../../response-registry.js';
+import { getDeliveryAdapter } from '../../delivery.js';
+import { showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { finalizeReject } from './finalize.js';
-import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
-import { armReasonCapture } from './reason-capture.js';
+import { getApprovalHandler, notifyApprovalResolved } from './primitive.js';
+import { armReasonCapture, clampReason } from './reason-capture.js';
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
   const approval = await getPendingApproval(payload.questionId);
@@ -43,15 +45,26 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '');
+  await handleRegisteredApproval(approval, payload, namespacedUserId(payload) ?? '');
   return true;
+}
+
+/** The decided request edited to its outcome, when the channel left it as posted. */
+function showOutcome(approval: PendingApproval, answer: ResponsePayload, reason?: string): Promise<void> {
+  return showRequestOutcome(
+    getDeliveryAdapter(),
+    answer,
+    { title: approval.title, question: approval.question, options: JSON.parse(approval.options_json) },
+    reason,
+  );
 }
 
 async function handleRegisteredApproval(
   approval: PendingApproval,
-  selectedOption: string,
+  answer: ResponsePayload,
   userId: string,
 ): Promise<void> {
+  const selectedOption = answer.value;
   if (!approval.session_id) {
     await deletePendingApproval(approval.approval_id);
     return;
@@ -65,18 +78,22 @@ async function handleRegisteredApproval(
   // "Reject with reason…" — hold the row and capture the admin's next DM
   // instead of finalizing now. The agent is notified exactly once: after the
   // reason arrives, or after the sweep's timeout if the admin ghosts.
-  if (selectedOption === REJECT_WITH_REASON_VALUE) {
+  if (selectedOption === REJECT_WITH_REASON_OPTION) {
     await armReasonCapture(approval, session, userId);
     return;
   }
 
-  // Plain Reject (or any other non-approve value) — instant fast path.
+  // Plain Reject (or any other non-approve value) — instant fast path, with
+  // the reason an answer in words gave after its no.
   if (selectedOption !== 'approve') {
-    await finalizeReject(approval, session, userId);
+    const reason = answer.reason ? clampReason(answer.reason) || undefined : undefined;
+    if (await finalizeReject(approval, session, userId, reason)) await showOutcome(approval, answer, reason);
     return;
   }
 
   if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) return;
+  // Decided: its outcome shows now, while the action may still take a while to apply.
+  await showOutcome(approval, answer);
 
   // Approved — dispatch to the module that registered for this action.
   const notify = (text: string): Promise<void> =>

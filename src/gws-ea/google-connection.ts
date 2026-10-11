@@ -1,11 +1,13 @@
 /**
- * Connecting the assistant to Google (KTD2, KTD5, KTD6): the resources of
- * the `connect_google` step, which `gws-ea connect-google` also runs on an
- * existing assistant. In order: the Workspace APIs in the assistant's
- * project, the OAuth client the operator downloads, the assistant's own
- * sign-in, agents' Google access, and a live check that the sign-in reaches
- * the assistant's own calendar and Drive. Each observes before it changes
- * anything, so running them again changes nothing.
+ * Connecting the assistant to Google (KTD2, KTD5, KTD6), in two steps. The
+ * `sign_in_google` step runs before the host starts, since the host talks in
+ * Chat as the assistant from its first moment: the Workspace APIs in the
+ * assistant's project, the OAuth client the operator downloads, and the
+ * assistant's own sign-in. The `connect_google` step runs once the host is
+ * up: agents' Google access, which the host publishes, and a live check that
+ * the sign-in reaches the assistant's own calendar and Drive. `gws-ea
+ * connect-google` runs both on an existing assistant. Each resource observes
+ * before it changes anything, so running them again changes nothing.
  *
  * This step writes only the grant file. The running host's refresher is the
  * only writer of the gateway's Google secrets: it publishes them from a new
@@ -96,7 +98,7 @@ function consoleUrl(projectId: string): string {
 function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
   return {
     kind: 'human-action',
-    phase: 'connect_google',
+    phase: 'sign_in_google',
     code: 'google_client_required',
     message: "Create the assistant's Google sign-in client, then continue with its file.",
     details: [
@@ -248,20 +250,18 @@ async function requireGrant(context: GoogleConnectionContext): Promise<GoogleGra
   return grant;
 }
 
-export function googleConnectionResources(
-  dependencies: GoogleConnectionDependencies = {},
-): readonly StepResource<GoogleConnectionContext>[] {
-  const fetchImpl = dependencies.fetch;
-  const sleep = dependencies.sleep ?? ((ms: number) => delay(ms));
-  const tokenOptions: TokenOptions = {
-    ...(fetchImpl ? { fetch: fetchImpl } : {}),
+function tokenOptionsOf(dependencies: GoogleConnectionDependencies): TokenOptions {
+  return {
+    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
     ...(dependencies.now ? { now: dependencies.now } : {}),
   };
-  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
-    const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
-    await requireGrant(context);
-    return publishedAccessProblem(secrets)?.reason;
-  };
+}
+
+/** `sign_in_google`'s resources: the APIs, the OAuth client, and the assistant's own sign-in. */
+export function googleSignInResources(
+  dependencies: GoogleConnectionDependencies = {},
+): readonly StepResource<GoogleConnectionContext>[] {
+  const tokenOptions = tokenOptionsOf(dependencies);
   return [
     googleWorkspaceApisResource(dependencies.gcloud),
     {
@@ -312,6 +312,25 @@ export function googleConnectionResources(
         return undefined;
       },
     },
+  ];
+}
+
+/**
+ * `connect_google`'s resources, once the host runs: agents' Google access,
+ * which the host publishes from the sign-in, and the live check.
+ */
+export function googleAccessResources(
+  dependencies: GoogleConnectionDependencies = {},
+): readonly StepResource<GoogleConnectionContext>[] {
+  const fetchImpl = dependencies.fetch;
+  const sleep = dependencies.sleep ?? ((ms: number) => delay(ms));
+  const tokenOptions = tokenOptionsOf(dependencies);
+  const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
+    const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
+    await requireGrant(context);
+    return publishedAccessProblem(secrets)?.reason;
+  };
+  return [
     {
       name: "agents' Google access",
       observe: async (context): Promise<Observation> => {
@@ -373,6 +392,13 @@ export function googleConnectionResources(
       apply: async () => undefined,
     },
   ];
+}
+
+/** Both steps' resources, in order, as `gws-ea connect-google` repairs a created assistant's connection. */
+export function googleConnectionResources(
+  dependencies: GoogleConnectionDependencies = {},
+): readonly StepResource<GoogleConnectionContext>[] {
+  return [...googleSignInResources(dependencies), ...googleAccessResources(dependencies)];
 }
 
 /** The assistant's Google connection as `status` reports it. */

@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, ONECLI_POSTGRES_IMAGE, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
@@ -119,12 +120,10 @@ async function deployedAssistant(
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
     ...release,
-    allocated_ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
+    allocated_ports: { onecli_app: 35_102, onecli_gateway: 35_103 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://target.example.test/webhook/gchat' },
-      gcp_project_id: 'target-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@target-project.iam.gserviceaccount.com',
       workspace_email: 'target@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

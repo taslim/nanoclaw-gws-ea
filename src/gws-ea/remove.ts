@@ -5,10 +5,14 @@
  * resource is observed. An absent resource is done; an owned one is deleted
  * and observed again; a foreign one is refused by name; one that cannot be
  * observed pauses with evidence until the operator abandons it. Everything a
- * resource needs — Docker, NanoClaw's service helpers, Google sign-in, the
- * Cloudflare token — is checked before the first change, and removal locks
- * only its own instance, so one stuck removal never blocks another assistant.
- * NanoClaw's helpers stop the host; removal then cleans up what they leave.
+ * resource needs — Docker, NanoClaw's service helpers, the operator's and the
+ * assistant's Google sign-ins — is checked before the first change, and
+ * removal locks only its own instance, so one stuck removal
+ * never blocks another assistant. NanoClaw's helpers stop the host; removal
+ * then cleans up what they leave. The assistant's Google Chat subscription
+ * goes after the host, which would only create it again, and before the
+ * project, which takes its topic, its Pub/Sub subscription, and its
+ * subscriber account with it (KTD13).
  * An unfinished update or rollback never stops it: its releases, what is
  * kept with them, its snapshots, and its quarantined state all sit under the
  * instance root, and go with it. So does every image the assistant's
@@ -25,37 +29,18 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { createWorkspaceEventsApi, type WorkspaceEventsApi } from '../modules/gws-ea-chat/subscription.js';
+import { GOOGLE_GRANT_FILE_NAME, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
+import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
 import {
-  CloudflareAmbiguousMutationError,
-  createCloudflareApi,
-  type CloudflareApi,
-  type CloudflareDnsRecord,
-  type CloudflareTunnel,
-} from './cloudflare-api.js';
-import {
-  connectorNetworking,
-  createCloudflareConnectorLayout,
-  stopCloudflareConnector,
-  type CloudflareConnectorLayout,
-  type CloudflareOriginHost,
-} from './cloudflare-connector.js';
-import {
-  assertManagedCloudflareConfigurationOwnership,
-  chooseOwnedDnsRecord,
-  chooseOwnedTunnel,
-  GCHAT_TUNNEL_PATH,
-  renderManagedCloudflareConfiguration,
-  replaceManagedCloudflareConfiguration,
-} from './cloudflare-ingress.js';
+  GoogleGrantRevokedError,
+  GoogleScopeNotGrantedError,
+  GoogleTokenError,
+  mintServiceToken,
+} from '../modules/gws-ea-google/tokens.js';
+import { GoogleApiError } from '../modules/gws-ea-inbox/gmail-api.js';
 import { reclaimImage } from './agent-image-release.js';
-import {
-  PauseRequired,
-  runStep,
-  withGoogleSignIn,
-  type CloudflareTokenRequest,
-  type StepIdentity,
-  type StepReporter,
-} from './events.js';
+import { PauseRequired, runStep, withGoogleSignIn, type StepIdentity, type StepReporter } from './events.js';
 import {
   assertGcloudInstalled,
   assertGcloudSignedIn,
@@ -71,6 +56,7 @@ import { readOperationRecord, type OperationRecord } from './operation.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
+import { redact } from './redact.js';
 import {
   buildToolEnvironment,
   checkedRunner,
@@ -80,14 +66,12 @@ import {
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
 import {
-  activeRemovalInstanceIds,
   assertInstanceId,
   assertStateConsistent,
   getInstanceReservation,
   readRegistry,
   releaseInstanceReservation,
   validateReservation,
-  withLockedCloudflareRegistry,
 } from './registry.js';
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
@@ -99,30 +83,28 @@ import {
   type InstanceServiceCoordinates,
   type InstanceServicePlatform,
 } from './service-coordinates.js';
-import {
-  GwsEaError,
-  ingressEndpointUrl,
-  type InstanceRegistry,
-  type InstanceReservation,
-  type ManagedCloudflareIngressClaim,
-  type ProvisionStepId,
-  type SharedCloudflareMetadata,
-} from './types.js';
+import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from './validation.js';
-import { forgetAccountToken, forgettingRefusedToken, usableKeptAccountToken } from './cloudflare-token.js';
-import type { CloudflareZoneChoice } from './create-input.js';
 
 /** Resources in teardown order; the registry entry is released after all of them. */
-export const REMOVAL_RESOURCES = ['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files'] as const;
+export const REMOVAL_RESOURCES = ['nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'] as const;
 export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
 /**
  * What an operator may leave behind when removal cannot observe it (`--abandon`):
- * the Google Cloud project, or the assistant's DNS record in a Cloudflare zone
- * the token can no longer see (a deleted zone takes its records with it).
+ * the Google Cloud project, or the assistant's Google Chat subscription when
+ * Google refuses its sign-in.
  */
-export const ABANDONABLE_RESOURCES = ['gcp-project', 'cloudflare-dns'] as const;
+export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
+
+/** What leaving each resource behind means, as a pause tells the operator. */
+const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
+  'gcp-project':
+    "Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.",
+  'chat-subscription':
+    'Leaving it behind is safe: once the project is deleted it delivers nowhere, and Google deletes it within 7 days; removal records this evidence.',
+};
 
 function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
   return ABANDONABLE_RESOURCES.some((candidate) => candidate === resource);
@@ -130,13 +112,10 @@ function isAbandonable(resource: RemovalResource): resource is RemovalResource &
 
 const RECEIPT_SCHEMA_VERSION = 3 as const;
 const INVALID_RECORD = 'invalid_runtime_config';
-const CONNECTION_ATTEMPTS = 30;
-const CONNECTION_DELAY_MS = 1_000;
-const DELETE_ATTEMPTS = 3;
 
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
-  'managed-ingress': { id: 'remove_managed_ingress', label: 'Removing the Cloudflare route…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
+  'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
   onecli: { id: 'remove_onecli', label: 'Removing OneCLI…' },
   'instance-files': { id: 'remove_instance_files', label: 'Removing local files…' },
@@ -168,7 +147,6 @@ export interface LocalRuntime {
 /** The human input removal may need, through the driver's `Interaction` port. */
 export interface RemovalInteraction {
   signInToGoogleCloud(account: string): Promise<void>;
-  requestCloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
 }
 
 /** What the driver supplies to one removal. */
@@ -184,15 +162,15 @@ export interface RemovalOptions {
 /** Boundary seams; each defaults to the real one. */
 export interface RemovalDependencies extends RemovalOptions {
   readonly platform?: InstanceServicePlatform;
+  /** Reaches Google as the assistant: its Chat token and its Workspace Events subscription. */
+  readonly fetch?: typeof globalThis.fetch;
   /** Runs local teardown: the service manager fallback, the stray-host kill, and Docker. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly runGcloud?: GcloudCommandRunner;
   /** Probe the recorded Docker endpoint, else resolve the active local one. */
   readonly resolveDocker?: (recorded: string | undefined) => Promise<string>;
-  readonly createCloudflareApi?: (accountToken: string) => CloudflareApi;
   readonly uninstallNanoclaw?: (reservation: InstanceReservation, runtime: LocalRuntime) => Promise<void>;
   readonly removeOnecli?: (reservation: InstanceReservation, runtime: LocalRuntime) => Promise<void>;
-  readonly stopCloudflareConnector?: (layout: CloudflareConnectorLayout, dockerEndpoint: string) => Promise<void>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -220,25 +198,11 @@ export class RemovalPause extends PauseRequired {
     super(`${resource.replaceAll('-', '_')}_unobservable`, reason, [
       'Evidence:',
       ...evidence.split('\n').map((line) => `  ${line}`),
-      `Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.`,
+      LEAVING_BEHIND[resource],
     ]);
     this.name = 'RemovalPause';
     this.resource = resource;
   }
-}
-
-export interface ExistingRemovalPreview {
-  readonly mode: 'existing';
-  readonly endpoint: string;
-}
-
-export interface ManagedRemovalPreview {
-  readonly mode: 'managed-cloudflare';
-  readonly hostname: string;
-  readonly callback: string;
-  readonly dnsRecordId: string | null;
-  readonly route: string;
-  readonly sharedIngress: 'retained-for-peers' | 'retired';
 }
 
 export interface RemovalPreview {
@@ -247,7 +211,6 @@ export interface RemovalPreview {
   readonly gcpProject: string;
   readonly gcpAccount: string;
   readonly onecliProject: string;
-  readonly ingress: ExistingRemovalPreview | ManagedRemovalPreview;
 }
 
 function evidenceOf(value: unknown): Evidence | undefined {
@@ -398,233 +361,101 @@ async function readRecordedRuntime(
   };
 }
 
-function managedClaim(reservation: InstanceReservation): ManagedCloudflareIngressClaim | undefined {
-  const ingress = reservation.exclusive_resource_claims.ingress;
-  return ingress.mode === 'managed-cloudflare' ? ingress : undefined;
-}
-
-/**
- * Other managed assistants that still need the machine's tunnel: every live
- * one, and every removal that has not yet taken its route down. A receipt that
- * cannot be read counts as still needing it.
- */
-async function tunnelUsers(paths: ControlPlanePaths, registry: InstanceRegistry, instanceId: string): Promise<number> {
-  const peers = Object.values(registry.instances).filter(
-    (instance) => instance.instance_id !== instanceId && managedClaim(instance) !== undefined,
-  );
-  const receipts = await Promise.all(peers.map((peer) => readReceipt(paths, peer.instance_id)));
-  return receipts.filter((receipt) => receipt?.completed['managed-ingress'] === undefined).length;
-}
-
 /** Evaluate once, on first use. */
 function once<T>(evaluate: () => Promise<T>): () => Promise<T> {
   let value: Promise<T> | undefined;
   return () => (value ??= evaluate());
 }
 
+/** The assistant's Google sign-in, where every runtime keeps it: in the instance's secrets (`googleGrantFile`). */
+function grantFileOf(paths: ControlPlanePaths, instanceId: string): string {
+  return path.join(paths.instanceRoot(instanceId), 'secrets', GOOGLE_GRANT_FILE_NAME);
+}
+
 /**
- * Delete, then observe again: gone is done even when the delete failed (it
- * was already deleted). Still there retries a delete Cloudflare did not
- * confirm; otherwise removal stops with the delete's error.
+ * Google's answer to the assistant's sign-in is final: the grant is revoked
+ * or short of Chat's scopes, or Google refuses its token or the call. Only an
+ * unreachable or overloaded Google is worth asking again.
  */
-async function deleteAndConfirm(send: () => Promise<void>, gone: () => Promise<boolean>, what: string): Promise<void> {
-  for (let attempt = 1; ; attempt += 1) {
-    let failure: unknown;
-    try {
-      await send();
-      // The observation below decides whether a failed delete matters.
-      // eslint-disable-next-line no-catch-all/no-catch-all
-    } catch (error) {
-      failure = error;
-    }
-    if (await gone()) return;
-    if (failure instanceof CloudflareAmbiguousMutationError && attempt < DELETE_ATTEMPTS) continue;
-    throw (
-      failure ?? new GwsEaError('cloudflare_removal_incomplete', `Cloudflare still shows ${what} after its deletion`)
+function googleRefuses(error: unknown): boolean {
+  if (error instanceof GoogleApiError) return !error.retryable;
+  if (error instanceof GoogleTokenError) return error.refused;
+  return error instanceof GoogleGrantRevokedError || error instanceof GoogleScopeNotGrantedError;
+}
+
+/** What Google, or reading the sign-in, answered: its message, which names no secret, redacted all the same. */
+function answerOf(error: unknown): string {
+  return redact(error instanceof Error ? error.message : String(error));
+}
+
+/** Why removal cannot see the assistant's Chat subscription. */
+interface ChatSubscriptionRefusal {
+  readonly reason: string;
+  readonly evidence: string;
+}
+
+/** How removal reaches the assistant's Chat subscription, which only the assistant's own sign-in can see. */
+type ChatSubscriptionAccess =
+  /** The assistant never signed in, so its host never subscribed. */
+  | { readonly state: 'unsigned' }
+  | { readonly state: 'signed-in'; readonly account: string; readonly api: WorkspaceEventsApi }
+  /** Google refuses the sign-in, or the sign-in cannot be read. */
+  | ({ readonly state: 'refused' } & ChatSubscriptionRefusal);
+
+function signInRefusal(account: string, error: unknown): ChatSubscriptionRefusal {
+  return {
+    reason: "Google refuses the assistant's sign-in, so removal cannot see or delete its Google Chat subscription.",
+    evidence: [`Assistant account: ${account}`, `Google answered: ${answerOf(error)}`].join('\n'),
+  };
+}
+
+/**
+ * Workspace Events as the assistant, proven by listing its Chat
+ * subscriptions, which changes nothing: from the grant the instance keeps,
+ * with a Chat token minted for each call as the host mints its own.
+ */
+async function chatSubscriptionAccess(
+  grantFile: string,
+  fetch: typeof globalThis.fetch | undefined,
+): Promise<ChatSubscriptionAccess> {
+  let grant: GoogleGrant | undefined;
+  try {
+    grant = await readGoogleGrantFile(grantFile);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A sign-in that cannot be read cannot see the subscription; removal pauses with why.
+  } catch (error) {
+    return {
+      state: 'refused',
+      reason:
+        "The assistant's Google sign-in cannot be read, so removal cannot see or delete its Google Chat subscription.",
+      evidence: [`Sign-in file: ${grantFile}`, `Reading it failed: ${answerOf(error)}`].join('\n'),
+    };
+  }
+  if (grant === undefined) return { state: 'unsigned' };
+  const signedIn = grant;
+  const options = fetch === undefined ? {} : { fetch };
+  const api = createWorkspaceEventsApi({
+    token: async () => (await mintServiceToken(signedIn, 'chat', options)).accessToken,
+    ...options,
+  });
+  try {
+    await api.list();
+  } catch (error) {
+    if (!googleRefuses(error)) throw error;
+    return { state: 'refused', ...signInRefusal(signedIn.account, error) };
+  }
+  return { state: 'signed-in', account: signedIn.account, api };
+}
+
+/** Delete every subscription the assistant holds on its Chat target, then observe that none is left. */
+async function deleteChatSubscriptions(api: WorkspaceEventsApi): Promise<void> {
+  for (const subscription of await api.list()) await api.remove(subscription.name);
+  const left = (await api.list()).filter((subscription) => subscription.state !== 'DELETED');
+  if (left.length > 0) {
+    throw new GwsEaError(
+      'chat_subscription_removal_incomplete',
+      `Google still shows the Chat subscription ${left.map((subscription) => subscription.name).join(', ')} after its deletion`,
     );
   }
-}
-
-/** This machine's tunnel, observed by the name only it uses. */
-async function observeTunnel(
-  api: CloudflareApi,
-  metadata: SharedCloudflareMetadata,
-): Promise<CloudflareTunnel | undefined> {
-  return chooseOwnedTunnel(
-    await api.listTunnels(metadata.account_id, metadata.tunnel_name),
-    metadata.tunnel_name,
-    metadata.tunnel_id,
-  );
-}
-
-function requireCloudflareMetadata(registry: InstanceRegistry): SharedCloudflareMetadata {
-  const metadata = registry.shared_infrastructure_metadata.cloudflare;
-  if (!metadata) throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is not recorded');
-  return metadata;
-}
-
-async function waitForTunnelConnectionsToClear(
-  api: CloudflareApi,
-  accountId: string,
-  tunnelId: string,
-  sleep: (milliseconds: number) => Promise<void>,
-): Promise<void> {
-  const connections = await pollUntil(
-    () => api.listTunnelConnections(accountId, tunnelId),
-    (active) => active.length === 0,
-    { intervalMs: CONNECTION_DELAY_MS, limitMs: (CONNECTION_ATTEMPTS - 1) * CONNECTION_DELAY_MS, sleep },
-  );
-  if (connections.length > 0) {
-    throw new GwsEaError('cloudflare_connections_active', 'Cloudflare tunnel still has active connector sessions');
-  }
-}
-
-/**
- * A Cloudflare client whose token lists zones in the reserved account, which
- * also proves it, account-owned tokens included: the token an unfinished
- * create kept, while Cloudflare still accepts it, else one the operator gives.
- */
-async function authorizedApi(
-  claim: ManagedCloudflareIngressClaim,
-  interaction: RemovalInteraction,
-  createApi: (accountToken: string) => CloudflareApi,
-  keptTokenFile: string,
-): Promise<{ readonly api: CloudflareApi; readonly zones: readonly CloudflareZoneChoice[] }> {
-  let keptApi: CloudflareApi | undefined;
-  const kept = await usableKeptAccountToken(keptTokenFile, claim.account_id, (token) => {
-    keptApi = createApi(token);
-    return keptApi.listActiveZones();
-  });
-  if (kept && keptApi) return { api: keptApi, zones: kept.zones };
-  const token = await interaction.requestCloudflareAccountToken({
-    accountId: claim.account_id,
-    reason: `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
-  });
-  const api = createApi(token);
-  return { api, zones: await api.listActiveZones() };
-}
-
-interface CloudflareAuthority {
-  readonly api: CloudflareApi;
-  /** Set when the token cannot see the reserved zone and the operator leaves its DNS record behind. */
-  readonly dnsLeftBehind?: string;
-}
-
-/**
- * A token that works, checked against the reserved zone. A zone it cannot see
- * pauses removal: Cloudflare answers the same for a deleted zone, whose
- * records went with it, and for a token without access, whose zone still
- * holds the record, so only the operator can say which it is.
- */
-async function cloudflareAuthority(
-  claim: ManagedCloudflareIngressClaim,
-  interaction: RemovalInteraction,
-  createApi: (accountToken: string) => CloudflareApi,
-  options: { readonly leaveDnsBehind: boolean; readonly keptTokenFile: string },
-): Promise<CloudflareAuthority> {
-  const { leaveDnsBehind } = options;
-  const { api, zones } = await authorizedApi(claim, interaction, createApi, options.keptTokenFile);
-  if (
-    zones.some(
-      (zone) =>
-        zone.accountId === claim.account_id &&
-        zone.zoneId === claim.zone_id &&
-        zone.name === claim.zone_name &&
-        zone.status === 'active',
-    )
-  ) {
-    return { api };
-  }
-  const inAccount = zones.filter((zone) => zone.accountId === claim.account_id);
-  const renamed = inAccount.find((zone) => zone.name === claim.zone_name);
-  const evidence = [
-    `Reserved zone: ${claim.zone_name} (${claim.zone_id}) in account ${claim.account_id}`,
-    `Active zones this token can see in that account: ${inAccount.map((zone) => zone.name).join(', ') || 'none'}`,
-    ...(renamed ? [`${claim.zone_name} is now a different zone (${renamed.zoneId}), so the reserved one is gone`] : []),
-  ].join('\n');
-  if (leaveDnsBehind) return { api, dnsLeftBehind: evidence };
-  // A kept token that cannot see the zone is not reused: the rerun asks for one that can.
-  await forgetAccountToken(options.keptTokenFile);
-  throw new RemovalPause(
-    'cloudflare-dns',
-    `Cloudflare cannot see zone ${claim.zone_name}, which holds this assistant's DNS record. If the zone was deleted, the record went with it; if not, rerun with a token that can read it.`,
-    evidence,
-  );
-}
-
-interface ManagedIngressRemoval {
-  readonly paths: ControlPlanePaths;
-  readonly reservation: InstanceReservation;
-  readonly claim: ManagedCloudflareIngressClaim;
-  readonly api: CloudflareApi;
-  /** The assistant's own `establish_transport` started, so its DNS record may exist. */
-  readonly ownTransport: boolean;
-  readonly originHost: CloudflareOriginHost;
-  readonly connector: CloudflareConnectorLayout;
-  readonly stopConnector: () => Promise<void>;
-  readonly sleep: (milliseconds: number) => Promise<void>;
-  /** Record in the receipt that this route is gone; called under the machine lock. */
-  readonly recordRouteRemoved: () => Promise<void>;
-}
-
-/**
- * The assistant's route leaves the shared route set under the machine lock;
- * peers write it there too, so it is observed whenever the machine has a
- * tunnel. Its own DNS record follows. Once no other assistant needs the
- * tunnel, this removal retires the connector and tunnel, still under the
- * machine lock, and forgets the tunnel so the next managed assistant creates
- * its own. Its route is recorded gone under that same lock, retiring or not,
- * so of two removals deciding back to back exactly one retires.
- */
-async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<void> {
-  const { paths, reservation, claim, api } = removal;
-  const tunnelId = await withLockedCloudflareRegistry(paths, async ({ registry }) => {
-    const metadata = requireCloudflareMetadata(registry);
-    const found = await observeTunnel(api, metadata);
-    if (!found) return metadata.tunnel_id;
-    const observed = await api.getTunnelConfiguration(claim.account_id, found.id);
-    const universe = renderManagedCloudflareConfiguration(registry, removal.originHost);
-    const current = assertManagedCloudflareConfigurationOwnership(observed.config, universe);
-    if (current.ingress.some((rule) => 'hostname' in rule && rule.hostname === claim.hostname)) {
-      const leaving = new Set([...(await activeRemovalInstanceIds(paths, registry)), reservation.instance_id]);
-      const desired = renderManagedCloudflareConfiguration(registry, removal.originHost, leaving);
-      await replaceManagedCloudflareConfiguration(api, claim.account_id, found.id, desired, current);
-    }
-    return found.id;
-  });
-
-  if (removal.ownTransport) {
-    const observe = async (): Promise<CloudflareDnsRecord | undefined> =>
-      chooseOwnedDnsRecord(await api.listDnsRecords(claim.zone_id, claim.hostname), reservation, tunnelId);
-    const record = await observe();
-    if (record) {
-      await deleteAndConfirm(
-        () => api.deleteDnsRecord(claim.zone_id, record.id),
-        async () => (await observe()) === undefined,
-        `the DNS record for ${claim.hostname}`,
-      );
-    }
-  }
-
-  await withLockedCloudflareRegistry(paths, async (locked) => {
-    if ((await tunnelUsers(paths, locked.registry, reservation.instance_id)) === 0) {
-      const metadata = requireCloudflareMetadata(locked.registry);
-      const retiring = await observeTunnel(api, metadata);
-      await removal.stopConnector();
-      if (retiring) {
-        await waitForTunnelConnectionsToClear(api, metadata.account_id, retiring.id, removal.sleep);
-        await deleteAndConfirm(
-          () => api.deleteTunnel(metadata.account_id, retiring.id),
-          async () => (await observeTunnel(api, metadata)) === undefined,
-          `tunnel ${metadata.tunnel_name}`,
-        );
-      }
-      await rm(removal.connector.rootDirectory, { recursive: true, force: true });
-      await locked.forgetTunnel();
-    }
-    // A failed retirement records nothing, so a resumed removal retires again.
-    await removal.recordRouteRemoved();
-  });
 }
 
 /** How often, and how many times, removal checks that a stray host it stopped is gone. */
@@ -795,8 +626,8 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
   // Every tag in the assistant's own image repository goes: each kept release's `:r-<release>`, the `:building` tag
   // of an image a build had not yet labeled, and each agent group's own image. Removing a tag deletes its image only
   // with the last tag naming it, so an agent image another assistant shares by content stays with that assistant's
-  // tags. Nothing outside the repository is named, so the OneCLI, gateway, and connector images assistants share
-  // stay too (KTD6).
+  // tags. Nothing outside the repository is named, so the OneCLI and gateway images assistants share stay
+  // too (KTD6).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
     repositoryTags(
@@ -843,24 +674,12 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
     (await readReceipt(paths, instanceId))?.reservation ??
     (await getInstanceReservation(paths, instanceId));
   const claims = reservation.exclusive_resource_claims;
-  const ingress = claims.ingress;
   return {
     instanceId,
     checkout: paths.checkoutRoot(instanceId),
     gcpProject: claims.gcp_project_id,
     gcpAccount: claims.gcp_account,
     onecliProject: claims.onecli_project,
-    ingress:
-      ingress.mode === 'existing'
-        ? { mode: 'existing', endpoint: ingressEndpointUrl(ingress) }
-        : {
-            mode: 'managed-cloudflare',
-            hostname: ingress.hostname,
-            callback: ingress.callback_url,
-            dnsRecordId: ingress.dns_record_id,
-            route: `${ingress.hostname} ${GCHAT_TUNNEL_PATH}`,
-            sharedIngress: (await tunnelUsers(paths, registry, instanceId)) > 0 ? 'retained-for-peers' : 'retired',
-          },
   };
 }
 
@@ -896,7 +715,6 @@ async function removeLocked(
   const reservation =
     registry.instances[instanceId] ?? existing?.reservation ?? (await getInstanceReservation(paths, instanceId));
   const claims = reservation.exclusive_resource_claims;
-  const claim = managedClaim(reservation);
   let receipt: RemovalReceipt = existing ?? {
     schema_version: RECEIPT_SCHEMA_VERSION,
     instance_id: instanceId,
@@ -914,13 +732,10 @@ async function removeLocked(
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
   const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
-  const shared = registry.shared_infrastructure_metadata.cloudflare;
-  // A recorded tunnel, or one whose creation started, may exist under the machine's tunnel name.
-  const tunnelRecorded = shared !== null && (shared.tunnel_id !== null || shared.tunnel_creation_started_at !== null);
   const owned: Readonly<Record<RemovalResource, boolean>> = {
-    // Peers write every managed route into the shared set, so it is observed whenever the machine has a tunnel.
-    'managed-ingress': claim !== undefined && (started('establish_transport') || (!released && tunnelRecorded)),
     nanoclaw: started('start_nanoclaw'),
+    // The host keeps the subscription from its start, with the assistant's sign-in.
+    'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
     onecli: started('start_onecli'),
     'instance-files': true,
@@ -977,30 +792,31 @@ async function removeLocked(
       () => interaction.signInToGoogleCloud(account),
       (refusal) => activeStep()?.write(`${refusal.message}; signing in, then trying again\n`),
     );
-  const cloudflare = once(async () => {
-    if (!claim) throw new GwsEaError('invalid_removal', 'Only managed ingress needs Cloudflare authorization');
-    return cloudflareAuthority(
-      claim,
-      interaction,
-      dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })),
-      {
-        leaveDnsBehind: abandon.has('cloudflare-dns') || receipt.abandoned['cloudflare-dns'] !== undefined,
-        keptTokenFile: paths.keptCloudflareTokenFile(instanceId),
-      },
-    );
-  });
+  const chatSubscription = once(() => chatSubscriptionAccess(grantFileOf(paths, instanceId), dependencies.fetch));
+  /** Leave the subscription behind when the operator accepts it, else pause with why removal cannot see it. */
+  const leaveChatSubscription = (refusal: ChatSubscriptionRefusal): Evidence => {
+    if (!abandon.has('chat-subscription')) {
+      throw new RemovalPause('chat-subscription', refusal.reason, refusal.evidence);
+    }
+    activeStep()?.write(`${refusal.reason}\n${refusal.evidence}\n`);
+    return { at: new Date().toISOString(), evidence: refusal.evidence };
+  };
 
   await runStep(reporter, { id: 'prerequisites' }, async () => {
     if (pending.has('nanoclaw')) requireUninstall();
-    const retiresConnector = pending.has('managed-ingress') && (await tunnelUsers(paths, registry, instanceId)) === 0;
-    if (pending.has('nanoclaw') || pending.has('onecli') || retiresConnector) await docker();
+    if (pending.has('nanoclaw') || pending.has('onecli')) await docker();
     if (pending.has('gcp-project')) {
       await withSignIn(async () => {
         await assertGcloudInstalled(runGcloud);
         await assertGcloudSignedIn(account, runGcloud);
       });
     }
-    if (pending.has('managed-ingress')) await cloudflare();
+    if (pending.has('chat-subscription')) {
+      const access = await chatSubscription();
+      if (access.state === 'refused' && !abandon.has('chat-subscription')) {
+        throw new RemovalPause('chat-subscription', access.reason, access.evidence);
+      }
+    }
   });
 
   const file = paths.removalFile(instanceId);
@@ -1012,46 +828,26 @@ async function removeLocked(
   await record((current) => current);
 
   const removals: Readonly<Record<RemovalResource, () => Promise<Evidence | undefined>>> = {
-    'managed-ingress': async () => {
-      if (!claim) return undefined;
-      const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform });
-      const { api, dnsLeftBehind } = await cloudflare();
-      if (dnsLeftBehind !== undefined) {
-        await record((current) => ({
-          ...current,
-          abandoned: {
-            ...current.abandoned,
-            'cloudflare-dns': { at: new Date().toISOString(), evidence: dnsLeftBehind },
-          },
-        }));
-      }
-      await forgettingRefusedToken(paths.keptCloudflareTokenFile(instanceId), () =>
-        removeManagedIngress({
-          paths,
-          reservation,
-          claim,
-          api,
-          // A record left behind in a zone the token cannot see is not looked for.
-          ownTransport: provisioning.started('establish_transport') && dnsLeftBehind === undefined,
-          originHost: connectorNetworking(connector.platform).originHost,
-          connector,
-          stopConnector: async () =>
-            dependencies.stopCloudflareConnector
-              ? dependencies.stopCloudflareConnector(connector, await docker())
-              : stopCloudflareConnector(connector, { dockerEndpoint: await docker() }),
-          sleep: dependencies.sleep ?? delay,
-          recordRouteRemoved: () =>
-            record((current) => ({
-              ...current,
-              completed: { ...current.completed, 'managed-ingress': new Date().toISOString() },
-            })),
-        }),
-      );
-      return undefined;
-    },
     nanoclaw: async () => {
       await requireUninstall()(reservation, await localRuntime());
       return undefined;
+    },
+    'chat-subscription': async () => {
+      const access = await chatSubscription();
+      switch (access.state) {
+        case 'unsigned':
+          return undefined;
+        case 'refused':
+          return leaveChatSubscription(access);
+        case 'signed-in':
+          try {
+            await deleteChatSubscriptions(access.api);
+            return undefined;
+          } catch (error) {
+            if (!googleRefuses(error)) throw error;
+            return leaveChatSubscription(signInRefusal(access.account, error));
+          }
+      }
     },
     'gcp-project': async () => {
       const coordinates: GcpProjectCoordinates = {

@@ -83,7 +83,7 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
  * changed (R9).
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
-  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card; the command says when it does, and you are told the result.";
+  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it in the conversation; the command says when it does, and you are told the result.";
 
 /**
  * Who the assistant and the principal are, for each audience (KTD14). Main
@@ -277,13 +277,14 @@ async function requestAddAddressCard(ctx: CallerContext, email: string, approver
     action: ADD_ADDRESS_APPROVAL,
     payload: addAddressPayload(email),
     title: 'Add one of your email addresses?',
-    asks: `to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, and each of them can open the Google Drive folder where the assistant keeps what it makes for you, so approve only if this address is yours.`,
+    asks: `to record ${email} as one of your email addresses. Mail I receive from your addresses is treated as yours, with your authority, and each of them can open the Google Drive folder where I keep what I make for you, so approve only if this address is yours.`,
+    details: { facts: { email } },
   });
   return {
     email,
     status: 'awaiting-principal',
     message:
-      'The principal was asked to confirm on a card, because mail from their addresses carries their authority. You will be told the result; until then the address is not theirs.',
+      'The principal was asked to confirm, because mail from their addresses carries their authority. You will be told the result; until then the address is not theirs.',
   } as const;
 }
 
@@ -383,7 +384,7 @@ registerResource({
     add: {
       access: 'open',
       description:
-        "Add one of the principal's email addresses, when the principal says it is theirs. Adding one already held changes nothing. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card: the result says so, and you are told when they decide.",
+        "Add one of the principal's email addresses, when the principal says it is theirs. Adding one already held changes nothing. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it in the conversation: the result says so, and you are told when they decide.",
       args: [EMAIL_ARGUMENT],
       examples: ['ncl principal-addresses add --email name@example.com'],
       handler: addAddress,
@@ -490,7 +491,7 @@ registerResource({
     set: {
       access: 'open',
       description:
-        "Change the principal's name, home time zone, or both, when the principal tells you to. No card is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
+        "Change the principal's name, home time zone, or both, when the principal tells you to. No confirmation is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
       args: [NAME_ARGUMENT, TIMEZONE_ARGUMENT],
       examples: ['ncl principal-profile set --name "Juno Hale"', 'ncl principal-profile set --timezone Europe/London'],
       handler: setPrincipalProfile,

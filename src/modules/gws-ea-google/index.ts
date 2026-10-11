@@ -8,9 +8,10 @@
  * here rewrites a group's configuration.
  *
  * On a GWS-EA instance the host is also told where the assistant's grant
- * file is; while the host runs it publishes one token per agent credential's
- * host through the selected gateway's credential connection, and holds
- * host-only tokens in memory.
+ * file is. From the moment this module loads, the host mints its own tokens
+ * from the grant and holds them in memory; while it runs, it also publishes
+ * one token per agent credential's host through the selected gateway's
+ * credential connection.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -27,7 +28,8 @@ import {
   type HostGoogleServiceId,
 } from './grant.js';
 import { googleGrantFilePath, readGoogleGrantFile } from './grant-file.js';
-import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleTokenRefresher } from './refresher.js';
+import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER } from './refresher.js';
+import { createHostTokenSource, type HostTokenSource } from './tokens.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 
 /** How often the host checks whether a token needs renewing. */
@@ -116,11 +118,19 @@ registerContainerEnv('gws-ea-google:gog', ({ agentGroupId, capabilities }): Reco
   };
 });
 
-let active: GoogleTokenRefresher | undefined;
+/** Where this host finds the assistant's grant, read as the module loads; undefined without a Google sign-in. */
+const grantFile = googleGrantFilePath();
+
+/**
+ * The host's own tokens (KTD5), built as the module loads from the grant
+ * alone: channels start before the host's modules, so Chat has its token
+ * before any module's start runs, whatever the gateway stores.
+ */
+const hostTokens: HostTokenSource | undefined =
+  grantFile === undefined ? undefined : createHostTokenSource({ readGrant: () => readGoogleGrantFile(grantFile) });
 
 onHostStart(async ({ signal }) => {
-  const grantFile = googleGrantFilePath();
-  if (!grantFile) return;
+  if (grantFile === undefined) return;
   const gateway = getGatewayProvider();
   const credentials = gateway.credentials;
   if (!credentials) {
@@ -134,14 +144,6 @@ onHostStart(async ({ signal }) => {
     connection: (target) => credentials.connection(target),
     log,
   });
-  active = refresher;
-  signal.addEventListener(
-    'abort',
-    () => {
-      if (active === refresher) active = undefined;
-    },
-    { once: true },
-  );
   // Started, not awaited: host startup never waits on Google.
   void (async () => {
     while (!signal.aborted) {
@@ -152,13 +154,34 @@ onHostStart(async ({ signal }) => {
 });
 
 /**
- * A live token for a host-only Google service (KTD1, KTD6), such as the
- * Gmail token for the assistant's own inbox or the Drive token for the home
- * folder: minted on demand and held only in this host's memory, never in a
- * gateway or a container. A service whose scopes the grant does not hold
- * fails with `GoogleScopeNotGrantedError` without asking Google.
+ * A live token for a host-only Google service (KTD1, KTD5, KTD6), such as the
+ * Gmail token for the assistant's own inbox, the Drive token for the home
+ * folder, or the Chat token the assistant talks with: minted on demand and
+ * held only in this host's memory, never in a gateway or a container. It is
+ * served from the moment this module loads, before any module starts. A
+ * service whose scopes the grant does not hold fails with
+ * `GoogleScopeNotGrantedError` without asking Google.
  */
 export function hostGoogleAccessToken(service: HostGoogleServiceId): Promise<string> {
-  if (!active) return Promise.reject(new Error('Google access is off on this host: it has no Google sign-in'));
-  return active.hostAccessToken(service);
+  if (!hostTokens) return Promise.reject(new Error('Google access is off on this host: it has no Google sign-in'));
+  return hostTokens.accessToken(service);
+}
+
+/** The assistant's Google account, as its sign-in names it. */
+export interface AssistantGoogleAccount {
+  /** Its Workspace address, lowercased. */
+  readonly account: string;
+  /** Its Google ID: Chat knows the assistant as `users/{sub}`. */
+  readonly sub: string;
+}
+
+/**
+ * The assistant's account from this host's grant, or undefined on a host
+ * without a Google sign-in or before the assistant signs in. A grant the host
+ * cannot read is refused, as everywhere else.
+ */
+export async function assistantGoogleAccount(): Promise<AssistantGoogleAccount | undefined> {
+  if (grantFile === undefined) return undefined;
+  const grant = await readGoogleGrantFile(grantFile);
+  return grant && { account: grant.account, sub: grant.sub };
 }

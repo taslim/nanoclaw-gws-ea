@@ -20,6 +20,7 @@ import { getContainerConfig } from '../../db/container-configs.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
+import { escapeInvisibles, quoted, REASON_LIMIT } from '../approvals/request-text.js';
 
 export async function validateInstallPackages(content: Record<string, unknown>, session: Session): Promise<boolean> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
@@ -64,14 +65,24 @@ export async function requestInstallPackagesHold(content: Record<string, unknown
   const npm = (content.npm as string[]) || [];
   const reason = (content.reason as string) || '';
 
-  const packageList = [...apt.map((p) => `apt: ${p}`), ...npm.map((p) => `npm: ${p}`)].join(', ');
+  // The packages first, as the host validated them; the agent's reason last, as one quoted line.
+  const lines = [
+    ...(apt.length > 0 ? [`apt: ${apt.join(', ')}`] : []),
+    ...(npm.length > 0 ? [`npm: ${npm.join(', ')}`] : []),
+    "I'd like to install these packages, which means rebuilding my container.",
+    ...(reason ? [`Reason: ${quoted(reason, REASON_LIMIT)}`] : []),
+  ];
   await requestApproval({
     session,
     agentName: agentGroup.name,
     action: 'install_packages',
     payload: { apt, npm, reason },
-    title: 'Install Packages Request',
-    question: `Agent "${agentGroup.name}" is attempting to install a package + rebuild container:\n${packageList}${reason ? `\nReason: ${reason}` : ''}`,
+    title: 'Install packages',
+    question: lines.join('\n'),
+    details: {
+      facts: { apt, npm },
+      supplied: reason ? { reason: { text: reason, source: 'agent' } } : undefined,
+    },
   });
 }
 
@@ -102,21 +113,6 @@ export const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN
 function redactSecret(value: string): string {
   const digest = createHash('sha256').update(value).digest('hex').slice(0, 8);
   return `<redacted: ${Buffer.byteLength(value, 'utf8')} bytes, sha256 ${digest}>`;
-}
-
-/**
- * Render every control/format/invisible/bidi character — and backtick, so a
- * payload can never close the card's code fence — as a visible \uXXXX
- * escape. Applied to JSON-encoded payload fields: JSON.stringify already
- * escapes chars below 0x20, this covers the rest (Cf bidi/zero-width chars,
- * U+2028/U+2029 line separators, private-use, lone surrogates).
- * Exported for tests.
- */
-export function escapeInvisibles(s: string): string {
-  return s.replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\u2028\u2029`]/gu, (c) => {
-    const cp = c.codePointAt(0) ?? 0;
-    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
-  });
 }
 
 export async function validateAddMcpServer(content: Record<string, unknown>, session: Session): Promise<boolean> {
@@ -244,13 +240,12 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   // JSON-encode each field (exact boundaries, embedded newlines render as
   // visible \n escapes), escape invisibles/backticks, and wrap the payload
   // in a code fence — no payload content can add lines to the card, spoof
-  // another field, or break out of the fence.
-  const question =
-    `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n` + '```\n' + fields.join('\n') + '\n' + '```';
+  // another field, or break out of the fence. The fields come first.
+  const question = '```\n' + fields.join('\n') + '\n```\n' + "I'd like to add this MCP server to my tools.";
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
     await notifyAgent(
       session,
-      `add_mcp_server failed: rendered approval card exceeds ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim the MCP configuration.`,
+      `add_mcp_server failed: the approval request would exceed ${MCP_APPROVAL_CARD_MAX_BYTES} bytes — trim the MCP configuration.`,
     );
     return;
   }
@@ -259,7 +254,8 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     agentName: agentGroup.name,
     action: 'add_mcp_server',
     payload: { name: serverName, ...serverConfig },
-    title: 'Add MCP Request',
+    title: 'Add an MCP server',
     question,
+    details: { facts: { server: serverName } },
   });
 }

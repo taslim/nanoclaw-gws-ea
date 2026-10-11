@@ -28,7 +28,7 @@ const INSTANCE_HOST_ENVIRONMENT_KEYS = [
 /**
  * Ambient variables every tool the control plane runs inherits. Never
  * SSH_AUTH_SOCK, GOOGLE_APPLICATION_CREDENTIALS, or any other CLOUDSDK_*,
- * CLOUDFLARE_*, ONECLI_*, ANTHROPIC_*, or GCHAT_* variable.
+ * GWS_EA_*, ONECLI_*, or ANTHROPIC_* variable.
  */
 export const TOOL_ENVIRONMENT_KEYS = [
   ...INSTANCE_HOST_ENVIRONMENT_KEYS,

@@ -2,9 +2,17 @@ import http from 'http';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
+import { getEmoji, Message, parseMarkdown, type Adapter, type AdapterPostableMessage, type RawMessage } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import type { ChannelSetup, InboundMessage } from './adapter.js';
+import {
+  createChatSdkBridge,
+  readPostedRequest,
+  splitForLimit,
+  type InboundReaction,
+  type ReactionSource,
+  type WorkingIndicator,
+} from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -112,6 +120,43 @@ describe('createChatSdkBridge', () => {
   it('keeps adapters without a transport probe available after setup', () => {
     const bridge = createChatSdkBridge({ adapter: stubAdapter({}), supportsThreads: true });
     expect(bridge.isConnected()).toBe(true);
+  });
+
+  it("gives an adapter without a working mark no endTyping, and its typing pulse stays the SDK's alone", async () => {
+    const typing: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        startTyping: async (threadId: string) => {
+          typing.push(threadId);
+        },
+      }),
+      supportsThreads: true,
+    });
+
+    await bridge.setTyping!('stub:c1', 'thread-1', undefined, undefined, 'message-1');
+
+    expect(bridge.endTyping).toBeUndefined();
+    expect(typing).toEqual(['thread-1']);
+  });
+
+  it('hands an adapter with a working mark each pulse that names a message, and each end, by thread', async () => {
+    const calls: string[] = [];
+    const adapter = stubAdapter({
+      startTyping: async (threadId: string) => {
+        calls.push(`typing ${threadId}`);
+      },
+    }) as Adapter & WorkingIndicator;
+    Object.assign(adapter, {
+      workingOn: async (threadId: string, messageId: string) => void calls.push(`working ${threadId} ${messageId}`),
+      endWorking: async (threadId: string, messageId: string) => void calls.push(`ended ${threadId} ${messageId}`),
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+
+    await bridge.setTyping!('stub:c1', null, undefined, undefined, 'message-1');
+    await bridge.setTyping!('stub:c1', null);
+    await bridge.endTyping!('stub:c1', null, 'message-1');
+
+    expect(calls).toEqual(['typing stub:c1', 'working stub:c1 message-1', 'typing stub:c1', 'ended stub:c1 message-1']);
   });
 });
 
@@ -648,16 +693,187 @@ it('forwards the authenticated instance and message address without editing a de
       },
       undefined,
     );
-    expect(onAction).toHaveBeenCalledWith('address-fixture', 'approve', 'selected', {
-      instance: 'fixture-one',
-      messageId: 'original-card',
-      platformId: 'fixture:room',
-    });
+    expect(onAction).toHaveBeenCalledWith(
+      'address-fixture',
+      'approve',
+      'selected',
+      { instance: 'fixture-one', messageId: 'original-card', platformId: 'fixture:room' },
+      { deferResolution: true },
+    );
     expect(editMessage).not.toHaveBeenCalled();
   } finally {
     await bridge.teardown();
     await closeDb();
   }
+});
+
+describe('createChatSdkBridge — reactions an adapter reads itself', () => {
+  // An adapter that reads its platform's reactions (ReactionSource) hands each
+  // to the bridge and awaits it, so a reaction is acknowledged only once routed.
+  const ASSISTANT_TEXT = "I'd book Tuesday 3pm with Juno, shall I?";
+
+  interface Routed {
+    readonly platformId: string;
+    readonly threadId: string | null;
+    readonly message: InboundMessage;
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  function targetMessage(threadId: string, author: { userId: string; fullName: string; isMe: boolean }, text: string) {
+    return new Message({
+      id: 'spaces/AAAAjuno/messages/morgan.1',
+      threadId,
+      text,
+      formatted: parseMarkdown(text),
+      raw: {},
+      author: { ...author, userName: author.fullName, isBot: false },
+      metadata: { dateSent: new Date('2026-10-10T16:58:00Z'), edited: false },
+      attachments: [],
+    });
+  }
+
+  function thumbsUp(
+    threadId: string,
+    on: { userId: string; fullName: string; isMe: boolean },
+    text = ASSISTANT_TEXT,
+  ): InboundReaction {
+    return {
+      reactionName: 'spaces/AAAAjuno/messages/morgan.1/reactions/r1',
+      emoji: getEmoji('thumbs_up'),
+      user: { userId: 'users/1001', userName: 'Juno Hale', fullName: 'Juno Hale', isBot: false, isMe: false },
+      message: targetMessage(threadId, on, text),
+      threadId,
+      reactedAt: new Date('2026-10-10T17:00:00Z'),
+    };
+  }
+
+  async function startReactionSource(options: { redelivers?: boolean; failRouting?: boolean } = {}) {
+    let handler: ((reaction: InboundReaction) => Promise<void>) | undefined;
+    let handlerAtInitialize = false;
+    const routed: Routed[] = [];
+    const source: ReactionSource = {
+      setReactionHandler: (next) => {
+        handler = next;
+      },
+    };
+    const adapter = Object.assign(
+      stubAdapter({
+        name: 'fixture',
+        initialize: async () => {
+          // The adapter starts reading events here, so the bridge must already listen.
+          handlerAtInitialize = handler !== undefined;
+        },
+        channelIdFromThreadId: (threadId: string) => threadId.slice(0, threadId.lastIndexOf(':')),
+        isDM: (threadId: string) => threadId.endsWith(':dm'),
+      }),
+      source,
+    );
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, redelivers: options.redelivers });
+    await bridge.setup({
+      onInbound: async (platformId, threadId, message) => {
+        if (options.failRouting) throw new Error('database is locked');
+        routed.push({ platformId, threadId, message });
+      },
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    });
+    return {
+      bridge,
+      routed,
+      handlerAtInitialize: () => handlerAtInitialize,
+      react: (reaction: InboundReaction) => handler!(reaction),
+    };
+  }
+
+  it("listens before the adapter starts, and routes a reaction on the assistant's message to wake it", async () => {
+    const source = await startReactionSource({ redelivers: true });
+    try {
+      expect(source.handlerAtInitialize()).toBe(true);
+      await source.react(thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true }));
+
+      expect(source.routed).toEqual([
+        {
+          platformId: 'fixture:spaces/AAAAjuno',
+          threadId: 'fixture:spaces/AAAAjuno:dm',
+          message: {
+            id: 'spaces/AAAAjuno/messages/morgan.1/reactions/r1',
+            kind: 'chat-sdk',
+            timestamp: '2026-10-10T17:00:00.000Z',
+            content: {
+              sender: 'Juno Hale',
+              senderId: 'users/1001',
+              senderName: 'Juno Hale',
+              reaction: { emoji: 'thumbs_up', target: { self: true, sender: 'Morgan', excerpt: ASSISTANT_TEXT } },
+            },
+            isMention: false,
+            isGroup: false,
+            authenticatedSender: { userId: 'users/1001', displayName: 'Juno Hale', kind: 'human' },
+            reaction: true,
+            deduplicate: true,
+          },
+        },
+      ]);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it("marks a reaction on someone else's message quiet, naming whose it is", async () => {
+    const source = await startReactionSource();
+    try {
+      await source.react(
+        thumbsUp('fixture:spaces/AAAAroom:thread-1', { userId: 'users/2002', fullName: 'Remy Vance', isMe: false }),
+      );
+
+      const [{ message }] = source.routed;
+      expect(message).toMatchObject({
+        reaction: true,
+        quiet: true,
+        isGroup: true,
+        content: { reaction: { target: { self: false, sender: 'Remy Vance' } } },
+      });
+      expect(message).not.toHaveProperty('deduplicate');
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it('carries an excerpt of a long message, cut to 200 characters', async () => {
+    const source = await startReactionSource();
+    try {
+      const long = `${'Agenda: '.repeat(40)}end`;
+      await source.react(
+        thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true }, long),
+      );
+
+      const content = source.routed[0]!.message.content as { reaction: { target: { excerpt: string } } };
+      expect(content.reaction.target.excerpt).toBe(`${'Agenda: '.repeat(24)}Agenda:…`);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it('rejects when routing fails, so the adapter hands the reaction over again', async () => {
+    const source = await startReactionSource({ failRouting: true });
+    try {
+      await expect(
+        source.react(thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true })),
+      ).rejects.toThrow(/database is locked/u);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
 });
 
 describe('createChatSdkBridge — local Gateway webhook', () => {
@@ -778,6 +994,718 @@ describe('createChatSdkBridge — local Gateway webhook', () => {
       expect(handleWebhook).toHaveBeenCalledTimes(1);
     } finally {
       await bridge.teardown();
+    }
+  });
+});
+
+describe('createChatSdkBridge — requests as text', () => {
+  // A channel whose account cannot show cards (Google Chat under user
+  // authentication) posts questions and approval requests in words, records
+  // each one it posts, and leaves its outcome to the handler that authorizes
+  // an answer: the bridge never edits a request on its own.
+  const DM = 'fixture:spaces/AAAAjuno';
+  const POSTED_AT = '2026-10-10T17:00:05.000000Z';
+  const APPROVAL_OPTIONS = [
+    { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+    { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+    { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: 'reject_with_reason' },
+  ];
+  const QUESTION = "I'd like to install ffmpeg to cut the video.";
+
+  interface EditCall {
+    threadId: string;
+    messageId: string;
+    message: AdapterPostableMessage;
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  async function textBridge(postedRaw: unknown = { createTime: POSTED_AT }) {
+    const posts: PostCall[] = [];
+    const edits: EditCall[] = [];
+    const adapter = stubAdapter({
+      name: 'fixture',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+      postMessage: async (threadId, message) => {
+        posts.push({ threadId, message });
+        return { id: `spaces/AAAAjuno/messages/morgan.${posts.length}`, threadId, raw: postedRaw };
+      },
+      editMessage: async (threadId, messageId, message) => {
+        edits.push({ threadId, messageId, message });
+        return { id: messageId, threadId, raw: {} };
+      },
+    });
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      textRequests: {
+        postedAt: (raw) => {
+          const createTime = (raw as { createTime?: string }).createTime;
+          return createTime === undefined ? undefined : new Date(createTime);
+        },
+      },
+    });
+    const onAction = vi.fn();
+    await bridge.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction });
+    const { SqliteStateAdapter } = await import('../state-sqlite.js');
+    const state = new SqliteStateAdapter();
+    await state.connect();
+    return {
+      bridge,
+      adapter,
+      posts,
+      edits,
+      onAction,
+      posted: (messageId: string) => readPostedRequest(state, 'fixture', messageId),
+    };
+  }
+
+  function askApproval(questionId = 'appr-1') {
+    return {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId,
+        title: 'Install packages',
+        question: QUESTION,
+        options: APPROVAL_OPTIONS,
+      },
+    };
+  }
+
+  function outcome(questionId: string, resolution: string, messageId?: string) {
+    return {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId,
+        ...(messageId === undefined ? {} : { messageId }),
+        text: ['Install packages', QUESTION, resolution].join('\n\n'),
+        terminalCard: { title: 'Install packages', question: QUESTION, resolution },
+      },
+    };
+  }
+
+  it.each([
+    [
+      'an approval whose rejection takes a reason',
+      APPROVAL_OPTIONS,
+      'Quote this message with yes or no, or react 👍 or 👎. To say why, quote it with no and your reason.',
+    ],
+    ['a plain approval', APPROVAL_OPTIONS.slice(0, 2), 'Quote this message with yes or no, or react 👍 or 👎.'],
+    [
+      'any other request, numbering its options,',
+      [
+        { label: 'Connect to main', value: 'connect:ag-main' },
+        { label: 'Connect new agent', value: 'new_agent' },
+        { label: 'Reject', value: 'reject' },
+      ],
+      '1. Connect to main\n2. Connect new agent\n3. Reject\n\nQuote this message with the number or name of your choice.',
+    ],
+  ] as const)('posts %s in words, with no code and no card, and records it', async (_asked, options, howToAnswer) => {
+    const { bridge, posts, posted } = await textBridge();
+    try {
+      const id = await bridge.deliver(DM, null, {
+        kind: 'chat-sdk',
+        content: { type: 'ask_question', questionId: 'appr-1', title: 'Install packages', question: QUESTION, options },
+      });
+
+      expect(id).toBe('spaces/AAAAjuno/messages/morgan.1');
+      expect(posts).toEqual([
+        { threadId: DM, message: { markdown: `**Install packages**\n\n${QUESTION}\n\n${howToAnswer}` } },
+      ]);
+      expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toEqual({
+        questionId: 'appr-1',
+        platformId: DM,
+        postedAt: '2026-10-10T17:00:05.000Z',
+      });
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it('posts a display card as text with its links', async () => {
+    const { bridge, posts, posted } = await textBridge();
+    try {
+      const id = await bridge.deliver(DM, null, {
+        kind: 'chat-sdk',
+        content: {
+          type: 'card',
+          card: {
+            title: 'Launch review',
+            description: 'Thursday at 10am with Juno and Remy.',
+            children: ['Agenda attached', { text: 'Room: Atlas' }],
+            actions: [
+              { label: 'Agenda', url: 'https://example.com/agenda' },
+              { label: 'No link' },
+              { label: 'Room booking', url: 'https://example.com/atlas' },
+            ],
+          },
+          fallbackText: 'Launch review Thursday',
+        },
+      });
+
+      expect(id).toBe('spaces/AAAAjuno/messages/morgan.1');
+      expect(posts[0]!.message).toEqual({
+        markdown:
+          '**Launch review**\n\nThursday at 10am with Juno and Remy.\n\nAgenda attached\n\nRoom: Atlas\n\n' +
+          '[Agenda](https://example.com/agenda)\n[Room booking](https://example.com/atlas)',
+      });
+      expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toBeUndefined();
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it('remembers a request the platform reported no time for, without one', async () => {
+    const { bridge, posted } = await textBridge({});
+    try {
+      await bridge.deliver(DM, null, askApproval());
+
+      expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toEqual({ questionId: 'appr-1', platformId: DM });
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it('edits nothing for an outcome of a request it never posted, naming no message', async () => {
+    const { bridge, edits } = await textBridge();
+    try {
+      await bridge.deliver(DM, null, outcome('appr-elsewhere', '✅ Approved'));
+
+      expect(edits).toEqual([]);
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it("edits the posted request to its handler's outcome, after which it takes no answer", async () => {
+    const { bridge, edits, posted } = await textBridge();
+    try {
+      await bridge.deliver(DM, null, askApproval());
+      await bridge.deliver(DM, null, outcome('appr-1', '✅ Approved', 'spaces/AAAAjuno/messages/morgan.1'));
+
+      expect(edits).toEqual([
+        {
+          threadId: DM,
+          messageId: 'spaces/AAAAjuno/messages/morgan.1',
+          message: { markdown: `**Install packages**\n\n${QUESTION}\n\n✅ Approved` },
+        },
+      ]);
+      expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toBeUndefined();
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it('refuses to reword an open request, and edits it once it shows its outcome', async () => {
+    const { bridge, edits, posted } = await textBridge();
+    try {
+      await bridge.deliver(DM, null, askApproval());
+      const reworded = {
+        kind: 'chat-sdk',
+        content: {
+          operation: 'edit',
+          messageId: 'spaces/AAAAjuno/messages/morgan.1',
+          text: 'Install a spell checker?',
+        },
+      };
+
+      await expect(bridge.deliver(DM, null, reworded)).rejects.toThrow(/open request/);
+      expect(edits).toEqual([]);
+      expect((await posted('spaces/AAAAjuno/messages/morgan.1'))?.questionId).toBe('appr-1');
+
+      await bridge.deliver(DM, null, outcome('appr-1', '✅ Approved'));
+      await bridge.deliver(DM, null, reworded);
+      expect(edits.map((edit) => edit.message)).toEqual([
+        { markdown: `**Install packages**\n\n${QUESTION}\n\n✅ Approved` },
+        { markdown: 'Install a spell checker?' },
+      ]);
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it('edits the message the answer named when a question was posted twice, and the newest when none is named', async () => {
+    const { bridge, edits, posted } = await textBridge();
+    try {
+      await bridge.deliver(DM, null, askApproval('mg-room'));
+      await bridge.deliver(DM, null, askApproval('mg-room'));
+      await bridge.deliver(DM, null, outcome('mg-room', '📋 Choosing…', 'spaces/AAAAjuno/messages/morgan.1'));
+
+      expect(edits.map((edit) => edit.messageId)).toEqual(['spaces/AAAAjuno/messages/morgan.1']);
+      expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toBeUndefined();
+      expect((await posted('spaces/AAAAjuno/messages/morgan.2'))?.questionId).toBe('mg-room');
+
+      await bridge.deliver(DM, null, outcome('mg-room', '✅ Connected to main'));
+      expect(edits.map((edit) => edit.messageId)).toEqual([
+        'spaces/AAAAjuno/messages/morgan.1',
+        'spaces/AAAAjuno/messages/morgan.2',
+      ]);
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
+  it("edits an expired gateway request to say so, through the coordinator's own edit", async () => {
+    const coordinator = await import('../gateway-approval-coordinator.js');
+    const { createPendingApproval, getPendingApproval } = await import('../db/sessions.js');
+    const { bridge, edits } = await textBridge();
+    await coordinator.startGatewayApprovalCoordinator(
+      {
+        kind: 'fixture',
+        agentSkills: [],
+        sessions: {
+          async ensure() {
+            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
+          },
+        },
+        approvals: {
+          async subscribe(_decide, signal) {
+            await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+          },
+        },
+      },
+      {
+        deliver: (_channelType, platformId, threadId, kind, content) =>
+          bridge.deliver(platformId, threadId, { kind, content: JSON.parse(content) as unknown }),
+      },
+      vi.fn(),
+    );
+    try {
+      const messageId = await bridge.deliver(DM, null, {
+        kind: 'chat-sdk',
+        content: {
+          type: 'ask_question',
+          questionId: 'ga-1',
+          title: 'Credentials request',
+          question: 'POST api.example.com/v1/charges',
+          options: APPROVAL_OPTIONS.slice(0, 2),
+        },
+      });
+      await createPendingApproval({
+        approval_id: 'ga-1',
+        request_id: 'req-1',
+        action: coordinator.GATEWAY_APPROVAL_ACTION,
+        payload: JSON.stringify({ gatewayProvider: 'fixture' }),
+        created_at: new Date().toISOString(),
+        channel_type: 'fixture',
+        platform_id: DM,
+        platform_message_id: messageId ?? null,
+        expires_at: new Date().toISOString(),
+        title: 'Credentials request',
+        question: 'POST api.example.com/v1/charges',
+        options_json: JSON.stringify(APPROVAL_OPTIONS.slice(0, 2)),
+      });
+
+      await coordinator.editExpiredGatewayApprovalCard((await getPendingApproval('ga-1'))!, 'no response');
+
+      expect(edits).toEqual([
+        {
+          threadId: DM,
+          messageId: 'spaces/AAAAjuno/messages/morgan.1',
+          message: {
+            markdown: '**Credentials request**\n\nPOST api.example.com/v1/charges\n\n⏱️ Timed out — no response',
+          },
+        },
+      ]);
+    } finally {
+      await coordinator.stopGatewayApprovalCoordinator();
+      await bridge.teardown();
+    }
+  });
+
+  it('never edits a request on a click: it hands the answer on for its handler to resolve', async () => {
+    const { registerQuestionRenderResolver } = await import('./question-render-registry.js');
+    registerQuestionRenderResolver((id) =>
+      id === 'text-click-fixture'
+        ? { title: 'Pick a time', options: [{ label: 'Tuesday', selectedLabel: 'Tuesday', value: 'tue' }] }
+        : undefined,
+    );
+    const { bridge, adapter, edits, onAction } = await textBridge();
+    try {
+      const chat = (bridge as unknown as { _chat: import('chat').Chat })._chat;
+      await chat.processAction(
+        {
+          actionId: 'ncq:text-click-fixture:0',
+          adapter,
+          messageId: 'spaces/AAAAjuno/messages/morgan.1',
+          raw: {},
+          threadId: DM,
+          user: { userId: 'users/2001' } as never,
+          value: '0',
+        },
+        undefined,
+      );
+
+      expect(onAction).toHaveBeenCalledWith(
+        'text-click-fixture',
+        'tue',
+        'users/2001',
+        { instance: 'fixture', messageId: 'spaces/AAAAjuno/messages/morgan.1', platformId: DM },
+        { deferResolution: true },
+      );
+      expect(edits).toEqual([]);
+    } finally {
+      await bridge.teardown();
+    }
+  });
+});
+
+describe('createChatSdkBridge — answers in words', () => {
+  // On a channel whose requests are text, a reply or reaction that answers a
+  // request reaches the request's handler through onAction, awaited, instead
+  // of the agent. Anything else is routed as any message is. Which words and
+  // reactions answer which request is answers.test.ts's to prove; these cases
+  // prove what the bridge hands it and does with its verdict.
+  const DM = 'fixture:spaces/AAAAjuno';
+  const DM_THREAD = `${DM}:dm`;
+  const ROOM = 'fixture:spaces/AAAAlaunch';
+  const ROOM_THREAD = `${ROOM}:thread-1`;
+  const JUNO = { userId: 'users/1001', userName: 'Juno Hale', fullName: 'Juno Hale', isBot: false, isMe: false };
+  const T0 = Date.parse('2026-10-10T17:00:00.000Z');
+  const APPROVAL_OPTIONS = [
+    { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+    { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+    { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: 'reject_with_reason' },
+  ];
+  const TIMES = [
+    { label: 'Tuesday 3pm', selectedLabel: 'Tuesday 3pm', value: 'tue' },
+    { label: 'Wednesday 10am', selectedLabel: 'Wednesday 10am', value: 'wed' },
+    { label: 'Thursday 9am', selectedLabel: 'Thursday 9am', value: 'thu' },
+  ];
+  const YES_NO = [
+    { label: 'Yes', selectedLabel: 'Yes', value: 'yes' },
+    { label: 'No', selectedLabel: 'No', value: 'no' },
+  ];
+
+  type ActionCall = Parameters<ChannelSetup['onAction']>;
+
+  /** An ISO time `seconds` into the scenario, by the platform's clock. */
+  function iso(seconds: number): string {
+    return new Date(T0 + seconds * 1000).toISOString();
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    const { createAgentGroup } = await import('../db/agent-groups.js');
+    const { createSession } = await import('../db/sessions.js');
+    await runMigrations(await initTestDb());
+    const now = new Date().toISOString();
+    await createAgentGroup({ id: 'ag-main', name: 'Main', folder: 'main', agent_provider: null, created_at: now });
+    await createSession({
+      id: 'sess-main',
+      agent_group_id: 'ag-main',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: now,
+      created_at: now,
+    });
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  async function answeringBridge(handle: (...call: ActionCall) => Promise<void> = async () => {}) {
+    let chat: import('chat').ChatInstance | undefined;
+    let reactionHandler: ((reaction: InboundReaction) => Promise<void>) | undefined;
+    const routed: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
+    const actions: ActionCall[] = [];
+    let posts = 0;
+    let postedAt = iso(0);
+    const source: ReactionSource = {
+      setReactionHandler: (next) => {
+        reactionHandler = next;
+      },
+    };
+    const adapter = Object.assign(
+      stubAdapter({
+        name: 'fixture',
+        userName: 'noel',
+        initialize: async (instance) => {
+          chat = instance;
+        },
+        channelIdFromThreadId: (threadId: string) => threadId.slice(0, threadId.lastIndexOf(':')),
+        isDM: (threadId: string) => threadId.endsWith(':dm'),
+        postMessage: async (threadId) => {
+          posts += 1;
+          return { id: `spaces/AAAA/messages/noel.${posts}`, threadId, raw: { createTime: postedAt } };
+        },
+      }),
+      source,
+    );
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      redelivers: true,
+      extractReplyContext: (raw) => {
+        const quote = raw.quote as { name?: string; text: string } | undefined;
+        return quote ? { sender: 'Noel', text: quote.text, ...(quote.name ? { id: quote.name } : {}) } : null;
+      },
+      textRequests: { postedAt: (raw) => new Date((raw as { createTime: string }).createTime) },
+    });
+    await bridge.setup({
+      onInbound: async (platformId, threadId, message) => {
+        routed.push({ platformId, threadId, message });
+      },
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: async (...call) => {
+        actions.push(call);
+        await handle(...call);
+      },
+    });
+    const { SqliteStateAdapter } = await import('../state-sqlite.js');
+    const state = new SqliteStateAdapter();
+    await state.connect();
+    return {
+      bridge,
+      routed,
+      actions,
+      state,
+      /** The assistant posts a request in a conversation, recorded `seconds` into the scenario. */
+      async ask(platformId: string, questionId: string, options: typeof APPROVAL_OPTIONS, seconds: number) {
+        postedAt = iso(seconds);
+        const messageId = await bridge.deliver(platformId, null, {
+          kind: 'chat-sdk',
+          content: { type: 'ask_question', questionId, title: 'Request', question: 'Shall I?', options },
+        });
+        return messageId!;
+      },
+      /**
+       * Someone writes in a thread, `seconds` into the scenario, quoting a message when told to, or
+       * forwarding one: a forward quotes text without naming a message it replies to.
+       */
+      write(
+        text: string,
+        seconds: number,
+        options: { id?: string; thread?: string; quote?: string; forwarded?: string } = {},
+      ) {
+        const message = new Message({
+          id: options.id ?? `spaces/AAAA/messages/juno.${seconds}`,
+          threadId: options.thread ?? DM_THREAD,
+          text,
+          formatted: parseMarkdown(text),
+          raw:
+            options.quote !== undefined
+              ? { quote: { name: options.quote, text: 'Shall I?' } }
+              : options.forwarded !== undefined
+                ? { quote: { text: options.forwarded } }
+                : {},
+          author: JUNO,
+          metadata: { dateSent: new Date(T0 + seconds * 1000), edited: false },
+          attachments: [],
+        });
+        return chat!.processMessage(adapter, options.thread ?? DM_THREAD, message);
+      },
+      /** Someone reacts in the DM to the assistant's message; the platform names a reaction the same each delivery. */
+      react(messageId: string, emoji: string) {
+        return reactionHandler!({
+          reactionName: `${messageId}/reactions/${emoji}`,
+          emoji: getEmoji(emoji),
+          user: JUNO,
+          message: new Message({
+            id: messageId,
+            threadId: DM_THREAD,
+            text: 'Shall I?',
+            formatted: parseMarkdown('Shall I?'),
+            raw: {},
+            author: { userId: 'users/9', userName: 'Noel', fullName: 'Noel', isBot: false, isMe: true },
+            metadata: { dateSent: new Date(T0), edited: false },
+            attachments: [],
+          }),
+          threadId: DM_THREAD,
+          reactedAt: new Date(T0 + 90_000),
+        });
+      },
+    };
+  }
+
+  /** An agent's question, open for the next hour. */
+  async function askedQuestion(questionId: string, options: typeof YES_NO): Promise<void> {
+    const { createPendingQuestion } = await import('../db/sessions.js');
+    await createPendingQuestion({
+      question_id: questionId,
+      session_id: 'sess-main',
+      message_out_id: `out-${questionId}`,
+      platform_id: DM,
+      channel_type: 'fixture',
+      thread_id: null,
+      title: 'Request',
+      question: 'Shall I?',
+      options,
+      deadline: new Date(Date.now() + 3_600_000).toISOString(),
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  async function pendingApproval(approvalId: string, options: typeof APPROVAL_OPTIONS = APPROVAL_OPTIONS) {
+    const { createPendingApproval } = await import('../db/sessions.js');
+    await createPendingApproval({
+      approval_id: approvalId,
+      request_id: `request-${approvalId}`,
+      action: 'install_packages',
+      payload: '{}',
+      created_at: new Date().toISOString(),
+      title: 'Request',
+      question: 'Shall I?',
+      options_json: JSON.stringify(options),
+    });
+  }
+
+  it("takes a plain answer in a DM by the platform's clock, against the questions asked since the person last wrote", async () => {
+    await askedQuestion('q-room', YES_NO);
+    await askedQuestion('q-projector', YES_NO);
+    const desk = await answeringBridge();
+    try {
+      await desk.ask(DM, 'q-room', YES_NO, 0);
+      // Typed as the question arrived: no answer, and the question is now older than Juno's last message.
+      await desk.write('yes', 2);
+      const projector = await desk.ask(DM, 'q-projector', YES_NO, 10);
+      await desk.write('yes', 20);
+
+      expect(desk.actions).toEqual([
+        [
+          'q-projector',
+          'yes',
+          'users/1001',
+          { instance: 'fixture', messageId: projector, platformId: DM },
+          { deferResolution: true },
+        ],
+      ]);
+      expect(desk.routed.map(({ message }) => message.id)).toEqual(['spaces/AAAA/messages/juno.2']);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('takes quoted answers in a group, past a mention of the assistant and with the reason a no gives, and routes a plain one', async () => {
+    await askedQuestion('q-launch', TIMES);
+    await pendingApproval('appr-launch');
+    const desk = await answeringBridge();
+    try {
+      const question = await desk.ask(ROOM, 'q-launch', TIMES, 0);
+      const approval = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
+      await desk.write('2', 20, { thread: ROOM_THREAD });
+      await desk.write('2', 30, { thread: ROOM_THREAD, quote: question });
+      await desk.write('@noel no, too expensive', 40, { thread: ROOM_THREAD, quote: approval });
+
+      expect(desk.actions).toEqual([
+        [
+          'q-launch',
+          'wed',
+          'users/1001',
+          { instance: 'fixture', messageId: question, platformId: ROOM },
+          { deferResolution: true },
+        ],
+        [
+          'appr-launch',
+          'reject',
+          'users/1001',
+          { instance: 'fixture', messageId: approval, platformId: ROOM },
+          { deferResolution: true, reason: 'too expensive' },
+        ],
+      ]);
+      expect(desk.routed.map(({ platformId, message }) => [platformId, message.id])).toEqual([
+        [ROOM, 'spaces/AAAA/messages/juno.20'],
+      ]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('routes a forward with its quote: it names no request, though its words would answer the open question', async () => {
+    await askedQuestion('q-room', YES_NO);
+    const desk = await answeringBridge();
+    try {
+      await desk.ask(DM, 'q-room', YES_NO, 0);
+      await desk.write('yes', 30, { forwarded: 'Atlas is free on Thursday.' });
+
+      expect(desk.actions).toEqual([]);
+      expect(desk.routed.map(({ message }) => message.content)).toEqual([
+        expect.objectContaining({ text: 'yes', replyTo: { sender: 'Noel', text: 'Atlas is free on Thursday.' } }),
+      ]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('hands a 👍 on an approval to its handler once, though delivered again, and routes a 👍 that answers nothing', async () => {
+    const channelOptions = [
+      { label: 'Choose existing agent', selectedLabel: 'Choose existing agent', value: 'choose_existing' },
+      { label: 'Connect new agent', selectedLabel: 'Connect new agent', value: 'new_agent' },
+      { label: 'Reject', selectedLabel: 'Reject', value: 'reject' },
+    ];
+    await pendingApproval('appr-ffmpeg');
+    await pendingApproval('mg-launch', channelOptions);
+    const desk = await answeringBridge();
+    try {
+      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
+      const channel = await desk.ask(DM, 'mg-launch', channelOptions, 0);
+      await desk.react(request, 'thumbs_up');
+      await desk.react(request, 'thumbs_up');
+      await desk.react(channel, 'thumbs_up');
+
+      expect(desk.actions).toEqual([
+        [
+          'appr-ffmpeg',
+          'approve',
+          'users/1001',
+          { instance: 'fixture', messageId: request, platformId: DM },
+          { deferResolution: true },
+        ],
+      ]);
+      expect(desk.routed.map(({ message }) => [message.id, message.reaction])).toEqual([
+        [`${channel}/reactions/thumbs_up`, true],
+      ]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it("rejects while an answer's handler fails, then takes the answer delivered again once, routing none of it", async () => {
+    await askedQuestion('q-room', YES_NO);
+    let failures = 1;
+    const desk = await answeringBridge(async () => {
+      if (failures-- > 0) throw new Error('database is locked');
+    });
+    try {
+      const request = await desk.ask(DM, 'q-room', YES_NO, 0);
+      const id = 'spaces/AAAA/messages/juno.yes';
+      // Pub/Sub may deliver a message again for days, and the SDK drops a copy for ten minutes only; the
+      // adapter releases that for a message it could not hand on. Each delivery here comes past it.
+      const deliver = async () => {
+        await desk.state.delete(`dedupe:fixture:${id}`);
+        await desk.write('yes', 30, { id, quote: request });
+      };
+
+      await expect(deliver()).rejects.toThrow(/database is locked/u);
+      await deliver();
+      await deliver();
+
+      expect(desk.actions.map(([questionId, value]) => [questionId, value])).toEqual([
+        ['q-room', 'yes'],
+        ['q-room', 'yes'],
+      ]);
+      expect(desk.routed).toEqual([]);
+    } finally {
+      await desk.bridge.teardown();
     }
   });
 });

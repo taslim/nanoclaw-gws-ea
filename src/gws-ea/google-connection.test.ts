@@ -17,7 +17,9 @@ import { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 import {
   DRIVE_ABOUT_URL,
   GOOGLE_CLIENT_FILE_FLAG,
+  googleAccessResources,
   googleConnectionResources,
+  googleSignInResources,
   observeGoogleConnection,
   PRIMARY_CALENDAR_URL,
   type GoogleConnectionContext,
@@ -32,7 +34,16 @@ const SECRETS = path.join(ROOT, 'secrets');
 const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
 const DRIVE = 'https://www.googleapis.com/auth/drive';
-/** The scopes this release adds to the sign-in, in the order it asks for them: Workspace's, then the ceiling. */
+const HOST_CHAT: readonly string[] = HOST_GOOGLE_SERVICES.chat.scopes;
+/** Chat's scopes beyond the host's Chat token, each pinned in grant.test.ts. */
+const CHAT_CEILING = GOOGLE_SIGN_IN_SCOPES.filter(
+  (scope) => scope.includes('/auth/chat.') && !HOST_CHAT.includes(scope),
+);
+/**
+ * The scopes the sign-in asks for beyond what an assistant signed in before
+ * Workspace holds, in the order it asks for them: Workspace's, Chat's, then
+ * the ceiling.
+ */
 const THIS_RELEASE_SCOPES = [
   DRIVE,
   'https://www.googleapis.com/auth/documents',
@@ -40,6 +51,7 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/presentations',
   'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.responses.readonly',
+  ...HOST_CHAT,
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.readonly',
   'https://www.googleapis.com/auth/calendar.events.readonly',
@@ -73,6 +85,7 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets.readonly',
   'https://www.googleapis.com/auth/presentations.readonly',
   'https://www.googleapis.com/auth/forms.body.readonly',
+  ...CHAT_CEILING,
 ];
 /** The scopes an assistant signed in before Drive, Docs, Sheets, Slides and Forms holds. */
 const BEFORE_WORKSPACE = [
@@ -86,7 +99,7 @@ const BEFORE_WORKSPACE = [
 
 function runtime(): InstanceRuntimeConfig {
   return {
-    schema_version: 2,
+    schema_version: 3,
     instance_id: '11111111-1111-4111-8111-111111111111',
     install_id: '11111111111141118111111111111111',
     instance_root: ROOT,
@@ -94,17 +107,16 @@ function runtime(): InstanceRuntimeConfig {
     state_root: path.join(ROOT, 'state'),
     node_path: '/usr/bin/node',
     home_directory: ROOT,
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     agent_egress_network: 'gws-ea-x-agent-egress',
     onecli_project: 'gws-ea-x',
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: 'gws-ea-x-gateway-1',
     selected_provider: 'claude',
-    endpoint_url: 'https://juno.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
-      gchat_credentials: path.join(SECRETS, 'gchat-service-account.json'),
+      gchat_subscriber_key: path.join(SECRETS, 'gchat-subscriber-key.json'),
       onecli_runtime_api_key: path.join(SECRETS, 'onecli-runtime-api-key'),
       onecli_admin_api_key: path.join(SECRETS, 'onecli-admin-api-key'),
     },
@@ -116,7 +128,7 @@ const GCP: GcpProjectInput = {
   projectId: 'gws-ea-juno-test',
   account: 'operator@example.test',
   serviceAccountEmail: deriveGchatServiceAccountEmail('gws-ea-juno-test'),
-  credentialFile: path.join(SECRETS, 'gchat-service-account.json'),
+  credentialFile: path.join(SECRETS, 'gchat-subscriber-key.json'),
   cwd: ROOT,
 };
 
@@ -204,8 +216,9 @@ class World {
 
 function grant(overrides: Partial<GoogleGrant> = {}): GoogleGrant {
   return {
-    schema_version: 1,
+    schema_version: 2,
     account: ACCOUNT,
+    sub: '104857395723948572901',
     ...CLIENT,
     refresh_token: '1//refresh-token',
     scopes: GOOGLE_SIGN_IN_SCOPES.map((scope) =>
@@ -302,7 +315,7 @@ describe("connecting the assistant's Google account", () => {
     ]);
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
     expect(pause).toMatchObject({
-      phase: 'connect_google',
+      phase: 'sign_in_google',
       code: 'google_client_required',
       resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
       actionUrl: `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
@@ -328,6 +341,37 @@ describe("connecting the assistant's Google account", () => {
     expect(fs.existsSync(path.join(SECRETS, 'google-oauth-client.json'))).toBe(false);
     expect(world.vaultWrites).toEqual([]);
     expect(signIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("signs in before the host runs, reading nothing from OneCLI, and leaves agents' access for after it", async () => {
+    const world = new World();
+    const options = { gcloud: { runCommand: world.runCommand }, fetch: world.fetch, sleep: async () => undefined };
+    const signInResources = googleSignInResources(options);
+
+    await expect(
+      connect(
+        signInResources,
+        context(async () => grant(), writeDownloadedClient()),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(signInResources.map((resource) => resource.name)).toEqual([
+      'the Google Workspace APIs',
+      "the assistant's Google sign-in client",
+      "the assistant's Google sign-in",
+    ]);
+    expect(googleAccessResources(options).map((resource) => resource.name)).toEqual([
+      "agents' Google access",
+      "the assistant's own calendar and Drive",
+    ]);
+    // connect-google repairs both, in the same order.
+    expect(googleConnectionResources(options).map((resource) => resource.name)).toEqual([
+      ...signInResources.map((resource) => resource.name),
+      ...googleAccessResources(options).map((resource) => resource.name),
+    ]);
+    const vaultReads = vi.mocked(world.fetch).mock.calls.filter(([input]) => String(input).includes('/v1/secrets'));
+    expect(vaultReads).toEqual([]);
+    expect(world.vaultWrites).toEqual([]);
   });
 
   it("waits for the host to publish each credential's secret before the step is done", async () => {

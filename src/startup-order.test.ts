@@ -7,6 +7,7 @@ const state = vi.hoisted(() => ({
   routeInbound: vi.fn(),
   startChannels: vi.fn(),
   ready: vi.fn(),
+  responseHandlers: [] as Array<(payload: import('./response-registry.js').ResponsePayload) => Promise<boolean>>,
 }));
 vi.mock('./backfill-container-configs.js', () => ({ backfillContainerConfigs: vi.fn() }));
 vi.mock('./config.js', () => ({ CENTRAL_DB_PATH: ':memory:' }));
@@ -55,7 +56,7 @@ vi.mock('./delivery.js', () => ({
 vi.mock('./host-sweep.js', () => ({ startHostSweep: vi.fn(), stopHostSweep: vi.fn() }));
 vi.mock('./host-lifecycle.js', () => ({ startHostModules: vi.fn(), stopHostModules: vi.fn() }));
 vi.mock('./router.js', () => ({ routeInbound: state.routeInbound }));
-vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => [] }));
+vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => state.responseHandlers }));
 vi.mock('./channels/index.js', () => ({}));
 vi.mock('./modules/index.js', () => ({}));
 vi.mock('./cli/commands/index.js', () => ({}));
@@ -68,7 +69,16 @@ vi.mock('./channels/channel-registry.js', () => ({
   initChannelAdapters: state.startChannels,
 }));
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  state.adopted = false;
+  state.approvalReady = false;
+  state.releaseAdoption = undefined;
+  state.responseHandlers = [];
+  state.routeInbound.mockReset();
+  state.startChannels.mockReset();
+  state.ready.mockReset();
+});
 
 it('finishes adoption before a channel can route its first inbound message', async () => {
   vi.spyOn(process, 'on').mockReturnValue(process);
@@ -89,4 +99,110 @@ it('finishes adoption before a channel can route its first inbound message', asy
   state.releaseAdoption!();
   await vi.waitFor(() => expect(state.ready).toHaveBeenCalled());
   expect(state.routeInbound).toHaveBeenCalledOnce();
+});
+
+it("hands the router a channel's marks: a copy its platform may redeliver, quiet context, and a reaction", async () => {
+  vi.resetModules();
+  vi.spyOn(process, 'on').mockReturnValue(process);
+  const content = { sender: 'Remy Vance', reaction: { emoji: 'thumbs_up', target: { self: false } } };
+  const message = {
+    id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
+    kind: 'chat-sdk' as const,
+    timestamp: '2026-10-10T17:00:00.000Z',
+    isMention: false,
+    isGroup: true,
+    authenticatedSender: { userId: 'users/2002', displayName: 'Remy Vance', kind: 'human' as const },
+    deduplicate: true,
+    quiet: true,
+    reaction: true,
+  };
+  state.startChannels.mockImplementation(async (setup) => {
+    void setup({ channelType: 'gchat', instance: 'gchat' }).onInbound(
+      'gchat:spaces/AAAAroom',
+      'gchat:spaces/AAAAroom:thread-lunch',
+      { ...message, content },
+    );
+  });
+  await import('./index.js');
+  await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
+  state.releaseAdoption!();
+
+  await vi.waitFor(() => expect(state.routeInbound).toHaveBeenCalledOnce());
+  expect(state.routeInbound).toHaveBeenCalledWith({
+    channelType: 'gchat',
+    instance: 'gchat',
+    platformId: 'gchat:spaces/AAAAroom',
+    threadId: 'gchat:spaces/AAAAroom:thread-lunch',
+    message: { ...message, content: JSON.stringify(content) },
+  });
+});
+
+it('holds an answer until inbound is ready, and settles it only once its handler has finished', async () => {
+  vi.resetModules();
+  vi.spyOn(process, 'on').mockReturnValue(process);
+  let finish!: () => void;
+  const handler = vi.fn(async () => {
+    expect(state.adopted).toBe(true);
+    await new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return true;
+  });
+  state.responseHandlers = [handler];
+  let answered: void | Promise<void> = undefined;
+  state.startChannels.mockImplementation(async (setup) => {
+    answered = setup({ channelType: 'fixture' }).onAction(
+      'q-1',
+      'reject',
+      'users/2001',
+      { platformId: 'fixture:dm', messageId: 'fixture:dm/m-1' },
+      { deferResolution: true, reason: 'too expensive' },
+    );
+  });
+  await import('./index.js');
+  await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
+  expect(handler).not.toHaveBeenCalled();
+
+  let settled = false;
+  const settling = Promise.resolve(answered).then(() => {
+    settled = true;
+  });
+  state.releaseAdoption!();
+  await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+  expect(handler).toHaveBeenCalledWith({
+    questionId: 'q-1',
+    value: 'reject',
+    reason: 'too expensive',
+    userId: 'users/2001',
+    channelType: 'fixture',
+    instance: 'fixture',
+    messageId: 'fixture:dm/m-1',
+    platformId: 'fixture:dm',
+    threadId: null,
+    deferResolution: true,
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  finish();
+  await settling;
+  expect(settled).toBe(true);
+});
+
+it('rejects an answer whose handler fails, so its channel can hand it over again', async () => {
+  vi.resetModules();
+  vi.spyOn(process, 'on').mockReturnValue(process);
+  state.responseHandlers = [
+    async () => {
+      throw new Error('database is locked');
+    },
+  ];
+  let answered: void | Promise<void> = undefined;
+  state.startChannels.mockImplementation(async (setup) => {
+    answered = setup({ channelType: 'fixture' }).onAction('q-1', 'approve', 'users/2001');
+  });
+  await import('./index.js');
+  await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
+  state.releaseAdoption!();
+
+  await expect(Promise.resolve(answered)).rejects.toThrow('database is locked');
 });

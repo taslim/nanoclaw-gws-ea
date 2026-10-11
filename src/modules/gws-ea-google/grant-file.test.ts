@@ -7,8 +7,9 @@ import { readGoogleGrantFile } from './grant-file.js';
 const ROOT = '/tmp/nanoclaw-gws-ea-google-test';
 const FILE = path.join(ROOT, 'secrets', 'google-grant.json');
 const GRANT = {
-  schema_version: 1,
+  schema_version: 2,
   account: 'juno@example.test',
+  sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',

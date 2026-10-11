@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
-import { createPendingApproval } from '../db/sessions.js';
+import { createPendingApproval, createPendingQuestion, createSession } from '../db/sessions.js';
 import { log } from '../log.js';
 import { registerQuestionRenderResolver, resolveQuestionRender } from './question-render-registry.js';
 
@@ -86,6 +87,7 @@ describe('question render resolver registry', () => {
 
     expect(await resolveQuestionRender('resolver-failure-question')).toEqual({
       title: 'Built-in fallback after failure',
+      kind: 'approval',
       question: '',
       options: [{ label: 'Allow', selectedLabel: 'Allowed', value: 'allow' }],
     });
@@ -105,9 +107,77 @@ describe('question render resolver registry', () => {
 
     expect(await resolveQuestionRender('built-in-render-question')).toEqual({
       title: 'Built-in approval',
+      kind: 'approval',
       question: '',
       options: [{ label: 'Allow', selectedLabel: 'Allowed', value: 'allow' }],
     });
+  });
+
+  it("tells a pending approval's expiry, and that an approval no longer pending is resolved", async () => {
+    const approval = {
+      request_id: 'request-gateway',
+      action: 'gateway_request',
+      payload: '{}',
+      created_at: new Date().toISOString(),
+      expires_at: '2026-10-10T17:02:00.000Z',
+      title: 'Credentials request',
+      options_json: JSON.stringify([{ label: 'Approve', selectedLabel: 'Approved', value: 'approve' }]),
+    };
+    await createPendingApproval({ ...approval, approval_id: 'ga-open' });
+    await createPendingApproval({ ...approval, approval_id: 'ga-decided', status: 'approved' });
+
+    expect(await resolveQuestionRender('ga-open')).toEqual(
+      expect.objectContaining({ deferResolution: true, expiresAt: '2026-10-10T17:02:00.000Z' }),
+    );
+    expect(await resolveQuestionRender('ga-open')).not.toHaveProperty('resolved');
+    expect(await resolveQuestionRender('ga-decided')).toEqual(expect.objectContaining({ resolved: true }));
+    expect(await resolveQuestionRender('ga-decided')).not.toHaveProperty('expiresAt');
+  });
+
+  it("tells an agent's own question from an approval", async () => {
+    const now = new Date().toISOString();
+    await createAgentGroup({ id: 'ag-main', name: 'Main', folder: 'main', agent_provider: null, created_at: now });
+    await createSession({
+      id: 'sess-main',
+      agent_group_id: 'ag-main',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: now,
+      created_at: now,
+    });
+    await createPendingQuestion({
+      question_id: 'agent-question',
+      session_id: 'sess-main',
+      message_out_id: 'out-agent-question',
+      platform_id: 'gchat:spaces/AAAAjuno',
+      channel_type: 'gchat',
+      thread_id: null,
+      title: 'Book the room',
+      question: 'Shall I book Atlas for Thursday?',
+      options: [
+        { label: 'Yes', selectedLabel: 'Yes', value: 'yes' },
+        { label: 'No', selectedLabel: 'No', value: 'no' },
+      ],
+      deadline: '2026-10-10T17:05:00.000Z',
+      created_at: now,
+    });
+    await createPendingApproval({
+      approval_id: 'install-approval',
+      request_id: 'request-install',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now,
+      title: 'Install packages',
+      options_json: JSON.stringify([{ label: 'Approve', selectedLabel: 'Approved', value: 'approve' }]),
+    });
+
+    expect(await resolveQuestionRender('agent-question')).toEqual(
+      expect.objectContaining({ kind: 'question', expiresAt: '2026-10-10T17:05:00.000Z' }),
+    );
+    expect(await resolveQuestionRender('install-approval')).toEqual(expect.objectContaining({ kind: 'approval' }));
   });
 
   it('returns undefined when neither a module nor the built-in fallback owns the id', async () => {

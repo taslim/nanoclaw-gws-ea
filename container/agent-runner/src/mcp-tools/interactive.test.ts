@@ -41,6 +41,23 @@ describe('ask_user_question cancellation', () => {
   });
 });
 
+describe('ask_user_question timeout', () => {
+  it.each([
+    ['the wait it is given', { timeout: 90 }, 90],
+    ['the default wait when none is given', {}, 300],
+  ])('carries %s in the question it writes, so the host knows when it stops', async (_wait, args, seconds) => {
+    const controller = new AbortController();
+    const waiting = askUserQuestion.handler(
+      { title: 'Fixture', question: 'Choose', options: ['yes', 'no'], ...args },
+      { signal: controller.signal },
+    );
+    while (!getUndeliveredMessages().length) await Bun.sleep(1);
+    controller.abort();
+    await waiting;
+    expect(JSON.parse(getUndeliveredMessages()[0].content).timeoutSeconds).toBe(seconds);
+  });
+});
+
 describe('send_card', () => {
   it('tells the agent when callback actions will be dropped', async () => {
     const result = await sendCard.handler({
@@ -57,6 +74,9 @@ describe('send_card', () => {
     expect(result.isError).not.toBe(true);
     expect(result.content[0].text).toContain('2 invalid action(s) were dropped');
     expect(result.content[0].text).toContain('ask_user_question');
+    // In words a chat without cards or buttons can use. The tool's descriptions are
+    // checked with every other tool's (server.capabilities.test.ts).
+    expect(result.content[0].text).not.toMatch(/\b(?:cards?|buttons?|click\w*|tap\w*)\b/iu);
     // Only renderable actions reach the payload, so the count and the row agree.
     const content = JSON.parse(getUndeliveredMessages()[0].content);
     expect(content.type).toBe('card');
@@ -83,7 +103,7 @@ describe('send_card', () => {
         card: { title: 'Test', actions: [{ label: 'Docs', url: 'https://example.com', style }] },
       });
 
-      expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+      expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
       const content = JSON.parse(getUndeliveredMessages()[0].content);
       expect(content.card.actions).toEqual([{ label: 'Docs', url: 'https://example.com', style }]);
     },
@@ -162,7 +182,7 @@ describe('send_card', () => {
     async (url) => {
       const result = await sendCard.handler({ card: { title: 'Test', actions: [{ label: 'Open', url }] } });
 
-      expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+      expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
       const content = JSON.parse(getUndeliveredMessages()[0].content);
       expect(content.card.actions).toEqual([{ label: 'Open', url }]);
     },
@@ -179,7 +199,7 @@ describe('send_card', () => {
       },
     });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
     const content = JSON.parse(getUndeliveredMessages()[0].content);
     expect(content.card.actions).toEqual([
       { label: 'Wiki', url: 'https://de.wikipedia.org/wiki/M%C3%BCnchen' },
@@ -235,13 +255,13 @@ describe('send_card', () => {
       card: { title: 'Test', actions: [{ label: 'Docs', url: 'https://example.com' }] },
     });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
   });
 
   it('stays quiet for display-only cards', async () => {
     const result = await sendCard.handler({ card: { title: 'Test', description: 'No actions' } });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
   });
 });
 

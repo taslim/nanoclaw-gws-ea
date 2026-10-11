@@ -9,7 +9,7 @@
  * manager (launchd: a job loaded or not, its host running only while the
  * program its definition names exists), Docker and the OneCLI project, `ps`,
  * `lsof`, the release's install, build, migration, and tripwire scripts, the
- * host's status and listener, and `ncl`. Git, tar, SQLite, and the files are
+ * host's status and its Google Chat health, and `ncl`. Git, tar, SQLite, and the files are
  * real. Each test file removes the machines it made with
  * `removeTemporaryRoots`.
  */
@@ -26,6 +26,7 @@ import { expect } from 'vitest';
 import { AGENT_IMAGE_KEY_LABEL } from '../agent-image.js';
 import { releaseImageKey, releaseImageTag } from '../agent-image-release.js';
 import { runCli, type CliRuntime } from '../cli.js';
+import { deriveGcpClaims } from '../gcp-identity.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '../journal.js';
 import { readKeptRelease } from '../kept-release.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose, type OnecliRuntimeLayout } from '../onecli-compose.js';
@@ -59,6 +60,7 @@ import {
 } from '../update.js';
 import { readCentralMigrations } from '../verify.js';
 import { getInstallScopedNames } from '../../install-slug.js';
+import type { ChatHealth } from '../../modules/gws-ea-chat/health.js';
 
 const roots: string[] = [];
 
@@ -351,12 +353,10 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
     source_remote: host.remote,
     release_track: 'dogfood',
     deployed_commit: host.first,
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
-      gcp_project_id: `update-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@update-${port}.iam.gserviceaccount.com`,
       workspace_email: `a${port}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -519,7 +519,6 @@ export interface World {
   readonly rebuilds: Array<{ readonly args: readonly string[]; readonly timeoutMs: number | undefined }>;
   /** Main's shared skills reconciled, each time: the list the live release ships. */
   readonly skills: string[][];
-  readonly fetched: string[];
   /** How long each health check was allowed. */
   readonly healthWaits: Array<number | undefined>;
   migrate: Migrate;
@@ -533,10 +532,10 @@ export interface World {
   openFiles: string;
   /** The containers `docker ps --all` lists, by the install label it filters on. */
   readonly containers: Map<string, readonly string[]>;
-  /** The listener ID the running host answers with. */
-  listener: string;
-  /** The callback route answers 502, as a tunnel with nothing behind it does. */
-  routeDown?: boolean;
+  /** The running host's Google Chat consumer never connects: Pub/Sub refuses its subscriber. */
+  chatDown?: boolean;
+  /** Google refuses the assistant's sign-in, so the running host never confirms its Chat subscription. */
+  chatSignInNeeded?: boolean;
   /** What observing OneCLI finds instead of it present. */
   onecliObservation?: Observation;
   /** Runs when the host starts, from the live release, as the host would. */
@@ -588,13 +587,11 @@ export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id' | 'insta
     reverified: [],
     rebuilds: [],
     skills: [],
-    fetched: [],
     healthWaits: [],
     migrate,
     processes: '',
     openFiles: '',
     containers: new Map(),
-    listener: '11111111-1111-4111-8111-111111111111',
   };
 }
 
@@ -891,15 +888,17 @@ export function reboot(state: World, runtime: InstanceRuntimeConfig): void {
   state.running = existsSync(path.join(runtime.checkout_root, 'dist', 'gws-ea', 'process.js'));
 }
 
-/** The host's status over its socket, and its listener: the running host answers for its own release. */
+/** The host's status over its socket: the running host answers only for its own checkout, as upstream's does. */
 export function hostStatus(state: World, runtime: InstanceRuntimeConfig): HostStatusHelpers {
-  const status = (root: string) => ({
-    pid: 4242,
-    instance_id: `host-${state.events.length}`,
-    project_root: root,
-    webhook: { id: state.listener, port: runtime.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-    channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-  });
+  const status = (root: string) => {
+    if (root !== runtime.checkout_root) throw new Error('Host status does not identify this running installation');
+    return {
+      pid: 4242,
+      instance_id: `host-${state.events.length}`,
+      project_root: root,
+      channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+    };
+  };
   return {
     queryHost: async (root) => {
       if (!state.running) throw new Error('connect ENOENT data/ncl.sock');
@@ -913,14 +912,59 @@ export function hostStatus(state: World, runtime: InstanceRuntimeConfig): HostSt
   };
 }
 
+/** When the fake host records its Chat failures. */
+const CHAT_FAILED_AT = '2026-10-10T09:00:00.000Z';
+
 /**
- * The assistant's own `ncl`, through its running host: an agent group's image
- * rebuilt on the live release's image, the profile, and main's shared skills
- * set to the list the live release ships.
+ * The running host's Google Chat, as `gws-ea-chat health` reports it:
+ * receiving, unless `state` says Pub/Sub refuses its subscriber or Google its
+ * sign-in.
+ */
+function chatHealthOf(state: World): ChatHealth {
+  return {
+    consumer: state.chatDown
+      ? {
+          connected: false,
+          lastPullAt: null,
+          error: {
+            kind: 'subscriber_credential',
+            message: 'Pub/Sub refused the subscriber (HTTP 403)',
+            at: CHAT_FAILED_AT,
+          },
+        }
+      : { connected: true, lastPullAt: CHAT_FAILED_AT, error: null },
+    subscription: state.chatSignInNeeded
+      ? {
+          state: 'unknown',
+          name: null,
+          expireTime: null,
+          suspensionReason: null,
+          error: {
+            kind: 'sign_in_needed',
+            message: "Google no longer accepts the assistant's sign-in; sign in again",
+            at: CHAT_FAILED_AT,
+          },
+        }
+      : {
+          state: 'active',
+          name: 'subscriptions/chat-juno-hale',
+          expireTime: '2026-10-17T09:00:00.000Z',
+          suspensionReason: null,
+          error: null,
+        },
+    signInNeeded: state.chatSignInNeeded === true,
+  };
+}
+
+/**
+ * The assistant's own `ncl`, through its running host: its Google Chat
+ * health, an agent group's image rebuilt on the live release's image, the
+ * profile, and main's shared skills set to the list the live release ships.
  */
 function ncl(state: World): NonNullable<UpdateDependencies['ncl']> {
   return async (config, args, options) => {
     if (!state.running) throw new GwsEaError('ncl_failed', 'ncl could not reach the host: connect ENOENT');
+    if (args[0] === 'gws-ea-chat' && args[1] === 'health') return chatHealthOf(state);
     if (args[0] === 'gws-ea-profile' && args[1] === 'get') return { main_agent_group_id: 'ag-main' };
     if (args[0] === 'gws-ea-main' && args[1] === 'reconcile') {
       const id = args[args.indexOf('--agent-group-id') + 1]!;
@@ -966,14 +1010,6 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
     freeBytes: async () => state.freeBytes,
     service: SERVICE,
     ambientEnv: {},
-    fetch: async (input, init) => {
-      const url = String(input);
-      state.fetched.push(`${init?.method ?? 'GET'} ${url}`);
-      if (!state.running) throw new TypeError('fetch failed');
-      const local = new URL(url).hostname === '127.0.0.1';
-      if (!local && state.routeDown) return new Response(null, { status: 502 });
-      return new Response(null, { status: 401, headers: { 'x-nanoclaw-webhook-id': state.listener } });
-    },
     onecli: {
       reverify: async (layout: OnecliRuntimeLayout) => {
         state.reverified.push(layout.project);
@@ -1094,7 +1130,6 @@ export function status(host: Machine, state: World, next: Release, runtime: Inst
       uid: 501,
       observers: {
         runCommand: runner(state),
-        ...(deps.fetch ? { fetch: deps.fetch } : {}),
         ncl: unserved,
         onecliAgents: unserved,
         onecli: async () => ({ status: 'present' }),

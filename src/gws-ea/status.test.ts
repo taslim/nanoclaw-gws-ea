@@ -2,8 +2,8 @@
  * `list` and `status` observe assistants built as create leaves them: a
  * registry reservation and journal, a Git checkout detached at its release
  * with its marker and runtime, the release receipt, and the OneCLI Compose
- * file. The host, service manager, Docker, OneCLI, and the callback are
- * faked at their boundaries; Git and SQLite are real.
+ * file. The host, service manager, Docker, and OneCLI are faked at their
+ * boundaries; Git and SQLite are real.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -28,7 +28,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
-import { acquireInstanceOperation, recordPrincipalSelection, reserveInstance } from './journal.js';
+import { deriveGcpClaims } from './gcp-identity.js';
+import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
@@ -45,7 +46,7 @@ import {
 } from './operation.js';
 import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { PRESENT } from './phases.js';
-import type { PrincipalCandidate } from './principal.js';
+import type { PrincipalBinding } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
@@ -78,7 +79,6 @@ const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.ant
 const MAIN = 'ag-main';
 const EXTERNAL_EMAIL = 'ag-external-email';
 const SESSION = 'sess-principal';
-const LISTENER = '6f1c2b1e-8d4a-4c1e-9b7a-2f3e4d5c6b7a';
 const NOW = new Date('2026-09-28T14:30:00.000Z');
 const DELIVERED_AT = '2026-09-28T14:00:00.000Z';
 const SENTINEL = 'sentinel-secret-value-7f3a9c';
@@ -86,7 +86,7 @@ const SENTINEL = 'sentinel-secret-value-7f3a9c';
 /** The fields `list --json` prints for each assistant, in order, as its help documents them. */
 const LIST_FIELDS = [
   'instance_id',
-  'hostname',
+  'account',
   'track',
   'deployed_commit',
   'phase',
@@ -112,9 +112,6 @@ const STATUS_FIELDS = [
 
 /** A schema fingerprint as `status` prints it. */
 const FINGERPRINT = /^sha256:[0-9a-f]{64}$/u;
-
-/** How the machine's shared connector differs from what this tool would run. */
-const CONNECTOR_DRIFT = 'it was started with a different connector token';
 
 interface Machine {
   readonly root: string;
@@ -147,7 +144,6 @@ async function nextRelease(host: Machine): Promise<string> {
 interface AssistantOptions {
   readonly label: string;
   readonly port: number;
-  readonly ingress: 'existing' | 'managed-cloudflare';
   /** The repository it was created from and the release it runs: the tool's first release unless given. */
   readonly from?: { readonly repository: string; readonly commit: string };
 }
@@ -171,33 +167,19 @@ function stateOf(reservation: InstanceReservation): string {
  */
 async function assistant(
   host: Machine,
-  { label, port, ingress, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
+  { label, port, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
 ): Promise<InstanceReservation> {
   const { paths } = host;
   const instanceId = randomUUID();
-  const callback = `https://${label}.example.test/webhook/gchat`;
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
     source_remote: from.repository,
     release_track: 'dogfood',
     deployed_commit: from.commit,
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress:
-        ingress === 'existing'
-          ? { mode: 'existing', endpoint_url: callback }
-          : {
-              mode: 'managed-cloudflare',
-              account_id: 'a'.repeat(32),
-              zone_id: 'b'.repeat(32),
-              zone_name: 'example.test',
-              hostname: `${label}.example.test`,
-              callback_url: callback,
-              dns_record_id: 'd'.repeat(31) + String(port % 10),
-            },
-      gcp_project_id: `status-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@status-${port}.iam.gserviceaccount.com`,
       workspace_email: `${label}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -248,26 +230,14 @@ async function assistant(
   return reserved;
 }
 
-function principal(): PrincipalCandidate {
+/** The principal bind_principal bound through the DM the assistant opened. */
+function principal(): PrincipalBinding {
   return {
+    userId: 'gchat:users/2001',
     messagingGroupId: 'mg-principal',
     platformId: 'gchat:spaces/dm-principal',
-    userId: 'gchat:users/principal',
-    senderName: 'Principal',
-    authenticatedMessageId: 'spaces/dm-principal/messages/first',
-    authenticatedMessageAt: new Date().toISOString(),
+    boundAt: new Date().toISOString(),
   };
-}
-
-/** The principal conversation bind_principal fixed in the journal. */
-async function bound(paths: ControlPlanePaths, instanceId: string): Promise<void> {
-  const operation = await acquireInstanceOperation(paths, instanceId);
-  if (!operation) throw new Error('The test instance operation was busy');
-  try {
-    await recordPrincipalSelection(operation, principal());
-  } finally {
-    operation.release();
-  }
 }
 
 /** The rollback point an update left: the release it left, and the snapshot it took, whose schema is `manifest`. */
@@ -389,9 +359,8 @@ interface World {
   readonly installed: ReadonlySet<string>;
   /** Installs whose service runs. */
   readonly active: Set<string>;
-  /** Checkouts whose host answers on its socket, its webhook, and `ncl`. */
+  /** Checkouts whose host answers on its socket and `ncl`. */
   readonly serving: Set<string>;
-  readonly ports: Map<string, number>;
   /** The agent image tags Docker holds. */
   readonly images: Set<string>;
   readonly commands: SanitizedCommand[];
@@ -404,9 +373,6 @@ function world(...assistants: readonly InstanceReservation[]): World {
     installed: new Set(assistants.map(installOf)),
     active: new Set(assistants.map(installOf)),
     serving: new Set(checkouts),
-    ports: new Map(
-      assistants.map((reservation) => [liveOf(reservation), reservation.allocated_ports.nanoclaw_webhook]),
-    ),
     images: new Set(assistants.map(liveImageOf)),
     commands: [],
     serviceEnvironments: [],
@@ -449,31 +415,9 @@ function hostStatus(state: World): HostStatusHelpers {
   return {
     queryHost: async (root) => {
       if (!state.serving.has(root)) throw new Error('NanoClaw is not running; see logs/nanoclaw.error.log');
-      return {
-        pid: 4242,
-        webhook: { port: state.ports.get(root), paths: ['/webhook/gchat'] },
-        channels: [{ instance: 'gchat', connected: true }],
-      };
+      return { pid: 4242, channels: [{ instance: 'gchat', connected: true }] };
     },
     waitForHost: async () => unused(),
-  };
-}
-
-/** The callback as the internet reaches it: the host's listener answers while it serves, behind a working route. */
-function callbackFetch(state: World): typeof globalThis.fetch {
-  return async (input, init) => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
-    const local = url.hostname === '127.0.0.1';
-    const serving = local
-      ? [...state.ports].some(([root, port]) => String(port) === url.port && state.serving.has(root))
-      : state.serving.size > 0;
-    if (!serving) {
-      throw new TypeError('fetch failed', {
-        cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }),
-      });
-    }
-    if (init?.method === 'GET') return new Response('not found', { status: 404 });
-    return new Response('', { status: 401, headers: { 'x-nanoclaw-webhook-id': LISTENER } });
   };
 }
 
@@ -489,6 +433,8 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { agent_group_id: EXTERNAL_EMAIL, problems: [] };
       case 'gws-ea-inbox health':
         return HEALTHY_INBOX;
+      case 'gws-ea-chat health':
+        return RECEIVING_CHAT;
       case `groups get --id ${MAIN}`:
         return { id: MAIN, name: 'main' };
       case `groups config get --id ${MAIN}`:
@@ -508,6 +454,19 @@ const HEALTHY_INBOX = {
   consecutiveFailures: 0,
   calendarNotifications: { state: 'ok', reason: null },
   calendarAccess: [{ address: 'morgan@example.test', access: 'bookable', checkedAt: '2026-09-28T14:29:00.000Z' }],
+} as const;
+
+/** Google Chat as the host's `gws-ea-chat health` reports it receiving. */
+const RECEIVING_CHAT = {
+  consumer: { connected: true, lastPullAt: '2026-09-28T14:29:30.000Z', error: null },
+  subscription: {
+    state: 'active',
+    name: 'subscriptions/chat-juno-hale',
+    expireTime: '2026-10-04T14:00:00.000Z',
+    suspensionReason: null,
+    error: null,
+  },
+  signInNeeded: false,
 } as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
@@ -546,15 +505,13 @@ function recordingRunner(state: World): StatusObservers['runCommand'] {
 function healthyObservers(state: World): StatusObservers {
   return {
     runCommand: recordingRunner(state),
-    fetch: callbackFetch(state),
     ncl: ncl(state),
     onecliAgents,
     onecli: async () => PRESENT,
-    connector: async () => ({ status: 'present' }),
-    principalBinding: (input) => ({
+    principalBinding: () => ({
       status: 'matched',
       agentGroupId: MAIN,
-      candidate: input.selectedCandidate ?? principal(),
+      principal: principal(),
       welcomeEventId: 'gws-ea-welcome:stable',
     }),
     schema: () => MANIFEST,
@@ -604,16 +561,12 @@ interface StatusShape {
 describe('status', () => {
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
-    // Beside the healthy host: a removal cut short, and a drifted shared connector.
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    // Beside the healthy host: a removal cut short.
     await removalStarted(host.paths, reservation);
     const state = world(reservation);
 
-    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
-      ...healthyObservers(state),
-      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
-    });
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id);
 
     expect(exitCode).toBe(0);
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
@@ -633,8 +586,15 @@ describe('status', () => {
         { address: 'morgan@example.test', access: 'bookable', checked_at: HEALTHY_INBOX.lastSuccessAt },
       ],
     });
-    // A shared connector's drift is reported, never counted against this assistant (KTD11).
-    expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
+    expect(status.probes.chat).toEqual({
+      status: 'ok',
+      reason: null,
+      consumer_connected: true,
+      last_pull_at: RECEIVING_CHAT.consumer.lastPullAt,
+      subscription_state: 'active',
+      subscription_expire_time: RECEIVING_CHAT.subscription.expireTime,
+      sign_in_needed: false,
+    });
     expect(status.probes.delivery).toMatchObject({
       last: { status: 'delivered', message_out_id: 'out-welcome', at: DELIVERED_AT },
       retrying: 0,
@@ -644,9 +604,7 @@ describe('status', () => {
       observed_at: NOW.toISOString(),
       phase: { state: 'live', release: host.release.slice(0, 8) },
       registry: {
-        hostname: 'alpha.example.test',
-        endpoint_url: 'https://alpha.example.test/webhook/gchat',
-        ingress_mode: 'managed-cloudflare',
+        account: 'alpha@example.test',
         track: 'dogfood',
         source_remote: host.tool,
         deployed_commit: host.release,
@@ -671,8 +629,7 @@ describe('status', () => {
 
   it('reports a stopped host as a stopped service and an unreachable host, and still reports every other probe', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     state.active.clear();
     state.serving.clear();
@@ -686,16 +643,16 @@ describe('status', () => {
       reason: `The host is unreachable: NanoClaw is not running; see ${host.paths.instanceRoot(reservation.instance_id)}/logs/nanoclaw.error.log`,
     });
     expect(status.probes.main_identity).toMatchObject({ status: 'unknown', agent_group_id: null });
-    expect(status.probes.route).toMatchObject({ status: 'degraded', reason: expect.stringMatching(/local listener/u) });
-    for (const name of ['checkout', 'onecli', 'principal', 'connector', 'delivery']) {
+    // Whether Chat receives is the host's to say, so a host that does not answer leaves it unknown.
+    expect(status.probes.chat).toMatchObject({ status: 'unknown', consumer_connected: null, sign_in_needed: null });
+    for (const name of ['checkout', 'onecli', 'principal', 'delivery']) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
   });
 
   it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const reason = `Google no longer accepts the sign-in; connect it with gws-ea connect-google --id ${reservation.instance_id}`;
 
@@ -717,8 +674,7 @@ describe('status', () => {
 
   it("reports main's identity as unknown, not degraded, when OneCLI does not answer for its agents", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const refusal = 'OneCLI refused the agent list (HTTP 503)';
 
@@ -735,8 +691,7 @@ describe('status', () => {
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const refusal = 'OneCLI gateway image gws-ea-onecli-gateway:0 provenance label does not match its build content';
 
@@ -749,8 +704,6 @@ describe('status', () => {
 
     expect(exitCode).toBe(0);
     expect(status.probes.onecli).toEqual({ status: 'degraded', reason: refusal });
-    // An operator-managed endpoint has no connector to observe.
-    expect(Object.keys(status.probes)).toEqual(PROBE_NAMES.filter((name) => name !== 'connector'));
     for (const name of Object.keys(status.probes).filter((probe) => probe !== 'onecli')) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
@@ -758,8 +711,7 @@ describe('status', () => {
 
   it('reports external-email as the host reports it', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting =
@@ -799,8 +751,7 @@ describe('status', () => {
 
   it('reports the inbox as the host reports it, degraded while it fails, while calendar news is not on yet, or when its report is invalid', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting = (health: unknown) => ({
@@ -886,10 +837,131 @@ describe('status', () => {
     }
   });
 
+  it('reports Google Chat as the host reports it: receiving, a broken sign-in named as one, and anything else as not receiving', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const id = reservation.instance_id;
+    /** The chat probe `status --json` prints while the host reports `health`. */
+    const chatProbe = async (health: unknown): Promise<ProbeShape> => {
+      const ncl: StatusObservers['ncl'] = async (runtime, args) =>
+        args.join(' ') === 'gws-ea-chat health' ? health : healthy.ncl(runtime, args);
+      return (await statusJson(host, state, id, { ...healthy, ncl })).status.probes.chat!;
+    };
+    const at = '2026-09-28T14:20:00.000Z';
+    const signIn = `Sign the assistant in again with gws-ea connect-google --id ${id}.`;
+    const consumerDown = {
+      connected: false,
+      lastPullAt: null,
+      error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
+    };
+    const suspended = { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' };
+
+    // Google suspended the subscription for the assistant's authorization.
+    expect(await chatProbe({ ...RECEIVING_CHAT, subscription: suspended, signInNeeded: true })).toEqual({
+      status: 'degraded',
+      reason: `Sign-in needed for Google Chat: Google suspended its Chat subscription (USER_SCOPE_REVOKED). ${signIn}`,
+      consumer_connected: true,
+      last_pull_at: RECEIVING_CHAT.consumer.lastPullAt,
+      subscription_state: 'suspended',
+      subscription_expire_time: RECEIVING_CHAT.subscription.expireTime,
+      sign_in_needed: true,
+    });
+
+    // Google refused the assistant's grant, so the host never confirmed a subscription.
+    expect(
+      await chatProbe({
+        ...RECEIVING_CHAT,
+        subscription: {
+          state: 'unknown',
+          name: null,
+          expireTime: null,
+          suspensionReason: null,
+          error: { kind: 'sign_in_needed', message: 'Google refused a chat token (invalid_scope)', at },
+        },
+        signInNeeded: true,
+      }),
+    ).toMatchObject({
+      status: 'degraded',
+      reason: `Sign-in needed for Google Chat: Google refused a chat token (invalid_scope). ${signIn}`,
+      subscription_state: 'unknown',
+      sign_in_needed: true,
+    });
+
+    // A broken sign-in does not explain a consumer that is down: the consumer
+    // pulls with the subscriber key, so that is its own failure.
+    expect(await chatProbe({ consumer: consumerDown, subscription: suspended, signInNeeded: true })).toMatchObject({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
+        `its subscription is suspended, and its sign-in is broken. ${signIn}`,
+      consumer_connected: false,
+      sign_in_needed: true,
+    });
+
+    // Anything else is Chat not receiving, with each side's last failure.
+    expect(
+      await chatProbe({
+        consumer: consumerDown,
+        subscription: {
+          state: 'expired',
+          name: 'subscriptions/chat-juno-hale',
+          expireTime: '2026-09-28T13:00:00.000Z',
+          suspensionReason: null,
+          error: { kind: 'unreachable', message: 'Google could not be reached (/v1/subscriptions)', at },
+        },
+        signInNeeded: false,
+      }),
+    ).toEqual({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
+        'its subscription is expired (Google could not be reached (/v1/subscriptions)).',
+      consumer_connected: false,
+      last_pull_at: null,
+      subscription_state: 'expired',
+      subscription_expire_time: '2026-09-28T13:00:00.000Z',
+      sign_in_needed: false,
+    });
+
+    // A host only just started has neither yet.
+    expect(
+      await chatProbe({
+        consumer: { connected: false, lastPullAt: null, error: null },
+        subscription: { state: 'unknown', name: null, expireTime: null, suspensionReason: null, error: null },
+        signInNeeded: false,
+      }),
+    ).toMatchObject({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer has not connected yet; its subscription is not confirmed yet.',
+    });
+
+    for (const report of [
+      { ...RECEIVING_CHAT, signInNeeded: 'no' },
+      { ...RECEIVING_CHAT, consumer: { ...RECEIVING_CHAT.consumer, connected: 1 } },
+      { ...RECEIVING_CHAT, subscription: { ...RECEIVING_CHAT.subscription, state: 'ACTIVE' } },
+      {
+        ...RECEIVING_CHAT,
+        subscription: { ...RECEIVING_CHAT.subscription, error: { kind: 'revoked', message: 'x', at } },
+      },
+    ]) {
+      expect(await chatProbe(report)).toEqual({
+        status: 'degraded',
+        reason: 'ncl returned an invalid Chat report',
+        consumer_connected: null,
+        last_pull_at: null,
+        subscription_state: null,
+        subscription_expire_time: null,
+        sign_in_needed: null,
+      });
+    }
+  });
+
   it("shows each principal address's calendar access in every state, and never counts it against the inbox (AE4)", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const checkedAt = '2026-09-28T14:29:00.000Z';
@@ -939,7 +1011,7 @@ describe('status', () => {
 
   it("reports an assistant behind the tool's release with both commits", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const toolRelease = await nextRelease(host);
     const state = world(reservation);
 
@@ -961,7 +1033,7 @@ describe('status', () => {
 
   it('reports the rollback point, whether either schema moved since its snapshot, and a fingerprint of each', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const previousCommit = 'e'.repeat(40);
     await keepRollbackPoint(host.paths, reservation, previousCommit);
     const state = world(reservation);
@@ -1007,7 +1079,7 @@ describe('status', () => {
     ['that cannot be read', 'torn', /Rollback point/u],
   ] as const)('offers no rollback for a rollback point %s', async (_label, flaw, why) => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const file = host.paths.rollbackPointFile(reservation.instance_id);
     await keepRollbackPoint(host.paths, reservation, 'e'.repeat(40));
     if (flaw === 'torn') await writeFile(file, '{torn', { mode: 0o600 });
@@ -1028,13 +1100,9 @@ describe('status', () => {
 
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
-    const { runtime, output } = command(host, state, {
-      ...healthyObservers(state),
-      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
-    });
+    const { runtime, output } = command(host, state);
 
     expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
 
@@ -1043,8 +1111,10 @@ describe('status', () => {
     expect(text).toContain('Observed: Sep 28, 2026, 10:30 AM');
     expect(text).toContain('Sep 28, 2026, 10:00 AM');
     for (const name of PROBE_NAMES) expect(text).toMatch(new RegExp(`^ {2}ok +${name}\\b`, 'mu'));
-    expect(text).toMatch(
-      new RegExp(`^ {2}ok +connector +${CONNECTOR_DRIFT}; it is shared, so it is left as it is$`, 'mu'),
+    const tz = 'America/New_York';
+    expect(output.stdout).toContain(
+      `  ok        chat            subscription active until ${formatLocalTime(RECEIVING_CHAT.subscription.expireTime, tz)}; ` +
+        `last pulled ${formatLocalTime(RECEIVING_CHAT.consumer.lastPullAt, tz)}`,
     );
     expect(output.stderr).toEqual([]);
   });
@@ -1054,7 +1124,7 @@ describe('status', () => {
     ['rollback', { kind: 'prune' }],
   ] as const)("names a committed %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await recordedWith(host.paths, reservation, { kind, to, followUp });
     const { runtime, output } = command(host, world(reservation));
@@ -1070,7 +1140,7 @@ describe('status', () => {
 
   it('names a host never started as such', async () => {
     const host = await machine();
-    const unstarted = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const unstarted = await assistant(host, { label: 'beta', port: 36_011 });
     // Its host never started, so it has no runtime record.
     await rm(instanceRuntimeFile(stateOf(unstarted)));
     const state = world(unstarted);
@@ -1087,8 +1157,7 @@ describe('status', () => {
 
   it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     // A switch has removed the live link; the runtime record and the databases stay in the assistant's state.
     await rm(liveOf(reservation));
     const state = world(reservation);
@@ -1142,7 +1211,7 @@ describe('status', () => {
 
   it("reports the live release's agent image as degraded when its tag is gone", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     state.images.clear();
 
@@ -1158,7 +1227,7 @@ describe('status', () => {
 
   it('names the fix-forward command for an update that failed and left no release to return to', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await updateFailedWithoutReturn(host.paths, reservation, target);
     const state = world(reservation);
@@ -1186,7 +1255,7 @@ describe('status', () => {
 
   it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await rollbackFailedReturning(host.paths, reservation, target);
     const state = world(reservation);
@@ -1219,8 +1288,8 @@ describe('status', () => {
 describe('list', () => {
   it('shows every assistant, the phase of one mid-update, and the removal another left', async () => {
     const host = await machine();
-    const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const alpha = await assistant(host, { label: 'alpha', port: 36_001 });
+    const beta = await assistant(host, { label: 'beta', port: 36_011 });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
     await updateUnfinishedAt(host.paths, beta, target);
     await removalStarted(host.paths, alpha);
@@ -1243,7 +1312,7 @@ describe('list', () => {
       expect.arrayContaining([
         {
           instance_id: alpha.instance_id,
-          hostname: 'alpha.example.test',
+          account: 'alpha@example.test',
           track: 'dogfood',
           deployed_commit: host.release,
           phase: { state: 'live', release: host.release.slice(0, 8) },
@@ -1254,7 +1323,7 @@ describe('list', () => {
         },
         {
           instance_id: beta.instance_id,
-          hostname: 'beta.example.test',
+          account: 'beta@example.test',
           track: 'dogfood',
           deployed_commit: host.release,
           phase: { state: 'live', release: host.release.slice(0, 8) },
@@ -1281,13 +1350,13 @@ describe('list', () => {
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
-        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +live +removing`,
+        `${alpha.instance_id} +alpha@example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +live +removing`,
         'u',
       ),
     );
     expect(lines).toMatch(
       new RegExp(
-        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +live +update fenced`,
+        `${beta.instance_id} +beta@example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +live +update fenced`,
         'u',
       ),
     );
@@ -1301,12 +1370,11 @@ describe('list', () => {
 
   it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {
     const host = await machine();
-    const behind = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const behind = await assistant(host, { label: 'alpha', port: 36_001 });
     const toolRelease = await nextRelease(host);
     const current = await assistant(host, {
       label: 'beta',
       port: 36_011,
-      ingress: 'existing',
       from: { repository: host.tool, commit: toolRelease },
     });
     // A release of a repository the tool's checkout never fetched, so its history cannot place it.
@@ -1318,7 +1386,6 @@ describe('list', () => {
     const unplaced = await assistant(host, {
       label: 'gamma',
       port: 36_021,
-      ingress: 'existing',
       from: { repository: elsewhere, commit: foreign },
     });
     const state = world(behind, current, unplaced);
@@ -1352,7 +1419,7 @@ describe('list', () => {
       },
     });
     const lines = text.output.stdout.join('\n');
-    expect(lines).toMatch(/^INSTANCE ID +HOSTNAME +TRACK +COMMIT +BEHIND TOOL +SERVICE +PHASE +OPERATION$/mu);
+    expect(lines).toMatch(/^INSTANCE ID +ACCOUNT +TRACK +COMMIT +BEHIND TOOL +SERVICE +PHASE +OPERATION$/mu);
     for (const [reservation, cell] of [
       [behind, 'yes'],
       [current, 'no'],
@@ -1454,9 +1521,8 @@ function verbOf({ command, args }: SanitizedCommand): string {
 describe('read-only commands', () => {
   it('write no file, load no secret, pass no secret environment variable, and ask Docker and Git only to read', async () => {
     const host = await machine();
-    const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
-    await bound(host.paths, alpha.instance_id);
+    const alpha = await assistant(host, { label: 'alpha', port: 36_001 });
+    const beta = await assistant(host, { label: 'beta', port: 36_011 });
     hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
     await sessionMailbox(stateOf(alpha));
     await keepRollbackPoint(host.paths, alpha, 'e'.repeat(40), {
@@ -1466,12 +1532,10 @@ describe('read-only commands', () => {
     const secretsFile = path.join(host.paths.configRoot, 'secrets.env');
     await writeFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${SENTINEL}\n`, { mode: 0o600 });
     vi.stubEnv('GWS_EA_PROVIDER_CREDENTIAL', SENTINEL);
-    vi.stubEnv('GWS_EA_CLOUDFLARE_API_TOKEN', SENTINEL);
     const state = world(alpha, beta);
     // Only the external boundaries are faked; every reader of the fixture is real.
     const observers: Partial<StatusObservers> = {
       runCommand: recordingRunner(state),
-      fetch: callbackFetch(state),
       ncl: ncl(state),
       onecliAgents,
     };
@@ -1525,10 +1589,14 @@ describe('help', () => {
       'behind_tool_release',
       'previous_commit',
       'schema_moved',
-      'drift',
       'last_success_at',
       'calendar_notifications',
       'calendar_access',
+      'consumer_connected',
+      'last_pull_at',
+      'subscription_state',
+      'subscription_expire_time',
+      'sign_in_needed',
     ]) {
       expect(help, field).toContain(field);
     }
@@ -1536,7 +1604,7 @@ describe('help', () => {
 
   it('pins the order of the fields status prints', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
     expect(Object.keys(status)).toEqual([...STATUS_FIELDS]);

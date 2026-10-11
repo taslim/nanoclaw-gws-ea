@@ -27,7 +27,7 @@ import type { NanoclawServiceHelpers } from '../src/gws-ea/service-control.js';
 import type { ToolCheckout } from '../src/gws-ea/stray-install.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
-import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
+import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
 import { attendPause } from './gws-ea-pause.js';
 import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 import { confirmThenOpen, formatNoteLink } from './lib/browser.js';
@@ -144,18 +144,6 @@ export function createTerminalPresenter(): Presenter {
 function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractivePrompts {
   return {
     providerCredential: (providerId) => authenticateGwsEaProvider(providerId, providers),
-    async cloudflareAccountToken({ reason }) {
-      p.log.warn(reason);
-      p.note(CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
-      const answer = await p.password({
-        message: 'Cloudflare API token for managed ingress',
-        validate: (value) => (value?.trim() ? undefined : 'Required'),
-      });
-      if (p.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) {
-        throw new GwsEaError('cancelled', 'Managed ingress repair was cancelled');
-      }
-      return answer.trim();
-    },
     googleCloudSignIn: (account) => signInToGoogleCloud(account),
     googleAccount: (account) => confirmGoogleAccount(account),
     async googleWorkspaceSignIn(url, account) {

@@ -1,15 +1,17 @@
 /**
  * Attending a gws-ea pause at the terminal, so a run can go on in the same
- * process: the Google Chat configuration is confirmed in place, the
- * assistant's downloaded Google client is located, a principal conversation
- * is chosen from a list, and what the person was asked to do is waited for. Anything else stops, and the CLI reports how to resume.
+ * process: a choice the pause offers, such as the billing account to link, is
+ * made from its list; the Google Chat API configuration is confirmed in place;
+ * the assistant's downloaded Google client is located; and what the person was
+ * asked to do is waited for. Anything else stops, and the CLI reports how to
+ * resume.
  */
 import * as p from '@clack/prompts';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import type { PauseResponse } from '../src/gws-ea/events.js';
+import { decisionForChoice, type PauseResponse } from '../src/gws-ea/events.js';
 import type { ProvisionHumanPause } from '../src/gws-ea/phases.js';
 import { pollUntil } from '../src/gws-ea/poll.js';
 
@@ -79,18 +81,23 @@ export async function attendPause(
   ].join('\n');
 
   if (pause.choices?.length) {
-    prompts.note(shown, 'Principal conversation');
+    // A choice is attended only when its resume flag records one; the CLI reports any other.
+    const { choices, resumeFlag } = pause;
+    if (choices.some((choice) => decisionForChoice(resumeFlag, choice.id) === undefined)) return STOP;
+    const context = [...(pause.details ?? []), ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : [])];
+    if (context.length > 0) prompts.note(context.join('\n'), 'Choose one');
     const selected = await prompts.select({
-      message: "Which conversation is the principal's?",
-      options: pause.choices.map((choice) => ({ value: choice.id, label: choice.label })),
+      message: pause.message,
+      options: choices.map((choice) => ({ value: choice.id, label: choice.label })),
       signal,
     });
     if (prompts.isCancel(selected) || typeof selected !== 'string') return STOP;
-    return { kind: 'continue', decisions: { messagingGroupId: selected } };
+    const decisions = decisionForChoice(resumeFlag, selected);
+    return decisions ? { kind: 'continue', decisions } : STOP;
   }
 
   if (pause.resumeFlag === '--chat-configured') {
-    prompts.note(shown, 'Google Chat app');
+    prompts.note(shown, 'Google Chat API');
     const answer = await prompts.confirm({
       message: 'Have you saved this configuration?',
       initialValue: true,

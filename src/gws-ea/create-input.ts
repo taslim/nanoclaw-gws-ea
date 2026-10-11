@@ -25,6 +25,41 @@ export function parsePrincipalEmailFlags(values: readonly string[]): readonly st
   return [...new Set(emails)];
 }
 
+/** `--principal-chat-email`: which of the principal's addresses they use for Google Chat. */
+export const PRINCIPAL_CHAT_EMAIL_FLAG = 'principal-chat-email';
+
+/** `value` as one of the principal's addresses, lowercased, or undefined when it is none of them. */
+function principalAddressOf(value: string, principalEmails: readonly string[]): string | undefined {
+  const email = normalizePrincipalEmail(value);
+  return email !== undefined && principalEmails.includes(email) ? email : undefined;
+}
+
+function notAPrincipalAddress(principalEmails: readonly string[]): string {
+  return `Use one of the principal's addresses: ${principalEmails.join(', ')}`;
+}
+
+/**
+ * Why `value` cannot be the address the principal uses for Google Chat, or
+ * undefined when it can: it must be one of their addresses (KTD11), in any
+ * spelling of it.
+ */
+export function principalChatEmailProblem(value: string, principalEmails: readonly string[]): string | undefined {
+  return principalAddressOf(value, principalEmails) === undefined ? notAPrincipalAddress(principalEmails) : undefined;
+}
+
+/** `value` as the principal's Google Chat address, lowercased; anything else is refused, naming the flag. */
+export function parsePrincipalChatEmail(value: string, principalEmails: readonly string[]): string {
+  const email = principalAddressOf(value, principalEmails);
+  if (email === undefined) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      `--${PRINCIPAL_CHAT_EMAIL_FLAG}: ${notAPrincipalAddress(principalEmails)}`,
+      { details: { flag: `--${PRINCIPAL_CHAT_EMAIL_FLAG}` } },
+    );
+  }
+  return email;
+}
+
 /** One flag per create prompt, so `create` can run without a person. */
 export const CREATE_INPUT_FLAGS = [
   'assistant-first-name',
@@ -32,11 +67,8 @@ export const CREATE_INPUT_FLAGS = [
   'principal-first-name',
   'principal-last-name',
   'principal-timezone',
+  PRINCIPAL_CHAT_EMAIL_FLAG,
   'workspace-email',
-  'ingress',
-  'endpoint',
-  'cloudflare-zone',
-  'hostname-label',
   'provider',
 ] as const;
 
@@ -47,7 +79,6 @@ export type CreateInputFlag = (typeof CREATE_INPUT_FLAGS)[number];
  * the owner-only `--secrets-file` under the config root, and is never written.
  */
 export const SECRET_INPUTS = {
-  cloudflareAccountToken: 'GWS_EA_CLOUDFLARE_API_TOKEN',
   providerCredential: 'GWS_EA_PROVIDER_CREDENTIAL',
 } as const;
 
@@ -117,20 +148,6 @@ export async function loadSecretSource(options: {
   return { get: (input) => values.get(input) };
 }
 
-export interface CloudflareZoneChoice {
-  readonly accountId: string;
-  readonly accountName: string;
-  readonly zoneId: string;
-  readonly name: string;
-  readonly status: 'active';
-}
-
-export interface ManagedIngressSetupSession {
-  discoverZones(accountToken: string): Promise<readonly CloudflareZoneChoice[]>;
-  retainAccountToken(accountToken: string): void;
-  clearAccountToken(): void;
-}
-
 export interface CreatePromptContext {
   readonly instanceId: string;
   readonly track: string;
@@ -146,22 +163,9 @@ export interface CreatePromptContext {
    */
   readonly providedPrincipalEmails: readonly string[];
   readonly secrets: SecretSource;
-  readonly managedIngressSetup?: ManagedIngressSetupSession;
 }
 
-export type CreateIngressAnswer =
-  | { readonly mode: 'existing'; readonly endpointUrl: string }
-  | {
-      readonly mode: 'managed-cloudflare';
-      readonly accountId: string;
-      readonly zoneId: string;
-      readonly zoneName: string;
-      readonly hostname: string;
-      readonly callbackUrl: string;
-    };
-
 export interface CreateSetupAnswers {
-  readonly ingress: CreateIngressAnswer;
   readonly assistantWorkspaceEmail: string;
   readonly bootstrapManifest: ProductionBootstrapManifest;
 }

@@ -21,9 +21,8 @@ The capture record keeps the envelope the capture wrote (`kind`, `program`,
 `args`, `exit_code`, `stdout`, `stderr`). Probe files hold only the recorded
 stream, as recorded.
 
-A successful gcloud or Cloudflare response could not be recorded: the gate
-stopped at Google Cloud sign-in. Tests for those readers use documented response
-shapes.
+A successful gcloud response could not be recorded: the gate stopped at Google
+Cloud sign-in. Tests for its readers use documented response shapes.
 
 ## Sanitization
 

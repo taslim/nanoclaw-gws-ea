@@ -54,8 +54,12 @@ import {
 import { unguarded } from './guard/index.js';
 import { wakeContainer } from './container-runner.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
+import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
+import { createPendingApproval, createPendingQuestion, createSession, getPendingQuestion } from './db/sessions.js';
+import { resolveQuestionRender } from './channels/question-render-registry.js';
+import type { PendingQuestion, Session } from './types.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { log } from './log.js';
 
@@ -405,6 +409,186 @@ describe('deliverSessionMessages — instance resolution', () => {
 
     await deliverSessionMessages(session);
     expect(instances).toEqual(['telegram']);
+  });
+});
+
+describe("deliverSessionMessages — an agent's question", () => {
+  function insertQuestion(sessionId: string, content: Record<string, unknown>): void {
+    const db = new Database(outboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES ('out-question', datetime('now'), 'chat-sdk', 'telegram:123', 'telegram', ?)`,
+    ).run(JSON.stringify(content));
+    db.close();
+  }
+
+  const QUESTION = {
+    type: 'ask_question',
+    questionId: 'q-time',
+    title: 'Pick a time',
+    question: 'When should I book the review with Juno?',
+    options: ['Tuesday 3pm', 'Wednesday 10am'],
+  };
+
+  it("stores the question with its deadline, from the agent's timeout, before the channel sees it", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    let atSend: PendingQuestion | undefined;
+    setDeliveryAdapter({
+      async deliver() {
+        atSend = await getPendingQuestion('q-time');
+        return 'plat-question';
+      },
+    });
+
+    const before = Date.now();
+    await deliverSessionMessages(session);
+    const after = Date.now();
+
+    expect(atSend).toEqual(
+      expect.objectContaining({
+        question_id: 'q-time',
+        session_id: session.id,
+        title: 'Pick a time',
+        question: 'When should I book the review with Juno?',
+        options: [
+          { label: 'Tuesday 3pm', selectedLabel: 'Tuesday 3pm', value: 'Tuesday 3pm' },
+          { label: 'Wednesday 10am', selectedLabel: 'Wednesday 10am', value: 'Wednesday 10am' },
+        ],
+      }),
+    );
+    const deadline = Date.parse(atSend!.deadline!);
+    expect(deadline).toBeGreaterThanOrEqual(before + 120_000);
+    expect(deadline).toBeLessThanOrEqual(after + 120_000);
+  });
+
+  it('stores no question whose timeout is missing: nothing would know when it stops waiting', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, QUESTION);
+    setDeliveryAdapter({ deliver: async () => 'plat-question' });
+
+    await deliverSessionMessages(session);
+
+    expect(await getPendingQuestion('q-time')).toBeUndefined();
+  });
+
+  function recordSent(): string[] {
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        return 'plat-question';
+      },
+    });
+    return sent;
+  }
+
+  /** Every attempt the row gets: a refused question never goes out, however often it is tried. */
+  async function exhaustAttempts(session: Session): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) await deliverSessionMessages(session);
+  }
+
+  it("refuses a question carrying an approval's id: nothing is posted or stored, and the id still names the approval", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await createPendingApproval({
+      approval_id: 'appr-install',
+      session_id: session.id,
+      request_id: 'appr-install',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now(),
+      title: 'Install packages',
+      question: 'Install ripgrep for Morgan Ellery?',
+      options_json: JSON.stringify([
+        { label: 'Approve', selectedLabel: 'Approved', value: 'approve' },
+        { label: 'Reject', selectedLabel: 'Rejected', value: 'reject' },
+      ]),
+    });
+    insertQuestion(session.id, {
+      ...QUESTION,
+      questionId: 'appr-install',
+      options: ['approve', 'reject'],
+      timeoutSeconds: 120,
+    });
+    const sent = recordSent();
+
+    await exhaustAttempts(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('failed');
+    expect(await getPendingQuestion('appr-install')).toBeUndefined();
+    expect(await resolveQuestionRender('appr-install')).toEqual(
+      expect.objectContaining({ kind: 'approval', title: 'Install packages' }),
+    );
+  });
+
+  it.each([
+    { held: "another session's question", sessionId: 'sess-other', messageOutId: 'out-question' },
+    { held: 'an earlier message of its own session', sessionId: null, messageOutId: 'out-earlier' },
+  ])('refuses a question carrying the id of $held, which keeps its answers', async ({ sessionId, messageOutId }) => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    if (sessionId) {
+      await createSession({
+        id: sessionId,
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: 'thread-juno',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at: now(),
+      });
+    }
+    const held: PendingQuestion = {
+      question_id: 'q-time',
+      session_id: sessionId ?? session.id,
+      message_out_id: messageOutId,
+      platform_id: 'telegram:123',
+      channel_type: 'telegram',
+      thread_id: null,
+      title: 'Hold the Atlas room?',
+      question: 'Shall I hold Atlas for the review with Juno Hale?',
+      options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+      deadline: '2026-10-11T17:05:00.000Z',
+      created_at: now(),
+    };
+    await createPendingQuestion(held);
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    const sent = recordSent();
+
+    await exhaustAttempts(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('failed');
+    expect(await getPendingQuestion('q-time')).toEqual(held);
+  });
+
+  it('still posts a question whose earlier attempt stored it before the send failed', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        if (sent.length === 1) throw new Error('network timeout');
+        return 'plat-question';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(await getPendingQuestion('q-time')).toEqual(
+      expect.objectContaining({ session_id: session.id, message_out_id: 'out-question' }),
+    );
+    await deliverSessionMessages(session);
+
+    expect(sent).toHaveLength(2);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('delivered');
   });
 });
 
@@ -1130,5 +1314,89 @@ describe('outbound guard at the adapter boundary', () => {
     expect(() => registerOutboundGuard('test:duplicate', allow)).toThrow(
       'Outbound guard already registered: test:duplicate',
     );
+  });
+});
+
+describe('a send ends the working signal of every turn anchored in its conversation', () => {
+  const ANCHOR = 'telegram-message-41';
+
+  interface Ended {
+    readonly channelType: string;
+    readonly platformId: string;
+    readonly threadId: string | null;
+    readonly anchor: string;
+    readonly instance: string | undefined;
+  }
+
+  afterEach(() => {
+    guardDecides = null;
+  });
+
+  /** An adapter that marks the message a turn works on; sends whose content names `unreachable` fail. */
+  function recordEnds(): Ended[] {
+    const ended: Ended[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        if (content.includes('unreachable')) throw new Error('telegram unavailable');
+        return 'pm-1';
+      },
+      async setTyping() {},
+      async endTyping(channelType, platformId, threadId, anchor, instance) {
+        ended.push({ channelType, platformId, threadId, anchor, instance });
+      },
+    });
+    return ended;
+  }
+
+  function hostSend(platformId: string, text: string): Promise<string | undefined> {
+    return getDeliveryAdapter()!.deliver(
+      'telegram',
+      platformId,
+      null,
+      'chat-sdk',
+      JSON.stringify({ type: 'ask_question', questionId: 'appr-1', title: 'Approve?', question: text, options: [] }),
+      undefined,
+      'telegram',
+    );
+  }
+
+  it("the agent's reply ends its turn's anchor, once however many parts it has", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const ended = recordEnds();
+    startTypingRefresh(session.id, 'ag-1', 'telegram', 'telegram:123', null, 'telegram', ANCHOR);
+    try {
+      insertOutbound('ag-1', session.id, 'reply-1');
+      insertOutbound('ag-1', session.id, 'reply-2');
+
+      await deliverSessionMessages(session);
+
+      expect(ended).toEqual([
+        { channelType: 'telegram', platformId: 'telegram:123', threadId: null, anchor: ANCHOR, instance: 'telegram' },
+      ]);
+    } finally {
+      stopTypingRefresh(session.id);
+    }
+  });
+
+  it("the host's own send (an approval request) ends it too, but not a refused or failed send, or one elsewhere", async () => {
+    const ended = recordEnds();
+    armGuard((send) =>
+      send.content.includes('Main St')
+        ? { effect: 'refuse', reason: 'it names a private address.' }
+        : { effect: 'allow' },
+    );
+    startTypingRefresh('sess-host', 'ag-1', 'telegram', 'telegram:123', null, 'telegram', ANCHOR);
+    try {
+      await expect(hostSend('telegram:123', 'Juno lives at 1 Main St')).rejects.toBeInstanceOf(OutboundRefusedError);
+      await expect(hostSend('telegram:123', 'unreachable')).rejects.toThrow('telegram unavailable');
+      await hostSend('telegram:456', 'Approve?');
+      expect(ended).toEqual([]);
+
+      await hostSend('telegram:123', 'Approve?');
+      expect(ended.map((end) => end.anchor)).toEqual([ANCHOR]);
+    } finally {
+      stopTypingRefresh('sess-host');
+    }
   });
 });

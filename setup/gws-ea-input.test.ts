@@ -17,7 +17,6 @@ const prerequisites: Prerequisites = {
   platform: 'macos',
   runningAsRoot: false,
   dockerEndpoint: 'unix:///Users/principal/.docker/run/docker.sock',
-  rootlessDocker: false,
   account: 'operator@example.test',
 };
 const NO_SECRETS: SecretSource = { get: () => undefined };
@@ -47,7 +46,7 @@ function provider(value: string, label: string): SetupProviderEntry {
 }
 
 describe('GWS-EA interactive create input', () => {
-  it('derives display names, defaults timezone from the system, auto-selects the sole provider, and keeps --endpoint off Cloudflare', async () => {
+  it('derives display names, defaults timezone from the system, and auto-selects the sole provider', async () => {
     const claude = provider('claude', 'Claude');
     const text = vi
       .fn()
@@ -56,9 +55,9 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('America/Los_Angeles')
-      .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test');
+      .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test')
+      .mockResolvedValueOnce(' T@Other.test');
     const select = vi.fn();
-    const discoverZones = vi.fn();
 
     const result = await collectGwsEaCreateInput(
       {
@@ -68,11 +67,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: {
-          endpoint: 'https://assistant.example.test/webhook/gchat',
-          'workspace-email': 'ada@example.test',
-        },
-        managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
+        provided: { 'workspace-email': 'ada@example.test' },
       },
       {
         providers: [claude],
@@ -80,8 +75,6 @@ describe('GWS-EA interactive create input', () => {
         prompts: {
           note: vi.fn(),
           text,
-          password: vi.fn(),
-          confirm: vi.fn(),
           select,
           isCancel: () => false,
           logInfo: vi.fn(),
@@ -90,15 +83,26 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(select).not.toHaveBeenCalled();
-    expect(discoverZones).not.toHaveBeenCalled();
-    expect(text).toHaveBeenCalledTimes(6);
+    expect(text).toHaveBeenCalledTimes(7);
     expect(text).toHaveBeenNthCalledWith(
       5,
       expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
     );
     expect(text).toHaveBeenNthCalledWith(6, expect.objectContaining({ message: 'Principal email addresses' }));
+    // Which of them the principal uses for Google Chat, prefilled with the first; it must be one of theirs.
+    expect(text).toHaveBeenNthCalledWith(
+      7,
+      expect.objectContaining({
+        message: 'Principal Google Chat address',
+        initialValue: 'morgan@example.test',
+      }),
+    );
+    const [{ validate }] = text.mock.calls[6] as [{ validate: (value: string) => string | undefined }];
+    expect(validate('remy.vance@example.test')).toBe(
+      "Use one of the principal's addresses: morgan@example.test, t@other.test",
+    );
+    expect(validate('T@other.test')).toBeUndefined();
     expect(result).toEqual({
-      ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
       assistantWorkspaceEmail: 'ada@example.test',
       bootstrapManifest: {
         schema_version: 1,
@@ -123,8 +127,8 @@ describe('GWS-EA interactive create input', () => {
           principal_display_name: 'Morgan',
           principal_timezone: 'America/Los_Angeles',
           principal_emails: ['morgan@example.test', 't@other.test'],
+          principal_chat_email: 't@other.test',
         },
-        selected_messaging_group_id: null,
       },
     });
   });
@@ -147,7 +151,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: { endpoint: 'https://assistant.example.test/webhook/gchat', 'workspace-email': 'ada@example.test' },
+        provided: { 'workspace-email': 'ada@example.test' },
       },
       {
         providers: [provider('claude', 'Claude')],
@@ -155,8 +159,6 @@ describe('GWS-EA interactive create input', () => {
         prompts: {
           note: vi.fn(),
           text,
-          password: vi.fn(),
-          confirm: vi.fn(),
           select: vi.fn(),
           isCancel: () => false,
           logInfo: vi.fn(),
@@ -194,10 +196,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
-        provided: {
-          endpoint: 'https://aya.example.test/webhook/gchat',
-          'workspace-email': 'aya@example.test',
-        },
+        provided: { 'workspace-email': 'aya@example.test' },
       },
       {
         providers: [claude, codex],
@@ -205,8 +204,6 @@ describe('GWS-EA interactive create input', () => {
         prompts: {
           note: vi.fn(),
           text,
-          password: vi.fn(),
-          confirm: vi.fn(),
           select,
           isCancel: () => false,
           logInfo: vi.fn(),
@@ -225,9 +222,9 @@ describe('GWS-EA interactive create input', () => {
     expect(result.bootstrapManifest.identity.principal_display_name).toBe('Morgan Ellery');
   });
 
-  it('attaches focused validation to prompted timezone, email, and endpoint fields', async () => {
+  it('attaches focused validation to prompted timezone and email fields', async () => {
     const validators = new Map<string, (value: string | undefined) => string | undefined>();
-    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya@example.test', 'https://example.test/webhook/gchat'];
+    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya@example.test'];
     const prompts = {
       note: vi.fn(),
       text: vi.fn(
@@ -236,9 +233,7 @@ describe('GWS-EA interactive create input', () => {
           return answers.shift();
         },
       ),
-      select: vi.fn(async () => 'existing'),
-      password: vi.fn(),
-      confirm: vi.fn(),
+      select: vi.fn(),
       isCancel: () => false,
       logInfo: vi.fn(),
     };
@@ -264,214 +259,6 @@ describe('GWS-EA interactive create input', () => {
     // Main's container runs in it, and a container's TZ reads an offset with its sign flipped.
     expect(validators.get('Principal timezone')?.('+05:30')).toMatch(/valid IANA timezone/u);
     expect(validators.get('Assistant Google Workspace email')?.('not-an-email')).toMatch(/valid email/u);
-    expect(validators.get('Existing Google Chat webhook endpoint')?.('https://example.test/not-webhook')).toMatch(
-      /webhook\/gchat/u,
-    );
-  });
-
-  it('collects a managed Cloudflare claim without serializing the run-scoped token', async () => {
-    const retained: string[] = [];
-    const discoverZones = vi.fn(async (token: string) => {
-      expect(token).toBe('cloudflare-token-canary');
-      return [
-        {
-          accountId: 'a'.repeat(32),
-          accountName: 'Principal account',
-          zoneId: 'b'.repeat(32),
-          name: 'example.com',
-          status: 'active' as const,
-        },
-      ];
-    });
-    const text = vi
-      .fn()
-      .mockResolvedValueOnce('Aya')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Morgan')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('UTC')
-      .mockResolvedValueOnce('aya');
-    const select = vi.fn(async () => 'managed-cloudflare');
-    const password = vi.fn(async () => 'cloudflare-token-canary');
-    const confirm = vi.fn(async () => true);
-
-    const note = vi.fn();
-    const result = await collectGwsEaCreateInput(
-      {
-        instanceId: '11111111-1111-4111-8111-111111111111',
-        prerequisites,
-        sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['morgan@example.test'],
-        secrets: NO_SECRETS,
-        track: 'prod',
-        provided: {
-          'workspace-email': 'aya@example.test',
-        },
-        managedIngressSetup: {
-          discoverZones,
-          retainAccountToken: (token) => retained.push(token),
-          clearAccountToken: vi.fn(),
-        },
-      },
-      {
-        providers: [provider('claude', 'Claude')],
-        detectedTimezone: 'UTC',
-        prompts: {
-          note,
-          text,
-          password,
-          confirm,
-          select,
-          isCancel: () => false,
-          logInfo: vi.fn(),
-        },
-      },
-    );
-
-    expect(discoverZones).toHaveBeenCalledOnce();
-    const cloudflareGuidance = note.mock.calls.find((call) => call[1] === 'Cloudflare access')?.[0];
-    expect(cloudflareGuidance).toContain('https://dash.cloudflare.com/profile/api-tokens');
-    expect(cloudflareGuidance).toContain('Account-owned tokens: https://dash.cloudflare.com/?to=/:account/api-tokens');
-    expect(cloudflareGuidance).toContain('Cloudflare Tunnel: Edit');
-    expect(cloudflareGuidance).toContain('Zone: Read');
-    expect(cloudflareGuidance).toContain('DNS: Edit');
-    expect(note.mock.invocationCallOrder[1]).toBeLessThan(password.mock.invocationCallOrder[0]!);
-    expect(select).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'How should Google Chat reach this assistant?',
-      }),
-    );
-    expect(confirm).toHaveBeenCalledWith({
-      message:
-        'Reserve aya.example.com for this assistant?\nGoogle Chat callback: https://aya.example.com/webhook/gchat',
-      initialValue: true,
-    });
-    expect(result.ingress).toEqual({
-      mode: 'managed-cloudflare',
-      accountId: 'a'.repeat(32),
-      zoneId: 'b'.repeat(32),
-      zoneName: 'example.com',
-      hostname: 'aya.example.com',
-      callbackUrl: 'https://aya.example.com/webhook/gchat',
-    });
-    expect(retained).toEqual(['cloudflare-token-canary']);
-    expect(JSON.stringify(result)).not.toContain('cloudflare-token-canary');
-  });
-
-  it('prompts for a zone only when the token exposes more than one active zone', async () => {
-    const zoneSelect = vi.fn(async (options: { message: string }) =>
-      options.message === 'Which Cloudflare zone should host the assistant?' ? 'd'.repeat(32) : 'managed-cloudflare',
-    );
-    const text = vi
-      .fn()
-      .mockResolvedValueOnce('Aya')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Morgan')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('UTC')
-      .mockResolvedValueOnce('aya');
-
-    const result = await collectGwsEaCreateInput(
-      {
-        instanceId: '11111111-1111-4111-8111-111111111111',
-        prerequisites,
-        sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['morgan@example.test'],
-        secrets: NO_SECRETS,
-        track: 'prod',
-        provided: {
-          'workspace-email': 'aya@example.test',
-        },
-        managedIngressSetup: {
-          discoverZones: async () => [
-            {
-              accountId: 'a'.repeat(32),
-              accountName: 'Principal account',
-              zoneId: 'b'.repeat(32),
-              name: 'example.com',
-              status: 'active',
-            },
-            {
-              accountId: 'c'.repeat(32),
-              accountName: 'Second account',
-              zoneId: 'd'.repeat(32),
-              name: 'example.net',
-              status: 'active',
-            },
-          ],
-          retainAccountToken: vi.fn(),
-          clearAccountToken: vi.fn(),
-        },
-      },
-      {
-        providers: [provider('claude', 'Claude')],
-        detectedTimezone: 'UTC',
-        prompts: {
-          note: vi.fn(),
-          text,
-          password: vi.fn(async () => 'token'),
-          confirm: vi.fn(async () => true),
-          select: zoneSelect,
-          isCancel: () => false,
-          logInfo: vi.fn(),
-        },
-      },
-    );
-
-    expect(result.ingress).toMatchObject({
-      accountId: 'c'.repeat(32),
-      zoneId: 'd'.repeat(32),
-      hostname: 'aya.example.net',
-    });
-    expect(zoneSelect).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not retain Cloudflare authority when hostname confirmation is declined', async () => {
-    const retainAccountToken = vi.fn();
-    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya'];
-
-    await expect(
-      collectGwsEaCreateInput(
-        {
-          instanceId: '11111111-1111-4111-8111-111111111111',
-          prerequisites,
-          sourceRemote: 'https://example.test/nanoclaw.git',
-          providedPrincipalEmails: ['morgan@example.test'],
-          secrets: NO_SECRETS,
-          track: 'prod',
-          provided: {
-            'workspace-email': 'aya@example.test',
-          },
-          managedIngressSetup: {
-            discoverZones: async () => [
-              {
-                accountId: 'a'.repeat(32),
-                accountName: 'Principal account',
-                zoneId: 'b'.repeat(32),
-                name: 'example.com',
-                status: 'active',
-              },
-            ],
-            retainAccountToken,
-            clearAccountToken: vi.fn(),
-          },
-        },
-        {
-          providers: [provider('claude', 'Claude')],
-          detectedTimezone: 'UTC',
-          prompts: {
-            note: vi.fn(),
-            text: vi.fn(async () => answers.shift()),
-            password: vi.fn(async () => 'token'),
-            confirm: vi.fn(async () => false),
-            select: vi.fn(async () => 'managed-cloudflare'),
-            isCancel: () => false,
-            logInfo: vi.fn(),
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'cancelled' });
-    expect(retainAccountToken).not.toHaveBeenCalled();
   });
 });
 
@@ -498,12 +285,6 @@ describe('GWS-EA unattended create input', () => {
     text: vi.fn(async () => {
       throw new Error('unattended input must not prompt');
     }),
-    password: vi.fn(async () => {
-      throw new Error('unattended input must not prompt');
-    }),
-    confirm: vi.fn(async () => {
-      throw new Error('unattended input must not prompt');
-    }),
     select: vi.fn(async () => {
       throw new Error('unattended input must not prompt');
     }),
@@ -516,13 +297,10 @@ describe('GWS-EA unattended create input', () => {
     'principal-last-name': 'Ellery',
     'principal-timezone': 'America/Los_Angeles',
     'workspace-email': 'aya@example.test',
-    endpoint: 'https://aya.example.test/webhook/gchat',
   } as const;
 
   function unattended(
     provided: Record<string, string>,
-    secrets: SecretSource = NO_SECRETS,
-    extra = {},
     providedPrincipalEmails: readonly string[] = ['morgan@example.test'],
   ) {
     return collectGwsEaCreateInput(
@@ -531,10 +309,9 @@ describe('GWS-EA unattended create input', () => {
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         providedPrincipalEmails,
-        secrets,
+        secrets: NO_SECRETS,
         track: 'dogfood',
         provided,
-        ...extra,
       },
       {
         interactive: false,
@@ -548,14 +325,41 @@ describe('GWS-EA unattended create input', () => {
   it('builds the full answer from flags alone', async () => {
     const result = await unattended(FLAGS);
 
-    expect(result.ingress).toEqual({ mode: 'existing', endpointUrl: 'https://aya.example.test/webhook/gchat' });
+    expect(result.assistantWorkspaceEmail).toBe('aya@example.test');
     expect(result.bootstrapManifest.identity).toEqual({
       assistant_display_name: 'Aya',
       principal_display_name: 'Morgan Ellery',
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['morgan@example.test'],
+      // Their only address is the one the assistant opens its DM with.
+      principal_chat_email: 'morgan@example.test',
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
+  });
+
+  it("takes the principal's Google Chat address from its flag, as one of their addresses", async () => {
+    const emails = ['morgan@example.test', 'morgan@home.example.test'];
+
+    const result = await unattended({ ...FLAGS, 'principal-chat-email': 'Morgan@Home.example.test' }, emails);
+
+    expect(result.bootstrapManifest.identity).toMatchObject({
+      principal_emails: emails,
+      principal_chat_email: 'morgan@home.example.test',
+    });
+  });
+
+  it('names --principal-chat-email when the principal has several addresses and none is named', async () => {
+    await expect(unattended(FLAGS, ['morgan@example.test', 'morgan@home.example.test'])).rejects.toMatchObject({
+      code: 'input_required',
+      message: expect.stringContaining('--principal-chat-email'),
+    });
+  });
+
+  it("refuses a Google Chat address that is not one of the principal's", async () => {
+    await expect(unattended({ ...FLAGS, 'principal-chat-email': 'remy.vance@example.test' })).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: "--principal-chat-email: Use one of the principal's addresses: morgan@example.test",
+    });
   });
 
   it("holds the principal's timezone in the zone's own spelling, which a container's TZ reads", async () => {
@@ -565,14 +369,14 @@ describe('GWS-EA unattended create input', () => {
   });
 
   it('names --principal-email when no principal address is given', async () => {
-    await expect(unattended(FLAGS, NO_SECRETS, {}, [])).rejects.toMatchObject({
+    await expect(unattended(FLAGS, [])).rejects.toMatchObject({
       code: 'input_required',
       message: expect.stringContaining('--principal-email'),
     });
   });
 
   it("refuses the assistant's own address as the principal's", async () => {
-    await expect(unattended(FLAGS, NO_SECRETS, {}, ['aya@example.test'])).rejects.toMatchObject({
+    await expect(unattended(FLAGS, ['aya@example.test'])).rejects.toMatchObject({
       code: 'invalid_arguments',
       message: expect.stringContaining('--principal-email'),
     });
@@ -590,7 +394,7 @@ describe('GWS-EA unattended create input', () => {
       /another spelling of morganellery@gmail\.com/u,
     ],
   ])('refuses principal addresses with %s, naming --principal-email', async (_case, emails, message) => {
-    await expect(unattended(FLAGS, NO_SECRETS, {}, emails)).rejects.toMatchObject({
+    await expect(unattended(FLAGS, emails)).rejects.toMatchObject({
       code: 'invalid_arguments',
       message: expect.stringMatching(new RegExp(`^--principal-email: .*${message.source}`, 'u')),
     });
@@ -620,121 +424,6 @@ describe('GWS-EA unattended create input', () => {
       message: expect.stringMatching(/--workspace-email.*Google Workspace/su),
     });
   });
-
-  it('collects managed Cloudflare ingress from flags and the supplied token', async () => {
-    const retained: string[] = [];
-    const { endpoint: _endpoint, ...base } = FLAGS;
-    const result = await unattended(
-      { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.net', 'hostname-label': 'aya' },
-      { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
-      {
-        managedIngressSetup: {
-          discoverZones: async () => [
-            {
-              accountId: 'a'.repeat(32),
-              accountName: 'A',
-              zoneId: 'b'.repeat(32),
-              name: 'example.com',
-              status: 'active',
-            },
-            {
-              accountId: 'c'.repeat(32),
-              accountName: 'C',
-              zoneId: 'd'.repeat(32),
-              name: 'example.net',
-              status: 'active',
-            },
-          ],
-          retainAccountToken: (token: string) => retained.push(token),
-          clearAccountToken: vi.fn(),
-        },
-      },
-    );
-
-    expect(result.ingress).toEqual({
-      mode: 'managed-cloudflare',
-      accountId: 'c'.repeat(32),
-      zoneId: 'd'.repeat(32),
-      zoneName: 'example.net',
-      hostname: 'aya.example.net',
-      callbackUrl: 'https://aya.example.net/webhook/gchat',
-    });
-    expect(retained).toEqual(['supplied-cloudflare-token']);
-  });
-
-  it('names the Cloudflare token variable when managed ingress has no token', async () => {
-    const { endpoint: _endpoint, ...base } = FLAGS;
-    await expect(
-      unattended(
-        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
-        NO_SECRETS,
-        { managedIngressSetup: { discoverZones: vi.fn(), retainAccountToken: vi.fn(), clearAccountToken: vi.fn() } },
-      ),
-    ).rejects.toMatchObject({
-      code: 'input_required',
-      message: expect.stringContaining('GWS_EA_CLOUDFLARE_API_TOKEN'),
-    });
-  });
-
-  it.each([
-    ['no active zone', [], 'cloudflare_zone_required'],
-    [
-      'the same zone twice',
-      [
-        {
-          accountId: 'a'.repeat(32),
-          accountName: 'A',
-          zoneId: 'b'.repeat(32),
-          name: 'example.com',
-          status: 'active' as const,
-        },
-        {
-          accountId: 'a'.repeat(32),
-          accountName: 'A',
-          zoneId: 'b'.repeat(32),
-          name: 'example.com',
-          status: 'active' as const,
-        },
-      ],
-      'invalid_cloudflare_zone',
-    ],
-  ])('refuses a token whose zones show %s, before choosing one', async (_label, zones, code) => {
-    const { endpoint: _endpoint, ...base } = FLAGS;
-    const retainAccountToken = vi.fn();
-    await expect(
-      unattended(
-        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
-        { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
-        { managedIngressSetup: { discoverZones: async () => zones, retainAccountToken, clearAccountToken: vi.fn() } },
-      ),
-    ).rejects.toMatchObject({ code });
-    expect(retainAccountToken).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [true, 'This Docker runs rootless.'],
-    [undefined, 'Docker did not say whether it runs rootless.'],
-  ])(
-    'refuses managed ingress unless Linux Docker is known rootful, before asking Cloudflare (rootless: %s)',
-    async (rootlessDocker, reason) => {
-      const { endpoint: _endpoint, ...base } = FLAGS;
-      const discoverZones = vi.fn();
-      await expect(
-        unattended(
-          { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
-          { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
-          {
-            prerequisites: { ...prerequisites, platform: 'linux', rootlessDocker },
-            managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
-          },
-        ),
-      ).rejects.toMatchObject({
-        code: 'managed_ingress_unsupported',
-        message: expect.stringMatching(new RegExp(`${reason.replaceAll('.', '\\.')} .*--endpoint`, 'u')),
-      });
-      expect(discoverZones).not.toHaveBeenCalled();
-    },
-  );
 
   it('requires --provider only when more than one provider is composed', async () => {
     const providers = [provider('claude', 'Claude'), provider('codex', 'Codex')];
@@ -793,7 +482,7 @@ describe('GWS-EA unattended create input', () => {
             release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
           }),
           holdLoopbackPorts: async () => ({
-            ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
+            ports: { onecli_app: 35_102, onecli_gateway: 35_103 },
             release: async () => undefined,
           }),
           advanceProvision: async () => ({
@@ -802,7 +491,7 @@ describe('GWS-EA unattended create input', () => {
               kind: 'human-action',
               phase: 'configure_channel',
               code: 'chat_configuration_required',
-              message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+              message: "Configure the Google Chat API for this assistant's project, then confirm it.",
               resumeFlag: '--chat-configured',
             },
           }),

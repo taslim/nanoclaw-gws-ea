@@ -192,6 +192,20 @@ describe('create_agent — guard-based authorization (wrapped delivery action)',
     expect(mockInitGroupFilesystem).not.toHaveBeenCalled();
   });
 
+  it('asks in the assistant’s voice, with the name the agent chose as one quoted line', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    await runCreateAgent({ name: 'Scout <users/all>\n*now*', instructions: 'help' });
+
+    expect(mockRequestApproval.mock.calls[0][0]).toMatchObject({
+      title: 'Create an agent',
+      question:
+        'Name: "Scout ‹users/all› \\*now\\*"\n' +
+        "I'd like to create a new agent for this, with its own workspace and container.",
+      details: { supplied: { name: { text: 'Scout <users/all>\n*now*', source: 'agent' } } },
+    });
+  });
+
   it('missing config: fails closed to approval (no direct create)', async () => {
     mockGetContainerConfig.mockReturnValue(undefined);
 

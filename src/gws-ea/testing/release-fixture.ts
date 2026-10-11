@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { CLOUDFLARED_IMAGE, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from '../pins.js';
+import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from '../pins.js';
 import { runSanitizedCommand, type SanitizedCommand } from '../process.js';
 import type { SetupCommand } from '../release-preflight.js';
 import type { ReleaseStageSeams } from '../release-stage.js';
@@ -35,7 +35,7 @@ const RELEASE_FILES: Readonly<Record<string, { readonly contents: string; readon
     })}\n`,
   },
   'src/gws-ea/versions.json': {
-    contents: `${JSON.stringify({ 'onecli-gateway': ONECLI_GATEWAY_VERSION, cloudflared: CLOUDFLARED_IMAGE })}\n`,
+    contents: `${JSON.stringify({ 'onecli-gateway': ONECLI_GATEWAY_VERSION })}\n`,
   },
   'bin/ncl': { contents: '#!/bin/sh\n', mode: 0o755 },
   'container/Dockerfile': { contents: 'FROM scratch\n' },

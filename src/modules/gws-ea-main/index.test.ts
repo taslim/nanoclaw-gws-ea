@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { defaultEmojiResolver } from 'chat';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { dispatch } from '../../cli/dispatch.js';
@@ -29,6 +30,20 @@ const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking',
 
 /** Backticked words the guidance uses that are not tools: main's own name, a preference's sources, and a handoff's fields. */
 const NOT_TOOLS = ['main', 'principal', 'learned', 'people', 'calendar'];
+
+/** Words for controls a chat may not have: in Google Chat main asks in words, and the principal answers in the conversation. */
+const CONTROL_WORDS = /\b(?:cards?|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
+
+/** Each control word `text` uses outside code, in its context: a tool called `send_card` is a name, not wording. */
+function controlWords(text: string): string[] {
+  const prose = text.replace(/`[^`\n]*`/gu, '');
+  return [...prose.matchAll(CONTROL_WORDS)].map(({ index }) => prose.slice(Math.max(0, index - 40), index + 20));
+}
+
+/** The add_reaction tool's own example emoji, as its definition gives them. */
+const REACTION_TOOL_EXAMPLES = /description: 'Emoji name \(e\.g\., ([^)]+)\)'/u.exec(
+  fs.readFileSync(path.resolve('container', 'agent-runner', 'src', 'mcp-tools', 'core.ts'), 'utf8'),
+)?.[1];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-30T00:00:00.000Z' };
@@ -185,6 +200,47 @@ describe("GWS-EA's guidance for main", () => {
     }
     // The host's note on unsigned mail in their name opens with these words.
     expect(document).toContain('Gmail could not confirm');
+  });
+
+  it('never tells main of cards, buttons, clicks or taps: it asks in words, and the principal answers in the conversation', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-skills', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const groupDir = path.join(TEST_ROOT, main.folder);
+
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+
+    expect(document).toContain('# NanoClaw Module: interactive\n');
+    expect(controlWords(document)).toEqual([]);
+  });
+
+  it("names only reactions Google Chat can show, and leaves 👀 to the host's working sign", async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    const groupDir = path.join(TEST_ROOT, main.folder);
+
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+    const reacting = /### Reacting to messages[^\n]*\n([\s\S]*?)(?=\n#|$)/u.exec(document)?.[1];
+    expect(reacting).toBeDefined();
+    expect(REACTION_TOOL_EXAMPLES).toBeDefined();
+
+    // Each backticked lowercase name in the section is an emoji, apart from the tool's `emoji` field itself.
+    const taught = [...(reacting ?? '').matchAll(/`([a-z][a-z0-9_]*)`/gu)]
+      .map(([, name]) => name!)
+      .filter((name) => name !== 'emoji');
+    const named = [...taught, ...(REACTION_TOOL_EXAMPLES ?? '').split(',').map((name) => name.trim())];
+    expect(taught.length).toBeGreaterThan(0);
+    // An unmapped name reaches Google Chat as itself, which no message can carry as a reaction.
+    for (const name of named) expect(defaultEmojiResolver.toGChat(name), name).not.toBe(name);
+    // 👀 is the host's sign that the assistant is working; the host takes it off, whoever placed it.
+    expect(named).not.toContain('eyes');
   });
 });
 

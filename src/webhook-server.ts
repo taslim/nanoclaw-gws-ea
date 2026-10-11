@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { Chat } from 'chat';
 
-import { getWebhookHost, getWebhookPort } from './config.js';
+import { getWebhookPort } from './config.js';
 import { log } from './log.js';
 
 interface WebhookEntry {
@@ -123,7 +123,6 @@ function ensureServer(): void {
   if (server) return;
 
   const port = getWebhookPort();
-  const host = getWebhookHost();
   const id = randomUUID();
 
   const candidate = http.createServer((req, res) => {
@@ -183,11 +182,11 @@ function ensureServer(): void {
   listenerId = id;
   candidate.on('error', (err) => {
     if (!candidate.listening && server === candidate) server = null;
-    log.error('Webhook server error', { host, port, err });
+    log.error('Webhook server error', { port, err });
   });
 
-  candidate.listen(port, host, () => {
-    log.info('Webhook server started', { host, port, adapters: [...routes.keys()] });
+  candidate.listen(port, '0.0.0.0', () => {
+    log.info('Webhook server started', { port, adapters: [...routes.keys()] });
   });
 }
 

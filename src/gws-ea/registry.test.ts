@@ -20,9 +20,9 @@ import {
   getInstanceReservation,
   readRegistry,
   swapInstanceRelease,
-  withLockedCloudflareRegistry,
   writeInstanceMarker,
 } from './registry.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
 import type { CreateTargetRequest } from './release-target.js';
@@ -49,56 +49,24 @@ function reservation(instanceId: string = randomUUID()): InstanceReservationInpu
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
-    allocated_ports: {
-      nanoclaw_webhook: 31_001,
-      onecli_app: 31_002,
-      onecli_gateway: 31_003,
-    },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     exclusive_resource_claims: {
-      ingress: {
-        mode: 'existing',
-        endpoint_url: 'https://assistant.example.test/webhook/gchat',
-      },
-      gcp_project_id: 'assistant-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   };
 }
 
-function managedReservation(instanceId: string = randomUUID()): InstanceReservationInput {
+/** A second assistant: its own ID, and so its own project and Chat delivery, ports, and Workspace account. */
+function distinctReservation(instanceId: string = randomUUID()): InstanceReservationInput {
   const input = reservation(instanceId);
   return {
     ...input,
-    exclusive_resource_claims: {
-      ...input.exclusive_resource_claims,
-      ingress: {
-        mode: 'managed-cloudflare',
-        account_id: 'a'.repeat(32),
-        zone_id: 'b'.repeat(32),
-        zone_name: 'example.com',
-        hostname: 'assistant.example.com',
-        callback_url: 'https://assistant.example.com/webhook/gchat',
-        dns_record_id: null,
-      },
-    },
+    allocated_ports: { onecli_app: 32_002, onecli_gateway: 32_003 },
+    exclusive_resource_claims: { ...input.exclusive_resource_claims, workspace_email: 'second@example.test' },
   };
-}
-
-function distinctManagedReservation(): InstanceReservationInput {
-  const input = managedReservation();
-  input.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
-  input.exclusive_resource_claims.gcp_project_id = 'second-project';
-  input.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
-  input.exclusive_resource_claims.workspace_email = 'second@example.test';
-  if (input.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
-    throw new Error('managed reservation fixture is invalid');
-  }
-  input.exclusive_resource_claims.ingress.hostname = 'second.example.com';
-  input.exclusive_resource_claims.ingress.callback_url = 'https://second.example.com/webhook/gchat';
-  return input;
 }
 
 function createArgs(): string[] {
@@ -108,8 +76,6 @@ function createArgs(): string[] {
     'dogfood',
     '--source-remote',
     'https://example.test/nanoclaw.git',
-    '--endpoint',
-    'https://assistant.example.test/webhook/gchat',
     '--workspace-email',
     'assistant@example.test',
   ];
@@ -118,7 +84,6 @@ function createArgs(): string[] {
 function createSetupInput() {
   return {
     sourceRemote: 'https://example.test/nanoclaw.git',
-    ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
@@ -143,8 +108,8 @@ function createSetupInput() {
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
+        principal_chat_email: 'principal@example.test',
       },
-      selected_messaging_group_id: null,
     },
   } as const;
 }
@@ -155,7 +120,6 @@ const PREREQUISITES: Prerequisites = {
   runningAsRoot: false,
   nodePath: process.execPath,
   dockerEndpoint: 'unix:///var/run/docker.sock',
-  rootlessDocker: false,
   account: 'operator@example.test',
 };
 
@@ -167,7 +131,7 @@ function productionRuntime() {
       release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
     }),
     holdLoopbackPorts: async () => ({
-      ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+      ports: { onecli_app: 34_102, onecli_gateway: 34_103 },
       release: async () => undefined,
     }),
   };
@@ -266,37 +230,7 @@ describe('machine registry', () => {
     expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
   });
 
-  it('records one shared Cloudflare owner for managed reservations', async () => {
-    const paths = await testPaths();
-    const input = managedReservation();
-    await reserveInstance(paths, input);
-
-    const registry = await readRegistry(paths);
-    expect(registry.instances[input.instance_id]).toEqual(input);
-    expect(registry.shared_infrastructure_metadata.cloudflare).toMatchObject({
-      account_id: 'a'.repeat(32),
-      tunnel_id: null,
-    });
-    expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
-  });
-
-  it('records and reads back a tunnel whose ID is a version 7 UUID', async () => {
-    const paths = await testPaths();
-    await reserveInstance(paths, managedReservation());
-    const v7 = '01922b7e-8c3a-7d4e-9f12-3456789abcde';
-
-    await withLockedCloudflareRegistry(paths, (locked) => locked.updateCoordinates({ tunnelId: v7 }));
-
-    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id).toBe(v7);
-  });
-
   it.each([
-    [
-      'webhook port',
-      (first: InstanceReservationInput, second: InstanceReservationInput) => {
-        second.allocated_ports.nanoclaw_webhook = first.allocated_ports.nanoclaw_webhook;
-      },
-    ],
     [
       'OneCLI app port',
       (first: InstanceReservationInput, second: InstanceReservationInput) => {
@@ -307,13 +241,6 @@ describe('machine registry', () => {
       'OneCLI gateway port',
       (first: InstanceReservationInput, second: InstanceReservationInput) => {
         second.allocated_ports.onecli_gateway = first.allocated_ports.onecli_gateway;
-      },
-    ],
-    [
-      'GCP project and its derived Chat service account',
-      (first: InstanceReservationInput, second: InstanceReservationInput) => {
-        second.exclusive_resource_claims.gcp_project_id = first.exclusive_resource_claims.gcp_project_id;
-        second.exclusive_resource_claims.gchat_service_account = first.exclusive_resource_claims.gchat_service_account;
       },
     ],
     [
@@ -328,29 +255,10 @@ describe('machine registry', () => {
         second.exclusive_resource_claims.onecli_project = first.exclusive_resource_claims.onecli_project;
       },
     ],
-    [
-      'managed hostname, callback, DNS name, and route',
-      (first: InstanceReservationInput, second: InstanceReservationInput) => {
-        second.exclusive_resource_claims.ingress = { ...first.exclusive_resource_claims.ingress };
-      },
-    ],
-    [
-      'DNS record ID',
-      (first: InstanceReservationInput, second: InstanceReservationInput) => {
-        if (
-          first.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare' ||
-          second.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare'
-        ) {
-          throw new Error('managed reservation fixture is invalid');
-        }
-        first.exclusive_resource_claims.ingress.dns_record_id = 'c'.repeat(32);
-        second.exclusive_resource_claims.ingress.dns_record_id = first.exclusive_resource_claims.ingress.dns_record_id;
-      },
-    ],
   ] as const)('refuses a competing %s claim without changing its owner', async (_claim, collide) => {
     const paths = await testPaths();
-    const first = managedReservation();
-    const second = distinctManagedReservation();
+    const first = reservation();
+    const second = distinctReservation();
     collide(first, second);
     await reserveInstance(paths, first);
     const before = await readFile(paths.registryFile);
@@ -361,121 +269,39 @@ describe('machine registry', () => {
     await expect(stat(paths.instanceRoot(second.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('refuses an existing callback URL claimed by another instance', async () => {
+  it.each(['gcp_project_id', 'gchat_events_topic', 'gchat_events_subscription', 'gchat_subscriber_account'] as const)(
+    "refuses a reservation whose %s is another assistant's, before publishing it",
+    async (claim) => {
+      const paths = await testPaths();
+      const first = reservation();
+      await reserveInstance(paths, first);
+      const before = await readFile(paths.registryFile, 'utf8');
+      const borrowing = distinctReservation();
+      borrowing.exclusive_resource_claims[claim] = first.exclusive_resource_claims[claim];
+
+      await expect(reserveInstance(paths, borrowing)).rejects.toMatchObject({
+        code: 'invalid_claim',
+        message: `${claim} is not this assistant's`,
+      });
+      expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+    },
+  );
+
+  it('refuses a registry an earlier release wrote, telling the operator to remove its assistants and delete it', async () => {
     const paths = await testPaths();
-    const first = reservation();
-    const second = reservation();
-    second.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
-    second.exclusive_resource_claims.gcp_project_id = 'second-project';
-    second.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
-    second.exclusive_resource_claims.workspace_email = 'second@example.test';
-    await reserveInstance(paths, first);
-
-    await expect(reserveInstance(paths, second)).rejects.toMatchObject({ code: 'claim_conflict' });
-    expect((await readRegistry(paths)).instances).toEqual({ [first.instance_id]: first });
-  });
-
-  it('keeps derived checkout and Chat identities tied to the instance and project', async () => {
-    const paths = await testPaths();
-    const first = managedReservation();
-    const second = distinctManagedReservation();
-    await reserveInstance(paths, first);
-    await reserveInstance(paths, second);
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id, second.instance_id]);
-    expect(paths.instanceRoot(first.instance_id)).toBe(path.join(paths.stateRoot, first.instance_id.slice(0, 8)));
-    expect(paths.instanceRoot(first.instance_id)).not.toBe(paths.instanceRoot(second.instance_id));
-    expect(first.exclusive_resource_claims.gchat_service_account).not.toBe(
-      second.exclusive_resource_claims.gchat_service_account,
-    );
-    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.account_id).toBe('a'.repeat(32));
-
-    const invalidChatIdentity = distinctManagedReservation();
-    invalidChatIdentity.exclusive_resource_claims.gchat_service_account =
-      first.exclusive_resource_claims.gchat_service_account;
-    await expect(reserveInstance(paths, invalidChatIdentity)).rejects.toMatchObject({ code: 'invalid_claim' });
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id, second.instance_id]);
-  });
-
-  it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
-    const paths = await testPaths();
-    const first = managedReservation();
-    await reserveInstance(paths, first);
-
-    const duplicate = managedReservation();
-    duplicate.allocated_ports.nanoclaw_webhook += 100;
-    duplicate.allocated_ports.onecli_app += 100;
-    duplicate.allocated_ports.onecli_gateway += 100;
-    duplicate.exclusive_resource_claims.gcp_project_id = 'second-project';
-    duplicate.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
-    duplicate.exclusive_resource_claims.workspace_email = 'second@example.test';
-    await expect(reserveInstance(paths, duplicate)).rejects.toMatchObject({ code: 'claim_conflict' });
-
-    const crossAccount = managedReservation();
-    crossAccount.allocated_ports.nanoclaw_webhook += 200;
-    crossAccount.allocated_ports.onecli_app += 200;
-    crossAccount.allocated_ports.onecli_gateway += 200;
-    crossAccount.exclusive_resource_claims.gcp_project_id = 'third-project';
-    crossAccount.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@third-project.iam.gserviceaccount.com';
-    crossAccount.exclusive_resource_claims.workspace_email = 'third@example.test';
-    if (crossAccount.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
-      throw new Error('managed reservation fixture is invalid');
-    }
-    crossAccount.exclusive_resource_claims.ingress = {
-      ...crossAccount.exclusive_resource_claims.ingress,
-      account_id: 'c'.repeat(32),
-      zone_id: 'd'.repeat(32),
-      zone_name: 'example.net',
-      hostname: 'third.example.net',
-      callback_url: 'https://third.example.net/webhook/gchat',
-    };
-    await expect(reserveInstance(paths, crossAccount)).rejects.toMatchObject({ code: 'cloudflare_account_conflict' });
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id]);
-  });
-
-  it('rejects inconsistent managed callbacks and a tunnel name that does not match its ownership ID', async () => {
-    const paths = await testPaths();
-    const invalid = managedReservation();
-    if (invalid.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
-      throw new Error('managed reservation fixture is invalid');
-    }
-    invalid.exclusive_resource_claims.ingress = {
-      ...invalid.exclusive_resource_claims.ingress,
-      callback_url: 'https://other.example.com/webhook/gchat',
-    };
-    await expect(reserveInstance(paths, invalid)).rejects.toMatchObject({ code: 'invalid_claim' });
-
-    const nestedHostname = managedReservation();
-    if (nestedHostname.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
-      throw new Error('managed reservation fixture is invalid');
-    }
-    nestedHostname.exclusive_resource_claims.ingress = {
-      ...nestedHostname.exclusive_resource_claims.ingress,
-      hostname: 'nested.assistant.example.com',
-      callback_url: 'https://nested.assistant.example.com/webhook/gchat',
-    };
-    await expect(reserveInstance(paths, nestedHostname)).rejects.toMatchObject({ code: 'invalid_claim' });
-
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
-    await writeFile(
-      paths.registryFile,
-      JSON.stringify({
-        schema_version: 2,
-        instances: {},
-        shared_infrastructure_metadata: {
-          cloudflare: {
-            ownership_id: randomUUID(),
-            account_id: 'a'.repeat(32),
-            tunnel_name: 'gws-ea-owner',
-            tunnel_id: null,
-          },
-        },
-      }),
-      { mode: 0o600 },
-    );
-    await expect(readRegistry(paths)).rejects.toMatchObject({
-      code: 'invalid_registry',
-      message: expect.stringMatching(/tunnel name does not match its ownership ID/u),
-    });
+    const earlier = JSON.stringify({ schema_version: 2, instances: {} });
+    await writeFile(paths.registryFile, earlier, { mode: 0o600 });
+    const refusal = {
+      code: 'unsupported_registry',
+      message:
+        `The machine registry ${paths.registryFile} is from an earlier gws-ea release. Remove each assistant in it ` +
+        `with that release (gws-ea remove --id <instance_id>), then delete ${paths.registryFile} and retry.`,
+    };
+
+    await expect(readRegistry(paths)).rejects.toMatchObject(refusal);
+    await expect(reserveInstance(paths, reservation())).rejects.toMatchObject(refusal);
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(earlier);
   });
 
   it('loads a registry record with unknown fields and keeps its claims exact', async () => {
@@ -624,22 +450,11 @@ describe('instance roots', () => {
     const first = reservation();
     await reserveInstance(paths, first);
     const id = `${first.instance_id.slice(0, 8)}${randomUUID().slice(8)}`;
-    const sharingRoot: InstanceReservationInput = {
-      ...reservation(id),
-      allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
-      exclusive_resource_claims: {
-        ingress: { mode: 'existing', endpoint_url: 'https://second.example.test/webhook/gchat' },
-        gcp_project_id: 'second-project',
-        gcp_account: 'operator@example.test',
-        gchat_service_account: 'gws-ea-chat@second-project.iam.gserviceaccount.com',
-        workspace_email: 'second@example.test',
-        onecli_project: `gws-ea-${id.replaceAll('-', '')}`,
-      },
-    };
+    const sharingRoot = distinctReservation(id);
 
     await expect(reserveInstance(paths, sharingRoot)).rejects.toMatchObject({ code: 'claim_conflict' });
-    // With any other ID, the same claims are free.
-    await expect(reserveInstance(paths, { ...sharingRoot, instance_id: randomUUID() })).resolves.toBeDefined();
+    // With any other ID, and the claims it derives, the rest are free.
+    await expect(reserveInstance(paths, distinctReservation())).resolves.toBeDefined();
   });
 
   it("draws the ID again while its first eight hex digits name a registered assistant's root, or anything there", async () => {
@@ -668,7 +483,7 @@ describe('release compare-and-swap and live checkout agreement', () => {
   it('moves only the release fields, from the release it expects, leaving every claim and peer as it was', async () => {
     const paths = await testPaths();
     const input = reservation();
-    const peer = distinctManagedReservation();
+    const peer = distinctReservation();
     await reserveInstance(paths, input);
     await reserveInstance(paths, peer);
     const before = await readRegistry(paths);
@@ -679,7 +494,6 @@ describe('release compare-and-swap and live checkout agreement', () => {
     const after = await readRegistry(paths);
     expect(after.instances[input.instance_id]).toEqual(moved);
     expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);
-    expect(after.shared_infrastructure_metadata).toEqual(before.shared_infrastructure_metadata);
     expect((await stat(paths.registryFile)).mode & 0o777).toBe(0o600);
   });
 
@@ -720,7 +534,7 @@ describe('release compare-and-swap and live checkout agreement', () => {
   it("commits two assistants' concurrent swaps, neither overwriting the other's", async () => {
     const paths = await testPaths();
     const first = reservation();
-    const second = distinctManagedReservation();
+    const second = distinctReservation();
     await reserveInstance(paths, first);
     await reserveInstance(paths, second);
 
@@ -850,8 +664,8 @@ describe('create recovery contract', () => {
         pause: {
           kind: 'human-action' as const,
           phase: 'bind_principal' as const,
-          code: 'principal_dm_required',
-          message: 'Send the direct message.',
+          code: 'principal_chat_request_pending',
+          message: 'Accept the chat request.',
         },
       };
     };
@@ -869,7 +683,7 @@ describe('create recovery contract', () => {
           return { release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) } };
         },
         holdLoopbackPorts: async () => ({
-          ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+          ports: { onecli_app: 34_102, onecli_gateway: 34_103 },
           release: async () => {
             portsReleased = true;
           },
@@ -885,11 +699,11 @@ describe('create recovery contract', () => {
       'Reserving the assistant…',
       'Configuring Google Cloud…',
       'Waiting for the service account…',
-      'Paused at bind_principal: Send the direct message.',
+      'Paused at bind_principal: Accept the chat request.',
     ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
-      allocated_ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+      allocated_ports: { onecli_app: 34_102, onecli_gateway: 34_103 },
     });
     const persistedBootstrap = await readFile(paths.bootstrapFile(instanceId), 'utf8');
     expect(persistedBootstrap).not.toContain('provider-secret');
@@ -907,7 +721,7 @@ describe('create recovery contract', () => {
     expect(advanced).toEqual([instanceId, instanceId]);
   });
 
-  it('provisions from the documented create command and prints exact principal-selection commands', async () => {
+  it('provisions from the documented create command and prints the exact command for each choice a pause offers', async () => {
     const paths = await testPaths();
     const output: string[] = [];
     let idWasPrintedBeforeCollection = false;
@@ -915,13 +729,14 @@ describe('create recovery contract', () => {
       status: 'paused' as const,
       pause: {
         kind: 'human-action' as const,
-        phase: 'bind_principal' as const,
-        code: 'principal_selection_required',
-        message: 'Choose the verified principal conversation.',
+        phase: 'provision_gcp' as const,
+        code: 'gcp_billing_account_choice_required',
+        message: 'Choose the billing account that pays for Google Cloud project gws-ea-juno.',
         choices: [
-          { id: 'gchat:spaces/AAA', label: 'Primary DM' },
-          { id: "gchat:spaces/O'Brien", label: 'Second DM' },
+          { id: '01A2B3-C4D5E6-F7A8B9', label: 'Northwind (01A2B3-C4D5E6-F7A8B9)' },
+          { id: "O'Brien-account", label: "O'Brien (shared)" },
         ],
+        resumeFlag: '--billing-account',
       },
     };
     const collectCreateInputs = async () => {
@@ -942,10 +757,10 @@ describe('create recovery contract', () => {
     expect(idWasPrintedBeforeCollection).toBe(true);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(output).toContain(
-      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Northwind (01A2B3-C4D5E6-F7A8B9)": gws-ea resume --id ${instanceId} --billing-account '01A2B3-C4D5E6-F7A8B9'`,
     );
     expect(output).toContain(
-      `  "Second DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/O'\\''Brien'`,
+      `  "O'Brien (shared)": gws-ea resume --id ${instanceId} --billing-account 'O'\\''Brien-account'`,
     );
 
     const resumeOutput: string[] = [];
@@ -959,7 +774,7 @@ describe('create recovery contract', () => {
       }),
     ).toBe(10);
     expect(resumeOutput).toContain(
-      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Northwind (01A2B3-C4D5E6-F7A8B9)": gws-ea resume --id ${instanceId} --billing-account '01A2B3-C4D5E6-F7A8B9'`,
     );
   });
 
@@ -1127,8 +942,8 @@ describe('create recovery contract', () => {
             pause: {
               kind: 'human-action',
               phase: 'bind_principal',
-              code: 'principal_dm_required',
-              message: 'Send the direct message.',
+              code: 'principal_chat_request_pending',
+              message: 'Accept the chat request.',
             },
           };
         },

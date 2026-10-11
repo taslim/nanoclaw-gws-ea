@@ -37,6 +37,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
 import { registerApprovalHandler } from '../approvals/index.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
@@ -272,13 +273,13 @@ async function requestRemovalCard(ctx: CallerContext, value: PrivateValue, appro
     action: REMOVAL_APPROVAL,
     payload: removalPayload(value.id),
     title: 'Stop protecting a private detail?',
-    asks: `to stop protecting your private ${KIND_NOUNS[value.kind]} "${value.label}". Once it is removed, the assistant may share it with people other than you.`,
+    asks: `to stop protecting your private ${KIND_NOUNS[value.kind]} ${quoted(value.label, NAME_LIMIT)}. Once it is removed, I may share it with people other than you.`,
+    details: { facts: { kind: value.kind, label: value.label } },
   });
   return {
     id: value.id,
     status: 'awaiting-principal',
-    message:
-      'The principal was asked to confirm on a card. You will be told the result; until then the value stays protected.',
+    message: 'The principal was asked to confirm. You will be told the result; until then the value stays protected.',
   } as const;
 }
 
@@ -375,7 +376,7 @@ registerResource({
     remove: {
       access: 'open',
       description:
-        'Stop protecting a private value. Removing one switches its check off, so the principal confirms it on a card first; you are told the result, and the value stays protected until then.',
+        'Stop protecting a private value. Removing one switches its check off, so the principal confirms it first; you are told the result, and the value stays protected until then.',
       args: [{ name: 'id', type: 'string', description: 'The value to remove (from `list`).', required: true }],
       examples: ['ncl private-values remove --id pv-1a2b3c4d5e6f'],
       handler: async (args, ctx) => {

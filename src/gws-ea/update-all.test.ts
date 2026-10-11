@@ -44,6 +44,7 @@ import {
 } from './testing/cutover-fixture.js';
 import type { CliRuntime } from './cli.js';
 import { removeToolCheckouts, toolCheckoutWorld } from './testing/stray-fixture.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { advanceOperation, beginOperation, readOperationRecord } from './operation.js';
 import { getInstanceReservation, swapInstanceRelease } from './registry.js';
@@ -106,7 +107,7 @@ function fleetServices({ state, stopped }: Fleet): NanoclawServiceHelpers {
   };
 }
 
-/** Each assistant's host answers for its own checkout, on its own webhook port. */
+/** Each assistant's host answers for its own checkout. */
 function fleetHosts({ host, state, assistants }: Fleet): HostStatusHelpers {
   const of = (root: string): HostStatusHelpers => {
     const runtime = assistants.find((candidate) =>
@@ -178,7 +179,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const mirror = path.join(host.root, 'mirror.git');
     git(host.root, 'clone', '--quiet', '--bare', host.remote, mirror);
     git(mirror, 'config', 'uploadpack.allowFilter', 'true');
-    // Created in another order than `list` shows them, which is by hostname.
+    // Created in another order than `list` shows them, which is by account.
     const later = await assistant(host, { port: 37_301 });
     const current = await assistant(host, { port: 37_001 });
     const earlier = await assistant(host, { port: 37_101 });
@@ -589,12 +590,10 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       source_remote: host.remote,
       release_track: 'dogfood',
       deployed_commit: host.first,
-      allocated_ports: { nanoclaw_webhook: 37_101, onecli_app: 37_102, onecli_gateway: 37_103 },
+      allocated_ports: { onecli_app: 37_102, onecli_gateway: 37_103 },
       exclusive_resource_claims: {
-        ingress: { mode: 'existing', endpoint_url: 'https://a37101.example.test/webhook/gchat' },
-        gcp_project_id: 'update-37101',
+        ...deriveGcpClaims(creating),
         gcp_account: 'operator@example.test',
-        gchat_service_account: 'gws-ea-chat@update-37101.iam.gserviceaccount.com',
         workspace_email: 'a37101@example.test',
         onecli_project: `gws-ea-${creating.replaceAll('-', '')}`,
       },

@@ -21,7 +21,13 @@ export interface ChannelSetup {
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
-  /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
+  /**
+   * Called when someone answers a question or approval request: a click on a
+   * card's button, or an answer in words on a channel whose requests are
+   * text. Waits for the same readiness as onInbound, then resolves once the
+   * answer's handler has finished and rejects when it fails, so a channel
+   * that redelivers can hand the answer over again.
+   */
   onAction(
     questionId: string,
     selectedOption: string,
@@ -32,7 +38,21 @@ export interface ChannelSetup {
       platformId?: string;
       threadId?: string | null;
     },
-  ): void;
+    answer?: ActionAnswer,
+  ): void | Promise<void>;
+}
+
+/** What a channel knows about an answer beyond the option it chose. */
+export interface ActionAnswer {
+  /**
+   * The channel left the request as posted: the handler that resolves the
+   * answer edits it to its outcome once it has authorized it. Set for a
+   * request whose presentation defers resolution, and for every request on a
+   * channel whose requests are text.
+   */
+  deferResolution?: boolean;
+  /** The reason given with a rejection: in words, the text after the no. */
+  reason?: string;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */
@@ -78,8 +98,17 @@ export interface InboundEvent {
      * it even when their content carries sender fields.
      */
     authenticatedSender?: AuthenticatedSender;
-    /** Retry-safe only for owner-controlled routed admin messages. */
+    /**
+     * Retry-safe: the source may deliver this message again after it was
+     * routed, so a copy already queued in a session is dropped there. Set for
+     * owner-controlled routed admin messages and for channels whose platform
+     * redelivers (InboundMessage.deduplicate).
+     */
     deduplicate?: boolean;
+    /** Context only (InboundMessage.quiet). */
+    quiet?: boolean;
+    /** A reaction rather than something written (InboundMessage.reaction). */
+    reaction?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -110,6 +139,27 @@ export interface InboundMessage {
   isGroup?: boolean;
   /** Sender identity asserted by the authenticated adapter transport. */
   authenticatedSender?: AuthenticatedSender;
+  /**
+   * The platform may deliver this message again after it was routed, as
+   * Pub/Sub's at-least-once delivery does, and its id is the same each time:
+   * the router drops a copy already queued instead of storing and waking twice.
+   */
+  deduplicate?: boolean;
+  /**
+   * Context, not something to answer: the router stores it with trigger=0 in
+   * the session its conversation already has, and drops it when there is
+   * none. It never engages a wiring, wakes an agent, creates a session, or
+   * fans out to sibling sessions (the quiet path, src/router.ts).
+   */
+  quiet?: boolean;
+  /**
+   * A reaction, not something a person wrote. It reaches an agent only when
+   * the person may, and is otherwise dropped without a trace: no drop record,
+   * no approval request. One that is not quiet, on the assistant's own
+   * message, engages its conversation's wiring as a mention does. Message
+   * interceptors never take a reaction or a quiet event as a reply.
+   */
+  reaction?: boolean;
 }
 
 export interface AuthenticatedSender {
@@ -256,12 +306,28 @@ export interface ChannelAdapter {
   deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
 
   // Optional
+  /**
+   * Show that the agent is working here; re-fired on a short interval while
+   * a turn runs (src/modules/typing). `anchor` is the platform's id for the
+   * message the turn works on in this conversation, while that work lasts
+   * (see endTyping).
+   */
   setTyping?(
     platformId: string,
     threadId: string | null,
     status?: string,
     statusKind?: 'auto' | 'agent',
+    anchor?: string,
   ): Promise<void>;
+  /**
+   * The work on the message `anchor` in this conversation ended: something
+   * was sent here, a newer message arrived, or the turn went idle, failed to
+   * wake, or its container exited. Called once for each turn that worked on
+   * it, after the pulses that carried it. An adapter that marks the message
+   * while a turn works on it (the Google Chat assistant's 👀) takes its mark
+   * off here; adapters without such a mark omit this.
+   */
+  endTyping?(platformId: string, threadId: string | null, anchor: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;

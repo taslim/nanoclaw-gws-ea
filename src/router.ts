@@ -16,6 +16,10 @@
  * `dropped_messages` is core audit infra. Core writes rows for structural
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
+ *
+ * Reactions and quiet events take the quiet path instead (routeQuietly):
+ * a side-effect-free access check, and no messaging group, session, drop
+ * record, or approval request is ever created for them.
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
@@ -30,9 +34,16 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
+import { canAccessAgentGroup } from './modules/permissions/access.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  effectiveSessionMode,
+  findSession,
+  resolveSession,
+  writeSessionMessage,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
@@ -258,6 +269,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     event = { ...event, threadId: null };
   }
 
+  if (event.message.quiet === true || event.message.reaction === true) {
+    await routeQuietly(event, adapter?.supportsThreads === true);
+    return;
+  }
+
   const isMention = event.message.isMention === true;
 
   // 1. Combined lookup: messaging_group row + count of wired agents in a
@@ -432,7 +448,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'wake');
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -464,7 +480,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'accumulate');
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -489,6 +505,63 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       agent_group_id: null,
     });
   }
+}
+
+/**
+ * The quiet path (KTD10), for reactions and quiet events. Neither is
+ * something a person wrote to an agent, so neither sets off what a message
+ * from someone unknown does: no messaging group is created, no channel or
+ * sender approval is requested, and no drop is recorded. Each wired agent
+ * the sender may reach (mayReachQuietly) gets the event: a quiet one as
+ * context in the session the conversation already has, never waking it.
+ * A reaction on the assistant's own message is addressed to it as a mention
+ * is, so it engages the wiring whatever its engage mode and wakes the agent.
+ */
+async function routeQuietly(event: InboundEvent, supportsThreads: boolean): Promise<void> {
+  const found = await getMessagingGroupWithAgentCount(
+    event.channelType,
+    event.platformId,
+    event.instance ?? event.channelType,
+  );
+  if (!found || found.agentCount === 0) return;
+  const { mg } = found;
+
+  const userId: string | null = senderResolver ? await senderResolver(event) : null;
+  const channelDefaults = getChannelDefaults(mg.instance ?? mg.channel_type, mg.channel_type);
+  const delivery = event.message.quiet === true ? 'quiet' : 'wake';
+
+  for (const agent of await getMessagingGroupAgents(mg.id)) {
+    const agentGroup = await getAgentGroup(agent.agent_group_id);
+    if (!agentGroup) continue;
+    if (!(await mayReachQuietly(userId, mg, agent))) {
+      log.debug('Quiet event dropped — sender has no access', { agentGroupId: agent.agent_group_id, userId });
+      continue;
+    }
+    const threadsEnabled = resolveThreadPolicy(
+      agent.threads ?? null,
+      channelDefaults,
+      mg.is_group === 1,
+      supportsThreads,
+    );
+    const effectiveThreadId = threadsEnabled ? event.threadId : null;
+    await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, delivery);
+  }
+}
+
+/**
+ * Whether the sender may reach this wired agent, decided as the access gate
+ * and the sender-scope gate decide it (a public conversation and a wiring
+ * open to all senders, or owner / admin / member access) but without their
+ * side effects: the access gate records the drop and asks an approver about
+ * an unknown sender, and a reaction must never raise a request.
+ */
+async function mayReachQuietly(
+  userId: string | null,
+  mg: MessagingGroup,
+  agent: MessagingGroupAgent,
+): Promise<boolean> {
+  if (mg.unknown_sender_policy === 'public' && agent.sender_scope === 'all') return true;
+  return userId !== null && (await canAccessAgentGroup(userId, agent.agent_group_id)).allowed;
 }
 
 /**
@@ -551,6 +624,13 @@ async function evaluateEngage(
   }
 }
 
+/**
+ * How a routed message reaches an agent: waking it; stored as context
+ * (trigger=0) for when it next wakes, in a session created if need be; or
+ * stored as context only in a session that already exists (the quiet path).
+ */
+type Delivery = 'wake' | 'accumulate' | 'quiet';
+
 async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
@@ -559,25 +639,26 @@ async function deliverToAgent(
   userId: string | null,
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
-  wake: boolean,
+  delivery: Delivery,
 ): Promise<void> {
+  const wake = delivery === 'wake';
   // Apply the resolved thread policy (wiring override AND channel declaration
-  // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
-  // wiring in a group chat → per-thread session regardless of wiring
-  // session_mode. agent-shared preserved (it's a cross-channel directive the
-  // adapter doesn't know about). DMs collapse sub-threads to one session
-  // (is_group=0 short-circuit).
-  let effectiveSessionMode = agent.session_mode;
-  if (threadsEnabled && effectiveSessionMode !== 'agent-shared' && mg.is_group !== 0) {
-    effectiveSessionMode = 'per-thread';
-  }
+  // AND adapter capability — resolveThreadPolicy at fanout) to the wiring's
+  // session_mode.
+  const sessionMode = effectiveSessionMode(agent, mg, threadsEnabled);
 
-  const { session, created } = await resolveSession(
-    agent.agent_group_id,
-    mg.id,
-    effectiveThreadId,
-    effectiveSessionMode,
-  );
+  let session: Session;
+  let created = false;
+  if (delivery === 'quiet') {
+    const existing = await findSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode);
+    if (!existing) {
+      log.debug('Quiet event dropped — the conversation has no session', { agentGroupId: agent.agent_group_id });
+      return;
+    }
+    session = existing;
+  } else {
+    ({ session, created } = await resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode));
+  }
 
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
@@ -640,7 +721,10 @@ async function deliverToAgent(
     });
   } catch (error) {
     if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
+    // The first copy already set off everything below: typing, the wake (or
+    // the sweep's, when that wake failed), and the fan-out to sibling sessions.
     log.info('Duplicate retry-safe inbound message already queued', { messageId, sessionId: session.id });
+    return;
   }
 
   if (wake && created) {
@@ -651,7 +735,7 @@ async function deliverToAgent(
       mg,
       platformId: event.platformId,
       threadId: effectiveThreadId,
-      sessionMode: effectiveSessionMode,
+      sessionMode,
       message: {
         id: event.message.id,
         kind: event.message.kind,
@@ -667,7 +751,7 @@ async function deliverToAgent(
     engage_mode: agent.engage_mode,
     kind: event.message.kind,
     userId,
-    wake,
+    delivery,
     created,
     ...(processAfter === null ? {} : { processAfter }),
     agentGroupName: agentGroup.name,
@@ -677,7 +761,9 @@ async function deliverToAgent(
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires, and a delayed one
     // until the host sweep wakes the session once it is due.
-    // Typing fires via the adapter instance that owns this chat's row.
+    // Typing fires via the adapter instance that owns this chat's row. Its
+    // anchor is the platform's id for the message the turn now works on; a
+    // reaction is no one's message, so it leaves the conversation's anchor be.
     startTypingRefresh(
       session.id,
       session.agent_group_id,
@@ -685,6 +771,7 @@ async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
+      event.message.reaction === true ? undefined : event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {

@@ -5,36 +5,32 @@
  * depends on, so a skill refresh or upstream update that drops a recorded
  * divergence fails this suite, not a live assistant. Only effects outside the
  * guarded modules are replaced: container wake-up, launchd and Docker behind
- * the update helpers' command runner, and Google's certificate check and the
- * OneCLI servers behind `fetch`. Modules outside `src/` (scripts and the agent
+ * the update helpers' command runner, and the OneCLI servers behind `fetch`.
+ * Modules outside `src/` (scripts and the agent
  * runner) load by path, since the host's build covers only `src/`.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
+import { GoogleChatAdapter } from '@chat-adapter/gchat';
 import Database from 'better-sqlite3';
+import { Message, parseMarkdown, type Adapter, type ChatInstance } from 'chat';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { ChannelRegistration, InboundEvent } from '../channels/adapter.js';
+import type { InboundEvent, InboundMessage } from '../channels/adapter.js';
 import type { ContainerConfig } from '../container-config.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
 import type { ProviderStateVolume } from '../provider-contracts/registry.js';
 import type { AgentGroup, Session } from '../types.js';
-import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import type { NanoclawCommandRunner, NanoclawServiceEnvironment, NanoclawServiceHelpers } from './service-control.js';
 
 const external = vi.hoisted(() => ({ requestWake: vi.fn(async () => true) }));
 
 // Recording pass-throughs: the real modules run; the guards read what they were given.
-vi.mock('@chat-adapter/gchat', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@chat-adapter/gchat')>();
-  return { ...actual, createGoogleChatAdapter: vi.fn(actual.createGoogleChatAdapter) };
-});
 vi.mock('../channels/chat-sdk-bridge.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../channels/chat-sdk-bridge.js')>();
   return { ...actual, createChatSdkBridge: vi.fn(actual.createChatSdkBridge) };
@@ -71,66 +67,6 @@ async function freshInstall(): Promise<string> {
   vi.resetModules();
   return directory;
 }
-
-describe('recorded divergence: Google Chat receives the Workspace Add-on identity', () => {
-  it('passes the add-on identity from the host environment to the adapter, which then accepts its requests', async () => {
-    await freshInstall();
-    const endpointUrl = 'https://assistant.example.test/webhook/gchat';
-    const addOnIdentity = deriveWorkspaceAddOnIdentity('441811502258');
-    // What gws-ea's instance launcher puts in the host environment.
-    vi.stubEnv('GCHAT_CREDENTIALS', JSON.stringify({ client_email: 'bot@example.test', private_key: 'unused' }));
-    vi.stubEnv('GCHAT_ENDPOINT_URL', endpointUrl);
-    vi.stubEnv('GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL', addOnIdentity);
-    const registry = await import('../channels/channel-registry.js');
-    const sdk = await import('@chat-adapter/gchat');
-    await import('../channels/gchat.js');
-
-    const registration = vi
-      .mocked(registry.registerChannelAdapter)
-      .mock.calls.find(([name]) => name === 'gchat')?.[1] as ChannelRegistration | undefined;
-    expect(await registration?.factory()).toBeTruthy();
-    const adapter = vi.mocked(sdk.createGoogleChatAdapter).mock.results.at(-1)?.value as
-      | ReturnType<typeof sdk.createGoogleChatAdapter>
-      | undefined;
-    expect(adapter).toBeDefined();
-    const internals = adapter as unknown as {
-      oauth2Client: { verifyIdToken(options: { idToken: string; audience: string }): Promise<unknown> };
-      handleMessageEvent(event: unknown, options: unknown): void;
-    };
-    // Google's signature check needs its certificates; the identity claims are what the adapter decides on.
-    vi.spyOn(internals.oauth2Client, 'verifyIdToken').mockImplementation(async ({ audience }) => ({
-      getPayload: () => ({
-        aud: audience,
-        email: addOnIdentity,
-        email_verified: true,
-        iss: 'https://accounts.google.com',
-      }),
-    }));
-    const handled = vi.spyOn(internals, 'handleMessageEvent').mockImplementation(() => undefined);
-
-    const response = await adapter!.handleWebhook(
-      new Request(endpointUrl, {
-        method: 'POST',
-        headers: { authorization: 'Bearer add-on-signed', 'content-type': 'application/json' },
-        body: JSON.stringify({
-          chat: {
-            messagePayload: {
-              message: {
-                name: 'spaces/dm/messages/one',
-                sender: { displayName: 'Principal', name: 'users/principal', type: 'HUMAN' },
-                text: 'hello',
-              },
-              space: { name: 'spaces/dm', type: 'DM' },
-            },
-          },
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(handled).toHaveBeenCalledOnce();
-  });
-});
 
 describe('recorded divergence: the installed OneCLI adapter', () => {
   it('is exactly what add-onecli installs: every file it copies equals its payload source', async () => {
@@ -273,27 +209,6 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
   });
 });
 
-describe('recorded divergence: the webhook server honors a loopback WEBHOOK_HOST', () => {
-  it('binds 127.0.0.1 when the instance sets WEBHOOK_HOST to loopback', async () => {
-    await freshInstall();
-    const port = await freePort();
-    vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
-    vi.stubEnv('WEBHOOK_PORT', String(port));
-    const listen = vi.spyOn(net.Server.prototype, 'listen');
-    const webhooks = await import('../webhook-server.js');
-    cleanups.push(() => webhooks.stopWebhookServer());
-
-    webhooks.registerWebhookHandler('divergence-guard', (_request, response) => {
-      response.end('ok');
-    });
-
-    const server = listen.mock.contexts.find((context) => context instanceof net.Server) as net.Server | undefined;
-    expect(server).toBeDefined();
-    await vi.waitFor(() => expect(server!.listening).toBe(true));
-    expect(server!.address()).toMatchObject({ address: '127.0.0.1', port } satisfies Partial<AddressInfo>);
-  });
-});
-
 describe('recorded divergence: init-first-agent takes an optional welcome event ID', () => {
   const initFirstAgent = path.join(CONTROL_PLANE_ROOT, 'scripts', 'init-first-agent.ts');
 
@@ -391,38 +306,60 @@ describe('recorded divergence: init-first-agent takes an optional welcome event 
   });
 });
 
-async function freePort(): Promise<number> {
-  const probe = net.createServer();
-  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
-  const { port } = probe.address() as AddressInfo;
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  return port;
-}
-
-describe('recorded divergence: Google Chat gives the agent the message a principal quotes', () => {
-  it('hands the registered bridge a reply-context hook that reads the quoted snapshot', async () => {
+describe('recorded divergence: the Chat SDK bridge names the message a reply quotes, and marks a redelivered platform retry-safe', () => {
+  it("hands the agent the reply hook's message id, and marks each inbound of a platform that redelivers", async () => {
     await freshInstall();
-    vi.stubEnv('GCHAT_CREDENTIALS', JSON.stringify({ client_email: 'bot@example.test', private_key: 'secret' }));
-    vi.stubEnv('GCHAT_ENDPOINT_URL', 'https://assistant.example.test/webhook/gchat');
-    const bridge = await import('../channels/chat-sdk-bridge.js');
-    await import('../channels/gchat.js');
-    const registry = await import('../channels/channel-registry.js');
-    const registration = vi
-      .mocked(registry.registerChannelAdapter)
-      .mock.calls.find(([name]) => name === 'gchat')?.[1] as ChannelRegistration | undefined;
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const { createChatSdkBridge } = await import('../channels/chat-sdk-bridge.js');
+    // A polling adapter, so the bridge binds no webhook port; every thread is a DM.
+    const adapter = {
+      name: 'stubchat',
+      userName: 'morgan',
+      runtimeMode: 'polling',
+      initialize: async () => undefined,
+      isDM: () => true,
+      channelIdFromThreadId: (threadId: string) => threadId.replace(/:dm$/u, ''),
+    } as unknown as Adapter;
+    const routed: InboundMessage[] = [];
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      redelivers: true,
+      extractReplyContext: (raw) => ({ id: String(raw.quoted), sender: 'Morgan Ellery', text: 'Lunch at 1?' }),
+    });
+    await bridge.setup({
+      onInbound: async (_platformId, _threadId, message) => {
+        routed.push(message);
+      },
+      onInboundEvent: () => undefined,
+      onMetadata: () => undefined,
+      onAction: () => undefined,
+    });
+    cleanups.push(() => bridge.teardown());
 
-    await registration!.factory();
-
-    const hook = vi.mocked(bridge.createChatSdkBridge).mock.calls[0]?.[0].extractReplyContext;
-    expect(
-      hook?.({
-        chat: {
-          messagePayload: {
-            message: { quotedMessageMetadata: { quotedMessageSnapshot: { sender: 'Juno', text: 'Lunch at 1?' } } },
-          },
-        },
+    await (bridge as unknown as { _chat: ChatInstance })._chat.processMessage(
+      adapter,
+      'stubchat:dm-1:dm',
+      new Message({
+        id: 'reply-2',
+        threadId: 'stubchat:dm-1:dm',
+        text: 'yes',
+        formatted: parseMarkdown('yes'),
+        raw: { quoted: 'question-1' },
+        author: { userId: 'u-1', userName: 'Juno Hale', fullName: 'Juno Hale', isBot: false, isMe: false },
+        metadata: { dateSent: new Date(), edited: false },
+        attachments: [],
       }),
-    ).toEqual({ sender: 'Juno', text: 'Lunch at 1?' });
+    );
+
+    expect(routed).toEqual([expect.objectContaining({ id: 'reply-2', deduplicate: true })]);
+    expect((routed[0]!.content as { replyTo?: unknown }).replyTo).toEqual({
+      id: 'question-1',
+      sender: 'Morgan Ellery',
+      text: 'Lunch at 1?',
+    });
   });
 });
 
@@ -1207,25 +1144,26 @@ describe("recorded divergence: the host's own sends pass the outbound guards, an
     expect(host).toContain('startHostModules({ db, deliveryAdapter: guardedDelivery,');
   });
 
-  it("forwards a channel's authenticated sender, and drops one an admin transport's routed event carries", async () => {
+  it("forwards a channel's authenticated sender and retry-safe mark, and drops a sender an admin transport's routed event carries", async () => {
     const host = await readFile(path.join(originalCwd, 'src/index.ts'), 'utf8');
     const onInbound = host.slice(host.indexOf('onInbound(platformId, threadId, message) {'));
     const channelMessage = onInbound.slice(0, onInbound.indexOf('onInboundEvent('));
     const adminEvent = onInbound.slice(onInbound.indexOf('onInboundEvent('), onInbound.indexOf('onMetadata('));
 
     expect(channelMessage).toContain('authenticatedSender: message.authenticatedSender,');
+    expect(channelMessage).toContain('deduplicate: message.deduplicate,');
     expect(adminEvent).toContain('authenticatedSender: undefined,');
     expect(adminEvent).toContain("deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,");
   });
 });
 
-describe('recorded divergence: the base checkout composes the secured Google Chat channel', () => {
+describe("recorded divergence: Google Chat is the assistant's own channel, on the pinned SDK", () => {
   /** The slice of `scripts/skill-directives.ts` this guard drives. */
   interface SkillDirectives {
     parseDirectives(markdown: string): ReadonlyArray<{ readonly kind: string; readonly body: readonly string[] }>;
   }
 
-  it('pins the Chat SDK core to the Google Chat adapter, and add-gchat neither copies over nor removes the adapter', async () => {
+  it('pins the Chat SDK core to the Google Chat adapter, and add-gchat would install that same version', async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const manifest = JSON.parse(await read('package.json')) as { dependencies: Record<string, string> };
     const adapterVersion = manifest.dependencies['@chat-adapter/gchat'];
@@ -1236,12 +1174,41 @@ describe('recorded divergence: the base checkout composes the secured Google Cha
 
     expect(adapterVersion).toMatch(/^\d+\.\d+\.\d+$/u);
     expect(manifest.dependencies.chat).toBe(adapterVersion);
-    expect(skill.filter((directive) => directive.kind === 'copy').flatMap((directive) => directive.body)).toEqual([
-      'src/channels/gchat-registration.test.ts',
-    ]);
     expect(skill.filter((directive) => directive.kind === 'dep').flatMap((directive) => directive.body)).toEqual([
       `@chat-adapter/gchat@${adapterVersion}`,
     ]);
-    expect(await read('.claude/skills/add-gchat/REMOVE.md')).not.toMatch(/\brm\b[^\n]*src\/channels\/gchat\.ts/u);
+  });
+
+  it('registers gchat once, from the gws-ea-chat module and never from the channel barrel', async () => {
+    await freshInstall();
+    const barrel = await readFile(path.join(originalCwd, 'src/channels/index.ts'), 'utf8');
+    const registry = await import('../channels/channel-registry.js');
+    const registered = () =>
+      vi.mocked(registry.registerChannelAdapter).mock.calls.filter(([name]) => name === 'gchat').length;
+    vi.mocked(registry.registerChannelAdapter).mockClear();
+
+    expect(barrel).not.toMatch(/gchat/u);
+    await import('../channels/index.js');
+    expect(registered()).toBe(0);
+    await import('../modules/index.js');
+    expect(registered()).toBe(1);
+  });
+
+  it("still has every SDK method the assistant's adapter overrides or calls, so an SDK upgrade cannot drop one silently", async () => {
+    const { AssistantChatAdapter } = await import('../modules/gws-ea-chat/adapter.js');
+    const sdk = GoogleChatAdapter.prototype as unknown as Record<string, unknown>;
+    const own = (prototype: object, method: string) => Object.prototype.hasOwnProperty.call(prototype, method);
+    const overridden = [
+      'initialize',
+      'handleWebhook',
+      'handlePubSubMessageEvent',
+      'normalizeBotMentions',
+      'editMessage',
+    ];
+    const called = ['parsePubSubMessage', 'encodeThreadId', 'fetchAttachmentData'];
+
+    for (const method of [...overridden, ...called]) expect(typeof sdk[method], method).toBe('function');
+    expect(overridden.filter((method) => !own(AssistantChatAdapter.prototype, method))).toEqual([]);
+    expect(called.filter((method) => own(AssistantChatAdapter.prototype, method))).toEqual([]);
   });
 });

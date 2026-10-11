@@ -48,10 +48,6 @@ function commit(root: string, message: string): void {
   git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', message);
 }
 
-async function writePins(root: string, changes: Record<string, string>): Promise<void> {
-  await write(root, PINS_FILE, `${JSON.stringify({ ...LAUNCHER_PIN_FILE, ...changes }, null, 2)}\n`);
-}
-
 async function releaseFixture(): Promise<string> {
   const instanceRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-preflight-'));
   roots.push(instanceRoot);
@@ -175,20 +171,6 @@ describe('release preflight', () => {
       }),
     ).rejects.toThrow(/dist\/gws-ea\/process\.js/u);
     expect(commands).toHaveLength(2);
-  });
-
-  it.each([
-    ['cloudflare/cloudflared:latest'],
-    ['cloudflare/cloudflared:2026.9.1'],
-    ['cloudflare/cloudflared@sha256:' + 'a'.repeat(64)],
-  ])('rejects a mutable or incomplete cloudflared pin: %s', async (image) => {
-    const root = await releaseFixture();
-    await writePins(root, { cloudflared: image });
-    commit(root, 'invalid cloudflared pin');
-
-    await expect(runReleasePreflight(preflightInput(root))).rejects.toMatchObject({
-      code: 'invalid_release_pin',
-    });
   });
 
   it.each([

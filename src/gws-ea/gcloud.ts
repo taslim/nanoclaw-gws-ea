@@ -1,11 +1,14 @@
 /**
- * Google Cloud through gcloud. `provision_gcp` observes its resources
- * with reads whose failures are classified, never guessed: an expired sign-in
- * signs in again, and anything a read cannot decide is unknown and changes
- * nothing, except creating the project under the instance's own random ID.
- * The Chat key converges by replacement, and a key-creation policy lifted to
- * create it is recorded in the journal first and restored before the step can
- * complete. Every command is logged in a form an operator can rerun.
+ * Google Cloud through gcloud. `provision_gcp` builds the assistant's Google
+ * Chat delivery in its own project: billing, the topic Google Chat publishes
+ * to, the pull subscription the host reads, and a subscriber account that may
+ * only pull it. It observes its resources with reads whose failures are
+ * classified, never guessed: an expired sign-in signs in again, and anything a
+ * read cannot decide is unknown and changes nothing, except creating the
+ * project under the instance's own random ID. The subscriber key converges by
+ * replacement, and a key-creation policy lifted to create it is recorded in
+ * the journal first and restored before the step can complete. Every command
+ * is logged in a form an operator can rerun.
  */
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -13,12 +16,16 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
-import { SignInRequired } from './events.js';
+import { BILLING_ACCOUNT_FLAG, SignInRequired } from './events.js';
 import {
+  deriveGchatEventsSubscription,
+  deriveGchatEventsTopic,
   deriveGchatServiceAccountEmail,
+  GCHAT_EVENTS_SUBSCRIPTION_ID,
+  GCHAT_EVENTS_TOPIC_ID,
   GCHAT_SERVICE_ACCOUNT_ID,
+  GCP_BILLING_ACCOUNT_PATTERN,
   GCP_PROJECT_PATTERN,
-  parseGcpProjectNumber,
 } from './gcp-identity.js';
 import { readProvisionJournal, recordKeyPolicyLifted, type InstanceOperation } from './journal.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory } from './paths.js';
@@ -44,7 +51,37 @@ const INVALID_OUTPUT = 'invalid_gcloud_output';
 const INVALID_CREDENTIAL = 'invalid_gchat_credential';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
-const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
+const REQUIRED_APIS = [
+  'chat.googleapis.com',
+  'iam.googleapis.com',
+  'orgpolicy.googleapis.com',
+  'pubsub.googleapis.com',
+  'workspaceevents.googleapis.com',
+] as const;
+const BILLING_URL = 'https://console.cloud.google.com/billing';
+const BILLING_USER_ROLE = 'roles/billing.user';
+/** The member Google Chat publishes a Workspace Events subscription's events as. */
+const GCHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com';
+const PUBLISHER_ROLE = 'roles/pubsub.publisher';
+const SUBSCRIBER_ROLE = 'roles/pubsub.subscriber';
+/**
+ * The pull subscription (KTD3): the host extends the 60-second deadline while
+ * it handles an event, the 7 days Google retains cover a host that is away,
+ * the subscription never expires while it is idle, and an acknowledged event
+ * is gone.
+ */
+const SUBSCRIPTION_SETTINGS = [
+  '--ack-deadline=60',
+  '--message-retention-duration=7d',
+  '--expiration-period=never',
+  '--no-retain-acked-messages',
+] as const;
+/**
+ * Google's documented answer when domain restricted sharing
+ * (constraints/iam.allowedPolicyMemberDomains) refuses a member.
+ */
+const DOMAIN_RESTRICTED_SHARING = /do not belong to a permitted customer/u;
+const DOMAIN_RESTRICTED_SHARING_CONSTRAINT = 'iam.allowedPolicyMemberDomains';
 /**
  * The Workspace APIs the assistant's own Google sign-in holds scopes for
  * (KTD2), enabled by the Google connection. Nothing calls Drive Activity or
@@ -78,7 +115,7 @@ const IAM_SETTLES_MS = 7 * 60_000;
 /** Google: organization policy changes "can take up to 15 minutes to be fully enforced". */
 const ORG_POLICY_SETTLES_MS = 15 * 60_000;
 const POLICY_ADMIN_ROLE = 'roles/orgpolicy.policyAdmin';
-const SERVICE_ACCOUNT_DISPLAY_NAME = 'GWS-EA Google Chat';
+const SERVICE_ACCOUNT_DISPLAY_NAME = 'GWS-EA Chat subscriber';
 const ACCOUNT_PATTERN = /^[^\s@]+@[^\s@]+$/u;
 const CONSUMER_GOOGLE_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
 
@@ -112,7 +149,12 @@ const GCLOUD_FAILURES: ReadonlyArray<readonly [GcloudFailureClass, readonly RegE
 ];
 
 /** A create refused because the resource already exists (HTTP 409), in gcloud's wordings. */
-const ALREADY_EXISTS = [/\bALREADY_EXISTS\b/u, /already in use by another project/u, /is the subject of a conflict/u];
+const ALREADY_EXISTS = [
+  /\bALREADY_EXISTS\b/u,
+  /already in use by another project/u,
+  /is the subject of a conflict/u,
+  /Resource already exists in the project/u,
+];
 
 /** Classify a failed gcloud command by its stderr. */
 export function classifyGcloudFailure(outcome: SanitizedCommandOutcome): GcloudFailureClass {
@@ -120,7 +162,7 @@ export function classifyGcloudFailure(outcome: SanitizedCommandOutcome): GcloudF
   return match?.[0] ?? 'anything-else';
 }
 
-/** A personal Google account, which cannot own a Google Chat app for a Workspace. */
+/** A personal Google account, not the Google Workspace one the assistant and its project's owner must each be. */
 export function isConsumerGoogleAccount(email: string): boolean {
   return CONSUMER_GOOGLE_DOMAINS.has(email.slice(email.lastIndexOf('@') + 1).toLowerCase());
 }
@@ -148,8 +190,11 @@ export interface GcpProjectCoordinates {
 }
 
 export interface GcpProjectInput extends GcpProjectCoordinates {
+  /** The subscriber account, whose key `credentialFile` holds. */
   readonly serviceAccountEmail: string;
   readonly credentialFile: string;
+  /** The billing account the operator chose to link when several are open (`--billing-account`). */
+  readonly billingAccount?: string;
 }
 
 /** A step context that names the assistant's Google Cloud project. */
@@ -177,7 +222,6 @@ type Gcloud = (args: readonly string[]) => Promise<Ran>;
 
 interface Project {
   readonly projectId: string;
-  readonly projectNumber: string | undefined;
   readonly lifecycleState: string;
   readonly labels: Readonly<Record<string, unknown>>;
 }
@@ -239,10 +283,13 @@ function validateCoordinates(input: GcpProjectCoordinates | GcpProjectInput): vo
   if (!isNormalizedAbsolute(input.cwd)) throw new GwsEaError('unsafe_path', 'GCP command directory is invalid');
   if ('credentialFile' in input) {
     if (!isNormalizedAbsolute(input.credentialFile)) {
-      throw new GwsEaError('unsafe_path', 'Google Chat credential path is invalid');
+      throw new GwsEaError('unsafe_path', 'Chat subscriber key path is invalid');
     }
     if (input.serviceAccountEmail !== deriveGchatServiceAccountEmail(input.projectId)) {
-      throw new GwsEaError('invalid_claim', 'Chat service-account identity does not match the project');
+      throw new GwsEaError('invalid_claim', 'Chat subscriber account does not match the project');
+    }
+    if (input.billingAccount !== undefined && !GCP_BILLING_ACCOUNT_PATTERN.test(input.billingAccount)) {
+      throw new GwsEaError('invalid_billing_account', 'Billing account ID is invalid');
     }
   }
 }
@@ -263,9 +310,9 @@ function alreadyExists({ outcome }: Ran): boolean {
 }
 
 /** A command Google Cloud refused: the step stops with the failed command as evidence. */
-function gcloudFailed(message: string, { command, outcome }: Ran): GwsEaError {
+function gcloudFailed(message: string, { command, outcome }: Ran, code = 'gcloud_failed'): GwsEaError {
   const failure = commandExitError(command, outcome);
-  return new GwsEaError('gcloud_failed', message, {
+  return new GwsEaError(code, message, {
     cause: failure,
     ...(failure.details ? { details: failure.details } : {}),
   });
@@ -296,13 +343,6 @@ function parseJsonList(stdout: string, label: string): unknown[] {
   const list: unknown[] = value;
   return list;
 }
-
-export function deriveGcpProjectId(instanceId: string): string {
-  assertInstanceId(instanceId);
-  return `gws-ea-${instanceId.replaceAll('-', '').slice(0, 20)}`;
-}
-
-export { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 
 /** gcloud is on PATH and runs. */
 export async function assertGcloudInstalled(runner: GcloudCommandRunner = runSanitizedCommandOutcome): Promise<void> {
@@ -349,7 +389,6 @@ async function readProject(gcloud: Gcloud, projectId: string): Promise<Read<Proj
   return {
     value: {
       projectId: stringField(value, 'projectId', 'Google Cloud project', INVALID_OUTPUT),
-      projectNumber: parseGcpProjectNumber(value.projectNumber),
       lifecycleState: stringField(value, 'lifecycleState', 'Google Cloud project', INVALID_OUTPUT),
       // gcloud omits an empty label map.
       labels: isRecord(value.labels) ? value.labels : {},
@@ -383,28 +422,11 @@ function assertActiveProject(coordinates: GcpProjectCoordinates, project: Projec
   );
 }
 
-/** The add-on signing identity's project number, read only from the owned, active project. */
-export async function getOwnedGcpProjectNumber(
-  coordinates: GcpProjectCoordinates,
-  dependencies: GcloudDependencies = {},
-): Promise<string> {
-  const read = await readProject(gcloudFor(coordinates, dependencies), coordinates.projectId);
-  if ('failed' in read) {
-    throw gcloudFailed(`Google Cloud could not describe project ${coordinates.projectId}`, read.failed);
-  }
-  assertOwnedProject(coordinates, read.value);
-  assertActiveProject(coordinates, read.value);
-  if (!read.value.projectNumber) {
-    throw new GwsEaError(INVALID_OUTPUT, 'Google Cloud returned an invalid project number');
-  }
-  return read.value.projectNumber;
-}
-
 function serviceAccountDescription(instanceId: string): string {
   return `Owned by GWS-EA instance ${instanceId}`;
 }
 
-/** The Chat service account as listed, or undefined when the conclusive list lacks it. */
+/** The subscriber account as listed, or undefined when the conclusive list lacks it. */
 async function readServiceAccount(
   gcloud: Gcloud,
   gcp: GcpProjectInput,
@@ -436,7 +458,7 @@ function notYetUsable(read: Read<readonly string[]>): boolean {
   return 'failed' in read && /\bNOT_FOUND\b/u.test(read.failed.outcome.stderr);
 }
 
-/** The IDs of the Chat account's user-managed keys; an empty list is conclusive. */
+/** The IDs of the subscriber account's user-managed keys; an empty list is conclusive. */
 async function readUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Promise<Read<readonly string[]>> {
   const listed = await gcloud([
     'iam',
@@ -467,11 +489,11 @@ export function parseGchatServiceAccountCredential(
   contents: string,
   expected: { readonly projectId: string; readonly serviceAccountEmail: string },
 ): ServiceAccountCredential {
-  const value = parseJson(contents, 'Google Chat credential', INVALID_CREDENTIAL);
+  const value = parseJson(contents, 'Chat subscriber key', INVALID_CREDENTIAL);
   if (!isRecord(value) || value.type !== 'service_account') {
-    throw new GwsEaError(INVALID_CREDENTIAL, 'Google Chat credential is not a service-account key');
+    throw new GwsEaError(INVALID_CREDENTIAL, 'Chat subscriber key is not a service-account key');
   }
-  const field = (key: string): string => stringField(value, key, 'Google Chat credential', INVALID_CREDENTIAL);
+  const field = (key: string): string => stringField(value, key, 'Chat subscriber key', INVALID_CREDENTIAL);
   const projectId = field('project_id');
   const privateKeyId = field('private_key_id');
   const clientEmail = field('client_email');
@@ -481,10 +503,10 @@ export function parseGchatServiceAccountCredential(
     !privateKey.startsWith('-----BEGIN PRIVATE KEY-----\n') ||
     !privateKey.trimEnd().endsWith('\n-----END PRIVATE KEY-----')
   ) {
-    throw new GwsEaError(INVALID_CREDENTIAL, 'Google Chat credential contains an invalid private key');
+    throw new GwsEaError(INVALID_CREDENTIAL, 'Chat subscriber key contains an invalid private key');
   }
   if (projectId !== expected.projectId || clientEmail !== expected.serviceAccountEmail) {
-    throw new GwsEaError('gchat_credential_mismatch', 'Google Chat credential does not match the reserved project');
+    throw new GwsEaError('gchat_credential_mismatch', 'Chat subscriber key does not match the reserved project');
   }
   return { projectId, privateKeyId, clientEmail };
 }
@@ -512,7 +534,7 @@ function policyPermissionPause(coordinates: GcpProjectCoordinates): ProvisionHum
     kind: 'human-action',
     phase: 'provision_gcp',
     code: 'gcp_policy_permission_required',
-    message: `Google Cloud refused to change the Google Chat key-creation policy on project ${coordinates.projectId}.`,
+    message: `Google Cloud refused to change the service-account key-creation policy on project ${coordinates.projectId}.`,
     details: [
       `Grant ${coordinates.account} Organization Policy Administrator (${POLICY_ADMIN_ROLE}) on the organization that contains project ${coordinates.projectId}, then resume.`,
     ],
@@ -650,7 +672,7 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
       create,
       blocked,
       ORG_POLICY_SETTLES_MS,
-      'Waiting for Google Cloud to allow Google Chat key creation…',
+      'Waiting for Google Cloud to allow service-account key creation…',
       dependencies,
     );
   }
@@ -663,7 +685,7 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
   return undefined;
 }
 
-/** Delete every user-managed key of the Chat account, once it is confirmed to be this assistant's. */
+/** Delete every user-managed key of the subscriber account, once it is confirmed to be this assistant's. */
 async function deleteUserManagedKeys(context: GcpStepContext, dependencies: GcloudDependencies): Promise<void> {
   const gcp = context.input.gcp;
   const gcloud = gcloudFor(gcp, dependencies);
@@ -726,14 +748,14 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
     staged = await readKeyFile(staging, gcp);
     if (staged.status !== 'valid') {
       const problem = staged.status === 'unusable' ? staged.problem : 'no key file was written';
-      throw new GwsEaError(INVALID_CREDENTIAL, `Google Cloud created an unusable Google Chat key: ${problem}`);
+      throw new GwsEaError(INVALID_CREDENTIAL, `Google Cloud created an unusable subscriber key: ${problem}`);
     }
     const { keyId } = staged;
     const listed = await retryWhile(
       () => readUserManagedKeys(gcloudFor(gcp, dependencies), gcp),
       (read) => ('failed' in read ? notYetUsable(read) : !read.value.includes(keyId)),
       IAM_SETTLES_MS,
-      'Waiting for Google Cloud to list the new Google Chat key…',
+      'Waiting for Google Cloud to list the new subscriber key…',
       dependencies,
     );
     if ('failed' in listed) {
@@ -751,12 +773,6 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
   return undefined;
 }
 
-/**
- * `provision_gcp`'s resources, in order. The project is the one resource
- * created on an unknown observation, under the instance's own ID. A lifted
- * key-creation policy is restored last, once the key exists, including a lift
- * an interrupted run left behind.
- */
 /** The project has every API in `apis` enabled; enabling them is idempotent. */
 function enabledApisResource(
   name: string,
@@ -795,6 +811,273 @@ export function googleWorkspaceApisResource(dependencies: GcloudDependencies = {
   return enabledApisResource('the Google Workspace APIs', GOOGLE_WORKSPACE_APIS, dependencies);
 }
 
+interface BillingAccount {
+  readonly id: string;
+  readonly displayName: string;
+}
+
+/** The open billing accounts the reserved account can see; an empty list is conclusive. */
+async function readOpenBillingAccounts(gcloud: Gcloud): Promise<Read<readonly BillingAccount[]>> {
+  const listed = await gcloud(['billing', 'accounts', 'list', '--format=json']);
+  if (!succeeded(listed)) return { failed: listed };
+  const label = 'Google Cloud billing account';
+  return {
+    value: parseJsonList(listed.outcome.stdout, `${label}s`).flatMap((entry) => {
+      if (!isRecord(entry)) throw new GwsEaError(INVALID_OUTPUT, `${label} must be an object`);
+      if (entry.open !== true) return [];
+      const name = stringField(entry, 'name', label, INVALID_OUTPUT);
+      const id = name.slice('billingAccounts/'.length);
+      if (!name.startsWith('billingAccounts/') || !GCP_BILLING_ACCOUNT_PATTERN.test(id)) {
+        throw new GwsEaError(INVALID_OUTPUT, `${label} name is invalid`);
+      }
+      return [{ id, displayName: stringField(entry, 'displayName', label, INVALID_OUTPUT) }];
+    }),
+  };
+}
+
+function billingChoicePause(gcp: GcpProjectInput, accounts: readonly BillingAccount[]): ProvisionHumanPause {
+  return {
+    kind: 'human-action',
+    phase: 'provision_gcp',
+    code: 'gcp_billing_account_choice_required',
+    message: `Choose the billing account that pays for Google Cloud project ${gcp.projectId}.`,
+    choices: accounts.map(({ id, displayName }) => ({ id, label: `${displayName} (${id})` })),
+    resumeFlag: BILLING_ACCOUNT_FLAG,
+  };
+}
+
+function billingRequiredPause(gcp: GcpProjectInput, dependencies: GcloudDependencies): ProvisionHumanPause {
+  return {
+    kind: 'human-action',
+    phase: 'provision_gcp',
+    code: 'gcp_billing_account_required',
+    message: `Google Cloud project ${gcp.projectId} needs a billing account, and ${gcp.account} has no open one.`,
+    details: [
+      `Create a billing account, or have its administrator grant ${gcp.account} Billing Account User (${BILLING_USER_ROLE}) on an open one, then resume.`,
+    ],
+    actionUrl: BILLING_URL,
+    settled: async () => {
+      const open = await readOpenBillingAccounts(gcloudFor(gcp, dependencies));
+      return 'value' in open && open.value.length > 0;
+    },
+  };
+}
+
+/**
+ * The project pays through an open billing account, since Pub/Sub needs one:
+ * the only one the reserved account can use, or the one the operator chose.
+ */
+function billingResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
+  const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  return {
+    name: 'the billing account link',
+    observe: async (context) => {
+      const gcp = context.input.gcp;
+      const described = await gcloud(context)(['billing', 'projects', 'describe', gcp.projectId, '--format=json']);
+      if (!succeeded(described)) return unknownRead(`the billing of project ${gcp.projectId}`, described);
+      const info = parseJson(described.outcome.stdout, 'Google Cloud billing info', INVALID_OUTPUT);
+      if (!isRecord(info)) throw new GwsEaError(INVALID_OUTPUT, 'Google Cloud billing info must be an object');
+      // Disabled too when the linked account has closed, so an open one is linked in its place.
+      return info.billingEnabled === true ? PRESENT : ABSENT;
+    },
+    apply: async (context) => {
+      const gcp = context.input.gcp;
+      let chosen = gcp.billingAccount;
+      if (chosen === undefined) {
+        const open = await readOpenBillingAccounts(gcloud(context));
+        if ('failed' in open) {
+          throw gcloudFailed(`Google Cloud could not list the billing accounts of ${gcp.account}`, open.failed);
+        }
+        const [only, ...others] = open.value;
+        if (!only) return billingRequiredPause(gcp, dependencies);
+        if (others.length > 0) return billingChoicePause(gcp, open.value);
+        chosen = only.id;
+      }
+      const linked = await gcloud(context)([
+        'billing',
+        'projects',
+        'link',
+        gcp.projectId,
+        `--billing-account=${chosen}`,
+      ]);
+      if (!succeeded(linked)) {
+        throw gcloudFailed(`Google Cloud could not link billing account ${chosen} to project ${gcp.projectId}`, linked);
+      }
+      return undefined;
+    },
+  };
+}
+
+type PubsubKind = 'topics' | 'subscriptions';
+
+/** The topic or the subscription, found by its full name in the project's conclusive list. */
+function pubsubResource(
+  name: string,
+  kind: PubsubKind,
+  id: string,
+  fullName: (projectId: string) => string,
+  createFlags: readonly string[],
+  dependencies: GcloudDependencies,
+): StepResource<GcpStepContext> {
+  const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  return {
+    name,
+    observe: async (context) => {
+      const gcp = context.input.gcp;
+      const listed = await gcloud(context)(['pubsub', kind, 'list', `--project=${gcp.projectId}`, '--format=json']);
+      if (!succeeded(listed)) return unknownRead(`the Pub/Sub ${kind} of project ${gcp.projectId}`, listed);
+      const names = parseJsonList(listed.outcome.stdout, `Pub/Sub ${kind}`).map((entry) =>
+        requireString(isRecord(entry) ? entry.name : undefined, `Pub/Sub ${kind} name`, INVALID_OUTPUT),
+      );
+      return names.includes(fullName(gcp.projectId)) ? PRESENT : ABSENT;
+    },
+    apply: async (context) => {
+      const gcp = context.input.gcp;
+      const created = await gcloud(context)([
+        'pubsub',
+        kind,
+        'create',
+        id,
+        ...createFlags,
+        `--project=${gcp.projectId}`,
+      ]);
+      // Created by an interrupted run but not yet listed: the next observation waits for it.
+      if (!succeeded(created) && !alreadyExists(created)) {
+        throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}`, created);
+      }
+      return undefined;
+    },
+  };
+}
+
+/** One role on the topic or the subscription, for one member. */
+interface PubsubGrant {
+  readonly kind: PubsubKind;
+  readonly id: string;
+  readonly role: string;
+  readonly member: string;
+}
+
+/** Whether the grant is in the policy of the topic or the subscription. */
+async function observeGrant(gcloud: Gcloud, projectId: string, grant: PubsubGrant): Promise<Observation> {
+  const { kind, id, role, member } = grant;
+  const read = await gcloud(['pubsub', kind, 'get-iam-policy', id, `--project=${projectId}`, '--format=json']);
+  if (!succeeded(read)) return unknownRead(`the access policy of ${id}`, read);
+  const policy = parseJson(read.outcome.stdout, 'Pub/Sub access policy', INVALID_OUTPUT);
+  // gcloud omits an empty binding list.
+  const bindings = isRecord(policy) ? (policy.bindings ?? []) : undefined;
+  if (!Array.isArray(bindings)) throw new GwsEaError(INVALID_OUTPUT, 'Pub/Sub access policy is invalid');
+  const list: unknown[] = bindings;
+  const granted = list.some((binding) => {
+    if (!isRecord(binding) || binding.role !== role || !Array.isArray(binding.members)) return false;
+    const members: unknown[] = binding.members;
+    return members.includes(member);
+  });
+  return granted ? PRESENT : ABSENT;
+}
+
+function addGrant(gcloud: Gcloud, projectId: string, { kind, id, role, member }: PubsubGrant): Promise<Ran> {
+  return gcloud([
+    'pubsub',
+    kind,
+    'add-iam-policy-binding',
+    id,
+    `--member=${member}`,
+    `--role=${role}`,
+    `--project=${projectId}`,
+  ]);
+}
+
+/**
+ * The organization constraint that refused a change: the one Google names, or
+ * domain restricted sharing, which Google documents by its wording alone.
+ */
+function refusingConstraint({ outcome }: Ran): string | undefined {
+  if (classifyGcloudFailure(outcome) !== 'precondition') return undefined;
+  const named = /\bconstraints\/([\w.]+)/u.exec(outcome.stderr)?.[1];
+  if (named) return named;
+  return DOMAIN_RESTRICTED_SHARING.test(outcome.stderr) ? DOMAIN_RESTRICTED_SHARING_CONSTRAINT : undefined;
+}
+
+/** Google Chat may publish to the topic; this step lets no one else. */
+function publisherResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
+  const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  const grant: PubsubGrant = {
+    kind: 'topics',
+    id: GCHAT_EVENTS_TOPIC_ID,
+    role: PUBLISHER_ROLE,
+    member: GCHAT_PUBLISHER,
+  };
+  return {
+    name: 'the publisher grant on the topic',
+    observe: (context) => observeGrant(gcloud(context), context.input.gcp.projectId, grant),
+    apply: async (context) => {
+      const { projectId } = context.input.gcp;
+      const granted = await addGrant(gcloud(context), projectId, grant);
+      if (succeeded(granted)) return undefined;
+      const topic = deriveGchatEventsTopic(projectId);
+      const constraint = refusingConstraint(granted);
+      if (constraint) {
+        throw gcloudFailed(
+          `An organization policy (constraints/${constraint}) refuses to let Google Chat publish to ${topic}. An organization policy administrator must allow ${GCHAT_PUBLISHER} under it for project ${projectId}, then resume.`,
+          granted,
+          'gcp_publisher_grant_refused',
+        );
+      }
+      throw gcloudFailed(`Google Cloud could not let Google Chat publish to ${topic}`, granted);
+    },
+  };
+}
+
+/**
+ * The subscriber account may pull the one subscription and do nothing else.
+ * Google documents that an account it just created may take 60 seconds or
+ * more to become usable; until then it refuses a grant to it as an account
+ * that does not exist, naming it.
+ */
+function subscriberResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
+  const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  const grant = (gcp: GcpProjectInput): PubsubGrant => ({
+    kind: 'subscriptions',
+    id: GCHAT_EVENTS_SUBSCRIPTION_ID,
+    role: SUBSCRIBER_ROLE,
+    member: `serviceAccount:${gcp.serviceAccountEmail}`,
+  });
+  return {
+    name: "the subscriber's grant on the subscription",
+    observe: (context) => observeGrant(gcloud(context), context.input.gcp.projectId, grant(context.input.gcp)),
+    apply: async (context) => {
+      const gcp = context.input.gcp;
+      const unknownAccount = (attempt: Ran): boolean =>
+        !succeeded(attempt) &&
+        /\b(?:INVALID_ARGUMENT|NOT_FOUND)\b/u.test(attempt.outcome.stderr) &&
+        attempt.outcome.stderr.includes(gcp.serviceAccountEmail);
+      const granted = await retryWhile(
+        () => addGrant(gcloud(context), gcp.projectId, grant(gcp)),
+        unknownAccount,
+        IAM_SETTLES_MS,
+        'Waiting for Google Cloud to make the new service account usable…',
+        dependencies,
+      );
+      if (!succeeded(granted)) {
+        const within = unknownAccount(granted) ? ` within ${minutes(IAM_SETTLES_MS)}` : '';
+        throw gcloudFailed(
+          `Google Cloud could not let ${gcp.serviceAccountEmail} pull ${deriveGchatEventsSubscription(gcp.projectId)}${within}`,
+          granted,
+        );
+      }
+      return undefined;
+    },
+  };
+}
+
+/**
+ * `provision_gcp`'s resources, in order: Pub/Sub needs billing, and each
+ * grant needs what it grants on. The project is the one resource created on
+ * an unknown observation, under the instance's own ID. A lifted key-creation
+ * policy is restored last, once the key exists, including a lift an
+ * interrupted run left behind.
+ */
 export function googleCloudResources(dependencies: GcloudDependencies = {}): readonly StepResource<GcpStepContext>[] {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
   return [
@@ -826,9 +1109,27 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
         return undefined;
       },
     },
+    billingResource(dependencies),
     enabledApisResource('the Google Cloud APIs', REQUIRED_APIS, dependencies),
+    pubsubResource(
+      'the Google Chat events topic',
+      'topics',
+      GCHAT_EVENTS_TOPIC_ID,
+      deriveGchatEventsTopic,
+      [],
+      dependencies,
+    ),
+    pubsubResource(
+      'the Google Chat events subscription',
+      'subscriptions',
+      GCHAT_EVENTS_SUBSCRIPTION_ID,
+      deriveGchatEventsSubscription,
+      [`--topic=${GCHAT_EVENTS_TOPIC_ID}`, ...SUBSCRIPTION_SETTINGS],
+      dependencies,
+    ),
+    publisherResource(dependencies),
     {
-      name: 'the Google Chat service account',
+      name: 'the Chat subscriber account',
       observe: async (context) => {
         const gcp = context.input.gcp;
         const read = await readServiceAccount(gcloud(context), gcp);
@@ -856,8 +1157,9 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
         return undefined;
       },
     },
+    subscriberResource(dependencies),
     {
-      name: 'the Google Chat credential',
+      name: 'the Chat subscriber key',
       observe: async (context) => {
         const gcp = context.input.gcp;
         const local = await readKeyFile(gcp.credentialFile, gcp);
@@ -876,7 +1178,7 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
       apply: (context) => replaceKey(context, dependencies),
     },
     {
-      name: 'the Google Chat key-creation policy',
+      name: 'the key-creation policy',
       observe: async ({ operation }) =>
         (await readProvisionJournal(operation.paths, operation.instanceId)).key_policy_lifted ? ABSENT : PRESENT,
       apply: (context) => restoreKeyCreationPolicy(context, dependencies),

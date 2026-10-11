@@ -1,13 +1,28 @@
 import type { GatewayApprovalRequest } from './gateway-providers/gateway-provider-registry.js';
 
 // Escape Markdown syntax instead of changing the displayed account or resource.
+// `<` and `>` become `‹` and `›`: a channel's own markup (a Chat mention
+// `<users/…>`, a link `<url|text>`) survives Markdown escapes.
 const safeMultiline = (text: string) =>
-  // eslint-disable-next-line no-control-regex -- strip control bytes from gateway-supplied display text
-  text.replace(/[\x00-\x09\x0b-\x1f]/g, ' ').replace(/[\\<>&`*_~[\]()]/g, '\\$&');
+  text
+    // eslint-disable-next-line no-control-regex -- strip control bytes from gateway-supplied display text
+    .replace(/[\x00-\x09\x0b-\x1f]/g, ' ')
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/[\\&`*_~[\]()]/g, '\\$&');
 
 const safe = (text: string) => safeMultiline(text.replace(/[\r\n]/g, ' '));
 
-/** One renderer for every gateway; no inference of business intent from HTTP methods. */
+/** A summary's resource as shown: an HTTP request's method, host, and path, never its query or fragment. */
+export function gatewayRequestResource(resource: string): string {
+  return /^(?:[A-Z]+ |https?:)/.test(resource) ? (resource.split(/[?#]/, 1)[0] ?? resource) : resource;
+}
+
+/**
+ * One renderer for every gateway; no inference of business intent from HTTP
+ * methods. A summary is shown in the assistant's voice, the request first: the
+ * assistant is the one asking, so the agent's name is not shown.
+ */
 export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { title: string; question: string } {
   if (request.displayFields !== undefined) {
     if (!Array.isArray(request.displayFields) || request.displayFields.length > 24)
@@ -52,14 +67,10 @@ export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { 
     throw new Error('Invalid gateway approval details');
   }
   const detailed = Boolean(summary.details?.length);
-  const resource = /^(?:[A-Z]+ |https?:)/.test(summary.resource)
-    ? summary.resource.split(/[?#]/, 1)[0]
-    : summary.resource;
   const lines = [
-    `*Agent:* ${safe(summary.agent)}`,
+    `*${detailed ? 'Where' : 'Resource'}:* ${safe(gatewayRequestResource(summary.resource))}`,
     ...(detailed ? [] : [`*Action:* ${safe(summary.action)}`]),
-    `*${detailed ? 'Where' : 'Resource'}:* ${safe(resource)}`,
-    ...(detailed ? [] : [`*Why approval:* ${safe(summary.reason)}`]),
+    ...(detailed ? [] : [`*Why I'm asking:* ${safe(summary.reason)}`]),
   ];
   for (const detail of summary.details ?? []) {
     if (
@@ -74,10 +85,10 @@ export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { 
     lines.push(`*${safe(detail.label)}:* ${safe(detail.value)}`);
   }
   const scope = detailed
-    ? 'Approve once to allow this action.'
-    : 'Approve allows this request once. It does not connect an account or change its permissions.';
+    ? 'Approving lets me do this once.'
+    : "Approving lets this one request through. It doesn't connect an account or change what I'm allowed to do.";
   return {
-    title: detailed ? safe(summary.action) : 'Approve external request',
+    title: detailed ? safe(summary.action) : 'May I make this request?',
     question: lines.join('\n').slice(0, 2600 - scope.length - 1) + '\n' + scope,
   };
 }

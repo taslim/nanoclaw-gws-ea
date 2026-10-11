@@ -6,13 +6,16 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent } from '../channels/adapter.js';
+import { ASSISTANT_SUB, CHAT_TOKEN } from '../modules/gws-ea-chat/testing/fake-chat-api.js';
+import { FakeChatDirectMessages } from '../modules/gws-ea-chat/testing/fake-chat-dm.js';
+import type { InstanceNclOptions } from './ncl.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
+  bindPrincipal,
   GWS_EA_WELCOME_INSTRUCTION,
   principalWelcomeEventId,
-  reconcilePrincipalDm,
-  type PrincipalCandidate,
-  type PrincipalDiscoveryDependencies,
+  type PrincipalBindingDependencies,
+  type PrincipalBindingResult,
 } from './principal.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
@@ -20,10 +23,23 @@ import { verifyPrincipalBinding } from './verify.js';
 
 // Waking main starts its container; these tests stop at the session's inbound queue.
 vi.mock('../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
+// The assistant's Chat token, as the host mints it from the assistant's sign-in.
+vi.mock('../modules/gws-ea-google/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/gws-ea-google/index.js')>()),
+  hostGoogleAccessToken: vi.fn(async () => CHAT_TOKEN),
+  assistantGoogleAccount: vi.fn(async () => ({ account: 'aya@example.com', sub: ASSISTANT_SUB })),
+}));
 
-const STARTED_AT = '2026-09-18T18:00:00.000Z';
-/** Binding order: bind, then the host's records and main's DM wiring, then the welcome. */
-const BIND_ORDER = ['user', 'bind', 'role:owner', 'member', 'wiring', 'bootstrap'] as const;
+const CHAT_EMAIL = 'juno.hale@northwind.example';
+const VERIFIED_AT = '2026-09-18T18:05:00.000Z';
+const OPENED = {
+  status: 'opened',
+  user_id: 'gchat:users/2001',
+  platform_id: 'gchat:spaces/dm-2001',
+  messaging_group_id: 'mg-principal',
+} as const;
+/** Binding order: open the DM, bind, then the host's records and main's DM wiring, then the welcome. */
+const BIND_ORDER = ['open-dm', 'user', 'bind', 'role:owner', 'member', 'wiring', 'bootstrap'] as const;
 
 function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): InstanceRuntimeConfig {
   const instanceId = '11111111-1111-4111-8111-111111111111';
@@ -31,7 +47,7 @@ function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): Instance
   const secrets = `${root}/secrets`;
   const project = `gws-ea-${instanceId.replaceAll('-', '')}`;
   return {
-    schema_version: 2,
+    schema_version: 3,
     instance_id: instanceId,
     install_id: instanceId.replaceAll('-', ''),
     instance_root: root,
@@ -39,17 +55,16 @@ function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): Instance
     state_root: `${root}/state`,
     node_path: '/usr/bin/node',
     home_directory: '/Users/operator',
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     agent_egress_network: `${project}-agent-egress`,
     onecli_project: project,
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: `${project}-gateway-1`,
     selected_provider: 'claude',
-    endpoint_url: 'https://aya.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
-      gchat_credentials: `${secrets}/gchat-service-account.json`,
+      gchat_subscriber_key: `${secrets}/gchat-subscriber-key.json`,
       onecli_runtime_api_key: `${secrets}/onecli-runtime-api-key`,
       onecli_admin_api_key: `${secrets}/onecli-admin-api-key`,
     },
@@ -57,75 +72,64 @@ function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): Instance
   };
 }
 
-function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    channel_type: 'gchat',
-    platform_id: 'gchat:spaces/dm-1',
-    instance: 'gchat-assistant',
-    user_id: 'gchat:users/1',
-    sender_name: 'Morgan',
-    sender_authenticated: 1,
-    sender_kind: 'human',
-    is_group: 0,
-    authenticated_message_id: 'spaces/dm-1/messages/1',
-    authenticated_message_at: '2026-09-18T18:01:00.000Z',
-    reason: 'no_agent_wired',
-    messaging_group_id: 'mg-1',
-    ...overrides,
-  };
-}
+const INPUT = { adapterInstance: 'gchat-assistant', chatEmail: CHAT_EMAIL, verifiedAt: VERIFIED_AT } as const;
 
 function harness(
-  rows: readonly unknown[],
+  dm: unknown = OPENED,
   mainAgentGroupId: string | null = 'ag-main',
 ): {
   order: string[];
-  dependencies: PrincipalDiscoveryDependencies;
+  dependencies: PrincipalBindingDependencies;
   runNcl: ReturnType<typeof vi.fn>;
   runCommand: ReturnType<typeof vi.fn>;
 } {
   const order: string[] = [];
-  const runNcl = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
-    const operation = `${args[0]} ${args[1]}`;
-    if (operation === 'gws-ea-profile get') {
-      return {
-        main_agent_group_id: mainAgentGroupId,
-        principal_display_name: 'Morgan',
-      };
-    }
-    if (operation === 'dropped-messages list') return rows;
-    const flag = (name: string) => args[args.indexOf(name) + 1];
-    if (operation === 'users create') {
-      order.push('user');
-      return { id: flag('--id'), kind: flag('--kind') };
-    }
-    if (operation === 'gws-ea-profile bind-principal') {
-      order.push('bind');
-      return {
-        user_id: flag('--user-id'),
-        verified_at: flag('--verified-at'),
-        messaging_group_id: flag('--messaging-group-id'),
-      };
-    }
-    if (operation === 'roles grant') {
-      order.push(`role:${flag('--role')}`);
-      return { user_id: flag('--user'), role: flag('--role'), agent_group_id: null };
-    }
-    if (operation === 'members add') {
-      order.push('member');
-      return { user_id: flag('--user'), agent_group_id: flag('--group') };
-    }
-    if (operation === 'wirings create') {
-      order.push('wiring');
-      return {
-        messaging_group_id: flag('--messaging-group-id'),
-        agent_group_id: flag('--agent-group-id'),
-        sender_scope: flag('--sender-scope'),
-        session_mode: flag('--session-mode'),
-      };
-    }
-    throw new Error(`Unexpected ncl call: ${args.join(' ')}`);
-  });
+  const runNcl = vi.fn(
+    async (_config: InstanceRuntimeConfig, args: readonly string[], _options?: InstanceNclOptions) => {
+      const operation = `${args[0]} ${args[1]}`;
+      if (operation === 'gws-ea-profile get') {
+        return {
+          main_agent_group_id: mainAgentGroupId,
+          principal_display_name: 'Juno Hale',
+        };
+      }
+      const flag = (name: string) => args[args.indexOf(name) + 1];
+      if (operation === 'gws-ea-chat open-principal-dm') {
+        order.push('open-dm');
+        return dm;
+      }
+      if (operation === 'users create') {
+        order.push('user');
+        return { id: flag('--id'), kind: flag('--kind') };
+      }
+      if (operation === 'gws-ea-profile bind-principal') {
+        order.push('bind');
+        return {
+          user_id: flag('--user-id'),
+          verified_at: flag('--verified-at'),
+          messaging_group_id: flag('--messaging-group-id'),
+        };
+      }
+      if (operation === 'roles grant') {
+        order.push(`role:${flag('--role')}`);
+        return { user_id: flag('--user'), role: flag('--role'), agent_group_id: null };
+      }
+      if (operation === 'members add') {
+        order.push('member');
+        return { user_id: flag('--user'), agent_group_id: flag('--group') };
+      }
+      if (operation === 'wirings create') {
+        order.push('wiring');
+        return {
+          messaging_group_id: flag('--messaging-group-id'),
+          agent_group_id: flag('--agent-group-id'),
+          sender_scope: flag('--sender-scope'),
+          session_mode: flag('--session-mode'),
+        };
+      }
+      throw new Error(`Unexpected ncl call: ${args.join(' ')}`);
+    },
+  );
   // The checkout's `init-first-agent` script, run as a child process.
   const runCommand = vi.fn(async () => {
     order.push('bootstrap');
@@ -134,121 +138,66 @@ function harness(
   return { order, dependencies: { runNcl, runCommand }, runNcl, runCommand };
 }
 
-describe('verified principal first-DM reconciliation', () => {
-  it('requires canonical main to be published before reading or binding candidates', async () => {
-    const h = harness([row()], null);
-    await expect(
-      reconcilePrincipalDm(
-        runtimeConfig(),
-        { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
-        h.dependencies,
-      ),
-    ).rejects.toThrow(/canonical main/i);
-    expect(h.runNcl).toHaveBeenCalledTimes(1);
+function nclArgs(runNcl: ReturnType<typeof vi.fn>, operation: string): readonly string[] {
+  const call = runNcl.mock.calls.find((candidate) => `${candidate[1][0]} ${candidate[1][1]}` === operation);
+  if (!call) throw new Error(`No ncl ${operation}`);
+  return call[1] as readonly string[];
+}
+
+describe('binding the principal through the DM the assistant opens', () => {
+  it('requires canonical main to be published before opening any DM', async () => {
+    const h = harness(OPENED, null);
+    await expect(bindPrincipal(runtimeConfig(), INPUT, h.dependencies)).rejects.toThrow(/canonical main/i);
+    expect(h.order).toEqual([]);
     expect(h.runCommand).not.toHaveBeenCalled();
   });
 
-  it('waits with zero candidates, persists and binds one, and requires exact selection with multiple', async () => {
-    const empty = harness([]);
-    await expect(
-      reconcilePrincipalDm(
-        runtimeConfig(),
-        { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
-        empty.dependencies,
-      ),
-    ).resolves.toEqual({ status: 'waiting' });
+  it('opens the named address and binds the person Google resolved, then wires main and welcomes them there', async () => {
+    const h = harness();
 
-    const sole = harness([row()]);
-    const persistSelection = vi.fn(
-      async (candidate: Parameters<NonNullable<PrincipalDiscoveryDependencies['persistSelection']>>[0]) => {
-        sole.order.push('persist');
-        return candidate;
+    const result = await bindPrincipal(runtimeConfig(), INPUT, h.dependencies);
+
+    expect(result).toEqual({
+      status: 'bound',
+      agentGroupId: 'ag-main',
+      principal: {
+        userId: 'gchat:users/2001',
+        messagingGroupId: 'mg-principal',
+        platformId: 'gchat:spaces/dm-2001',
+        boundAt: VERIFIED_AT,
       },
-    );
-    await expect(
-      reconcilePrincipalDm(
-        runtimeConfig(),
-        { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
-        { ...sole.dependencies, persistSelection },
-      ),
-    ).resolves.toMatchObject({ status: 'bound', candidate: { userId: 'gchat:users/1' } });
-    expect(persistSelection).toHaveBeenCalledWith(expect.objectContaining({ messagingGroupId: 'mg-1' }));
-    expect(sole.order).toEqual(['persist', ...BIND_ORDER]);
-
-    const multiple = harness([
-      row(),
-      row({ messaging_group_id: 'mg-2', platform_id: 'gchat:spaces/dm-2', user_id: 'gchat:users/2' }),
-    ]);
-    const result = await reconcilePrincipalDm(
-      runtimeConfig(),
-      { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
-      multiple.dependencies,
-    );
-    expect(result).toMatchObject({
-      status: 'selection-required',
-      candidates: [{ messagingGroupId: 'mg-1' }, { messagingGroupId: 'mg-2' }],
+      eventId: principalWelcomeEventId(runtimeConfig(), 'ag-main', { messagingGroupId: 'mg-principal' }),
     });
-    expect(multiple.order).toEqual([]);
-
-    await expect(
-      reconcilePrincipalDm(
-        runtimeConfig(),
-        {
-          adapterInstance: 'gchat-assistant',
-          provisioningStartedAt: STARTED_AT,
-          messagingGroupId: 'mg-not-present',
-        },
-        multiple.dependencies,
-      ),
-    ).rejects.toThrow(/not eligible/i);
-  });
-
-  it('filters group, bot, wrong-instance, stale, unverified, and malformed transport evidence', async () => {
-    const h = harness([
-      row({ messaging_group_id: 'mg-group', is_group: 1 }),
-      row({ messaging_group_id: 'mg-bot', sender_kind: 'bot' }),
-      row({ messaging_group_id: 'mg-wrong-instance', instance: 'gchat-other' }),
-      row({ messaging_group_id: 'mg-stale', authenticated_message_at: '2026-09-18T17:59:59.999Z' }),
-      row({ messaging_group_id: 'mg-unverified', sender_authenticated: 0 }),
-      row({ messaging_group_id: 'mg-content-only', authenticated_message_id: null }),
-      row({ messaging_group_id: 'mg-malformed-time', authenticated_message_at: '2026-09-18 18:01:00' }),
-      row(),
-    ]);
-    const result = await reconcilePrincipalDm(
-      runtimeConfig(),
-      { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT, messagingGroupId: 'mg-1' },
-      h.dependencies,
-    );
-    expect(result).toMatchObject({ status: 'bound', candidate: { messagingGroupId: 'mg-1' } });
     expect(h.order).toEqual(BIND_ORDER);
-  });
-
-  it('binds, then makes the host records and wiring, then bootstraps with one deterministic event ID', async () => {
-    const h = harness([row()]);
-    const dependencies = {
-      ...h.dependencies,
-      persistSelection: async (
-        candidate: Parameters<NonNullable<PrincipalDiscoveryDependencies['persistSelection']>>[0],
-      ) => {
-        h.order.push('persist');
-        return candidate;
-      },
-    };
-    const input = {
-      adapterInstance: 'gchat-assistant',
-      provisioningStartedAt: STARTED_AT,
-      messagingGroupId: 'mg-1',
-    } as const;
-    const first = await reconcilePrincipalDm(runtimeConfig(), input, dependencies);
-    const second = await reconcilePrincipalDm(runtimeConfig(), input, dependencies);
-    expect(first).toEqual(second);
-    expect(h.order).toEqual(['persist', ...BIND_ORDER, 'persist', ...BIND_ORDER]);
-    const wiring = h.runNcl.mock.calls.find((call) => call[1][0] === 'wirings')?.[1] as readonly string[];
-    expect(wiring).toEqual([
+    // One address, the one create named, with the time Google may take to answer.
+    expect(h.runNcl.mock.calls.filter((call) => call[1][0] === 'gws-ea-chat')).toEqual([
+      [runtimeConfig(), ['gws-ea-chat', 'open-principal-dm', '--email', CHAT_EMAIL], { timeoutMs: expect.any(Number) }],
+    ]);
+    expect(nclArgs(h.runNcl, 'users create')).toEqual([
+      'users',
+      'create',
+      '--id',
+      'gchat:users/2001',
+      '--kind',
+      'gchat',
+      '--display-name',
+      'Juno Hale',
+    ]);
+    expect(nclArgs(h.runNcl, 'gws-ea-profile bind-principal')).toEqual([
+      'gws-ea-profile',
+      'bind-principal',
+      '--user-id',
+      'gchat:users/2001',
+      '--verified-at',
+      VERIFIED_AT,
+      '--messaging-group-id',
+      'mg-principal',
+    ]);
+    expect(nclArgs(h.runNcl, 'wirings create')).toEqual([
       'wirings',
       'create',
       '--messaging-group-id',
-      'mg-1',
+      'mg-principal',
       '--agent-group-id',
       'ag-main',
       '--sender-scope',
@@ -265,11 +214,11 @@ describe('verified principal first-DM reconciliation', () => {
           '--channel',
           'gchat',
           '--user-id',
-          'gchat:users/1',
+          'gchat:users/2001',
           '--platform-id',
-          'gchat:spaces/dm-1',
+          'gchat:spaces/dm-2001',
           '--display-name',
-          'Morgan',
+          'Juno Hale',
           '--agent-group-id',
           'ag-main',
           '--role',
@@ -277,12 +226,67 @@ describe('verified principal first-DM reconciliation', () => {
           '--instance',
           'gchat-assistant',
           '--event-id',
-          (first as { eventId: string }).eventId,
+          (result as Extract<PrincipalBindingResult, { status: 'bound' }>).eventId,
           '--welcome',
           GWS_EA_WELCOME_INSTRUCTION,
         ],
       }),
     );
+  });
+
+  it.each([
+    ['a request the principal must accept', { status: 'awaiting_acceptance', space: 'spaces/dm-2001' }],
+    ['Google unavailable', { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' }],
+  ] as const)('reports %s, binding nothing', async (_label, answer) => {
+    const h = harness(answer);
+
+    await expect(bindPrincipal(runtimeConfig(), INPUT, h.dependencies)).resolves.toEqual(answer);
+    expect(h.order).toEqual(['open-dm']);
+    expect(h.runCommand).not.toHaveBeenCalled();
+  });
+
+  it('stops, binding nothing, when the host cannot open the DM with the address', async () => {
+    const h = harness();
+    const hostNcl = h.dependencies.runNcl!;
+    const runNcl: NonNullable<PrincipalBindingDependencies['runNcl']> = async (config, args, options) => {
+      if (args[0] === 'gws-ea-chat') {
+        throw new GwsEaError(
+          'ncl_failed',
+          `ncl ${args.join(' ')} failed: Google Chat cannot open a direct message with ${CHAT_EMAIL}: not found`,
+        );
+      }
+      return hostNcl(config, args, options);
+    };
+
+    await expect(bindPrincipal(runtimeConfig(), INPUT, { ...h.dependencies, runNcl })).rejects.toThrow(CHAT_EMAIL);
+    expect(h.order).toEqual([]);
+    expect(h.runCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['names the address rather than the numeric ID', { ...OPENED, user_id: `gchat:users/${CHAT_EMAIL}` }],
+    ['is in another channel', { ...OPENED, platform_id: 'slack:D123' }],
+    ['carries no conversation', { status: 'opened', user_id: 'gchat:users/2001', platform_id: 'gchat:spaces/dm-2001' }],
+  ])('refuses an opened DM that %s, binding nothing', async (_label, answer) => {
+    const h = harness(answer);
+
+    await expect(bindPrincipal(runtimeConfig(), INPUT, h.dependencies)).rejects.toMatchObject({
+      code: 'invalid_child_output',
+    });
+    expect(h.order).toEqual(['open-dm']);
+  });
+
+  it('fails without bootstrapping when the host does not confirm the principal wiring', async () => {
+    const h = harness();
+    const hostNcl = h.dependencies.runNcl!;
+    const runNcl: NonNullable<PrincipalBindingDependencies['runNcl']> = async (config, args, options) =>
+      args[0] === 'wirings'
+        ? { messaging_group_id: 'mg-principal', agent_group_id: 'ag-main', sender_scope: 'all', session_mode: 'shared' }
+        : hostNcl(config, args, options);
+    await expect(bindPrincipal(runtimeConfig(), INPUT, { ...h.dependencies, runNcl })).rejects.toThrow(
+      /wiring was not confirmed/,
+    );
+    expect(h.runCommand).not.toHaveBeenCalled();
   });
 
   it("runs main's own welcome for the principal, never NanoClaw's channel addendum", () => {
@@ -291,75 +295,15 @@ describe('verified principal first-DM reconciliation', () => {
     expect(GWS_EA_WELCOME_INSTRUCTION).not.toMatch(/addend|\/app\/skills/u);
   });
 
-  it('fails without bootstrapping when the host does not confirm the principal wiring', async () => {
-    const h = harness([row()]);
-    const hostNcl = h.dependencies.runNcl!;
-    const runNcl = async (config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> =>
-      args[0] === 'wirings'
-        ? { messaging_group_id: 'mg-1', agent_group_id: 'ag-main', sender_scope: 'all', session_mode: 'shared' }
-        : hostNcl(config, args);
-    await expect(
-      reconcilePrincipalDm(
-        runtimeConfig(),
-        { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT, messagingGroupId: 'mg-1' },
-        { ...h.dependencies, runNcl },
-      ),
-    ).rejects.toThrow(/wiring was not confirmed/);
-    expect(h.runCommand).not.toHaveBeenCalled();
-  });
-
-  it('uses the latest authenticated event when a second DM arrives after a binding crash', async () => {
-    const first = row();
-    const second = row({
-      authenticated_message_id: 'spaces/dm-1/messages/2',
-      authenticated_message_at: '2026-09-18T18:02:00.000Z',
-    });
-    const h = harness([first, second]);
-
-    const result = await reconcilePrincipalDm(
-      runtimeConfig(),
-      { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT, messagingGroupId: 'mg-1' },
-      h.dependencies,
-    );
-
-    expect(result).toMatchObject({
-      status: 'bound',
-      candidate: {
-        messagingGroupId: 'mg-1',
-        authenticatedMessageId: 'spaces/dm-1/messages/2',
-        authenticatedMessageAt: '2026-09-18T18:02:00.000Z',
-      },
-    });
-    const bindArgs = h.runNcl.mock.calls.find((call) => call[1][1] === 'bind-principal')?.[1] as readonly string[];
-    expect(bindArgs[bindArgs.indexOf('--verified-at') + 1]).toBe('2026-09-18T18:02:00.000Z');
-    expect(h.runCommand).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps one welcome identity when later messages replace discovery evidence', () => {
-    const first = {
-      messagingGroupId: 'mg-1',
-      platformId: 'gchat:spaces/dm-1',
-      userId: 'gchat:users/1',
-      senderName: 'Morgan',
-      authenticatedMessageId: 'spaces/dm-1/messages/1',
-      authenticatedMessageAt: '2026-09-18T18:01:00.000Z',
-    };
-    expect(
-      principalWelcomeEventId(runtimeConfig(), 'ag-main', {
-        ...first,
-        authenticatedMessageId: 'spaces/dm-1/messages/2',
-        authenticatedMessageAt: '2026-09-18T18:02:00.000Z',
-      }),
-    ).toBe(principalWelcomeEventId(runtimeConfig(), 'ag-main', first));
+  it('keeps one welcome identity per assistant, main, and conversation', () => {
+    const welcome = principalWelcomeEventId(runtimeConfig(), 'ag-main', { messagingGroupId: 'mg-principal' });
+    expect(principalWelcomeEventId(runtimeConfig(), 'ag-main', { messagingGroupId: 'mg-principal' })).toBe(welcome);
+    expect(principalWelcomeEventId(runtimeConfig(), 'ag-main', { messagingGroupId: 'mg-other' })).not.toBe(welcome);
   });
 
   it('executes the checked-out bootstrap script with the allowlisted instance environment', async () => {
-    const h = harness([row()]);
-    await reconcilePrincipalDm(
-      runtimeConfig(),
-      { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT, messagingGroupId: 'mg-1' },
-      h.dependencies,
-    );
+    const h = harness();
+    await bindPrincipal(runtimeConfig(), INPUT, h.dependencies);
     expect(h.runCommand).toHaveBeenCalledWith(
       expect.objectContaining({
         command: '/usr/bin/node',
@@ -372,20 +316,23 @@ describe('verified principal first-DM reconciliation', () => {
 });
 
 /**
- * The binding on real NanoClaw code: the principal's DM is routed by
- * the router into a checkout's central DB built by core migrations, every
- * `ncl` call goes through the host's dispatch, and the checkout's own
+ * The binding on real NanoClaw code: the host opens the principal's DM
+ * through its own `ncl` command against Google Chat faked at `fetch`, every
+ * `ncl` call goes through the host's dispatch into a checkout's central DB
+ * built by core migrations, and the checkout's own
  * `scripts/init-first-agent.ts` runs as a child process and hands its welcome
  * to the host's CLI socket.
  */
-describe('verified principal binding on a real instance', () => {
+describe('binding the principal on a real instance', () => {
   const originalCwd = process.cwd();
   const cleanups: Array<() => Promise<void>> = [];
-  const PLATFORM = 'gchat:spaces/principal-dm';
-  const USER = 'gchat:users/principal';
+  const PRINCIPAL_ID = '2001';
+  const USER = `gchat:users/${PRINCIPAL_ID}`;
+  const COLLEAGUE = 'users/3003';
 
   afterEach(async () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+    vi.unstubAllGlobals();
     process.chdir(originalCwd);
   });
 
@@ -401,10 +348,14 @@ describe('verified principal binding on a real instance', () => {
     await mkdir(path.join(root, 'state', 'data'), { recursive: true });
     await mkdir(checkout);
     await symlink(path.join('..', 'state', 'data'), path.join(checkout, 'data'));
-    // The checkout's own script and loader, as `reconcilePrincipalDm` runs them.
+    // The checkout's own script and loader, as `bindPrincipal` runs them.
     await symlink(path.join(CONTROL_PLANE_ROOT, 'scripts'), path.join(checkout, 'scripts'));
     await symlink(path.join(CONTROL_PLANE_ROOT, 'node_modules'), path.join(checkout, 'node_modules'));
     process.chdir(checkout);
+    // Google Chat, as the host's DM command reaches it.
+    const chat = new FakeChatDirectMessages();
+    chat.people.set(CHAT_EMAIL, { id: PRINCIPAL_ID });
+    vi.stubGlobal('fetch', chat.fetch);
     vi.resetModules();
     await import('../modules/index.js');
     await import('../cli/commands/index.js');
@@ -466,13 +417,34 @@ describe('verified principal binding on a real instance', () => {
       node_path: process.execPath,
       home_directory: os.homedir(),
     });
-    const provisioningStartedAt = new Date(Date.now() - 1_000).toISOString();
+    const provisioningStartedAt = new Date(Date.now() - 2_000).toISOString();
+    const verifiedAt = new Date(Date.now() - 1_000).toISOString();
     const database = () => new Database(path.join(checkout, 'data', 'v2.db'), { readonly: true });
+    /** A message in Google Chat, as the assistant's adapter routes it. */
+    const chatMessage = (platformId: string, sender: string, id: string) =>
+      routeInbound({
+        channelType: 'gchat',
+        instance: 'gchat',
+        platformId,
+        threadId: null,
+        message: {
+          id: `${platformId}/messages/${id}`,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ text: 'hello', senderId: sender, author: { userId: sender } }),
+          timestamp: new Date().toISOString(),
+          // The Chat SDK bridge marks a direct message as addressing the assistant.
+          isMention: true,
+          isGroup: false,
+          authenticatedSender: { userId: sender, displayName: 'Someone', kind: 'human' },
+        },
+      });
     return {
+      chat,
       checkout,
       config,
       provisioningStartedAt,
       runNcl,
+      chatMessage,
       /** Canonical main is published only once its identity is verified. */
       publishMain: () =>
         runNcl(config, [
@@ -483,36 +455,18 @@ describe('verified principal binding on a real instance', () => {
           '--assistant-workspace-email',
           'aya@example.com',
           '--principal-display-name',
-          'Principal',
+          'Juno Hale',
           '--principal-timezone',
           'UTC',
           '--main-agent-group-id',
           'ag-main',
         ]),
-      /** The principal's first message, authenticated by the Google Chat adapter. */
-      principalMessage: (options: { readonly platformId?: string; readonly isGroup?: boolean } = {}) =>
-        routeInbound({
-          channelType: 'gchat',
-          instance: 'gchat',
-          platformId: options.platformId ?? PLATFORM,
-          threadId: null,
-          message: {
-            id: `${options.platformId ?? PLATFORM}/messages/first`,
-            kind: 'chat-sdk',
-            content: JSON.stringify({
-              text: 'hello',
-              senderId: 'users/principal',
-              author: { userId: 'users/principal' },
-            }),
-            timestamp: new Date().toISOString(),
-            // The Chat SDK bridge marks a direct message as addressing the bot.
-            isMention: true,
-            isGroup: options.isGroup ?? false,
-            authenticatedSender: { userId: 'users/principal', displayName: 'Principal', kind: 'human' },
-          },
-        }),
-      reconcile: (dependencies: PrincipalDiscoveryDependencies = {}) =>
-        reconcilePrincipalDm(config, { adapterInstance: 'gchat', provisioningStartedAt }, { runNcl, ...dependencies }),
+      bind: (dependencies: PrincipalBindingDependencies = {}) =>
+        bindPrincipal(
+          config,
+          { adapterInstance: 'gchat', chatEmail: CHAT_EMAIL, verifiedAt },
+          { runNcl, ...dependencies },
+        ),
       /** Once the host has received `count` welcomes, every one of them has been routed. */
       settled: async (count: number) => {
         await vi.waitFor(() => expect(routed).toHaveLength(count));
@@ -553,18 +507,22 @@ describe('verified principal binding on a real instance', () => {
     };
   }
 
-  it('binds a routed DM through the host, welcomes it once, and verify finds the binding', async () => {
+  it('binds only the person behind the named address, welcomes them first in the DM the assistant opened, and routes their next message to main (AE7)', async () => {
     const instance = await runningInstance();
     await instance.publishMain();
-    await instance.principalMessage();
+    // A colleague writes to the assistant while it is being created.
+    await instance.chatMessage('gchat:spaces/dm-colleague', COLLEAGUE, 'colleague');
 
-    const result = await instance.reconcile();
+    const result = await instance.bind();
     await instance.settled(1);
 
-    expect(result).toMatchObject({ status: 'bound', agentGroupId: 'ag-main', candidate: { userId: USER } });
-    const { candidate, eventId } = result as { candidate: PrincipalCandidate; eventId: string };
+    expect(result).toMatchObject({ status: 'bound', agentGroupId: 'ag-main', principal: { userId: USER } });
+    const { principal, eventId } = result as Extract<PrincipalBindingResult, { status: 'bound' }>;
+    expect(instance.chat.setups()).toEqual([`users/${CHAT_EMAIL}`]);
+    expect(principal.platformId).toBe(`gchat:spaces/dm-${PRINCIPAL_ID}`);
+    expect(instance.rows('SELECT user_id FROM gws_ea_principal_users')).toEqual([{ user_id: USER }]);
     expect(instance.rows('SELECT user_id, messaging_group_id FROM user_dms')).toEqual([
-      { user_id: USER, messaging_group_id: candidate.messagingGroupId },
+      { user_id: USER, messaging_group_id: principal.messagingGroupId },
     ]);
     expect(instance.rows('SELECT user_id, role, agent_group_id FROM user_roles')).toEqual([
       { user_id: USER, role: 'owner', agent_group_id: null },
@@ -578,41 +536,46 @@ describe('verified principal binding on a real instance', () => {
       ),
     ).toEqual([
       {
-        messaging_group_id: candidate.messagingGroupId,
+        messaging_group_id: principal.messagingGroupId,
         agent_group_id: 'ag-main',
         sender_scope: 'known',
         session_mode: 'agent-shared',
       },
     ]);
+    // The welcome is the first message main has, in the conversation the assistant opened.
     expect(instance.mainInbound()).toEqual([`${eventId}:ag-main`]);
     expect(
       verifyPrincipalBinding({
         runtime: instance.config,
         adapterInstance: 'gchat',
         provisioningStartedAt: instance.provisioningStartedAt,
-        selectedCandidate: candidate,
       }),
-    ).toEqual({ status: 'matched', agentGroupId: 'ag-main', candidate, welcomeEventId: eventId });
+    ).toEqual({ status: 'matched', agentGroupId: 'ag-main', principal, welcomeEventId: eventId });
+
+    // The principal's next message reaches main through its wiring, raising no approval.
+    await instance.chatMessage(principal.platformId, `users/${PRINCIPAL_ID}`, 'reply');
+    expect(instance.mainInbound()).toEqual([`${eventId}:ag-main`, `${principal.platformId}/messages/reply:ag-main`]);
+    expect(instance.rows('SELECT * FROM pending_channel_approvals')).toEqual([]);
+    expect(instance.rows('SELECT * FROM pending_sender_approvals')).toEqual([]);
   }, 60_000);
 
   it('completes with one welcome after a crash between the profile bind and init-first-agent', async () => {
     const instance = await runningInstance();
     await instance.publishMain();
-    await instance.principalMessage();
     const crashAfterBind = async (config: InstanceRuntimeConfig, argv: readonly string[]): Promise<unknown> => {
       const data = await instance.runNcl(config, argv);
       if (argv[1] === 'bind-principal') throw new Error('The process died after binding the principal');
       return data;
     };
 
-    await expect(instance.reconcile({ runNcl: crashAfterBind })).rejects.toThrow('died after binding');
+    await expect(instance.bind({ runNcl: crashAfterBind })).rejects.toThrow('died after binding');
     expect(instance.rows('SELECT user_id FROM gws_ea_principal_users')).toEqual([{ user_id: USER }]);
     expect(instance.mainInbound()).toEqual([]);
 
-    const retried = await instance.reconcile();
+    const retried = await instance.bind();
     await instance.settled(1);
     // A second crash after the welcome was handed over, before the step recorded it.
-    const again = await instance.reconcile();
+    const again = await instance.bind();
     await instance.settled(2);
 
     expect(again).toEqual(retried);
@@ -622,14 +585,18 @@ describe('verified principal binding on a real instance', () => {
 
   it("fails the step when main's DM wiring has sender scope all, which canonical-main admission rejects", async () => {
     const instance = await runningInstance();
-    await instance.principalMessage();
-    const [dm] = instance.rows<{ id: string }>('SELECT id FROM messaging_groups WHERE platform_id = ?', PLATFORM);
+    const opened = (await instance.runNcl(instance.config, [
+      'gws-ea-chat',
+      'open-principal-dm',
+      '--email',
+      CHAT_EMAIL,
+    ])) as { messaging_group_id: string };
     // Wired before canonical main was published, so admission had nothing to hold it to.
     await instance.runNcl(instance.config, [
       'wirings',
       'create',
       '--messaging-group-id',
-      dm!.id,
+      opened.messaging_group_id,
       '--agent-group-id',
       'ag-main',
       '--sender-scope',
@@ -639,7 +606,7 @@ describe('verified principal binding on a real instance', () => {
     ]);
     await instance.publishMain();
 
-    await expect(instance.reconcile()).rejects.toMatchObject({
+    await expect(instance.bind()).rejects.toMatchObject({
       code: 'ncl_failed',
       message: expect.stringContaining("Canonical main wiring rejected: sender_scope must be 'known'"),
     });
@@ -647,44 +614,22 @@ describe('verified principal binding on a real instance', () => {
     expect(instance.mainInbound()).toEqual([]);
   }, 60_000);
 
-  it('fails the step without wiring main when the principal conversation is not a direct message', async () => {
+  it('pauses without binding while a principal outside the organization has not accepted the DM', async () => {
     const instance = await runningInstance();
+    instance.chat.people.set(CHAT_EMAIL, { id: PRINCIPAL_ID, external: true });
     await instance.publishMain();
-    await instance.principalMessage();
-    const discovered = (await instance.runNcl(instance.config, [
-      'dropped-messages',
-      'list',
-      '--channel-type',
-      'gchat',
-    ])) as Array<{ messaging_group_id: string }>;
-    const conversation = discovered[0]!.messaging_group_id;
-    // The recorded conversation is a group space, whatever the drop recorded.
-    const db = new Database(path.join(instance.checkout, 'data', 'v2.db'));
-    try {
-      db.prepare('UPDATE messaging_groups SET is_group = 1 WHERE id = ?').run(conversation);
-    } finally {
-      db.close();
-    }
 
-    await expect(instance.reconcile()).rejects.toMatchObject({
-      code: 'ncl_failed',
-      message: expect.stringContaining('requires a direct conversation'),
+    await expect(instance.bind()).resolves.toEqual({
+      status: 'awaiting_acceptance',
+      space: `spaces/dm-${PRINCIPAL_ID}`,
     });
-    await expect(
-      instance.runNcl(instance.config, [
-        'wirings',
-        'create',
-        '--messaging-group-id',
-        conversation,
-        '--agent-group-id',
-        'ag-main',
-        '--sender-scope',
-        'known',
-        '--session-mode',
-        'agent-shared',
-      ]),
-    ).rejects.toThrow('Canonical main wiring rejected: only direct messages are allowed');
+    expect(instance.rows('SELECT user_id FROM gws_ea_principal_users')).toEqual([]);
     expect(instance.rows('SELECT id FROM messaging_group_agents')).toEqual([]);
-    expect(instance.mainInbound()).toEqual([]);
+
+    instance.chat.accepted.add(PRINCIPAL_ID);
+    const bound = await instance.bind();
+    await instance.settled(1);
+    expect(bound).toMatchObject({ status: 'bound', principal: { userId: USER } });
+    expect(instance.mainInbound()).toEqual([`${(bound as { eventId: string }).eventId}:ag-main`]);
   }, 60_000);
 });

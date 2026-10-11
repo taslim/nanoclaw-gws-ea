@@ -12,6 +12,7 @@ import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import type { GoogleConnectionContext } from './google-connection.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
@@ -86,12 +87,10 @@ function reservation(instanceId = randomUUID()): InstanceReservationInput {
     release_track: 'dogfood',
     source_remote: PRIVATE_REMOTE,
     deployed_commit: 'a'.repeat(40),
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
-      gcp_project_id: 'assistant-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -100,7 +99,6 @@ function reservation(instanceId = randomUUID()): InstanceReservationInput {
 
 function setupAnswers() {
   return {
-    ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
@@ -125,8 +123,8 @@ function setupAnswers() {
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
+        principal_chat_email: 'principal@example.test',
       },
-      selected_messaging_group_id: null,
     },
   } as const;
 }
@@ -137,7 +135,6 @@ const PREREQUISITES: Prerequisites = {
   runningAsRoot: false,
   nodePath: process.execPath,
   dockerEndpoint: 'unix:///var/run/docker.sock',
-  rootlessDocker: false,
   account: 'operator@example.test',
 };
 
@@ -149,7 +146,7 @@ function createRuntime(): Partial<CliRuntime> {
       release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
     }),
     holdLoopbackPorts: async () => ({
-      ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+      ports: { onecli_app: 34_102, onecli_gateway: 34_103 },
       release: async () => undefined,
     }),
   };
@@ -158,15 +155,17 @@ function createRuntime(): Partial<CliRuntime> {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_dm_required',
-  message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+  code: 'principal_chat_request_pending',
+  message:
+    "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
+    'direct message as a request. Ask them to accept it in Google Chat, then resume.',
 };
 
 const CHAT_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'configure_channel',
   code: 'chat_configuration_required',
-  message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+  message: "Configure the Google Chat API for this assistant's project, then confirm it.",
   resumeFlag: '--chat-configured',
 };
 
@@ -174,7 +173,6 @@ const CHAT_PAUSE: ProvisionHumanPause = {
 function terminalPrompts(): InteractivePrompts {
   return {
     providerCredential: vi.fn(),
-    cloudflareAccountToken: vi.fn(),
     googleCloudSignIn: vi.fn(),
     googleAccount: vi.fn(),
     googleWorkspaceSignIn: vi.fn(),
@@ -228,6 +226,28 @@ describe('gws-ea usage', () => {
     expect(io.out[0]).toBe('Usage: gws-ea <command> [options]');
     expect(io.out.join('\n')).toContain('ncl --id <instance_id> -- <ncl arguments>');
     expect(io.out.join('\n')).toContain('logs --id <instance_id> [--errors] [--follow]');
+  });
+
+  it('names create and each of its options, and the one secret create and resume take', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+    const usage = io.out.indexOf(
+      '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
+    );
+    expect(
+      io.out.slice(usage, io.out.indexOf('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]')),
+    ).toEqual([
+      '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
+      '         [--assistant-first-name <name> --assistant-last-name <name>]',
+      '         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]',
+      '         [--principal-email <email>]...  (once per address the principal uses)',
+      '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
+      '         [--workspace-email <email>] [--provider <id>]',
+      "         Deploys this gws-ea's own release, which must be committed, clean, and on the track.",
+    ]);
+    expect(io.out).toContain('  create, resume: [--secrets-file <owner-only file under the config root>]');
+    expect(io.out).toContain('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
   });
 
   it('names update and each of its options', async () => {
@@ -393,6 +413,39 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(io.out.at(-1)).toMatch(/^Log: \S+progress\.log$/u);
   });
 
+  it('resumes with the billing account the operator chose, and refuses one that is no billing account ID', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const chosen: Array<string | undefined> = [];
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { interaction }) => {
+      chosen.push(interaction.decisions.billingAccount);
+      return { status: 'ready' };
+    };
+
+    const io = lines();
+    expect(
+      await runCli(['resume', '--id', input.instance_id, '--billing-account', '01A2B3-C4D5E6-F7A8B9'], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(chosen).toEqual(['01A2B3-C4D5E6-F7A8B9']);
+
+    const refused = lines();
+    expect(
+      await runCli(['resume', '--id', input.instance_id, '--billing-account', "01A2B3; echo 'hi'"], {
+        paths,
+        ...refused.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      }),
+    ).not.toBe(0);
+    expect(refused.err.join('\n')).toContain('--billing-account');
+    expect(chosen).toHaveLength(1);
+  });
+
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
@@ -435,7 +488,7 @@ describe('gws-ea stop summaries and exit codes', () => {
         prompts: { ...terminalPrompts(), attendPause: async () => ({ kind: 'stop' }) },
         advanceProvision: async (_operation, { runtime }) => {
           // A later runtime check runs after the step that paused, as before a real human pause.
-          await runStep(runtime, { id: 'establish_transport' }, async () => undefined);
+          await runStep(runtime, { id: 'start_nanoclaw' }, async () => undefined);
           return { status: 'paused', pause: CHAT_PAUSE };
         },
       }),
@@ -548,14 +601,14 @@ describe('gws-ea stop summaries and exit codes', () => {
       paths,
       input.instance_id,
       `advanceProvision: (_operation, { runtime }) =>
-        runStep(runtime, { id: 'establish_transport' }, async () => {
+        runStep(runtime, { id: 'connect_google' }, async () => {
           await ready();
           await new Promise((resolve) => setTimeout(resolve, 60_000));
         }),`,
     );
 
     expect(exitCode).toBe(130);
-    expect(progress).toMatch(/· interrupted at establish_transport \(SIGINT\)\n$/u);
+    expect(progress).toMatch(/· interrupted at connect_google \(SIGINT\)\n$/u);
     // The instance lock went with the process, so the next resume is not refused as busy.
     const operation = await acquireInstanceOperation(paths, input.instance_id);
     expect(operation).not.toBeNull();
@@ -573,7 +626,6 @@ describe('gws-ea stop summaries and exit codes', () => {
       `advanceProvision: async () => ({ status: 'paused', pause: JSON.parse(process.env.TEST_PAUSE) }),
         prompts: {
           providerCredential: ${unexpected},
-          cloudflareAccountToken: ${unexpected},
           googleCloudSignIn: ${unexpected},
           googleAccount: ${unexpected},
           attendPause: async (_pause, signal) => {
@@ -606,7 +658,6 @@ describe('gws-ea stop summaries and exit codes', () => {
       `advanceProvision: async () => ({ status: 'paused', pause: JSON.parse(process.env.TEST_PAUSE) }),
         prompts: {
           providerCredential: ${unexpected},
-          cloudflareAccountToken: ${unexpected},
           googleCloudSignIn: ${unexpected},
           googleAccount: ${unexpected},
           attendPause: async (_pause, signal) => {
@@ -919,22 +970,12 @@ describe('gws-ea secrets inputs', () => {
     expect(io.err.join('\n')).toMatch(/0600/u);
   });
 
-  it('uses supplied secrets without persisting them to the registry, journal, or logs', async () => {
+  it('uses a supplied secret without persisting it to the registry, journal, or logs', async () => {
     const paths = await testPaths();
     const providerSecret = `sk-ant-api03-${'p'.repeat(40)}`;
-    const cloudflareSecret = `cf-token-${'c'.repeat(40)}`;
     const secretsFile = path.join(paths.configRoot, 'secrets.env');
     await writeOwnerFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${providerSecret}\n`);
-    const accountId = 'a'.repeat(32);
-    const managedIngressSetup = {
-      discoverZones: vi.fn(async () => [
-        { accountId, accountName: 'Example', zoneId: 'b'.repeat(32), name: 'example.com', status: 'active' as const },
-      ]),
-      retainAccountToken: vi.fn(),
-      requireAccountToken: vi.fn(() => cloudflareSecret),
-      clearAccountToken: vi.fn(),
-    };
-    let collectedToken: string | undefined;
+    let collected: string | undefined;
     const io = lines();
 
     const exitCode = await runCli(
@@ -943,10 +984,8 @@ describe('gws-ea secrets inputs', () => {
         paths,
         ...io.runtime,
         ...createRuntime(),
-        environment: { GWS_EA_CLOUDFLARE_API_TOKEN: cloudflareSecret },
-        managedIngressSetup,
         collectCreateInputs: async (context) => {
-          collectedToken = context.secrets.get('cloudflareAccountToken');
+          collected = context.secrets.get('providerCredential');
           return setupAnswers();
         },
         advanceProvision: async (_operation, { interaction, runtime }) =>
@@ -955,64 +994,19 @@ describe('gws-ea secrets inputs', () => {
               providerId: 'claude',
               metadata: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
             });
-            const token = await interaction.requestCloudflareAccountToken({ accountId, reason: 'Repair' });
-            activeStep()?.write(`accidentally logged ${credential.value} and ${token}\n`);
+            activeStep()?.write(`accidentally logged ${credential.value}\n`);
             return { status: 'paused' as const, pause: DM_PAUSE };
           }),
       },
     );
 
     expect(exitCode).toBe(10);
-    expect(collectedToken).toBe(cloudflareSecret);
-    expect(managedIngressSetup.discoverZones).toHaveBeenCalledWith(cloudflareSecret);
+    expect(collected).toBe(providerSecret);
     const persisted = [...(await filesUnder(paths.stateRoot)), ...(await filesUnder(paths.configRoot))].filter(
       (file) => file !== secretsFile,
     );
     expect(persisted.some((file) => file.endsWith('progress.log'))).toBe(true);
-    for (const file of persisted) {
-      const contents = await readFile(file, 'utf8');
-      expect(contents, file).not.toContain(providerSecret);
-      expect(contents, file).not.toContain(cloudflareSecret);
-    }
-  });
-});
-
-describe('gws-ea run-scoped Cloudflare authority', () => {
-  function managedIngressSetup() {
-    return {
-      discoverZones: vi.fn(),
-      retainAccountToken: vi.fn(),
-      requireAccountToken: vi.fn(),
-      clearAccountToken: vi.fn(),
-    };
-  }
-
-  it.each([
-    ['create', 10],
-    ['resume', 10],
-    ['remove', 0],
-  ] as const)('is cleared when %s exits', async (command, exitCode) => {
-    const paths = await testPaths();
-    const session = managedIngressSetup();
-    const reserved = async (): Promise<string> => (await reserveInstance(paths, reservation())).instance_id;
-    const args =
-      command === 'create'
-        ? ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE]
-        : command === 'resume'
-          ? ['resume', '--id', await reserved()]
-          : ['remove', '--id', await reserved(), '--yes'];
-
-    expect(
-      await runCli(args, {
-        paths,
-        ...lines().runtime,
-        ...createRuntime(),
-        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
-        removeAssistant: async () => undefined,
-        managedIngressSetup: session,
-      }),
-    ).toBe(exitCode);
-    expect(session.clearAccountToken).toHaveBeenCalledOnce();
+    for (const file of persisted) expect(await readFile(file, 'utf8'), file).not.toContain(providerSecret);
   });
 
   it("redacts the secrets in an assistant's root from its run log", async () => {
@@ -1020,10 +1014,10 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
     const input = await reserveInstance(paths, reservation());
     const root = paths.instanceRoot(input.instance_id);
     // Values no redaction pattern knows: only their files name them secret.
-    const accountToken = `account-token-${randomUUID()}`;
+    const adminKey = `admin-key-${randomUUID()}`;
     const postgresPassword = randomUUID();
     for (const [file, secret] of [
-      [path.join(root, 'secrets', 'cloudflare-account-token'), accountToken],
+      [path.join(root, 'secrets', 'onecli-admin-api-key'), adminKey],
       [path.join(root, 'onecli', 'secrets', 'postgres-password'), postgresPassword],
     ] as const) {
       await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -1036,7 +1030,7 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
         paths,
         ...io.runtime,
         removeAssistant: async () => {
-          activeStep()?.write(`accidentally logged ${accountToken} and ${postgresPassword}\n`);
+          activeStep()?.write(`accidentally logged ${adminKey} and ${postgresPassword}\n`);
           return undefined;
         },
       }),
@@ -1046,29 +1040,6 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
       (await filesUnder(paths.instanceLogsRoot(input.instance_id))).map((file) => readFile(file, 'utf8')),
     );
     expect(logged.join('\n')).toContain(`accidentally logged ${REDACTED} and ${REDACTED}`);
-  });
-
-  it('is cleared when the run throws', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation());
-    const session = managedIngressSetup();
-    const crash = new Error('the failure loop crashed');
-
-    await expect(
-      runCli(['resume', '--id', input.instance_id], {
-        paths,
-        ...lines().runtime,
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision: async () => {
-          throw new GwsEaError('onecli_unhealthy', 'OneCLI did not become healthy');
-        },
-        onFailure: async () => {
-          throw crash;
-        },
-        managedIngressSetup: session,
-      }),
-    ).rejects.toBe(crash);
-    expect(session.clearAccountToken).toHaveBeenCalledOnce();
   });
 });
 
@@ -1236,13 +1207,6 @@ describe("gws-ea create and the principal's email addresses", () => {
     expect(io.err).toEqual([message, 'Run gws-ea --help for usage.']);
     expect(collectCreateInputs).not.toHaveBeenCalled();
     expect(await everythingUnder(paths)).toEqual(before);
-  });
-
-  it('names --principal-email in the usage, once per address', async () => {
-    const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    expect(io.out.join('\n')).toContain('[--principal-email <email>]...');
   });
 });
 
@@ -1417,7 +1381,6 @@ describe('gws-ea prerequisites', () => {
       ...lines().runtime,
       prompts: {
         providerCredential: vi.fn(),
-        cloudflareAccountToken: vi.fn(),
         googleCloudSignIn,
         googleAccount: vi.fn(),
         googleWorkspaceSignIn: vi.fn(),
@@ -1543,12 +1506,10 @@ function assistantReservation(port: number): InstanceReservationInput {
   const instanceId = randomUUID();
   return {
     ...reservation(instanceId),
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
-      gcp_project_id: `assistant-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@assistant-${port}.iam.gserviceaccount.com`,
       workspace_email: `assistant-${port}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -1786,7 +1747,7 @@ describe('gws-ea connect-google', () => {
     const { instanceId } = await createdGoogleAssistant(paths);
     const pause: ProvisionHumanPause = {
       kind: 'human-action',
-      phase: 'connect_google',
+      phase: 'sign_in_google',
       code: 'google_client_required',
       message: "Create the assistant's Google sign-in client.",
       resumeFlag: '--google-client-file <file>',

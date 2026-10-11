@@ -11,26 +11,30 @@ const summary = {
   reason: 'Policy requires approval',
 };
 
-it('shows action, resource, reason and one-request approval scope without query values', () => {
+it('asks as the assistant: the resource first, then the action and reason, and one-request scope, without query values', () => {
   const card = gatewayApprovalPresentation(request(summary));
-  expect(card.title).toBe('Approve external request');
-  expect(card.question).toContain('*Action:* Read external data');
-  expect(card.question).toContain('*Resource:* GET api.example.test/repos');
-  expect(card.question).toContain('*Why approval:* Policy requires approval');
-  expect(card.question).toContain('this request once');
+  expect(card.title).toBe('May I make this request?');
+  expect(card.question.split('\n')).toEqual([
+    '*Resource:* GET api.example.test/repos',
+    '*Action:* Read external data',
+    "*Why I'm asking:* Policy requires approval",
+    "Approving lets this one request through. It doesn't connect an account or change what I'm allowed to do.",
+  ]);
   expect(card.question).not.toContain('secret');
 });
 
-it('escapes supplied formatting and mentions, and bounds the card', () => {
+it('escapes supplied formatting, mentions, and links, and bounds the card', () => {
   const card = gatewayApprovalPresentation(
     request({
       ...summary,
-      agent: '<@everyone>\n*Admin*',
-      details: Array.from({ length: 6 }, () => ({ label: 'Detail', value: 'a'.repeat(600) })),
+      details: [
+        { label: 'To', value: '<users/all>\n*Admin* <https://evil.example|Approve>' },
+        ...Array.from({ length: 5 }, () => ({ label: 'Detail', value: 'a'.repeat(600) })),
+      ],
     }),
   );
-  expect(card.question).not.toContain('<@everyone>');
-  expect(card.question).not.toContain('*Admin*');
+  expect(card.question).not.toMatch(/<users\/all>|<https:/u);
+  expect(card.question).toContain('*To:* ‹users/all› \\*Admin\\* ‹https://evil.example|Approve›');
   expect(card.question.length).toBeLessThanOrEqual(2600);
 });
 

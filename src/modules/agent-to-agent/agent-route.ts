@@ -31,6 +31,7 @@ import { log } from '../../log.js';
 import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
 
 export { isSafeAttachmentName };
@@ -304,15 +305,20 @@ function parseMessageContent(contentStr: string): { text: string; files: string[
   }
 }
 
+/**
+ * The request for a held message, in the assistant's voice (KTD14): which of
+ * its agents it passes between first, then what the sending agent wrote and
+ * attached, each as one quoted line.
+ */
 function buildGateQuestion(sourceName: string, targetName: string, contentStr: string): string {
   const { text, files } = parseMessageContent(contentStr);
-  const body = text.length > GATE_CARD_BODY_MAX ? `${text.slice(0, GATE_CARD_BODY_MAX)}… (truncated)` : text;
-  const lines = [`Agent "${sourceName}" wants to send a message to "${targetName}":`, '', body];
-  if (files.length > 0) lines.push('', `Attachments: ${files.join(', ')}`);
-  lines.push(
-    '',
-    `Approve, Reject, or "Reject with reason…" to decline and then type a short reason I'll relay to "${sourceName}".`,
-  );
+  const lines = [
+    `From: ${quoted(sourceName, NAME_LIMIT)}`,
+    `To: ${quoted(targetName, NAME_LIMIT)}`,
+    `Message: ${quoted(text, GATE_CARD_BODY_MAX)}`,
+    ...(files.length > 0 ? [`Attachments: ${files.map((file) => quoted(file, NAME_LIMIT)).join(', ')}`] : []),
+    "I'd like to pass this message between my agents.",
+  ];
   return lines.join('\n');
 }
 

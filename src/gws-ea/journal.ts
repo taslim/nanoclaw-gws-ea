@@ -25,8 +25,6 @@ import {
   type ControlPlanePaths,
 } from './paths.js';
 import { admitInstanceCommand, type OperationIntent } from './operation.js';
-import type { PrincipalCandidate } from './principal.js';
-import { parsePrincipalCandidate } from './principal-selection.js';
 import { safeErrorCode, safeErrorMessage } from './redact.js';
 import {
   assertInstanceId,
@@ -44,7 +42,13 @@ import {
   type InstanceReservationInput,
   type ProvisionStepId,
 } from './types.js';
-import { hasControlCharacters, isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
+import {
+  hasControlCharacters,
+  isRecord,
+  normalizePrincipalEmail,
+  requireCanonicalTimestamp,
+  requireString,
+} from './validation.js';
 
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
 
@@ -53,21 +57,24 @@ export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
  * it when a launcher can no longer read a journal an earlier launcher wrote:
  * the steps, their order, or what a completed step promises changed. Contract
  * 2 added the assistant's Google sign-in (`connect_google`) before the
- * welcome.
+ * welcome. Contract 3 signs the assistant in (`sign_in_google`) and confirms
+ * the Chat configuration before the host starts, drops `establish_transport`
+ * because the host pulls Chat's events, and binds the principal through the
+ * DM the assistant opens with the address create named.
  */
-export const LAUNCHER_CONTRACT_VERSION = 2 as const;
+export const LAUNCHER_CONTRACT_VERSION = 3 as const;
 
 export interface JournalStep {
   readonly started_at: string;
   readonly completed_at?: string;
 }
 
-/** Human decisions supplied on re-entry. */
+/** Human decisions, fixed once made. */
 export interface JournalDecisions {
-  /** `--chat-configured`: the operator finished the Google Chat app configuration. */
+  /** `--chat-configured`: the operator finished the Google Chat API configuration. */
   readonly chat_configuration_confirmed_at?: string;
-  /** The principal conversation, fixed once chosen. */
-  readonly principal?: PrincipalCandidate;
+  /** The address the principal uses for Google Chat, as create named it: the one the assistant opens its DM with. */
+  readonly principal_chat_email?: string;
 }
 
 export interface JournalError {
@@ -135,13 +142,21 @@ function parseSteps(value: unknown): ProvisionJournal['steps'] {
   return steps;
 }
 
+function principalChatEmail(value: unknown): string {
+  const email = typeof value === 'string' ? normalizePrincipalEmail(value) : undefined;
+  if (email === undefined) throw invalid("Provision journal principal's Chat address is invalid");
+  return email;
+}
+
 function parseDecisions(value: unknown): JournalDecisions {
   if (!isRecord(value)) throw invalid('Provision journal decisions are invalid');
   return {
     ...(value.chat_configuration_confirmed_at === undefined
       ? {}
       : { chat_configuration_confirmed_at: timestamp(value.chat_configuration_confirmed_at, 'Chat confirmation') }),
-    ...(value.principal === undefined ? {} : { principal: parsePrincipalCandidate(value.principal) }),
+    ...(value.principal_chat_email === undefined
+      ? {}
+      : { principal_chat_email: principalChatEmail(value.principal_chat_email) }),
   };
 }
 
@@ -370,21 +385,22 @@ export function recordChatConfigurationConfirmed(operation: InstanceOperation): 
   );
 }
 
-/** Fix the principal conversation; a different later choice is refused. */
-export function recordPrincipalSelection(
-  operation: InstanceOperation,
-  candidate: PrincipalCandidate,
-): Promise<ProvisionJournal> {
-  const selected = parsePrincipalCandidate(candidate);
+/**
+ * Fix the address the principal uses for Google Chat, as create named it, so
+ * the bind step has it once create's setup file is gone; a different later
+ * address is refused.
+ */
+export function recordPrincipalChatAddress(operation: InstanceOperation, address: string): Promise<ProvisionJournal> {
+  const email = principalChatEmail(address);
   return updateProvisionJournal(operation, (journal) => {
-    const existing = journal.decisions.principal;
-    if (existing && JSON.stringify(existing) !== JSON.stringify(selected)) {
+    const existing = journal.decisions.principal_chat_email;
+    if (existing !== undefined && existing !== email) {
       throw new GwsEaError(
-        'principal_selection_mismatch',
-        'The principal selection is already fixed for this instance',
+        'principal_chat_address_mismatch',
+        "The principal's Google Chat address is already fixed for this instance",
       );
     }
-    return existing ? journal : { ...journal, decisions: { ...journal.decisions, principal: selected } };
+    return existing ? journal : { ...journal, decisions: { ...journal.decisions, principal_chat_email: email } };
   });
 }
 

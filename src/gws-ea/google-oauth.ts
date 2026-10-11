@@ -17,6 +17,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import {
   GOOGLE_GRANT_SCHEMA_VERSION,
   GOOGLE_SIGN_IN_SCOPES,
+  isGoogleAccountId,
   missingGoogleScopes,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
@@ -284,7 +285,11 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
   });
   const profile = await readJson(userinfo);
   const signedIn = isRecord(profile) && typeof profile.email === 'string' ? profile.email.toLowerCase() : undefined;
-  if (!userinfo.ok || signedIn === undefined) throw signInFailed('Google did not say which account signed in');
+  // The account's Google ID, by which Chat knows the assistant (`users/{sub}`).
+  const sub = isRecord(profile) && isGoogleAccountId(profile.sub) ? profile.sub : undefined;
+  if (!userinfo.ok || signedIn === undefined || sub === undefined) {
+    throw signInFailed('Google did not say which account signed in');
+  }
   if (signedIn !== account || !isRecord(profile) || profile.email_verified !== true) {
     throw new GwsEaError(
       'google_account_mismatch',
@@ -303,6 +308,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
   return {
     schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
     account,
+    sub,
     client_id: input.client.client_id,
     client_secret: input.client.client_secret,
     refresh_token: tokens.refresh_token,

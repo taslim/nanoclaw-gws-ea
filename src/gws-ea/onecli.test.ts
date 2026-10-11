@@ -57,7 +57,7 @@ const HOSTILE_AMBIENT: NodeJS.ProcessEnv = {
   ONECLI_API_KEY: 'ambient-secret',
   POSTGRES_PASSWORD: 'ambient-postgres',
   NANOCLAW_INSTALL_ID: 'victim',
-  GCHAT_CREDENTIALS: 'channel-secret',
+  GWS_EA_PROVIDER_CREDENTIAL: 'provider-secret',
 };
 const roots: string[] = [];
 

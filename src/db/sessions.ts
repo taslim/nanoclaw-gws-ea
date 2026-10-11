@@ -178,12 +178,14 @@ export async function deleteSession(id: string): Promise<void> {
  * Insert a pending question row. Idempotent: when delivery fails and retries,
  * the second attempt calls this with the same question_id — without `OR
  * IGNORE` that would throw UNIQUE and prevent the retry from reaching the
- * actual send step. Returns true if a new row was inserted.
+ * actual send step. Delivery refuses a question whose id anything else
+ * already holds before it gets here, so the only conflict left is that same
+ * row's earlier attempt. Returns true if a new row was inserted.
  */
 export async function createPendingQuestion(pq: PendingQuestion): Promise<boolean> {
   const result = await getDb().run(
-    `INSERT INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, created_at)
-       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @created_at)
+    `INSERT INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, question, options_json, deadline, created_at)
+       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @question, @options_json, @deadline, @created_at)
        ON CONFLICT (question_id) DO NOTHING`,
     {
       question_id: pq.question_id,
@@ -193,7 +195,9 @@ export async function createPendingQuestion(pq: PendingQuestion): Promise<boolea
       channel_type: pq.channel_type,
       thread_id: pq.thread_id,
       title: pq.title,
+      question: pq.question,
       options_json: JSON.stringify(pq.options),
+      deadline: pq.deadline,
       created_at: pq.created_at,
     },
   );
@@ -212,6 +216,11 @@ export async function getPendingQuestion(questionId: string): Promise<PendingQue
 
 export async function deletePendingQuestion(questionId: string): Promise<void> {
   await getDb().run('DELETE FROM pending_questions WHERE question_id = ?', questionId);
+}
+
+/** A session's questions, once nothing in it waits for their answers. */
+export async function deletePendingQuestionsForSession(sessionId: string): Promise<void> {
+  await getDb().run('DELETE FROM pending_questions WHERE session_id = ?', sessionId);
 }
 
 // ── Pending Approvals ──
@@ -310,7 +319,9 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
  * Resolve ask_question render metadata for any card. Approval-backed rows
  * include the original question body so the bridge can retain it when the
  * card resolves; generic pending_questions intentionally keep their existing
- * title + options shape.
+ * title + options shape, with the deadline past which they take no answer.
+ * An approval whose status is no longer pending is resolved. Each render says
+ * whether an agent asked it (a pending question) or it is an approval.
  */
 export async function getAskQuestionRender(id: string): Promise<
   | {
@@ -318,21 +329,35 @@ export async function getAskQuestionRender(id: string): Promise<
       question?: string;
       options: import('../channels/ask-question.js').NormalizedOption[];
       deferResolution?: boolean;
+      expiresAt?: string;
+      resolved?: boolean;
+      kind: 'question' | 'approval';
     }
   | undefined
 > {
   const q = await getPendingQuestion(id);
-  if (q) return { title: q.title, options: q.options };
-  const a = await getDb().get<{ title: string; question: string; options_json: string; action: string }>(
-    'SELECT title, question, options_json, action FROM pending_approvals WHERE approval_id = ?',
+  if (q)
+    return { title: q.title, kind: 'question', options: q.options, ...(q.deadline ? { expiresAt: q.deadline } : {}) };
+  const a = await getDb().get<{
+    title: string;
+    question: string;
+    options_json: string;
+    action: string;
+    status: PendingApproval['status'];
+    expires_at: string | null;
+  }>(
+    'SELECT title, question, options_json, action, status, expires_at FROM pending_approvals WHERE approval_id = ?',
     id,
   );
   if (a?.title)
     return {
       title: a.title,
+      kind: 'approval',
       question: a.question,
       options: JSON.parse(a.options_json),
       ...(a.action === 'gateway_request' ? { deferResolution: true } : {}),
+      ...(a.status === 'pending' ? {} : { resolved: true }),
+      ...(a.status === 'pending' && a.expires_at ? { expiresAt: a.expires_at } : {}),
     };
 
   // Channel-registration + unknown-sender approvals persist the same render
@@ -342,7 +367,8 @@ export async function getAskQuestionRender(id: string): Promise<
       'SELECT title, question, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?',
       id,
     );
-    if (c?.title) return { title: c.title, question: c.question, options: JSON.parse(c.options_json) };
+    if (c?.title)
+      return { title: c.title, kind: 'approval', question: c.question, options: JSON.parse(c.options_json) };
   }
 
   if (await hasTable(getDb(), 'pending_sender_approvals')) {
@@ -350,7 +376,8 @@ export async function getAskQuestionRender(id: string): Promise<
       'SELECT title, question, options_json FROM pending_sender_approvals WHERE id = ?',
       id,
     );
-    if (s?.title) return { title: s.title, question: s.question, options: JSON.parse(s.options_json) };
+    if (s?.title)
+      return { title: s.title, kind: 'approval', question: s.question, options: JSON.parse(s.options_json) };
   }
 
   return undefined;

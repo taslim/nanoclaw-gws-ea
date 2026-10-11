@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { deriveGcpClaims } from './gcp-identity.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths } from './paths.js';
 
@@ -540,12 +541,10 @@ describe("an assistant's own service coordinates", () => {
       release_track: 'dogfood',
       source_remote: 'https://example.test/nanoclaw.git',
       deployed_commit: 'a'.repeat(40),
-      allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+      allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
       exclusive_resource_claims: {
-        ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
-        gcp_project_id: 'assistant-project',
+        ...deriveGcpClaims(instanceId),
         gcp_account: 'operator@example.test',
-        gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
         workspace_email: 'assistant@example.test',
         onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
       },

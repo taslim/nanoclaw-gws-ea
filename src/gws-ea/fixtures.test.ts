@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
+import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcp-identity.js';
 
 /**
  * The committed-fixture scan: a recording may carry an identifying or
@@ -68,7 +68,7 @@ const RULES: readonly Rule[] = [
     reserved: ([match]) => zeroFilledUuid(match),
   },
   {
-    // 32 or more: Cloudflare account, zone, and record IDs as well as 40-hex key IDs and commits.
+    // 32 or more: install IDs as well as 40-hex key IDs and commits.
     name: 'long hex string',
     pattern: /(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])/giu,
     reserved: ([match]) => zeroFilled(match),
@@ -151,7 +151,7 @@ describe('fixture scan', () => {
     ],
     ['a UUID', '"id": "123e4567-e89b-12d3-a456-426614174000"', 'UUID'],
     ['a 40-hex key ID', '"private_key_id": "3e28af43e476702724501d5efc04c79127df1958"', 'long hex string'],
-    ['a 32-hex Cloudflare account ID', '"account_id": "9a7806061c88ada191ed06f989cc3dac"', 'long hex string'],
+    ['a 32-hex install ID', 'NANOCLAW_INSTALL_ID=9a7806061c88ada191ed06f989cc3dac', 'long hex string'],
     ['a macOS home path', 'unix:///Users/jane/.docker/run/docker.sock', 'home path'],
     ['a Linux home path', '/home/jane/.config/gcloud', 'home path'],
     ['a macOS home path for the reserved user name', '/Users/operator/.docker', 'home path'],
@@ -180,7 +180,7 @@ describe('fixture scan', () => {
   it.each([
     ['a zero-filled UUID', '"id": "00000000-0000-0000-0000-000000000000"'],
     ['the reserved instance ID', `"instance_id": "${RESERVED_INSTANCE_ID}"`],
-    ['a zero-filled UUID with an ordinal', '"tunnel_id": "00000000-0000-4000-8000-000000000002"'],
+    ['a zero-filled UUID with an ordinal', '"instance_id": "00000000-0000-4000-8000-000000000002"'],
     ['a zero-filled hex ID', `"zone_id": "${'0'.repeat(32)}"`],
     ['a zero-filled digest', `meta/${'0'.repeat(64)}`],
     ['an example.com address', 'operator@example.com'],

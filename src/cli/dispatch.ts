@@ -18,6 +18,7 @@ import { getMessagingGroupAgentByPair } from '../db/messaging-groups.js';
 import { getSession } from '../db/sessions.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
+import { escapeInvisibles } from '../modules/approvals/request-text.js';
 import type { PendingApproval } from '../types.js';
 import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 import { localizeIsoTimestamps } from './format.js';
@@ -152,14 +153,17 @@ export async function dispatch(
     const argSummary = Object.entries(req.args)
       .map(([k, v]) => `--${k} ${v}`)
       .join(' ');
+    // The exact command first, in a code span no argument can close or break onto another line.
+    const command = escapeInvisibles(`ncl ${req.command}${argSummary ? ' ' + argSummary : ''}`);
 
     await requestApproval({
       session,
       agentName,
       action: 'cli_command',
       payload: { frame: { id: req.id, command: req.command, args: req.args }, callerContext: ctx },
-      title: `CLI: ${req.command}`,
-      question: `Agent "${agentName}" wants to run:\n\`ncl ${req.command}${argSummary ? ' ' + argSummary : ''}\``,
+      title: 'Run a command',
+      question: `\`${command}\`\nI'd like to run this command.`,
+      details: { facts: { command: `ncl ${req.command}` } },
     });
 
     return err(req.id, 'approval-pending', 'Approval request sent to admin. You will be notified of the result.');

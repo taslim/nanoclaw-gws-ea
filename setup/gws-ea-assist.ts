@@ -69,12 +69,7 @@ const STEP_SOURCES: Readonly<Record<string, readonly string[]>> = {
   start_onecli: ['src/gws-ea/onecli.ts', 'src/gws-ea/onecli-compose.ts', 'src/gws-ea/onecli-admin.ts'],
   configure_provider: ['src/gws-ea/onecli.ts', 'src/gws-ea/onecli-admin.ts'],
   start_nanoclaw: ['src/gws-ea/service.ts'],
-  establish_transport: [
-    'src/gws-ea/cloudflare-ingress.ts',
-    'src/gws-ea/cloudflare-connector.ts',
-    'src/gws-ea/endpoint.ts',
-  ],
-  configure_channel: ['src/gws-ea/chat-configuration.ts', 'src/gws-ea/endpoint.ts'],
+  configure_channel: ['src/gws-ea/chat-configuration.ts'],
   bind_principal: ['src/gws-ea/principal.ts'],
   verify_conversation: ['src/gws-ea/verify.ts'],
   inspect: ['src/gws-ea/remove.ts'],
@@ -164,8 +159,8 @@ function consentText(directory: string, files: readonly BundleFile[]): string {
     'Claude (Anthropic) receives, over the network:',
     "  - this run's progression log and the failing step's raw log, with secrets redacted",
     `  - ${sources.length} gws-ea source ${sources.length === 1 ? 'file' : 'files'}${sources.length ? `: ${sources.join(', ')}` : ''}`,
-    'They can include your Google account email; Google Cloud project, organization, and Cloudflare zone IDs;',
-    'hostnames; local paths; and Google Chat user IDs and display names.',
+    'They can include your Google account email; Google Cloud project and organization IDs; local paths;',
+    'and Google Chat user IDs and display names.',
     'Claude gets no tools, no MCP servers, and none of your secret environment variables. It runs nothing.',
     `Review the bundle first: ${directory}`,
   ].join('\n');
@@ -175,7 +170,7 @@ function prompt(report: FailureReport, files: readonly BundleFile[]): string {
   return redact(
     [
       'You are diagnosing a failed run of gws-ea, a CLI that provisions a Google Workspace executive assistant',
-      '(a NanoClaw instance) with gcloud, Cloudflare, Docker, OneCLI, and launchd or systemd.',
+      '(a NanoClaw instance) with gcloud, Docker, OneCLI, and launchd or systemd.',
       'You have no tools. Everything you know is below; the logs are redacted.',
       '',
       'Reply in at most 12 short lines: the most likely cause, grounded in the logs, and what the operator should',

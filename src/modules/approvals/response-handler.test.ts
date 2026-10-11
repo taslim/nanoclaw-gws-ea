@@ -11,6 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createSession, createPendingApproval, getPendingApproval } from '../../db/sessions.js';
+import { setDeliveryAdapter } from '../../delivery.js';
+import { normalizeOptions } from '../../channels/ask-question.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import Database from 'better-sqlite3';
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 
@@ -261,5 +265,131 @@ describe('approval response authorization', () => {
     });
     expect(handler).toHaveBeenCalledTimes(1);
     expect(await getPendingApproval('appr-4')).toBeUndefined();
+  });
+});
+
+describe('an answer on a channel that left the request as posted', () => {
+  // Text requests (and presentations that defer resolution) leave the request
+  // unchanged until the handler that authorizes an answer edits it to its
+  // outcome, addressed by question id in the conversation the answer came from.
+  const OPTIONS = normalizeOptions([
+    { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+    { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+    { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: 'reject_with_reason' },
+  ]);
+  const QUESTION = "I'd like to install ffmpeg to cut the video.";
+  let edits: Array<{ platformId: string; instance: string | undefined; content: Record<string, unknown> }>;
+
+  beforeEach(async () => {
+    edits = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, platformId, _threadId, _kind, content, _files, instance) {
+        edits.push({ platformId, instance, content: JSON.parse(content) as Record<string, unknown> });
+        return undefined;
+      },
+    });
+    await upsertUser({ id: 'gchat:users/2001', kind: 'gchat', display_name: 'Morgan Ellery', created_at: now() });
+    await createPendingApproval({
+      approval_id: 'appr-text',
+      session_id: 'sess-1',
+      request_id: 'appr-text',
+      action: 'install_packages_text',
+      payload: JSON.stringify({ packages: ['ffmpeg'] }),
+      created_at: now(),
+      title: 'Install packages',
+      question: QUESTION,
+      options_json: JSON.stringify(OPTIONS),
+      approver_user_id: 'gchat:users/2001',
+    });
+  });
+
+  function answer(value: string, userId: string, reason?: string) {
+    return {
+      questionId: 'appr-text',
+      value,
+      ...(reason === undefined ? {} : { reason }),
+      userId,
+      channelType: 'gchat',
+      instance: 'gchat',
+      messageId: 'spaces/AAAAjuno/messages/morgan.1',
+      platformId: 'gchat:spaces/AAAAjuno',
+      threadId: null,
+      deferResolution: true,
+    };
+  }
+
+  function outcomeEdit(resolution: string) {
+    return {
+      platformId: 'gchat:spaces/AAAAjuno',
+      instance: 'gchat',
+      content: {
+        operation: 'edit',
+        questionId: 'appr-text',
+        messageId: 'spaces/AAAAjuno/messages/morgan.1',
+        text: `Install packages\n\n${QUESTION}\n\n${resolution}`,
+        terminalCard: { title: 'Install packages', question: QUESTION, resolution },
+      },
+    };
+  }
+
+  function agentNotes(): string[] {
+    const db = new Database(inboundDbPath('ag-1', 'sess-1'), { readonly: true });
+    try {
+      return (db.prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{ content: string }>).map(
+        (row) => (JSON.parse(row.content) as { text: string }).text,
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  it('leaves the request open and unedited when someone other than its approver answers', async () => {
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const handler = vi.fn().mockResolvedValue(undefined);
+    registerApprovalHandler('install_packages_text', handler);
+
+    expect(await handleApprovalsResponse(answer('approve', 'users/3003'))).toBe(true);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(edits).toEqual([]);
+    expect((await getPendingApproval('appr-text'))?.status).toBe('pending');
+  });
+
+  it("edits the request to its outcome once its approver's answer is authorized, then applies it", async () => {
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const editsWhenApplied: number[] = [];
+    registerApprovalHandler('install_packages_text', async () => {
+      editsWhenApplied.push(edits.length);
+    });
+
+    expect(await handleApprovalsResponse(answer('approve', 'users/2001'))).toBe(true);
+
+    expect(edits).toEqual([outcomeEdit('✅ Approved')]);
+    expect(editsWhenApplied).toEqual([1]);
+    expect(await getPendingApproval('appr-text')).toBeUndefined();
+  });
+
+  it('rejects with the reason given after the no, and shows it in the outcome as quoted text', async () => {
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+
+    await handleApprovalsResponse(answer('reject', 'users/2001', 'too expensive, ask <users/all> "first" *today*'));
+
+    // How quoted text reads is request-text.test.ts's; here, that the outcome shows the reason that way.
+    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "too expensive, ask ‹users/all› 'first' \\*today\\*"`)]);
+    expect(agentNotes()).toEqual([
+      'Your install_packages_text request was rejected by admin: "too expensive, ask <users/all> "first" *today*"',
+    ]);
+    expect(await getPendingApproval('appr-text')).toBeUndefined();
+  });
+
+  it('leaves a card the channel already resolved alone', async () => {
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+
+    await handleApprovalsResponse({ ...answer('reject', 'users/2001'), deferResolution: undefined });
+
+    expect(edits).toEqual([]);
+    expect(await getPendingApproval('appr-text')).toBeUndefined();
   });
 });

@@ -5,8 +5,8 @@
  * The switch moves no state; a snapshot restore quarantines the state it
  * replaces and hands the host every person forgotten since the snapshot. Git,
  * tar, SQLite, and the files are real; the service manager, Docker and
- * OneCLI, `ps`, `lsof`, the release's scripts, the host's status and
- * listener, and `ncl` are faked at their boundaries (see
+ * OneCLI, `ps`, `lsof`, the release's scripts, the host's status and its
+ * Google Chat health, and `ncl` are faked at their boundaries (see
  * `testing/cutover-fixture.ts`).
  */
 import { mkdirSync, readlinkSync, writeFileSync } from 'node:fs';
@@ -349,10 +349,10 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
 
   it('goes back to the release it left with the state it had when the restored release fails its checks', async () => {
     const { host, runtime, next, state } = await migrated();
-    // The release it returns to never answers on its callback route.
+    // The release it returns to never receives Google Chat.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(host.first);
-      if (state.routeDown) void converse(runtime, 'written-by-the-restored-release');
+      state.chatDown = readlinkSync(root) === releaseName(host.first);
+      if (state.chatDown) void converse(runtime, 'written-by-the-restored-release');
     };
     const { run, err } = cli(host, state, next, runtime);
 
@@ -374,10 +374,10 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
   it('stays open going back when its return fails before the state it replaced is back, and rollback --id finishes it', async () => {
     const { host, runtime, next, state } = await migrated();
     const database = path.join(runtime.state_root, 'data', 'v2.db');
-    // The release it returns to never answers on its callback route, and once it ran, something holds its state open.
+    // The release it returns to never receives Google Chat, and once it ran, something holds its state open.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(host.first);
-      if (state.routeDown) state.openFiles = `p777\ncsqlite3\nf3\nn${database}\n`;
+      state.chatDown = readlinkSync(root) === releaseName(host.first);
+      if (state.chatDown) state.openFiles = `p777\ncsqlite3\nf3\nn${database}\n`;
     };
     const id = runtime.instance_id;
     const { run, err } = cli(host, state, next, runtime);
@@ -399,7 +399,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     expect(messages(path.join(quarantine, held!))).toEqual(['m1', 'm2']);
     state.openFiles = '';
     delete state.onStart;
-    delete state.routeDown;
+    delete state.chatDown;
     err.length = 0;
 
     expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
@@ -414,8 +414,8 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
 
   it('closes for fix-forward when going back fails too, and a newer update supersedes it', async () => {
     const { host, runtime, next, state } = await migrated();
-    // Neither release answers on its callback route.
-    state.routeDown = true;
+    // Neither release receives Google Chat.
+    state.chatDown = true;
     const id = runtime.instance_id;
     const { run, err } = cli(host, state, next, runtime);
 
@@ -427,7 +427,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
     expect(await run(['start', '--id', id])).toBe(1);
     const newer = await nextRelease(host);
-    delete state.routeDown;
+    delete state.chatDown;
 
     expect(await cli(host, state, newer, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
 
@@ -452,14 +452,14 @@ describe('a rollback closed for fix-forward with follow-ups left', GIT_HEAVY, ()
       { kind: 'reclaim_image', image_id: displaced },
     ]);
     // The rollback takes that follow-up over, then fails, and so does going back: it is closed for fix-forward.
-    state.routeDown = true;
+    state.chatDown = true;
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(1);
     expect(await readOperationRecord(host.paths, id)).toMatchObject({
       kind: 'rollback',
       closed: 'failed',
       follow_ups: [{ kind: 'reclaim_image', image_id: displaced }],
     });
-    delete state.routeDown;
+    delete state.chatDown;
     delete state.imageInUse;
     const newer = await nextRelease(host);
 
@@ -626,9 +626,9 @@ describe('a rollback killed at each phase', GIT_HEAVY, () => {
   it('killed while going back, finishes going back on the next rollback --id', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     await migratedByNext(runtime, 'm2');
-    // The release it returns to never answers on its callback route, so the rollback goes back.
+    // The release it returns to never receives Google Chat, so the rollback goes back.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(host.first);
+      state.chatDown = readlinkSync(root) === releaseName(host.first);
     };
     records.killReturning = true;
     await killRollback(host, runtime, state, next, {});

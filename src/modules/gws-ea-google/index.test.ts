@@ -1,24 +1,35 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
 import type { ContainerConfig } from '../../container-config.js';
 import { composeSessionSpec } from '../../container-runner.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getGatewayProvider } from '../../gateway-providers/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { loadMainAgentGroupId, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { HOME_FOLDER_ENV } from '../gws-ea-workspace/index.js';
-import { AGENT_GOOGLE_SERVICES, EXPOSED_GOOGLE_SERVICES, EXPOSED_GOOGLE_SKILLS } from './grant.js';
+import {
+  AGENT_GOOGLE_SERVICES,
+  EXPOSED_GOOGLE_SERVICES,
+  EXPOSED_GOOGLE_SKILLS,
+  GOOGLE_GRANT_FILE_ENV,
+  GOOGLE_SIGN_IN_SCOPES,
+  HOST_GOOGLE_SERVICES,
+} from './grant.js';
+import { GOOGLE_TOKEN_ENDPOINT } from './tokens.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 import '../capabilities/index.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-google-skills-test';
+const GRANT_FILE = path.join(TEST_ROOT, 'secrets', 'google-grant.json');
+const ASSISTANT_SUB = '104857395723948572901';
 const SKILLS_DIR = path.resolve('container', 'skills');
 const GOOGLE_KEYS = ['google-calendar', 'google-mail-read', 'google-directory', 'google-workspace'];
 
@@ -102,8 +113,8 @@ async function nameMain(agentGroupId: string): Promise<void> {
   });
 }
 
-/** The gog settings a spawn gives this group holding these capabilities, from the real composition. */
-function gogSettingsAtSpawn(capabilities: readonly string[], agentGroupId = 'ag-spawned'): Record<string, string> {
+/** Every setting a spawn gives this group holding these capabilities, from the real composition. */
+function envAtSpawn(capabilities: readonly string[], agentGroupId = 'ag-spawned'): Record<string, string> {
   const agent = composeSessionSpec({
     agentGroup: group(agentGroupId, agentGroupId),
     session: { id: 'session-1', agent_group_id: agentGroupId } as Session,
@@ -114,9 +125,67 @@ function gogSettingsAtSpawn(capabilities: readonly string[], agentGroupId = 'ag-
     contribution: {},
     gateway: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
   }).containers[0];
+  return { ...agent.env, ...agent.contributedEnv };
+}
+
+/** The gog settings a spawn gives this group holding these capabilities. */
+function gogSettingsAtSpawn(capabilities: readonly string[], agentGroupId = 'ag-spawned'): Record<string, string> {
   return Object.fromEntries(
-    Object.entries({ ...agent.env, ...agent.contributedEnv }).filter(([key]) => key.startsWith('GOG_')),
+    Object.entries(envAtSpawn(capabilities, agentGroupId)).filter(([key]) => key.startsWith('GOG_')),
   );
+}
+
+/** The assistant's grant, as the sign-in writes it into the instance's secrets. */
+function writeGrantFile(): void {
+  fs.mkdirSync(path.dirname(GRANT_FILE), { recursive: true, mode: 0o700 });
+  const grant = {
+    schema_version: 2,
+    account: 'juno@northwind.example',
+    sub: ASSISTANT_SUB,
+    client_id: 'client.apps.googleusercontent.com',
+    client_secret: 'GOCSPX-client-secret',
+    refresh_token: '1//refresh-token',
+    scopes: [...GOOGLE_SIGN_IN_SCOPES],
+    granted_at: '2026-10-10T09:00:00.000Z',
+  };
+  fs.writeFileSync(GRANT_FILE, JSON.stringify(grant), { mode: 0o600 });
+}
+
+/**
+ * This module as a starting host loads it, with `grantFile` as the host's
+ * grant path and Google's token endpoint answering every request with exactly
+ * the scopes asked: the token source is built as it loads, before any
+ * module's start. Returns the module, its host's start, and what Google was asked.
+ */
+async function loadAsHost(grantFile: string) {
+  vi.stubEnv(GOOGLE_GRANT_FILE_ENV, grantFile);
+  const asked: string[] = [];
+  const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    expect(String(input)).toBe(GOOGLE_TOKEN_ENDPOINT);
+    const scope = new URLSearchParams(String(init?.body)).get('scope') ?? '';
+    asked.push(scope);
+    return new Response(JSON.stringify({ access_token: `ya29.host-${asked.length}`, expires_in: 3599, scope }));
+  });
+  vi.stubGlobal('fetch', fetch);
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+  // The gateway this host runs: the test gateway, which stores no runtime credentials.
+  const gateway = getGatewayProvider();
+  vi.resetModules();
+  (await import('../../gateway-providers/index.js')).resetGatewayProvider(gateway);
+  const lifecycle = await import('../../host-lifecycle.js');
+  const google = await import('./index.js');
+  const start = async (): Promise<void> => {
+    const host = new AbortController();
+    onTestFinished(() => host.abort());
+    const deliveryAdapter = { deliver: async () => undefined };
+    for (const callback of lifecycle.getHostStartCallbacks()) {
+      await callback({ db: getDb(), deliveryAdapter, signal: host.signal });
+    }
+  };
+  return { google, start, asked, fetch };
 }
 
 /** A skill's SKILL.md, which it must ship, and its instructions.md when it has one. */
@@ -383,5 +452,70 @@ describe("gog's settings at spawn", () => {
     expect(gogSettingsAtSpawn(everythingElse)).toEqual({});
     expect(gogSettingsAtSpawn(everythingElse, 'ag-main')).toEqual({});
     expect(gogSettingsAtSpawn([])).toEqual({});
+  });
+});
+
+describe("the host's own Google tokens", () => {
+  it('mints a Chat token from the grant before any module starts, and while the gateway stores no credentials', async () => {
+    writeGrantFile();
+    const { google, start, asked } = await loadAsHost(GRANT_FILE);
+
+    await expect(google.hostGoogleAccessToken('chat')).resolves.toBe('ya29.host-1');
+    expect(asked).toEqual([HOST_GOOGLE_SERVICES.chat.scopes.join(' ')]);
+
+    expect(getGatewayProvider().credentials).toBeUndefined();
+    // Starting the host keeps the same source, so the token minted before it is still held.
+    await start();
+    await expect(google.hostGoogleAccessToken('chat')).resolves.toBe('ya29.host-1');
+  });
+
+  it("tells the host the assistant's account and its Google ID from the grant", async () => {
+    writeGrantFile();
+    const { google, fetch } = await loadAsHost(GRANT_FILE);
+
+    await expect(google.assistantGoogleAccount()).resolves.toEqual({
+      account: 'juno@northwind.example',
+      sub: ASSISTANT_SUB,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses on a host without a Google sign-in, asking Google nothing', async () => {
+    const { google, fetch } = await loadAsHost('');
+
+    await expect(google.hostGoogleAccessToken('chat')).rejects.toThrow(
+      'Google access is off on this host: it has no Google sign-in',
+    );
+    await expect(google.assistantGoogleAccount()).resolves.toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses until the sign-in writes the grant, then mints from it', async () => {
+    const { google, fetch } = await loadAsHost(GRANT_FILE);
+
+    await expect(google.hostGoogleAccessToken('chat')).rejects.toThrow(/not signed in to Google yet/);
+    await expect(google.assistantGoogleAccount()).resolves.toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+
+    writeGrantFile();
+    await expect(google.hostGoogleAccessToken('chat')).resolves.toBe('ya29.host-1');
+  });
+
+  it("keeps the grant's path out of every agent's container", async () => {
+    writeGrantFile();
+    vi.stubEnv(GOOGLE_GRANT_FILE_ENV, GRANT_FILE);
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+    await nameMain('ag-main');
+
+    for (const [capabilities, agentGroupId] of [
+      [resolveCapabilities('all', 'main'), 'ag-main'],
+      [resolveCapabilities('all', 'research'), 'ag-research'],
+    ] as const) {
+      const env = envAtSpawn(capabilities, agentGroupId);
+      expect(Object.keys(env).filter((key) => key.startsWith('GWS_EA_'))).toEqual([]);
+      expect(Object.values(env).filter((value) => value.includes('google-grant'))).toEqual([]);
+    }
   });
 });

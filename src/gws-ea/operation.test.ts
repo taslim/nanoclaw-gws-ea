@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance, type InstanceOperation } from './journal.js';
 import {
   advanceOperation,
@@ -55,12 +56,10 @@ function reservation(port: number): InstanceReservationInput {
   return {
     instance_id: instanceId,
     ...FROM,
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
-      gcp_project_id: `operation-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@operation-${port}.iam.gserviceaccount.com`,
       workspace_email: `assistant-${port}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

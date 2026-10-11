@@ -35,14 +35,14 @@ import { getResponseHandlers, type ResponsePayload } from './response-registry.j
 
 const hostAbortController = new AbortController();
 
+/**
+ * Hand an answer to the first handler that claims it. A handler that throws
+ * rejects the dispatch: the answer is not handled, and a channel that
+ * redelivers hands it over again.
+ */
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
-    try {
-      const claimed = await handler(payload);
-      if (claimed) return;
-    } catch (err) {
-      log.error('Response handler threw', { questionId: payload.questionId, err });
-    }
+    if (await handler(payload)) return;
   }
   log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
 }
@@ -124,6 +124,9 @@ async function main(): Promise<void> {
                 isMention: message.isMention,
                 isGroup: message.isGroup,
                 authenticatedSender: message.authenticatedSender,
+                deduplicate: message.deduplicate,
+                quiet: message.quiet,
+                reaction: message.reaction,
               },
             }),
           )
@@ -162,19 +165,28 @@ async function main(): Promise<void> {
           isGroup,
         });
       },
-      onAction(questionId, selectedOption, userId, address) {
-        dispatchResponse({
-          questionId,
-          value: selectedOption,
-          userId,
-          channelType: adapter.channelType,
-          instance: address?.instance ?? adapter.instance ?? adapter.channelType,
-          messageId: address?.messageId,
-          platformId: address?.platformId ?? '',
-          threadId: address?.threadId ?? null,
-        }).catch((err) => {
-          log.error('Failed to handle question response', { questionId, err });
-        });
+      // Like onInbound: an answer waits for inbound readiness, and the promise
+      // settles once its handler has, rejecting when the handler fails.
+      onAction(questionId, selectedOption, userId, address, answer) {
+        return inboundReady
+          .then(() =>
+            dispatchResponse({
+              questionId,
+              value: selectedOption,
+              reason: answer?.reason,
+              userId,
+              channelType: adapter.channelType,
+              instance: address?.instance ?? adapter.instance ?? adapter.channelType,
+              messageId: address?.messageId,
+              platformId: address?.platformId ?? '',
+              threadId: address?.threadId ?? null,
+              deferResolution: answer?.deferResolution,
+            }),
+          )
+          .catch((err: unknown) => {
+            log.error('Failed to handle question response', { questionId, err });
+            throw err;
+          });
       },
     };
   });

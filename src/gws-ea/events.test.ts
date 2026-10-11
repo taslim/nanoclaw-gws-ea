@@ -37,29 +37,10 @@ const PAUSE: ProvisionHumanPause = {
 
 const NO_SECRETS: SecretSource = { get: () => undefined };
 
-const ZONE = { accountName: 'Example', zoneId: 'b'.repeat(32), name: 'example.com', status: 'active' as const };
-
-function ingressSetup(accountId = 'a'.repeat(32)) {
-  let retained: string | undefined;
-  return {
-    discoverZones: vi.fn(async () => [{ ...ZONE, accountId }]),
-    retainAccountToken: vi.fn((token: string) => {
-      retained = token;
-    }),
-    requireAccountToken: vi.fn(() => {
-      if (!retained) throw new GwsEaError('cloudflare_token_required', 'Token required');
-      return retained;
-    }),
-  };
-}
-
 function prompts(overrides: Partial<InteractivePrompts> = {}): InteractivePrompts {
   return {
     providerCredential: vi.fn(async () => {
       throw new Error('unexpected provider prompt');
-    }),
-    cloudflareAccountToken: vi.fn(async () => {
-      throw new Error('unexpected Cloudflare prompt');
     }),
     googleCloudSignIn: vi.fn(async () => undefined),
     googleAccount: vi.fn(async () => {
@@ -163,13 +144,12 @@ describe('Interaction port', () => {
       kind: 'human-action',
       phase: 'configure_channel',
       code: 'chat_configuration_required',
-      message: 'Finish the Google Chat app configuration, then confirm it.',
+      message: "Configure the Google Chat API for this assistant's project, then confirm it.",
       resumeFlag: '--chat-configured',
     };
     const options = {
       decisions: { chatConfigured: false },
       secrets: { get: () => undefined },
-      managedIngressSetup: ingressSetup(),
     };
     const signal = new AbortController().signal;
 
@@ -197,7 +177,6 @@ describe('Interaction port', () => {
       secrets: { get: (name) => (name === 'providerCredential' ? 'sk-ant-api03-supplied' : undefined) },
       prompts: prompts(),
       terminal,
-      managedIngressSetup: ingressSetup(),
     });
 
     await expect(
@@ -227,7 +206,6 @@ describe('Interaction port', () => {
         },
       }),
       terminal: { suspend: () => order.push('suspend'), resume: () => order.push('resume') },
-      managedIngressSetup: ingressSetup(),
     });
 
     await interaction.requestProviderCredential({
@@ -239,39 +217,10 @@ describe('Interaction port', () => {
     expect(redact(`value ${secret}`)).toBe(`value ${REDACTED}`);
   });
 
-  it('verifies and retains a Cloudflare token for the reserved account', async () => {
-    const secret = `prompted-cloudflare-${Date.now()}`;
-    const setup = ingressSetup();
-    const cloudflareAccountToken = vi.fn(async () => secret);
-    const interaction = createInteraction({
-      decisions: { chatConfigured: false },
-      secrets: NO_SECRETS,
-      prompts: prompts({ cloudflareAccountToken }),
-      managedIngressSetup: setup,
-    });
-
-    await expect(
-      interaction.requestCloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'Listener drifted' }),
-    ).resolves.toBe(secret);
-    expect(cloudflareAccountToken).toHaveBeenCalledWith({ accountId: 'a'.repeat(32), reason: 'Listener drifted' });
-    expect(setup.retainAccountToken).toHaveBeenCalledWith(secret);
-    expect(redact(secret)).toBe(REDACTED);
-
-    const foreign = createInteraction({
-      decisions: { chatConfigured: false },
-      secrets: { get: () => 'token-for-another-account' },
-      managedIngressSetup: ingressSetup('f'.repeat(32)),
-    });
-    await expect(
-      foreign.requestCloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'Repair' }),
-    ).rejects.toMatchObject({ code: 'cloudflare_capability_missing' });
-  });
-
   it('pauses naming how to supply each input when no person can be asked', async () => {
     const interaction = createInteraction({
       decisions: { chatConfigured: false },
       secrets: NO_SECRETS,
-      managedIngressSetup: ingressSetup(),
     });
 
     const provider = await interaction
@@ -282,12 +231,6 @@ describe('Interaction port', () => {
       .catch((error: unknown) => error);
     expect(provider).toBeInstanceOf(PauseRequired);
     expect((provider as PauseRequired).instructions.join('\n')).toContain('GWS_EA_PROVIDER_CREDENTIAL');
-
-    const cloudflare = await interaction
-      .requestCloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'Repair' })
-      .catch((error: unknown) => error);
-    expect(cloudflare).toBeInstanceOf(PauseRequired);
-    expect((cloudflare as PauseRequired).instructions.join('\n')).toContain('GWS_EA_CLOUDFLARE_API_TOKEN');
 
     const signIn = await interaction.signInToGoogleCloud('operator@example.test').catch((error: unknown) => error);
     expect(signIn).toBeInstanceOf(PauseRequired);
@@ -328,7 +271,6 @@ describe('Interaction port', () => {
         },
       }),
       terminal: { suspend: () => order.push('suspend'), resume: () => order.push('resume') },
-      managedIngressSetup: ingressSetup(),
     });
 
     await expect(interaction.confirmGoogleAccount('operator@example.test')).resolves.toBe(false);
@@ -338,15 +280,14 @@ describe('Interaction port', () => {
   it('hands the terminal to a sign-in child', async () => {
     const order: string[] = [];
     const interaction = createInteraction({
-      decisions: { chatConfigured: true, messagingGroupId: 'gchat:spaces/AAA' },
+      decisions: { chatConfigured: true, billingAccount: '01A2B3-C4D5E6-F7A8B9' },
       secrets: NO_SECRETS,
       prompts: prompts({ googleCloudSignIn: async () => void order.push('sign-in') }),
       terminal: { suspend: () => order.push('suspend'), resume: () => order.push('resume') },
-      managedIngressSetup: ingressSetup(),
     });
 
     await interaction.signInToGoogleCloud('operator@example.test');
     expect(order).toEqual(['suspend', 'sign-in', 'resume']);
-    expect(interaction.decisions).toEqual({ chatConfigured: true, messagingGroupId: 'gchat:spaces/AAA' });
+    expect(interaction.decisions).toEqual({ chatConfigured: true, billingAccount: '01A2B3-C4D5E6-F7A8B9' });
   });
 });

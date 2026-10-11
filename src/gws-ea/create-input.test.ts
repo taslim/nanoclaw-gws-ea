@@ -4,7 +4,12 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadSecretSource, parsePrincipalEmailFlags } from './create-input.js';
+import {
+  CREATE_INPUT_FLAGS,
+  loadSecretSource,
+  parsePrincipalEmailFlags,
+  principalChatEmailProblem,
+} from './create-input.js';
 import { redact, REDACTED } from './redact.js';
 import { normalizePrincipalEmail } from './validation.js';
 
@@ -57,26 +62,45 @@ describe('principal email inputs', () => {
   });
 });
 
+describe("the principal's Google Chat address", () => {
+  const EMAILS = ['juno.hale@northwind.example', 'juno@hale.example'] as const;
+
+  it("takes one of the principal's addresses, in any spelling of it", () => {
+    expect(principalChatEmailProblem('Juno@Hale.example ', EMAILS)).toBeUndefined();
+    expect(principalChatEmailProblem(EMAILS[0], EMAILS)).toBeUndefined();
+  });
+
+  it.each(['remy.vance@northwind.example', 'not-an-email', ''])(
+    'refuses %j, naming the addresses it can be',
+    (value) => {
+      expect(principalChatEmailProblem(value, EMAILS)).toBe(
+        "Use one of the principal's addresses: juno.hale@northwind.example, juno@hale.example",
+      );
+    },
+  );
+
+  it('can be given as a create flag, so create runs without a person', () => {
+    expect(CREATE_INPUT_FLAGS).toContain('principal-chat-email');
+  });
+});
+
 describe('secret inputs', () => {
-  it('reads secrets from the environment first, then an owner-only file, and registers them', async () => {
+  it('reads a secret from the environment first, then an owner-only file, and registers it', async () => {
     const root = await configRoot();
     const fileSecret = `file-provider-${Date.now()}-secret`;
-    const file = await secretsFile(
-      root,
-      `# operator secrets\nGWS_EA_PROVIDER_CREDENTIAL="${fileSecret}"\nGWS_EA_CLOUDFLARE_API_TOKEN=from-file-token\n`,
-      0o400,
-    );
+    const file = await secretsFile(root, `# operator secrets\nGWS_EA_PROVIDER_CREDENTIAL="${fileSecret}"\n`, 0o400);
 
-    const source = await loadSecretSource({
-      environment: { GWS_EA_CLOUDFLARE_API_TOKEN: 'from-environment-token' },
+    const fromFile = await loadSecretSource({ environment: {}, file, configRoot: root });
+    const fromEnvironment = await loadSecretSource({
+      environment: { GWS_EA_PROVIDER_CREDENTIAL: 'from-environment-credential' },
       file,
       configRoot: root,
     });
 
-    expect(source.get('providerCredential')).toBe(fileSecret);
-    expect(source.get('cloudflareAccountToken')).toBe('from-environment-token');
+    expect(fromFile.get('providerCredential')).toBe(fileSecret);
+    expect(fromEnvironment.get('providerCredential')).toBe('from-environment-credential');
     expect(redact(fileSecret)).toBe(REDACTED);
-    expect(redact('from-environment-token')).toBe(REDACTED);
+    expect(redact('from-environment-credential')).toBe(REDACTED);
   });
 
   it('supplies nothing when neither source has a value', async () => {

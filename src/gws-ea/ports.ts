@@ -5,7 +5,7 @@ import { GwsEaError, type AllocatedPorts } from './types.js';
 
 export type AllocatedPortName = keyof AllocatedPorts;
 
-/** Three loopback ports, held until the reservation that claims them is written. */
+/** OneCLI's two loopback ports, held until the reservation that claims them is written. */
 export interface HeldLoopbackPorts {
   readonly ports: AllocatedPorts;
   release(): Promise<void>;
@@ -32,12 +32,12 @@ async function listenLoopback(server: Server): Promise<number> {
 }
 
 /**
- * Allocate three distinct loopback ports. They stay held until the caller
+ * Allocate two distinct loopback ports. They stay held until the caller
  * releases them after reserving; the registry's port claims keep them unique
  * among assistants from then on, and each runtime binds its own on start.
  */
 export async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
-  const servers = [createServer(), createServer(), createServer()] as const;
+  const servers = [createServer(), createServer()] as const;
   const release = async (): Promise<void> => {
     await Promise.all(servers.map(closeServer));
   };
@@ -48,11 +48,8 @@ export async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
     await release().catch(() => undefined);
     throw new GwsEaError('port_allocation_failed', 'Could not allocate the required loopback ports', { cause: error });
   }
-  const [nanoclawWebhook, onecliApp, onecliGateway] = ports as [number, number, number];
-  return {
-    ports: { nanoclaw_webhook: nanoclawWebhook, onecli_app: onecliApp, onecli_gateway: onecliGateway },
-    release,
-  };
+  const [onecliApp, onecliGateway] = ports as [number, number];
+  return { ports: { onecli_app: onecliApp, onecli_gateway: onecliGateway }, release };
 }
 
 /** The process listening on a TCP port, as `lsof` names it. */

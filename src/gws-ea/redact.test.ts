@@ -59,13 +59,13 @@ describe('GWS-EA redactor', () => {
     const apiKey = uniqueSecret('api-key');
     const nestedToken = uniqueSecret('nested');
     await writeFile(path.join(root, 'onecli-admin-api-key'), `${apiKey}\n`, { mode: 0o600 });
-    await writeFile(path.join(nested, 'tunnel-token'), nestedToken, { mode: 0o600 });
+    await writeFile(path.join(nested, 'refresh-token'), nestedToken, { mode: 0o600 });
 
     await registerSecretDirectory(root);
     await registerSecretDirectory(path.join(root, 'absent'));
 
     expect(redact(`stderr: rejected ${apiKey}`)).toBe(`stderr: rejected ${REDACTED}`);
-    expect(redact(`connector ${nestedToken}`)).toBe(`connector ${REDACTED}`);
+    expect(redact(`refresh ${nestedToken}`)).toBe(`refresh ${REDACTED}`);
   });
 
   it('redacts PEM blocks, including JSON-escaped newlines and truncated blocks', () => {
@@ -95,7 +95,7 @@ describe('GWS-EA redactor', () => {
     expect(redact('token ya29.a0AfH6SMBx-y_z')).toBe(`token ${REDACTED}`);
     expect(redact('key sk-ant-api03-AbC_dEf-123')).toBe(`key ${REDACTED}`);
     expect(redact('onecli oc_AbCdEfGhIjKlMnOpQrStUv')).toBe(`onecli ${REDACTED}`);
-    expect(redact('tunnel eyJhIjoiYWNjb3VudCIsInQiOiJ0dW5uZWwifQ==')).toBe(`tunnel ${REDACTED}`);
+    expect(redact('token eyJhIjoiYWNjb3VudCIsInQiOiJyZWZyZXNoIn0=')).toBe(`token ${REDACTED}`);
     expect(redact('jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl done')).toBe(`jwt ${REDACTED} done`);
   });
 
@@ -185,7 +185,7 @@ describe('GWS-EA redactor', () => {
 
   it('reads .env content as key names only', () => {
     expect(
-      envKeyNames('# comment\nONECLI_URL=http://127.0.0.1:1\n\nexport GCHAT_ENDPOINT_URL=https://x\nnot a pair\n'),
-    ).toEqual(['ONECLI_URL', 'GCHAT_ENDPOINT_URL']);
+      envKeyNames('# comment\nONECLI_URL=http://127.0.0.1:1\n\nexport NANOCLAW_EGRESS_NETWORK=x\nnot a pair\n'),
+    ).toEqual(['ONECLI_URL', 'NANOCLAW_EGRESS_NETWORK']);
   });
 });
