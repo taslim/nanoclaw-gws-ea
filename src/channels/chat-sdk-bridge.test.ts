@@ -1255,6 +1255,34 @@ describe('createChatSdkBridge — requests as text', () => {
     }
   });
 
+  it('refuses to reword an open request, and edits it once it shows its outcome', async () => {
+    const { bridge, edits, posted } = await textBridge();
+    try {
+      await bridge.deliver(DM, null, askApproval());
+      const reworded = {
+        kind: 'chat-sdk',
+        content: {
+          operation: 'edit',
+          messageId: 'spaces/AAAAjuno/messages/morgan.1',
+          text: 'Install a spell checker?',
+        },
+      };
+
+      await expect(bridge.deliver(DM, null, reworded)).rejects.toThrow(/open request/);
+      expect(edits).toEqual([]);
+      expect((await posted('spaces/AAAAjuno/messages/morgan.1'))?.questionId).toBe('appr-1');
+
+      await bridge.deliver(DM, null, outcome('appr-1', '✅ Approved'));
+      await bridge.deliver(DM, null, reworded);
+      expect(edits.map((edit) => edit.message)).toEqual([
+        { markdown: `**Install packages**\n\n${QUESTION}\n\n✅ Approved` },
+        { markdown: 'Install a spell checker?' },
+      ]);
+    } finally {
+      await bridge.teardown();
+    }
+  });
+
   it('finds the posted message from the question id alone', async () => {
     const { bridge, edits } = await textBridge();
     try {

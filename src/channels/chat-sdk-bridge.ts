@@ -1232,6 +1232,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       if (content.operation === 'edit' && content.messageId) {
+        // An open text request still takes answers as posted, so rewording it
+        // would have its approver decide something other than what they read.
+        // Only its handler's outcome, addressed by question id, edits it.
+        if (textRequests && (await readPostedRequest(state, adapter.name, content.messageId as string))) {
+          throw new Error(`refused an edit to the open request posted as ${String(content.messageId)}`);
+        }
         const render =
           typeof content.questionId === 'string' ? await resolveQuestionRender(content.questionId) : undefined;
         if (render?.renderTerminal && content.terminalCard) {
