@@ -143,8 +143,8 @@ function createSetupInput() {
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
+        principal_chat_email: 'principal@example.test',
       },
-      selected_messaging_group_id: null,
     },
   } as const;
 }
@@ -850,8 +850,8 @@ describe('create recovery contract', () => {
         pause: {
           kind: 'human-action' as const,
           phase: 'bind_principal' as const,
-          code: 'principal_dm_required',
-          message: 'Send the direct message.',
+          code: 'principal_chat_request_pending',
+          message: 'Accept the chat request.',
         },
       };
     };
@@ -885,7 +885,7 @@ describe('create recovery contract', () => {
       'Reserving the assistant…',
       'Configuring Google Cloud…',
       'Waiting for the service account…',
-      'Paused at bind_principal: Send the direct message.',
+      'Paused at bind_principal: Accept the chat request.',
     ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
@@ -907,7 +907,7 @@ describe('create recovery contract', () => {
     expect(advanced).toEqual([instanceId, instanceId]);
   });
 
-  it('provisions from the documented create command and prints exact principal-selection commands', async () => {
+  it('provisions from the documented create command and prints the exact command for each choice a pause offers', async () => {
     const paths = await testPaths();
     const output: string[] = [];
     let idWasPrintedBeforeCollection = false;
@@ -915,13 +915,14 @@ describe('create recovery contract', () => {
       status: 'paused' as const,
       pause: {
         kind: 'human-action' as const,
-        phase: 'bind_principal' as const,
-        code: 'principal_selection_required',
-        message: 'Choose the verified principal conversation.',
+        phase: 'provision_gcp' as const,
+        code: 'gcp_billing_account_choice_required',
+        message: 'Choose the billing account that pays for Google Cloud project gws-ea-juno.',
         choices: [
-          { id: 'gchat:spaces/AAA', label: 'Primary DM' },
-          { id: "gchat:spaces/O'Brien", label: 'Second DM' },
+          { id: '01A2B3-C4D5E6-F7A8B9', label: 'Northwind (01A2B3-C4D5E6-F7A8B9)' },
+          { id: "O'Brien-account", label: "O'Brien (shared)" },
         ],
+        resumeFlag: '--billing-account',
       },
     };
     const collectCreateInputs = async () => {
@@ -942,10 +943,10 @@ describe('create recovery contract', () => {
     expect(idWasPrintedBeforeCollection).toBe(true);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(output).toContain(
-      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Northwind (01A2B3-C4D5E6-F7A8B9)": gws-ea resume --id ${instanceId} --billing-account '01A2B3-C4D5E6-F7A8B9'`,
     );
     expect(output).toContain(
-      `  "Second DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/O'\\''Brien'`,
+      `  "O'Brien (shared)": gws-ea resume --id ${instanceId} --billing-account 'O'\\''Brien-account'`,
     );
 
     const resumeOutput: string[] = [];
@@ -959,7 +960,7 @@ describe('create recovery contract', () => {
       }),
     ).toBe(10);
     expect(resumeOutput).toContain(
-      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Northwind (01A2B3-C4D5E6-F7A8B9)": gws-ea resume --id ${instanceId} --billing-account '01A2B3-C4D5E6-F7A8B9'`,
     );
   });
 
@@ -1127,8 +1128,8 @@ describe('create recovery contract', () => {
             pause: {
               kind: 'human-action',
               phase: 'bind_principal',
-              code: 'principal_dm_required',
-              message: 'Send the direct message.',
+              code: 'principal_chat_request_pending',
+              message: 'Accept the chat request.',
             },
           };
         },

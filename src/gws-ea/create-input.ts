@@ -25,6 +25,41 @@ export function parsePrincipalEmailFlags(values: readonly string[]): readonly st
   return [...new Set(emails)];
 }
 
+/** `--principal-chat-email`: which of the principal's addresses they use for Google Chat. */
+export const PRINCIPAL_CHAT_EMAIL_FLAG = 'principal-chat-email';
+
+/** `value` as one of the principal's addresses, lowercased, or undefined when it is none of them. */
+function principalAddressOf(value: string, principalEmails: readonly string[]): string | undefined {
+  const email = normalizePrincipalEmail(value);
+  return email !== undefined && principalEmails.includes(email) ? email : undefined;
+}
+
+function notAPrincipalAddress(principalEmails: readonly string[]): string {
+  return `Use one of the principal's addresses: ${principalEmails.join(', ')}`;
+}
+
+/**
+ * Why `value` cannot be the address the principal uses for Google Chat, or
+ * undefined when it can: it must be one of their addresses (KTD11), in any
+ * spelling of it.
+ */
+export function principalChatEmailProblem(value: string, principalEmails: readonly string[]): string | undefined {
+  return principalAddressOf(value, principalEmails) === undefined ? notAPrincipalAddress(principalEmails) : undefined;
+}
+
+/** `value` as the principal's Google Chat address, lowercased; anything else is refused, naming the flag. */
+export function parsePrincipalChatEmail(value: string, principalEmails: readonly string[]): string {
+  const email = principalAddressOf(value, principalEmails);
+  if (email === undefined) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      `--${PRINCIPAL_CHAT_EMAIL_FLAG}: ${notAPrincipalAddress(principalEmails)}`,
+      { details: { flag: `--${PRINCIPAL_CHAT_EMAIL_FLAG}` } },
+    );
+  }
+  return email;
+}
+
 /** One flag per create prompt, so `create` can run without a person. */
 export const CREATE_INPUT_FLAGS = [
   'assistant-first-name',
@@ -32,6 +67,7 @@ export const CREATE_INPUT_FLAGS = [
   'principal-first-name',
   'principal-last-name',
   'principal-timezone',
+  PRINCIPAL_CHAT_EMAIL_FLAG,
   'workspace-email',
   'ingress',
   'endpoint',

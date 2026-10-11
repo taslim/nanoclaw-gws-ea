@@ -14,7 +14,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
+import { principalWelcomeEventId, type PrincipalBinding } from './principal.js';
 import {
   readLatestDelivery,
   readSchemaManifest,
@@ -91,7 +91,7 @@ async function composeHost() {
   };
 }
 
-/** The principal's first DM, as the router records the conversation. */
+/** The principal's DM, as the host records the conversation it opened with them. */
 async function principalDm(): Promise<string> {
   await host.createMessagingGroupIfAbsent({
     id: 'mg-principal',
@@ -144,15 +144,9 @@ async function bindPrincipal(dm: string): Promise<void> {
   ]);
 }
 
-function candidate(): PrincipalCandidate {
-  return {
-    messagingGroupId: dmId,
-    platformId: PLATFORM,
-    userId: USER,
-    senderName: 'Principal',
-    authenticatedMessageId: 'spaces/dm-principal/messages/first',
-    authenticatedMessageAt: BOUND_AT,
-  };
+/** The principal as the bind step bound them, at the moment it began. */
+function binding(): PrincipalBinding {
+  return { userId: USER, messagingGroupId: dmId, platformId: PLATFORM, boundAt: BOUND_AT };
 }
 
 function input(overrides: Partial<ConversationVerificationInput> = {}): ConversationVerificationInput {
@@ -261,32 +255,29 @@ afterEach(async () => {
 });
 
 describe('principal binding verification', () => {
-  it('matches the binding and queued welcome in the session the router created for the DM', async () => {
-    const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, candidate());
+  it('finds the one principal bound since provisioning began, and their queued welcome in the DM session', async () => {
+    const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, binding());
     await inbound(`${welcomeEventId}:${MAIN}`, BOUND_AT, 'chat', { text: 'welcome', senderId: USER });
     const runtime = { ...RUNTIME, state_root: checkout };
 
+    expect(verifyPrincipalBinding({ runtime, adapterInstance: INSTANCE, provisioningStartedAt: BOUND_AT })).toEqual({
+      status: 'matched',
+      agentGroupId: MAIN,
+      principal: binding(),
+      welcomeEventId,
+    });
+    // A binding from before this create began is not its principal.
     expect(
-      verifyPrincipalBinding({
-        runtime,
-        adapterInstance: INSTANCE,
-        provisioningStartedAt: BOUND_AT,
-        selectedCandidate: candidate(),
-      }),
-    ).toEqual({ status: 'matched', agentGroupId: MAIN, candidate: candidate(), welcomeEventId });
+      verifyPrincipalBinding({ runtime, adapterInstance: INSTANCE, provisioningStartedAt: '2026-09-18T18:00:00.001Z' }),
+    ).toEqual({ status: 'absent' });
     expect(
-      verifyPrincipalBinding({
-        runtime,
-        adapterInstance: INSTANCE,
-        provisioningStartedAt: '2026-09-18T18:00:00.001Z',
-        selectedCandidate: candidate(),
-      }),
+      verifyPrincipalBinding({ runtime, adapterInstance: 'gchat-other', provisioningStartedAt: BOUND_AT }),
     ).toEqual({ status: 'absent' });
   });
 
   it('matches a principal whose owner role a retried bind granted again', async () => {
     await host.ncl(['roles', 'grant', '--user', USER, '--role', 'owner']);
-    const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, candidate());
+    const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, binding());
     await inbound(`${welcomeEventId}:${MAIN}`, BOUND_AT, 'chat', { text: 'welcome', senderId: USER });
 
     expect(
@@ -294,7 +285,6 @@ describe('principal binding verification', () => {
         runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
-        selectedCandidate: candidate(),
       }),
     ).toMatchObject({ status: 'matched', agentGroupId: MAIN });
   });
@@ -305,7 +295,6 @@ describe('principal binding verification', () => {
         runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
-        selectedCandidate: candidate(),
       }),
     ).toEqual({ status: 'absent' });
   });
@@ -554,7 +543,6 @@ describe('read-only observation', () => {
         runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
-        selectedCandidate: candidate(),
       }),
     ).toEqual({ status: 'absent' });
 

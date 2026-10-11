@@ -4,7 +4,12 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadSecretSource, parsePrincipalEmailFlags } from './create-input.js';
+import {
+  CREATE_INPUT_FLAGS,
+  loadSecretSource,
+  parsePrincipalEmailFlags,
+  principalChatEmailProblem,
+} from './create-input.js';
 import { redact, REDACTED } from './redact.js';
 import { normalizePrincipalEmail } from './validation.js';
 
@@ -54,6 +59,28 @@ describe('principal email inputs', () => {
   it('normalizes one address the way every layer stores it, or says it cannot be one', () => {
     expect(normalizePrincipalEmail(' Ada@Example.TEST')).toBe('ada@example.test');
     expect(normalizePrincipalEmail('ada@example')).toBeUndefined();
+  });
+});
+
+describe("the principal's Google Chat address", () => {
+  const EMAILS = ['juno.hale@northwind.example', 'juno@hale.example'] as const;
+
+  it("takes one of the principal's addresses, in any spelling of it", () => {
+    expect(principalChatEmailProblem('Juno@Hale.example ', EMAILS)).toBeUndefined();
+    expect(principalChatEmailProblem(EMAILS[0], EMAILS)).toBeUndefined();
+  });
+
+  it.each(['remy.vance@northwind.example', 'not-an-email', ''])(
+    'refuses %j, naming the addresses it can be',
+    (value) => {
+      expect(principalChatEmailProblem(value, EMAILS)).toBe(
+        "Use one of the principal's addresses: juno.hale@northwind.example, juno@hale.example",
+      );
+    },
+  );
+
+  it('can be given as a create flag, so create runs without a person', () => {
+    expect(CREATE_INPUT_FLAGS).toContain('principal-chat-email');
   });
 });
 

@@ -895,7 +895,7 @@ async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
   return { ...OK, ...facts };
 }
 
-/** The assistant's own Google sign-in, as `connect_google` left it and Google still accepts it. */
+/** The assistant's own Google sign-in, as `sign_in_google` left it and Google still accepts it. */
 async function workspaceProbe({
   reservation,
   runtime: record,
@@ -908,11 +908,9 @@ async function workspaceProbe({
     : { status: 'degraded', reason: report.reason, account: report.account };
 }
 
-/** The principal conversation bind_principal fixed, still bound, with its welcome queued. */
+/** The principal bind_principal bound through the DM the assistant opened, still bound, with its welcome queued. */
 async function principalProbe({ context, reservation, observers }: Subject): Promise<ProbeResult> {
   const journal = await readProvisionJournal(context.paths, reservation.instance_id);
-  const candidate = journal.decisions.principal;
-  if (!candidate) return { status: 'degraded', reason: 'No principal conversation is bound yet.' };
   const result = observers.principalBinding({
     runtime: {
       state_root: context.paths.instanceLayout(reservation.instance_id).state,
@@ -920,14 +918,10 @@ async function principalProbe({ context, reservation, observers }: Subject): Pro
     },
     adapterInstance: ADAPTER_INSTANCE,
     provisioningStartedAt: journal.started_at,
-    selectedCandidate: candidate,
   });
   return result.status === 'matched'
     ? OK
-    : {
-        status: 'degraded',
-        reason: `The binding of ${candidate.senderName ?? candidate.userId} or its welcome is missing.`,
-      };
+    : { status: 'degraded', reason: "The principal's direct message, its binding, or its welcome is missing." };
 }
 
 /** The managed route observed from outside, or the operator's endpoint refusing unsigned traffic. */

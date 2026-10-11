@@ -16,7 +16,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
-import { SignInRequired } from './events.js';
+import { BILLING_ACCOUNT_FLAG, SignInRequired } from './events.js';
 import {
   deriveGchatEventsSubscription,
   deriveGchatEventsTopic,
@@ -869,7 +869,7 @@ function billingChoicePause(gcp: GcpProjectInput, accounts: readonly BillingAcco
     code: 'gcp_billing_account_choice_required',
     message: `Choose the billing account that pays for Google Cloud project ${gcp.projectId}.`,
     choices: accounts.map(({ id, displayName }) => ({ id, label: `${displayName} (${id})` })),
-    resumeFlag: '--billing-account',
+    resumeFlag: BILLING_ACCOUNT_FLAG,
   };
 }
 

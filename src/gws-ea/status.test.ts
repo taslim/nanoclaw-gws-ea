@@ -28,7 +28,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
-import { acquireInstanceOperation, recordPrincipalSelection, reserveInstance } from './journal.js';
+import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
@@ -45,7 +45,7 @@ import {
 } from './operation.js';
 import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { PRESENT } from './phases.js';
-import type { PrincipalCandidate } from './principal.js';
+import type { PrincipalBinding } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
@@ -248,26 +248,14 @@ async function assistant(
   return reserved;
 }
 
-function principal(): PrincipalCandidate {
+/** The principal bind_principal bound through the DM the assistant opened. */
+function principal(): PrincipalBinding {
   return {
+    userId: 'gchat:users/2001',
     messagingGroupId: 'mg-principal',
     platformId: 'gchat:spaces/dm-principal',
-    userId: 'gchat:users/principal',
-    senderName: 'Principal',
-    authenticatedMessageId: 'spaces/dm-principal/messages/first',
-    authenticatedMessageAt: new Date().toISOString(),
+    boundAt: new Date().toISOString(),
   };
-}
-
-/** The principal conversation bind_principal fixed in the journal. */
-async function bound(paths: ControlPlanePaths, instanceId: string): Promise<void> {
-  const operation = await acquireInstanceOperation(paths, instanceId);
-  if (!operation) throw new Error('The test instance operation was busy');
-  try {
-    await recordPrincipalSelection(operation, principal());
-  } finally {
-    operation.release();
-  }
 }
 
 /** The rollback point an update left: the release it left, and the snapshot it took, whose schema is `manifest`. */
@@ -551,10 +539,10 @@ function healthyObservers(state: World): StatusObservers {
     onecliAgents,
     onecli: async () => PRESENT,
     connector: async () => ({ status: 'present' }),
-    principalBinding: (input) => ({
+    principalBinding: () => ({
       status: 'matched',
       agentGroupId: MAIN,
-      candidate: input.selectedCandidate ?? principal(),
+      principal: principal(),
       welcomeEventId: 'gws-ea-welcome:stable',
     }),
     schema: () => MANIFEST,
@@ -605,7 +593,6 @@ describe('status', () => {
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
     // Beside the healthy host: a removal cut short, and a drifted shared connector.
     await removalStarted(host.paths, reservation);
     const state = world(reservation);
@@ -672,7 +659,6 @@ describe('status', () => {
   it('reports a stopped host as a stopped service and an unreachable host, and still reports every other probe', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     state.active.clear();
     state.serving.clear();
@@ -695,7 +681,6 @@ describe('status', () => {
   it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const reason = `Google no longer accepts the sign-in; connect it with gws-ea connect-google --id ${reservation.instance_id}`;
 
@@ -718,7 +703,6 @@ describe('status', () => {
   it("reports main's identity as unknown, not degraded, when OneCLI does not answer for its agents", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const refusal = 'OneCLI refused the agent list (HTTP 503)';
 
@@ -736,7 +720,6 @@ describe('status', () => {
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const refusal = 'OneCLI gateway image gws-ea-onecli-gateway:0 provenance label does not match its build content';
 
@@ -759,7 +742,6 @@ describe('status', () => {
   it('reports external-email as the host reports it', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting =
@@ -800,7 +782,6 @@ describe('status', () => {
   it('reports the inbox as the host reports it, degraded while it fails, while calendar news is not on yet, or when its report is invalid', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting = (health: unknown) => ({
@@ -889,7 +870,6 @@ describe('status', () => {
   it("shows each principal address's calendar access in every state, and never counts it against the inbox (AE4)", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const checkedAt = '2026-09-28T14:29:00.000Z';
@@ -1029,7 +1009,6 @@ describe('status', () => {
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
     const { runtime, output } = command(host, state, {
       ...healthyObservers(state),
@@ -1088,7 +1067,6 @@ describe('status', () => {
   it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    await bound(host.paths, reservation.instance_id);
     // A switch has removed the live link; the runtime record and the databases stay in the assistant's state.
     await rm(liveOf(reservation));
     const state = world(reservation);
@@ -1456,7 +1434,6 @@ describe('read-only commands', () => {
     const host = await machine();
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
-    await bound(host.paths, alpha.instance_id);
     hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
     await sessionMailbox(stateOf(alpha));
     await keepRollbackPoint(host.paths, alpha, 'e'.repeat(40), {

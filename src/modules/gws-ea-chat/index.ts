@@ -10,17 +10,20 @@
  *
  * A host without the assistant's Google sign-in or without Chat delivery
  * (config.ts) has no Chat channel. Status reads whether Chat is receiving
- * through `gws-ea-chat health`.
+ * through `gws-ea-chat health`, and create opens the principal's DM through
+ * `gws-ea-chat open-principal-dm` (dm.ts).
  */
 import type { ChannelAdapter } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
 import { GCHAT_CHANNEL_TYPE } from '../../gws-ea/types.js';
+import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { googleGrantFilePath } from '../gws-ea-google/grant-file.js';
 import { assistantGoogleAccount, hostGoogleAccessToken, type AssistantGoogleAccount } from '../gws-ea-google/index.js';
 import { AssistantChatAdapter, createAssistantChatChannel, GCHAT_DEFAULTS, hostChatAuth } from './adapter.js';
 import { readChatDeliveryConfig, type ChatDeliveryConfig } from './config.js';
 import { startChatDelivery } from './delivery.js';
+import { openPrincipalDm } from './dm.js';
 import { chatHealth } from './health.js';
 import { createChatHydrator } from './hydrate.js';
 
@@ -86,6 +89,29 @@ register({
     return undefined;
   },
   handler: async () => chatHealth.read(),
+});
+
+// Create's binding, from the host only: the assistant opens its DM with the one address the
+// principal uses for Google Chat, and answers with the person Google resolved and its conversation.
+register({
+  name: 'gws-ea-chat-open-principal-dm',
+  description: "Open the assistant's direct message with the principal's Google Chat address.",
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    const unknown = Object.keys(raw).filter((key) => key !== 'email');
+    if (unknown.length > 0) throw new Error(`Unknown Chat field: --${unknown[0]}`);
+    const email = typeof raw.email === 'string' ? normalizePrincipalEmail(raw.email) : undefined;
+    if (email === undefined) throw new Error("--email must be the principal's Google Chat address");
+    return { email };
+  },
+  handler: async ({ email }) => {
+    const assistant = await signedInAssistant();
+    return openPrincipalDm(email, {
+      chatToken: () => hostGoogleAccessToken('chat'),
+      assistantUserId: `users/${assistant.sub}`,
+    });
+  },
 });
 
 export {

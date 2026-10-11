@@ -4,15 +4,22 @@ export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
 /** NanoClaw's channel type for Google Chat: the prefix of its user IDs and the `channel_type` of its rows. */
 export const GCHAT_CHANNEL_TYPE = 'gchat';
 
-/** Provisioning steps in run order; a completed `verify_conversation` means the assistant is ready. */
+/**
+ * Provisioning steps in run order; a completed `verify_conversation` means the
+ * assistant is ready. The host talks in Chat as the assistant from the moment
+ * it starts, so Chat is configured and the assistant signed in before
+ * `start_nanoclaw`; agents' Google access, which the running host publishes,
+ * is connected after it.
+ */
 export const PROVISION_STEPS = [
   'materialize_checkout',
   'provision_gcp',
   'start_onecli',
   'configure_provider',
+  'configure_channel',
+  'sign_in_google',
   'start_nanoclaw',
   'establish_transport',
-  'configure_channel',
   'connect_google',
   'bind_principal',
   'verify_conversation',

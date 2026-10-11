@@ -125,8 +125,8 @@ function setupAnswers() {
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
+        principal_chat_email: 'principal@example.test',
       },
-      selected_messaging_group_id: null,
     },
   } as const;
 }
@@ -158,15 +158,17 @@ function createRuntime(): Partial<CliRuntime> {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_dm_required',
-  message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+  code: 'principal_chat_request_pending',
+  message:
+    "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
+    'direct message as a request. Ask them to accept it in Google Chat, then resume.',
 };
 
 const CHAT_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'configure_channel',
   code: 'chat_configuration_required',
-  message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+  message: "Configure the Google Chat API for this assistant's project, then confirm it.",
   resumeFlag: '--chat-configured',
 };
 
@@ -391,6 +393,39 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(io.out).toContain(`Paused at bind_principal: ${DM_PAUSE.message}`);
     expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id}`);
     expect(io.out.at(-1)).toMatch(/^Log: \S+progress\.log$/u);
+  });
+
+  it('resumes with the billing account the operator chose, and refuses one that is no billing account ID', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const chosen: Array<string | undefined> = [];
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { interaction }) => {
+      chosen.push(interaction.decisions.billingAccount);
+      return { status: 'ready' };
+    };
+
+    const io = lines();
+    expect(
+      await runCli(['resume', '--id', input.instance_id, '--billing-account', '01A2B3-C4D5E6-F7A8B9'], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(chosen).toEqual(['01A2B3-C4D5E6-F7A8B9']);
+
+    const refused = lines();
+    expect(
+      await runCli(['resume', '--id', input.instance_id, '--billing-account', "01A2B3; echo 'hi'"], {
+        paths,
+        ...refused.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      }),
+    ).not.toBe(0);
+    expect(refused.err.join('\n')).toContain('--billing-account');
+    expect(chosen).toHaveLength(1);
   });
 
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
@@ -1786,7 +1821,7 @@ describe('gws-ea connect-google', () => {
     const { instanceId } = await createdGoogleAssistant(paths);
     const pause: ProvisionHumanPause = {
       kind: 'human-action',
-      phase: 'connect_google',
+      phase: 'sign_in_google',
       code: 'google_client_required',
       message: "Create the assistant's Google sign-in client.",
       resumeFlag: '--google-client-file <file>',

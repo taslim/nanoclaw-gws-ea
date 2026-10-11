@@ -13,7 +13,7 @@ import {
   readProvisionJournal,
   recordChatConfigurationConfirmed,
   recordKeyPolicyLifted,
-  recordPrincipalSelection,
+  recordPrincipalChatAddress,
   recordStepCompleted,
   recordStepFailure,
   recordStepStarted,
@@ -68,14 +68,8 @@ async function rawJournal(paths: ControlPlanePaths, instanceId: string): Promise
   return JSON.parse(await readFile(paths.journalFile(instanceId), 'utf8')) as Record<string, unknown>;
 }
 
-const PRINCIPAL = {
-  messagingGroupId: 'mg-principal',
-  platformId: 'gchat:spaces/dm-principal',
-  userId: 'gchat:users/principal',
-  senderName: 'Principal',
-  authenticatedMessageId: 'spaces/dm-principal/messages/first',
-  authenticatedMessageAt: '2026-09-19T00:01:00.000Z',
-} as const;
+/** The address the principal uses for Google Chat, as create named it. */
+const CHAT_EMAIL = 'juno.hale@northwind.example';
 
 describe('provision journal v3', () => {
   it('is created with the reservation, so a crash before the first step leaves a journal with nothing started', async () => {
@@ -119,6 +113,11 @@ describe('provision journal v3', () => {
       { launcher_contract_version: 1 },
       'incompatible_launcher',
     ],
+    [
+      'a contract 2 journal, from before the sign-in moved ahead of the host and the assistant opened the DM',
+      { launcher_contract_version: 2 },
+      'incompatible_launcher',
+    ],
   ] as const)('refuses %s with remove-and-recreate guidance and leaves it untouched', async (_label, change, code) => {
     const { paths, input } = await fixture();
     const contents = JSON.stringify({ ...(await rawJournal(paths, input.instance_id)), ...change });
@@ -157,7 +156,12 @@ describe('provision journal v3', () => {
           materialize_checkout: { started_at: raw.started_at, completed_at: raw.started_at, attempt: 3 },
           future_step: { started_at: raw.started_at },
         },
-        decisions: { principal: { ...PRINCIPAL, avatar: 'https://example.test/a.png' }, future_choice: 'x' },
+        decisions: {
+          principal_chat_email: CHAT_EMAIL,
+          // What a launcher before this one fixed by hand, which nothing reads any more.
+          principal: { messagingGroupId: 'mg-principal', userId: 'gchat:users/2001' },
+          future_choice: 'x',
+        },
       }),
       { mode: 0o600 },
     );
@@ -166,7 +170,7 @@ describe('provision journal v3', () => {
     expect(journal.steps).toEqual({
       materialize_checkout: { started_at: raw.started_at, completed_at: raw.started_at },
     });
-    expect(journal.decisions).toEqual({ principal: PRINCIPAL });
+    expect(journal.decisions).toEqual({ principal_chat_email: CHAT_EMAIL });
     expect(journal).not.toHaveProperty('future_fact');
   });
 
@@ -213,13 +217,13 @@ describe('provision journal v3', () => {
         confirmedAt,
       );
 
-      await recordPrincipalSelection(operation, PRINCIPAL);
-      await expect(recordPrincipalSelection(operation, PRINCIPAL)).resolves.toMatchObject({
-        decisions: { principal: PRINCIPAL },
+      await recordPrincipalChatAddress(operation, CHAT_EMAIL);
+      await expect(recordPrincipalChatAddress(operation, CHAT_EMAIL)).resolves.toMatchObject({
+        decisions: { principal_chat_email: CHAT_EMAIL },
       });
-      await expect(
-        recordPrincipalSelection(operation, { ...PRINCIPAL, messagingGroupId: 'mg-other' }),
-      ).rejects.toMatchObject({ code: 'principal_selection_mismatch' });
+      await expect(recordPrincipalChatAddress(operation, 'juno@hale.example')).rejects.toMatchObject({
+        code: 'principal_chat_address_mismatch',
+      });
 
       expect((await recordKeyPolicyLifted(operation, true)).key_policy_lifted).toBe(true);
     } finally {
@@ -229,7 +233,7 @@ describe('provision journal v3', () => {
     await expect(recordStepStarted(operation, 'provision_gcp')).rejects.toMatchObject({ code: 'operation_inactive' });
     const reopened = await readProvisionJournal(paths, input.instance_id);
     expect(reopened.steps.provision_gcp).toBeUndefined();
-    expect(reopened.decisions.principal).toEqual(PRINCIPAL);
+    expect(reopened.decisions.principal_chat_email).toBe(CHAT_EMAIL);
     expect(reopened.key_policy_lifted).toBe(true);
   });
 

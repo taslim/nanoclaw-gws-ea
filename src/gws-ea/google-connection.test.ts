@@ -17,7 +17,9 @@ import { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 import {
   DRIVE_ABOUT_URL,
   GOOGLE_CLIENT_FILE_FLAG,
+  googleAccessResources,
   googleConnectionResources,
+  googleSignInResources,
   observeGoogleConnection,
   PRIMARY_CALENDAR_URL,
   type GoogleConnectionContext,
@@ -314,7 +316,7 @@ describe("connecting the assistant's Google account", () => {
     ]);
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
     expect(pause).toMatchObject({
-      phase: 'connect_google',
+      phase: 'sign_in_google',
       code: 'google_client_required',
       resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
       actionUrl: `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
@@ -340,6 +342,37 @@ describe("connecting the assistant's Google account", () => {
     expect(fs.existsSync(path.join(SECRETS, 'google-oauth-client.json'))).toBe(false);
     expect(world.vaultWrites).toEqual([]);
     expect(signIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("signs in before the host runs, reading nothing from OneCLI, and leaves agents' access for after it", async () => {
+    const world = new World();
+    const options = { gcloud: { runCommand: world.runCommand }, fetch: world.fetch, sleep: async () => undefined };
+    const signInResources = googleSignInResources(options);
+
+    await expect(
+      connect(
+        signInResources,
+        context(async () => grant(), writeDownloadedClient()),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(signInResources.map((resource) => resource.name)).toEqual([
+      'the Google Workspace APIs',
+      "the assistant's Google sign-in client",
+      "the assistant's Google sign-in",
+    ]);
+    expect(googleAccessResources(options).map((resource) => resource.name)).toEqual([
+      "agents' Google access",
+      "the assistant's own calendar and Drive",
+    ]);
+    // connect-google repairs both, in the same order.
+    expect(googleConnectionResources(options).map((resource) => resource.name)).toEqual([
+      ...signInResources.map((resource) => resource.name),
+      ...googleAccessResources(options).map((resource) => resource.name),
+    ]);
+    const vaultReads = vi.mocked(world.fetch).mock.calls.filter(([input]) => String(input).includes('/v1/secrets'));
+    expect(vaultReads).toEqual([]);
+    expect(world.vaultWrites).toEqual([]);
   });
 
   it("waits for the host to publish each credential's secret before the step is done", async () => {

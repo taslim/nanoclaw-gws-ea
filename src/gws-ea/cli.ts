@@ -23,6 +23,7 @@ import {
 } from './create-input.js';
 import { finishFollowUps, type CutoverDependencies } from './cutover.js';
 import {
+  BILLING_ACCOUNT_FLAG,
   createInteraction,
   pendingActionOf,
   PauseRequired,
@@ -35,6 +36,7 @@ import {
   type StepReporter,
 } from './events.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
+import { GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
   loadCreatedRuntime,
@@ -290,7 +292,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
     repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
-    values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
+    values: ['id', 'billing-account', 'google-client-file', ...COMMON_OPTIONS],
     switches: ['chat-configured'],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes'] },
@@ -368,6 +370,19 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/** `--billing-account`: the billing account a pause offered, as Google names it. */
+function parseBillingAccount(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!GCP_BILLING_ACCOUNT_PATTERN.test(value)) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      `${BILLING_ACCOUNT_FLAG}: ${JSON.stringify(value)} is not a billing account ID such as 01A2B3-C4D5E6-F7A8B9`,
+      { details: { flag: BILLING_ACCOUNT_FLAG } },
+    );
+  }
+  return value;
+}
+
 function isBusy(error: unknown): boolean {
   return error instanceof GwsEaError && error.code === 'instance_busy';
 }
@@ -435,28 +450,23 @@ function exitFact(details: GwsEaErrorDetails | undefined): string | undefined {
   return undefined;
 }
 
+/** A pause as the person reads it: what to do, and the command that continues; a choice gives one per option. */
 function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => string, log: string): StopReport {
-  const headline = `Paused at ${pause.phase}: ${pause.message}`;
-  if (pause.choices?.length) {
-    return {
-      outcome: 'paused',
-      headline,
-      details: [
-        'Eligible principal conversations:',
-        ...pause.choices.map(
-          (choice) => `  ${JSON.stringify(choice.label)}: ${resume(`--messaging-group-id ${shellQuote(choice.id)}`)}`,
-        ),
-        `Log: ${log}`,
-      ],
-    };
-  }
+  const { choices, resumeFlag } = pause;
   return {
     outcome: 'paused',
-    headline,
+    headline: `Paused at ${pause.phase}: ${pause.message}`,
     details: [
       ...(pause.details ?? []).map((detail) => `  ${detail}`),
       ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
-      `Continue with: ${resume(pause.resumeFlag)}`,
+      ...(choices?.length && resumeFlag
+        ? [
+            'Choose one:',
+            ...choices.map(
+              (choice) => `  ${JSON.stringify(choice.label)}: ${resume(`${resumeFlag} ${shellQuote(choice.id)}`)}`,
+            ),
+          ]
+        : [`Continue with: ${resume(resumeFlag)}`]),
       `Log: ${log}`,
     ],
   };
@@ -531,6 +541,7 @@ class Cli {
       }
       case 'resume': {
         const instanceId = targetInstance(options);
+        const billingAccount = parseBillingAccount(options['billing-account']);
         return () =>
           this.#attempt({
             command,
@@ -539,7 +550,7 @@ class Cli {
             instanceId,
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
-              ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+              ...(billingAccount ? { billingAccount } : {}),
               ...(options['google-client-file']
                 ? { googleClientFile: path.resolve(options['google-client-file']) }
                 : {}),
@@ -909,9 +920,9 @@ class Cli {
    */
   /**
    * Connect a created assistant's own Google account (KTD5): the same
-   * resources as create's `connect_google` step, outside the provision
-   * journal, so a lost or outdated sign-in is repaired without recreating
-   * the assistant.
+   * resources as create's `sign_in_google` and `connect_google` steps, outside
+   * the provision journal, so a lost or outdated sign-in is repaired without
+   * recreating the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
@@ -1718,11 +1729,14 @@ function printHelp(output: LineWriter): void {
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--principal-email <email>]...  (once per address the principal uses)');
+  output(
+    '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
+  );
   output('         [--workspace-email <email>] [--provider <id>]');
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
-  output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]');
   output(
     "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
   );

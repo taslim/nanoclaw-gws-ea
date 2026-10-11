@@ -6,8 +6,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   readProvisionJournal,
   recordChatConfigurationConfirmed,
-  recordPrincipalSelection,
+  recordPrincipalChatAddress,
   type InstanceOperation,
+  type ProvisionJournal,
 } from './journal.js';
 import {
   ABSENT,
@@ -45,7 +46,6 @@ import {
   reconcileInstanceRuntime,
   instanceOnecliAdmin,
   createInstanceRuntimeConfig,
-  googleChatProjectNumberFile,
   hostLogFiles,
   instanceServicePid,
   loadInstanceRuntimeConfig,
@@ -60,10 +60,10 @@ import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import type { OnecliAgent } from './onecli-admin.js';
 import {
-  listPrincipalCandidates,
-  reconcilePrincipalDm,
-  type PrincipalCandidate,
-  type PrincipalDiscoveryDependencies,
+  bindPrincipal,
+  type PrincipalBinding,
+  type PrincipalBindingDependencies,
+  type PrincipalBindingResult,
 } from './principal.js';
 import { verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
@@ -102,7 +102,6 @@ import {
   requireString,
   unwrapData,
 } from './validation.js';
-import { parseGcpProjectNumber } from './gcp-identity.js';
 import {
   credentialMatchesMetadata,
   type ProviderCredential,
@@ -110,13 +109,8 @@ import {
 } from '../provider-credential.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
-import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
-import {
-  getOwnedGcpProjectNumber,
-  googleCloudResources,
-  parseGchatServiceAccountCredential,
-  type GcpProjectInput,
-} from './gcloud.js';
+import { googleAccessResources, googleSignInResources, type GoogleConnectionInput } from './google-connection.js';
+import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
 import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   forgetAccountToken,
@@ -153,23 +147,23 @@ export interface ProductionProvisionInput {
   readonly identity: MainIdentityInput;
   /** The principal's name in the operator's messages: the published profile's, or create's before. */
   readonly principalDisplayName: string;
+  /** The address the principal uses for Google Chat, as create named it: the assistant opens its DM there (KTD11). */
+  readonly principalChatEmail: string;
   readonly adapterInstance: string;
-  /** The journal's start: only principal messages after it count. */
+  /** The journal's start: only a principal bound after it counts. */
   readonly provisioningStartedAt: string;
-  /** The operator confirmed the Google Chat app configuration (`--chat-configured`). */
+  /** The operator confirmed the Google Chat API configuration (`--chat-configured`). */
   readonly chatConfigured: boolean;
-  readonly selectedMessagingGroupId?: string;
-  readonly selectedPrincipal?: PrincipalCandidate;
   readonly bootstrapManifestFile?: string;
   readonly serviceDependencies: InstanceRuntimeDependencies;
   readonly onecliDependencies?: OnecliRuntimeDependencies;
   readonly identityDependencies?: MainIdentityDependencies;
-  readonly principalDependencies?: PrincipalDiscoveryDependencies;
+  readonly principalDependencies?: PrincipalBindingDependencies;
   readonly hostStatus: HostStatusHelpers;
   readonly ingress: IngressClaim;
   readonly managedIngressSetup?: ManagedAccountTokenSession;
   readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
-  /** The assistant's Google sign-in (`connect_google`, KTD2, KTD5). */
+  /** The assistant's Google sign-in (`sign_in_google`), and agents' access to it (`connect_google`; KTD2, KTD5). */
   readonly google: GoogleConnectionInput;
 }
 
@@ -177,7 +171,7 @@ export interface ProductionProvisionState {
   onecliReceipt?: OnecliRuntimeReceipt;
   providerSecretId?: string;
   mainAgentGroupId?: string;
-  principal?: PrincipalCandidate;
+  principal?: PrincipalBinding;
   welcomeEventId?: string;
 }
 
@@ -194,7 +188,6 @@ export interface ProductionProvisionDependencies {
   readonly stageRelease: typeof stageRelease;
   /** `provision_gcp`'s resources. */
   readonly googleCloudResources: typeof googleCloudResources;
-  readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
   readonly observeOnecli: Observe;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
   readonly verifyOnecliRuntime: typeof verifyOnecliRuntime;
@@ -211,12 +204,14 @@ export interface ProductionProvisionDependencies {
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
-  readonly reconcilePrincipal: typeof reconcilePrincipalDm;
+  readonly bindPrincipal: typeof bindPrincipal;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
   /** `establish_transport`'s resources in managed mode. */
   readonly managedTransportResources: typeof managedTransportResources;
+  /** `sign_in_google`'s resources. */
+  readonly googleSignInResources: typeof googleSignInResources;
   /** `connect_google`'s resources. */
-  readonly googleConnectionResources: typeof googleConnectionResources;
+  readonly googleAccessResources: typeof googleAccessResources;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
@@ -360,8 +355,8 @@ function hostReason(error: unknown, runtime: InstanceRuntimeConfig): string {
  * The host as its own status reports it (upstream `queryHost`, which accepts
  * only a host identifying this checkout). A host that does not answer is
  * starting while its service runs a process, and stopped otherwise; one that
- * answers is present once it serves the Google Chat webhook on its allocated
- * port with the channel connected, and still starting until then.
+ * answers is present once its Google Chat channel is connected, and still
+ * starting until then. Chat's events are pulled, so no Chat route is served.
  */
 async function observeInstanceHost(
   context: ProductionProvisionContext,
@@ -393,9 +388,6 @@ async function observeInstanceHost(
     reason,
     evidence: `host pid ${String(pid)}; see ${errorLog}`,
   });
-  if (!isRecord(webhook) || !Array.isArray(webhook.paths) || !webhook.paths.includes('/webhook/gchat')) {
-    return starting('The assistant has not opened its Google Chat webhook yet');
-  }
   if (!channels.some((channel) => isRecord(channel) && channel.instance === 'gchat' && channel.connected === true)) {
     return starting('Channel gchat is not connected in the running host');
   }
@@ -506,6 +498,7 @@ async function bootstrapManifestRemoved(file: string | undefined): Promise<boole
   }
 }
 
+/** The subscriber key the host pulls Chat's events with is this assistant's own, before the host starts. */
 async function ensureGchatCredential(context: ProductionProvisionContext): Promise<void> {
   const target = context.input.runtime.secret_files.gchat_credentials;
   const contents = await readOwnerOnlyFile(target);
@@ -516,32 +509,10 @@ async function ensureGchatCredential(context: ProductionProvisionContext): Promi
   });
 }
 
-async function ensureGchatProjectNumber(
-  context: ProductionProvisionContext,
-  dependencies: ProductionProvisionDependencies,
-): Promise<void> {
-  const file = googleChatProjectNumberFile(context.input.runtime);
-  try {
-    const current = (await readOwnerOnlyFile(file)).trim();
-    if (!parseGcpProjectNumber(current)) {
-      throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
-    }
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  const number = await dependencies.getOwnedGcpProjectNumber(context.input.gcp);
-  if (!parseGcpProjectNumber(number)) {
-    throw new GwsEaError('invalid_child_output', 'Google Cloud returned an invalid project number');
-  }
-  await writePrivateTextFile(file, `${number}\n`);
-}
-
 const defaultProductionDependencies: ProductionProvisionDependencies = {
   observeCheckout: defaultObserveCheckout,
   stageRelease,
   googleCloudResources,
-  getOwnedGcpProjectNumber,
   observeOnecli: defaultObserveOnecli,
   reconcileOnecliRuntime,
   verifyOnecliRuntime,
@@ -555,10 +526,11 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
   verifyPrincipalBinding,
-  reconcilePrincipal: reconcilePrincipalDm,
+  bindPrincipal,
   verifyConversation: verifyTalkableConversation,
   managedTransportResources,
-  googleConnectionResources,
+  googleSignInResources,
+  googleAccessResources,
   sleep: delay,
 };
 
@@ -668,7 +640,7 @@ const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> 
   session_not_ready:
     "The assistant has not opened the principal's conversation yet; check the errors below, then resume.",
   welcome_not_delivered: 'The assistant has not delivered its welcome; check the errors below, then resume.',
-  later_principal_message_missing: 'Send the assistant another message in Google Chat, such as a reply to its welcome.',
+  later_principal_message_missing: "Ask the principal to reply to the assistant's welcome in Google Chat.",
   reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
 };
 
@@ -698,65 +670,65 @@ async function principalPause(
   };
 }
 
-/** A pause while the principal DM is awaited or chosen; otherwise the binding joins the run state. */
-async function principalResult(
-  context: ProductionProvisionContext,
-  result: Awaited<ReturnType<typeof reconcilePrincipalDm>>,
-): Promise<ProvisionHumanPause | undefined> {
-  if (result.status === 'waiting') {
-    return {
-      ...(await principalPause(
-        context,
-        'bind_principal',
-        'principal_dm_required',
-        'Ask the principal to send a direct message to the configured Google Chat app.',
-        `Principal: ${context.input.principalDisplayName} (not bound yet)`,
-      )),
-      settled: async () =>
-        (
-          await listPrincipalCandidates(
-            context.input.runtime,
-            {
-              adapterInstance: context.input.adapterInstance,
-              provisioningStartedAt: context.input.provisioningStartedAt,
-            },
-            context.input.principalDependencies,
-          )
-        ).length > 0,
-    };
-  }
-  if (result.status === 'selection-required') {
-    return {
-      ...humanPause(
-        'bind_principal',
-        'principal_selection_required',
-        'Select the principal direct-message conversation, then resume.',
-      ),
-      choices: result.candidates.map((candidate) => ({
-        id: candidate.messagingGroupId,
-        label: candidate.senderName ? `${candidate.senderName} (${candidate.userId})` : candidate.userId,
-      })),
-    };
-  }
-  context.state.mainAgentGroupId = result.agentGroupId;
-  context.state.principal = result.candidate;
-  context.state.welcomeEventId = result.eventId;
-  return undefined;
+/** The principal in a pause before they are bound: their name and the address the assistant opens its DM with. */
+function unboundPrincipal(input: ProductionProvisionInput): string {
+  return `Principal: ${input.principalDisplayName} (${input.principalChatEmail})`;
 }
 
+/** A pause while the principal's DM cannot be opened yet; otherwise the binding joins the run state. */
+async function principalResult(
+  context: ProductionProvisionContext,
+  result: PrincipalBindingResult,
+): Promise<ProvisionHumanPause | undefined> {
+  const name = context.input.principalDisplayName;
+  switch (result.status) {
+    case 'awaiting_acceptance':
+      return principalPause(
+        context,
+        'bind_principal',
+        'principal_chat_request_pending',
+        `${name} is outside the assistant's Google Workspace organization, so Google Chat shows them its ` +
+          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
+        unboundPrincipal(context.input),
+      );
+    case 'unavailable':
+      return principalPause(
+        context,
+        'bind_principal',
+        'google_chat_unavailable',
+        `Google Chat did not answer while the assistant opened its direct message with ${name} ` +
+          `(${result.reason}). Resume to try again.`,
+        unboundPrincipal(context.input),
+      );
+    case 'bound':
+      context.state.mainAgentGroupId = result.agentGroupId;
+      context.state.principal = result.principal;
+      context.state.welcomeEventId = result.eventId;
+      return undefined;
+    default: {
+      const unhandled: never = result;
+      throw new GwsEaError('invalid_child_output', `Unknown principal binding ${String(unhandled)}`);
+    }
+  }
+}
+
+/**
+ * Google Chat API configuration has no API (chat-configuration.ts): the
+ * assistant's name, an avatar, and a description, with interactive features
+ * off, since the assistant talks in Chat as its own account.
+ */
 function chatConfigurationPause(input: ProductionProvisionInput): ProvisionHumanPause {
   return {
     ...humanPause(
       'configure_channel',
       'chat_configuration_required',
-      "Finish this assistant's Google Chat app configuration, then confirm it.",
+      "Configure the Google Chat API for this assistant's project, then confirm it.",
     ),
     details: [
       `App name: ${input.identity.assistantDisplayName}`,
-      'Add a public HTTPS avatar URL and a short description.',
-      'Keep “Build this Chat app as a Google Workspace add-on” enabled.',
-      `Enable interactive features and 1:1 messages, then use HTTP endpoint URL ${input.runtime.endpoint_url}`,
-      'Limit visibility to the intended principal or Workspace domain.',
+      'Avatar URL: a public HTTPS image of the assistant',
+      `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
+      'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
     ],
     actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
     resumeFlag: '--chat-configured',
@@ -769,9 +741,17 @@ function bindingObservation(
 ): Observation {
   if (result.status === 'absent') return ABSENT;
   context.state.mainAgentGroupId = result.agentGroupId;
-  context.state.principal = result.candidate;
+  context.state.principal = result.principal;
   context.state.welcomeEventId = result.welcomeEventId;
   return PRESENT;
+}
+
+/** When the bind step began: every attempt binds the principal as verified then, so a retry changes nothing. */
+async function bindStepStart(context: ProductionProvisionContext): Promise<string> {
+  const journal = await readProvisionJournal(context.operation.paths, context.operation.instanceId);
+  const started = journal.steps.bind_principal?.started_at;
+  if (!started) throw new GwsEaError('step_not_started', 'The principal binding step has not started');
+  return started;
 }
 
 function conversationInput(context: ProductionProvisionContext): ConversationVerificationInput | undefined {
@@ -785,7 +765,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
     messagingGroupId: principal.messagingGroupId,
     principalUserId: principal.userId,
     adapterInstance: context.input.adapterInstance,
-    boundAt: principal.authenticatedMessageAt,
+    boundAt: principal.boundAt,
     welcomeEventId,
   };
 }
@@ -837,8 +817,6 @@ export function createProductionProvisionSteps(
         runtime: value.input.runtime,
         adapterInstance: value.input.adapterInstance,
         provisioningStartedAt: value.input.provisioningStartedAt,
-        selectedMessagingGroupId: value.input.selectedMessagingGroupId,
-        selectedCandidate: value.state.principal ?? value.input.selectedPrincipal,
       }),
     );
   /** The conversation check needs the binding, which an earlier run may have made. */
@@ -856,8 +834,8 @@ export function createProductionProvisionSteps(
       (result) => !result || result.ready || !DELIVERY_REASONS.has(result.reason),
       { intervalMs: DELIVERY_POLL_MS, limitMs: DELIVERY_WAIT_MS, sleep: dependencies.sleep },
     );
-  /** The principal's messages reach the assistant only through its host, and the connector when managed. */
-  const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
+  /** The host opens the principal's DM and pulls their messages: a pause for them needs it running. */
+  const principalPauseNeeds = ['start_nanoclaw'] as const;
 
   return {
     materialize_checkout: {
@@ -942,6 +920,21 @@ export function createProductionProvisionSteps(
         },
       ],
     },
+    configure_channel: {
+      label: 'Checking Google Chat configuration…',
+      resources: [
+        {
+          name: 'the Google Chat API configuration',
+          observe: async (value) =>
+            value.input.chatConfigured ? PRESENT : { status: 'pause', pause: chatConfigurationPause(value.input) },
+          apply: async (value) => (value.input.chatConfigured ? undefined : chatConfigurationPause(value.input)),
+        },
+      ],
+    },
+    sign_in_google: {
+      label: 'Signing the assistant in to Google…',
+      resources: dependencies.googleSignInResources(),
+    },
     start_nanoclaw: {
       label: 'Starting the assistant…',
       liveness: { label: 'Checking the assistant…' },
@@ -952,7 +945,6 @@ export function createProductionProvisionSteps(
           observe: (value) => observeInstanceHost(value, dependencies),
           apply: async (value) => {
             await ensureGchatCredential(value);
-            await ensureGchatProjectNumber(value, dependencies);
             await startInstanceHost(value, dependencies, runtime.emit);
             return undefined;
           },
@@ -1020,32 +1012,9 @@ export function createProductionProvisionSteps(
               keptAccountTokenForgotten(context),
             ],
           },
-    configure_channel: {
-      label: 'Checking Google Chat configuration…',
-      resources: [
-        {
-          name: 'the Google Chat app configuration',
-          observe: async (value) => {
-            if (!value.input.chatConfigured) return { status: 'pause', pause: chatConfigurationPause(value.input) };
-            try {
-              await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
-              return PRESENT;
-              /* eslint-disable-next-line no-catch-all/no-catch-all -- Any auth-probe failure means the external postcondition is absent. */
-            } catch {
-              return ABSENT;
-            }
-          },
-          apply: async (value) => {
-            if (!value.input.chatConfigured) return chatConfigurationPause(value.input);
-            await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
-            return undefined;
-          },
-        },
-      ],
-    },
     connect_google: {
-      label: "Connecting the assistant's Google account…",
-      resources: dependencies.googleConnectionResources(),
+      label: "Connecting agents to the assistant's Google account…",
+      resources: dependencies.googleAccessResources(),
     },
     bind_principal: {
       label: 'Connecting the principal conversation…',
@@ -1057,13 +1026,12 @@ export function createProductionProvisionSteps(
           apply: async (value) =>
             principalResult(
               value,
-              await dependencies.reconcilePrincipal(
+              await dependencies.bindPrincipal(
                 value.input.runtime,
                 {
                   adapterInstance: value.input.adapterInstance,
-                  provisioningStartedAt: value.input.provisioningStartedAt,
-                  messagingGroupId: value.input.selectedMessagingGroupId,
-                  selectedCandidate: value.input.selectedPrincipal,
+                  chatEmail: value.input.principalChatEmail,
+                  verifiedAt: await bindStepStart(value),
                 },
                 value.input.principalDependencies,
               ),
@@ -1090,7 +1058,7 @@ export function createProductionProvisionSteps(
               'verify_conversation',
               result.reason,
               CONVERSATION_PAUSES[result.reason],
-              `Bound principal: ${principal.senderName ?? value.input.principalDisplayName} (${principal.userId})`,
+              `Bound principal: ${value.input.principalDisplayName} (${principal.userId})`,
             );
             if (result.reason !== 'later_principal_message_missing') return pause;
             return {
@@ -1134,8 +1102,9 @@ export interface ProductionBootstrapManifest {
     readonly principal_timezone: string;
     /** The principal's addresses create collected: one or more, lowercased, each once. */
     readonly principal_emails: readonly string[];
+    /** The one of them the principal uses for Google Chat, which the assistant opens its DM with (KTD11). */
+    readonly principal_chat_email: string;
   };
-  readonly selected_messaging_group_id: string | null;
 }
 
 const INVALID_BOOTSTRAP = 'invalid_bootstrap_manifest';
@@ -1156,6 +1125,17 @@ function bootstrapPrincipalEmails(value: unknown): readonly string[] {
   return [...new Set(emails)];
 }
 
+function bootstrapPrincipalChatEmail(value: unknown, principalEmails: readonly string[]): string {
+  const email = typeof value === 'string' ? normalizePrincipalEmail(value) : undefined;
+  if (email === undefined || !principalEmails.includes(email)) {
+    throw new GwsEaError(
+      INVALID_BOOTSTRAP,
+      "Bootstrap principal Chat address must be one of the principal's email addresses",
+    );
+  }
+  return email;
+}
+
 export function validateProductionBootstrapManifest(value: unknown): ProductionBootstrapManifest {
   const manifest = requireRecord(value, 'Bootstrap manifest', INVALID_BOOTSTRAP);
   if (manifest.schema_version !== BOOTSTRAP_SCHEMA_VERSION) {
@@ -1173,7 +1153,7 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
     const candidate = provider[key];
     return candidate === null || candidate === undefined ? null : bootstrapString(candidate, `provider ${key}`, 512);
   };
-  const selected = manifest.selected_messaging_group_id;
+  const principalEmails = bootstrapPrincipalEmails(identity.principal_emails);
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
     node_path: requirePath(manifest.node_path, 'node_path', INVALID_BOOTSTRAP),
@@ -1196,12 +1176,9 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
       assistant_display_name: bootstrapString(identity.assistant_display_name, 'assistant display name', 120),
       principal_display_name: bootstrapString(identity.principal_display_name, 'principal display name', 120),
       principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
-      principal_emails: bootstrapPrincipalEmails(identity.principal_emails),
+      principal_emails: principalEmails,
+      principal_chat_email: bootstrapPrincipalChatEmail(identity.principal_chat_email, principalEmails),
     },
-    selected_messaging_group_id:
-      selected === null || selected === undefined
-        ? null
-        : bootstrapString(selected, 'selected messaging group ID', 512),
   };
 }
 
@@ -1308,8 +1285,6 @@ interface ProvisionSource {
   readonly identity: MainIdentityInput;
   /** The principal's name in the operator's messages. */
   readonly principalDisplayName: string;
-  /** The messaging group create's bootstrap input selected, if any. */
-  readonly bootstrapMessagingGroupId: string | null;
   /** Main's published profile, once there is one. */
   readonly profile: PersistedProfileIdentity | undefined;
 }
@@ -1348,7 +1323,6 @@ export async function resolveProvisionSource(
             }),
       },
       principalDisplayName: profile?.principal_display_name ?? identity.principal_display_name,
-      bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
   }
   const receipt = operation.paths.releasePreflightFile(operation.instanceId, reservation.deployed_commit);
@@ -1369,7 +1343,6 @@ export async function resolveProvisionSource(
       assistantWorkspaceEmail: profile.assistant_workspace_email,
     },
     principalDisplayName: profile.principal_display_name,
-    bootstrapMessagingGroupId: null,
   };
 }
 
@@ -1452,6 +1425,29 @@ export async function recordedHost(
   return dockerEndpoint ? { dockerEndpoint } : {};
 }
 
+/**
+ * The address the principal uses for Google Chat (KTD11). Create's setup file
+ * names it, but the setup file is gone once main is published, before the
+ * principal is bound, so the first run fixes it in the journal, which every
+ * later run reads.
+ */
+export async function fixPrincipalChatAddress(
+  operation: InstanceOperation,
+  journal: ProvisionJournal,
+  manifest: ProductionBootstrapManifest | undefined,
+): Promise<string> {
+  const fixed = journal.decisions.principal_chat_email;
+  if (fixed !== undefined) return fixed;
+  if (!manifest) {
+    throw new GwsEaError(
+      'bootstrap_required',
+      "The principal's Google Chat address is missing: the temporary bootstrap manifest is gone and the journal has none",
+    );
+  }
+  await recordPrincipalChatAddress(operation, manifest.identity.principal_chat_email);
+  return manifest.identity.principal_chat_email;
+}
+
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
@@ -1459,21 +1455,13 @@ export async function runProductionProvision(
 ): Promise<ProvisionResult> {
   const { interaction, managedIngress } = options;
   const provisionRuntime = options.runtime ?? {};
-  const selectedMessagingGroupId = interaction?.decisions.messagingGroupId;
   const journal = interaction?.decisions.chatConfigured
     ? await recordChatConfigurationConfirmed(operation)
     : await readProvisionJournal(operation.paths, operation.instanceId);
   const provisioningStartedAt = journal.started_at;
-  const selectedPrincipal = journal.decisions.principal;
-  if (
-    selectedPrincipal &&
-    selectedMessagingGroupId !== undefined &&
-    selectedPrincipal.messagingGroupId !== selectedMessagingGroupId
-  ) {
-    throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
-  }
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const { manifest, runtime: persistedRuntime } = await readInstanceState(operation.paths, reservation);
+  const principalChatEmail = await fixPrincipalChatAddress(operation, journal, manifest);
   let runtime: InstanceRuntimeConfig;
   let onecli: OnecliRuntimeLayout;
   if (persistedRuntime) {
@@ -1492,9 +1480,7 @@ export async function runProductionProvision(
   }
   const source = await resolveProvisionSource(operation, reservation, runtime, manifest);
   const state = hydrateMainState(source.profile);
-  // The fixed principal's conversation wins, then this run's selection, then create's.
-  const messagingGroupId =
-    selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? source.bootstrapMessagingGroupId;
+  const billingAccount = interaction?.decisions.billingAccount;
   const context: ProductionProvisionContext = {
     operation,
     state,
@@ -1517,6 +1503,7 @@ export async function runProductionProvision(
         serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
         credentialFile: runtime.secret_files.gchat_credentials,
         cwd: runtime.instance_root,
+        ...(billingAccount ? { billingAccount } : {}),
       },
       providerCredentialMetadata: source.providerCredentialMetadata,
       ...(manifest && interaction
@@ -1530,11 +1517,10 @@ export async function runProductionProvision(
         : {}),
       identity: source.identity,
       principalDisplayName: source.principalDisplayName,
+      principalChatEmail,
       adapterInstance: 'gchat',
       provisioningStartedAt,
       chatConfigured: journal.decisions.chat_configuration_confirmed_at !== undefined,
-      ...(messagingGroupId ? { selectedMessagingGroupId: messagingGroupId } : {}),
-      ...(selectedPrincipal ? { selectedPrincipal } : {}),
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
@@ -1543,12 +1529,6 @@ export async function runProductionProvision(
         platform: manifest?.platform ?? instanceServicePlatform(),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,
-      },
-      principalDependencies: {
-        persistSelection: async (candidate) => {
-          await recordPrincipalSelection(operation, candidate);
-          return candidate;
-        },
       },
       hostStatus: options.hostStatus,
       ingress: reservation.exclusive_resource_claims.ingress,

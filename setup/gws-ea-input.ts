@@ -2,7 +2,10 @@ import * as p from '@clack/prompts';
 
 import {
   describeSecretInput,
+  parsePrincipalChatEmail,
+  PRINCIPAL_CHAT_EMAIL_FLAG,
   PRINCIPAL_EMAIL_FLAG,
+  principalChatEmailProblem,
   type CloudflareZoneChoice,
   type CreateIngressAnswer,
   type CreateInputFlag,
@@ -219,6 +222,24 @@ function principalEmailsFrom(value: string, assistant: string): { emails: string
     if (!emails.includes(email)) emails.push(email);
   }
   return { emails };
+}
+
+/**
+ * Which of the principal's addresses they use for Google Chat, the one the
+ * assistant opens its DM with (KTD11): their only address, or the one named
+ * by flag or asked for, prefilled with their first. It must be one of theirs.
+ */
+async function principalChatEmailInput(source: InputSource, principalEmails: readonly string[]): Promise<string> {
+  const [first, ...others] = principalEmails;
+  if (first === undefined) throw new GwsEaError('input_required', "The principal's addresses are missing");
+  const answer =
+    others.length === 0 && supplied(source, PRINCIPAL_CHAT_EMAIL_FLAG) === undefined
+      ? first
+      : await textInput(source, PRINCIPAL_CHAT_EMAIL_FLAG, 'Principal Google Chat address', {
+          initialValue: first,
+          validate: (value) => principalChatEmailProblem(value, principalEmails),
+        });
+  return parsePrincipalChatEmail(answer, principalEmails);
 }
 
 function systemTimezone(): string {
@@ -471,6 +492,7 @@ export async function collectGwsEaCreateInput(
     validate: workspaceEmailProblem,
   });
   const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
+  const principalChatEmail = await principalChatEmailInput(source, principalEmails);
   const ingress = await collectIngress(source, assistantFirst);
   const provider = await chooseProvider(providers, source);
   const metadata = provider.provisioning.credentialMetadata({ allowAmbientConfiguration: false });
@@ -501,8 +523,8 @@ export async function collectGwsEaCreateInput(
         principal_display_name: displayName(principalFirst, principalLast),
         principal_timezone: principalTimezone,
         principal_emails: principalEmails,
+        principal_chat_email: principalChatEmail,
       },
-      selected_messaging_group_id: null,
     },
   };
 }

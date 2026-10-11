@@ -33,9 +33,10 @@ import {
   type InstanceServicePlatform,
 } from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
-import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
+import { deriveGcpProjectId } from './gcloud.js';
 import { assertInstanceId } from './registry.js';
 import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
+import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
@@ -47,6 +48,7 @@ const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';
 const INVALID_RUNTIME = 'invalid_runtime_config';
 
 export interface InstanceSecretFiles {
+  /** The Chat subscriber account's JSON key, which the host pulls Chat's events with (KTD6). */
   readonly gchat_credentials: string;
   readonly onecli_runtime_api_key: string;
   readonly onecli_admin_api_key: string;
@@ -182,10 +184,6 @@ function expectedSecretFiles(instanceRoot: string): InstanceSecretFiles {
   };
 }
 
-export function googleChatProjectNumberFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
-  return path.join(path.dirname(config.secret_files.gchat_credentials), 'gchat-project-number');
-}
-
 /** The assistant's Google sign-in, which the host refreshes (KTD2). */
 export function googleGrantFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
   return path.join(path.dirname(config.secret_files.gchat_credentials), GOOGLE_GRANT_FILE_NAME);
@@ -318,7 +316,6 @@ export const INSTANCE_HOST_ENV_KEYS = [
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
   'ONECLI_URL',
-  'GCHAT_ENDPOINT_URL',
 ] as const;
 
 type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
@@ -335,7 +332,6 @@ export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readon
     NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
     ONECLI_URL: config.onecli_app_url,
-    GCHAT_ENDPOINT_URL: config.endpoint_url,
   };
 }
 
@@ -739,6 +735,13 @@ export function buildInstanceCliCommand(
   };
 }
 
+/**
+ * The host's environment. Chat delivery reaches it as the owner-only path of
+ * the subscriber key and the assistant's project, from which the host names
+ * its topic and pull subscription (KTD6): the key itself never enters an
+ * environment. The project is the one create reserved, named from the
+ * instance ID.
+ */
 async function buildInstanceHostEnvironment(
   configInput: InstanceRuntimeConfig,
   containerImage: string,
@@ -746,25 +749,22 @@ async function buildInstanceHostEnvironment(
 ): Promise<Record<string, string>> {
   const config = validateRuntimeConfig(configInput);
   await assertPrivateDirectory(path.dirname(config.secret_files.gchat_credentials));
-  const [gchatCredentials, onecliRuntimeApiKey, projectNumberFile] = await Promise.all([
+  const [subscriberKey, onecliRuntimeApiKey] = await Promise.all([
     readOwnerOnlyFile(config.secret_files.gchat_credentials),
     readOwnerOnlyFile(config.secret_files.onecli_runtime_api_key),
-    readOwnerOnlyFile(googleChatProjectNumberFile(config)),
   ]);
-  if (!gchatCredentials.trim() || !onecliRuntimeApiKey.trim()) {
+  if (!subscriberKey.trim() || !onecliRuntimeApiKey.trim()) {
     throw new GwsEaError('invalid_secret', 'A required instance host credential is empty');
   }
-  const projectNumber = parseGcpProjectNumber(projectNumberFile.trim());
-  if (!projectNumber) throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
   return buildHostEnvironment(ambient, {
     HOME: config.home_directory,
     DOCKER_HOST: config.docker_endpoint,
     ...instanceHostConfiguration(config),
     CONTAINER_IMAGE: containerImage,
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
-    GCHAT_CREDENTIALS: gchatCredentials,
-    GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: deriveWorkspaceAddOnIdentity(projectNumber),
     [GOOGLE_GRANT_FILE_ENV]: googleGrantFile(config),
+    [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: config.secret_files.gchat_credentials,
+    [GCHAT_PROJECT_ID_ENV]: deriveGcpProjectId(config.instance_id),
   });
 }
 

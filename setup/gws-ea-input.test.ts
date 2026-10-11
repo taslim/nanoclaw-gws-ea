@@ -56,7 +56,8 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('America/Los_Angeles')
-      .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test');
+      .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test')
+      .mockResolvedValueOnce(' T@Other.test');
     const select = vi.fn();
     const discoverZones = vi.fn();
 
@@ -91,12 +92,25 @@ describe('GWS-EA interactive create input', () => {
 
     expect(select).not.toHaveBeenCalled();
     expect(discoverZones).not.toHaveBeenCalled();
-    expect(text).toHaveBeenCalledTimes(6);
+    expect(text).toHaveBeenCalledTimes(7);
     expect(text).toHaveBeenNthCalledWith(
       5,
       expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
     );
     expect(text).toHaveBeenNthCalledWith(6, expect.objectContaining({ message: 'Principal email addresses' }));
+    // Which of them the principal uses for Google Chat, prefilled with the first; it must be one of theirs.
+    expect(text).toHaveBeenNthCalledWith(
+      7,
+      expect.objectContaining({
+        message: 'Principal Google Chat address',
+        initialValue: 'morgan@example.test',
+      }),
+    );
+    const [{ validate }] = text.mock.calls[6] as [{ validate: (value: string) => string | undefined }];
+    expect(validate('remy.vance@example.test')).toBe(
+      "Use one of the principal's addresses: morgan@example.test, t@other.test",
+    );
+    expect(validate('T@other.test')).toBeUndefined();
     expect(result).toEqual({
       ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
       assistantWorkspaceEmail: 'ada@example.test',
@@ -123,8 +137,8 @@ describe('GWS-EA interactive create input', () => {
           principal_display_name: 'Morgan',
           principal_timezone: 'America/Los_Angeles',
           principal_emails: ['morgan@example.test', 't@other.test'],
+          principal_chat_email: 't@other.test',
         },
-        selected_messaging_group_id: null,
       },
     });
   });
@@ -554,8 +568,39 @@ describe('GWS-EA unattended create input', () => {
       principal_display_name: 'Morgan Ellery',
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['morgan@example.test'],
+      // Their only address is the one the assistant opens its DM with.
+      principal_chat_email: 'morgan@example.test',
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
+  });
+
+  it("takes the principal's Google Chat address from its flag, as one of their addresses", async () => {
+    const emails = ['morgan@example.test', 'morgan@home.example.test'];
+
+    const result = await unattended(
+      { ...FLAGS, 'principal-chat-email': 'Morgan@Home.example.test' },
+      NO_SECRETS,
+      {},
+      emails,
+    );
+
+    expect(result.bootstrapManifest.identity).toMatchObject({
+      principal_emails: emails,
+      principal_chat_email: 'morgan@home.example.test',
+    });
+  });
+
+  it('names --principal-chat-email when the principal has several addresses and none is named', async () => {
+    await expect(
+      unattended(FLAGS, NO_SECRETS, {}, ['morgan@example.test', 'morgan@home.example.test']),
+    ).rejects.toMatchObject({ code: 'input_required', message: expect.stringContaining('--principal-chat-email') });
+  });
+
+  it("refuses a Google Chat address that is not one of the principal's", async () => {
+    await expect(unattended({ ...FLAGS, 'principal-chat-email': 'remy.vance@example.test' })).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: "--principal-chat-email: Use one of the principal's addresses: morgan@example.test",
+    });
   });
 
   it("holds the principal's timezone in the zone's own spelling, which a container's TZ reads", async () => {

@@ -7,13 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NanoclawServiceHelpers } from './service-control.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
-import {
-  readProvisionJournal,
-  recordPrincipalSelection,
-  reserveInstance,
-  withInstanceOperation,
-  type InstanceOperation,
-} from './journal.js';
+import { readProvisionJournal, reserveInstance, withInstanceOperation, type InstanceOperation } from './journal.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
@@ -28,6 +22,7 @@ import {
 } from './phases.js';
 import {
   createProductionProvisionSteps,
+  fixPrincipalChatAddress,
   installProductionBootstrapManifest,
   loadProductionBootstrapManifest,
   removeProductionBootstrapManifest,
@@ -52,7 +47,6 @@ import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
-  googleChatProjectNumberFile,
   instanceHostConfiguration,
   instanceServiceDefinitionFile,
   loadInstanceRuntimeConfig,
@@ -184,8 +178,8 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       principal_display_name: 'Principal',
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['principal@example.test'],
+      principal_chat_email: 'principal@example.test',
     },
-    selected_messaging_group_id: null,
   };
 }
 
@@ -196,8 +190,8 @@ afterEach(async () => {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_dm_required',
-  message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+  code: 'principal_chat_request_pending',
+  message: "Juno Hale must accept the assistant's chat request in Google Chat, then resume.",
 };
 
 /** An in-memory world of named resources for exercising the step engine. */
@@ -270,9 +264,10 @@ function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'):
     provision_gcp: step('provision_gcp'),
     start_onecli: runtime('start_onecli'),
     configure_provider: step('configure_provider'),
+    configure_channel: step('configure_channel'),
+    sign_in_google: step('sign_in_google'),
     start_nanoclaw: runtime('start_nanoclaw'),
     establish_transport: ingress === 'managed' ? runtime('establish_transport') : step('establish_transport'),
-    configure_channel: step('configure_channel'),
     connect_google: step('connect_google'),
     bind_principal: step('bind_principal', { pauseNeeds: principalPauseNeeds }),
     verify_conversation: step('verify_conversation', { pauseNeeds: principalPauseNeeds }),
@@ -596,8 +591,13 @@ describe('step engine', () => {
 
   it('checks completed runtime steps once per run, waiting on one that is still starting', async () => {
     const engine = await engineFixture();
-    const chat: ProvisionHumanPause = { ...DM_PAUSE, phase: 'configure_channel', code: 'chat_configuration_required' };
-    engine.world.pauseOnApply.set('configure_channel', chat);
+    // A pause after the host has started, so the next run re-checks both runtimes first.
+    const route: ProvisionHumanPause = {
+      ...DM_PAUSE,
+      phase: 'establish_transport',
+      code: 'existing_endpoint_required',
+    };
+    engine.world.pauseOnApply.set('establish_transport', route);
     await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
 
     engine.world.pauseOnApply.clear();
@@ -729,6 +729,62 @@ describe('production bootstrap trust boundary', () => {
         message: expect.stringMatching(/principal email/i),
       });
     }
+  });
+
+  it("keeps the principal's Google Chat address only as one of their addresses", async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    const manifest = bootstrapManifest(paths);
+    const load = async (principalChatEmail: unknown) => {
+      await writeFile(
+        file,
+        JSON.stringify({
+          ...manifest,
+          identity: {
+            ...manifest.identity,
+            principal_emails: ['principal@example.test', 'second@example.test'],
+            principal_chat_email: principalChatEmail,
+          },
+        }),
+        { mode: 0o600 },
+      );
+      return loadProductionBootstrapManifest(file);
+    };
+
+    await expect(load('Second@Example.test')).resolves.toMatchObject({
+      identity: { principal_chat_email: 'second@example.test' },
+    });
+    for (const invalid of [undefined, 'colleague@example.test', 'not-an-email', ['principal@example.test']]) {
+      await expect(load(invalid), JSON.stringify(invalid)).rejects.toMatchObject({
+        code: 'invalid_bootstrap_manifest',
+        message: expect.stringMatching(/Chat address/u),
+      });
+    }
+  });
+
+  it("fixes the principal's Chat address in the journal while create's setup file holds it, and reads it from there after", async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+    const manifest = {
+      ...bootstrapManifest(paths),
+      identity: {
+        ...bootstrapManifest(paths).identity,
+        principal_emails: ['principal@example.test', 'second@example.test'],
+        principal_chat_email: 'second@example.test',
+      },
+    };
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const journal = await readProvisionJournal(paths, reserved.instance_id);
+      await expect(fixPrincipalChatAddress(operation, journal, undefined)).rejects.toMatchObject({
+        code: 'bootstrap_required',
+      });
+      await expect(fixPrincipalChatAddress(operation, journal, manifest)).resolves.toBe('second@example.test');
+      // Main is published and the setup file is gone: the journal still holds it.
+      const fixed = await readProvisionJournal(paths, reserved.instance_id);
+      expect(fixed.decisions.principal_chat_email).toBe('second@example.test');
+      await expect(fixPrincipalChatAddress(operation, fixed, undefined)).resolves.toBe('second@example.test');
+    });
   });
 
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
@@ -944,6 +1000,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
       },
       principalDisplayName: 'Principal',
+      principalChatEmail: 'principal@example.test',
       adapterInstance: 'gchat',
       provisioningStartedAt: '2026-09-18T18:00:00.000Z',
       chatConfigured: false,
@@ -1178,8 +1235,9 @@ describe('production provision step composition', () => {
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const steps = createProductionProvisionSteps(productionContext(operation, reserved));
       expect(PROVISION_STEPS.filter((id) => steps[id].liveness)).toEqual(runtime);
-      expect(steps.bind_principal.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
-      expect(steps.verify_conversation.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
+      // Chat's events are pulled by the host, so the principal's pauses need only the host.
+      expect(steps.bind_principal.pauseNeeds).toEqual(['start_nanoclaw']);
+      expect(steps.verify_conversation.pauseNeeds).toEqual(['start_nanoclaw']);
       expect(steps.configure_channel.pauseNeeds).toBeUndefined();
     });
   });
@@ -1688,51 +1746,56 @@ describe('production provision step composition', () => {
     expect(managedTransportResources).not.toHaveBeenCalled();
   });
 
-  it('pauses with the exact project-scoped Chat configuration handoff', async () => {
+  it("pauses for the Chat API configuration: the assistant's name, avatar, and description, with interactive features off", async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation());
+    const reserved = await reserveInstance(paths, managedReservation());
     const verifyRoute = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
       const phase = createProductionProvisionSteps(context, { verifyRoute }).configure_channel.resources[0]!;
 
-      await expect(phase.observe(context)).resolves.toMatchObject({
+      const observed = await phase.observe(context);
+      expect(observed).toEqual({
         status: 'pause',
         pause: {
+          kind: 'human-action',
+          phase: 'configure_channel',
           code: 'chat_configuration_required',
+          message: "Configure the Google Chat API for this assistant's project, then confirm it.",
           details: [
             'App name: Aya',
-            expect.stringContaining('avatar'),
-            expect.stringContaining('Google Workspace add-on'),
-            expect.stringContaining('https://assistant.example.com/webhook/gchat'),
-            expect.stringContaining('visibility'),
+            'Avatar URL: a public HTTPS image of the assistant',
+            'Description: a short line, such as "Executive assistant to Principal"',
+            'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
           ],
           actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
           resumeFlag: '--chat-configured',
         },
       });
+      // No endpoint, callback, or add-on: Chat's events are pulled.
+      const shown = JSON.stringify(observed);
+      expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
+      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
     });
 
     expect(verifyRoute).not.toHaveBeenCalled();
   });
 
-  it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
+  it("takes the operator's confirmation as the Chat configuration, probing no route", async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation());
+    const reserved = await reserveInstance(paths, reservation());
+    const verifyRoute = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = { ...base, input: { ...base.input, chatConfigured: true } };
+      const phase = createProductionProvisionSteps(context, { verifyRoute }).configure_channel.resources[0]!;
 
-      expect(context.input.runtime.endpoint_url).toBe('https://assistant.example.com/webhook/gchat');
-      await expect(phase.observe(context)).resolves.toMatchObject({
-        status: 'pause',
-        pause: {
-          details: expect.arrayContaining([expect.stringContaining('https://assistant.example.com/webhook/gchat')]),
-        },
-      });
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
     });
+
+    expect(verifyRoute).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1846,7 +1909,6 @@ describe('production provision step composition', () => {
         const step = createProductionProvisionSteps(
           context,
           {
-            getOwnedGcpProjectNumber: async () => '441811502258',
             reconcileInstanceRuntime,
             instanceServicePid: async () => undefined,
             findPortHolder,
@@ -1903,7 +1965,6 @@ describe('production provision step composition', () => {
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       const findPortHolder = vi.fn(async () => ({ pid: 5150, command: 'python3' }));
       const host = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
         reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
         instanceServicePid: async () => undefined,
         findPortHolder,
@@ -1942,7 +2003,6 @@ describe('production provision step composition', () => {
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       const host = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
         reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
         // The host's own process holds its port: that is not a conflict.
         findPortHolder: async () => ({ pid: 4242, command: 'node' }),
@@ -1990,7 +2050,6 @@ describe('production provision step composition', () => {
       const reconcileMainIdentity = vi.fn();
       const events: RunEvent[] = [];
       const step = createProductionProvisionSteps(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
         reconcileInstanceRuntime,
         reconcileMainIdentity,
         // The service runs a process while the host starts; its socket opens after `host` more looks.
@@ -2107,7 +2166,6 @@ describe('create on the release layout', () => {
         const context = contextOf(operation);
         const steps = createProductionProvisionSteps(context, {
           stageRelease: (request) => stageRelease(request, staging.seams),
-          getOwnedGcpProjectNumber: async () => '441811502258',
         });
         return { value: await use(steps, context, operation) };
       });
@@ -2274,13 +2332,13 @@ interface ProductionHarness {
   providerCredential: boolean;
   routePublished: boolean;
   chatConfigured: boolean;
-  principal: 'waiting' | 'selection' | 'bound';
-  selectedMessagingGroupId?: string;
+  /** What opening the principal's DM finds: they have not accepted it yet, Google does not answer, or it opens. */
+  principal: 'awaiting_acceptance' | 'unavailable' | 'bound';
+  /** The address each bind opened the DM with, and the moment it bound them at. */
+  readonly binds: Array<{ readonly chatEmail: string; readonly verifiedAt: string }>;
   conversationReady: boolean;
   /** Not-ready answers the conversation check gives first, before `conversationReady` decides. */
   conversationReasons: ConversationNotReadyReason[];
-  /** Rows `ncl dropped-messages list` returns: authenticated first DMs awaiting a principal. */
-  droppedMessages: unknown[];
   /** The process dies right after the principal is bound, before the step completes. */
   crashAfterBinding: boolean;
   lastContext?: ProductionProvisionContext;
@@ -2289,11 +2347,8 @@ interface ProductionHarness {
 
 const PRINCIPAL = {
   messagingGroupId: 'mg-principal',
-  platformId: 'gchat:spaces/principal',
-  userId: 'gchat:users/principal',
-  senderName: 'Principal',
-  authenticatedMessageId: 'signed-first-dm',
-  authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
+  platformId: 'gchat:spaces/dm-2001',
+  userId: 'gchat:users/2001',
 } as const;
 
 /**
@@ -2332,7 +2387,8 @@ async function productionHarness(): Promise<ProductionHarness> {
   await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
   const resources = new Set<string>();
   const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
-  let principalBound = false;
+  /** When the principal was bound; undefined until they are. */
+  let boundAt: string | undefined;
 
   const harness: ProductionHarness = {
     paths,
@@ -2344,35 +2400,21 @@ async function productionHarness(): Promise<ProductionHarness> {
     providerCredential: true,
     routePublished: true,
     chatConfigured: true,
-    principal: 'waiting',
+    principal: 'awaiting_acceptance',
+    binds: [],
     conversationReady: true,
     conversationReasons: [],
-    droppedMessages: [],
     run: () =>
       withInstanceOperation(paths, reserved.instance_id, async (operation) => {
         const base = productionContext(operation, reserved);
-        // As `runProductionProvision` does, a principal an earlier run fixed is this run's selection.
-        const { principal: selectedPrincipal } = (await readProvisionJournal(paths, reserved.instance_id)).decisions;
         const context: ProductionProvisionContext = {
           ...base,
           state: {},
           input: {
             ...base.input,
             ...(harness.providerCredential ? {} : { requestProviderCredential: undefined }),
-            ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
-            ...(selectedPrincipal ? { selectedPrincipal } : {}),
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
-            principalDependencies: {
-              runNcl: async (_config, args) => {
-                if (args[0] !== 'dropped-messages') throw new Error(`Unexpected ncl ${args.join(' ')}`);
-                return { ok: true, data: harness.droppedMessages };
-              },
-              persistSelection: async (candidate) => {
-                await recordPrincipalSelection(operation, candidate);
-                return candidate;
-              },
-            },
             hostStatus: {
               queryHost: async () => {
                 if (resources.has('host')) return hostStatusOf(reserved);
@@ -2408,12 +2450,22 @@ async function productionHarness(): Promise<ProductionHarness> {
               },
             },
           ],
-          getOwnedGcpProjectNumber: async () => '441811502258',
-          googleConnectionResources: () => [
+          googleSignInResources: () => [
             {
-              name: "the assistant's Google account",
+              name: "the assistant's Google sign-in",
+              observe: async () => (resources.has('sign-in') ? PRESENT : ABSENT),
+              apply: async () => {
+                effect('signInGoogle', 'sign-in');
+                return undefined;
+              },
+            },
+          ],
+          googleAccessResources: () => [
+            {
+              name: "agents' Google access",
               observe: async () => (resources.has('google') ? PRESENT : ABSENT),
               apply: async () => {
+                if (!resources.has('host')) throw new Error("Agents' access is published by the running host");
                 effect('connectGoogle', 'google');
                 return undefined;
               },
@@ -2441,6 +2493,7 @@ async function productionHarness(): Promise<ProductionHarness> {
             return PRESENT;
           },
           reconcileInstanceRuntime: async () => {
+            if (!resources.has('sign-in')) throw new Error('The host talks in Chat as the assistant from its start');
             effect('reconcileInstanceRuntime', 'host');
             return { pid: 4242 } as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
           },
@@ -2453,28 +2506,35 @@ async function productionHarness(): Promise<ProductionHarness> {
             if (!harness.routePublished) throw new GwsEaError('endpoint_unreachable', 'Route is not published');
             return endpointUrl;
           },
-          // Like `verifyPrincipalBinding`, the binding is found only for the candidate it is asked about.
-          verifyPrincipalBinding: ({ selectedCandidate }) =>
-            principalBound && selectedCandidate?.messagingGroupId === PRINCIPAL.messagingGroupId
-              ? { status: 'matched', agentGroupId: 'ag-main', candidate: selectedCandidate, welcomeEventId: 'welcome' }
-              : { status: 'absent' },
-          reconcilePrincipal: async (_runtime, selection, dependencies) => {
-            harness.effects.push(`reconcilePrincipalDm:${harness.principal}`);
-            if (harness.principal === 'waiting') return { status: 'waiting' };
-            if (harness.principal === 'selection' && !selection.messagingGroupId) {
-              return {
-                status: 'selection-required',
-                candidates: [PRINCIPAL, { ...PRINCIPAL, messagingGroupId: 'mg-other', userId: 'gchat:users/other' }],
-              };
+          verifyPrincipalBinding: () =>
+            boundAt === undefined
+              ? { status: 'absent' }
+              : {
+                  status: 'matched',
+                  agentGroupId: 'ag-main',
+                  principal: { ...PRINCIPAL, boundAt },
+                  welcomeEventId: 'welcome',
+                },
+          bindPrincipal: async (_runtime, input) => {
+            harness.effects.push(`bindPrincipal:${harness.principal}`);
+            harness.binds.push({ chatEmail: input.chatEmail, verifiedAt: input.verifiedAt });
+            if (harness.principal === 'awaiting_acceptance') {
+              return { status: 'awaiting_acceptance', space: 'spaces/dm-2001' };
             }
-            // Like `reconcilePrincipalDm`, a newly chosen principal is fixed before it is bound.
-            if (!selection.selectedCandidate) await dependencies?.persistSelection?.(PRINCIPAL);
-            principalBound = true;
+            if (harness.principal === 'unavailable') {
+              return { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' };
+            }
+            boundAt = input.verifiedAt;
             if (harness.crashAfterBinding) {
               harness.crashAfterBinding = false;
               throw new Error('The process died after binding the principal');
             }
-            return { status: 'bound', candidate: PRINCIPAL, agentGroupId: 'ag-main', eventId: 'welcome' };
+            return {
+              status: 'bound',
+              principal: { ...PRINCIPAL, boundAt },
+              agentGroupId: 'ag-main',
+              eventId: 'welcome',
+            };
           },
           sleep: async (milliseconds) => void harness.sleeps.push(milliseconds),
           verifyConversation: () =>
@@ -2518,19 +2578,20 @@ describe('production step order and pause outcomes', () => {
     'provision_gcp',
     'start_onecli',
     'configure_provider',
+    'configure_channel',
+    'sign_in_google',
     'start_nanoclaw',
     'establish_transport',
-    'configure_channel',
     'connect_google',
     'bind_principal',
   ];
 
-  it('runs the steps in order and pauses for the principal DM, then for a selection, then completes', async () => {
+  it("signs in before the host starts, connects agents' access after it, then binds the principal through the DM the assistant opens", async () => {
     const harness = await productionHarness();
 
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
+      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
@@ -2538,25 +2599,12 @@ describe('production step order and pause outcomes', () => {
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
+      'signInGoogle',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
-      'reconcilePrincipalDm:waiting',
+      'bindPrincipal:awaiting_acceptance',
     ]);
-
-    harness.principal = 'selection';
-    await expect(harness.run()).resolves.toMatchObject({
-      status: 'paused',
-      pause: {
-        phase: 'bind_principal',
-        code: 'principal_selection_required',
-        choices: [{ id: 'mg-principal' }, { id: 'mg-other' }],
-      },
-    });
-
-    expect(await readFile(googleChatProjectNumberFile(harness.lastContext!.input.runtime), 'utf8')).toBe(
-      '441811502258\n',
-    );
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -2565,24 +2613,30 @@ describe('production step order and pause outcomes', () => {
     ).resolves.toContain('"providerCredential"');
 
     harness.principal = 'bound';
-    harness.selectedMessagingGroupId = 'mg-principal';
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
     expect(harness.sleeps).toEqual([]);
-    expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
+    expect(harness.effects.filter((effect) => !effect.startsWith('bindPrincipal'))).toEqual([
       'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
+      'signInGoogle',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
+    ]);
+    // One address, the one create named; every attempt binds at the moment the step began.
+    const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
+    expect(harness.binds).toEqual([
+      { chatEmail: 'principal@example.test', verifiedAt: began },
+      { chatEmail: 'principal@example.test', verifiedAt: began },
     ]);
   });
 
   const blockers: ReadonlyArray<readonly [ProvisionStepId, string, (harness: ProductionHarness) => void]> = [
     ['configure_provider', 'provider_credential_required', (harness) => void (harness.providerCredential = false)],
-    ['establish_transport', 'existing_endpoint_required', (harness) => void (harness.routePublished = false)],
     ['configure_channel', 'chat_configuration_required', (harness) => void (harness.chatConfigured = false)],
+    ['establish_transport', 'existing_endpoint_required', (harness) => void (harness.routePublished = false)],
   ];
 
   it.each(blockers)('pauses at %s with %s and continues once the person acts', async (step, code, block) => {
@@ -2597,8 +2651,54 @@ describe('production step order and pause outcomes', () => {
     harness.chatConfigured = true;
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
+      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
     });
+  });
+
+  it('starts no host before the Chat API is configured', async () => {
+    const harness = await productionHarness();
+    harness.chatConfigured = false;
+
+    await harness.run();
+
+    expect(harness.effects).not.toContain('signInGoogle');
+    expect(harness.effects).not.toContain('reconcileInstanceRuntime');
+  });
+
+  it('says a principal outside the organization must accept the request, and binds them once they do', async () => {
+    const harness = await productionHarness();
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'bind_principal',
+      code: 'principal_chat_request_pending',
+      message:
+        "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
+        'direct message as a request. Ask them to accept it in Google Chat, then resume.',
+    });
+    expect(paused.pause.details?.[0]).toBe('Principal: Principal (principal@example.test)');
+
+    harness.principal = 'bound';
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+  });
+
+  it('pauses with the error when Google stays unavailable, trying no other address, and binds once it answers', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'unavailable';
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'bind_principal',
+      code: 'google_chat_unavailable',
+      message:
+        'Google Chat did not answer while the assistant opened its direct message with Principal ' +
+        '(Google refused /v1/spaces:setup: Backend error). Resume to try again.',
+    });
+    expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test']);
+
+    harness.principal = 'bound';
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    expect(new Set(harness.binds.map((bind) => bind.chatEmail))).toEqual(new Set(['principal@example.test']));
   });
 
   it('resumes after the principal was bound but before the step completed, without binding again', async () => {
@@ -2608,7 +2708,7 @@ describe('production step order and pause outcomes', () => {
 
     await expect(harness.run()).rejects.toThrow('The process died after binding the principal');
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
-    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+    expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 
   /** A NanoClaw log line as the host writes it: local time of day, colored level and message. */
@@ -2635,8 +2735,8 @@ describe('production step order and pause outcomes', () => {
       status: 'paused',
       pause: {
         phase: 'bind_principal',
-        code: 'principal_dm_required',
-        details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`],
+        code: 'principal_chat_request_pending',
+        details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
       },
     });
 
@@ -2655,7 +2755,7 @@ describe('production step order and pause outcomes', () => {
     const details = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
     const stamp = logLine(after, 'WARN', '').slice(0, 14);
     expect(details.pause.details).toEqual([
-      'Principal: Principal (not bound yet)',
+      'Principal: Principal (principal@example.test)',
       `Errors logged since ${began} in ${errorLog}:`,
       `  ${stamp} WARN Google Chat request rejected authorization="Bearer [REDACTED]"`,
       '      at verifyRequest (gchat.js:1:1)',
@@ -2675,7 +2775,9 @@ describe('production step order and pause outcomes', () => {
     );
 
     await expect(harness.run()).resolves.toMatchObject({
-      pause: { details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`] },
+      pause: {
+        details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
+      },
     });
   });
 
@@ -2695,7 +2797,7 @@ describe('production step order and pause outcomes', () => {
     const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
     expect(paused.pause).toMatchObject({ phase: 'verify_conversation', code: 'later_principal_message_missing' });
     expect(paused.pause.details).toEqual([
-      'Bound principal: Principal (gchat:users/principal)',
+      'Bound principal: Principal (gchat:users/2001)',
       `Errors logged since ${began} in ${errorLog}:`,
       `  ${logLine(new Date(start + 1_000), 'ERROR', '').slice(0, 14)} ERROR Delivery failed`,
     ]);
@@ -2711,7 +2813,7 @@ describe('production step order and pause outcomes', () => {
     expect(paused.pause).toMatchObject({
       phase: 'verify_conversation',
       code: 'later_principal_message_missing',
-      message: 'Send the assistant another message in Google Chat, such as a reply to its welcome.',
+      message: "Ask the principal to reply to the assistant's welcome in Google Chat.",
     });
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
 
@@ -2736,34 +2838,6 @@ describe('production step order and pause outcomes', () => {
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(30);
   });
 
-  it('watches for the principal DM without binding anything', async () => {
-    const harness = await productionHarness();
-
-    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
-    expect(paused.pause).toMatchObject({ phase: 'bind_principal', code: 'principal_dm_required' });
-    await expect(paused.pause.settled?.()).resolves.toBe(false);
-
-    const provisioningStartedAt = harness.lastContext!.input.provisioningStartedAt;
-    harness.droppedMessages = [
-      {
-        channel_type: 'gchat',
-        instance: harness.lastContext!.input.adapterInstance,
-        reason: 'no_agent_wired',
-        sender_authenticated: 1,
-        sender_kind: 'human',
-        is_group: 0,
-        authenticated_message_at: new Date(new Date(provisioningStartedAt).getTime() + 1_000).toISOString(),
-        authenticated_message_id: 'message-1',
-        messaging_group_id: 'mg-principal',
-        platform_id: 'gchat:spaces/principal',
-        user_id: 'gchat:users/principal',
-        sender_name: 'Principal',
-      },
-    ];
-    await expect(paused.pause.settled?.()).resolves.toBe(true);
-    expect(harness.effects.filter((effect) => effect.startsWith('reconcilePrincipalDm'))).toHaveLength(1);
-  });
-
   it('pauses at verify_conversation until a later principal message is answered', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
@@ -2776,6 +2850,6 @@ describe('production step order and pause outcomes', () => {
 
     harness.conversationReady = true;
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
-    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+    expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 });

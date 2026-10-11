@@ -128,14 +128,30 @@ export async function withGoogleSignIn<T>(
   }
 }
 
-/** Human decisions supplied on re-entry; the engine persists them. */
+/** Human decisions supplied on re-entry. */
 export interface HumanDecisions {
-  /** `--chat-configured`: the operator finished the Google Chat app configuration. */
+  /** `--chat-configured`: the operator finished the Google Chat API configuration. */
   readonly chatConfigured: boolean;
-  /** `--messaging-group-id`: the principal conversation the operator chose. */
-  readonly messagingGroupId?: string;
   /** `--google-client-file`: the Desktop OAuth client the operator downloaded for the assistant's sign-in. */
   readonly googleClientFile?: string;
+  /** `--billing-account`: the billing account the operator chose to pay for the assistant's project. */
+  readonly billingAccount?: string;
+}
+
+/** The resume flag a billing-account choice is passed with. */
+export const BILLING_ACCOUNT_FLAG = '--billing-account';
+
+/**
+ * A pause's choice as the decision its resume flag records (`<resumeFlag>
+ * <id>`), or undefined for a flag that takes no choice.
+ */
+export function decisionForChoice(resumeFlag: string | undefined, id: string): Partial<HumanDecisions> | undefined {
+  switch (resumeFlag) {
+    case BILLING_ACCOUNT_FLAG:
+      return { billingAccount: id };
+    default:
+      return undefined;
+  }
 }
 
 /** Sign the assistant in to Google as its own account (KTD2). */

@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
+import { deriveGcpProjectId } from './gcloud.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths } from './paths.js';
 import type { SanitizedCommand } from './process.js';
@@ -12,7 +14,6 @@ import { GwsEaError } from './types.js';
 import {
   buildInstanceCliCommand,
   createInstanceRuntimeConfig,
-  googleChatProjectNumberFile,
   instanceServicePid,
   launchInstanceHost,
   loadInstanceRuntimeConfig,
@@ -422,7 +423,6 @@ describe('GWS-EA instance runtime', () => {
         `NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`,
         `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
         `ONECLI_URL=${config.onecli_app_url}`,
-        `GCHAT_ENDPOINT_URL=${config.endpoint_url}`,
       ].sort(),
     );
   });
@@ -504,19 +504,18 @@ describe('GWS-EA instance runtime', () => {
     expect(execve).not.toHaveBeenCalled();
   });
 
-  it('rejects an invalid Google Chat project number before host start', async () => {
+  it('starts no host whose Chat subscriber key is empty', async () => {
     const { config, release } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
+    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, '  \n');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
-    await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '0\n');
     const execve = vi.fn((): never => {
       throw new Error('execve called');
     });
 
     await expect(
       launchInstanceHost(path.join(config.state_root, 'data', 'gws-ea', 'runtime.json'), {}, execve, release),
-    ).rejects.toMatchObject({ code: 'invalid_runtime_config', message: expect.stringContaining('project number') });
+    ).rejects.toMatchObject({ code: 'invalid_secret' });
     expect(execve).not.toHaveBeenCalled();
   });
 
@@ -525,7 +524,6 @@ describe('GWS-EA instance runtime', () => {
     await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
-    await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '441811502258\n');
     const other = path.join(config.instance_root, 'bbbbbbbb');
     await releaseFolder(other);
     const execve = vi.fn((): never => {
@@ -554,10 +552,9 @@ describe('GWS-EA instance runtime', () => {
     await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(
       config.secret_files.gchat_credentials,
-      '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
+      '{"client_email":"subscriber@example.test","private_key":"chat-secret-canary"}',
     );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
-    await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '441811502258\n');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
     const calls: Array<{ file: string; args: readonly string[]; env: NodeJS.ProcessEnv; cwd: string }> = [];
     const marker = new Error('execve called');
@@ -578,8 +575,11 @@ describe('GWS-EA instance runtime', () => {
             ONECLI_URL: 'https://attacker.invalid',
             ONECLI_API_KEY: 'ambient-secret',
             GCHAT_CREDENTIALS: 'ambient-chat-secret',
+            GCHAT_ENDPOINT_URL: 'https://attacker.invalid/webhook/gchat',
             GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL:
               'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
+            [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: '/tmp/attacker-key.json',
+            [GCHAT_PROJECT_ID_ENV]: 'attacker-project',
             NODE_OPTIONS: '--import=/tmp/attacker.js',
             DOCKER_HOST: 'tcp://attacker.invalid:2376',
             CONTAINER_IMAGE: 'attacker/image:latest',
@@ -607,12 +607,17 @@ describe('GWS-EA instance runtime', () => {
         NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
         ONECLI_URL: config.onecli_app_url,
         ONECLI_API_KEY: 'runtime-secret-canary',
-        GCHAT_CREDENTIALS: expect.stringContaining('chat-secret-canary'),
-        GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
         GWS_EA_GOOGLE_GRANT_FILE: path.join(path.dirname(config.secret_files.gchat_credentials), 'google-grant.json'),
+        // Chat delivery: the subscriber key's owner-only path, never the key, and the assistant's project.
+        [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: config.secret_files.gchat_credentials,
+        [GCHAT_PROJECT_ID_ENV]: deriveGcpProjectId(config.instance_id),
       },
     });
     expect(calls[0]?.env).not.toHaveProperty('NODE_OPTIONS');
+    for (const retired of ['GCHAT_CREDENTIALS', 'GCHAT_ENDPOINT_URL', 'GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL']) {
+      expect(calls[0]?.env).not.toHaveProperty(retired);
+    }
+    expect(JSON.stringify(calls[0]?.env)).not.toContain('chat-secret-canary');
     expect(Object.values(calls[0]?.env ?? {})).not.toContain('admin-secret-canary');
   });
 
