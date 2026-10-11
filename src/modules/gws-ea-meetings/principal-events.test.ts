@@ -74,6 +74,7 @@ import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
+import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
@@ -188,12 +189,8 @@ beforeEach(async () => {
     await createAgentGroup({ id, name, folder: name, agent_provider: null, created_at: now() });
     await ensureContainerConfig(id);
   }
-  await updateContainerConfigJson('ag-external', 'capabilities', [
-    'files-read',
-    'time',
-    'request-status',
-    'gws-ea-email-external',
-  ]);
+  // external-email as the host stamps it.
+  await updateContainerConfigJson('ag-external', 'capabilities', [...EXTERNAL_EMAIL_CAPABILITIES]);
   for (const [id, channel, platform] of [
     ['mg-dm', 'gchat', 'spaces/dm'],
     ['mg-inbox', 'email', 'email:inbox'],

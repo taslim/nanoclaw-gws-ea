@@ -34,7 +34,7 @@ import { initSessionFolder, sessionDir, withMailboxSession } from '../../session
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { isContainerRunning } from '../../container-runner.js';
 import { createScheduledTask, prepareScheduledTask } from '../../modules/scheduling/create.js';
-import { handleRecurrence } from '../../modules/scheduling/recurrence.js';
+import { reconcileSession } from '../../reconcile-session.js';
 import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
@@ -832,16 +832,24 @@ describe('tasks CLI resource', () => {
       expect(conv.ok && iso.ok).toBe(true);
       if (!conv.ok || !iso.ok) return;
       const convId = (conv.data as { series_id: string }).series_id;
-      const isoId = (iso.data as { series_id: string }).series_id;
+      const { series_id: isoId, session_id: isoSession } = iso.data as { series_id: string; session_id: string };
       const call = (command: string, args: Record<string, unknown>) =>
         dispatch({ id: command, command, args }, agentCtx());
 
       const listed = await call('tasks-list', {});
       expect(listed.ok).toBe(true);
       if (!listed.ok) return;
-      const rows = listed.data as Array<{ series_id: string; session_id: string }>;
-      expect(rows.find((r) => r.series_id === convId)?.session_id).toBe('chat-1');
-      expect(rows.find((r) => r.series_id === isoId)?.session_id).not.toBe('chat-1');
+      const listing = (listed.data as Array<{ series_id: string; session_id: string }>).map((r) => [
+        r.series_id,
+        r.session_id,
+      ]);
+      expect(listing).toHaveLength(2);
+      expect(listing).toEqual(
+        expect.arrayContaining([
+          [convId, 'chat-1'],
+          [isoId, isoSession],
+        ]),
+      );
 
       expect((await call('tasks-update', { id: convId, prompt: 'Ask Juno Hale and Remy Vance' })).ok).toBe(true);
       const got = await call('tasks-get', { id: convId });
@@ -875,32 +883,35 @@ describe('tasks CLI resource', () => {
       const busy = await createInConversation({
         name: 'busy look',
         prompt: 'now',
-        process_after: '2020-01-01T00:00:00Z',
+        process_after: '2999-01-01T09:00:00Z',
       });
       expect(waiting.ok && busy.ok).toBe(true);
       if (!waiting.ok || !busy.ok) return;
       const waitingId = (waiting.data as { series_id: string }).series_id;
       const busyId = (busy.data as { series_id: string }).series_id;
+      // The occurrence being processed has a row id of its own, as a run-now or a repeating task's later turn has.
+      const run = await dispatch({ id: 'run-b', command: 'tasks-run', args: { id: busyId } }, agentCtx());
+      if (!run.ok) throw new Error(run.error.message);
       vi.mocked(isContainerRunning).mockImplementation((sessionId) => sessionId === 'chat-1');
       const outbound = new Database(outboundDbPath('ag-1', 'chat-1'));
       outbound
         .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
-        .run(busyId, 'processing', now());
+        .run((run.data as { row_id: string }).row_id, 'processing', now());
       outbound.close();
 
       const deleted = await dispatch({ id: 'del-w', command: 'tasks-delete', args: { id: waitingId } }, agentCtx());
       expect(deleted.ok).toBe(true);
       expect(await getSession('chat-1')).toBeDefined();
       expect(fs.existsSync(sessionDir('ag-1', 'chat-1'))).toBe(true);
-      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId]);
+      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId, busyId]);
 
       const refused = await dispatch({ id: 'del-b', command: 'tasks-delete', args: { id: busyId } }, agentCtx());
       expect(refused.ok).toBe(false);
       if (!refused.ok) expect(refused.error.message).toContain('task is running');
-      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId]);
+      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId, busyId]);
     });
 
-    it('re-arms a recurring conversation task in the same conversation after it completes', async () => {
+    it("re-arms a recurring conversation task in the same conversation on the conversation's sweep", async () => {
       const created = await createInConversation({
         name: 'morning',
         prompt: 'Prepare the morning for Morgan Ellery',
@@ -912,10 +923,8 @@ describe('tasks CLI resource', () => {
       const inbound = new Database(inboundDbPath('ag-1', 'chat-1'));
       inbound.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(seriesId);
       inbound.close();
-      const chat = await getSession('chat-1');
-      if (!chat) throw new Error('chat-1 missing');
 
-      await withMailboxSession('ag-1', 'chat-1', (mailbox) => handleRecurrence(mailbox, chat));
+      await reconcileSession('chat-1');
 
       const next = conversationTaskRows().filter((r) => r.status === 'pending');
       expect(next).toHaveLength(1);

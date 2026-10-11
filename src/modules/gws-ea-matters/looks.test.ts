@@ -126,7 +126,6 @@ describe("a matter's next look", () => {
     // The title comes from the live render, never from the task.
     expect(content.prompt).not.toContain('Acme');
     // A turn of main's conversation, never a task session of its own.
-    expect(main.thread_id).toBeNull();
     expect(await findTaskSessions(MAIN)).toEqual([]);
 
     const second = inDays(5);

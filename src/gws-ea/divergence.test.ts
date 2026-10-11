@@ -654,7 +654,9 @@ describe('recorded divergence: a module can hold an inbound message until it rel
       path.join(originalCwd, 'container/agent-runner/src/mailbox/sqlite/operations.ts'),
       'utf8',
     );
-    expect(operations).toMatch(/SELECT \* FROM messages_in\s+WHERE status = 'pending'/);
+    // The runner's other reads of pending rows (question and CLI answers) must not stand in for its batch read.
+    const pendingRead = /export function sqliteGetPendingMessages\([\s\S]*?\n\}\n/u.exec(operations)?.[0] ?? '';
+    expect(pendingRead).toMatch(/SELECT \* FROM messages_in\s+WHERE status = 'pending'\s/u);
   });
 });
 

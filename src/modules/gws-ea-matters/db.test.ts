@@ -377,7 +377,7 @@ describe("each thread's placement (Slice 5 KTD8)", () => {
     expect(await threadPlacement(THREAD_B)).toEqual({ placement: 'unplaced', released: false });
   });
 
-  it('names external-email as working a thread main handed over as it joins a matter, and lets the bridge name it for one already there', async () => {
+  it('names external-email as working a thread main handed over as it joins a matter, and lets the bridge name it for one already there, never in a closed one', async () => {
     await placeNowhere([thread(THREAD_A)]);
     await releaseThread(THREAD_A);
     const acme = await open('Acme renewal', [thread(THREAD_A), thread(THREAD_B), person(juno)]);
@@ -386,14 +386,20 @@ describe("each thread's placement (Slice 5 KTD8)", () => {
       [THREAD_B, null],
       [juno, null],
     ]);
+    const earlier = 'mail-5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9';
+    await createThread('gmail-thread-c', NOW, earlier);
+    const lunch = await open('Lunch with Remy', [thread(earlier)]);
+    await closeMatter({ id: lunch.id, outcome: 'Had lunch.' });
 
     await setLinkHandler(thread(THREAD_B), 'external-email');
-    await setLinkHandler(thread('mail-in-no-matter'), 'external-email');
+    // In no open matter: the closed matter's link is history, and stays as it was.
+    await setLinkHandler(thread(earlier), 'external-email');
     expect((await getMatter(acme.id))?.links.map((link) => link.handler)).toEqual([
       'external-email',
       'external-email',
       null,
     ]);
+    expect((await getMatter(lunch.id))?.links.map((link) => link.handler)).toEqual([null]);
   });
 });
 

@@ -15,7 +15,7 @@ import { ensureContainerConfig, updateContainerConfigScalars } from '../../../db
 import { createAgentGroup, createMessagingGroup, getDb } from '../../../db/index.js';
 import { inboundDbPath, outboundDbPath } from '../../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../../reconcile-session.js';
-import { resolveSession } from '../../../session-manager.js';
+import { resolveSession, withExistingMailboxSession } from '../../../session-manager.js';
 import type { Session } from '../../../types.js';
 import { bindVerifiedPrincipalUser } from '../../gws-ea-profile/db.js';
 import { upsertUserDm } from '../../permissions/db/user-dms.js';
@@ -99,13 +99,15 @@ export function taskContent(row: TaskRow): { readonly prompt: string; readonly s
 }
 
 /**
- * Run one occurrence: its time comes, the container answers it as the runner
- * does (`completed`, or `script-skip:error` for a script that failed), and
- * the host's sweep reads the answer and re-arms what repeats. SQLite's `now`,
- * which decides what is due, is the real clock, so the occurrence's time
- * moves to just past.
+ * Answer one occurrence: its time comes, the container answers it as the
+ * runner does (`completed`, or `script-skip:error` for a script that
+ * failed), and the host's sweep reads the answer, which settles the
+ * occurrence, and stops there: what repeats is not armed yet. A sweep that
+ * wakes main for other mail leaves the session so while it waits on the
+ * wake. SQLite's `now`, which decides what is due, is the real clock, so the
+ * occurrence's time moves to just past.
  */
-export async function runOccurrence(
+export async function answerOccurrence(
   session: Session,
   rowId: string,
   answer: 'completed' | 'script-skip:error',
@@ -120,6 +122,18 @@ export async function runOccurrence(
       .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
       .run(rowId, answer, new Date().toISOString()),
   );
+  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks()),
+  );
+}
+
+/** Run one occurrence: answer it, and the host's sweep goes on to re-arm what repeats. */
+export async function runOccurrence(
+  session: Session,
+  rowId: string,
+  answer: 'completed' | 'script-skip:error',
+): Promise<void> {
+  await answerOccurrence(session, rowId, answer);
   await reconcileSession(session.id);
 }
 

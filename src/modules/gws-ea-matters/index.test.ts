@@ -215,16 +215,12 @@ describe('GWS-EA matters ncl resource', () => {
     });
   });
 
+  // Each flag reaches the parser, whose every refusal `next-look.test.ts` covers.
   it.each<[string, Record<string, unknown>, RegExp]>([
     ['no next look', {}, /next look.*--look or --look-cron/i],
     ['two kinds of next look', { look: '2026-10-14T09:00', 'look-cron': '0 9 * * 1' }, /either --look or --look-cron/i],
     ['a next look in the past', { look: '2026-10-09T09:00' }, /--look must be in the future/i],
-    ['a next look that is not a time', { look: 'next Tuesday' }, /--look must be a date and time/i],
-    ['a date with no time', { look: '2026-10-14' }, /--look must be a date and time/i],
-    ['a cron expression that is not one', { 'look-cron': 'every monday' }, /--look-cron/i],
-    ['a cron expression with seconds', { 'look-cron': '0 0 9 * * 1' }, /five fields/i],
     ['a look that repeats every hour', { 'look-cron': '0 * * * *' }, /more than 4 times a day/i],
-    ['a look that never comes', { 'look-cron': '0 9 30 2 *' }, /--look-cron/i],
   ])('refuses to open a matter with %s', async (_label, look, message) => {
     expect(await run('matters-open', { title: 'Acme renewal', 'open-loop': 'Renew.', ...look })).toMatchObject(
       refused(message),

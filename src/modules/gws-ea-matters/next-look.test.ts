@@ -38,10 +38,12 @@ describe('a next look', () => {
     ['a time that has passed', { at: '2026-10-10T12:59' }, /in the future/],
     ['now', { at: '2026-10-10T12:00:00Z' }, /in the future/],
     ['a time with no date', { at: '09:00' }, /date and time/],
+    ['a date with no time', { at: '2026-10-14' }, /date and time/],
     ['an impossible date', { at: '2026-02-30T09:00' }, /date and time/],
     ['a cron expression with a sixth field', { cron: '0 0 9 * * 1' }, /five fields/],
+    ['a cron expression for a date that never comes', { cron: '0 9 30 2 *' }, /is not a cron expression/],
     ['a cron expression that fires five times a day', { cron: '0 8,11,14,17,20 * * *' }, /more than 4 times a day/],
-    ['a cron expression on two lines', { cron: '0 9 * *\n1' }, /--look-cron/],
+    ['a cron expression on two lines', { cron: '0 9 * *\n1' }, /must be one line/],
   ])('refuses %s', (_label, input, message) => {
     expect(() => parseNextLook(input, LAGOS, NOW)).toThrow(message);
   });

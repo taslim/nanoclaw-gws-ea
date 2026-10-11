@@ -189,8 +189,10 @@ describe('the morning', () => {
 
   it("briefs today's looks and the matters handed back without one, reading nothing live", async () => {
     gmail.put('gmail-thread-a', { id: 'a1', from: 'Juno Hale <juno@acme.example>', at: MONDAY_6AM, subject: 'Hi' });
-    const acme = await open('Acme renewal', { look: '2026-10-12T14:00' }, { thread: THREAD });
+    // Opened before the look that comes earlier, so the brief's order is by when each comes.
     const standup = await open('Weekly step back on the office move', { 'look-cron': '0 16 * * 1' });
+    vi.setSystemTime(new Date(Date.parse(MONDAY_6AM) + 60_000));
+    const acme = await open('Acme renewal', { look: '2026-10-12T14:00' }, { thread: THREAD });
     await open('Lunch with Noel Archer', { look: '2026-10-13T12:00' });
     // A look that ran with no new one set: the host hands it back at the morning.
     const lease = await open('Lease', { look: '2026-10-12T06:10' });

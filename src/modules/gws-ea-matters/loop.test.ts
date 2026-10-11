@@ -28,6 +28,7 @@ import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import '../../cli/resources/tasks.js';
 import { isContainerRunning } from '../../container-runner.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { reconcileSession } from '../../reconcile-session.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
@@ -38,6 +39,7 @@ import './index.js';
 import { lookSeries } from './looks.js';
 import { keepMattersOnTime, runMattersLoop } from './loop.js';
 import {
+  answerOccurrence,
   liveTaskRows,
   MAIN,
   mainSession,
@@ -171,6 +173,24 @@ describe("the host's guarantees for matters", () => {
     expect(next.process_after).toBe(CronExpressionParser.parse(YEARLY, { tz: ZONE }).next().toISOString());
   });
 
+  it('keeps the morning and a yearly look as they are through a pass between their run and the sweep arming the next', async () => {
+    const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
+    await keepMattersOnTime();
+    const [morning] = await mornings();
+    const main = await mainSession();
+
+    // The sweep has read the runner's answers, and waits on waking main for other mail before it arms what repeats.
+    await answerOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');
+    await answerOccurrence(main, morning.id, 'completed');
+    await keepMattersOnTime();
+    await reconcileSession(main.id);
+    await keepMattersOnTime();
+
+    expect(await looksByMatter()).toEqual(new Map([[birthday.id, [birthday.look_task_id]]]));
+    expect(await fresh(birthday)).toMatchObject({ look_task_id: birthday.look_task_id });
+    expect((await mornings()).map((row) => row.series_id)).toEqual([morning.series_id]);
+  });
+
   it('brings a failed yearly look back at the next morning, and its date for next year stays', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     const main = await mainSession();
@@ -248,7 +268,7 @@ describe("the host's guarantees for matters", () => {
     expect([...looks.keys()].sort()).toEqual([acme.id, birthday.id, lunch.id].sort());
   });
 
-  it('creates the morning when the host starts, and again after it is cancelled or the sweep pauses it', async () => {
+  it('creates the morning when the host starts, again after it is cancelled, and at the time main moved it to after the sweep pauses it', async () => {
     const controller = new AbortController();
     const loop = runMattersLoop(controller.signal);
     await vi.waitFor(async () => expect(await mornings()).toHaveLength(1));
@@ -263,17 +283,19 @@ describe("the host's guarantees for matters", () => {
     expect(await mornings()).toHaveLength(1);
     expect(second.series_id).not.toBe(first.series_id);
 
-    // Eight failed runs in a row, and the sweep pauses the series.
+    // main moves it while the principal travels; then eight failed runs in a row, and the sweep pauses the series.
+    await data(run('matters-morning', { at: '06:45' }));
+    const [moved] = await mornings();
     const main = await mainSession();
     for (let failures = 0; failures < 8; failures++) {
-      await runOccurrence(main, (await liveRow(second.series_id)).id, 'script-skip:error');
+      await runOccurrence(main, (await liveRow(moved.series_id)).id, 'script-skip:error');
     }
-    expect(await liveRow(second.series_id)).toMatchObject({ status: 'paused' });
+    expect(await liveRow(moved.series_id)).toMatchObject({ status: 'paused' });
 
     await keepMattersOnTime();
     const [third] = (await mornings()).filter((row) => row.status === 'pending');
     expect(await mornings()).toEqual([third]);
-    expect(third).toMatchObject({ recurrence: '30 7 * * *' });
-    expect(third.series_id).not.toBe(second.series_id);
+    expect(third).toMatchObject({ recurrence: '45 6 * * *' });
+    expect(third.series_id).not.toBe(moved.series_id);
   });
 });

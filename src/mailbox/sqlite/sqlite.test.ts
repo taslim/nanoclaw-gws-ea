@@ -254,6 +254,14 @@ describe('SQLite mailbox canonical serialization', () => {
     databases.push(inboundDb);
     inboundDb.exec(INBOUND_SCHEMA);
     const inbound = wrapSqliteInbound(inboundDb);
+    // The look arrives before the message, so arrival order differs from both id order and the order asked.
+    await inbound.insertTask({
+      id: 'look-m-0123456789ab-c3d4',
+      seriesId: 'look-m-0123456789ab-c3d4',
+      processAfter: '2026-10-10T08:00:00.000Z',
+      recurrence: null,
+      content: '{"prompt":"Look at matter m-0123456789ab"}',
+    });
     await inbound.insertMessage({
       id: 'in-ask',
       kind: 'chat-sdk',
@@ -265,27 +273,11 @@ describe('SQLite mailbox canonical serialization', () => {
       processAfter: null,
       recurrence: null,
     });
-    await inbound.insertTask({
-      id: 'look-m-0123456789ab-c3d4',
-      seriesId: 'look-m-0123456789ab-c3d4',
-      processAfter: '2026-10-10T08:00:00.000Z',
-      recurrence: null,
-      content: '{"prompt":"Look at matter m-0123456789ab"}',
-    });
     inbound.applyProcessingAcks([
       { messageId: 'in-ask', status: 'completed', statusChanged: parseIsoTimestamp('2026-10-10T09:01:00.000Z') },
     ]);
 
-    expect(inbound.getInboundMessages(['look-m-0123456789ab-c3d4', 'in-gone', 'in-ask'])).toEqual([
-      {
-        id: 'in-ask',
-        kind: 'chat-sdk',
-        seriesId: 'in-ask',
-        channelType: 'gchat',
-        platformId: 'gchat:spaces/dm',
-        threadId: 'spaces/dm/threads/t1',
-        content: '{"senderId":"users/morgan","text":"Is Thursday still on?"}',
-      },
+    expect(inbound.getInboundMessages(['in-ask', 'in-gone', 'look-m-0123456789ab-c3d4'])).toEqual([
       {
         id: 'look-m-0123456789ab-c3d4',
         kind: 'task',
@@ -294,6 +286,15 @@ describe('SQLite mailbox canonical serialization', () => {
         platformId: null,
         threadId: null,
         content: '{"prompt":"Look at matter m-0123456789ab"}',
+      },
+      {
+        id: 'in-ask',
+        kind: 'chat-sdk',
+        seriesId: 'in-ask',
+        channelType: 'gchat',
+        platformId: 'gchat:spaces/dm',
+        threadId: 'spaces/dm/threads/t1',
+        content: '{"senderId":"users/morgan","text":"Is Thursday still on?"}',
       },
     ]);
     expect(inbound.getInboundMessages([])).toEqual([]);

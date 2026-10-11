@@ -71,7 +71,11 @@ import {
 } from '../../channels/channel-registry.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { getDb } from '../../db/connection.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import {
+  ensureContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupsByChannel } from '../../db/messaging-groups.js';
 import { findSessionForAgent, getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -89,6 +93,8 @@ import { routeInbound } from '../../router.js';
 import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
+// As in production, each group's capability list is stored, so a group holds only what it was stamped with.
+import '../capabilities/index.js';
 import '../permissions/index.js';
 import { getMembers } from '../permissions/db/agent-group-members.js';
 import { getUserRoles } from '../permissions/db/user-roles.js';
@@ -106,7 +112,9 @@ import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-preferences/index.js';
+import { settleEchoFans } from '../cross-session-context/index.js';
 import { BRIDGE_ACTIONS } from '../gws-ea-external-email/bridge.js';
+import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
@@ -645,16 +653,16 @@ interface Row extends Content {
   };
 }
 
-/** A session's rows, without the copies cross-session context echoes in from its sibling threads. */
+/**
+ * Every row a session holds, echoes of its sibling sessions included:
+ * external-email's thread sessions are sealed, so none should ever hold one.
+ */
 function rows(session: Session): Row[] {
   const file = inboundDbPath(session.agent_group_id, session.id);
   if (!fs.existsSync(file)) return [];
   const db = new Database(file, { readonly: true });
   const found = db
-    .prepare(
-      `SELECT id, status, trigger, channel_type, platform_id, thread_id, content FROM messages_in
-        WHERE channel_type IS NOT 'session-echo' ORDER BY seq`,
-    )
+    .prepare('SELECT id, status, trigger, channel_type, platform_id, thread_id, content FROM messages_in ORDER BY seq')
     .all() as Array<Row['row'] & { content: string }>;
   db.close();
   return found.map(({ content, ...row }) => ({ ...(JSON.parse(content) as Content), row }));
@@ -745,6 +753,9 @@ beforeEach(async () => {
   // As in production, main's CLI scope is global, so only `hostOnly` keeps a host command from it.
   await ensureContainerConfig('ag-main');
   await updateContainerConfigScalars('ag-main', { cli_scope: 'global' });
+  // As the host stamps it, external-email holds no `conversation-context`: each thread's session is sealed.
+  await ensureContainerConfig('ag-external');
+  await updateContainerConfigJson('ag-external', 'capabilities', [...EXTERNAL_EMAIL_CAPABILITIES]);
   await createMessagingGroup({
     id: 'mg-dm',
     channel_type: 'gchat',
@@ -1649,7 +1660,7 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     expect(woken()).toEqual([main.id]);
   });
 
-  it("places Remy's new thread in the renewal main is arranging with Noel, and lets external-email read it only once main hands it over, briefed that Noel's thread settles the time (AE1)", async () => {
+  it("places Remy's new thread in the renewal main is arranging with Noel, and lets external-email read it only once main hands it over, briefed that Noel's thread settles the time, while neither thread's session reads the other's (AE1)", async () => {
     const noel = await addPerson({
       name: 'Noel Archer',
       level: 'active',
@@ -1679,14 +1690,18 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
       body: 'Noel asked me to find a time for the renewal call.',
     });
     await inbox.tick();
-    const remyThread = (await outsideMail()).find((email) => email.row.thread_id !== noelThread)?.row.thread_id ?? '';
+    const remyThread = (await outsideMail()).find((email) => email.sender === REMY)?.row.thread_id ?? '';
     const [placement] = notes(PLACEMENT);
     expect(placement.text).toContain(`- ${matter.id}: Acme renewal (same organization)`);
     const remySession = await requireThreadSession(remyThread);
     vi.mocked(requestWake).mockClear();
 
-    // Placed with the renewal, Remy's email still waits for main's handoff: no turn reads it.
+    // Placed with the renewal, Remy's email still waits for main's handoff: no turn reads it. His thread's session
+    // holds his email alone, and nothing of Noel's thread, where main's words were for Noel's.
     await ncl('matters-place', { id: matter.id, thread: remyThread });
+    expect(rows(remySession).map((row) => row.text)).toEqual([
+      expect.stringContaining('Noel asked me to find a time for the renewal call.'),
+    ]);
     const [remyEmail] = rows(remySession);
     expect(remyEmail.row.status).toBe('held');
     expect(runnerPoll(remySession)).not.toContain(remyEmail.row.id);
@@ -1694,16 +1709,36 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     expect(woken()).toEqual([]);
 
     const brief = `The renewal call is being set with Noel in thread ${noelThread}, which settles the time. Tell Remy it is in hand.`;
+    const handedOver = `From main, about this conversation:\n${brief}`;
     accepted(await mainAsks('email_handoff', { thread_key: remyThread, message: brief }));
 
-    expect(rows(remySession).map((row) => row.row.status)).toEqual(['pending', 'pending']);
-    expect(rows(remySession)[1].text).toBe(`From main, about this conversation:\n${brief}`);
+    expect(rows(remySession).map(({ row, text }) => [row.status, text])).toEqual([
+      ['pending', remyEmail.text],
+      ['pending', handedOver],
+    ]);
     expect(runnerPoll(remySession)).toEqual(expect.arrayContaining(rows(remySession).map((row) => row.row.id)));
     expect(woken()).toEqual([remySession.id]);
     expect((await getMatter(matter.id))?.links.filter((link) => link.kind === 'thread')).toEqual([
       expect.objectContaining({ reference: noelThread, handler: 'external-email' }),
       expect.objectContaining({ reference: remyThread, handler: 'external-email' }),
     ]);
+
+    // Noel answers in the thread main started. Each session still holds its own thread alone: neither reads the
+    // other's mail, nor main's words for the other.
+    await attachGmailThread(noelThread, 'g-noel');
+    gmail.receive({
+      threadId: 'g-noel',
+      from: `Noel Archer <${NOEL}>`,
+      subject: 'Re: The renewal call',
+      body: 'Thursday at 10 suits me.',
+    });
+    await inbox.tick();
+    await settleEchoFans();
+    expect(rows(await requireThreadSession(noelThread)).map((row) => row.text)).toEqual([
+      expect.stringContaining('Find 30 minutes this week for the renewal call.'),
+      expect.stringContaining('Thursday at 10 suits me.'),
+    ]);
+    expect(rows(remySession).map((row) => row.text)).toEqual([remyEmail.text, handedOver]);
   });
 
   it("wakes main once with the principal's own words on a thread they start with Noel, as their instruction, and nothing reaches external-email until main places it and hands it over", async () => {

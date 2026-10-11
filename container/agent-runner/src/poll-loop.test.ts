@@ -860,8 +860,11 @@ describe('a conversation turn of only scheduled tasks', () => {
     expect(pushes).toEqual([]);
   });
 
-  it('still asks for a re-send of a block that did not go out', async () => {
-    const { pushes } = await runTaskTurn('<message to="nobody">Remy Vance sent the venue options.</message>');
+  it.each([
+    ['to an unknown destination', '<message to="nobody">Remy Vance sent the venue options.</message>'],
+    ['left empty', '<message to="main">  </message>'],
+  ])('still asks for a re-send of a block that did not go out: %s', async (_label, resultText) => {
+    const { pushes } = await runTaskTurn(resultText);
 
     expect(getUndeliveredMessages()).toEqual([]);
     expect(pushes).toHaveLength(1);

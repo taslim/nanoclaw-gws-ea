@@ -195,4 +195,3 @@ describe('held rows reach no batch until released', () => {
     expect(getPendingMessages().map((m) => m.id)).toEqual(['held', 'due']);
   });
 });
-

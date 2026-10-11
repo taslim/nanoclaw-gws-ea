@@ -83,16 +83,19 @@ describe('suggesting open matters for a new piece', () => {
     ]);
   });
 
-  it('names the same person apart from their colleagues, strongest reason first', async () => {
+  it('names the same person apart from their colleagues, ranking by the strongest reason, then the latest change', async () => {
+    const lunch = await open('Lunch with Remy', [{ kind: 'person', reference: remy }]);
     const acme = await open('Acme renewal', [
       { kind: 'person', reference: juno },
       { kind: 'person', reference: remy },
     ]);
-    const lunch = await open('Lunch with Remy', [{ kind: 'person', reference: remy }]);
+    // The newest, but it shares only Remy's organization.
+    const offsite = await open('Acme offsite', [{ kind: 'person', reference: juno }]);
 
     expect(await candidatesFor(thread(authenticated('remy@acme.example')))).toEqual([
-      { id: lunch, title: 'Lunch with Remy', project: null, reasons: ['same person'] },
       { id: acme, title: 'Acme renewal', project: null, reasons: ['same person', 'same organization'] },
+      { id: lunch, title: 'Lunch with Remy', project: null, reasons: ['same person'] },
+      { id: offsite, title: 'Acme offsite', project: null, reasons: ['same organization'] },
     ]);
   });
 
