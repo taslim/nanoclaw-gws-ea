@@ -202,6 +202,18 @@ export async function recordThreadMessage(message: NewThreadMessage, at: string)
   );
 }
 
+/** The threads that recorded a message under any of these Message-IDs, each once. */
+export async function threadsWithMessageIds(rfcMessageIds: readonly string[]): Promise<string[]> {
+  const ids = [...new Set(rfcMessageIds)].slice(0, MAX_ANSWERED_IDS);
+  if (ids.length === 0) return [];
+  const rows = await getDb().all<{ thread_key: string }>(
+    `SELECT DISTINCT thread_key FROM gws_ea_thread_messages
+      WHERE rfc_message_id IN (${ids.map(() => '?').join(', ')}) ORDER BY thread_key`,
+    ...ids,
+  );
+  return rows.map((row) => row.thread_key);
+}
+
 /** A side's messages in the thread, oldest first. */
 export async function threadMessages(threadKey: string, side: ThreadSide): Promise<ThreadMessage[]> {
   const rows = await getDb().all<MessageRow>(

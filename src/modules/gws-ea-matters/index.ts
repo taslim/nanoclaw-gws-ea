@@ -5,15 +5,13 @@
  * whether it is open (R2); big projects split into strands one level deep
  * (R29, KTD13). Only `main` keeps matters, through main-only `ncl matters`
  * verbs whose answers are bare data for it, never words for the principal
- * (R6).
+ * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { TIMEZONE } from '../../config.js';
-import { resolveGroupTimezone } from '../../container-config.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
-import { assertMainCaller, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
   closeMatter,
   getMatter,
@@ -28,6 +26,7 @@ import {
 } from './db.js';
 import { gwsEaMattersMigration } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
+import { principalTimezone, renderMatter } from './render.js';
 
 registerMigration(gwsEaMattersMigration);
 
@@ -89,12 +88,6 @@ function parentFrom(args: Record<string, unknown>): string | null | undefined {
   const value = optionalString(args.parent);
   if (value === undefined) return undefined;
   return value.trim() === '' ? null : value;
-}
-
-/** The time zone `main` lives in, which a next look is read in. */
-async function principalTimezone(): Promise<string> {
-  const mainAgentGroupId = await getMainAgentGroupId();
-  return mainAgentGroupId === null ? TIMEZONE : resolveGroupTimezone(mainAgentGroupId);
 }
 
 /** The next look `--look` or `--look-cron` asks for (KTD4), checked before anything is written. */
@@ -300,15 +293,19 @@ registerResource({
     },
     get: {
       access: 'open',
-      description: 'Read one matter, open or closed: its words, links, strands, and next look.',
+      description:
+        'Read one matter, open or closed, as it stands now: its words, next look, project and strands, and each link read live from Gmail, Calendar and Drive.\n\n' +
+        'The view says when its links were read. Read it again before acting on one read a while ago. A link whose source did not answer says so.',
       args: [ID_ARG],
       examples: ['ncl matters get m-1a2b3c4d5e6f'],
+      // The view is the answer, printed as it is.
+      formatHuman: (view) => String(view),
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
           const id = requiredString(args, 'id');
           const matter = await getMatter(id);
           if (!matter) throw new Error(`No matter ${JSON.stringify(id.trim())} exists`);
-          return matter;
+          return renderMatter(matter);
         }),
     },
     list: {

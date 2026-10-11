@@ -343,6 +343,18 @@ export async function listOpenMatters(): Promise<OpenMatterSummary[]> {
   }));
 }
 
+/** A link of an open matter, with the matter it sits in. */
+export interface OpenMatterLink extends LinkRef {
+  readonly matter_id: string;
+}
+
+/** Every link of every open matter. */
+export async function listOpenMatterLinks(): Promise<OpenMatterLink[]> {
+  return getDb().all<OpenMatterLink>(
+    'SELECT matter_id, kind, reference FROM gws_ea_matter_links WHERE matter_open = 1 ORDER BY matter_id, linked_at, rowid',
+  );
+}
+
 /** Every closed matter, most recently closed first. */
 export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
   return getDb().all<ClosedMatterSummary>(

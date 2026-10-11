@@ -1,5 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/** Google as the host's own clients reach it, in memory: each test gets its own. */
+const google = vi.hoisted(() => ({ gmail: undefined as unknown, calendar: undefined as unknown }));
+vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-inbox/gmail-api.js')>()),
+  createGmailApi: () => ({
+    getThread: (id: string) =>
+      (google.gmail as import('../gws-ea-inbox/testing/fake-gmail-threads.js').FakeGmailThreads).getThread(id),
+  }),
+}));
+vi.mock('../gws-ea-meetings/calendar-api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../gws-ea-meetings/calendar-api.js')>();
+  const { delegatingCalendarApi } = await import('../gws-ea-meetings/testing/fake-calendar.js');
+  return {
+    ...actual,
+    createMeetingsCalendarApi: () =>
+      delegatingCalendarApi(() => google.calendar as import('../gws-ea-meetings/calendar-api.js').MeetingsCalendarApi),
+  };
+});
+
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { commandGuard, lookup } from '../../cli/registry.js';
@@ -10,7 +29,9 @@ import '../gws-ea-profile/index.js';
 import '../gws-ea-people/index.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-inbox/index.js';
+import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
 import { createThread } from '../gws-ea-inbox/thread-map.js';
+import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { getMatter, listOpenMatters, type Matter, type Placed } from './db.js';
 import './index.js';
 
@@ -52,6 +73,8 @@ function refused(message: RegExp) {
 let remy: string;
 
 beforeEach(async () => {
+  google.gmail = new FakeGmailThreads();
+  google.calendar = new FakeCalendar();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date(NOW));
   await runMigrations(await initTestDb());
@@ -111,7 +134,7 @@ describe('GWS-EA matters ncl resource', () => {
       moved: [],
     });
     // `ncl matters get <id>` arrives dash-joined with the id as its tail.
-    expect(await data(run(`matters-get-${id}`, {}))).toEqual(await getMatter(id));
+    expect(await data(run(`matters-get-${id}`, {}))).toContain(`Matter ${id}, open: Acme renewal`);
 
     const offsite = await data<Placed>(
       run('matters-open', { title: 'Team offsite', 'open-loop': 'Pick a venue.', 'look-cron': '0 9 * * 1' }),
@@ -138,7 +161,9 @@ describe('GWS-EA matters ncl resource', () => {
       open: false,
       outcome: 'Signed on the 9th.',
     });
-    expect(await data(run('matters-get', { id }))).toMatchObject({ open: false, outcome: 'Signed on the 9th.' });
+    expect(await data(run('matters-get', { id }))).toMatch(
+      /^Matter m-[0-9a-f]{12}, closed .*\nOutcome: Signed on the 9th\.$/msu,
+    );
     expect(await data(run('matters-list', {}))).toEqual([
       { id: offsite.matter.id, title: 'Team offsite', open_loop: 'Pick a venue.', strands: [] },
     ]);
@@ -274,7 +299,6 @@ describe('GWS-EA matters ncl resource', () => {
     await keep(run('matters-place', { id: lease.matter.id, thread: THREAD_A }));
     await keep(run('matters-place', { nowhere: true, thread: THREAD_B }));
     await keep(run('matters-update', { id: acme.matter.id, title: 'Acme' }));
-    await keep(run('matters-get', { id: acme.matter.id }));
     await keep(run('matters-list', {}));
     await keep(run('matters-close', { id: lease.matter.id, outcome: 'Signed.' }));
     await keep(run('matters-list', { closed: true }));
@@ -299,6 +323,74 @@ describe('GWS-EA matters ncl resource', () => {
       expect(isData, value).toBe(true);
     }
     expect(answers.every((answer) => typeof answer === 'object' && answer !== null)).toBe(true);
+  });
+
+  it('reads a matter through ncl with each link as Google says it is now, and prints that view (KTD5)', async () => {
+    const gmail = google.gmail as FakeGmailThreads;
+    const calendar = google.calendar as FakeCalendar;
+    gmail.put('gmail-thread-a', {
+      id: 'a1',
+      from: 'Remy Vance <remy@acme.example>',
+      at: '2026-10-10T09:30:00.000Z',
+      subject: 'Renewal',
+      snippet: 'Redlines attached.',
+    });
+    calendar.put({
+      calendarId: 'morgan@example.test',
+      id: '7k3q9v1m2n4p6r8s0t2u4v6a8b',
+      status: 'confirmed',
+      start: { dateTime: '2026-10-14T15:00:00+01:00' },
+      end: { dateTime: '2026-10-14T16:00:00+01:00' },
+      attendees: [{ email: 'remy@acme.example', responseStatus: 'declined' }],
+    });
+    const acme = await data<Placed>(
+      run('matters-open', {
+        title: 'Acme renewal',
+        'open-loop': 'Wants it signed by Friday.',
+        look: '2026-10-14T09:00',
+        thread: THREAD_A,
+        event: EVENT,
+        person: remy,
+      }),
+    );
+    const id = acme.matter.id;
+
+    const response = await run('matters-get', { id });
+    const view = await data<string>(Promise.resolve(response));
+    expect(view.replace(/ id="[0-9a-f]{16}"/gu, '')).toBe(
+      [
+        `Matter ${id}, open: Acme renewal`,
+        'Links read Oct 10, 2026, 1:00 PM.',
+        'Open loop:',
+        'Wants it signed by Friday.',
+        'Next look: none pending.',
+        'Links:',
+        `- thread ${THREAD_A}: latest Oct 10, 2026, 10:30 AM, from them: waiting on us`,
+        '<<<EXTERNAL_UNTRUSTED_CONTENT>>>',
+        'Source: gmail',
+        '---',
+        'Subject: Renewal',
+        'From: Remy Vance <remy@acme.example>',
+        'Excerpt: Redlines attached.',
+        '<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>',
+        `- event ${EVENT}: Oct 14, 2026, 3:00 PM to 4:00 PM; confirmed; declined: remy@acme.example`,
+        `- person ${remy}: Remy Vance`,
+      ].join('\n'),
+    );
+    // Both clients print the view as it is.
+    expect(response).toMatchObject({ ok: true, human: view });
+
+    // Nothing Google said is kept: the next read says what Google says then.
+    gmail.put('gmail-thread-a', {
+      id: 'a2',
+      from: 'Morgan <morgan@example.test>',
+      at: '2026-10-10T11:00:00.000Z',
+      sent: true,
+    });
+    expect(await data(run('matters-get', { id }))).toContain(
+      `- thread ${THREAD_A}: latest Oct 10, 2026, 12:00 PM, sent by the assistant: waiting on them`,
+    );
+    expect(gmail.reads).toEqual(['gmail-thread-a', 'gmail-thread-a']);
   });
 
   it('refuses every agent but main every verb, even with global CLI scope, and group-scoped agents at the guard', async () => {

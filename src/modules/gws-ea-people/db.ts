@@ -723,20 +723,30 @@ export async function recordForgottenFingerprints(rows: readonly ForgottenFinger
 }
 
 /**
+ * Whether an identity, such as `email:sam@example.com`, was forgotten at the
+ * principal's request (KTD8), in any spelling that reaches the same mailbox:
+ * a test against the fingerprints recorded now, for a reader that must never
+ * show a forgotten person. Without a key the store holds no fingerprints.
+ */
+export async function loadForgottenMatcher(): Promise<(handle: string) => boolean> {
+  const key = await loadFingerprintKey();
+  if (key === undefined) return () => false;
+  const recorded = new Set(
+    (await getDb().all<{ readonly fingerprint: string }>('SELECT fingerprint FROM gws_ea_people_fingerprints')).map(
+      (row) => row.fingerprint,
+    ),
+  );
+  return (handle) => recorded.size > 0 && recorded.has(identityFingerprint(key, handle));
+}
+
+/**
  * Everyone holding an identity whose fingerprint is recorded, by name. A
  * principal adding an identity back clears its fingerprint, so only a
  * snapshot restore leaves anyone here.
  */
 export async function listForgottenPeople(): Promise<Array<{ readonly id: string; readonly name: string }>> {
-  const key = await loadFingerprintKey();
-  if (key === undefined) return [];
-  const db = getDb();
-  const recorded = new Set(
-    (await db.all<{ readonly fingerprint: string }>('SELECT fingerprint FROM gws_ea_people_fingerprints')).map(
-      (row) => row.fingerprint,
-    ),
-  );
-  const identities = await db.all<{ readonly id: string; readonly name: string; readonly handle: string }>(
+  const isForgotten = await loadForgottenMatcher();
+  const identities = await getDb().all<{ readonly id: string; readonly name: string; readonly handle: string }>(
     `SELECT p.id, p.name, i.handle
        FROM gws_ea_people_identities i
        JOIN gws_ea_people p ON p.id = i.person_id
@@ -744,7 +754,7 @@ export async function listForgottenPeople(): Promise<Array<{ readonly id: string
   );
   const people = new Map<string, string>();
   for (const { id, name, handle } of identities) {
-    if (recorded.has(identityFingerprint(key, handle))) people.set(id, name);
+    if (isForgotten(handle)) people.set(id, name);
   }
   return [...people].map(([id, name]) => ({ id, name }));
 }
