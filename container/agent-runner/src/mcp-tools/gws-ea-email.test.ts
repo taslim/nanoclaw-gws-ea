@@ -93,7 +93,12 @@ describe('the email tools', () => {
       [emailToPrincipal, 'email_send', { thread_key: 'mail-inbound-2', text: 'Booked: Tuesday at 12:30.' }],
       [emailSend, 'email_send', { text: 'Hi Remy, …', subject: 'Morgan and Remy — 30 minutes this week?' }],
       [emailSend, 'email_send', { text: 'Looping Jane in.', to: ['dana@acme.example'], cc: ['jane@acme.example'] }],
-      [tellMain, 'tell_main', { message: 'Acme quoted $5,000 for the pilot and asks for a yes this week.' }],
+      [tellMain, 'tell_main', { account: 'Asked Acme for its pilot quote. Waiting on their reply.' }],
+      [
+        tellMain,
+        'tell_main',
+        { account: 'Acme quoted $5,000 for the pilot and asks for a yes this week.', wake: true },
+      ],
       [
         freeTime,
         'free_time',
@@ -167,8 +172,15 @@ describe('the email tools', () => {
 
     closeSessionDb();
     initTestSessionDb();
-    const toMain = await call(tellMain, { message: 'Looped in.', to: ['someone@else.example'], delivers: true });
-    expect(Object.keys(toMain.request).sort()).toEqual(['action', 'message', 'messageId', 'requestId']);
+    // An account is only ever of the calling thread: no thread is named, and the old message field is gone.
+    const toMain = await call(tellMain, {
+      account: 'Looped in.',
+      thread_key: 'mail-other-thread',
+      message: 'Looped in.',
+      to: ['someone@else.example'],
+      delivers: true,
+    });
+    expect(Object.keys(toMain.request).sort()).toEqual(['account', 'action', 'messageId', 'requestId']);
 
     // main names people; who each email goes to and who is copied is external-email's to place.
     closeSessionDb();
@@ -180,6 +192,16 @@ describe('the email tools', () => {
       message: 'Find Dana 30 minutes.',
     });
     expect(Object.keys(handoff.request).sort()).toEqual(['action', 'message', 'messageId', 'people', 'requestId']);
+  });
+
+  it("ask external-email for its whole account of the thread, within the host's limit, and a wake only by choice", () => {
+    expect(tellMain.tool.inputSchema.required).toEqual(['account']);
+    const { account, wake } = tellMain.tool.inputSchema.properties as Record<
+      string,
+      { readonly type: string; readonly description: string }
+    >;
+    expect(account.description).toContain('Up to 2,000 characters.');
+    expect(wake.type).toBe('boolean');
   });
 
   it('tell main that a thread books only on the calendar a handoff sets, with no calendar standing in for it', () => {
@@ -220,7 +242,8 @@ describe('the email tools', () => {
       [emailHandoff, { people: ['remy@friend.example'] }, /message is required/],
       [emailToPrincipal, { text: 'Booked.' }, /thread_key is required/],
       [emailSend, { subject: 'Hello' }, /text is required/],
-      [tellMain, {}, /message is required/],
+      [tellMain, {}, /account is required/],
+      [tellMain, { message: 'Acme asks for a yes this week.', wake: true }, /account is required/],
       [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00' }, /minutes is required/],
       [book, { start: '2026-10-13T12:30:00-07:00', minutes: 30 }, /title is required/],
       [changeBooking, { start: '2026-10-14T09:30:00-07:00' }, /booking is required/],
@@ -442,7 +465,8 @@ describe('files that go with a request', () => {
 
     it("are files that came in this thread, staged from its inbox under the request's own id by their file names", async () => {
       const { request } = await call(tellMain, {
-        message: 'Acme sent its invoice for the pilot, with its terms.',
+        account: 'Acme sent its invoice for the pilot, with its terms.',
+        wake: true,
         files: ['/workspace/inbox/mail-1/invoice.pdf', '/workspace/inbox/handoff-act-1/terms.txt'],
       });
       expect(request.files).toEqual(['invoice.pdf', 'terms.txt']);
@@ -467,7 +491,7 @@ describe('files that go with a request', () => {
         ['/workspace/inbox/mail-1/invoice.pdf', '/workspace/agent/notes.txt'],
       ]) {
         const result = await tellMain.handler(
-          { message: 'Acme sent its invoice.', files },
+          { account: 'Acme sent its invoice.', wake: true, files },
           { signal: AbortSignal.timeout(100) },
         );
         const label = JSON.stringify(files);
@@ -483,7 +507,7 @@ describe('files that go with a request', () => {
 
     it('refuse a file missing from the inbox as any tool does', async () => {
       const result = await tellMain.handler(
-        { message: 'Acme sent its invoice.', files: ['/workspace/inbox/mail-1/missing.pdf'] },
+        { account: 'Acme sent its invoice.', wake: true, files: ['/workspace/inbox/mail-1/missing.pdf'] },
         { signal: AbortSignal.timeout(100) },
       );
       expect(text(result)).toMatch(/No file at \/workspace\/inbox\/mail-1\/missing\.pdf/);
@@ -526,7 +550,7 @@ describe('a request the host is slow to answer', () => {
       [emailHandoff, { thread_key: 'mail-inbound-1', message: 'Avoid Friday.' }],
       [emailToPrincipal, { thread_key: 'mail-inbound-1', text: 'Done.' }],
       [emailSend, { text: 'Hello' }],
-      [tellMain, { message: 'Looped in.' }],
+      [tellMain, { account: 'Looped in.', wake: true }],
       [book, { start: '2026-10-13T12:30:00-07:00', minutes: 30, title: 'Catch up' }],
     ] as const) {
       const result = await timedOut(tool, args);
@@ -557,7 +581,7 @@ describe('a request the host is slow to answer', () => {
 
 describe('requestAction', () => {
   it('sends a request under the id its caller chose', async () => {
-    const waiting = requestAction('tell_main', { message: 'Looped in.' }, { timeoutMs: 20, requestId: 'act-chosen-1' });
+    const waiting = requestAction('tell_main', { account: 'Looped in.' }, { timeoutMs: 20, requestId: 'act-chosen-1' });
     const result = await waiting;
     expect(result).toEqual({ status: 'timeout', requestId: 'act-chosen-1' });
     const [row] = getUndeliveredMessages();
@@ -566,10 +590,10 @@ describe('requestAction', () => {
   });
 
   it('gives up after its timeout, and stops at once when cancelled', async () => {
-    const timedOut = await requestAction('tell_main', { message: 'x' }, { timeoutMs: 20, pollMs: 5 });
+    const timedOut = await requestAction('tell_main', { account: 'x' }, { timeoutMs: 20, pollMs: 5 });
     expect(timedOut).toEqual({ status: 'timeout', requestId: getUndeliveredMessages()[0].id });
     const controller = new AbortController();
-    const waiting = requestAction('tell_main', { message: 'x' }, { timeoutMs: 60_000, signal: controller.signal });
+    const waiting = requestAction('tell_main', { account: 'x' }, { timeoutMs: 60_000, signal: controller.signal });
     controller.abort();
     expect(await waiting).toEqual({ status: 'cancelled' });
   });

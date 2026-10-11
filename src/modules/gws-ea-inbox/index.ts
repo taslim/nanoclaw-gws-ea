@@ -59,6 +59,7 @@ import {
   gwsEaInboxEmailChannelMigration,
   gwsEaInboxMigration,
   gwsEaInboxRelativeFilePathsMigration,
+  gwsEaInboxThreadAccountsMigration,
   gwsEaInboxUnsignedNoticesMigration,
 } from './migration.js';
 import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
@@ -76,6 +77,7 @@ registerMigration(gwsEaInboxDropThreadHoldsMigration);
 registerMigration(gwsEaInboxRelativeFilePathsMigration);
 registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
+registerMigration(gwsEaInboxThreadAccountsMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;

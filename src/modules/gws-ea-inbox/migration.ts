@@ -254,3 +254,20 @@ export const gwsEaInboxCalendarAccessMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * The account the agent working a thread last left on it (Slice 5 R7, KTD9):
+ * what it did, what it learned that no source records, and where the thread
+ * stands, in its words, with when it left it. Each account replaces the one
+ * before, and a thread has none until its agent leaves one.
+ */
+export const gwsEaInboxThreadAccountsMigration: ModuleMigration = {
+  version: 7,
+  name: 'module:gws-ea-inbox:thread-accounts',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_threads ADD COLUMN account TEXT CHECK (account <> '');
+      ALTER TABLE gws_ea_threads ADD COLUMN account_at TEXT CHECK ((account IS NULL) = (account_at IS NULL));
+    `);
+  },
+};

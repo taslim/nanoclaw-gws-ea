@@ -6,7 +6,7 @@
  * between concurrent threads, and it frames and checks nothing.
  *
  *   email_handoff (main)           { thread_key?, people?, message, files?, calendar? } → { thread_key, message }
- *   tell_main     (external-email) { message, files? }                                → { message }
+ *   tell_main     (external-email) { account, wake?, files? }                         → { message }
  *
  * - `email_handoff` names one thread by its `mail-…` key, or starts one with
  *   the `people` it names. Either way the people it names are the thread's
@@ -27,14 +27,18 @@
  *   assistant can write to. Until `main` sets one, the thread books nothing
  *   (R11). `main`'s words join the mail already waiting in the thread's
  *   session, or are due at once when none is (`pendingDeadline`).
- * - `tell_main` writes `external-email`'s words into `main`'s session as
- *   information, framed untrusted because they draw on what outsiders wrote,
- *   and wakes it. The host's own words name only the thread's key, its
- *   addresses, each of the principal's marked by how it came to the thread,
- *   and the calendar the thread books on, so no name or subject a sender
- *   wrote passes as the host's, and main has what it weighs in setting that
- *   calendar (R13).
- *   Files that came in the thread go with them (Slice 6 KTD7), so main can
+ * - `tell_main` keeps `external-email`'s account of its thread on the
+ *   thread, in place of the last (Slice 5 R7, KTD9): what it did, what it
+ *   learned that no source records, and where the thread stands. `main`
+ *   reads it under the thread wherever a matter shows it, so the account is
+ *   capped at what a matter shows whole. Only with `wake`, when main must
+ *   act now, does it also go into `main`'s session as information, framed
+ *   untrusted because it draws on what outsiders wrote, and wake it. The
+ *   host's own words name only the thread's key, its addresses, each of the
+ *   principal's marked by how it came to the thread, and the calendar the
+ *   thread books on, so no name or subject a sender wrote passes as the
+ *   host's, and main has what it weighs in setting that calendar (R13).
+ *   Files that came in the thread go with a wake (Slice 6 KTD7), so main can
  *   keep one for the principal: read, as a handoff's are, only from the
  *   request's own outbox, none larger than mail brings into a thread, and
  *   saved in main's session with each one's SHA-256, framed as what others
@@ -42,7 +46,7 @@
  *
  * Each request is answered once, a refusal or failure included. A replayed
  * request writes nothing twice: a new thread's key and every row it writes
- * derive from the request.
+ * derive from the request, and an account it keeps again is the same one.
  */
 import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
@@ -77,6 +81,7 @@ import {
   getThread,
   recordThreadAddresses,
   recordThreadFile,
+  setThreadAccount,
   threadAddresses,
   threadMessages,
   type AddressSource,
@@ -144,10 +149,15 @@ const tellMainAction = defineGuardedAction({
 // The request's fields
 // ---------------------------------------------------------------------------
 
-/** Text as written: line breaks kept, nothing else unprintable. */
+/** Text as written, trimmed: line breaks kept, and empty unless it is text with nothing else unprintable. */
+function writtenText(value: unknown): string {
+  const text = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
+  return hasControlCharacters(text.replace(/[\n\t]/gu, ' ')) ? '' : text;
+}
+
 function messageOf(value: unknown): string {
-  const message = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
-  if (message === '' || message.length > MESSAGE_MAX || hasControlCharacters(message.replace(/[\n\t]/gu, ' '))) {
+  const message = writtenText(value);
+  if (message === '' || message.length > MESSAGE_MAX) {
     throw invalidArgs(`message must be text of 1 to ${MESSAGE_MAX} characters`);
   }
   return message;
@@ -466,6 +476,29 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
 
 const NOTHING_TOLD = 'main was told nothing';
 const MEGABYTE = 1024 * 1024;
+/** The longest account: what a matter shows whole under its thread (`ACCOUNT_LIMIT` in gws-ea-matters/live.ts). */
+const ACCOUNT_MAX = 2_000;
+
+/** What external-email reads when its account is kept and main is left to its work. */
+const ACCOUNT_KEPT =
+  'Your account of this thread is kept in place of the last. main reads it whenever it looks at this thread, and was not woken.';
+
+function accountOf(value: unknown): string {
+  const account = writtenText(value);
+  if (account.length > ACCOUNT_MAX) {
+    throw invalidArgs(
+      `account is ${account.length} characters, and may be at most ${ACCOUNT_MAX}: keep to what you did, what you learned that the thread's mail doesn't say, and where it stands.`,
+    );
+  }
+  if (account === '') throw invalidArgs(`account must be text of 1 to ${ACCOUNT_MAX} characters`);
+  return account;
+}
+
+function wakeOf(value: unknown): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw invalidArgs('wake must be true or false');
+  return value;
+}
 
 /** The files a word to main carries, as staged: none larger than mail brings into a thread. */
 function filesForMain(session: Session, requestId: string, names: readonly string[]): OutboundFile[] {
@@ -549,27 +582,42 @@ function tellMainStamp(
   );
 }
 
+/**
+ * Keep the account on the session's own thread, the only one a session may
+ * write, whatever thread a request names. Only a wake writes it into main's
+ * session, with any files.
+ */
 const tellMain: ActionAnswer = async (content, session, requestId) => {
-  const message = messageOf(content.message);
+  const account = accountOf(content.account);
+  const wake = wakeOf(content.wake);
   const names = fileNamesOf(content.files);
+  if (names.length > 0 && !wake) {
+    throw invalidArgs(`${NOTHING_TOLD}: files go to main only with wake, which hands them over with your account now.`);
+  }
   const threadKey = session.thread_id;
   if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
   const files = filesForMain(session, requestId, names);
-  const context = await loadRoutingContext(await assistantAddresses(), new Date());
+  const now = new Date();
+  await setThreadAccount(threadKey, account, now.toISOString());
+  if (!wake) return { message: ACCOUNT_KEPT };
+
+  const context = await loadRoutingContext(await assistantAddresses(), now);
   const people = peopleForMain(await threadAddresses(threadKey), context);
   const bookingCalendar = await bookingCalendarWords(await getThreadBookingCalendar(threadKey), context);
   const result = await writeNoteForMain({
     id: `tell-main-${session.id}-${requestId}`,
-    timestamp: context.at.toISOString(),
-    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(message, MESSAGE_MAX)}`,
+    timestamp: now.toISOString(),
+    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, ACCOUNT_MAX)}`,
     wake: true,
     files,
   });
   if (result === 'no-main' || result === 'no-principal') {
     throw new Error('There is no main, or no principal direct message, to tell');
   }
-  const passed = files.length === 0 ? '' : `, with ${listed(files.map((file) => file.filename))}`;
-  return { message: `main has your message${passed}. If it answers, its answer comes to you here.` };
+  const passed = files.length === 0 ? '' : `, with ${listed(files.map((file) => file.filename))},`;
+  return {
+    message: `main has your account${passed} and was woken by it. If it answers, its answer comes to you here.`,
+  };
 };
 
 /** Each action, with its handler and its guard, as the module registers them. */

@@ -22,7 +22,7 @@ const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]>
   ['time', ['reference_date']],
   ['reminders', []],
   ['gws-ea-email', []],
-  ['gws-ea-email-external', []],
+  ['gws-ea-email-external', ['wake']],
 ];
 
 describe('the mcp-tools instruction files', () => {

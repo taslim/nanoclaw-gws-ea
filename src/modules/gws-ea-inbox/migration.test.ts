@@ -29,6 +29,7 @@ import {
   recordThreadAddresses,
   recordThreadFile,
   recordThreadMessage,
+  threadAccount,
   type SendScope,
 } from './thread-map.js';
 
@@ -38,6 +39,7 @@ const DROP_THREAD_HOLDS = 'module:gws-ea-inbox:drop-thread-holds';
 const RELATIVE_FILE_PATHS = 'module:gws-ea-inbox:relative-file-paths';
 const UNSIGNED_NOTICES = 'module:gws-ea-inbox:unsigned-notices';
 const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
+const THREAD_ACCOUNTS = 'module:gws-ea-inbox:thread-accounts';
 
 /** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
 const INBOX_TABLES = [
@@ -194,7 +196,7 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's six, in order, and the meetings store registers none", () => {
+  it("are the inbox's seven, in order, and the meetings store registers none", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
@@ -205,6 +207,7 @@ describe('the inbox migrations', () => {
       RELATIVE_FILE_PATHS,
       UNSIGNED_NOTICES,
       CALENDAR_ACCESS,
+      THREAD_ACCOUNTS,
     ]);
   });
 
@@ -231,7 +234,7 @@ describe('squashed migrations', () => {
     expect(inboxTables(await install())).toEqual(ALL_INBOX_TABLES);
   });
 
-  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row', async () => {
+  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row, each thread with no account yet', async () => {
     const db = await initSqliteTestDb();
     await runMigrations(db, earlierRelease());
     await writeSlice4Work();
@@ -245,9 +248,17 @@ describe('squashed migrations', () => {
       RELATIVE_FILE_PATHS,
       UNSIGNED_NOTICES,
       CALENDAR_ACCESS,
+      THREAD_ACCOUNTS,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
-    expect(rowsOf(db)).toEqual(before);
+    expect(rowsOf(db)).toEqual({
+      ...before,
+      gws_ea_threads: before.gws_ea_threads.map((thread) => ({
+        ...(thread as object),
+        account: null,
+        account_at: null,
+      })),
+    });
     // A retry still finds its send in flight, and the thread still owns its booking.
     expect(await findSend(OUTSIDE, 'hash-2')).toMatchObject({ id: 'send-2', state: 'pending' });
     expect(await getThreadBooking(THREAD, 'evt-review')).toMatchObject({ calendarId: CALENDAR });
@@ -294,5 +305,25 @@ describe('relative-file-paths', () => {
 
     const rows = await db.all<{ host_path: string }>('SELECT host_path FROM gws_ea_thread_files ORDER BY sha256');
     expect(rows.map((row) => row.host_path)).toEqual(recorded.map(([, after]) => after));
+  });
+});
+
+describe('thread-accounts', () => {
+  it('holds no account on any thread until one is left, and never an empty one or one without its time', async () => {
+    const db = await freshInstall();
+    await createThread(GMAIL_THREAD, AT, THREAD);
+    expect(await threadAccount(THREAD)).toBeUndefined();
+
+    for (const [account, at] of [
+      ['', AT],
+      ['Waiting on Juno.', null],
+      [null, AT],
+    ] as const) {
+      await expect(
+        db.run('UPDATE gws_ea_threads SET account = ?, account_at = ? WHERE thread_key = ?', account, at, THREAD),
+        `${String(account)} at ${String(at)}`,
+      ).rejects.toThrow(/CHECK constraint failed/u);
+    }
+    expect(await threadAccount(THREAD)).toBeUndefined();
   });
 });

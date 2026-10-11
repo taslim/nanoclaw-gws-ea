@@ -9,11 +9,11 @@
  *   `external-email` with `email_handoff`, and writes to the principal in one
  *   of their threads with `email_principal`.
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
- *   thread with `email_send`, tells main what main should know with
- *   `tell_main`, passing on files that came in the thread, and schedules on
- *   the principal's calendar with `free_time`, `book`, `change_booking` and
- *   `cancel_booking`, each bound by the host to the thread whose session
- *   calls it.
+ *   thread with `email_send`, leaves main its account of the thread with
+ *   `tell_main`, waking main and passing on files that came in the thread
+ *   only when main must act now, and schedules on the principal's calendar
+ *   with `free_time`, `book`, `change_booking` and `cancel_booking`, each
+ *   bound by the host to the thread whose session calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -178,15 +178,23 @@ export const tellMain = requestTool({
   ...common,
   name: 'tell_main',
   description:
-    'Tell main something from this thread: what happened, what someone asks of the principal, or what you need, with any files from the thread main should have. main reads it as information from this thread, and any answer comes here as a new message. Answers once main has it.',
+    'Leave main your account of this thread, in place of your last one. main reads it whenever it looks at this thread. With wake, main also gets it now and takes a turn on it, with any files from the thread it should have, and any answer comes here as a new message. Answers once the account is kept.',
   properties: {
-    message: { type: 'string', description: 'What main should know, in plain language.' },
+    account: {
+      type: 'string',
+      description:
+        "In plain language: what you did, what you learned that the thread's mail doesn't say, and where the thread stands, including anything you wait on main for. Up to 2,000 characters.",
+    },
+    wake: {
+      type: 'boolean',
+      description: 'true only when main must act now, such as when you need its answer before you go on.',
+    },
     files: {
       ...FILES,
-      description: `Paths of files that came in this thread, under ${INBOX}/, for main to have, such as an invoice someone sent. Up to 10.`,
+      description: `Paths of files that came in this thread, under ${INBOX}/, for main to have, such as an invoice someone sent. Up to 10, only with wake.`,
     },
   },
-  required: ['message'],
+  required: ['account'],
   repeatable: false,
   prepare: (fields, requestId) => stageFiles(fields, requestId, true),
 });

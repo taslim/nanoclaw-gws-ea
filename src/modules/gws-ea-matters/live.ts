@@ -36,7 +36,7 @@ import {
   parseGmailMessage,
 } from '../gws-ea-inbox/mime.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
-import { getThread } from '../gws-ea-inbox/thread-map.js';
+import { getThread, threadAccount } from '../gws-ea-inbox/thread-map.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import {
   createMeetingsCalendarApi,
@@ -88,12 +88,17 @@ export interface LiveSources {
 
 let host: LiveSources | undefined;
 
-/** Google as the host's own tokens reach it, as the inbox, meetings and Workspace reach it. Built on first use. */
+/**
+ * Google as the host's own tokens reach it, as the inbox, meetings and
+ * Workspace reach it, and each thread's account from the thread map. Built
+ * on first use.
+ */
 export function hostSources(): LiveSources {
   host ??= {
     gmail: createGmailApi({ token: () => hostGoogleAccessToken('gmail') }),
     calendar: createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }),
     drive: createDriveApi({ token: () => hostGoogleAccessToken('drive-host') }),
+    threadAccount,
   };
   return host;
 }

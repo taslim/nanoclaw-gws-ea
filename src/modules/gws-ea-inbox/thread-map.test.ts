@@ -1,7 +1,8 @@
 /**
  * The thread map (KTD2): stable `mail-…` keys that exist before Gmail has a
  * thread, each side's messages, the addresses a thread may be written to,
- * and the ledger that sends each email once.
+ * the account the agent working it left, and the ledger that sends each
+ * email once.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -19,6 +20,8 @@ import {
   recordSent,
   recordThreadAddresses,
   recordThreadMessage,
+  setThreadAccount,
+  threadAccount,
   threadAddresses,
   threadMessages,
   visibleMessageIds,
@@ -236,6 +239,34 @@ describe("a thread's addresses", () => {
     await expect(recordThreadAddresses(threadKey, ['not an address'], 'main', AT)).rejects.toThrow(
       'Not an email address',
     );
+  });
+});
+
+describe("a thread's account (KTD9)", () => {
+  it('is none until the agent working the thread leaves one, then only its newest, with when it was left', async () => {
+    const { threadKey } = await createThread('g-acme', AT);
+    expect(await threadAccount(threadKey)).toBeUndefined();
+
+    await setThreadAccount(threadKey, 'Asked Remy for the redlines.', AT);
+    await setThreadAccount(threadKey, "Remy sent the redlines. Acme's budget is frozen until Q1.", LATER);
+
+    expect(await threadAccount(threadKey)).toEqual({
+      text: "Remy sent the redlines. Acme's budget is frozen until Q1.",
+      at: LATER,
+    });
+  });
+
+  it('is kept for each thread apart, and refused for a thread that does not exist', async () => {
+    const remy = await createThread('g-remy', AT);
+    const juno = await createThread('g-juno', AT);
+
+    await setThreadAccount(remy.threadKey, 'Waiting on Remy.', AT);
+
+    expect(await threadAccount(juno.threadKey)).toBeUndefined();
+    await expect(setThreadAccount('mail-missing', 'Waiting on Noel.', AT)).rejects.toThrow(
+      'No email thread mail-missing',
+    );
+    expect(await threadAccount('mail-missing')).toBeUndefined();
   });
 });
 

@@ -18,6 +18,9 @@
  * - A thread's addresses are those its messages carried and those `main`
  *   named (`recordThreadAddresses`). A forgotten person's go from every
  *   thread (`deleteThreadAddresses`).
+ * - A thread holds the account the agent working it last left, each one in
+ *   place of the one before, which `main` reads under the thread wherever a
+ *   matter shows it (`setThreadAccount`, `threadAccount`).
  * - A file goes out in a thread only when `main` handed it over for it, by
  *   its SHA-256 (`recordThreadFile`, `findThreadFile`).
  * - A send never happens twice. Before Gmail is called, a pending record
@@ -310,6 +313,32 @@ export async function threadsWithAddresses(
 export async function deleteThreadAddresses(addresses: readonly string[]): Promise<void> {
   const db = getDb();
   for (const address of addresses) await db.run('DELETE FROM gws_ea_thread_addresses WHERE address = ?', address);
+}
+
+// ---------------------------------------------------------------------------
+// The account of the agent working it
+// ---------------------------------------------------------------------------
+
+/** The thread's account is now `text`, left at `at`, in place of any before it. Throws for a thread that does not exist. */
+export async function setThreadAccount(threadKey: string, text: string, at: string): Promise<void> {
+  const { changes } = await getDb().run(
+    'UPDATE gws_ea_threads SET account = ?, account_at = ? WHERE thread_key = ?',
+    text,
+    at,
+    threadKey,
+  );
+  if (changes === 0) throw new Error(`No email thread ${threadKey} exists`);
+}
+
+/** The account the agent working the thread last left on it, and when, or undefined while it has left none. */
+export async function threadAccount(
+  threadKey: string,
+): Promise<{ readonly text: string; readonly at: string } | undefined> {
+  const row = await getDb().get<{ account: string; account_at: string }>(
+    'SELECT account, account_at FROM gws_ea_threads WHERE thread_key = ? AND account IS NOT NULL',
+    threadKey,
+  );
+  return row ? { text: row.account, at: row.account_at } : undefined;
 }
 
 // ---------------------------------------------------------------------------
