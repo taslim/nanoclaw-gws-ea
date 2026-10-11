@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { chatReceiving } from '../../gws-ea/chat-health.js';
 import { GoogleGrantRevokedError } from '../gws-ea-google/tokens.js';
 import { startChatDelivery, type ChatDelivery } from './delivery.js';
 import { createChatHealth, type ChatHealthRecorder } from './health.js';
@@ -334,5 +335,45 @@ describe('failures', () => {
     await vi.advanceTimersByTimeAsync(61_000);
     await until(active);
     expect(health.read().subscription.error).toBeNull();
+  });
+
+  it('shows no subscription, and Chat not receiving, once it deleted an expired one and Google refused a new one', async () => {
+    const existing = seedRenewed();
+    start();
+    await until(active);
+
+    // Asleep past its expiry; on waking, Google refuses to create another.
+    fake.createFailure = { status: 429, message: 'Quota exceeded for subscription creation.' };
+    vi.setSystemTime(Date.parse(existing.expireTime) + HOUR);
+    await vi.advanceTimersByTimeAsync(HOUR);
+    await until(() => health.read().subscription.error !== null);
+
+    expect(workspaceCalls('DELETE', `/v1/${existing.name}`)).toBe(1);
+    expect(fake.subscriptions.size).toBe(0);
+    expect(health.read().subscription).toEqual({
+      state: 'unknown',
+      name: null,
+      expireTime: null,
+      suspensionReason: null,
+      error: expect.objectContaining({ kind: 'unreachable' }),
+    });
+    expect(chatReceiving(health.read(), 'gws-ea-juno')).toEqual({
+      state: 'not_receiving',
+      reason: expect.stringContaining('its subscription is not confirmed yet'),
+    });
+  });
+
+  it('shows no subscription once Google lists none at a renewal, though the last one had not expired', async () => {
+    const existing = seedRenewed();
+    start();
+    await until(active);
+
+    // Deleted from outside this host; Google then refuses a new one.
+    fake.subscriptions.delete(existing.name);
+    fake.createFailure = { status: 503, message: 'The service is currently unavailable.' };
+    await vi.advanceTimersByTimeAsync(DAY);
+    await until(() => health.read().subscription.error !== null);
+
+    expect(health.read().subscription).toMatchObject({ state: 'unknown', name: null, expireTime: null });
   });
 });

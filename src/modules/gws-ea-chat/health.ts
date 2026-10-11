@@ -3,7 +3,9 @@
  * Events subscription each record what their last attempt found, and status
  * reads it through `gws-ea-chat health`. It lives in this host's memory only:
  * the host owns the subscription's whole life and keeps no local record of it
- * (KTD2), so a restarted host learns it all again from Google.
+ * (KTD2), so a restarted host learns it all again from Google. A subscription
+ * recorded active reads as expired once its expiry passes: if every renewal
+ * since failed, Google has stopped delivering.
  *
  * A broken Google sign-in is named as one: the assistant's grant refused,
  * or the subscription suspended for its authorization. Only a new sign-in
@@ -30,7 +32,11 @@ export interface ChatHealthError {
   readonly at: string;
 }
 
-/** `unknown` until the host has asked Google; `expired` when Google said so and no new one exists yet. */
+/**
+ * `unknown` until the host has confirmed one with Google, and again whenever
+ * it finds Google holds none it can use and has not made a new one yet;
+ * `expired` when the active one's expiry passed with no renewal.
+ */
 export type ChatSubscriptionState = 'unknown' | 'active' | 'suspended' | 'expired';
 
 export interface ChatConsumerHealth {
@@ -97,9 +103,11 @@ export function createChatHealth(): ChatHealthRecorder {
     read() {
       const suspendedForSignIn =
         subscription.state === 'suspended' && !ENDPOINT_SUSPENSIONS.has(subscription.suspensionReason ?? '');
+      const expires = Date.parse(subscription.expireTime ?? '');
+      const lapsed = subscription.state === 'active' && !Number.isNaN(expires) && expires <= Date.now();
       return {
         consumer,
-        subscription,
+        subscription: lapsed ? { ...subscription, state: 'expired' } : subscription,
         signInNeeded: suspendedForSignIn || subscription.error?.kind === 'sign_in_needed',
       };
     },

@@ -4,7 +4,7 @@ import { dispatch } from '../../cli/dispatch.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { GoogleGrantRevokedError } from '../gws-ea-google/tokens.js';
 import { startChatDelivery, type ChatDelivery } from './delivery.js';
-import { chatHealth } from './health.js';
+import { chatHealth, createChatHealth } from './health.js';
 import {
   ASSISTANT_TOKEN,
   FakeGoogleEvents,
@@ -113,5 +113,34 @@ describe('gws-ea-chat health', () => {
       { caller: 'host' },
     );
     expect(unknown).toMatchObject({ ok: false, error: { message: expect.stringContaining('--verbose') } });
+  });
+
+  it('reads a subscription recorded active as expired once its expiry passes', () => {
+    const health = createChatHealth();
+    const expireTime = '2026-10-17T09:00:00.000Z';
+    const renewalFailure = {
+      kind: 'unreachable',
+      message: 'Google refused /v1/subscriptions/chat-juno: The service is currently unavailable.',
+      at: '2026-10-16T09:00:00.000Z',
+    } as const;
+    health.subscription({ state: 'active', name: 'subscriptions/chat-juno', expireTime });
+    // Every renewal since has failed.
+    health.subscription({ error: renewalFailure });
+
+    vi.setSystemTime(Date.parse(expireTime) - 1);
+    expect(health.read().subscription.state).toBe('active');
+
+    vi.setSystemTime(Date.parse(expireTime));
+    expect(health.read()).toEqual({
+      consumer: { connected: false, lastPullAt: null, error: null },
+      subscription: {
+        state: 'expired',
+        name: 'subscriptions/chat-juno',
+        expireTime,
+        suspensionReason: null,
+        error: renewalFailure,
+      },
+      signInNeeded: false,
+    });
   });
 });

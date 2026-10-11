@@ -278,6 +278,8 @@ export function startSubscriptionSupervisor(options: SubscriptionSupervisorOptio
       current = undefined;
     }
     if (current === undefined) {
+      // Google holds none for the assistant now, until one is created.
+      options.health.subscription({ state: 'unknown', name: null, expireTime: null, suspensionReason: null });
       try {
         const created = await api.create(options.topic);
         log.info('Created the Chat subscription', { subscription: created.name, expireTime: created.expireTime });

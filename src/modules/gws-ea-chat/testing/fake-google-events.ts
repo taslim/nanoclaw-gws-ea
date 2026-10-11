@@ -18,7 +18,8 @@
  *   the assistant's; anything else is 401.
  *
  * Every request is recorded. A test makes a side fail (`pubsubFailure`,
- * `workspaceFailure`, `tokenFailure`) until it clears it.
+ * `workspaceFailure`, `tokenFailure`), or only subscription creation
+ * (`createFailure`), until it clears it.
  */
 import { ACK_DEADLINE_SECONDS } from '../pubsub-pull.js';
 
@@ -110,6 +111,8 @@ export class FakeGoogleEvents {
   pubsubFailure: Failure | undefined;
   /** Every Workspace Events call fails with this while set. */
   workspaceFailure: Failure | undefined;
+  /** Creating a subscription fails with this while set; Workspace Events' other calls still answer. */
+  createFailure: Failure | undefined;
   /** The token endpoint refuses with this OAuth error while set. */
   tokenFailure: { readonly status: number; readonly error: string } | undefined;
   /** Pub/Sub grants the subscriber the consume permission. */
@@ -355,6 +358,7 @@ export class FakeGoogleEvents {
       return json(200, listed.length === 0 ? {} : { subscriptions: listed });
     }
     if (method === 'POST' && path === 'subscriptions') {
+      if (this.createFailure) return refusal(this.createFailure);
       const target = String(record.targetResource);
       if ([...this.subscriptions.values()].some((sub) => sub.targetResource === target)) {
         return refusal({ status: 409, message: 'Subscription already exists.' }, 'ALREADY_EXISTS');
