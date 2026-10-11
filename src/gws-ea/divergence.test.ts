@@ -720,12 +720,14 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
 });
 
 describe("recorded divergence: the runner's tool barrel loads GWS-EA's tools", () => {
-  it("loads the runner's email, reminder and request-status tools, which name their own capability keys", async () => {
+  it("loads the runner's email and request-status tools, which name their own capability keys, and no reminder tools", async () => {
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
-    for (const module of ['gws-ea-email', 'reminders', 'request-status']) {
+    for (const module of ['gws-ea-email', 'request-status']) {
       expect(tools).toContain(`await import('./${module}.js');`);
     }
     expect(tools).not.toContain('gws-ea-meetings');
+    // Slice 5 R15: no tool times a conversation's own follow-through; a matter's look in main's conversation does.
+    expect(tools).not.toContain("'./reminders.js'");
   });
 });
 

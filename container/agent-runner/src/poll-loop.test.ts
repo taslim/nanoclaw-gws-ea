@@ -603,10 +603,10 @@ describe('failed turns on agent and route-less wakes (never answer a notice with
     expect(reports()).toEqual([failed('agent', 'ag-self', ['restart-1'])]);
   });
 
-  it('a turn woken by a message with no route (a reminder) is reported for the host to place', async () => {
-    insertRow('reminder-1', { text: 'You set this reminder: follow up with Remy', sender: 'reminder' }, null, null);
+  it('a turn woken by a message with no route is reported for the host to place', async () => {
+    insertRow('unrouted-1', { text: 'Check on the Acme renewal', sender: 'host' }, null, null);
     await failTurn();
-    expect(reports()).toEqual([failed(null, null, ['reminder-1'])]);
+    expect(reports()).toEqual([failed(null, null, ['unrouted-1'])]);
   });
 
   it('a batch mixing a failure notice with a real message is reported on the real route', async () => {

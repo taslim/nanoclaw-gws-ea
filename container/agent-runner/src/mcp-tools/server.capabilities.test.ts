@@ -35,7 +35,6 @@ const ALL = [
   'time',
   'request-status',
   'gws-ea-email',
-  'gws-ea-reminders',
   'google-calendar',
   'google-mail-read',
   'google-directory',
@@ -43,14 +42,13 @@ const ALL = [
 ];
 
 /** Exactly the keys the host stamps external-email with (src/modules/gws-ea-external-email/group.ts). */
-const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
+const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
 const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email_send', 'free_time', 'tell_main'];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
-const REMINDER_TOOLS = ['clear_reminder', 'remind_me'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
 const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats'];
 
@@ -67,7 +65,6 @@ const DEFAULT_ON_TOOLS = [
   'send_file',
   'send_message',
   ...MAIN_EMAIL_TOOLS,
-  ...REMINDER_TOOLS,
   ...CALENDAR_TOOLS,
   ...TIME_TOOLS,
 ].sort();
@@ -112,15 +109,10 @@ describe('NanoClaw tool server capabilities', () => {
     ['request-status', ['request-status'], ['request_status']],
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
-    ['gws-ea-reminders', ['gws-ea-reminders'], REMINDER_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
-    [
-      "external-email's keys",
-      EXTERNAL_EMAIL,
-      [...EXTERNAL_EMAIL_TOOLS, ...REMINDER_TOOLS, 'request_status', ...TIME_TOOLS].sort(),
-    ],
+    ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],
     ['no keys', [], []],
   ])('serves a group holding %s exactly the tools of its keys', async (_holding, grants, tools) => {
     expect(await served(grants)).toEqual(tools);

@@ -192,7 +192,6 @@ beforeEach(async () => {
     'files-read',
     'time',
     'request-status',
-    'gws-ea-reminders',
     'gws-ea-email-external',
   ]);
   for (const [id, channel, platform] of [

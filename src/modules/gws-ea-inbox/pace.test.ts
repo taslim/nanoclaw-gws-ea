@@ -49,10 +49,9 @@ import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { requestWake } from '../../request-wake.js';
 import { routeInbound } from '../../router.js';
-import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
-import { REMINDER_ID_PREFIX } from '../gws-ea-reminders/index.js';
 import { EMAIL_CHANNEL_DEFAULTS, ensureInbox, ensurePrincipalConversation } from './index.js';
 import { emailMessagingGroupIds } from './db.js';
 import { paceDeadline } from './pace.js';
@@ -61,7 +60,6 @@ import { runnerPoll } from './testing/runner-poll.js';
 import { createThread, placeThread, releaseThread } from './thread-map.js';
 
 const MINUTE = 60_000;
-const DAY = 24 * 60 * MINUTE;
 
 function now(): string {
   return new Date().toISOString();
@@ -272,25 +270,6 @@ describe('human pace', () => {
     const first = processAfter(thread, rowId('m1')) ?? '';
     reachWait(thread, first);
     await answered(thread, rowId('m1'));
-
-    const before = Date.now();
-    await mail('m2', 'mail-acme');
-
-    expectFreshWait(processAfter(thread, rowId('m2')), before, Date.now());
-  });
-
-  it('works a reply within 3 to 6 minutes while a reminder waits two days out', async () => {
-    await mail('m1', 'mail-acme');
-    const thread = await threadSession('mail-acme');
-    reachWait(thread, processAfter(thread, rowId('m1')) ?? '');
-    await answered(thread, rowId('m1'));
-    await writeSessionMessage(thread.agent_group_id, thread.id, {
-      id: `${REMINDER_ID_PREFIX}nudge`,
-      kind: 'chat',
-      timestamp: now(),
-      content: JSON.stringify({ text: 'Nudge Acme once if they have not replied.' }),
-      processAfter: new Date(Date.now() + 2 * DAY).toISOString(),
-    });
 
     const before = Date.now();
     await mail('m2', 'mail-acme');

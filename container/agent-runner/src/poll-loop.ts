@@ -807,7 +807,8 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * Is a failed turn reported to the host? Task runs report through their run
  * log, and a turn woken only by failure notices reports none, so a failure
  * chain stops after one hop. Every other turn is reported whatever its route,
- * a reminder's or a host note's included: the host decides who hears of it.
+ * a task's in a conversation or a host note's included: the host decides who
+ * hears of it.
  */
 function sendsFailureNotice(routing: RoutingContext): boolean {
   return !routing.taskRun && !routing.failureNoticeWake;

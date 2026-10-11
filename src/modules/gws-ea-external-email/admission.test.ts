@@ -114,20 +114,13 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
         'files-write',
         'time',
         'request-status',
-        'gws-ea-reminders',
         'gws-ea-email-external',
       ]),
     /capabilities/,
   ],
   [
     'a key missing from its list',
-    (g) =>
-      updateContainerConfigJson(g.id, 'capabilities', [
-        'time',
-        'request-status',
-        'gws-ea-reminders',
-        'gws-ea-email-external',
-      ]),
+    (g) => updateContainerConfigJson(g.id, 'capabilities', ['time', 'request-status', 'gws-ea-email-external']),
     /capabilities/,
   ],
   [

@@ -380,13 +380,13 @@ describe('a reply that fails permanently', () => {
     expect(sent.filter((send) => !isNotice(send))).toHaveLength(3);
   });
 
-  it("of an unprompted reminder, tells Morgan nothing, and main, waking nothing, with the look's matter", async () => {
+  it("of a message a look prompted, tells Morgan nothing, and main, waking nothing, with the look's matter", async () => {
     const { matter } = await openMatterWithLook(
       { title: "Juno Hale's birthday", openLoop: 'Morgan wants flowers sent.', links: [] },
       { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },
     );
     if (matter.look_task_id === null) throw new Error('The matter has no look');
-    reply('out-reminder', [matter.look_task_id]);
+    reply('out-look', [matter.look_task_id]);
     channel((send) => !isNotice(send));
 
     await drain(main, 3);

@@ -13,10 +13,9 @@
  * pending deadline when there is one, so it is worked with the mail already
  * waiting, and is otherwise due as written (`pendingDeadline`).
  *
- * A deadline is pending only while it is ahead and pace set it: a reminder
- * keeps its own time, and a retried message waits out its backoff, so
- * neither holds new mail. Once the agent has a batch, the next row starts a
- * new wait. No other session is delayed: the principal's own email and every
+ * A deadline is pending only while it is ahead and pace set it: a retried
+ * message waits out its backoff, which holds no new mail. Once the agent
+ * has a batch, the next row starts a new wait. No other session is delayed: the principal's own email and every
  * note to `main` are worked as they come.
  *
  * Pace starts once `main` has handed the thread over (Slice 5 KTD8). Until
@@ -26,7 +25,6 @@
  */
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { isReminderId } from '../gws-ea-reminders/index.js';
 import { emailMessagingGroupIds } from './db.js';
 import { threadPlacement } from './thread-map.js';
 
@@ -57,7 +55,7 @@ async function waitingDeadline(session: Session): Promise<string | null> {
   const waiting = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getWaitingMessages(),
   );
-  return waiting?.find((message) => message.tries === 0 && !isReminderId(message.id))?.processAfter ?? null;
+  return waiting?.find((message) => message.tries === 0)?.processAfter ?? null;
 }
 
 /**

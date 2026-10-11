@@ -1,6 +1,6 @@
 /**
- * `unknownToolNames` against the instruction files for the runner's time and
- * reminder tools, and each agent's email tools: each should name only a tool
+ * `unknownToolNames` against the instruction files for the runner's time
+ * tools and each agent's email tools: each should name only a tool
  * the runner actually exports, or a word this file's own not-tools list
  * explicitly carves out as something else (a request field, a sender, an
  * outcome word, and so on).
@@ -20,7 +20,6 @@ function instructions(name: string): string {
 /** Each instruction file GWS-EA relies on, with the backticked words in it that are not tool names. */
 const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]> = [
   ['time', ['reference_date']],
-  ['reminders', []],
   ['gws-ea-email', []],
   ['gws-ea-email-external', ['wake']],
 ];
