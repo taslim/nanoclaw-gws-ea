@@ -1147,7 +1147,7 @@ function publisherResource(dependencies: GcloudDependencies): StepResource<GcpSt
           add,
           settling,
           ORG_POLICY_SETTLES_MS,
-          'Waiting for Google Cloud to let Google Chat publish to the topic…',
+          'Waiting for Google Cloud to let Google Chat publish to the topic; it can take up to 15 minutes…',
           dependencies,
         );
         refusing = memberDomainRefusal(granted);

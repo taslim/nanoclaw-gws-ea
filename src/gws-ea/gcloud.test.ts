@@ -1119,7 +1119,7 @@ describe('Google Cloud setup through the step engine', () => {
       expect(setup.events).toContainEqual({
         type: 'step-waiting',
         step: 'provision_gcp',
-        reason: 'Waiting for Google Cloud to let Google Chat publish to the topic…',
+        reason: 'Waiting for Google Cloud to let Google Chat publish to the topic; it can take up to 15 minutes…',
       });
     },
   );
