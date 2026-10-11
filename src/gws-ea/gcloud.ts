@@ -773,7 +773,7 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
       create,
       blocked,
       ORG_POLICY_SETTLES_MS,
-      'Waiting for Google Cloud to allow service-account key creation…',
+      'Waiting for Google Cloud to allow service-account key creation; it can take up to 15 minutes…',
       dependencies,
     );
   }
