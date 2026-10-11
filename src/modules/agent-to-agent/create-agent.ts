@@ -28,6 +28,7 @@ import { writeSessionMessage } from '../../session-manager.js';
 import { destinationRefusal } from '../../db/wiring-admission.js';
 import type { AgentDestination, AgentGroup, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 
@@ -72,8 +73,13 @@ export async function requestCreateAgentHold(content: Record<string, unknown>, s
     agentName: sourceGroup.name,
     action: 'create_agent',
     payload: { name, instructions },
-    title: `Create agent: ${name}`,
-    question: `Agent "${sourceGroup.name}" wants to create a new sub-agent "${name}" (a new agent group with its own workspace and container). Approve?`,
+    title: 'Create an agent',
+    // The name the asking agent chose, as one quoted line, then the ask in the assistant's voice (KTD14).
+    question: [
+      `Name: ${quoted(name, NAME_LIMIT)}`,
+      "I'd like to create a new agent for this, with its own workspace and container.",
+    ].join('\n'),
+    details: { supplied: { name: { text: name, source: 'agent' } } },
   });
 }
 

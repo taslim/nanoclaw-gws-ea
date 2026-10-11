@@ -173,6 +173,30 @@ describe('agent message policies', () => {
     expect(JSON.parse(String(opts.payload.content)).text).toBe('sensitive');
   });
 
+  it('asks in the assistant’s voice, with what the agent wrote and attached as quoted lines', async () => {
+    await setMessagePolicy(A, B, 'telegram:dana', now());
+
+    await routeAgentMessage(
+      {
+        id: 'm3',
+        platform_id: B,
+        content: JSON.stringify({ text: 'Tell <users/all>:\n[the plan](https://example.test)', files: ['notes.txt'] }),
+        in_reply_to: null,
+      },
+      SA,
+    );
+
+    expect(vi.mocked(requestApproval).mock.calls[0][0].question).toBe(
+      [
+        'From: "A"',
+        'To: "B"',
+        'Message: "Tell ‹users/all›: \\[the plan\\]\\(https://example.test\\)"',
+        'Attachments: "notes.txt"',
+        "I'd like to pass this message between my agents.",
+      ].join('\n'),
+    );
+  });
+
   it('self-message is never gated even if a policy row somehow exists', async () => {
     await setMessagePolicy(A, A, 'telegram:dana', now()); // pathological, but must be ignored
     await routeAgentMessage(
