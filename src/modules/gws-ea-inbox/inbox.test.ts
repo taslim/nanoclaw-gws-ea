@@ -89,7 +89,7 @@ import { parseIsoTimestamp } from '../../mailbox/model.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { requestWake } from '../../request-wake.js';
-import { routeInbound } from '../../router.js';
+import { registerInboundDelay, routeInbound } from '../../router.js';
 import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
@@ -1597,6 +1597,24 @@ async function onlyThread(): Promise<string> {
   return keys[0];
 }
 
+/**
+ * A handoff main makes as the router writes an email into its thread's
+ * session: after the inbox's own delay has read the thread as not handed
+ * over, and before the email is written. Off unless a test sets it, and run
+ * once.
+ */
+let handOverMidWrite: { readonly threadKey: string; readonly handOver: () => Promise<void> } | undefined;
+registerInboundDelay(async (_event, session) => {
+  const pending = handOverMidWrite;
+  if (pending === undefined || session.thread_id !== pending.threadKey) return null;
+  handOverMidWrite = undefined;
+  await pending.handOver();
+  return null;
+});
+afterEach(() => {
+  handOverMidWrite = undefined;
+});
+
 describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
   beforeEach(async () => {
     await recordExternalEmailAgentGroupId('ag-external');
@@ -1813,6 +1831,47 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     expect(woken()).toEqual([main.id]);
   });
 
+  it('releases an email the router writes held as main hands its thread over, and asks main nothing of it', async () => {
+    gmail.receive({ threadId: 'g-renewal', from: `Remy Vance <${REMY}>`, subject: 'The renewal call', body: 'Hi.' });
+    await inbox.tick();
+    const threadKey = await onlyThread();
+    const session = await requireThreadSession(threadKey);
+    await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal call this week.',
+      links: [{ kind: 'thread', reference: threadKey }],
+    });
+    vi.mocked(requestWake).mockClear();
+
+    // Remy writes again, and main hands the thread over once the inbox has read it as not handed over, before the
+    // router writes his email held: the handoff releases only what was held until then.
+    handOverMidWrite = {
+      threadKey,
+      handOver: async () => {
+        accepted(await mainAsks('email_handoff', { thread_key: threadKey, message: 'Offer Thursday at 10.' }));
+      },
+    };
+    gmail.receive({
+      threadId: 'g-renewal',
+      from: `Remy Vance <${REMY}>`,
+      subject: 'Re: The renewal call',
+      body: 'Thursday at 10 works for Noel.',
+    });
+    await inbox.tick();
+
+    expect(handOverMidWrite).toBeUndefined();
+    expect(rows(session).map(({ row, text }) => [row.status, text])).toEqual([
+      ['pending', expect.stringContaining('Hi.')],
+      ['pending', 'From main, about this conversation:\nOffer Thursday at 10.'],
+      ['pending', expect.stringContaining('Thursday at 10 works for Noel.')],
+    ]);
+    // main hears nothing of the email it handed over: only the first email's note asked it to place the thread.
+    expect(notes(PLACEMENT)).toHaveLength(1);
+    expect(notes(/Thursday at 10 works for Noel\./u)).toEqual([]);
+    // The handoff wakes the thread's session for main's words, and the release again for Remy's email.
+    expect(woken()).toEqual([session.id, session.id]);
+  });
+
   it('settles what a thread placed nowhere and never handed over held, and asks main to place it again when new mail comes (AE2)', async () => {
     gmail.receive({
       threadId: 'g-news',
@@ -1891,6 +1950,60 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     expect(placements).toHaveLength(2);
     expect(placements[1].text).toContain('can we move it to Friday?');
     expect(woken()).toEqual([main.id]);
+  });
+
+  it("reads an email that arrives as its thread's matter closes as mail from before the close, and asks main to place the thread only for later mail", async () => {
+    gmail.receive({ threadId: 'g-renewal', from: `Remy Vance <${REMY}>`, subject: 'The renewal call', body: 'Hi.' });
+    await inbox.tick();
+    const threadKey = await onlyThread();
+    const session = await requireThreadSession(threadKey);
+    const { matter } = await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal call this week.',
+      links: [{ kind: 'thread', reference: threadKey }],
+    });
+    accepted(await mainAsks('email_handoff', { thread_key: threadKey, message: 'Offer Thursday at 10.' }));
+    vi.mocked(requestWake).mockClear();
+
+    // Remy writes again with the agenda, and main closes the matter while the host fetches it from Gmail: after the
+    // inbox read the thread as handed over, before the router reads it to write his email.
+    const fetchAttachment = gmail.getAttachment.bind(gmail);
+    vi.spyOn(gmail, 'getAttachment').mockImplementationOnce(async (messageId, attachmentId) => {
+      await ncl('matters-close', { id: matter.id, outcome: 'Call booked for Thursday at 10.' });
+      return fetchAttachment(messageId, attachmentId);
+    });
+    gmail.receive({
+      threadId: 'g-renewal',
+      from: `Remy Vance <${REMY}>`,
+      subject: 'Re: The renewal call',
+      body: 'Thursday works. The agenda is attached.',
+      files: [{ filename: 'agenda.txt', mimeType: 'text/plain', content: Buffer.from('1. Renewal terms') }],
+    });
+    await inbox.tick();
+
+    expect(rows(session).map(({ row, text }) => [row.status, text])).toEqual([
+      ['pending', expect.stringContaining('Hi.')],
+      ['pending', 'From main, about this conversation:\nOffer Thursday at 10.'],
+      ['pending', expect.stringContaining('Thursday works. The agenda is attached.')],
+    ]);
+    expect(notes(/Thursday works\./u)).toEqual([]);
+    expect(notes(PLACEMENT)).toHaveLength(1);
+    expect(woken()).toEqual([session.id]);
+
+    // Remy's next email finds the thread in no matter: it waits for main to place it, and his last stays read.
+    gmail.receive({
+      threadId: 'g-renewal',
+      from: `Remy Vance <${REMY}>`,
+      subject: 'Re: The renewal call',
+      body: 'One more thing: can we move it to Friday?',
+    });
+    await inbox.tick();
+
+    expect(rows(session).map((row) => row.row.status)).toEqual(['pending', 'pending', 'pending', 'held']);
+    expect(await threadPlacement(threadKey)).toEqual({ placement: 'unplaced', released: false });
+    const placements = notes(PLACEMENT);
+    expect(placements).toHaveLength(2);
+    expect(placements[1].text).toContain('can we move it to Friday?');
   });
 
   it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and in the morning brief (AE11)", async () => {

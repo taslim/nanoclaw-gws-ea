@@ -34,7 +34,7 @@
  *   over releases the mail held for it, and names external-email as working
  *   it in its open matter, so its account shows there (Slice 5 R7). The mail
  *   released and `main`'s words join the mail already waiting in the
- *   thread's session, or are due at once when none is (`pendingDeadline`).
+ *   thread's session, or are due at once when none is (`releaseHeldMail`).
  * - `tell_main` keeps `external-email`'s account of its thread on the
  *   thread, in place of the last (Slice 5 R7, KTD9): what it did, what it
  *   learned that no source records, and where the thread stands. `main`
@@ -76,20 +76,19 @@ import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-g
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { requestWake } from '../../request-wake.js';
-import {
-  readOutboxFiles,
-  resolveSession,
-  sessionDir,
-  withExistingMailboxSession,
-  writeSessionMessage,
-} from '../../session-manager.js';
+import { readOutboxFiles, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isBookableCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { calendarAccessOf, emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
-import { pendingDeadline } from '../gws-ea-inbox/pace.js';
-import { listed, loadRoutingContext, MAX_ATTACHMENT_BYTES, type RoutingContext } from '../gws-ea-inbox/route-mail.js';
+import {
+  listed,
+  loadRoutingContext,
+  MAX_ATTACHMENT_BYTES,
+  releaseHeldMail,
+  type RoutingContext,
+} from '../gws-ea-inbox/route-mail.js';
 import { assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   createThread,
@@ -473,10 +472,7 @@ async function writeHandoff(
       at,
     );
   }
-  const processAfter = await pendingDeadline(thread);
-  await withExistingMailboxSession(thread.agent_group_id, thread.id, (mailbox) =>
-    mailbox.releaseHeldMessages(processAfter),
-  );
+  const processAfter = await releaseHeldMail(thread);
   try {
     await writeSessionMessage(thread.agent_group_id, thread.id, {
       id,
