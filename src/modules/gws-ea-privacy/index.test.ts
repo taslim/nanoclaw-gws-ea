@@ -311,11 +311,12 @@ describe('removing a private value', () => {
     expect(notes(main).at(-1)).toMatch(/removed/i);
   });
 
-  it('asks as the assistant, in the first person, never as the agent group', async () => {
+  it('asks as the assistant, in the first person, never as the agent group, quoting the label as given', async () => {
     const home = await addHome();
+    // The label is main's words: shown quoted, it cannot mention anyone or format itself.
     const phone = await run(
       'private-values-add',
-      { label: 'Mobile', kind: 'phone', value: '+1 415 555 0134' },
+      { label: 'Mobile <users/all> *work*', kind: 'phone', value: '+1 415 555 0134' },
       agent(main),
     );
     if (!phone.ok) throw new Error(phone.error.message);
@@ -329,7 +330,9 @@ describe('removing a private value', () => {
       expect.stringMatching(
         /^I'd like to stop protecting your private address "Home"\. Once it is removed, I may share it/u,
       ),
-      expect.stringMatching(/^I'd like to stop protecting your private phone number "Mobile"\./u),
+      expect.stringMatching(
+        /^I'd like to stop protecting your private phone number "Mobile ‹users\/all› \\\*work\\\*"\./u,
+      ),
     ]);
     for (const question of questions) expect(question).not.toMatch(/\bmain\b/);
   });

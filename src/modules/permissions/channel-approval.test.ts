@@ -905,6 +905,17 @@ describe('channel registration answered on a channel that left it as posted', ()
 
     expect(sentSinceRequest()).toEqual(['edit: 📋 Choosing…', 'post: 📋 Choose an agent']);
   });
+
+  it('shows a new agent on the first request before it asks for its name', async () => {
+    const questionId = await pendingRegistration('chat-text-new-agent');
+
+    await answer(questionId, 'new_agent');
+
+    expect(sentSinceRequest()).toEqual([
+      'edit: 🆕 Connecting new agent…',
+      'post: Reply with the name for your new agent:',
+    ]);
+  });
 });
 
 describe("channel registration in the context of the agent that works in the approver's DM", () => {

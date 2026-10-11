@@ -348,6 +348,30 @@ describe("a request a group space's agent raises", () => {
     // The space's own session is not where the request was posted.
     expect(rowsOf(roomSession)).toEqual([]);
   });
+
+  it('says when the work it asks for is in no conversation, so it is not taken for main', async () => {
+    // As a task the space's agent runs on a schedule.
+    const unattached: Session = { ...session('sess-room-task', ROOM_AGENT, 'mg-room'), messaging_group_id: null };
+    await createSession(unattached);
+
+    await requestApproval({
+      session: unattached,
+      agentName: 'atlas',
+      action: 'fixture_change',
+      payload: {},
+      title: 'Change a setting',
+      question: "I'd like to change a setting.",
+    });
+
+    expect(delivered.map((d) => d.platformId)).toEqual([DM]);
+    expect(delivered[0]!.payload.question.split('\n')).toEqual([
+      "I'd like to change a setting.",
+      '',
+      "I'm asking for work of mine that isn't in any conversation.",
+    ]);
+    const [{ fields }] = notesOf(mainSession);
+    expect(fields.details).toEqual({ asked_from: 'outside any conversation' });
+  });
 });
 
 describe('a request posted into a conversation with no session yet', () => {

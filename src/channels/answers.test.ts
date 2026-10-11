@@ -68,6 +68,11 @@ afterEach(async () => {
   await closeDb();
 });
 
+/** A handler's database work: it lets other answers run before it records its decision. */
+function handlerWork(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 5));
+}
+
 /** One bridge's answers over its state store, with requests posted and handled as the host would. */
 async function startDesk() {
   const state = new SqliteStateAdapter();
@@ -75,9 +80,10 @@ async function startDesk() {
   const posted = new Map<string, PostedRequest>();
   const renders = new Map<string, QuestionRender>();
   const answered: Answer[] = [];
-  // The handler resolves the request it answers, as every response handler does.
+  // The handler resolves the request it answers, as every response handler does, once its work is done.
   let handle = async (answer: Answer): Promise<void> => {
     answered.push(answer);
+    await handlerWork();
     const render = renders.get(answer.questionId);
     if (render) renders.set(answer.questionId, { ...render, resolved: true });
   };
@@ -244,12 +250,14 @@ describe('createAnswers — the rule', () => {
     ]);
   });
 
-  it('covers AE3: a "yes" 2 seconds after a question is no answer', async () => {
+  it('covers AE3: a "yes" 2 seconds after a question is no answer, to it or to the earlier one being answered', async () => {
     const desk = await startDesk();
     await desk.write('Should we book the room?', -60);
     await desk.post(DM, 'q-room', question(), 0);
+    // While the principal types "yes" to the room, main asks something else.
+    await desk.post(DM, 'q-projector', question(), 28);
 
-    expect(await desk.write('yes', 2)).toBe(false);
+    expect(await desk.write('yes', 30)).toBe(false);
     expect(desk.answered).toEqual([]);
   });
 
@@ -419,6 +427,15 @@ describe('createAnswers — binding to its conversation and person', () => {
     expect(desk.answered).toEqual([]);
   });
 
+  it('counts a quoted reply as the person writing: a plain answer after it is not for a question posted before it', async () => {
+    const desk = await startDesk();
+    await desk.post(DM, 'q-room', question(), 0);
+    await desk.write('Thanks, Thursday works.', 10, { quote: { messageId: 'spaces/AAAA/messages/morgan.earlier' } });
+
+    expect(await desk.write('yes', 30)).toBe(false);
+    expect(desk.answered).toEqual([]);
+  });
+
   it('takes no plain answer from a message older than one the person already wrote', async () => {
     const desk = await startDesk();
     await desk.write('Should we book the room?', -60);
@@ -491,6 +508,7 @@ describe('createAnswers — once', () => {
     // Choosing an existing agent shows this request's outcome and asks which agent, under the same question.
     desk.handleWith(async (answer) => {
       desk.answered.push(answer);
+      await handlerWork();
       desk.showOutcome(answer.messageId);
       if (answer.messageId === first) {
         second = await desk.post(DM, 'mg-launch', approval(normalizeOptions(['main', 'research'])), 40);

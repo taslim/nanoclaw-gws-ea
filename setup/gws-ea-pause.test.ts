@@ -192,10 +192,17 @@ describe('attending a pause at the terminal', () => {
       attendPause(pause({ settled: failing }), new AbortController().signal, { prompts: prompts(), sleep }),
     ).resolves.toEqual({ kind: 'stop' });
 
+    // A pause with nothing to choose, confirm, locate, or wait for: the person acts elsewhere, then resumes.
     const terminal = prompts();
-    await expect(
-      attendPause(pause({ code: 'existing_endpoint_required' }), new AbortController().signal, { prompts: terminal }),
-    ).resolves.toEqual({ kind: 'stop' });
+    const policyAdmin = pause({
+      phase: 'provision_gcp',
+      code: 'gcp_policy_permission_required',
+      message: 'Google Cloud refused to change the service-account key-creation policy on project gws-ea-juno.',
+      details: [],
+    });
+    await expect(attendPause(policyAdmin, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
+      kind: 'stop',
+    });
     expect(terminal.note).not.toHaveBeenCalled();
   });
 });

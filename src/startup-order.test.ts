@@ -101,6 +101,54 @@ it('finishes adoption before a channel can route its first inbound message', asy
   expect(state.routeInbound).toHaveBeenCalledOnce();
 });
 
+it("hands the router a channel's marks: a copy its platform may redeliver, quiet context, and a reaction", async () => {
+  vi.resetModules();
+  vi.spyOn(process, 'on').mockReturnValue(process);
+  const authenticatedSender = { userId: 'users/2002', displayName: 'Remy Vance', kind: 'human' as const };
+  const content = { sender: 'Remy Vance', reaction: { emoji: 'thumbs_up', target: { self: false } } };
+  state.startChannels.mockImplementation(async (setup) => {
+    void setup({ channelType: 'gchat', instance: 'gchat' }).onInbound(
+      'gchat:spaces/AAAAroom',
+      'gchat:spaces/AAAAroom:thread-lunch',
+      {
+        id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
+        kind: 'chat-sdk',
+        content,
+        timestamp: '2026-10-10T17:00:00.000Z',
+        isMention: false,
+        isGroup: true,
+        authenticatedSender,
+        deduplicate: true,
+        quiet: true,
+        reaction: true,
+      },
+    );
+  });
+  await import('./index.js');
+  await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
+  state.releaseAdoption!();
+
+  await vi.waitFor(() => expect(state.routeInbound).toHaveBeenCalledOnce());
+  expect(state.routeInbound).toHaveBeenCalledWith({
+    channelType: 'gchat',
+    instance: 'gchat',
+    platformId: 'gchat:spaces/AAAAroom',
+    threadId: 'gchat:spaces/AAAAroom:thread-lunch',
+    message: {
+      id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
+      kind: 'chat-sdk',
+      content: JSON.stringify(content),
+      timestamp: '2026-10-10T17:00:00.000Z',
+      isMention: false,
+      isGroup: true,
+      authenticatedSender,
+      deduplicate: true,
+      quiet: true,
+      reaction: true,
+    },
+  });
+});
+
 it('holds an answer until inbound is ready, and settles it only once its handler has finished', async () => {
   vi.resetModules();
   vi.spyOn(process, 'on').mockReturnValue(process);

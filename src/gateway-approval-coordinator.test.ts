@@ -1010,6 +1010,16 @@ describe("a gateway request in the conversation's context", () => {
     expect(notes().map((note) => note.outcome ?? 'posted')).toEqual(['posted', '⏱️ Timed out — no response']);
   });
 
+  it('notes a request the gateway gave no summary for by its method and host', async () => {
+    await wireOwnerDm();
+    const coordinator = await import('./gateway-approval-coordinator.js');
+    await coordinator.startGatewayApprovalCoordinator(provider(), delivery, vi.fn());
+
+    void decide(request({ trigger: 'policy', destination: { host: 'api.github.com', method: 'POST' } }));
+    await vi.waitFor(() => expect(notes()).toHaveLength(1));
+    expect(notes()[0]!.details).toEqual({ request: 'POST api.github.com' });
+  });
+
   it("names the conversation a request comes from when its agent does not work in the approver's DM", async () => {
     const now = new Date().toISOString();
     await createAgentGroup({ id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: now });

@@ -1519,14 +1519,26 @@ describe('createChatSdkBridge — answers in words', () => {
         });
         return messageId!;
       },
-      /** Someone writes in a thread, `seconds` into the scenario, quoting a message when told to. */
-      write(text: string, seconds: number, options: { id?: string; thread?: string; quote?: string } = {}) {
+      /**
+       * Someone writes in a thread, `seconds` into the scenario, quoting a message when told to, or
+       * forwarding one: a forward quotes text without naming a message it replies to.
+       */
+      write(
+        text: string,
+        seconds: number,
+        options: { id?: string; thread?: string; quote?: string; forwarded?: string } = {},
+      ) {
         const message = new Message({
           id: options.id ?? `spaces/AAAA/messages/juno.${seconds}`,
           threadId: options.thread ?? DM_THREAD,
           text,
           formatted: parseMarkdown(text),
-          raw: options.quote === undefined ? {} : { quote: { name: options.quote, text: 'Shall I?' } },
+          raw:
+            options.quote !== undefined
+              ? { quote: { name: options.quote, text: 'Shall I?' } }
+              : options.forwarded !== undefined
+                ? { quote: { text: options.forwarded } }
+                : {},
           author: JUNO,
           metadata: { dateSent: new Date(T0 + seconds * 1000), edited: false },
           attachments: [],
@@ -1667,14 +1679,15 @@ describe('createChatSdkBridge — answers in words', () => {
   });
 
   it('covers AE5: routes 👍 on a three-option request as a reaction', async () => {
-    await pendingApproval('mg-launch', [
+    const channelOptions = [
       { label: 'Choose existing agent', selectedLabel: 'Choose existing agent', value: 'choose_existing' },
       { label: 'Connect new agent', selectedLabel: 'Connect new agent', value: 'new_agent' },
       { label: 'Reject', selectedLabel: 'Reject', value: 'reject' },
-    ]);
+    ];
+    await pendingApproval('mg-launch', channelOptions);
     const desk = await answeringBridge();
     try {
-      const request = await desk.ask(DM, 'mg-launch', APPROVAL_OPTIONS, 0);
+      const request = await desk.ask(DM, 'mg-launch', channelOptions, 0);
       await desk.react(request, 'thumbs_up');
 
       expect(desk.actions).toEqual([]);
@@ -1745,6 +1758,46 @@ describe('createChatSdkBridge — answers in words', () => {
         ],
       ]);
       expect(desk.routed.map(({ platformId }) => platformId)).toEqual([ROOM, ROOM]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('reads past the mention of the assistant a quoted group answer begins with', async () => {
+    await pendingApproval('appr-launch');
+    const desk = await answeringBridge();
+    try {
+      const request = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
+      await desk.write('@robin yes', 30, { thread: ROOM_THREAD, quote: request });
+
+      expect(desk.actions).toEqual([
+        [
+          'appr-launch',
+          'approve',
+          'users/1001',
+          { instance: 'fixture', messageId: request, platformId: ROOM },
+          { deferResolution: true },
+        ],
+      ]);
+      expect(desk.routed).toEqual([]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('routes a forward with its quote: it names no request, though its words would answer the open question', async () => {
+    await askedQuestion('q-room', YES_NO, inAnHour());
+    const desk = await answeringBridge();
+    try {
+      await desk.write('Should we book Atlas?', -60);
+      await desk.ask(DM, 'q-room', YES_NO, 0);
+      await desk.write('yes', 30, { forwarded: 'Atlas is free on Thursday.' });
+
+      expect(desk.actions).toEqual([]);
+      expect(desk.routed.map(({ message }) => message.content)).toEqual([
+        expect.objectContaining({ text: 'Should we book Atlas?' }),
+        expect.objectContaining({ text: 'yes', replyTo: { sender: 'Robin', text: 'Atlas is free on Thursday.' } }),
+      ]);
     } finally {
       await desk.bridge.teardown();
     }
@@ -1845,22 +1898,34 @@ describe('createChatSdkBridge — answers in words', () => {
     }
   });
 
-  it('runs a slow handler once when the quoted answer is delivered again meanwhile, passing no text through', async () => {
+  it('takes a quoted answer once, delivered again during its slow handler and after it, passing no text through', async () => {
     await pendingApproval('appr-ffmpeg');
+    const { transitionPendingApprovalStatus } = await import('../db/sessions.js');
     let finish!: () => void;
     const slow = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    const desk = await answeringBridge(() => slow);
+    // The handler takes its time (an image build), then records the decision.
+    const desk = await answeringBridge(async (questionId) => {
+      await slow;
+      await transitionPendingApprovalStatus(questionId, 'pending', 'approved');
+    });
     try {
       const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
       const id = 'spaces/AAAA/messages/juno.yes';
+      // The SDK drops a copy for ten minutes only: a handler can outlast that, and Pub/Sub
+      // may deliver the message again for days. Each copy here comes after its dedupe lapsed.
+      const pastSdkDedupe = () => desk.state.delete(`dedupe:fixture:${id}`);
+
       const first = desk.write('yes', 30, { id, quote: request });
-      // At 61 seconds Pub/Sub hands the message out again while the first is still being handled.
-      const again = desk.write('yes', 30, { id, quote: request });
+      await vi.waitFor(() => expect(desk.actions).toHaveLength(1));
+      await pastSdkDedupe();
+      const during = desk.write('yes', 30, { id, quote: request });
       await new Promise((resolve) => setTimeout(resolve, 20));
       finish();
-      await Promise.all([first, again]);
+      await Promise.all([first, during]);
+      await pastSdkDedupe();
+      await desk.write('yes', 30, { id, quote: request });
 
       expect(desk.actions).toHaveLength(1);
       expect(desk.routed).toEqual([]);
