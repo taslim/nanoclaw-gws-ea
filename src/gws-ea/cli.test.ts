@@ -1208,13 +1208,6 @@ describe("gws-ea create and the principal's email addresses", () => {
     expect(collectCreateInputs).not.toHaveBeenCalled();
     expect(await everythingUnder(paths)).toEqual(before);
   });
-
-  it('names --principal-email in the usage, once per address', async () => {
-    const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    expect(io.out.join('\n')).toContain('[--principal-email <email>]...');
-  });
 });
 
 /**

@@ -56,7 +56,7 @@ interface StoredMessage {
 export interface PublishedEvent {
   readonly type: string;
   readonly data: Readonly<Record<string, unknown>>;
-  /** `ce-source`: the subscription the event came through, the one Google holds now unless a test names another. */
+  /** `ce-source`: the subscription the event came through; an earlier one unless a test names it. */
   readonly source?: string;
   readonly subject?: string;
   readonly time?: string;
@@ -140,7 +140,7 @@ export class FakeGoogleEvents {
       case 'workspaceevents.googleapis.com':
         return this.workspaceEvents(method, url, body, authorization);
       case 'oauth2.googleapis.com':
-        return this.token(body);
+        return this.token();
       default:
         throw new TypeError(`fetch failed: no fake for ${url.host}`);
     }
@@ -156,7 +156,7 @@ export class FakeGoogleEvents {
       attributes: {
         'ce-id': `event-${id}`,
         'ce-type': event.type,
-        'ce-source': event.source ?? this.deliveringSubscription(),
+        'ce-source': event.source ?? '//workspaceevents.googleapis.com/subscriptions/chat-earlier',
         'ce-subject': event.subject ?? '//chat.googleapis.com/spaces/AAAAjuno',
         'ce-time': time,
         'ce-specversion': '1.0',
@@ -202,12 +202,10 @@ export class FakeGoogleEvents {
       .filter((ackId) => ackIds.has(ackId)).length;
   }
 
-  /** The Pub/Sub calls of one method (`pull`, `acknowledge`, ...), or the Workspace Events calls matching `PATCH`, etc. */
+  /** The Pub/Sub calls of one method, such as `pull` or `acknowledge`. */
   calls(method: string): RecordedRequest[] {
-    return this.requests.filter((request) =>
-      request.url.host === 'pubsub.googleapis.com'
-        ? request.url.pathname.endsWith(`:${method}`)
-        : `${request.method} ${request.url.pathname}`.startsWith(method),
+    return this.requests.filter(
+      (request) => request.url.host === 'pubsub.googleapis.com' && request.url.pathname.endsWith(`:${method}`),
     );
   }
 
@@ -225,16 +223,6 @@ export class FakeGoogleEvents {
     };
     this.subscriptions.set(subscription.name, subscription);
     return subscription;
-  }
-
-  /**
-   * An event's source, as Google names it: the full name of the subscription
-   * it came through, not the Chat resource. That is the one Google holds now,
-   * or an earlier one when it holds none.
-   */
-  private deliveringSubscription(): string {
-    const [current] = this.subscriptions.values();
-    return `//workspaceevents.googleapis.com/${current?.name ?? 'subscriptions/chat-earlier'}`;
   }
 
   private wake(): void {
@@ -394,12 +382,10 @@ export class FakeGoogleEvents {
     return refusal({ status: 404, message: `No fake for ${method} ${path}` });
   }
 
-  private token(body: unknown): Response {
+  private token(): Response {
     if (this.tokenFailure) {
       return json(this.tokenFailure.status, { error: this.tokenFailure.error, error_description: 'Refused' });
     }
-    const assertion = String((body as Record<string, unknown> | undefined)?.assertion ?? '');
-    if (assertion.split('.').length !== 3) return json(400, { error: 'invalid_request' });
     return json(200, { access_token: SUBSCRIBER_TOKEN, expires_in: 3600, token_type: 'Bearer' });
   }
 }

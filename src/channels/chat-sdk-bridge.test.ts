@@ -858,9 +858,7 @@ describe('createChatSdkBridge — reactions an adapter reads itself', () => {
       );
 
       const content = source.routed[0]!.message.content as { reaction: { target: { excerpt: string } } };
-      expect(content.reaction.target.excerpt).toHaveLength(200);
-      expect(content.reaction.target.excerpt.endsWith('…')).toBe(true);
-      expect(long.startsWith(content.reaction.target.excerpt.slice(0, -1))).toBe(true);
+      expect(content.reaction.target.excerpt).toBe(`${'Agenda: '.repeat(24)}Agenda:…`);
     } finally {
       await source.bridge.teardown();
     }
@@ -1098,84 +1096,39 @@ describe('createChatSdkBridge — requests as text', () => {
     };
   }
 
-  it('posts an approval request in words — its title, the question, yes or no — with no code and no card', async () => {
+  it.each([
+    [
+      'an approval whose rejection takes a reason',
+      APPROVAL_OPTIONS,
+      'Quote this message with yes or no, or react 👍 or 👎. To say why, quote it with no and your reason.',
+    ],
+    ['a plain approval', APPROVAL_OPTIONS.slice(0, 2), 'Quote this message with yes or no, or react 👍 or 👎.'],
+    [
+      'any other request, numbering its options,',
+      [
+        { label: 'Connect to main', value: 'connect:ag-main' },
+        { label: 'Connect new agent', value: 'new_agent' },
+        { label: 'Reject', value: 'reject' },
+      ],
+      '1. Connect to main\n2. Connect new agent\n3. Reject\n\nQuote this message with the number or name of your choice.',
+    ],
+  ] as const)('posts %s in words, with no code and no card, and records it', async (_asked, options, howToAnswer) => {
     const { bridge, posts, posted } = await textBridge();
     try {
-      const id = await bridge.deliver(DM, null, askApproval());
+      const id = await bridge.deliver(DM, null, {
+        kind: 'chat-sdk',
+        content: { type: 'ask_question', questionId: 'appr-1', title: 'Install packages', question: QUESTION, options },
+      });
 
       expect(id).toBe('spaces/AAAAjuno/messages/morgan.1');
       expect(posts).toEqual([
-        {
-          threadId: DM,
-          message: {
-            markdown:
-              `**Install packages**\n\n${QUESTION}\n\n` +
-              'Quote this message with yes or no, or react 👍 or 👎. To say why, quote it with no and your reason.',
-          },
-        },
+        { threadId: DM, message: { markdown: `**Install packages**\n\n${QUESTION}\n\n${howToAnswer}` } },
       ]);
       expect(await posted('spaces/AAAAjuno/messages/morgan.1')).toEqual({
         questionId: 'appr-1',
         platformId: DM,
         postedAt: '2026-10-10T17:00:05.000Z',
       });
-    } finally {
-      await bridge.teardown();
-    }
-  });
-
-  it('asks a plain approval yes or no, without the reason', async () => {
-    const { bridge, posts } = await textBridge();
-    try {
-      await bridge.deliver(DM, null, {
-        kind: 'chat-sdk',
-        content: {
-          type: 'ask_question',
-          questionId: 'nsa-1',
-          title: 'New sender',
-          question: 'Juno Hale wants to talk to me here. Allow?',
-          options: [
-            { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve' },
-            { label: 'Deny', selectedLabel: '❌ Denied', value: 'reject' },
-          ],
-        },
-      });
-
-      expect(posts[0]!.message).toEqual({
-        markdown:
-          '**New sender**\n\nJuno Hale wants to talk to me here. Allow?\n\n' +
-          'Quote this message with yes or no, or react 👍 or 👎.',
-      });
-    } finally {
-      await bridge.teardown();
-    }
-  });
-
-  it("lists any other request's options by number and name, offering no 👍", async () => {
-    const { bridge, posts, posted } = await textBridge();
-    try {
-      await bridge.deliver(DM, null, {
-        kind: 'chat-sdk',
-        content: {
-          type: 'ask_question',
-          questionId: 'mg-room',
-          title: 'Mentioned in a new space',
-          question: 'Remy Vance mentioned me in Launch. How should I handle it?',
-          options: [
-            { label: 'Connect to main', value: 'connect:ag-main' },
-            { label: 'Connect new agent', value: 'new_agent' },
-            { label: 'Reject', value: 'reject' },
-          ],
-        },
-      });
-
-      expect(posts[0]!.message).toEqual({
-        markdown:
-          '**Mentioned in a new space**\n\nRemy Vance mentioned me in Launch. How should I handle it?\n\n' +
-          '1. Connect to main\n2. Connect new agent\n3. Reject\n\n' +
-          'Quote this message with the number or name of your choice.',
-      });
-      expect((await posted('spaces/AAAAjuno/messages/morgan.1'))?.questionId).toBe('mg-room');
     } finally {
       await bridge.teardown();
     }
@@ -1278,18 +1231,6 @@ describe('createChatSdkBridge — requests as text', () => {
         { markdown: `**Install packages**\n\n${QUESTION}\n\n✅ Approved` },
         { markdown: 'Install a spell checker?' },
       ]);
-    } finally {
-      await bridge.teardown();
-    }
-  });
-
-  it('finds the posted message from the question id alone', async () => {
-    const { bridge, edits } = await textBridge();
-    try {
-      await bridge.deliver(DM, null, askApproval());
-      await bridge.deliver(DM, null, outcome('appr-1', '❌ Rejected'));
-
-      expect(edits.map((edit) => edit.messageId)).toEqual(['spaces/AAAAjuno/messages/morgan.1']);
     } finally {
       await bridge.teardown();
     }
@@ -1423,9 +1364,10 @@ describe('createChatSdkBridge — requests as text', () => {
 
 describe('createChatSdkBridge — answers in words', () => {
   // On a channel whose requests are text, a reply or reaction that answers a
-  // request (src/channels/answers.ts) reaches the request's handler through
-  // onAction, awaited, instead of the agent. Anything else is routed as any
-  // message is.
+  // request reaches the request's handler through onAction, awaited, instead
+  // of the agent. Anything else is routed as any message is. Which words and
+  // reactions answer which request is answers.test.ts's to prove; these cases
+  // prove what the bridge hands it and does with its verdict.
   const DM = 'fixture:spaces/AAAAjuno';
   const DM_THREAD = `${DM}:dm`;
   const ROOM = 'fixture:spaces/AAAAlaunch';
@@ -1505,7 +1447,6 @@ describe('createChatSdkBridge — answers in words', () => {
           posts += 1;
           return { id: `spaces/AAAA/messages/noel.${posts}`, threadId, raw: { createTime: postedAt } };
         },
-        editMessage: async (threadId, messageId) => ({ id: messageId, threadId, raw: {} }),
       }),
       source,
     );
@@ -1573,15 +1514,15 @@ describe('createChatSdkBridge — answers in words', () => {
         });
         return chat!.processMessage(adapter, options.thread ?? DM_THREAD, message);
       },
-      react(messageId: string, emoji: string, options: { id?: string; thread?: string } = {}) {
-        const thread = options.thread ?? DM_THREAD;
+      /** Someone reacts in the DM to the assistant's message; the platform names a reaction the same each delivery. */
+      react(messageId: string, emoji: string) {
         return reactionHandler!({
-          reactionName: options.id ?? `${messageId}/reactions/${emoji}`,
+          reactionName: `${messageId}/reactions/${emoji}`,
           emoji: getEmoji(emoji),
           user: JUNO,
           message: new Message({
             id: messageId,
-            threadId: thread,
+            threadId: DM_THREAD,
             text: 'Shall I?',
             formatted: parseMarkdown('Shall I?'),
             raw: {},
@@ -1589,14 +1530,15 @@ describe('createChatSdkBridge — answers in words', () => {
             metadata: { dateSent: new Date(T0), edited: false },
             attachments: [],
           }),
-          threadId: thread,
+          threadId: DM_THREAD,
           reactedAt: new Date(T0 + 90_000),
         });
       },
     };
   }
 
-  async function askedQuestion(questionId: string, options: typeof YES_NO, deadline: string): Promise<void> {
+  /** An agent's question, open for the next hour. */
+  async function askedQuestion(questionId: string, options: typeof YES_NO): Promise<void> {
     const { createPendingQuestion } = await import('../db/sessions.js');
     await createPendingQuestion({
       question_id: questionId,
@@ -1608,7 +1550,7 @@ describe('createChatSdkBridge — answers in words', () => {
       title: 'Request',
       question: 'Shall I?',
       options,
-      deadline,
+      deadline: new Date(Date.now() + 3_600_000).toISOString(),
       created_at: new Date().toISOString(),
     });
   }
@@ -1627,203 +1569,76 @@ describe('createChatSdkBridge — answers in words', () => {
     });
   }
 
-  const inAnHour = () => new Date(Date.now() + 3_600_000).toISOString();
-
-  it('hands a quoted answer to the request it quotes, addressed by its message and the answering space, routing nothing', async () => {
-    await askedQuestion('q-times', TIMES, inAnHour());
+  it("takes a plain answer in a DM by the platform's clock, against the questions asked since the person last wrote", async () => {
+    await askedQuestion('q-room', YES_NO);
+    await askedQuestion('q-projector', YES_NO);
     const desk = await answeringBridge();
     try {
-      const request = await desk.ask(DM, 'q-times', TIMES, 0);
-      await desk.write('2', 60, { quote: request });
+      await desk.ask(DM, 'q-room', YES_NO, 0);
+      // Typed as the question arrived: no answer, and the question is now older than Juno's last message.
+      await desk.write('yes', 2);
+      const projector = await desk.ask(DM, 'q-projector', YES_NO, 10);
+      await desk.write('yes', 20);
 
       expect(desk.actions).toEqual([
         [
-          'q-times',
-          'wed',
-          'users/1001',
-          { instance: 'fixture', messageId: request, platformId: DM },
-          { deferResolution: true },
-        ],
-      ]);
-      expect(desk.routed).toEqual([]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('covers AE1: routes a plain "yes" after an approval request, and approves on 👍 without routing it', async () => {
-    await pendingApproval('appr-ffmpeg');
-    const desk = await answeringBridge();
-    try {
-      await desk.write('Can you cut this video?', -60);
-      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
-      await desk.write('yes', 30);
-
-      expect(desk.routed.map(({ message }) => (message.content as { text: string }).text)).toEqual([
-        'Can you cut this video?',
-        'yes',
-      ]);
-      expect(desk.actions).toEqual([]);
-
-      await desk.react(request, 'thumbs_up');
-      expect(desk.actions).toEqual([
-        [
-          'appr-ffmpeg',
-          'approve',
-          'users/1001',
-          { instance: 'fixture', messageId: request, platformId: DM },
-          { deferResolution: true },
-        ],
-      ]);
-      expect(desk.routed).toHaveLength(2);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('covers AE9: a plain "yes" in the DM answers the open question, never the approval posted after it', async () => {
-    await askedQuestion('q-room', YES_NO, inAnHour());
-    await pendingApproval('appr-remy');
-    const desk = await answeringBridge();
-    try {
-      await desk.write('Should we book Atlas?', -60);
-      const question = await desk.ask(DM, 'q-room', YES_NO, 0);
-      await desk.ask(DM, 'appr-remy', APPROVAL_OPTIONS, 20);
-      await desk.write('yes', 40);
-
-      expect(desk.actions).toEqual([
-        [
-          'q-room',
+          'q-projector',
           'yes',
           'users/1001',
-          { instance: 'fixture', messageId: question, platformId: DM },
+          { instance: 'fixture', messageId: projector, platformId: DM },
           { deferResolution: true },
         ],
       ]);
-      expect(desk.routed).toHaveLength(1);
+      expect(desk.routed.map(({ message }) => message.id)).toEqual(['spaces/AAAA/messages/juno.2']);
     } finally {
       await desk.bridge.teardown();
     }
   });
 
-  it('covers AE5: routes 👍 on a three-option request as a reaction', async () => {
-    const channelOptions = [
-      { label: 'Choose existing agent', selectedLabel: 'Choose existing agent', value: 'choose_existing' },
-      { label: 'Connect new agent', selectedLabel: 'Connect new agent', value: 'new_agent' },
-      { label: 'Reject', selectedLabel: 'Reject', value: 'reject' },
-    ];
-    await pendingApproval('mg-launch', channelOptions);
+  it('takes quoted answers in a group, past a mention of the assistant and with the reason a no gives, and routes a plain one', async () => {
+    await askedQuestion('q-launch', TIMES);
+    await pendingApproval('appr-launch');
     const desk = await answeringBridge();
     try {
-      const request = await desk.ask(DM, 'mg-launch', channelOptions, 0);
-      await desk.react(request, 'thumbs_up');
-
-      expect(desk.actions).toEqual([]);
-      expect(desk.routed).toEqual([expect.objectContaining({ message: expect.objectContaining({ reaction: true }) })]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('rejects with the reason a quoted "no" gives', async () => {
-    await pendingApproval('appr-ffmpeg');
-    const desk = await answeringBridge();
-    try {
-      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
-      await desk.write('no, too expensive', 30, { quote: request });
+      const question = await desk.ask(ROOM, 'q-launch', TIMES, 0);
+      const approval = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
+      await desk.write('2', 20, { thread: ROOM_THREAD });
+      await desk.write('2', 30, { thread: ROOM_THREAD, quote: question });
+      await desk.write('@noel no, too expensive', 40, { thread: ROOM_THREAD, quote: approval });
 
       expect(desk.actions).toEqual([
         [
-          'appr-ffmpeg',
+          'q-launch',
+          'wed',
+          'users/1001',
+          { instance: 'fixture', messageId: question, platformId: ROOM },
+          { deferResolution: true },
+        ],
+        [
+          'appr-launch',
           'reject',
           'users/1001',
-          { instance: 'fixture', messageId: request, platformId: DM },
+          { instance: 'fixture', messageId: approval, platformId: ROOM },
           { deferResolution: true, reason: 'too expensive' },
         ],
       ]);
-      expect(desk.routed).toEqual([]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('covers AE8: routes a quoted reply to a question past its deadline, with its quote', async () => {
-    await askedQuestion('q-late', YES_NO, new Date(Date.now() - 1000).toISOString());
-    const desk = await answeringBridge();
-    try {
-      const request = await desk.ask(DM, 'q-late', YES_NO, 0);
-      await desk.write('yes', 30, { quote: request });
-
-      expect(desk.actions).toEqual([]);
-      expect(desk.routed).toHaveLength(1);
-      expect(desk.routed[0]!.message.content).toMatchObject({
-        text: 'yes',
-        replyTo: { sender: 'Noel', text: 'Shall I?', id: request },
-      });
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('covers AE11: takes a quoted answer in a group only for a request posted there; a plain one is routed', async () => {
-    await askedQuestion('q-dm', YES_NO, inAnHour());
-    await pendingApproval('appr-launch');
-    const desk = await answeringBridge();
-    try {
-      const inDm = await desk.ask(DM, 'q-dm', YES_NO, 0);
-      const inRoom = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
-      await desk.write('yes', 20, { thread: ROOM_THREAD });
-      await desk.write('yes', 30, { thread: ROOM_THREAD, quote: inDm });
-      await desk.write('yes', 40, { thread: ROOM_THREAD, quote: inRoom });
-
-      expect(desk.actions).toEqual([
-        [
-          'appr-launch',
-          'approve',
-          'users/1001',
-          { instance: 'fixture', messageId: inRoom, platformId: ROOM },
-          { deferResolution: true },
-        ],
+      expect(desk.routed.map(({ platformId, message }) => [platformId, message.id])).toEqual([
+        [ROOM, 'spaces/AAAA/messages/juno.20'],
       ]);
-      expect(desk.routed.map(({ platformId }) => platformId)).toEqual([ROOM, ROOM]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('reads past the mention of the assistant a quoted group answer begins with', async () => {
-    await pendingApproval('appr-launch');
-    const desk = await answeringBridge();
-    try {
-      const request = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
-      await desk.write('@noel yes', 30, { thread: ROOM_THREAD, quote: request });
-
-      expect(desk.actions).toEqual([
-        [
-          'appr-launch',
-          'approve',
-          'users/1001',
-          { instance: 'fixture', messageId: request, platformId: ROOM },
-          { deferResolution: true },
-        ],
-      ]);
-      expect(desk.routed).toEqual([]);
     } finally {
       await desk.bridge.teardown();
     }
   });
 
   it('routes a forward with its quote: it names no request, though its words would answer the open question', async () => {
-    await askedQuestion('q-room', YES_NO, inAnHour());
+    await askedQuestion('q-room', YES_NO);
     const desk = await answeringBridge();
     try {
-      await desk.write('Should we book Atlas?', -60);
       await desk.ask(DM, 'q-room', YES_NO, 0);
       await desk.write('yes', 30, { forwarded: 'Atlas is free on Thursday.' });
 
       expect(desk.actions).toEqual([]);
       expect(desk.routed.map(({ message }) => message.content)).toEqual([
-        expect.objectContaining({ text: 'Should we book Atlas?' }),
         expect.objectContaining({ text: 'yes', replyTo: { sender: 'Noel', text: 'Atlas is free on Thursday.' } }),
       ]);
     } finally {
@@ -1831,80 +1646,41 @@ describe('createChatSdkBridge — answers in words', () => {
     }
   });
 
-  it('resolves a durable gateway hold with a correctly addressed answer', async () => {
-    const coordinator = await import('../gateway-approval-coordinator.js');
-    const { createPendingApproval, getPendingApproval } = await import('../db/sessions.js');
-    const decide = vi.fn(async () => true);
-    const desk = await answeringBridge(async (questionId, value, userId, address, answer) => {
-      await coordinator.handleGatewayApprovalResponse({
-        questionId,
-        value,
-        reason: answer?.reason,
-        userId,
-        channelType: 'fixture',
-        instance: address?.instance,
-        messageId: address?.messageId,
-        platformId: address?.platformId ?? '',
-        threadId: address?.threadId ?? null,
-        deferResolution: answer?.deferResolution,
-      });
-    });
-    await coordinator.startGatewayApprovalCoordinator(
-      {
-        kind: 'fixture',
-        agentSkills: [],
-        sessions: {
-          async ensure() {
-            return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
-          },
-        },
-        approvals: {
-          durable: true,
-          decide,
-          listPending: async () => [],
-          async subscribe(_decide, signal) {
-            await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
-          },
-        },
-      },
-      {
-        deliver: (_channelType, platformId, threadId, kind, content) =>
-          desk.bridge.deliver(platformId, threadId, { kind, content: JSON.parse(content) as unknown }),
-      },
-      vi.fn(),
-    );
+  it('hands a 👍 on an approval to its handler once, though delivered again, and routes a 👍 that answers nothing', async () => {
+    const channelOptions = [
+      { label: 'Choose existing agent', selectedLabel: 'Choose existing agent', value: 'choose_existing' },
+      { label: 'Connect new agent', selectedLabel: 'Connect new agent', value: 'new_agent' },
+      { label: 'Reject', selectedLabel: 'Reject', value: 'reject' },
+    ];
+    await pendingApproval('appr-ffmpeg');
+    await pendingApproval('mg-launch', channelOptions);
+    const desk = await answeringBridge();
     try {
-      const request = await desk.ask(DM, 'ga-charge', APPROVAL_OPTIONS.slice(0, 2), 0);
-      await createPendingApproval({
-        approval_id: 'ga-charge',
-        request_id: 'req-charge',
-        action: coordinator.GATEWAY_APPROVAL_ACTION,
-        payload: JSON.stringify({ gatewayProvider: 'fixture' }),
-        created_at: new Date().toISOString(),
-        channel_type: 'fixture',
-        platform_id: DM,
-        instance: 'fixture',
-        platform_message_id: request,
-        expires_at: inAnHour(),
-        approver_user_id: 'fixture:users/1001',
-        title: 'Credentials request',
-        question: 'POST api.example.com/v1/charges',
-        options_json: JSON.stringify(APPROVAL_OPTIONS.slice(0, 2)),
-      });
+      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
+      const channel = await desk.ask(DM, 'mg-launch', channelOptions, 0);
+      await desk.react(request, 'thumbs_up');
+      await desk.react(request, 'thumbs_up');
+      await desk.react(channel, 'thumbs_up');
 
-      await desk.write('yes', 30, { quote: request });
-
-      expect(decide).toHaveBeenCalledWith('req-charge', 'approve');
-      expect(await getPendingApproval('ga-charge')).toBeUndefined();
-      expect(desk.routed).toEqual([]);
+      expect(desk.actions).toEqual([
+        [
+          'appr-ffmpeg',
+          'approve',
+          'users/1001',
+          { instance: 'fixture', messageId: request, platformId: DM },
+          { deferResolution: true },
+        ],
+      ]);
+      expect(desk.routed.map(({ message }) => [message.id, message.reaction])).toEqual([
+        [`${channel}/reactions/thumbs_up`, true],
+      ]);
     } finally {
-      await coordinator.stopGatewayApprovalCoordinator();
       await desk.bridge.teardown();
     }
   });
 
-  it('rejects while an answer fails, and resolves the request when the platform delivers it again', async () => {
-    await askedQuestion('q-room', YES_NO, inAnHour());
+  it("rejects while an answer's handler fails, then takes the answer delivered again once, routing none of it", async () => {
+    await askedQuestion('q-room', YES_NO);
     let failures = 1;
     const desk = await answeringBridge(async () => {
       if (failures-- > 0) throw new Error('database is locked');
@@ -1912,72 +1688,21 @@ describe('createChatSdkBridge — answers in words', () => {
     try {
       const request = await desk.ask(DM, 'q-room', YES_NO, 0);
       const id = 'spaces/AAAA/messages/juno.yes';
+      // Pub/Sub may deliver a message again for days, and the SDK drops a copy for ten minutes only; the
+      // adapter releases that for a message it could not hand on. Each delivery here comes past it.
+      const deliver = async () => {
+        await desk.state.delete(`dedupe:fixture:${id}`);
+        await desk.write('yes', 30, { id, quote: request });
+      };
 
-      await expect(desk.write('yes', 30, { id, quote: request })).rejects.toThrow(/database is locked/u);
-      // The adapter releases the SDK's own dedupe of a message it could not hand on, so the next delivery runs.
-      await desk.state.delete(`dedupe:fixture:${id}`);
-      await desk.write('yes', 30, { id, quote: request });
+      await expect(deliver()).rejects.toThrow(/database is locked/u);
+      await deliver();
+      await deliver();
 
-      expect(desk.actions).toHaveLength(2);
-      expect(desk.actions[1]!.slice(0, 2)).toEqual(['q-room', 'yes']);
-      expect(desk.routed).toEqual([]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('takes a quoted answer once, delivered again during its slow handler and after it, passing no text through', async () => {
-    await pendingApproval('appr-ffmpeg');
-    const { transitionPendingApprovalStatus } = await import('../db/sessions.js');
-    let finish!: () => void;
-    const slow = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    // The handler takes its time (an image build), then records the decision.
-    const desk = await answeringBridge(async (questionId) => {
-      await slow;
-      await transitionPendingApprovalStatus(questionId, 'pending', 'approved');
-    });
-    try {
-      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
-      const id = 'spaces/AAAA/messages/juno.yes';
-      // The SDK drops a copy for ten minutes only: a handler can outlast that, and Pub/Sub
-      // may deliver the message again for days. Each copy here comes after its dedupe lapsed.
-      const pastSdkDedupe = () => desk.state.delete(`dedupe:fixture:${id}`);
-
-      const first = desk.write('yes', 30, { id, quote: request });
-      await vi.waitFor(() => expect(desk.actions).toHaveLength(1));
-      await pastSdkDedupe();
-      const during = desk.write('yes', 30, { id, quote: request });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      finish();
-      await Promise.all([first, during]);
-      await pastSdkDedupe();
-      await desk.write('yes', 30, { id, quote: request });
-
-      expect(desk.actions).toHaveLength(1);
-      expect(desk.routed).toEqual([]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('drops a 👍 delivered again while its answer is handled, routing neither', async () => {
-    await pendingApproval('appr-ffmpeg');
-    let finish!: () => void;
-    const slow = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    const desk = await answeringBridge(() => slow);
-    try {
-      const request = await desk.ask(DM, 'appr-ffmpeg', APPROVAL_OPTIONS, 0);
-      const first = desk.react(request, 'thumbs_up', { id: 'reaction-1' });
-      const again = desk.react(request, 'thumbs_up', { id: 'reaction-1' });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      finish();
-      await Promise.all([first, again]);
-
-      expect(desk.actions).toHaveLength(1);
+      expect(desk.actions.map(([questionId, value]) => [questionId, value])).toEqual([
+        ['q-room', 'yes'],
+        ['q-room', 'yes'],
+      ]);
       expect(desk.routed).toEqual([]);
     } finally {
       await desk.bridge.teardown();

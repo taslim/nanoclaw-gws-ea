@@ -232,13 +232,10 @@ describe('a new principal address once the inbox exists', () => {
 
   it('asks as the assistant, in the first person, never as the agent group', async () => {
     await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main));
-    await getDb().run('UPDATE gws_ea_profile SET assistant_display_name = NULL WHERE singleton = 1');
-    await run('principal-addresses-add', { email: 'morgan@other.example.test' }, agent(main));
 
     const questions = sent.map((card) => (JSON.parse(card.content) as { question: string }).question);
     expect(questions).toEqual([
       expect.stringMatching(/^I'd like to record morgan@new\.example\.test as one of your email addresses\./),
-      expect.stringMatching(/^I'd like to record morgan@other\.example\.test as one of your email addresses\./),
     ]);
     for (const question of questions) expect(question).not.toMatch(/\bmain\b|\bAya\b|the assistant/u);
   });

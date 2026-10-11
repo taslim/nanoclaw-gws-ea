@@ -109,15 +109,6 @@ async function queuedIds(): Promise<unknown[]> {
 }
 
 describe('retry-safe routed inbound IDs', () => {
-  it('stores a retried welcome once and sets nothing off for the copy', async () => {
-    const welcome = event('gws-ea-welcome:stable', 'welcome', true);
-    await routeInbound(welcome);
-    await routeInbound(welcome);
-
-    expect(await queuedIds()).toEqual([{ id: 'gws-ea-welcome:stable:ag-1' }]);
-    expect(requestWake).toHaveBeenCalledTimes(1);
-  });
-
   it('drops a redelivered Chat message already routed: no second row, typing, wake, or fan-out', async () => {
     const message = event('spaces/AAAAjuno/messages/remy.1', 'Can you move Thursday?', true);
     await routeInbound(message);

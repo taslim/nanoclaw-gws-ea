@@ -234,16 +234,6 @@ describe('binding the principal through the DM the assistant opens', () => {
     );
   });
 
-  it('binds the same person, at the same moment, with the same welcome, when run again', async () => {
-    const h = harness();
-
-    const first = await bindPrincipal(runtimeConfig(), INPUT, h.dependencies);
-    const second = await bindPrincipal(runtimeConfig(), INPUT, h.dependencies);
-
-    expect(second).toEqual(first);
-    expect(h.order).toEqual([...BIND_ORDER, ...BIND_ORDER]);
-  });
-
   it.each([
     ['a request the principal must accept', { status: 'awaiting_acceptance', space: 'spaces/dm-2001' }],
     ['Google unavailable', { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' }],

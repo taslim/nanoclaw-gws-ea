@@ -9,7 +9,16 @@
  * Every request is recorded. A test makes the next requests fail with
  * `failures`, answered in order.
  */
-import { ASSISTANT, CHAT_TOKEN, type ChatFailure } from './fake-chat-api.js';
+import {
+  ASSISTANT,
+  CHAT_TOKEN,
+  NOT_FOUND,
+  UNAUTHENTICATED,
+  json,
+  refusal,
+  requestUrl,
+  type ChatFailure,
+} from './fake-chat-api.js';
 
 /** Someone Google Chat can resolve by address. */
 export interface FakeChatPerson {
@@ -33,21 +42,6 @@ interface FakeMembership {
   readonly member: { readonly name: string; readonly type: string };
 }
 
-function json(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-}
-
-function refusal(failure: ChatFailure): Response {
-  return json(failure.status, { error: { code: failure.status, message: failure.message } });
-}
-
-const NOT_FOUND: ChatFailure = { status: 404, message: 'Requested entity was not found.' };
-
-function requestUrl(input: string | URL | Request): URL {
-  if (input instanceof URL) return input;
-  return new URL(typeof input === 'string' ? input : input.url);
-}
-
 export class FakeChatDirectMessages {
   readonly requests: FakeChatDmRequest[] = [];
   /** People Chat resolves, by lowercased address. */
@@ -68,9 +62,7 @@ export class FakeChatDirectMessages {
     const path = decodeURIComponent(url.pathname.replace(/^\/v1\//u, ''));
     this.requests.push({ method, path, body });
     if (url.host !== 'chat.googleapis.com') throw new TypeError(`fetch failed: no fake for ${url.host}`);
-    if (new Headers(init?.headers).get('authorization') !== `Bearer ${CHAT_TOKEN}`) {
-      return refusal({ status: 401, message: 'Request had invalid authentication credentials.' });
-    }
+    if (new Headers(init?.headers).get('authorization') !== `Bearer ${CHAT_TOKEN}`) return refusal(UNAUTHENTICATED);
     const failure = this.failures.shift();
     if (failure) return refusal(failure);
     if (method === 'POST' && path === 'spaces:setup') return this.setup(body);

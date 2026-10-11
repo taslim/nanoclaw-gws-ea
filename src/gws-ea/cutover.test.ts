@@ -7,7 +7,6 @@
  * fault, on the fixture's assistants.
  */
 import { spawn } from 'node:child_process';
-import { readlinkSync } from 'node:fs';
 import { mkdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -334,15 +333,6 @@ describe('the serving gate: a release serves once its Google Chat receives (KTD1
     });
   });
 
-  it('serves a release whose only fault is a broken Google sign-in, returning the sign-in needed', async () => {
-    const host = await machine();
-    const runtime = await assistant(host);
-    const state = world(runtime);
-    state.chatSignInNeeded = true;
-
-    expect(await verifyLive(host, runtime, state)).toEqual({ signInNeeded: signInNeeded(runtime.instance_id) });
-  });
-
   it('refuses a broken sign-in beside any other fault', async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -355,26 +345,6 @@ describe('the serving gate: a release serves once its Google Chat receives (KTD1
 });
 
 describe('update and rollback through the serving gate (KTD12)', { timeout: 90_000 }, () => {
-  it('rolls back a new release whose Google Chat consumer never connects', async () => {
-    const host = await machine();
-    const runtime = await assistant(host);
-    const next = await nextRelease(host);
-    const state = world(runtime);
-    state.onStart = (root) => {
-      state.chatDown = readlinkSync(root) === releaseName(next.commit);
-    };
-    const { run, err } = cli(host, state, next, runtime);
-
-    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
-
-    const failure = err.join('\n');
-    expect(failure).toContain('Google Chat is not receiving: its consumer is not connected');
-    expect(failure).toContain('so it was rolled back');
-    expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
-    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
-    expect(state.running).toBe(true);
-  });
-
   it('serves an update and a rollback whose only fault is a broken Google sign-in, reporting the sign-in needed', async () => {
     const host = await machine();
     const runtime = await assistant(host);

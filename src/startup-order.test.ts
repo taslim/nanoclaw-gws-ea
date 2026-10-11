@@ -104,24 +104,23 @@ it('finishes adoption before a channel can route its first inbound message', asy
 it("hands the router a channel's marks: a copy its platform may redeliver, quiet context, and a reaction", async () => {
   vi.resetModules();
   vi.spyOn(process, 'on').mockReturnValue(process);
-  const authenticatedSender = { userId: 'users/2002', displayName: 'Remy Vance', kind: 'human' as const };
   const content = { sender: 'Remy Vance', reaction: { emoji: 'thumbs_up', target: { self: false } } };
+  const message = {
+    id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
+    kind: 'chat-sdk' as const,
+    timestamp: '2026-10-10T17:00:00.000Z',
+    isMention: false,
+    isGroup: true,
+    authenticatedSender: { userId: 'users/2002', displayName: 'Remy Vance', kind: 'human' as const },
+    deduplicate: true,
+    quiet: true,
+    reaction: true,
+  };
   state.startChannels.mockImplementation(async (setup) => {
     void setup({ channelType: 'gchat', instance: 'gchat' }).onInbound(
       'gchat:spaces/AAAAroom',
       'gchat:spaces/AAAAroom:thread-lunch',
-      {
-        id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
-        kind: 'chat-sdk',
-        content,
-        timestamp: '2026-10-10T17:00:00.000Z',
-        isMention: false,
-        isGroup: true,
-        authenticatedSender,
-        deduplicate: true,
-        quiet: true,
-        reaction: true,
-      },
+      { ...message, content },
     );
   });
   await import('./index.js');
@@ -134,18 +133,7 @@ it("hands the router a channel's marks: a copy its platform may redeliver, quiet
     instance: 'gchat',
     platformId: 'gchat:spaces/AAAAroom',
     threadId: 'gchat:spaces/AAAAroom:thread-lunch',
-    message: {
-      id: 'spaces/AAAAroom/messages/juno.1/reactions/r1',
-      kind: 'chat-sdk',
-      content: JSON.stringify(content),
-      timestamp: '2026-10-10T17:00:00.000Z',
-      isMention: false,
-      isGroup: true,
-      authenticatedSender,
-      deduplicate: true,
-      quiet: true,
-      reaction: true,
-    },
+    message: { ...message, content: JSON.stringify(content) },
   });
 });
 

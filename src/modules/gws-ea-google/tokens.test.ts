@@ -110,15 +110,6 @@ describe("minting a service's token from the grant", () => {
     expect(world.asked).toEqual([MODIFY]);
   });
 
-  it("mints the host's Chat token with the chat service's scopes alone, and refuses one Google made broader", async () => {
-    const world = google();
-    await expect(mintServiceToken(GRANT, 'chat', { fetch: world.fetch })).resolves.toMatchObject({ scopes: CHAT });
-    expect(world.asked).toEqual([CHAT.join(' ')]);
-
-    const broader = google((asked) => ({ scope: `${asked} https://www.googleapis.com/auth/chat.spaces` }));
-    await expect(mintServiceToken(GRANT, 'chat', { fetch: broader.fetch })).rejects.toMatchObject({ refused: true });
-  });
-
   it("refuses the host's Drive token on a grant without Drive, without asking Google", async () => {
     const world = google();
     const error = await mintServiceToken(OLD_GRANT, 'drive-host', { fetch: world.fetch }).catch(

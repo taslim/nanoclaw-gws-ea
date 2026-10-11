@@ -119,6 +119,16 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
   });
 }
 
+/** The Chat subscriber key `provision_gcp` publishes, owner-only in the runtime's secrets. */
+async function writeSubscriberKey(
+  context: ProductionProvisionContext,
+  overrides: Readonly<Record<string, string>> = {},
+): Promise<void> {
+  const file = context.input.runtime.secret_files.gchat_subscriber_key;
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, serviceAccount(overrides), { mode: 0o600 });
+}
+
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
   return {
     schema_version: 1,
@@ -1545,13 +1555,7 @@ describe('production provision step composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(credentialOverride), {
-        mode: 0o600,
-      });
+      await writeSubscriberKey(context, credentialOverride);
       const definitions = createProductionProvisionSteps(context, { reconcileInstanceRuntime: startRuntime });
 
       const host = definitions.start_nanoclaw.resources[0]!;
@@ -1626,11 +1630,7 @@ describe('production provision step composition', () => {
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       const reconcileInstanceRuntime = vi.fn(async () => ({ pid: 4242 }) as never);
       const step = createProductionProvisionSteps(
         context,
@@ -1679,11 +1679,7 @@ describe('production provision step composition', () => {
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       const host = createProductionProvisionSteps(context, {
         reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
       }).start_nanoclaw.resources[0]!;
@@ -1721,11 +1717,7 @@ describe('production provision step composition', () => {
           },
         },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       const reconcileInstanceRuntime = vi.fn(async () => {
         host = 'serving';
         return { pid: 4242 } as never;
@@ -1956,11 +1948,7 @@ describe('create on the release layout', () => {
       // Create's OneCLI step renders the Compose file itself before it reaches Docker.
       await expect(steps.start_onecli.resources[0]!.apply(context)).rejects.toThrow('Docker is not reached');
       // Create's service step installs the service definition when it starts the host.
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(), { mode: 0o600 });
+      await writeSubscriberKey(context);
       await expect(steps.start_nanoclaw.resources[0]!.apply(context)).resolves.toBeUndefined();
 
       const kept = keptReleaseFiles(create.layout.kept(create.release));
@@ -2115,11 +2103,7 @@ async function productionHarness(): Promise<ProductionHarness> {
             },
           },
         };
-        await mkdir(path.dirname(context.input.runtime.secret_files.gchat_subscriber_key), {
-          recursive: true,
-          mode: 0o700,
-        });
-        await writeFile(context.input.runtime.secret_files.gchat_subscriber_key, serviceAccount(), { mode: 0o600 });
+        await writeSubscriberKey(context);
         harness.lastContext = context;
         const effect = (name: string, resource: string): void => {
           harness.effects.push(name);
@@ -2275,9 +2259,16 @@ describe('production step order and pause outcomes', () => {
   it("signs in before the host starts, connects agents' access after it, then binds the principal through the DM the assistant opens", async () => {
     const harness = await productionHarness();
 
+    // A principal outside the assistant's organization must accept its DM first.
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
+      pause: {
+        phase: 'bind_principal',
+        code: 'principal_chat_request_pending',
+        message:
+          "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
+          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
+      },
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
@@ -2337,33 +2328,6 @@ describe('production step order and pause outcomes', () => {
       status: 'paused',
       pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
     });
-  });
-
-  it('starts no host before the Chat API is configured', async () => {
-    const harness = await productionHarness();
-    harness.chatConfigured = false;
-
-    await harness.run();
-
-    expect(harness.effects).not.toContain('signInGoogle');
-    expect(harness.effects).not.toContain('reconcileInstanceRuntime');
-  });
-
-  it('says a principal outside the organization must accept the request, and binds them once they do', async () => {
-    const harness = await productionHarness();
-
-    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
-    expect(paused.pause).toMatchObject({
-      phase: 'bind_principal',
-      code: 'principal_chat_request_pending',
-      message:
-        "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
-        'direct message as a request. Ask them to accept it in Google Chat, then resume.',
-    });
-    expect(paused.pause.details?.[0]).toBe('Principal: Principal (principal@example.test)');
-
-    harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
   });
 
   it('pauses with the error when Google stays unavailable, trying no other address, and binds once it answers', async () => {

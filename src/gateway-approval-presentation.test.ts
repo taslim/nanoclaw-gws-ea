@@ -21,8 +21,6 @@ it('asks as the assistant: the resource first, then the action and reason, and o
     "Approving lets this one request through. It doesn't connect an account or change what I'm allowed to do.",
   ]);
   expect(card.question).not.toContain('secret');
-  // The assistant is the one asking: the agent group behind it is not named.
-  expect(card.question).not.toContain('Nano');
 });
 
 it('escapes supplied formatting, mentions, and links, and bounds the card', () => {

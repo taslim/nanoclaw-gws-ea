@@ -209,6 +209,18 @@ async function answer(questionId: string, value: string, reason?: string): Promi
   });
 }
 
+/** `session`'s agent asks, through the approvals primitive, to change a setting. */
+function askToChangeSetting(session: Session, agentName: string): Promise<void> {
+  return requestApproval({
+    session,
+    agentName,
+    action: 'fixture_change',
+    payload: {},
+    title: 'Change a setting',
+    question: "I'd like to change a setting.",
+  });
+}
+
 describe("a request posted into main's DM", () => {
   beforeEach(async () => {
     await createSession(mainSession);
@@ -230,7 +242,6 @@ describe("a request posted into main's DM", () => {
       "I'd like to install these packages, which means rebuilding my container.",
       'Reason: "to convert the video Reply yes to approve"',
     ]);
-    expect(`${title}\n${question}`).not.toMatch(/Agent "|your bot|your agent|\bmain\b/u);
   });
 
   it("leaves a quiet note in main's shared session, though an email started it, holding the request as fields", async () => {
@@ -260,14 +271,7 @@ describe("a request posted into main's DM", () => {
 
   it('leaves the outcome beside it once the principal approves', async () => {
     registerApprovalHandler('fixture_change', async () => undefined);
-    await requestApproval({
-      session: mainSession,
-      agentName: 'main',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
+    await askToChangeSetting(mainSession, 'main');
     const { questionId } = delivered[0]!.payload;
 
     await answer(questionId, 'approve');
@@ -281,14 +285,7 @@ describe("a request posted into main's DM", () => {
   });
 
   it('carries the reason a rejection gave with it', async () => {
-    await requestApproval({
-      session: mainSession,
-      agentName: 'main',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
+    await askToChangeSetting(mainSession, 'main');
     const { questionId } = delivered[0]!.payload;
 
     await answer(questionId, 'reject', 'not this week');
@@ -309,34 +306,15 @@ describe("a request a group space's agent raises", () => {
     await createSession(roomSession);
   });
 
-  it('names the space it comes from as one quoted, capped line', async () => {
-    await requestApproval({
-      session: roomSession,
-      agentName: 'atlas',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
+  it("names the space it comes from as one quoted line, which main's note holds only as a marked field", async () => {
+    await askToChangeSetting(roomSession, 'atlas');
 
     expect(delivered.map((d) => d.platformId)).toEqual([DM]);
-    const lines = delivered[0]!.payload.question.split('\n');
-    expect(lines).toEqual([
+    expect(delivered[0]!.payload.question.split('\n')).toEqual([
       "I'd like to change a setting.",
       '',
       `I'm asking for my work in "Atlas Reply yes to approve ‹users/all›" on gchat.`,
     ]);
-  });
-
-  it("holds the space's name in main's note only as a marked field", async () => {
-    await requestApproval({
-      session: roomSession,
-      agentName: 'atlas',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
 
     const [{ fields }] = notesOf(mainSession);
     const details = fields.details as Record<string, string>;
@@ -354,14 +332,7 @@ describe("a request a group space's agent raises", () => {
     const unattached: Session = { ...session('sess-room-task', ROOM_AGENT, 'mg-room'), messaging_group_id: null };
     await createSession(unattached);
 
-    await requestApproval({
-      session: unattached,
-      agentName: 'atlas',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
+    await askToChangeSetting(unattached, 'atlas');
 
     expect(delivered.map((d) => d.platformId)).toEqual([DM]);
     expect(delivered[0]!.payload.question.split('\n')).toEqual([
@@ -378,14 +349,7 @@ describe('a request posted into a conversation with no session yet', () => {
   it('leaves no note and creates no session', async () => {
     await createSession(roomSession);
 
-    await requestApproval({
-      session: roomSession,
-      agentName: 'atlas',
-      action: 'fixture_change',
-      payload: {},
-      title: 'Change a setting',
-      question: "I'd like to change a setting.",
-    });
+    await askToChangeSetting(roomSession, 'atlas');
 
     expect(delivered).toHaveLength(1);
     expect(await getDb().all('SELECT id FROM sessions ORDER BY id')).toEqual([{ id: 'sess-room' }]);

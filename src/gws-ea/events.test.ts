@@ -5,14 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { SecretSource } from './create-input.js';
-import {
-  createInteraction,
-  decisionForChoice,
-  PauseRequired,
-  runStep,
-  type InteractivePrompts,
-  type RunEvent,
-} from './events.js';
+import { createInteraction, PauseRequired, runStep, type InteractivePrompts, type RunEvent } from './events.js';
 import { resolveControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause } from './phases.js';
 import { redact, REDACTED } from './redact.js';
@@ -296,18 +289,5 @@ describe('Interaction port', () => {
     await interaction.signInToGoogleCloud('operator@example.test');
     expect(order).toEqual(['suspend', 'sign-in', 'resume']);
     expect(interaction.decisions).toEqual({ chatConfigured: true, billingAccount: '01A2B3-C4D5E6-F7A8B9' });
-  });
-});
-
-describe("a pause's choice", () => {
-  it('becomes the decision its resume flag records', () => {
-    expect(decisionForChoice('--billing-account', '01A2B3-C4D5E6-F7A8B9')).toEqual({
-      billingAccount: '01A2B3-C4D5E6-F7A8B9',
-    });
-  });
-
-  it('is no decision for a flag that takes no choice', () => {
-    expect(decisionForChoice('--chat-configured', 'yes')).toBeUndefined();
-    expect(decisionForChoice(undefined, '01A2B3-C4D5E6-F7A8B9')).toBeUndefined();
   });
 });

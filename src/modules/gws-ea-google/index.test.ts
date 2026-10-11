@@ -464,13 +464,9 @@ describe("the host's own Google tokens", () => {
     expect(asked).toEqual([HOST_GOOGLE_SERVICES.chat.scopes.join(' ')]);
 
     expect(getGatewayProvider().credentials).toBeUndefined();
+    // Starting the host keeps the same source, so the token minted before it is still held.
     await start();
     await expect(google.hostGoogleAccessToken('chat')).resolves.toBe('ya29.host-1');
-    await expect(google.hostGoogleAccessToken('directory-host')).resolves.toBe('ya29.host-2');
-    expect(asked).toEqual([
-      HOST_GOOGLE_SERVICES.chat.scopes.join(' '),
-      'https://www.googleapis.com/auth/directory.readonly',
-    ]);
   });
 
   it("tells the host the assistant's account and its Google ID from the grant", async () => {

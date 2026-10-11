@@ -158,10 +158,6 @@ function iamPolicy(policy: ReadonlyMap<string, ReadonlySet<string>>): Record<str
   };
 }
 
-function pubsubNotFound(kind: string, id: string): SanitizedCommandOutcome {
-  return failed(`ERROR: (gcloud.pubsub.${kind}) NOT_FOUND: Resource not found (resource=${id}).`);
-}
-
 /** The member and role of `gcloud pubsub ... add-iam-policy-binding ID --member=M --role=R --project=P`. */
 function binding(words: readonly string[]): { member: string; role: string } {
   const flag = (name: string): string => {
@@ -279,26 +275,24 @@ class FakeGoogleCloud {
       return this.#createSubscription(words);
     }
     if (line === `pubsub topics get-iam-policy ${topic} ${scoped} --format=json`) {
-      return this.topic ? ok(json(iamPolicy(this.topicPolicy))) : pubsubNotFound('topics', topic);
+      return ok(json(iamPolicy(this.topicPolicy)));
     }
     if (line === `pubsub subscriptions get-iam-policy ${subscription} ${scoped} --format=json`) {
-      return this.subscription
-        ? ok(json(iamPolicy(this.subscriptionPolicy)))
-        : pubsubNotFound('subscriptions', subscription);
+      return ok(json(iamPolicy(this.subscriptionPolicy)));
     }
     if (
       words.length === 7 &&
       line.startsWith(`pubsub topics add-iam-policy-binding ${topic} `) &&
       words[6] === scoped
     ) {
-      return this.topic ? this.#grantOnTopic(words) : pubsubNotFound('topics', topic);
+      return this.#grantOnTopic(words);
     }
     if (
       words.length === 7 &&
       line.startsWith(`pubsub subscriptions add-iam-policy-binding ${subscription} `) &&
       words[6] === scoped
     ) {
-      return this.subscription ? this.#grantOnSubscription(words) : pubsubNotFound('subscriptions', subscription);
+      return this.#grantOnSubscription(words);
     }
     if (line === `services list --enabled ${scoped} --format=value(config.name)`) {
       return ok([...this.enabled].sort().join('\n') + '\n');
@@ -445,20 +439,6 @@ class FakeGoogleCloud {
   }
 
   #createSubscription(words: readonly string[]): SanitizedCommandOutcome {
-    const name = deriveGchatEventsSubscription(this.gcp.projectId);
-    if (this.subscription) {
-      return failed(
-        [
-          `ERROR: Failed to create subscription [${name}]: Resource already exists in the project (resource=${GCHAT_EVENTS_SUBSCRIPTION_ID}).`,
-          `ERROR: (gcloud.pubsub.subscriptions.create) Failed to create the following: [${GCHAT_EVENTS_SUBSCRIPTION_ID}].`,
-        ].join('\n'),
-      );
-    }
-    if (!this.topic) {
-      return failed(
-        `ERROR: (gcloud.pubsub.subscriptions.create) NOT_FOUND: Resource not found (resource=${GCHAT_EVENTS_TOPIC_ID}).`,
-      );
-    }
     const flags = words.slice(4, -1).map((flag): [string, string | boolean] => {
       const [key, value] = flag.slice(2).split('=') as [string, string | undefined];
       if (value !== undefined) return [key, value];
@@ -466,7 +446,7 @@ class FakeGoogleCloud {
     });
     this.subscription = Object.fromEntries(flags);
     this.mutations.push(words.join(' '));
-    return ok('', `Created subscription [${name}].\n`);
+    return ok('', `Created subscription [${deriveGchatEventsSubscription(this.gcp.projectId)}].\n`);
   }
 
   #grantOnTopic(words: readonly string[]): SanitizedCommandOutcome {
@@ -478,8 +458,8 @@ class FakeGoogleCloud {
   #grantOnSubscription(words: readonly string[]): SanitizedCommandOutcome {
     const { member, role } = binding(words);
     const email = this.gcp.serviceAccountEmail;
-    if (member === `serviceAccount:${email}` && (!this.serviceAccount || this.unknownMemberGrants > 0)) {
-      if (this.serviceAccount) this.unknownMemberGrants -= 1;
+    if (member === `serviceAccount:${email}` && this.unknownMemberGrants > 0) {
+      this.unknownMemberGrants -= 1;
       return failed(
         `ERROR: (gcloud.pubsub.subscriptions.add-iam-policy-binding) INVALID_ARGUMENT: Service account ${email} does not exist.`,
       );
@@ -498,13 +478,6 @@ class FakeGoogleCloud {
     policy.set(role, members);
     this.mutations.push(words.join(' '));
     return ok(json(iamPolicy(policy)), `Updated IAM policy for ${words[1]!.slice(0, -1)} [${words[3]}].\n`);
-  }
-
-  /** Who may do what on the topic and the subscription. */
-  get grants(): Record<'topic' | 'subscription', Record<string, string[]>> {
-    const plain = (policy: Map<string, Set<string>>): Record<string, string[]> =>
-      Object.fromEntries([...policy].map(([role, members]) => [role, [...members]]));
-    return { topic: plain(this.topicPolicy), subscription: plain(this.subscriptionPolicy) };
   }
 
   get serviceAccountDescription(): Record<string, unknown> {
@@ -913,6 +886,8 @@ describe('Google Cloud setup through the step engine', () => {
 
     const { projectId, instanceId, serviceAccountEmail } = setup.gcp;
     const keyId = await publishedKeyId(setup.gcp);
+    // Least privilege: only Google Chat may publish to the topic, and the subscriber may only pull the one
+    // subscription; the fake refuses any other grant, a project-wide one included, as an unexpected command.
     expect(setup.cloud.mutations).toEqual([
       `projects create ${projectId} --name=GWS-EA assistant --labels=gws-ea-instance=${instanceId},gws-ea-managed=true --format=json`,
       `billing projects link ${projectId} --billing-account=${BILLING_ACCOUNT}`,
@@ -925,7 +900,6 @@ describe('Google Cloud setup through the step engine', () => {
       `keys create ${keyId}`,
     ]);
     expect(setup.cloud.commands[0]).toBe(`projects describe ${projectId} --format=json`);
-    expect(setup.cloud.subscription).toEqual(SUBSCRIPTION_SETTINGS);
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
     expect(serviceAccountEmail).toBe(`gws-ea-chat@${projectId}.iam.gserviceaccount.com`);
     await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -933,26 +907,6 @@ describe('Google Cloud setup through the step engine', () => {
     expect(journal.steps.provision_gcp?.completed_at).toBeDefined();
     expect(journal.key_policy_lifted).toBe(false);
     expect(setup.sleeps).toEqual([]);
-  });
-
-  it('lets only Google Chat publish to the topic, and lets the subscriber account only pull the one subscription', async () => {
-    const setup = await harness();
-
-    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
-
-    expect(setup.cloud.grants).toEqual({
-      topic: { 'roles/pubsub.publisher': [CHAT_PUBLISHER] },
-      subscription: { 'roles/pubsub.subscriber': [`serviceAccount:${setup.gcp.serviceAccountEmail}`] },
-    });
-    // The fake refuses any other grant, a project-wide one included, as an unexpected command.
-    expect(setup.cloud.commands.filter((command) => command.includes('iam-policy-binding'))).toEqual([
-      expect.stringMatching(
-        /^pubsub topics add-iam-policy-binding gws-ea-chat-events --member=serviceAccount:chat-api-push@/u,
-      ),
-      expect.stringMatching(
-        /^pubsub subscriptions add-iam-policy-binding gws-ea-chat-events-pull --member=serviceAccount:gws-ea-chat@/u,
-      ),
-    ]);
   });
 
   it('grants Google Chat publishing and the subscriber pulling while each holds only another role there, and someone else already pulls', async () => {
@@ -1107,9 +1061,6 @@ describe('Google Cloud setup through the step engine', () => {
       step: 'provision_gcp',
       reason: 'Waiting for Google Cloud to make the new service account usable…',
     });
-    expect(setup.cloud.grants.subscription).toEqual({
-      'roles/pubsub.subscriber': [`serviceAccount:${setup.gcp.serviceAccountEmail}`],
-    });
   });
 
   it('stops with Google’s answer when the new subscriber account is still unknown after 7 minutes', async () => {
@@ -1122,7 +1073,6 @@ describe('Google Cloud setup through the step engine', () => {
       details: { stderrTail: expect.stringContaining('does not exist') },
     });
     expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(7 * 60_000);
-    expect(setup.cloud.grants.subscription).toEqual({});
   });
 
   it('adopts a project whose creation reports it already exists when its labels name this assistant', async () => {

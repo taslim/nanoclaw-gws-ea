@@ -843,26 +843,23 @@ describe('status', () => {
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const id = reservation.instance_id;
-    const reporting = (health: unknown): Partial<StatusObservers> => ({
-      ...healthy,
-      ncl: (async (runtime, args) =>
-        args.join(' ') === 'gws-ea-chat health' ? health : healthy.ncl(runtime, args)) satisfies StatusObservers['ncl'],
-    });
+    /** The chat probe `status --json` prints while the host reports `health`. */
+    const chatProbe = async (health: unknown): Promise<ProbeShape> => {
+      const ncl: StatusObservers['ncl'] = async (runtime, args) =>
+        args.join(' ') === 'gws-ea-chat health' ? health : healthy.ncl(runtime, args);
+      return (await statusJson(host, state, id, { ...healthy, ncl })).status.probes.chat!;
+    };
     const at = '2026-09-28T14:20:00.000Z';
     const signIn = `Sign the assistant in again with gws-ea connect-google --id ${id}.`;
+    const consumerDown = {
+      connected: false,
+      lastPullAt: null,
+      error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
+    };
+    const suspended = { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' };
 
     // Google suspended the subscription for the assistant's authorization.
-    const suspended = await statusJson(
-      host,
-      state,
-      id,
-      reporting({
-        ...RECEIVING_CHAT,
-        subscription: { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' },
-        signInNeeded: true,
-      }),
-    );
-    expect(suspended.status.probes.chat).toEqual({
+    expect(await chatProbe({ ...RECEIVING_CHAT, subscription: suspended, signInNeeded: true })).toEqual({
       status: 'degraded',
       reason: `Sign-in needed for Google Chat: Google suspended its Chat subscription (USER_SCOPE_REVOKED). ${signIn}`,
       consumer_connected: true,
@@ -873,11 +870,8 @@ describe('status', () => {
     });
 
     // Google refused the assistant's grant, so the host never confirmed a subscription.
-    const refused = await statusJson(
-      host,
-      state,
-      id,
-      reporting({
+    expect(
+      await chatProbe({
         ...RECEIVING_CHAT,
         subscription: {
           state: 'unknown',
@@ -888,8 +882,7 @@ describe('status', () => {
         },
         signInNeeded: true,
       }),
-    );
-    expect(refused.status.probes.chat).toMatchObject({
+    ).toMatchObject({
       status: 'degraded',
       reason: `Sign-in needed for Google Chat: Google refused a chat token (invalid_scope). ${signIn}`,
       subscription_state: 'unknown',
@@ -898,21 +891,7 @@ describe('status', () => {
 
     // A broken sign-in does not explain a consumer that is down: the consumer
     // pulls with the subscriber key, so that is its own failure.
-    const both = await statusJson(
-      host,
-      state,
-      id,
-      reporting({
-        consumer: {
-          connected: false,
-          lastPullAt: null,
-          error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
-        },
-        subscription: { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' },
-        signInNeeded: true,
-      }),
-    );
-    expect(both.status.probes.chat).toMatchObject({
+    expect(await chatProbe({ consumer: consumerDown, subscription: suspended, signInNeeded: true })).toMatchObject({
       status: 'degraded',
       reason:
         'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
@@ -922,16 +901,9 @@ describe('status', () => {
     });
 
     // Anything else is Chat not receiving, with each side's last failure.
-    const down = await statusJson(
-      host,
-      state,
-      id,
-      reporting({
-        consumer: {
-          connected: false,
-          lastPullAt: null,
-          error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
-        },
+    expect(
+      await chatProbe({
+        consumer: consumerDown,
         subscription: {
           state: 'expired',
           name: 'subscriptions/chat-juno-hale',
@@ -941,8 +913,7 @@ describe('status', () => {
         },
         signInNeeded: false,
       }),
-    );
-    expect(down.status.probes.chat).toEqual({
+    ).toEqual({
       status: 'degraded',
       reason:
         'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
@@ -953,22 +924,15 @@ describe('status', () => {
       subscription_expire_time: '2026-09-28T13:00:00.000Z',
       sign_in_needed: false,
     });
-    for (const name of Object.keys(down.status.probes).filter((probe) => probe !== 'chat')) {
-      expect(down.status.probes[name], name).toMatchObject({ status: 'ok' });
-    }
 
     // A host only just started has neither yet.
-    const starting = await statusJson(
-      host,
-      state,
-      id,
-      reporting({
+    expect(
+      await chatProbe({
         consumer: { connected: false, lastPullAt: null, error: null },
         subscription: { state: 'unknown', name: null, expireTime: null, suspensionReason: null, error: null },
         signInNeeded: false,
       }),
-    );
-    expect(starting.status.probes.chat).toMatchObject({
+    ).toMatchObject({
       status: 'degraded',
       reason:
         'Google Chat is not receiving: its consumer has not connected yet; its subscription is not confirmed yet.',
@@ -983,8 +947,7 @@ describe('status', () => {
         subscription: { ...RECEIVING_CHAT.subscription, error: { kind: 'revoked', message: 'x', at } },
       },
     ]) {
-      const invalid = await statusJson(host, state, id, reporting(report));
-      expect(invalid.status.probes.chat).toEqual({
+      expect(await chatProbe(report)).toEqual({
         status: 'degraded',
         reason: 'ncl returned an invalid Chat report',
         consumer_connected: null,

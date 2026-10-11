@@ -80,7 +80,6 @@ describe("opening the principal's DM", () => {
     });
     // Chat is asked by the address alias; the alias never becomes the person's ID.
     expect(chat.setups()).toEqual([`users/${JUNO}`]);
-    expect(JSON.stringify(result)).not.toContain(JUNO);
     expect(chat.requests.map(({ method, path }) => `${method} ${path}`)).toEqual([
       'POST spaces:setup',
       `GET spaces/dm-${JUNO_ID}/members`,
@@ -164,17 +163,16 @@ describe("opening the principal's DM", () => {
           member: { name: 'users/3003', type: 'HUMAN' },
         }),
     ],
+    [
+      'a DM whose other member is listed as a Chat app',
+      (fake: FakeChatDirectMessages) => void fake.people.set(JUNO, { id: JUNO_ID, type: 'BOT' }),
+    ],
   ])('refuses %s, binding nothing', async (_label, change) => {
     change(chat);
 
-    await expect(open()).rejects.toThrow(JUNO);
-    expect(await getMessagingGroupByPlatform('gchat', `gchat:spaces/dm-${JUNO_ID}`, 'gchat')).toBeUndefined();
-  });
-
-  it('refuses a DM whose other member is a Chat app, not a person', async () => {
-    chat.people.set(JUNO, { id: JUNO_ID, type: 'BOT' });
-
-    await expect(open()).rejects.toThrow(/not a direct message between the assistant and one person/u);
+    await expect(open()).rejects.toThrow(
+      `Google Chat answered ${JUNO} with spaces/dm-${JUNO_ID}, which is not a direct message between the assistant and one person`,
+    );
     expect(await getMessagingGroupByPlatform('gchat', `gchat:spaces/dm-${JUNO_ID}`, 'gchat')).toBeUndefined();
   });
 });

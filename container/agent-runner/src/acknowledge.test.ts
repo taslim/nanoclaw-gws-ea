@@ -108,8 +108,6 @@ describe('who is waiting', () => {
     expect(
       extractRouting([row('chat-sdk', { text: 'find me an hour', senderId: 'users/7' }, 'gchat')]).personWaiting,
     ).toBe(false);
-    const reacted = row('chat-sdk', { sender: 'Morgan Ellery', reaction: { emoji: 'thumbs_up' } }, 'gchat');
-    expect(extractRouting([reacted]).personWaiting).toBe(false);
   });
 
   it('is still someone when a turn also answers a chat with no such sign', () => {

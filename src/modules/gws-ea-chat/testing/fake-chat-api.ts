@@ -53,33 +53,30 @@ export interface FakeChatReaction {
   readonly emoji: { readonly unicode: string };
 }
 
-function json(status: number, body: unknown): Response {
+export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-function refusal(failure: ChatFailure): Response {
+export function refusal(failure: ChatFailure): Response {
   return json(failure.status, { error: { code: failure.status, message: failure.message } });
 }
 
-const NOT_FOUND: ChatFailure = { status: 404, message: 'Requested entity was not found.' };
-const UNAUTHENTICATED: ChatFailure = { status: 401, message: 'Request had invalid authentication credentials.' };
+export const NOT_FOUND: ChatFailure = { status: 404, message: 'Requested entity was not found.' };
+export const UNAUTHENTICATED: ChatFailure = { status: 401, message: 'Request had invalid authentication credentials.' };
 const CARDS_NEED_APP: ChatFailure = {
   status: 403,
   message: 'This field mask requires app authentication: cards_v2 can only be updated by a Chat app.',
 };
 
-function requestUrl(input: string | URL | Request): URL {
-  if (input instanceof URL) return input;
-  return new URL(typeof input === 'string' ? input : input.url);
+/** The URL Google's clients ask for: they call `fetch(url, init)`, never with a `Request`. */
+export function requestUrl(input: string | URL | Request): URL {
+  if (input instanceof Request) throw new TypeError('The fake answers fetch(url, init), not a Request');
+  return new URL(input);
 }
 
-/** A write's JSON body, as `fetch` was handed it. */
-async function requestBody(
-  input: string | URL | Request,
-  init: RequestInit | undefined,
-): Promise<Record<string, unknown>> {
-  const text = typeof init?.body === 'string' ? init.body : input instanceof Request ? await input.text() : '';
-  const body: unknown = text === '' ? {} : JSON.parse(text);
+/** A write's JSON body. */
+function requestBody(init: RequestInit | undefined): Record<string, unknown> {
+  const body: unknown = typeof init?.body === 'string' && init.body !== '' ? JSON.parse(init.body) : {};
   return typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
 }
 
@@ -101,10 +98,8 @@ export class FakeChatApi {
 
   readonly fetch: typeof globalThis.fetch = async (input, init) => {
     const url = requestUrl(input);
-    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
-    const authorization = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get(
-      'authorization',
-    );
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const authorization = new Headers(init?.headers).get('authorization');
     this.requests.push({ method, url, authorization });
     const path = decodeURIComponent(url.pathname.replace(/^\/v1\//u, ''));
     const failure = this.failures.get(path);
@@ -112,9 +107,9 @@ export class FakeChatApi {
     switch (url.host) {
       case 'chat.googleapis.com':
         if (authorization !== `Bearer ${CHAT_TOKEN}`) return refusal(UNAUTHENTICATED);
-        if (method === 'POST') return this.write(path, await requestBody(input, init));
+        if (method === 'POST') return this.write(path, requestBody(init));
         if (method === 'DELETE') return this.remove(path);
-        if (method === 'PUT' || method === 'PATCH') return this.update(path, url, await requestBody(input, init));
+        if (method === 'PUT' || method === 'PATCH') return this.update(path, url, requestBody(init));
         return this.chat(path, url);
       case 'people.googleapis.com':
         if (authorization !== `Bearer ${DIRECTORY_TOKEN}`) return refusal(UNAUTHENTICATED);

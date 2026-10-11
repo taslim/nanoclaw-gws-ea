@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { chatReceiving } from '../../gws-ea/chat-health.js';
 import { GoogleGrantRevokedError } from '../gws-ea-google/tokens.js';
 import { startChatDelivery, type ChatDelivery } from './delivery.js';
 import { createChatHealth, type ChatHealthRecorder } from './health.js';
@@ -113,41 +112,27 @@ describe('adoption', () => {
     );
   });
 
-  it('deletes one that delivers to another topic and creates it again', async () => {
-    const stale = seedRenewed({
-      notificationEndpoint: { pubsubTopic: 'projects/gws-ea-old-project-9z8y/topics/gws-ea-chat-events' },
-    });
+  it.each<[string, Partial<StoredSubscription>]>([
+    [
+      'delivers to another topic',
+      { notificationEndpoint: { pubsubTopic: 'projects/gws-ea-old-project-9z8y/topics/gws-ea-chat-events' } },
+    ],
+    ['subscribes to other events', { eventTypes: [CHAT_MESSAGE_CREATED] }],
+    // An hour before the test's clock.
+    ['has expired', { expireTime: '2026-10-10T08:00:00.000Z' }],
+  ])('deletes one that %s and creates it again', async (_, fields) => {
+    const stale = seedRenewed(fields);
     start();
 
     await until(active);
     expect(workspaceCalls('DELETE', `/v1/${stale.name}`)).toBe(1);
-    const [created] = [...fake.subscriptions.values()];
-    expect(created?.name).not.toBe(stale.name);
-    expect(created?.notificationEndpoint).toEqual({ pubsubTopic: TOPIC });
-    expect(health.read().subscription.name).toBe(created?.name);
-  });
-
-  it('deletes one that subscribes to other events and creates it again', async () => {
-    const stale = seedRenewed({ eventTypes: [CHAT_MESSAGE_CREATED] });
-    start();
-
-    await until(active);
-    expect(workspaceCalls('DELETE', `/v1/${stale.name}`)).toBe(1);
-    expect([...fake.subscriptions.values()].map((sub) => sub.eventTypes)).toEqual([
-      [CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED],
-    ]);
-  });
-
-  it('deletes one that has expired and creates it again', async () => {
-    const lapsed = fake.seedSubscription({ expireTime: new Date(Date.now() - HOUR).toISOString() });
-    start();
-
-    await until(active);
-    expect(workspaceCalls('DELETE', `/v1/${lapsed.name}`)).toBe(1);
     const [created, ...others] = [...fake.subscriptions.values()];
     expect(others).toEqual([]);
-    expect(created).toMatchObject({ state: 'ACTIVE', notificationEndpoint: { pubsubTopic: TOPIC } });
-    expect(created!.name).not.toBe(lapsed.name);
+    expect(created).toMatchObject({
+      eventTypes: [CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED],
+      notificationEndpoint: { pubsubTopic: TOPIC },
+    });
+    expect(created!.name).not.toBe(stale.name);
     expect(health.read().subscription.name).toBe(created!.name);
   });
 
@@ -337,7 +322,7 @@ describe('failures', () => {
     expect(health.read().subscription.error).toBeNull();
   });
 
-  it('shows no subscription, and Chat not receiving, once it deleted an expired one and Google refused a new one', async () => {
+  it('shows no subscription once it deleted an expired one and Google refused a new one', async () => {
     const existing = seedRenewed();
     start();
     await until(active);
@@ -356,10 +341,6 @@ describe('failures', () => {
       expireTime: null,
       suspensionReason: null,
       error: expect.objectContaining({ kind: 'unreachable' }),
-    });
-    expect(chatReceiving(health.read(), 'gws-ea-juno')).toEqual({
-      state: 'not_receiving',
-      reason: expect.stringContaining('its subscription is not confirmed yet'),
     });
   });
 

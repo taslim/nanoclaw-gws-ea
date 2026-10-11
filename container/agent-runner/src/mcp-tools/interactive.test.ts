@@ -42,28 +42,19 @@ describe('ask_user_question cancellation', () => {
 });
 
 describe('ask_user_question timeout', () => {
-  async function questionWritten(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  it.each([
+    ['the wait it is given', { timeout: 90 }, 90],
+    ['the default wait when none is given', {}, 300],
+  ])('carries %s in the question it writes, so the host knows when it stops', async (_wait, args, seconds) => {
     const controller = new AbortController();
-    const waiting = askUserQuestion.handler(args, { signal: controller.signal });
+    const waiting = askUserQuestion.handler(
+      { title: 'Fixture', question: 'Choose', options: ['yes', 'no'], ...args },
+      { signal: controller.signal },
+    );
     while (!getUndeliveredMessages().length) await Bun.sleep(1);
     controller.abort();
     await waiting;
-    return JSON.parse(getUndeliveredMessages()[0].content) as Record<string, unknown>;
-  }
-
-  it('carries how long it waits in the question it writes, so the host knows when it stops', async () => {
-    const question = await questionWritten({
-      title: 'Fixture',
-      question: 'Choose',
-      options: ['yes', 'no'],
-      timeout: 90,
-    });
-    expect(question.timeoutSeconds).toBe(90);
-  });
-
-  it('carries the default wait when none is given', async () => {
-    const question = await questionWritten({ title: 'Fixture', question: 'Choose', options: ['yes', 'no'] });
-    expect(question.timeoutSeconds).toBe(300);
+    expect(JSON.parse(getUndeliveredMessages()[0].content).timeoutSeconds).toBe(seconds);
   });
 });
 

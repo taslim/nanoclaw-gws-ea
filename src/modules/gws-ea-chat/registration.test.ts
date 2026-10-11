@@ -2,7 +2,8 @@
  * The Google Chat channel registers from this module, over the assistant's
  * grant and the host's Chat delivery, as the email channel registers from
  * its own: a host without both has no Chat, and a grant this release cannot
- * read asks for a new sign-in. The channel barrel no longer registers it.
+ * read asks for a new sign-in. The divergence guard checks that nothing else
+ * registers it.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -131,16 +132,5 @@ describe('the gchat registration', () => {
     });
     expect(config.adapter).toBeInstanceOf(AssistantChatAdapter);
     expect(config.adapter).toMatchObject({ botUserId: ASSISTANT, userName: 'morgan.ellery', runtimeMode: 'polling' });
-  });
-});
-
-describe('registration across the barrels', () => {
-  it('registers gchat once: from this module, and not from the channel barrel', async () => {
-    const registry = await import('../../channels/channel-registry.js');
-    await import('../../channels/index.js');
-    expect(vi.mocked(registry.registerChannelAdapter).mock.calls.map(([name]) => name)).not.toContain('gchat');
-
-    await import('../index.js');
-    expect(vi.mocked(registry.registerChannelAdapter).mock.calls.filter(([name]) => name === 'gchat')).toHaveLength(1);
   });
 });

@@ -230,6 +230,38 @@ function slackGroupMention(platformId: string) {
   };
 }
 
+/** A mention in an unwired group, and the registration request it raises: its question id. */
+async function pendingRegistration(platformId: string): Promise<string> {
+  const { routeInbound } = await import('../../router.js');
+  await expectAsyncDelivery(() => routeInbound(groupMention(platformId)));
+  return (await getDb().get<{ messaging_group_id: string }>(
+    'SELECT messaging_group_id FROM pending_channel_approvals',
+  ))!.messaging_group_id;
+}
+
+/** An answer in the owner's DM, by default from a channel that leaves the request as posted. */
+async function answer(
+  questionId: string,
+  value: string,
+  { userId = 'owner', deferResolution = true }: { userId?: string; deferResolution?: boolean } = {},
+): Promise<void> {
+  const { getResponseHandlers } = await import('../../response-registry.js');
+  for (const handler of getResponseHandlers()) {
+    const claimed = await handler({
+      questionId,
+      value,
+      userId,
+      channelType: 'telegram',
+      instance: 'telegram',
+      messageId: 'request-message',
+      platformId: 'dm-owner',
+      threadId: null,
+      deferResolution,
+    });
+    if (claimed) return;
+  }
+}
+
 describe('unknown-channel registration flow', () => {
   it('delivers an approval card on mention into an unwired group', async () => {
     const { routeInbound } = await import('../../router.js');
@@ -741,23 +773,7 @@ describe('unknown-channel registration flow', () => {
 
   it("create new agent: a reaction or a quiet event in the owner's DM is not taken as the name", async () => {
     const { routeInbound } = await import('../../router.js');
-    const { getResponseHandlers } = await import('../../response-registry.js');
-
-    await expectAsyncDelivery(() => routeInbound(groupMention('chat-create-aside')));
-    const pending = (await getDb().get<{ messaging_group_id: string }>(
-      'SELECT messaging_group_id FROM pending_channel_approvals',
-    ))!;
-    for (const handler of getResponseHandlers()) {
-      const claimed = await handler({
-        questionId: pending.messaging_group_id,
-        value: 'new_agent',
-        userId: 'owner',
-        channelType: 'telegram',
-        platformId: 'dm-owner',
-        threadId: null,
-      });
-      if (claimed) break;
-    }
+    await answer(await pendingRegistration('chat-create-aside'), 'new_agent');
 
     const fromOwner = (id: string, text: string, marker: { reaction?: true; quiet?: true } = {}) => ({
       channelType: 'telegram',
@@ -829,31 +845,6 @@ describe('unknown-channel registration flow', () => {
 describe('channel registration answered on a channel that left it as posted', () => {
   // Text requests: the request stays as posted until the handler that
   // authorizes an answer edits it to its outcome, by question id.
-  async function pendingRegistration(platformId: string): Promise<string> {
-    const { routeInbound } = await import('../../router.js');
-    await expectAsyncDelivery(() => routeInbound(groupMention(platformId)));
-    return (await getDb().get<{ messaging_group_id: string }>(
-      'SELECT messaging_group_id FROM pending_channel_approvals',
-    ))!.messaging_group_id;
-  }
-
-  async function answer(questionId: string, value: string, userId = 'owner'): Promise<void> {
-    const { getResponseHandlers } = await import('../../response-registry.js');
-    for (const handler of getResponseHandlers()) {
-      const claimed = await handler({
-        questionId,
-        value,
-        userId,
-        channelType: 'telegram',
-        instance: 'telegram',
-        messageId: 'request-message',
-        platformId: 'dm-owner',
-        threadId: null,
-        deferResolution: true,
-      });
-      if (claimed) return;
-    }
-  }
 
   /** What went out after the request, in order: each outcome edit's resolution, or a new request's title. */
   function sentSinceRequest(): string[] {
@@ -867,7 +858,7 @@ describe('channel registration answered on a channel that left it as posted', ()
   it("leaves it unedited for a bystander's answer", async () => {
     const questionId = await pendingRegistration('chat-text-bystander');
 
-    await answer(questionId, 'connect:ag-1', 'random-bystander');
+    await answer(questionId, 'connect:ag-1', { userId: 'random-bystander' });
 
     expect(sentSinceRequest()).toEqual([]);
     expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(1);
@@ -991,22 +982,10 @@ describe("channel registration in the context of the agent that works in the app
   });
 
   it('leaves the outcome beside it once the approver answers', async () => {
-    const { routeInbound } = await import('../../router.js');
-    const { getResponseHandlers } = await import('../../response-registry.js');
-    await expectAsyncDelivery(() => routeInbound(groupMention('chat-outcome')));
-    const { questionId } = JSON.parse(deliverMock.mock.calls[0]![4] as string) as { questionId: string };
+    const questionId = await pendingRegistration('chat-outcome');
 
-    for (const handler of getResponseHandlers()) {
-      const claimed = await handler({
-        questionId,
-        value: 'reject',
-        userId: 'owner',
-        channelType: 'telegram',
-        platformId: 'dm-owner',
-        threadId: null,
-      });
-      if (claimed) break;
-    }
+    // A card channel resolves the request itself; the note is the handler's either way.
+    await answer(questionId, 'reject', { deferResolution: false });
 
     expect((await notes()).map((note) => [note.request, note.outcome ?? 'posted'])).toEqual([
       [questionId, 'posted'],

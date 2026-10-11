@@ -273,28 +273,34 @@ describe('pulling', () => {
     expect(health.read().consumer).toEqual({ connected: true, lastPullAt: expect.any(String), error: null });
   });
 
-  it('shows a subscriber Google refuses (401) as a failing credential, backs off without spinning, and recovers', async () => {
-    fake.pubsubFailure = { status: 401, message: 'Request had invalid authentication credentials.' };
-    start(async () => undefined);
+  it.each([
+    [401, 'Request had invalid authentication credentials.'],
+    [403, 'User not authorized to perform this action.'],
+  ])(
+    'shows a subscriber Google refuses (%i) as a failing credential, backs off without spinning, and recovers',
+    async (status, message) => {
+      fake.pubsubFailure = { status, message };
+      start(async () => undefined);
 
-    await vi.advanceTimersByTimeAsync(10_000);
-    // Tried at 0, 1, 3, and 7 seconds.
-    expect(fake.requests.length).toBeLessThanOrEqual(5);
-    expect(health.read().consumer).toEqual({
-      connected: false,
-      lastPullAt: null,
-      error: {
-        kind: 'subscriber_credential',
-        message: expect.stringContaining('invalid authentication credentials'),
-        at: expect.any(String),
-      },
-    });
+      await vi.advanceTimersByTimeAsync(10_000);
+      // Tried at 0, 1, 3, and 7 seconds.
+      expect(fake.requests.length).toBeLessThanOrEqual(5);
+      expect(health.read().consumer).toEqual({
+        connected: false,
+        lastPullAt: null,
+        error: {
+          kind: 'subscriber_credential',
+          message: expect.stringContaining(message),
+          at: expect.any(String),
+        },
+      });
 
-    fake.pubsubFailure = undefined;
-    await vi.advanceTimersByTimeAsync(6_000);
-    await until(() => health.read().consumer.connected);
-    expect(health.read().consumer.error).toBeNull();
-  });
+      fake.pubsubFailure = undefined;
+      await vi.advanceTimersByTimeAsync(6_000);
+      await until(() => health.read().consumer.connected);
+      expect(health.read().consumer.error).toBeNull();
+    },
+  );
 
   it('shows a subscriber Pub/Sub does not let pull as a failing credential', async () => {
     fake.mayConsume = false;

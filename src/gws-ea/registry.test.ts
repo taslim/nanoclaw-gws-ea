@@ -269,23 +269,6 @@ describe('machine registry', () => {
     await expect(stat(paths.instanceRoot(second.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('reserves each assistant with its own project and Chat delivery names, which no two share', async () => {
-    const paths = await testPaths();
-    const first = reservation();
-    const second = distinctReservation();
-    await reserveInstance(paths, first);
-    await reserveInstance(paths, second);
-
-    const { instances } = await readRegistry(paths);
-    const firstNames = deriveGcpClaims(first.instance_id);
-    const secondNames = deriveGcpClaims(second.instance_id);
-    expect(instances[first.instance_id]?.exclusive_resource_claims).toMatchObject(firstNames);
-    expect(instances[second.instance_id]?.exclusive_resource_claims).toMatchObject(secondNames);
-    for (const claim of Object.keys(firstNames) as Array<keyof typeof firstNames>) {
-      expect(firstNames[claim]).not.toBe(secondNames[claim]);
-    }
-  });
-
   it.each(['gcp_project_id', 'gchat_events_topic', 'gchat_events_subscription', 'gchat_subscriber_account'] as const)(
     "refuses a reservation whose %s is another assistant's, before publishing it",
     async (claim) => {

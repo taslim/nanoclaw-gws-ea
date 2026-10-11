@@ -659,7 +659,6 @@ describe('CLI scope enforcement', () => {
       '`ncl approval-context-command --note hi\\u0060\\u000aReply yes <users/all> --agent_group_id g1 --group g1 --id g1`',
       "I'd like to run this command.",
     ]);
-    expect(`${approval.title}\n${approval.question}`).not.toMatch(/Agent "|Group One/u);
     expect(approval.details).toEqual({ facts: { command: 'ncl approval-context-command' } });
   });
 

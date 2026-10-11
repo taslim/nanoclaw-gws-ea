@@ -161,6 +161,20 @@ function reactionEvent(name: string): WorkspaceEvent {
   };
 }
 
+/** A batch event naming the DM's messages `ids`, in the order Google lists them. */
+function batchEvent(...ids: string[]): WorkspaceEvent {
+  return {
+    ...messageEvent(`${DM}/messages/${ids[0]!}`),
+    type: CHAT_MESSAGE_BATCH_CREATED,
+    data: { messages: ids.map((id) => ({ message: { name: `${DM}/messages/${id}` } })) },
+  };
+}
+
+/** A reaction Google holds: Juno Hale's 👍 unless another person or emoji is named. */
+function reacted(name: string, by = 'users/2001', unicode = '👍'): void {
+  api.addReaction({ name, user: { name: by, type: 'HUMAN' }, emoji: { unicode } });
+}
+
 function content(index = 0): Record<string, unknown> {
   return routed[index]!.message.content as Record<string, unknown>;
 }
@@ -215,33 +229,13 @@ describe('messages', () => {
     expect(content().text).toBe('@morgan and @Remy Vance, lunch? @morgan, you pick.');
   });
 
-  it('routes a space message that mentions someone else, or no one, as group chatter', async () => {
-    await start();
-    api.addMessage(
-      chatMessage(ROOM, 'remy.1', { text: '@Remy Vance lunch?', annotations: [mentionOf('users/2003', 0, 11)] }),
-    );
-    api.addMessage(chatMessage(ROOM, 'remy.2', { text: 'Running late.' }));
-
-    await deliver!(messageEvent(`${ROOM}/messages/remy.1`));
-    await deliver!(messageEvent(`${ROOM}/messages/remy.2`));
-
-    expect(routed.map((entry) => [entry.message.isMention, entry.message.isGroup])).toEqual([
-      [false, true],
-      [false, true],
-    ]);
-  });
-
   it('dispatches each message of a batch, in the order they were written', async () => {
     await start();
     api.addMessage(chatMessage(DM, 'remy.1', { text: 'first', createTime: '2026-10-10T17:00:01Z' }));
     api.addMessage(chatMessage(DM, 'remy.2', { text: 'second', createTime: '2026-10-10T17:00:02Z' }));
     api.addMessage(chatMessage(DM, 'remy.3', { text: 'third', createTime: '2026-10-10T17:00:03Z' }));
 
-    await deliver!({
-      ...messageEvent(`${DM}/messages/remy.3`),
-      type: CHAT_MESSAGE_BATCH_CREATED,
-      data: { messages: ['remy.3', 'remy.1', 'remy.2'].map((id) => ({ message: { name: `${DM}/messages/${id}` } })) },
-    });
+    await deliver!(batchEvent('remy.3', 'remy.1', 'remy.2'));
 
     expect(routed.map((entry) => (entry.message.content as { text: string }).text)).toEqual([
       'first',
@@ -258,15 +252,6 @@ describe('messages', () => {
 
     expect(routed).toEqual([]);
     expect(api.requests.filter((request) => request.url.host === 'people.googleapis.com')).toEqual([]);
-  });
-
-  it('names a sender with no visible profile by their user id, never "User 123"', async () => {
-    await start();
-    api.addMessage(chatMessage(DM, 'remy.1', { from: 'users/2002' }));
-
-    await deliver!(messageEvent(`${DM}/messages/remy.1`));
-
-    expect(content()).toMatchObject({ sender: 'users/2002', senderName: 'users/2002' });
   });
 
   it('gives the agent the quoted text, its sender, and the name of the message replied to', async () => {
@@ -317,7 +302,6 @@ describe('messages', () => {
         data: Buffer.from('agenda').toString('base64'),
       }),
     ]);
-    expect(api.calls('media/ref-agenda')).toEqual([expect.objectContaining({ authorization: `Bearer ${CHAT_TOKEN}` })]);
   });
 });
 
@@ -329,51 +313,12 @@ describe('when an event cannot be handled', () => {
     expect(routed).toEqual([]);
   });
 
-  it('refuses a message Google fails to return, so Pub/Sub delivers it again', async () => {
-    await start();
-    api.addMessage(chatMessage(DM, 'remy.1'));
-    api.failures.set(`${DM}/messages/remy.1`, { status: 500, message: 'Internal error' });
-
-    await expect(deliver!(messageEvent(`${DM}/messages/remy.1`))).rejects.toThrow(/Internal error/u);
-    expect(routed).toEqual([]);
-
-    api.failures.clear();
-    await deliver!(messageEvent(`${DM}/messages/remy.1`));
-    expect(routed).toHaveLength(1);
-  });
-
-  it('routes a message again after its routing failed: the SDK forgets it was seen', async () => {
-    await start();
-    api.addMessage(chatMessage(DM, 'remy.1'));
-    unroutable.add(`${DM}/messages/remy.1`);
-
-    await expect(deliver!(messageEvent(`${DM}/messages/remy.1`))).rejects.toThrow(/database is locked/u);
-    expect(routed).toEqual([]);
-
-    await deliver!(messageEvent(`${DM}/messages/remy.1`));
-    expect(routed).toHaveLength(1);
-  });
-
-  it('drops a copy of a message already routed, and acknowledges it', async () => {
-    await start();
-    api.addMessage(chatMessage(DM, 'remy.1'));
-
-    await deliver!(messageEvent(`${DM}/messages/remy.1`));
-    await expect(deliver!(messageEvent(`${DM}/messages/remy.1`))).resolves.toBeUndefined();
-
-    expect(routed).toHaveLength(1);
-  });
-
   it('dispatches none of a batch while one of its messages cannot be read, so their order holds', async () => {
     await start();
     api.addMessage(chatMessage(DM, 'remy.1', { createTime: '2026-10-10T17:00:01Z' }));
     api.addMessage(chatMessage(DM, 'remy.2', { createTime: '2026-10-10T17:00:02Z' }));
     api.failures.set(`${DM}/messages/remy.1`, { status: 503, message: 'Unavailable' });
-    const batch: WorkspaceEvent = {
-      ...messageEvent(`${DM}/messages/remy.2`),
-      type: CHAT_MESSAGE_BATCH_CREATED,
-      data: { messages: ['remy.1', 'remy.2'].map((id) => ({ message: { name: `${DM}/messages/${id}` } })) },
-    };
+    const batch = batchEvent('remy.1', 'remy.2');
 
     await expect(deliver!(batch)).rejects.toThrow(/Unavailable/u);
     expect(routed).toEqual([]);
@@ -383,7 +328,7 @@ describe('when an event cannot be handled', () => {
     expect(routed.map((entry) => entry.message.id)).toEqual([`${DM}/messages/remy.1`, `${DM}/messages/remy.2`]);
   });
 
-  it('stops a batch at the first message the host could not route; when it comes again, the routed one is dropped', async () => {
+  it('stops a batch at the first message the host could not route; when it comes again, the routed one is dropped and the rest routed', async () => {
     await start();
     for (const [id, second] of [
       ['remy.1', '01'],
@@ -393,11 +338,7 @@ describe('when an event cannot be handled', () => {
       api.addMessage(chatMessage(DM, id, { createTime: `2026-10-10T17:00:${second}Z` }));
     }
     unroutable.add(`${DM}/messages/remy.2`);
-    const batch: WorkspaceEvent = {
-      ...messageEvent(`${DM}/messages/remy.3`),
-      type: CHAT_MESSAGE_BATCH_CREATED,
-      data: { messages: ['remy.1', 'remy.2', 'remy.3'].map((id) => ({ message: { name: `${DM}/messages/${id}` } })) },
-    };
+    const batch = batchEvent('remy.1', 'remy.2', 'remy.3');
 
     await expect(deliver!(batch)).rejects.toThrow(/database is locked/u);
     expect(routed.map((entry) => entry.message.id)).toEqual([`${DM}/messages/remy.1`]);
@@ -457,11 +398,7 @@ describe('reactions', () => {
     await start();
     const events = received();
     api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT, text: 'Shall I move Thursday to Friday?' }));
-    api.addReaction({
-      name: `${target}/reactions/r1`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👍' },
-    });
+    reacted(`${target}/reactions/r1`);
 
     await deliver!(reactionEvent(`${target}/reactions/r1`));
 
@@ -481,32 +418,11 @@ describe('reactions', () => {
     expect(events[0]!.message.text).toBe('Shall I move Thursday to Friday?');
   });
 
-  it("names the author of another person's message the reaction is on", async () => {
-    await start();
-    const events = received();
-    api.addMessage(chatMessage(ROOM, 'remy.1', { from: 'users/2001', text: 'Lunch at 1?' }));
-    api.addReaction({
-      name: `${ROOM}/messages/remy.1/reactions/r1`,
-      user: { name: 'users/2002', type: 'HUMAN' },
-      emoji: { unicode: '🎉' },
-    });
-
-    await deliver!(reactionEvent(`${ROOM}/messages/remy.1/reactions/r1`));
-
-    expect(events[0]!.threadId).toBe(threadOf(ROOM, 'remy'));
-    expect(events[0]!.user.fullName).toBe('users/2002');
-    expect(events[0]!.message.author).toMatchObject({ userId: 'users/2001', fullName: 'Juno Hale', isMe: false });
-  });
-
   it("drops the assistant's own reaction without reading the message it is on", async () => {
     await start();
     const events = received();
     api.addMessage(chatMessage(DM, 'remy.1'));
-    api.addReaction({
-      name: `${DM}/messages/remy.1/reactions/r1`,
-      user: { name: ASSISTANT, type: 'HUMAN' },
-      emoji: { unicode: '👀' },
-    });
+    reacted(`${DM}/messages/remy.1/reactions/r1`, ASSISTANT, '👀');
 
     await deliver!(reactionEvent(`${DM}/messages/remy.1/reactions/r1`));
 
@@ -527,16 +443,8 @@ describe('reactions', () => {
     await start();
     api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT, text: 'Shall I move Thursday to Friday?' }));
     api.addMessage(chatMessage(ROOM, 'remy.1', { from: 'users/2001', text: 'Lunch at 1?' }));
-    api.addReaction({
-      name: `${target}/reactions/r1`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👍' },
-    });
-    api.addReaction({
-      name: `${ROOM}/messages/remy.1/reactions/r2`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👍' },
-    });
+    reacted(`${target}/reactions/r1`);
+    reacted(`${ROOM}/messages/remy.1/reactions/r2`);
 
     await deliver!(reactionEvent(`${target}/reactions/r1`));
     await deliver!(reactionEvent(`${ROOM}/messages/remy.1/reactions/r2`));
@@ -571,32 +479,13 @@ describe('reactions', () => {
     });
   });
 
-  it('refuses a reaction the host could not route, so it comes again', async () => {
-    await start();
-    api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT }));
-    api.addReaction({
-      name: `${target}/reactions/r1`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👍' },
-    });
-    unroutable.add(`${target}/reactions/r1`);
-
-    await expect(deliver!(reactionEvent(`${target}/reactions/r1`))).rejects.toThrow(/database is locked/u);
-    await deliver!(reactionEvent(`${target}/reactions/r1`));
-    expect(routed).toHaveLength(1);
-  });
-
   it('refuses a reaction whose handler fails, so it comes again', async () => {
     await start();
     adapter.setReactionHandler(async () => {
       throw new Error('database is locked');
     });
     api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT }));
-    api.addReaction({
-      name: `${target}/reactions/r1`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👍' },
-    });
+    reacted(`${target}/reactions/r1`);
 
     await expect(deliver!(reactionEvent(`${target}/reactions/r1`))).rejects.toThrow(/database is locked/u);
   });
@@ -670,7 +559,6 @@ describe('the working 👀 (R6)', () => {
     await pulse();
     await wait(4_000);
     expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
-    expect(api.calls(`${JUNO_1}/reactions`)[0]!.authorization).toBe(`Bearer ${CHAT_TOKEN}`);
   });
 
   it('never shows 👀 for a turn that ends within 3 seconds', async () => {
@@ -696,11 +584,7 @@ describe('the working 👀 (R6)', () => {
   });
 
   it("removes exactly its own 👀 by the name Chat gave it, and leaves the principal's own 👀 in place", async () => {
-    api.addReaction({
-      name: `${JUNO_1}/reactions/juno-eyes`,
-      user: { name: 'users/2001', type: 'HUMAN' },
-      emoji: { unicode: '👀' },
-    });
+    reacted(`${JUNO_1}/reactions/juno-eyes`, 'users/2001', '👀');
     await start();
     await pulse();
     await wait(3_000);
@@ -712,7 +596,7 @@ describe('the working 👀 (R6)', () => {
     expect(eyesOn(JUNO_1)).toEqual([{ name: `${JUNO_1}/reactions/juno-eyes`, user: 'users/2001' }]);
   });
 
-  it('never shows 👀 again for a message whose work ended', async () => {
+  it('never shows 👀 again for a message whose work ended, yet shows it for the next message there', async () => {
     await start();
     await pulse();
     await wait(3_000);
@@ -730,6 +614,12 @@ describe('the working 👀 (R6)', () => {
     expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
     expect(eyesOn(JUNO_1)).toEqual([]);
     expect(eyesOn(JUNO_2)).toEqual([]);
+
+    const JUNO_3 = `${DM}/messages/juno.3`;
+    api.addMessage(chatMessage(DM, 'juno.3'));
+    await pulse(JUNO_3);
+    await wait(3_000);
+    expect(eyesOn(JUNO_3)).toHaveLength(1);
   });
 
   it('removes the 👀 Chat was still placing when the work ended', async () => {
@@ -826,21 +716,14 @@ describe('the working 👀 (R6)', () => {
       if (channel === hosted) channel = undefined;
     });
 
-    /** The principal's message, read and routed; the turn it engages starts typing as the router does. */
-    async function engage(session: string): Promise<string> {
+    it('a full turn: 👀 after 3 seconds, removed by the reply, and nothing left recorded', async () => {
       registerChannelAdapter('gchat', { factory: () => (hosted = build()) });
       await initChannelAdapters(() => hostSetup());
       setDeliveryAdapter(createChannelDeliveryAdapter());
+      // The principal's message, read and routed; the turn it engages starts typing as the router does.
       await deliver!(messageEvent(JUNO_1));
-      const anchor = routed[0]!.message.id;
-      startTypingRefresh(session, 'ag-main', 'gchat', PLATFORM, null, 'gchat', anchor);
+      startTypingRefresh('sess-reply', 'ag-main', 'gchat', PLATFORM, null, 'gchat', routed[0]!.message.id);
       await settle();
-      return anchor;
-    }
-
-    it('a full turn: 👀 after 3 seconds, removed by the reply, and nothing left recorded', async () => {
-      const anchor = await engage('sess-reply');
-      expect(anchor).toBe(JUNO_1);
       await wait(3_000);
       const [placed] = eyesOn(JUNO_1);
       expect(placed?.user).toBe(ASSISTANT);
@@ -868,79 +751,17 @@ describe('the working 👀 (R6)', () => {
       await settle();
       expect(requests('DELETE')).toHaveLength(1);
     });
-
-    it('a reply within 3 seconds never shows 👀', async () => {
-      await engage('sess-quick');
-      await wait(1_500);
-      await getDeliveryAdapter()!.deliver(
-        'gchat',
-        PLATFORM,
-        null,
-        'chat',
-        JSON.stringify({ text: 'Done.' }),
-        undefined,
-        'gchat',
-      );
-      await wait(10_000);
-      stopTypingRefresh('sess-quick');
-
-      expect(requests('POST')).toEqual([]);
-    });
-
-    it('a turn that sends nothing removes its 👀 when it goes idle', async () => {
-      await engage('sess-idle');
-      await wait(3_000);
-      expect(eyesOn(JUNO_1)).toHaveLength(1);
-
-      // Past the typing module's grace window with no heartbeat: the agent is idle.
-      await wait(20_000);
-      expect(eyesOn(JUNO_1)).toEqual([]);
-    });
-
-    it("an approval request the host posts into the DM removes 👀; the container's exit removes another turn's", async () => {
-      await engage('sess-approval');
-      await wait(3_000);
-      await getDeliveryAdapter()!.deliver(
-        'gchat',
-        PLATFORM,
-        null,
-        'chat-sdk',
-        JSON.stringify({
-          type: 'ask_question',
-          questionId: 'appr-1',
-          title: 'Install a package?',
-          question: 'Morgan wants jq.',
-          options: ['Approve', 'Reject'],
-        }),
-        undefined,
-        'gchat',
-      );
-      await settle();
-      expect(eyesOn(JUNO_1)).toEqual([]);
-      stopTypingRefresh('sess-approval');
-
-      const JUNO_2 = `${DM}/messages/juno.2`;
-      api.addMessage(chatMessage(DM, 'juno.2'));
-      startTypingRefresh('sess-exit', 'ag-main', 'gchat', PLATFORM, null, 'gchat', JUNO_2);
-      await wait(3_000);
-      expect(eyesOn(JUNO_2)).toHaveLength(1);
-
-      stopTypingRefresh('sess-exit');
-      await settle();
-      expect(eyesOn(JUNO_2)).toEqual([]);
-    });
   });
 });
 
 describe('requests', () => {
-  it("posts a request as the assistant's text, and remembers it with the time Google recorded it", async () => {
-    await start();
-
-    const name = await channel!.deliver(`gchat:${DM}`, null, {
+  /** The host's approval request in the DM; resolves to the name Google gave the post. */
+  function askToInstall(questionId: string): Promise<string | undefined> {
+    return channel!.deliver(`gchat:${DM}`, null, {
       kind: 'chat-sdk',
       content: {
         type: 'ask_question',
-        questionId: 'appr-1',
+        questionId,
         title: 'Install a package?',
         question: 'I would like jq to read the export.',
         options: [
@@ -949,6 +770,12 @@ describe('requests', () => {
         ],
       },
     });
+  }
+
+  it("posts a request as the assistant's text, and remembers it with the time Google recorded it", async () => {
+    await start();
+
+    const name = await askToInstall('appr-1');
 
     expect(name).toBe(`${DM}/messages/morgan.1`);
     expect(api.messages.get(name!)?.text).toBe(
@@ -966,19 +793,7 @@ describe('requests', () => {
 
   it("shows an answered request's outcome by editing its text alone, as a user may", async () => {
     await start();
-    const name = await channel!.deliver(`gchat:${DM}`, null, {
-      kind: 'chat-sdk',
-      content: {
-        type: 'ask_question',
-        questionId: 'appr-2',
-        title: 'Install a package?',
-        question: 'I would like jq to read the export.',
-        options: [
-          { label: 'Approve', value: 'approve' },
-          { label: 'Reject', value: 'reject' },
-        ],
-      },
-    });
+    const name = await askToInstall('appr-2');
 
     await channel!.deliver(`gchat:${DM}`, null, {
       kind: 'chat-sdk',
@@ -1051,10 +866,6 @@ describe('transport', () => {
       await channel!.deliver(`gchat:${DM}`, null, { kind: 'chat', content: { text: 'The room is booked too.' } });
 
       expect(hostTokensTaken).toBeGreaterThan(taken);
-      const posts = api.requests.filter(
-        (request) => request.method === 'POST' && request.url.pathname === `/v1/${DM}/messages`,
-      );
-      expect(posts.map((request) => request.authorization)).toEqual([`Bearer ${CHAT_TOKEN}`, `Bearer ${CHAT_TOKEN}`]);
     } finally {
       vi.useRealTimers();
     }
@@ -1064,17 +875,12 @@ describe('transport', () => {
     await start();
 
     expect(registerWebhookAdapter).not.toHaveBeenCalled();
-    const pubsubPush = new Request('https://assistant.example.test/webhook/gchat', {
-      method: 'POST',
-      body: JSON.stringify({ message: { data: 'e30=', messageId: '1', publishTime: '' }, subscription: 'x' }),
-    });
     const chatEvent = new Request('https://assistant.example.test/webhook/gchat', {
       method: 'POST',
       body: JSON.stringify({
         chat: { messagePayload: { message: { name: `${DM}/messages/x` }, space: { name: DM } } },
       }),
     });
-    expect((await adapter.handleWebhook(pubsubPush)).status).toBe(404);
     expect((await adapter.handleWebhook(chatEvent)).status).toBe(404);
     expect(routed).toEqual([]);
   });

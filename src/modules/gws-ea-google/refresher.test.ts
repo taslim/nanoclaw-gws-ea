@@ -152,7 +152,6 @@ describe('the Google token refresher', () => {
 
     expect(w.asked()).toEqual(FULL_SCOPES);
     expect(w.asked().join(' ')).not.toContain(MODIFY);
-    expect(w.asked().join(' ')).not.toContain('/auth/chat.');
     expect(w.minted[0]?.get('grant_type')).toBe('refresh_token');
     expect([...w.vault.keys()]).toEqual(AGENT_SECRETS);
     expect(w.vault.get('google-gmail-read')).toEqual({

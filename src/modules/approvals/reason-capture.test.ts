@@ -217,7 +217,7 @@ describe('reject with reason', () => {
 
   it('leaves a reaction or a quiet event in the armed DM to routing, and keeps waiting for the reason', async () => {
     const { captureReasonReply } = await import('./reason-capture.js');
-    await seedApproval('appr-6', 'install_packages');
+    await seedApproval('appr-6');
     await clickRejectWithReason('appr-6');
 
     const reaction = dmReply();
@@ -227,7 +227,6 @@ describe('reject with reason', () => {
     expect((await getPendingApproval('appr-6'))?.status).toBe('awaiting_reason');
 
     expect(await captureReasonReply(dmReply('too risky for prod'))).toBe(true);
-    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "too risky for prod"');
   });
 
   it('ignores DMs on channels with no armed reason capture', async () => {

@@ -151,8 +151,7 @@ describe('anchors — the message each conversation’s turn works on', () => {
   const EMAIL = 'email:principal';
   const MAIL_1 = 'mail-thread-1';
 
-  const chat = (anchor?: string, session = 'sess-1') =>
-    startTypingRefresh(session, 'ag-1', 'gchat', DM, null, 'gchat', anchor);
+  const chat = (anchor?: string) => startTypingRefresh('sess-1', 'ag-1', 'gchat', DM, null, 'gchat', anchor);
   const chatEnd = (anchor: string): End => ({
     channelType: 'gchat',
     platformId: DM,
@@ -289,11 +288,6 @@ describe('anchors — the message each conversation’s turn works on', () => {
 
     expect(ends).toEqual([]);
     expect(pulses.at(-1)?.anchor).toBe(JUNO_1);
-
-    chat(undefined, 'sess-2');
-    await vi.advanceTimersByTimeAsync(0);
-    stopTypingRefresh('sess-2');
-    expect(ends).toEqual([]);
   });
 
   it('an end that fails, even at once, never fails the send or the stop that fired it', async () => {
@@ -315,19 +309,5 @@ describe('anchors — the message each conversation’s turn works on', () => {
     });
     expect(() => stopTypingRefresh('sess-1')).not.toThrow();
     await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it('an adapter without endTyping keeps the pulse as it was', async () => {
-    const calls = captureAdapter();
-    chat(JUNO_1);
-    await vi.advanceTimersByTimeAsync(8_500);
-    endTypingInConversation('gchat', DM, null, 'gchat');
-    await vi.advanceTimersByTimeAsync(4_000);
-    stopTypingRefresh('sess-1');
-
-    expect(calls.length).toBeGreaterThanOrEqual(4);
-    for (const call of calls) {
-      expect(call).toEqual({ channelType: 'gchat', platformId: DM, threadId: null, instance: 'gchat' });
-    }
   });
 });

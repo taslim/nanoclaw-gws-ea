@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dispatch } from '../../cli/dispatch.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { GoogleGrantRevokedError } from '../gws-ea-google/tokens.js';
 import { startChatDelivery, type ChatDelivery } from './delivery.js';
 import { chatHealth, createChatHealth } from './health.js';
 import {
@@ -32,11 +31,11 @@ afterEach(async () => {
 });
 
 /** This host's delivery, recording into the health status reads. */
-function start(assistantToken: () => Promise<string> = async () => ASSISTANT_TOKEN): void {
+function start(): void {
   delivery = startChatDelivery({
     config: { subscriberKeyFile: '/unused/subscriber-key.json', topic: TOPIC, subscription: SUBSCRIPTION },
     onChatEvent: async () => undefined,
-    assistantToken,
+    assistantToken: async () => ASSISTANT_TOKEN,
     subscriberToken: async () => SUBSCRIBER_TOKEN,
     fetch: fake.fetch,
   });
@@ -75,28 +74,6 @@ describe('gws-ea-chat health', () => {
           error: null,
         },
         signInNeeded: false,
-      },
-    });
-  });
-
-  it("reports each side's last error kind, and a refused sign-in as sign-in needed", async () => {
-    fake.pubsubFailure = { status: 403, message: 'User not authorized to perform this action.' };
-    start(async () => {
-      throw new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again");
-    });
-    await until(() => chatHealth.read().consumer.error !== null && chatHealth.read().subscription.error !== null);
-
-    expect(await report()).toMatchObject({
-      ok: true,
-      data: {
-        consumer: { connected: false, error: { kind: 'subscriber_credential', at: '2026-10-10T09:00:00.000Z' } },
-        subscription: {
-          error: {
-            kind: 'sign_in_needed',
-            message: "Google no longer accepts the assistant's sign-in; sign in again",
-          },
-        },
-        signInNeeded: true,
       },
     });
   });

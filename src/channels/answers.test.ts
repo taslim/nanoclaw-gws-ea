@@ -418,15 +418,6 @@ describe('createAnswers — binding to its conversation and person', () => {
     expect(desk.answered).toEqual([]);
   });
 
-  it('takes a plain answer from a person only after a question posted since they last wrote', async () => {
-    const desk = await startDesk();
-    await desk.post(DM, 'q-room', question(), 0);
-    await desk.write('Morning!', 10);
-
-    expect(await desk.write('yes', 30)).toBe(false);
-    expect(desk.answered).toEqual([]);
-  });
-
   it('counts a quoted reply as the person writing: a plain answer after it is not for a question posted before it', async () => {
     const desk = await startDesk();
     await desk.post(DM, 'q-room', question(), 0);

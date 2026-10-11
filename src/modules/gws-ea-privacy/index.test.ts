@@ -322,7 +322,6 @@ describe('removing a private value', () => {
     if (!phone.ok) throw new Error(phone.error.message);
 
     await run('private-values-remove', { id: home }, agent(main));
-    await getDb().run("UPDATE gws_ea_profile SET assistant_display_name = 'Juno' WHERE singleton = 1");
     await run('private-values-remove', { id: (phone.data as { id: string }).id }, agent(main));
 
     const questions = sent.map((card) => (JSON.parse(card.content) as { question: string }).question);

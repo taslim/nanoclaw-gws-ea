@@ -950,6 +950,7 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
 
     expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
 
+    expect(err.join('\n')).toContain('Google Chat is not receiving: its consumer is not connected');
     expect(err.join('\n')).toContain('so it was rolled back');
     expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));

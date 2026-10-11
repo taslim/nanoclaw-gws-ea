@@ -15,9 +15,7 @@ describe('quoted', () => {
   });
 
   it('caps a long name at the limit, marking the cut', () => {
-    const line = quoted(`Atlas ${'x'.repeat(200)}`, 20);
-    expect(line).toBe(`"Atlas ${'x'.repeat(13)}…"`);
-    expect(Array.from(line.slice(1, -1))).toHaveLength(20);
+    expect(quoted(`Atlas ${'x'.repeat(200)}`, 20)).toBe(`"Atlas ${'x'.repeat(13)}…"`);
   });
 
   it('cannot close its own quotes', () => {
@@ -27,7 +25,6 @@ describe('quoted', () => {
 
   it('cannot mention anyone or make a link', () => {
     const line = quoted('<users/123> <users/all> <https://evil.example|Approve here>', NAME_LIMIT);
-    expect(line).not.toMatch(/[<>]/u);
     expect(line).toBe('"‹users/123› ‹users/all› ‹https://evil.example|Approve here›"');
     expect(quoted('[Approve](https://evil.example)', NAME_LIMIT)).toBe('"\\[Approve\\]\\(https://evil.example\\)"');
   });

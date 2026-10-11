@@ -232,73 +232,64 @@ describe('signing in as the assistant', () => {
     });
   });
 
-  it('asks for the Workspace scopes, and refuses a sign-in that leaves them unticked', async () => {
-    const workspace = /\/auth\/(drive|documents|spreadsheets|presentations|forms\.)/u;
-    const withoutWorkspace = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !workspace.test(scope)).map((scope) =>
-      scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
-    );
-    const g = google({ scope: withoutWorkspace.join(' ') });
-    const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
-
-    const error = await signInAsAssistant({
-      client: CLIENT,
-      account: 'juno@example.test',
-      present: b.present,
-      fetch: g.fetch,
-    }).catch((caught: unknown) => caught);
-
-    // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the rest of those products' scopes the ceiling adds.
-    const workspaceScopes = [
-      'https://www.googleapis.com/auth/drive',
-      'https://www.googleapis.com/auth/documents',
-      'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/presentations',
-      'https://www.googleapis.com/auth/forms.body',
-      'https://www.googleapis.com/auth/forms.responses.readonly',
-      'https://www.googleapis.com/auth/drive.readonly',
-      'https://www.googleapis.com/auth/drive.metadata',
-      'https://www.googleapis.com/auth/drive.metadata.readonly',
-      'https://www.googleapis.com/auth/drive.activity',
-      'https://www.googleapis.com/auth/drive.activity.readonly',
-      'https://www.googleapis.com/auth/drive.labels',
-      'https://www.googleapis.com/auth/drive.labels.readonly',
-      'https://www.googleapis.com/auth/drive.meet.readonly',
-      'https://www.googleapis.com/auth/documents.readonly',
-      'https://www.googleapis.com/auth/spreadsheets.readonly',
-      'https://www.googleapis.com/auth/presentations.readonly',
-      'https://www.googleapis.com/auth/forms.body.readonly',
-    ];
-    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(expect.arrayContaining(workspaceScopes));
-    expect(error).toMatchObject({ code: 'google_scope_missing' });
-    expect(String(error)).toContain(`did not grant ${workspaceScopes.join(', ')};`);
-  });
-
-  it('asks for the Chat scopes, and refuses a sign-in that leaves one unticked, naming it', async () => {
-    const chatMessages = 'https://www.googleapis.com/auth/chat.messages';
-    const withoutChatMessages = GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== chatMessages).map((scope) =>
-      scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
-    );
-    const g = google({ scope: withoutChatMessages.join(' ') });
-    const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
-
-    const error = await signInAsAssistant({
-      client: CLIENT,
-      account: 'juno@example.test',
-      present: b.present,
-      fetch: g.fetch,
-    }).catch((caught: unknown) => caught);
-
-    expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(
-      expect.arrayContaining([
-        chatMessages,
+  it.each([
+    [
+      'Workspace',
+      /\/auth\/(drive|documents|spreadsheets|presentations|forms\.)/u,
+      // Drive's, Docs', Sheets', Slides' and Forms' own scopes, then the rest of those products' scopes the ceiling adds.
+      [
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/presentations',
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/forms.responses.readonly',
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/drive.metadata',
+        'https://www.googleapis.com/auth/drive.metadata.readonly',
+        'https://www.googleapis.com/auth/drive.activity',
+        'https://www.googleapis.com/auth/drive.activity.readonly',
+        'https://www.googleapis.com/auth/drive.labels',
+        'https://www.googleapis.com/auth/drive.labels.readonly',
+        'https://www.googleapis.com/auth/drive.meet.readonly',
+        'https://www.googleapis.com/auth/documents.readonly',
+        'https://www.googleapis.com/auth/spreadsheets.readonly',
+        'https://www.googleapis.com/auth/presentations.readonly',
+        'https://www.googleapis.com/auth/forms.body.readonly',
+      ],
+    ],
+    [
+      'Chat',
+      /\/auth\/chat\.(messages|spaces\.readonly|spaces\.create|memberships\.readonly)$/u,
+      // The host's Chat token's scopes.
+      [
+        'https://www.googleapis.com/auth/chat.messages',
         'https://www.googleapis.com/auth/chat.spaces.readonly',
         'https://www.googleapis.com/auth/chat.spaces.create',
         'https://www.googleapis.com/auth/chat.memberships.readonly',
-      ]),
-    );
-    expect(error).toMatchObject({ code: 'google_scope_missing' });
-    expect(String(error)).toContain(`did not grant ${chatMessages};`);
-  });
+      ],
+    ],
+  ] as const)(
+    'asks for the %s scopes, and refuses a sign-in that leaves them unticked, naming them',
+    async (_product, unticked, scopes) => {
+      const granted = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !unticked.test(scope)).map((scope) =>
+        scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
+      );
+      const g = google({ scope: granted.join(' ') });
+      const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
+
+      const error = await signInAsAssistant({
+        client: CLIENT,
+        account: 'juno@example.test',
+        present: b.present,
+        fetch: g.fetch,
+      }).catch((caught: unknown) => caught);
+
+      expect(b.seen[0]!.searchParams.get('scope')?.split(' ')).toEqual(expect.arrayContaining([...scopes]));
+      expect(error).toMatchObject({ code: 'google_scope_missing' });
+      expect(String(error)).toContain(`did not grant ${scopes.join(', ')};`);
+    },
+  );
 
   it('refuses a sign-in that returns no refresh token', async () => {
     const g = google({ refresh: false });

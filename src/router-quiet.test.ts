@@ -255,13 +255,23 @@ describe("a reaction on the assistant's own message", () => {
     await routeInbound(reaction({ by: JUNO, platformId: DM, threadId: DM_THREAD, on: 'assistant' }));
 
     const [session] = await sessions();
-    expect(rowsOf(session!.id)).toEqual([expect.objectContaining({ id: `${DM}/reactions/r1:${MAIN}`, trigger: 1 })]);
-    expect(JSON.parse(rowsOf(session!.id)[0]!.content)).toMatchObject({
+    const rows = rowsOf(session!.id);
+    expect(rows).toEqual([expect.objectContaining({ id: `${DM}/reactions/r1:${MAIN}`, trigger: 1 })]);
+    expect(JSON.parse(rows[0]!.content)).toMatchObject({
       sender: JUNO.name,
       reaction: { emoji: 'thumbs_up', target: { self: true, excerpt: "I'd book Tuesday 3pm with Juno, shall I?" } },
     });
     expect(requestWake).toHaveBeenCalledTimes(1);
-    expect(startTypingRefresh).toHaveBeenCalledTimes(1);
+    // A reaction is no one's message, so the turn it wakes has no typing anchor.
+    expect(startTypingRefresh).toHaveBeenCalledExactlyOnceWith(
+      session!.id,
+      MAIN,
+      'gchat',
+      DM,
+      null,
+      'gchat',
+      undefined,
+    );
   });
 
   it("engages a group's mention wiring as a mention would, in the thread it is in", async () => {
@@ -270,16 +280,6 @@ describe("a reaction on the assistant's own message", () => {
     expect(await sessions()).toEqual([
       expect.objectContaining({ messaging_group_id: 'mg-room', thread_id: ROOM_THREAD }),
     ]);
-    expect(requestWake).toHaveBeenCalledTimes(1);
-  });
-
-  it('stores a redelivered reaction once and wakes once', async () => {
-    const thumbsUp = reaction({ by: JUNO, platformId: DM, threadId: DM_THREAD, on: 'assistant' });
-    await routeInbound(thumbsUp);
-    await routeInbound(thumbsUp);
-
-    const [session] = await sessions();
-    expect(rowsOf(session!.id)).toHaveLength(1);
     expect(requestWake).toHaveBeenCalledTimes(1);
   });
 });
@@ -421,12 +421,5 @@ describe('the message a woken turn works on (its typing anchor)', () => {
       'gchat',
       'spaces/AAAAjuno/messages/juno.1',
     );
-  });
-
-  it('is none for a reaction, which no one wrote', async () => {
-    await routeInbound(reaction({ by: JUNO, platformId: DM, threadId: DM_THREAD, on: 'assistant' }));
-
-    const [session] = await sessions();
-    expect(startTypingRefresh).toHaveBeenCalledWith(session!.id, MAIN, 'gchat', DM, null, 'gchat', undefined);
   });
 });

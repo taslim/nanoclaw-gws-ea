@@ -371,22 +371,17 @@ describe('an answer on a channel that left the request as posted', () => {
     expect(await getPendingApproval('appr-text')).toBeUndefined();
   });
 
-  it('rejects with the reason given after the no, and shows it in the outcome', async () => {
+  it('rejects with the reason given after the no, and shows it in the outcome as quoted text', async () => {
     const { handleApprovalsResponse } = await import('./response-handler.js');
 
-    await handleApprovalsResponse(answer('reject', 'users/2001', 'too expensive'));
+    await handleApprovalsResponse(answer('reject', 'users/2001', 'too expensive, ask <users/all> "first" *today*'));
 
-    expect(edits).toEqual([outcomeEdit('❌ Rejected: "too expensive"')]);
-    expect(agentNotes()).toEqual(['Your install_packages_text request was rejected by admin: "too expensive"']);
+    // How quoted text reads is request-text.test.ts's; here, that the outcome shows the reason that way.
+    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "too expensive, ask ‹users/all› 'first' \\*today\\*"`)]);
+    expect(agentNotes()).toEqual([
+      'Your install_packages_text request was rejected by admin: "too expensive, ask <users/all> "first" *today*"',
+    ]);
     expect(await getPendingApproval('appr-text')).toBeUndefined();
-  });
-
-  it('shows a reason as quoted text that cannot mention anyone or format itself', async () => {
-    const { handleApprovalsResponse } = await import('./response-handler.js');
-
-    await handleApprovalsResponse(answer('reject', 'users/2001', 'ask <users/all> "first", *bold*'));
-
-    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "ask ‹users/all› 'first', \\*bold\\*"`)]);
   });
 
   it('leaves a card the channel already resolved alone', async () => {

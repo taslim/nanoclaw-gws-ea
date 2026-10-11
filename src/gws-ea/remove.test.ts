@@ -582,6 +582,20 @@ async function expectGone(paths: ControlPlanePaths, input: InstanceReservationIn
   expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
 }
 
+/** `gws-ea remove --yes` for `input`, through `world`'s boundaries, recording what it prints. */
+function removeCommand(paths: ControlPlanePaths, input: InstanceReservationInput, { dependencies }: World) {
+  const io = { out: [] as string[], err: [] as string[] };
+  const run = (args: readonly string[]): Promise<number> =>
+    runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
+      paths,
+      stdout: (line) => io.out.push(line),
+      stderr: (line) => io.err.push(line),
+      removeAssistant: (removalPaths, id, options) =>
+        removeAssistant(removalPaths, id, { ...dependencies, ...options, interaction: dependencies.interaction }),
+    });
+  return { run, io };
+}
+
 describe('removal from any partial state', () => {
   it('removes a reservation with no journal locally, without gcloud or Docker', async () => {
     const paths = await testPaths();
@@ -630,16 +644,9 @@ describe('removal from any partial state', () => {
       started: ['materialize_checkout', 'provision_gcp', 'start_onecli'],
       lifted: true,
     });
-    const { dependencies, gcloud } = world(input);
-    const io = { out: [] as string[], err: [] as string[] };
-    const cli = (args: readonly string[]): Promise<number> =>
-      runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
-        paths,
-        stdout: (line) => io.out.push(line),
-        stderr: (line) => io.err.push(line),
-        removeAssistant: (removalPaths, id, options) =>
-          removeAssistant(removalPaths, id, { ...dependencies, ...options, interaction: dependencies.interaction }),
-      });
+    const removal = world(input);
+    const { dependencies, gcloud } = removal;
+    const { run: cli, io } = removeCommand(paths, input, removal);
 
     expect(await cli([])).toBe(10);
     const paused = io.out.join('\n');
@@ -697,21 +704,6 @@ describe('removal from any partial state', () => {
     ]);
   });
 
-  it('stops the host, deletes the project, then removes OneCLI, resolving Docker once', async () => {
-    const paths = await testPaths();
-    const input = await reserve(paths, reservationInput(), {
-      started: ['materialize_checkout', 'provision_gcp', 'start_onecli', 'configure_provider', 'start_nanoclaw'],
-    });
-    const { dependencies, gcloud, order } = world(input);
-    gcloud.owned();
-
-    await removeAssistant(paths, input.instance_id, dependencies);
-
-    expect(dependencies.resolveDocker).toHaveBeenCalledOnce();
-    expect(order).toEqual(['nanoclaw', 'gcp', 'onecli']);
-    await expectGone(paths, input);
-  });
-
   it("does not let one assistant's stuck removal block creating, resuming, or removing another", async () => {
     const paths = await testPaths();
     // Its project was created, and Google will no longer show it.
@@ -744,20 +736,6 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     'start_nanoclaw',
   ] as const;
 
-  /** `gws-ea remove --yes` for `input`, through `world`'s boundaries, recording what it prints. */
-  function removeCommand(paths: ControlPlanePaths, input: InstanceReservationInput, { dependencies }: World) {
-    const io = { out: [] as string[], err: [] as string[] };
-    const run = (args: readonly string[]): Promise<number> =>
-      runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
-        paths,
-        stdout: (line) => io.out.push(line),
-        stderr: (line) => io.err.push(line),
-        removeAssistant: (removalPaths, id, options) =>
-          removeAssistant(removalPaths, id, { ...dependencies, ...options, interaction: dependencies.interaction }),
-      });
-    return { run, io };
-  }
-
   it('stops the host before deleting the subscription with the assistant’s sign-in, and deletes the project after', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: STARTED });
@@ -769,6 +747,7 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     const outcome = await removeAssistant(paths, input.instance_id, removal.dependencies);
 
     expect(removal.order).toEqual(['nanoclaw', 'chat-subscription', 'gcp', 'onecli']);
+    expect(removal.dependencies.resolveDocker).toHaveBeenCalledOnce();
     expect(removal.google.events.subscriptions.size).toBe(0);
     // Listed for the assistant's own target with its own Chat token before any change, which proves the sign-in, then
     // once the host stopped: listed, deleted, and listed again to see it gone.

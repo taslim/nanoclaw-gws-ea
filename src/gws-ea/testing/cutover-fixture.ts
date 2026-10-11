@@ -920,7 +920,7 @@ const CHAT_FAILED_AT = '2026-10-10T09:00:00.000Z';
  * receiving, unless `state` says Pub/Sub refuses its subscriber or Google its
  * sign-in.
  */
-export function chatHealthOf(state: World): ChatHealth {
+function chatHealthOf(state: World): ChatHealth {
   return {
     consumer: state.chatDown
       ? {

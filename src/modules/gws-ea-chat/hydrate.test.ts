@@ -130,9 +130,6 @@ describe('a message', () => {
         quotedMessageSnapshot: { sender: 'Juno Hale', text: 'Thursday is open.' },
       },
     });
-    expect(api.calls(`${DM}/messages/remy.1`)).toEqual([
-      expect.objectContaining({ method: 'GET', authorization: `Bearer ${CHAT_TOKEN}` }),
-    ]);
   });
 
   it('reads an attachment-only message as one with no text', async () => {
