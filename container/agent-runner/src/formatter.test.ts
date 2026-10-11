@@ -236,6 +236,46 @@ describe('reply_to + quoted_message rendering', () => {
   });
 });
 
+describe('reactions', () => {
+  // The host's chat-sdk bridge writes a reaction's row with content.reaction:
+  // the emoji by the name add_reaction takes, and an excerpt of the message.
+  function reactionRow(target: { self: boolean; sender: string; excerpt: string }, sender = 'Juno Hale') {
+    return { sender, senderId: 'users/1001', senderName: sender, reaction: { emoji: 'thumbs_up', target } };
+  }
+
+  it('renders a reaction on the agent\'s own message as a <reaction> from "you", never a <message>', () => {
+    insertMessage('m1', 'chat-sdk', { sender: 'Juno Hale', text: 'Can you find time with Remy?' });
+    insertMessage(
+      'r1',
+      'chat-sdk',
+      reactionRow({ self: true, sender: 'Morgan', excerpt: "I'd book Tuesday 3pm with Remy, shall I?" }),
+    );
+    const result = formatMessages(getPendingMessages());
+    expect(result).toMatch(
+      /<reaction sender="Juno Hale" emoji="thumbs_up" time="[^"]+">\n {2}<reacted_to sender="you">I'd book Tuesday 3pm with Remy, shall I\?<\/reacted_to>\n<\/reaction>/,
+    );
+    expect(result.match(/<message /g)).toHaveLength(1);
+  });
+
+  it("names whose message it is when it is someone else's", () => {
+    insertMessage('r1', 'chat-sdk', reactionRow({ self: false, sender: 'Remy Vance', excerpt: 'Lunch at 1?' }));
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<reacted_to sender="Remy Vance">Lunch at 1?</reacted_to>');
+    expect(result).not.toContain('<message');
+  });
+
+  it('escapes the reactor, the emoji, and the excerpt', () => {
+    insertMessage(
+      'r1',
+      'chat-sdk',
+      reactionRow({ self: false, sender: 'A & B', excerpt: '<script>alert("xss")</script>' }, 'Kit <Moreau>'),
+    );
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender="Kit &lt;Moreau&gt;"');
+    expect(result).toContain('<reacted_to sender="A &amp; B">&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;');
+  });
+});
+
 describe('XML escaping', () => {
   it('escapes <, >, &, " in sender and body', () => {
     insertMessage('m1', 'chat', {

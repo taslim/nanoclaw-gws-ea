@@ -2,9 +2,10 @@ import http from 'http';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
+import { getEmoji, Message, parseMarkdown, type Adapter, type AdapterPostableMessage, type RawMessage } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import type { InboundMessage } from './adapter.js';
+import { createChatSdkBridge, splitForLimit, type InboundReaction, type ReactionSource } from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -658,6 +659,177 @@ it('forwards the authenticated instance and message address without editing a de
     await bridge.teardown();
     await closeDb();
   }
+});
+
+describe('createChatSdkBridge — reactions an adapter reads itself', () => {
+  // An adapter that reads its platform's reactions (ReactionSource) hands each
+  // to the bridge and awaits it, so a reaction is acknowledged only once routed.
+  const ASSISTANT_TEXT = "I'd book Tuesday 3pm with Juno, shall I?";
+
+  interface Routed {
+    readonly platformId: string;
+    readonly threadId: string | null;
+    readonly message: InboundMessage;
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  function targetMessage(threadId: string, author: { userId: string; fullName: string; isMe: boolean }, text: string) {
+    return new Message({
+      id: 'spaces/AAAAjuno/messages/morgan.1',
+      threadId,
+      text,
+      formatted: parseMarkdown(text),
+      raw: {},
+      author: { ...author, userName: author.fullName, isBot: false },
+      metadata: { dateSent: new Date('2026-10-10T16:58:00Z'), edited: false },
+      attachments: [],
+    });
+  }
+
+  function thumbsUp(
+    threadId: string,
+    on: { userId: string; fullName: string; isMe: boolean },
+    text = ASSISTANT_TEXT,
+  ): InboundReaction {
+    return {
+      reactionName: 'spaces/AAAAjuno/messages/morgan.1/reactions/r1',
+      emoji: getEmoji('thumbs_up'),
+      user: { userId: 'users/1001', userName: 'Juno Hale', fullName: 'Juno Hale', isBot: false, isMe: false },
+      message: targetMessage(threadId, on, text),
+      threadId,
+      reactedAt: new Date('2026-10-10T17:00:00Z'),
+    };
+  }
+
+  async function startReactionSource(options: { redelivers?: boolean; failRouting?: boolean } = {}) {
+    let handler: ((reaction: InboundReaction) => Promise<void>) | undefined;
+    let handlerAtInitialize = false;
+    const routed: Routed[] = [];
+    const source: ReactionSource = {
+      setReactionHandler: (next) => {
+        handler = next;
+      },
+    };
+    const adapter = Object.assign(
+      stubAdapter({
+        name: 'fixture',
+        initialize: async () => {
+          // The adapter starts reading events here, so the bridge must already listen.
+          handlerAtInitialize = handler !== undefined;
+        },
+        channelIdFromThreadId: (threadId: string) => threadId.slice(0, threadId.lastIndexOf(':')),
+        isDM: (threadId: string) => threadId.endsWith(':dm'),
+      }),
+      source,
+    );
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, redelivers: options.redelivers });
+    await bridge.setup({
+      onInbound: async (platformId, threadId, message) => {
+        if (options.failRouting) throw new Error('database is locked');
+        routed.push({ platformId, threadId, message });
+      },
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    });
+    return {
+      bridge,
+      routed,
+      handlerAtInitialize: () => handlerAtInitialize,
+      react: (reaction: InboundReaction) => handler!(reaction),
+    };
+  }
+
+  it("listens before the adapter starts, and routes a reaction on the assistant's message to wake it", async () => {
+    const source = await startReactionSource({ redelivers: true });
+    try {
+      expect(source.handlerAtInitialize()).toBe(true);
+      await source.react(thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true }));
+
+      expect(source.routed).toEqual([
+        {
+          platformId: 'fixture:spaces/AAAAjuno',
+          threadId: 'fixture:spaces/AAAAjuno:dm',
+          message: {
+            id: 'spaces/AAAAjuno/messages/morgan.1/reactions/r1',
+            kind: 'chat-sdk',
+            timestamp: '2026-10-10T17:00:00.000Z',
+            content: {
+              sender: 'Juno Hale',
+              senderId: 'users/1001',
+              senderName: 'Juno Hale',
+              reaction: { emoji: 'thumbs_up', target: { self: true, sender: 'Morgan', excerpt: ASSISTANT_TEXT } },
+            },
+            isMention: false,
+            isGroup: false,
+            authenticatedSender: { userId: 'users/1001', displayName: 'Juno Hale', kind: 'human' },
+            reaction: true,
+            deduplicate: true,
+          },
+        },
+      ]);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it("marks a reaction on someone else's message quiet, naming whose it is", async () => {
+    const source = await startReactionSource();
+    try {
+      await source.react(
+        thumbsUp('fixture:spaces/AAAAroom:thread-1', { userId: 'users/2002', fullName: 'Remy Vance', isMe: false }),
+      );
+
+      const [{ message }] = source.routed;
+      expect(message).toMatchObject({
+        reaction: true,
+        quiet: true,
+        isGroup: true,
+        content: { reaction: { target: { self: false, sender: 'Remy Vance' } } },
+      });
+      expect(message).not.toHaveProperty('deduplicate');
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it('carries an excerpt of a long message, cut to 200 characters', async () => {
+    const source = await startReactionSource();
+    try {
+      const long = `${'Agenda: '.repeat(40)}end`;
+      await source.react(
+        thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true }, long),
+      );
+
+      const content = source.routed[0]!.message.content as { reaction: { target: { excerpt: string } } };
+      expect(content.reaction.target.excerpt).toHaveLength(200);
+      expect(content.reaction.target.excerpt.endsWith('…')).toBe(true);
+      expect(long.startsWith(content.reaction.target.excerpt.slice(0, -1))).toBe(true);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
+
+  it('rejects when routing fails, so the adapter hands the reaction over again', async () => {
+    const source = await startReactionSource({ failRouting: true });
+    try {
+      await expect(
+        source.react(thumbsUp('fixture:spaces/AAAAjuno:dm', { userId: 'users/9', fullName: 'Morgan', isMe: true })),
+      ).rejects.toThrow(/database is locked/u);
+    } finally {
+      await source.bridge.teardown();
+    }
+  });
 });
 
 describe('createChatSdkBridge — local Gateway webhook', () => {

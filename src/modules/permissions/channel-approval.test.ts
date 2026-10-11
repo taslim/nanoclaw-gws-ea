@@ -737,6 +737,47 @@ describe('unknown-channel registration flow', () => {
     expect(stillPending).toBe(0);
   });
 
+  it("create new agent: a reaction or a quiet event in the owner's DM is not taken as the name", async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await expectAsyncDelivery(() => routeInbound(groupMention('chat-create-aside')));
+    const pending = (await getDb().get<{ messaging_group_id: string }>(
+      'SELECT messaging_group_id FROM pending_channel_approvals',
+    ))!;
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.messaging_group_id,
+        value: 'new_agent',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    const fromOwner = (id: string, text: string, marker: { reaction?: true; quiet?: true } = {}) => ({
+      channelType: 'telegram',
+      platformId: 'dm-owner',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', senderName: 'Owner', text }),
+        timestamp: now(),
+        ...marker,
+      },
+    });
+    await routeInbound(fromOwner('aside-reaction', 'Thumbsy', { reaction: true }));
+    await routeInbound(fromOwner('aside-quiet', 'Quietly', { quiet: true }));
+    expect(await countRows("SELECT COUNT(*) AS c FROM agent_groups WHERE name IN ('Thumbsy', 'Quietly')")).toBe(0);
+
+    // Still waiting: the owner's next written reply is the name.
+    await routeInbound(fromOwner('name-reply-3', 'Newbie'));
+    expect(await countRows("SELECT COUNT(*) AS c FROM agent_groups WHERE name = 'Newbie'")).toBe(1);
+  });
+
   it('a name reply after the registration vanished is consumed without creating anything', async () => {
     const { routeInbound } = await import('../../router.js');
     const { getResponseHandlers } = await import('../../response-registry.js');

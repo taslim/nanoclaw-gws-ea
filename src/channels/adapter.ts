@@ -85,6 +85,10 @@ export interface InboundEvent {
      * redelivers (InboundMessage.deduplicate).
      */
     deduplicate?: boolean;
+    /** Context only (InboundMessage.quiet). */
+    quiet?: boolean;
+    /** A reaction rather than something written (InboundMessage.reaction). */
+    reaction?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -121,6 +125,21 @@ export interface InboundMessage {
    * the router drops a copy already queued instead of storing and waking twice.
    */
   deduplicate?: boolean;
+  /**
+   * Context, not something to answer: the router stores it with trigger=0 in
+   * the session its conversation already has, and drops it when there is
+   * none. It never engages a wiring, wakes an agent, creates a session, or
+   * fans out to sibling sessions (the quiet path, src/router.ts).
+   */
+  quiet?: boolean;
+  /**
+   * A reaction, not something a person wrote. It reaches an agent only when
+   * the person may, and is otherwise dropped without a trace: no drop record,
+   * no approval request. One that is not quiet, on the assistant's own
+   * message, engages its conversation's wiring as a mention does. Message
+   * interceptors never take a reaction or a quiet event as a reply.
+   */
+  reaction?: boolean;
 }
 
 export interface AuthenticatedSender {

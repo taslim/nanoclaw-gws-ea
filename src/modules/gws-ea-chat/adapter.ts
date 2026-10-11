@@ -21,7 +21,7 @@ import { defaultEmojiResolver, type ChatInstance, type Message, type ReactionEve
 import { OAuth2Client } from 'google-auth-library';
 
 import type { ChannelAdapter, ChannelDefaults } from '../../channels/adapter.js';
-import { createChatSdkBridge, type ReplyContext } from '../../channels/chat-sdk-bridge.js';
+import { createChatSdkBridge, type ReactionSource, type ReplyContext } from '../../channels/chat-sdk-bridge.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { RENEW_BEFORE_EXPIRY_MS } from '../gws-ea-google/tokens.js';
@@ -50,6 +50,8 @@ export interface ChatReactionEvent extends Omit<ReactionEvent, 'thread' | 'messa
   readonly reactionName: string;
   /** The message reacted to, read as an inbound message is: its author's `isMe` marks the assistant's own. */
   readonly message: Message;
+  /** When it was placed: its event's time, as Google records it. */
+  readonly reactedAt: Date;
   readonly raw: ChatReaction;
 }
 
@@ -105,7 +107,7 @@ export function hostChatAuth(token: () => Promise<string>, fetch?: typeof global
   return client;
 }
 
-export class AssistantChatAdapter extends GoogleChatAdapter {
+export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource {
   /** Chat's events are pulled: the bridge registers no webhook route for this adapter. */
   readonly runtimeMode = 'polling';
   private readonly hydrator: ChatHydrator;
@@ -313,6 +315,7 @@ export class AssistantChatAdapter extends GoogleChatAdapter {
           messageId: messageName,
           threadId,
           message: await this.parsePubSubMessage(this.notification(read.message, read.space), threadId),
+          reactedAt: new Date(at),
           reactionName: reaction.name,
           raw: reaction,
         });

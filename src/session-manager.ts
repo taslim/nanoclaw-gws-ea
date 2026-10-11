@@ -93,14 +93,30 @@ function sessionCreationKey(
 }
 
 /**
- * Find or create a session for a messaging group + thread.
+ * The active session a messaging group + thread already has, which
+ * resolveSession would resolve to; never creates one.
  *
  * Session modes:
  * - 'shared': one session per messaging group (ignores threadId)
  * - 'per-thread': one session per (messaging group, thread)
  * - 'agent-shared': one session per agent group — all messaging groups
- *   wired with this mode share a single session (e.g. GitHub + Slack)
+ *   wired with this mode share a single session (e.g. GitHub + Slack), so it
+ *   is found whichever conversation started it
  */
+export async function findSession(
+  agentGroupId: string,
+  messagingGroupId: string | null,
+  threadId: string | null,
+  sessionMode: 'shared' | 'per-thread' | 'agent-shared',
+): Promise<Session | undefined> {
+  if (sessionMode === 'agent-shared') return findSessionByAgentGroup(agentGroupId);
+  if (!messagingGroupId) return undefined;
+  // Scope lookup by agent_group_id so fan-out to multiple agents in the
+  // same chat doesn't accidentally deliver to the wrong agent's session.
+  return findSessionForAgent(agentGroupId, messagingGroupId, sessionMode === 'shared' ? null : threadId);
+}
+
+/** Find or create a session for a messaging group + thread (session modes: findSession). */
 export async function resolveSession(
   agentGroupId: string,
   messagingGroupId: string | null,
@@ -109,20 +125,9 @@ export async function resolveSession(
 ): Promise<{ session: Session; created: boolean }> {
   const key = sessionCreationKey(agentGroupId, messagingGroupId, threadId, sessionMode);
   return withSessionCreationLock(key, async () => {
-    // agent-shared: single session per agent group, regardless of messaging group
-    if (sessionMode === 'agent-shared') {
-      const existing = await findSessionByAgentGroup(agentGroupId);
-      if (existing) {
-        return { session: existing, created: false };
-      }
-    } else if (messagingGroupId) {
-      const lookupThreadId = sessionMode === 'shared' ? null : threadId;
-      // Scope lookup by agent_group_id so fan-out to multiple agents in the
-      // same chat doesn't accidentally deliver to the wrong agent's session.
-      const existing = await findSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
-      if (existing) {
-        return { session: existing, created: false };
-      }
+    const existing = await findSession(agentGroupId, messagingGroupId, threadId, sessionMode);
+    if (existing) {
+      return { session: existing, created: false };
     }
 
     const id = generateId();
@@ -143,14 +148,9 @@ export async function resolveSession(
       await createSession(session);
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
-      const existing =
-        sessionMode === 'agent-shared'
-          ? await findSessionByAgentGroup(agentGroupId)
-          : messagingGroupId
-            ? await findSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId)
-            : undefined;
-      if (!existing) throw error;
-      return { session: existing, created: false };
+      const raced = await findSession(agentGroupId, messagingGroupId, threadId, sessionMode);
+      if (!raced) throw error;
+      return { session: raced, created: false };
     }
     initSessionFolder(agentGroupId, id);
     log.info('Session created', { id, agentGroupId, messagingGroupId, threadId: lookupThreadId, sessionMode });

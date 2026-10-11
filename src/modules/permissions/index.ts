@@ -646,6 +646,8 @@ registerResponseHandler(handleChannelApprovalResponse);
 // creates the agent immediately, wires the channel, and replays.
 
 registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
+  // A reaction or a quiet event is never the name the approver was asked to type.
+  if (event.message.reaction === true || event.message.quiet === true) return false;
   const userId = await extractAndUpsertUser(event);
   if (!userId) return false;
 

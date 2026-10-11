@@ -18,14 +18,16 @@ import {
   type Adapter,
   type AssistantContextChangedEvent,
   type AssistantThreadStartedEvent,
+  type Author,
   type ConcurrencyStrategy,
+  type EmojiValue,
   type Message as ChatMessage,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
 
@@ -50,6 +52,57 @@ export interface ReplyContext {
   sender: string;
   /** The platform's id for the message replied to, when the platform names it. */
   id?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Reactions an adapter reads itself
+// ---------------------------------------------------------------------------
+
+/** A reaction someone placed on a message, as an adapter read it from its platform. */
+export interface InboundReaction {
+  /** The reaction's own id, the same each time the platform delivers it. */
+  readonly reactionName: string;
+  readonly emoji: EmojiValue;
+  /** Who reacted. */
+  readonly user: Author;
+  /** The message reacted to, read as an inbound message is: `author.isMe` marks the assistant's own. */
+  readonly message: ChatMessage;
+  /** The SDK thread of the message reacted to. */
+  readonly threadId: string;
+  readonly reactedAt: Date;
+}
+
+/**
+ * An adapter that reads its platform's reactions itself and hands each one to
+ * the bridge, awaiting the promise: it resolves once the reaction is routed
+ * and rejects when routing fails, so a platform that redelivers hands the
+ * reaction over again. The SDK's own reaction dispatch is fire-and-forget,
+ * which such a platform cannot use. The adapter drops its own reactions.
+ */
+export interface ReactionSource {
+  readonly setReactionHandler: (handler: (reaction: InboundReaction) => Promise<void>) => void;
+}
+
+function isReactionSource(adapter: Adapter): adapter is Adapter & ReactionSource {
+  return typeof (adapter as Partial<ReactionSource>).setReactionHandler === 'function';
+}
+
+/** How much of the message reacted to the agent sees with the reaction. */
+const REACTION_EXCERPT_CHARS = 200;
+
+function excerpt(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length <= REACTION_EXCERPT_CHARS ? trimmed : `${trimmed.slice(0, REACTION_EXCERPT_CHARS - 1)}…`;
+}
+
+/** The sender identity the platform transport asserts for an SDK author, never parsed from content. */
+function authenticatedSenderOf(author: Author): AuthenticatedSender | undefined {
+  if (typeof author.userId !== 'string' || author.userId.length === 0) return undefined;
+  return {
+    userId: author.userId,
+    displayName: author.fullName || author.userName || undefined,
+    kind: author.isBot === false ? 'human' : author.isBot === true ? 'bot' : 'unknown',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -557,14 +610,44 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       timestamp: message.metadata.dateSent.toISOString(),
       isMention,
       isGroup,
-      authenticatedSender:
-        typeof message.author.userId === 'string' && message.author.userId.length > 0
-          ? {
-              userId: message.author.userId,
-              displayName: message.author.fullName || message.author.userName || undefined,
-              kind: message.author.isBot === false ? 'human' : message.author.isBot === true ? 'bot' : 'unknown',
-            }
-          : undefined,
+      authenticatedSender: authenticatedSenderOf(message.author),
+      ...(config.redelivers === true ? { deduplicate: true } : {}),
+    };
+  }
+
+  /**
+   * A reaction as the router takes it (InboundMessage.reaction): its own id,
+   * so a redelivery is dropped, and quiet unless it is on the assistant's own
+   * message. Its content names who reacted, the emoji by the name
+   * add_reaction takes, and the message reacted to as an excerpt; it carries
+   * no text, so nothing reads it as something written.
+   */
+  function reactionToInbound(reaction: InboundReaction, isGroup: boolean | undefined): InboundMessage {
+    const reactor = reaction.user.fullName || reaction.user.userName || reaction.user.userId;
+    const target = reaction.message.author;
+    const self = target.isMe === true;
+    return {
+      id: reaction.reactionName,
+      kind: 'chat-sdk',
+      content: {
+        sender: reactor,
+        senderId: reaction.user.userId,
+        senderName: reactor,
+        reaction: {
+          emoji: reaction.emoji.name,
+          target: {
+            self,
+            sender: target.fullName || target.userName || target.userId,
+            excerpt: excerpt(reaction.message.text),
+          },
+        },
+      },
+      timestamp: reaction.reactedAt.toISOString(),
+      isMention: false,
+      isGroup,
+      authenticatedSender: authenticatedSenderOf(reaction.user),
+      reaction: true,
+      ...(self ? {} : { quiet: true }),
       ...(config.redelivers === true ? { deduplicate: true } : {}),
     };
   }
@@ -748,6 +831,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           platformId: adapter.channelIdFromThreadId(event.threadId),
         });
       });
+
+      // Reactions the adapter reads itself (ReactionSource), registered
+      // before initialize starts its reading. Awaited: a reaction the router
+      // could not take rejects back to the adapter. In a DM, the thread is
+      // the reacted message's own, as a direct message's is.
+      if (isReactionSource(adapter)) {
+        adapter.setReactionHandler(async (reaction) => {
+          const isDM = adapter.isDM?.(reaction.threadId);
+          await setupConfig.onInbound(
+            adapter.channelIdFromThreadId(reaction.threadId),
+            isDM === true ? normalizeDmThreadId(reaction.threadId, reaction.message.id) : reaction.threadId,
+            reactionToInbound(reaction, isDM === undefined ? undefined : !isDM),
+          );
+        });
+      }
 
       await chat.initialize();
 

@@ -410,6 +410,7 @@ describe('reactions', () => {
         messageId: target,
         threadId: `gchat:${DM}:dm`,
         user: { userId: 'users/2001', userName: 'Juno Hale', fullName: 'Juno Hale', isBot: false, isMe: false },
+        reactedAt: new Date('2026-10-10T17:00:00Z'),
       }),
     ]);
     expect(events[0]!.emoji.name).toBe('thumbs_up');
@@ -459,7 +460,55 @@ describe('reactions', () => {
     expect(events).toEqual([]);
   });
 
-  it('resolves a reaction without dispatching it while no handler is registered', async () => {
+  it("routes a reaction through the channel: waking on the assistant's message, quiet on anyone else's", async () => {
+    await start();
+    api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT, text: 'Shall I move Thursday to Friday?' }));
+    api.addMessage(chatMessage(ROOM, 'remy.1', { from: 'users/2001', text: 'Lunch at 1?' }));
+    api.addReaction({
+      name: `${target}/reactions/r1`,
+      user: { name: 'users/2001', type: 'HUMAN' },
+      emoji: { unicode: '👍' },
+    });
+    api.addReaction({
+      name: `${ROOM}/messages/remy.1/reactions/r2`,
+      user: { name: 'users/2001', type: 'HUMAN' },
+      emoji: { unicode: '👍' },
+    });
+
+    await deliver!(reactionEvent(`${target}/reactions/r1`));
+    await deliver!(reactionEvent(`${ROOM}/messages/remy.1/reactions/r2`));
+
+    expect(routed).toEqual([
+      {
+        platformId: `gchat:${DM}`,
+        threadId: `gchat:${DM}:dm`,
+        message: expect.objectContaining({
+          id: `${target}/reactions/r1`,
+          timestamp: '2026-10-10T17:00:00.000Z',
+          isGroup: false,
+          reaction: true,
+          deduplicate: true,
+          authenticatedSender: { userId: 'users/2001', displayName: 'Juno Hale', kind: 'human' },
+        }),
+      },
+      {
+        platformId: `gchat:${ROOM}`,
+        threadId: threadOf(ROOM, 'remy'),
+        message: expect.objectContaining({ id: `${ROOM}/messages/remy.1/reactions/r2`, isGroup: true, quiet: true }),
+      },
+    ]);
+    expect(routed[0]!.message).not.toHaveProperty('quiet');
+    expect(content(0).reaction).toEqual({
+      emoji: 'thumbs_up',
+      target: { self: true, sender: 'morgan', excerpt: 'Shall I move Thursday to Friday?' },
+    });
+    expect(content(1).reaction).toEqual({
+      emoji: 'thumbs_up',
+      target: { self: false, sender: 'Juno Hale', excerpt: 'Lunch at 1?' },
+    });
+  });
+
+  it('refuses a reaction the host could not route, so it comes again', async () => {
     await start();
     api.addMessage(chatMessage(DM, 'morgan.1', { from: ASSISTANT }));
     api.addReaction({
@@ -467,9 +516,11 @@ describe('reactions', () => {
       user: { name: 'users/2001', type: 'HUMAN' },
       emoji: { unicode: '👍' },
     });
+    routingFailures = 1;
 
-    await expect(deliver!(reactionEvent(`${target}/reactions/r1`))).resolves.toBeUndefined();
-    expect(routed).toEqual([]);
+    await expect(deliver!(reactionEvent(`${target}/reactions/r1`))).rejects.toThrow(/database is locked/u);
+    await deliver!(reactionEvent(`${target}/reactions/r1`));
+    expect(routed).toHaveLength(1);
   });
 
   it('refuses a reaction whose handler fails, so it comes again', async () => {

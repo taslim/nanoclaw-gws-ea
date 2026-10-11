@@ -125,6 +125,8 @@ async function main(): Promise<void> {
                 isGroup: message.isGroup,
                 authenticatedSender: message.authenticatedSender,
                 deduplicate: message.deduplicate,
+                quiet: message.quiet,
+                reaction: message.reaction,
               },
             }),
           )

@@ -261,6 +261,7 @@ function formatChatMessages(messages: MessageInRow[]): string {
 function formatSingleChat(msg: MessageInRow): string {
   if (isSessionEcho(msg)) return formatEchoMessage(msg);
   const content = parseContent(msg.content);
+  if (content.reaction !== undefined) return formatReaction(msg, content.sender, content.reaction);
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
@@ -274,6 +275,41 @@ function formatSingleChat(msg: MessageInRow): string {
   const fromAttr = originAttr(msg);
 
   return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+}
+
+/** content.reaction, as the host's chat-sdk bridge writes it on a reaction's row. */
+interface ReactionContent {
+  /** The emoji by the name add_reaction takes (thumbs_up). */
+  emoji: string;
+  /** The message reacted to: an excerpt, and whether it is the agent's own (self). */
+  target: { self: boolean; sender: string; excerpt: string };
+}
+
+function readReaction(value: unknown): ReactionContent {
+  const reaction = typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
+  const target =
+    typeof reaction.target === 'object' && reaction.target !== null ? (reaction.target as Record<string, unknown>) : {};
+  return {
+    emoji: typeof reaction.emoji === 'string' ? reaction.emoji : 'unknown',
+    target: {
+      self: target.self === true,
+      sender: typeof target.sender === 'string' ? target.sender : 'Unknown',
+      excerpt: typeof target.excerpt === 'string' ? target.excerpt : '',
+    },
+  };
+}
+
+/**
+ * Render a reaction someone placed on a message: who, the emoji, and an
+ * excerpt of the message, from "you" when it is the agent's own. Never a
+ * <message>: there is nothing written to reply to, and no id to react to.
+ */
+function formatReaction(msg: MessageInRow, reactor: unknown, value: unknown): string {
+  const { emoji, target } = readReaction(value);
+  const sender = typeof reactor === 'string' && reactor ? reactor : 'Unknown';
+  const time = formatLocalTime(msg.timestamp, TIMEZONE);
+  const on = target.self ? 'you' : target.sender;
+  return `<reaction${originAttr(msg)} sender="${escapeXml(sender)}" emoji="${escapeXml(emoji)}" time="${escapeXml(time)}">\n  <reacted_to sender="${escapeXml(on)}">${escapeXml(target.excerpt)}</reacted_to>\n</reaction>`;
 }
 
 /**
