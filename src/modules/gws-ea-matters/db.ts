@@ -326,12 +326,14 @@ export interface LookSlot {
   readonly id: string;
   readonly title: string;
   readonly look_task_id: string | null;
+  /** When the host heard that a run of this matter's look failed, until its loop has brought the look back. */
+  readonly look_failed_at: string | null;
 }
 
 /** Every open matter's look slot, oldest first. */
 export async function listOpenLookSlots(): Promise<LookSlot[]> {
   return getDb().all<LookSlot>(
-    'SELECT id, title, look_task_id FROM gws_ea_matters WHERE closed_at IS NULL ORDER BY created_at, id',
+    'SELECT id, title, look_task_id, look_failed_at FROM gws_ea_matters WHERE closed_at IS NULL ORDER BY created_at, id',
   );
 }
 
@@ -737,6 +739,14 @@ export async function setLinkHandler(link: LinkRef, handler: string): Promise<vo
  * has none (KTD4). The task is the clock, so this is not a change to the
  * matter itself and leaves `updated_at` as it was.
  */
+/**
+ * Mark that a run of the matter's look failed, or clear the mark (KTD7 step 3).
+ * A matter that is gone, or closed since, is left as it is.
+ */
+export async function markLookFailed(id: string, at: string | null): Promise<void> {
+  await getDb().run('UPDATE gws_ea_matters SET look_failed_at = ? WHERE id = ? AND closed_at IS NULL', at, id);
+}
+
 export async function recordLookTask(id: string, taskId: string | null): Promise<void> {
   const matterId = id.trim();
   const result = await getDb().run('UPDATE gws_ea_matters SET look_task_id = ? WHERE id = ?', taskId, matterId);

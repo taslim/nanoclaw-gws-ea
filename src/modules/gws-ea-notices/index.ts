@@ -69,6 +69,7 @@ import { registerInboundFailedHook } from '../../reconcile-session.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { conversationPeople, EMAIL_CHANNEL_TYPE, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
+import { markLookFailed } from '../gws-ea-matters/db.js';
 import { lookSeries } from '../gws-ea-matters/looks.js';
 import {
   getExternalEmailAgentGroupId,
@@ -468,8 +469,13 @@ registerDeliveryAction(
     if (first !== undefined) {
       await tellPrincipal('turn-failed', session, principal, first, outage ? OUTAGE_NOTICE_TEXT : FAILURE_NOTICE_TEXT);
     }
-    // A turn the principal started only partly, or not at all; a look it lost comes back through the matters loop.
+    // A turn the principal started only partly, or not at all; a look it lost comes back through the matters
+    // loop, which hears of it here because the runner settles a failed turn's rows as done.
     if (first === undefined || rest.length > 0) await tellMainOfItsOwn('turn-failed', batch, carriedBy(rest, false));
+    for (const message of rest) {
+      const look = message.kind === 'task' ? lookSeries(message.seriesId ?? message.id) : undefined;
+      if (look !== undefined) await markLookFailed(look.matterId, new Date().toISOString());
+    }
   },
   unguarded("reports a failure to the principal or main only; the principal's notice passes the outbound guard"),
 );

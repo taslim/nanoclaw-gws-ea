@@ -58,3 +58,19 @@ export const gwsEaMattersMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * A failed look (KTD7 step 3). The runner settles a failed turn's rows as
+ * done, so a repeating look's next occurrence is armed on its next date as if
+ * it had run; the host marks the matter here when it hears of the failure,
+ * and its loop brings that occurrence to the next morning, then clears the
+ * mark. It is the host's bookkeeping for one guarantee, never shown to `main`
+ * or anyone, and no status of the matter.
+ */
+export const gwsEaMattersLookFailedMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-matters:look-failed',
+  async up(db) {
+    await db.exec('ALTER TABLE gws_ea_matters ADD COLUMN look_failed_at TEXT');
+  },
+};

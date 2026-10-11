@@ -89,6 +89,8 @@ describe('the matters schema', () => {
       'created_at',
       'updated_at',
       'closed_at',
+      // The host's own mark for one guarantee (KTD7 step 3), never shown to main: no status.
+      'look_failed_at',
     ]);
     expect(await columns('gws_ea_matter_links')).toEqual([
       'matter_id',

@@ -29,7 +29,7 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { listUnplacedThreads, recordPlacementNote } from '../gws-ea-inbox/thread-map.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
-import { listOpenLookSlots, type LookSlot } from './db.js';
+import { listOpenLookSlots, markLookFailed, type LookSlot } from './db.js';
 import {
   findTasks,
   lookSeries,
@@ -75,18 +75,30 @@ async function handBackMattersWithoutALook(
 /**
  * Step 3: a repeating look whose latest run failed, and whose next
  * occurrence is more than a day after the next morning, comes at the morning.
+ * A failed script shows in the series' runs; a failed turn, which the runner
+ * settles as done, shows in the mark the notices module sets on the matter.
  * Once it runs, the sweep arms the next occurrence from its cron again.
  */
 async function bringFailedRepeatsForward(morning: string, slots: readonly Slot[]): Promise<void> {
-  for (const { held } of slots) {
+  for (const { slot, held } of slots) {
     if (held === undefined) continue;
     const { session, task } = held;
+    // Until the sweep arms the occurrence after a failed run, the mark waits for the next pass.
     if (task.status !== 'pending' || task.recurrence === null || task.processAfter === null) continue;
-    if (Date.parse(task.processAfter) - Date.parse(morning) <= DAY_MS) continue;
     const key = seriesKey(task);
-    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      if (mailbox.trailingFailedRuns(key) > 0) mailbox.updateTask(key, { processAfter: morning });
-    });
+    // A failed script shows in the series' runs; a failed turn, which the runner settles as done, only in the mark.
+    const failed =
+      slot.look_failed_at !== null ||
+      ((await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.trailingFailedRuns(key),
+      )) ?? 0) > 0;
+    if (!failed) continue;
+    if (Date.parse(task.processAfter) - Date.parse(morning) > DAY_MS) {
+      await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+        mailbox.updateTask(key, { processAfter: morning });
+      });
+    }
+    if (slot.look_failed_at !== null) await markLookFailed(slot.id, null);
   }
 }
 

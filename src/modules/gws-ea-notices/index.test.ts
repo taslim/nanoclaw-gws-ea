@@ -720,6 +720,33 @@ describe('a failed turn the runner reports', () => {
     expect(onlyFact().text).toBe('Your turn failed before it finished, so what it was handling may be left undone.');
   });
 
+  it("of a repeating look, brings it back at the next morning and keeps next year's date", async () => {
+    const yearly = '0 9 14 3 *';
+    const { matter } = await openMatterWithLook(
+      { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
+      { kind: 'repeat', cron: yearly },
+    );
+    await keepMattersOnTime();
+    const look = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
+    if (look === undefined) throw new Error('No look');
+    // The runner acks a failed turn's rows as done, so the series re-arms on next year's date.
+    await runOccurrence(main, look.id, 'completed');
+    turnFailed(main, { batch: [look.id], error: 'API Error: 529 overloaded' });
+
+    await drain(main, 1);
+    await keepMattersOnTime();
+
+    const morning = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-morning-'))?.process_after;
+    const retry = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
+    expect(retry).toMatchObject({ recurrence: yearly, process_after: morning });
+    expect(sent).toEqual([]);
+
+    // Once taken, it is back on its yearly date, and a later pass leaves it there.
+    await runOccurrence(main, retry?.id ?? '', 'completed');
+    await keepMattersOnTime();
+    expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)?.process_after).not.toBe(morning);
+  });
+
   it('holding a calendar note and a waking tell_main, puts both with their matters on main’s next turn as one note, and tells Morgan nothing', async () => {
     await createThread('g-juno', now(), THREAD_JUNO);
     const renewal = (
