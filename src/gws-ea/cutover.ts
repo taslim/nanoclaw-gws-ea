@@ -4,7 +4,7 @@
  *
  * The fence stops the assistant's service job and drains its agents, proves
  * the instance quiet (no process runs from its instance root, no container
- * carries its install's label, nothing holds anything under its `state/`
+ * carries its install's label, no writer holds anything under its `state/`
  * open), and removes the live link, so nothing can start a host until a
  * switch points the link again, not even the service manager after a reboot.
  * The switch, run only fenced, stamps the target release's upgrade tripwire
@@ -75,7 +75,7 @@ import {
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { GwsEaError, releaseLine, type InstanceReservation, type ReleaseCoordinates } from './types.js';
-import { isRecord, unwrapData } from './validation.js';
+import { isRecord, parseJson, requireRecord, requireString, unixSocketPath, unwrapData } from './validation.js';
 import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 
 /** How long containers the drain stopped may take to be removed (`--rm` removes them after they exit). */
@@ -155,17 +155,21 @@ async function processesRunningFrom(
 /** Every container carrying the install's label, in any state. */
 async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
   const label = getInstallScopedNames(instance.installId).containerInstallLabel;
-  const { stdout } = await (seams.runCommand ?? runSanitizedCommand)({
-    command: 'docker',
-    args: ['ps', '--all', '--quiet', '--filter', `label=${label}`],
-    cwd: instance.homeDirectory,
-    env: toolEnvironment(seams, { HOME: instance.homeDirectory, DOCKER_HOST: instance.dockerEndpoint }),
-    timeoutMs: PROBE_TIMEOUT_MS,
-  });
+  const { stdout } = await quietDocker(instance, seams, ['ps', '--all', '--quiet', '--filter', `label=${label}`]);
   return stdout
     .split(/\r?\n/u)
     .map((id) => id.trim())
     .filter(Boolean);
+}
+
+function quietDocker(instance: QuietInstance, seams: QuiescenceSeams, args: readonly string[]) {
+  return (seams.runCommand ?? runSanitizedCommand)({
+    command: 'docker',
+    args: [...args],
+    cwd: instance.homeDirectory,
+    env: toolEnvironment(seams, { HOME: instance.homeDirectory, DOCKER_HOST: instance.dockerEndpoint }),
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
 }
 
 /**
@@ -177,24 +181,25 @@ async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams
 const LSOF = 'lsof "$@"; status=$?; [ "$status" -le 1 ] || exit "$status"';
 
 /**
- * `lsof` on everything under `directory`, in its field output, read whatever
- * its status; an error it meets is reported on stderr, and fails the check.
+ * Read lsof's field output; a reported inspection error fails the check.
  */
-async function lsofHolders(directory: string, seams: QuiescenceSeams): Promise<OpenFileHolder[]> {
+async function lsofOutput(args: readonly string[], cwd: string, seams: QuiescenceSeams): Promise<string> {
   const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
     command: 'sh',
-    args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', directory],
-    // Run from beside it: `lsof +D` reports every process whose working directory is inside, its own included.
-    cwd: path.dirname(directory),
+    args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'pcn', ...args],
+    cwd,
     env: toolEnvironment(seams),
     timeoutMs: PROBE_TIMEOUT_MS,
   });
   if (stderr.trim()) {
-    throw new GwsEaError(
-      'command_failed',
-      `lsof could not tell what holds ${directory} open: ${redact(stderr.trim())}`,
-    );
+    throw new GwsEaError('command_failed', `lsof could not establish which files are open: ${redact(stderr.trim())}`);
   }
+  return stdout;
+}
+
+async function lsofHolders(directory: string, seams: QuiescenceSeams): Promise<OpenFileHolder[]> {
+  // Run from beside it: `lsof +D` reports its own working directory too.
+  const stdout = await lsofOutput(['+D', directory], path.dirname(directory), seams);
   const holders: OpenFileHolder[] = [];
   let pid = 0;
   let command = 'unknown';
@@ -279,13 +284,225 @@ function abbreviated(args: string): string {
   return args.length > 160 ? `${args.slice(0, 157)}...` : args;
 }
 
+const APPLE_VM =
+  '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine';
+const INVALID_DOCKER_OUTPUT = 'invalid_docker_output';
+
+/** Inspect mounts, never environment: unrelated containers may hold credentials. */
+async function assertNoWritableHostMounts(instance: QuietInstance, seams: QuiescenceSeams): Promise<void> {
+  const list = await quietDocker(instance, seams, ['ps', '--all', '--quiet', '--no-trunc']);
+  const ids = list.stdout.split(/\s+/u).filter(Boolean);
+  if (ids.length === 0) return;
+  const result = await quietDocker(instance, seams, [
+    'container',
+    'inspect',
+    '--format',
+    '{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"mounts":{{json .Mounts}},"configuredMounts":{{json (index .HostConfig "Mounts")}},"privileged":{{json (index .HostConfig "Privileged")}},"capabilities":{{json (index .HostConfig "CapAdd")}}}',
+    ...ids,
+  ]);
+  const records = result.stdout
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) =>
+      requireRecord(parseJson(line, 'Docker inspection', INVALID_DOCKER_OUTPUT), 'Container', INVALID_DOCKER_OUTPUT),
+    );
+  const inspected = new Set(records.map((record) => requireString(record.id, 'Container ID', INVALID_DOCKER_OUTPUT)));
+  if (records.length !== ids.length || inspected.size !== ids.length || ids.some((id) => !inspected.has(id))) {
+    throw new GwsEaError(
+      INVALID_DOCKER_OUTPUT,
+      'Docker did not inspect every listed container; host access is unknown',
+    );
+  }
+  const volumes = new Set<string>();
+  for (const record of records) {
+    const name = requireString(record.name, 'Container name', INVALID_DOCKER_OUTPUT).replace(/^\//u, '');
+    const status = requireString(record.status, 'Container status', INVALID_DOCKER_OUTPUT);
+    if (['created', 'exited', 'dead'].includes(status)) continue;
+    if (
+      !['running', 'paused', 'restarting', 'removing'].includes(status) ||
+      !Array.isArray(record.mounts) ||
+      (record.configuredMounts !== null && !Array.isArray(record.configuredMounts))
+    ) {
+      throw new GwsEaError(INVALID_DOCKER_OUTPUT, `Docker could not establish ${name}'s host access`);
+    }
+    // Mount-admin capabilities can make a read-only bind writable again.
+    if (
+      record.privileged !== false ||
+      (record.capabilities !== null &&
+        (!Array.isArray(record.capabilities) ||
+          record.capabilities.some(
+            (capability: unknown) =>
+              typeof capability !== 'string' ||
+              ['ALL', 'SYS_ADMIN', 'CAP_SYS_ADMIN'].includes(capability.toUpperCase()),
+          )))
+    ) {
+      throw notQuiet(
+        instance.instanceRoot,
+        `container ${name} (${record.id}) has privileged or unknown host access; stop it before retrying`,
+      );
+    }
+    const configuredMounts = (record.configuredMounts ?? []).map((value: unknown) =>
+      requireRecord(value, 'Configured mount', INVALID_DOCKER_OUTPUT),
+    );
+    // Present bind options expose Docker's old-client non-recursive default; absent options do not.
+    for (const configured of configuredMounts) {
+      if (configured.Type !== 'bind' || configured.BindOptions == null) continue;
+      const options = requireRecord(configured.BindOptions, 'Bind options', INVALID_DOCKER_OUTPUT);
+      if (options.ReadOnlyNonRecursive !== undefined && options.ReadOnlyNonRecursive !== false) {
+        throw notQuiet(
+          instance.instanceRoot,
+          `container ${name} (${record.id}) may have writable host submounts; stop it before retrying`,
+        );
+      }
+    }
+    for (const value of record.mounts) {
+      const mount = requireRecord(value, 'Container mount', INVALID_DOCKER_OUTPUT);
+      if (mount.Type === 'bind') {
+        if (
+          mount.RW === false &&
+          typeof mount.Destination === 'string' &&
+          configuredMounts.some(
+            (configured) =>
+              configured.Type === 'bind' &&
+              configured.Target === mount.Destination &&
+              configured.ReadOnly === true &&
+              isRecord(configured.BindOptions),
+          )
+        )
+          continue;
+        // Source paths can change after mounting, so even apparently unrelated binds must block.
+        throw notQuiet(
+          instance.instanceRoot,
+          `container ${name} (${record.id}) has a writable or unknown host bind; stop it before retrying`,
+        );
+      }
+      if (mount.Type === 'volume') {
+        const volume = requireString(mount.Name, 'Mount volume name', INVALID_DOCKER_OUTPUT);
+        if (!volumes.has(volume)) {
+          await assertDesktopVolume(instance, seams, volume);
+          volumes.add(volume);
+        }
+      } else if (mount.Type !== 'tmpfs' && mount.Type !== 'image') {
+        throw new GwsEaError(
+          INVALID_DOCKER_OUTPUT,
+          `Docker mount type for ${name} is unsupported; host access is unknown`,
+        );
+      }
+    }
+  }
+}
+
+/** Only ordinary local volumes are known to reside wholly inside the VM. */
+async function assertDesktopVolume(instance: QuietInstance, seams: QuiescenceSeams, name: string): Promise<void> {
+  const result = await quietDocker(instance, seams, [
+    'volume',
+    'inspect',
+    '--format',
+    '{"name":{{json .Name}},"driver":{{json .Driver}},"options":{{json .Options}}}',
+    name,
+  ]);
+  const volume = requireRecord(
+    parseJson(result.stdout, 'Docker volume inspection', INVALID_DOCKER_OUTPUT),
+    'Volume',
+    INVALID_DOCKER_OUTPUT,
+  );
+  if (
+    volume.name === name &&
+    volume.driver === 'local' &&
+    (volume.options === null || (isRecord(volume.options) && Object.keys(volume.options).length === 0))
+  )
+    return;
+  throw new GwsEaError(
+    INVALID_DOCKER_OUTPUT,
+    `Docker volume ${name} may access the host; stop its containers before retrying`,
+  );
+}
+
+/** Apple retains sharing handles after exit; verify its VM and exclude host writers first. */
+async function activeFileHolders(
+  instance: QuietInstance,
+  holders: readonly OpenFileHolder[],
+  seams: QuiescenceSeams,
+): Promise<readonly OpenFileHolder[]> {
+  if (
+    (seams.platform ?? process.platform) !== 'darwin' ||
+    holders.length === 0 ||
+    holders.some((holder) => !holder.command.startsWith('com.apple.Virtualization.'))
+  )
+    return holders;
+  const result = await quietDocker(instance, seams, [
+    'info',
+    '--format',
+    '{"os":{{json .OperatingSystem}},"labels":{{json .Labels}},"kernel":{{json .KernelVersion}},"version":{{json .ServerVersion}}}',
+  ]);
+  const info = requireRecord(
+    parseJson(result.stdout, 'Docker runtime', INVALID_DOCKER_OUTPUT),
+    'Docker runtime',
+    INVALID_DOCKER_OUTPUT,
+  );
+  if (info.os !== 'Docker Desktop') return holders;
+  // Recursive read-only defaults require Docker >=25 and Linux >=5.12.
+  const version = typeof info.version === 'string' ? /^(\d+)\./u.exec(info.version) : null;
+  const kernel = typeof info.kernel === 'string' ? /^(\d+)\.(\d+)\./u.exec(info.kernel) : null;
+  if (
+    !version ||
+    Number(version[1]) < 25 ||
+    !kernel ||
+    !(Number(kernel[1]) > 5 || (Number(kernel[1]) === 5 && Number(kernel[2]) >= 12))
+  )
+    return holders;
+  if (!Array.isArray(info.labels) || !info.labels.every((label): label is string => typeof label === 'string')) {
+    throw new GwsEaError(INVALID_DOCKER_OUTPUT, 'Docker Desktop did not report its runtime address');
+  }
+  const addresses = info.labels.filter((label) => label.startsWith('com.docker.desktop.address='));
+  const socket =
+    addresses.length === 1 ? unixSocketPath(addresses[0]!.slice('com.docker.desktop.address='.length)) : undefined;
+  if (socket === undefined || path.basename(socket) !== 'docker-cli.sock') return holders;
+  const disk = path.join(path.dirname(socket), 'vms', '0', 'data', 'Docker.raw');
+  const verified = new Set<number>();
+  for (const pid of new Set(holders.map((holder) => holder.pid))) {
+    const command = await (seams.runCommand ?? runSanitizedCommand)({
+      command: 'ps',
+      args: ['-p', String(pid), '-o', 'comm='],
+      cwd: instance.homeDirectory,
+      env: toolEnvironment(seams),
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (command.stdout.trim() !== APPLE_VM) continue;
+    const files = (await lsofOutput(['-a', '-p', String(pid), disk], instance.homeDirectory, seams)).split('\n');
+    if (files.includes(`p${pid}`) && files.includes(`n${disk}`)) verified.add(pid);
+  }
+  if (verified.size === 0) return holders;
+  await assertNoWritableHostMounts(instance, seams);
+  return holders.filter((holder) => !verified.has(holder.pid));
+}
+
+function summarizeHolders(holders: readonly OpenFileHolder[]): string {
+  const processes = new Map<number, { command: string; files: Set<string> }>();
+  for (const holder of holders) {
+    const process = processes.get(holder.pid) ?? { command: holder.command, files: new Set<string>() };
+    process.files.add(holder.file);
+    processes.set(holder.pid, process);
+  }
+  return [...processes]
+    .map(([pid, { command, files }]) => {
+      const paths = [...files];
+      const detail =
+        paths.length === 1
+          ? paths[0]
+          : `${paths.length} paths (${paths.slice(0, 3).join(', ')}${paths.length > 3 ? ', ...' : ''})`;
+      return `${command} (PID ${pid}) holds ${detail}`;
+    })
+    .join('; ');
+}
+
 /**
  * Prove a stopped assistant quiet (KTD1): no process runs from its instance
  * root, no container carries its install's label in any state (those the
  * drain stopped get a moment to be removed), and no process holds anything
- * under its `state/` open, a database's `-wal`, `-shm`, and `-journal` side
- * files included. Refuses, naming what it found, before anything is copied
- * or moved.
+ * under its `state/` open, a database's side files included. Retained Apple
+ * VM handles are discounted only for the verified Docker Desktop runtime
+ * without writable or unknown active host mounts. Refuses before copying or moving.
  */
 export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
   const root = instance.instanceRoot;
@@ -309,9 +526,11 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
   // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
-  const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];
+  const holders = (await exists(instance.state))
+    ? await activeFileHolders(instance, await openFileHolders(instance.state, seams), seams)
+    : [];
   if (holders.length > 0) {
-    throw notQuiet(root, holders.map(({ pid, command, file }) => `${command} (PID ${pid}) holds ${file}`).join('; '));
+    throw notQuiet(root, summarizeHolders(holders));
   }
 }
 
