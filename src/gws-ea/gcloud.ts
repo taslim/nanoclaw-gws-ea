@@ -1060,7 +1060,7 @@ function pubsubResource(
       // Created by an interrupted run but not yet listed: the next observation waits for it.
       if (!succeeded(created) && !alreadyExists(created)) {
         const within = initializing(created)
-          ? `: ${minutes(ORG_POLICY_SETTLES_MS)} on, its organization policy still allows Pub/Sub no region to store messages in (constraints/gcp.resourceLocations)`
+          ? ` after ${minutes(ORG_POLICY_SETTLES_MS)}: the project's organization policy (constraints/gcp.resourceLocations) allows Pub/Sub no region to store messages in`
           : '';
         throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}${within}`, created);
       }
