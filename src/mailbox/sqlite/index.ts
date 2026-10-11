@@ -55,6 +55,7 @@ import {
 import type {
   AgentMailbox,
   InboundMailbox,
+  InboundOrigin,
   MailboxHistoryMessage,
   MailboxSession,
   MailboxSessionKey,
@@ -226,6 +227,16 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .all() as WaitingMessage[]
       ).map((row) => ({ ...row, processAfter: sqliteTimestamp(row.processAfter) })),
     hasMessage: (messageId) => db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined,
+    getInboundMessages: (messageIds) =>
+      messageIds.length === 0
+        ? []
+        : (db
+            .prepare(
+              `SELECT id, kind, series_id AS seriesId, channel_type AS channelType, platform_id AS platformId,
+                      thread_id AS threadId, content
+                 FROM messages_in WHERE id IN (${messageIds.map(() => '?').join(', ')}) ORDER BY seq`,
+            )
+            .all(...messageIds) as InboundOrigin[]),
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
     getDeliveredIds: () => getDeliveredIds(db),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),

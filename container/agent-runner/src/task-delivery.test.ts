@@ -336,7 +336,14 @@ describe('a scheduled task in a conversation', () => {
     expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
       [
         'system',
-        { action: 'turn_failed', channelType: null, platformId: null, threadId: null, error: 'Incorrect API key' },
+        {
+          action: 'turn_failed',
+          channelType: null,
+          platformId: null,
+          threadId: null,
+          error: 'Incorrect API key',
+          batch: ['look-a1b2'],
+        },
       ],
     ]);
     expect(taskLogRows()).toEqual([]);

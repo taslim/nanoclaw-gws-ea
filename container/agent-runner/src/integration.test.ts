@@ -474,7 +474,7 @@ describe('poll loop — provider error recovery', () => {
 
     const out = getUndeliveredMessages();
     expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
-      ['system', { ...TURN_FAILED, error: 'API rate limit exceeded' }],
+      ['system', { ...TURN_FAILED, error: 'API rate limit exceeded', batch: ['m1'] }],
     ]);
 
     // Input message should be marked completed despite the error

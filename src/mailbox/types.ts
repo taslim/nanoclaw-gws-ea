@@ -52,6 +52,20 @@ export interface MessageRetry {
   threadId: string | null;
 }
 
+/**
+ * An inbound message as it arrived: its kind, the series a task belongs to,
+ * its conversation, and its content, which names its sender.
+ */
+export interface InboundOrigin {
+  id: string;
+  kind: string;
+  seriesId: string | null;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  content: string;
+}
+
 /** A pending inbound message that waits for its `process_after`. */
 export interface WaitingMessage {
   id: string;
@@ -125,6 +139,8 @@ export interface InboundMailbox {
   getWaitingMessages(): WaitingMessage[];
   /** Whether the mailbox holds a message with this id, whatever its status. */
   hasMessage(messageId: string): boolean;
+  /** The messages with these ids, whatever their status, in the order they arrived; an id it lacks is left out. */
+  getInboundMessages(messageIds: readonly string[]): InboundOrigin[];
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;

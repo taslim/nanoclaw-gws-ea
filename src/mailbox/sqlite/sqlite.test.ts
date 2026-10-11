@@ -248,4 +248,54 @@ describe('SQLite mailbox canonical serialization', () => {
     });
     expect(inbound.getWaitingMessages()).toEqual([{ id: 'held', tries: 0, processAfter: later }]);
   });
+
+  it('reads the inbound messages a failure names, whatever their status, in the order they arrived', async () => {
+    const inboundDb = new Database(':memory:');
+    databases.push(inboundDb);
+    inboundDb.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(inboundDb);
+    await inbound.insertMessage({
+      id: 'in-ask',
+      kind: 'chat-sdk',
+      timestamp: '2026-10-10T09:00:00.000Z',
+      platformId: 'gchat:spaces/dm',
+      channelType: 'gchat',
+      threadId: 'spaces/dm/threads/t1',
+      content: '{"senderId":"users/morgan","text":"Is Thursday still on?"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    await inbound.insertTask({
+      id: 'look-m-0123456789ab-c3d4',
+      seriesId: 'look-m-0123456789ab-c3d4',
+      processAfter: '2026-10-10T08:00:00.000Z',
+      recurrence: null,
+      content: '{"prompt":"Look at matter m-0123456789ab"}',
+    });
+    inbound.applyProcessingAcks([
+      { messageId: 'in-ask', status: 'completed', statusChanged: parseIsoTimestamp('2026-10-10T09:01:00.000Z') },
+    ]);
+
+    expect(inbound.getInboundMessages(['look-m-0123456789ab-c3d4', 'in-gone', 'in-ask'])).toEqual([
+      {
+        id: 'in-ask',
+        kind: 'chat-sdk',
+        seriesId: 'in-ask',
+        channelType: 'gchat',
+        platformId: 'gchat:spaces/dm',
+        threadId: 'spaces/dm/threads/t1',
+        content: '{"senderId":"users/morgan","text":"Is Thursday still on?"}',
+      },
+      {
+        id: 'look-m-0123456789ab-c3d4',
+        kind: 'task',
+        seriesId: 'look-m-0123456789ab-c3d4',
+        channelType: null,
+        platformId: null,
+        threadId: null,
+        content: '{"prompt":"Look at matter m-0123456789ab"}',
+      },
+    ]);
+    expect(inbound.getInboundMessages([])).toEqual([]);
+  });
 });

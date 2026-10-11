@@ -21,6 +21,7 @@ import {
   setCurrentReplyRoute,
 } from './db/session-state.js';
 import {
+  batchOf,
   formatMessages,
   extractRouting,
   categorizeMessage,
@@ -177,6 +178,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
+          batch: [msg.id],
         });
         commandIds.push(msg.id);
         continue;
@@ -192,6 +194,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: uploadTrace(config.providerName) }),
+          batch: [msg.id],
         });
         commandIds.push(msg.id);
         continue;
@@ -233,6 +236,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // The turn answers what the query reads: the commands were answered above,
+    // and a task its script gated never woke it.
+    const turnRouting: RoutingContext = { ...routing, batch: batchOf(keep) };
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, nativeSlashCommands, config.providerName);
@@ -252,7 +259,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // replies into the conversation being answered and stamp in_reply_to for
     // a2a return-path routing. Re-published at every turn boundary inside
     // processQuery as later messages are answered.
-    publishReplyRoute(routing);
+    publishReplyRoute(turnRouting);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -266,7 +273,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     try {
       const result = await processQuery(
         query,
-        routing,
+        turnRouting,
         processingIds,
         config.providerName,
         config.provider.onExchangeComplete?.bind(config.provider),
@@ -719,23 +726,29 @@ export async function processQuery(
       // Completed turns are no longer answering or queued. Preserve partial
       // output from unfinished turns and report that the run did not finish.
       // Retrying the same route or several queued turns in one thread needs
-      // only one report. The host picks an a2a reply's session by in_reply_to,
-      // so agent routes also compare it.
+      // only one report, naming every message those turns answered. The host
+      // picks an a2a reply's session by in_reply_to, so agent routes also
+      // compare it.
       const failedRoutes = [...(answering ? [routing] : []), ...queuedTurns.map((turn) => turn.routing)];
       const noticed: RoutingContext[] = [];
       for (const target of failedRoutes) {
         if (!sendsFailureNotice(target)) continue;
-        if (
-          noticed.some(
-            (prior) =>
-              prior.platformId === target.platformId &&
-              prior.channelType === target.channelType &&
-              prior.threadId === target.threadId &&
-              (target.channelType !== 'agent' || prior.inReplyTo === target.inReplyTo),
-          )
-        )
-          continue;
-        noticed.push(target);
+        const prior = noticed.findIndex(
+          (candidate) =>
+            candidate.platformId === target.platformId &&
+            candidate.channelType === target.channelType &&
+            candidate.threadId === target.threadId &&
+            (target.channelType !== 'agent' || candidate.inReplyTo === target.inReplyTo),
+        );
+        if (prior === -1) noticed.push(target);
+        else if (target.batch !== undefined) {
+          noticed[prior] = {
+            ...noticed[prior],
+            batch: [...new Set([...(noticed[prior].batch ?? []), ...target.batch])],
+          };
+        }
+      }
+      for (const target of noticed) {
         try {
           await reportTurnFailed(target, errMsg);
         } catch (reportError) {
@@ -802,9 +815,10 @@ function sendsFailureNotice(routing: RoutingContext): boolean {
 
 /**
  * Report a failed turn to the host as a typed `turn_failed` system action
- * carrying the turn's route, the provider's error, and the cause it
- * recognized. The host decides who hears about it and in what words, and
- * keeps the error in its log; nothing is written for the conversation itself.
+ * carrying the turn's route, the provider's error, the cause it recognized,
+ * and the batch it answered. The host decides who hears about it and in what
+ * words, and keeps the error in its log; nothing is written for the
+ * conversation itself.
  */
 async function reportTurnFailed(
   routing: RoutingContext,
@@ -822,6 +836,7 @@ async function reportTurnFailed(
       threadId: routing.threadId,
       ...(error ? { error } : {}),
       ...(failure ? { failure } : {}),
+      ...(routing.batch === undefined ? {} : { batch: routing.batch }),
     }),
   });
 }
@@ -1057,17 +1072,16 @@ function deliveredSince(afterSeq: number): boolean {
 /**
  * Does messages_out already hold a chat row with this exact destination and
  * body, written in the seq window (afterSeq, uptoSeq]? Used by the mid-turn
- * door's cross-segment echo guard. Content equality is exact: the door writes
- * `JSON.stringify({ text: body })` after the same trim/sanitize pipeline, so
- * a true door-written duplicate always matches; a body differing by even one
- * character is a different message and delivers.
+ * door's cross-segment echo guard. Text equality is exact: the door writes
+ * `{ text: body }` after the same trim/sanitize pipeline, beside only the
+ * batch the turn answers, so a true door-written duplicate always matches; a
+ * body differing by even one character is a different message and delivers.
  */
 function wasWrittenInSeqWindow(dest: DestinationEntry, body: string, afterSeq: number, uptoSeq: number): boolean {
   if (uptoSeq <= afterSeq) return false;
   try {
     const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
     const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-    const content = JSON.stringify({ text: body });
     return getUndeliveredMessages().some(
       (message) =>
         (message.seq ?? 0) > afterSeq &&
@@ -1075,7 +1089,7 @@ function wasWrittenInSeqWindow(dest: DestinationEntry, body: string, afterSeq: n
         message.kind === 'chat' &&
         message.platform_id === platformId &&
         message.channel_type === channelType &&
-        message.content === content,
+        isDoorText(message.content, body),
     );
   } catch (err) {
     // The guard is an anti-duplication refinement; if the lookup itself
@@ -1084,6 +1098,19 @@ function wasWrittenInSeqWindow(dest: DestinationEntry, body: string, afterSeq: n
     log(`Echo-guard lookup failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
+}
+
+/** Whether `content` is what the door writes for `body`: its words, with nothing beside them but the batch. */
+function isDoorText(content: string, body: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+  const fields = parsed as Record<string, unknown>;
+  return fields.text === body && Object.keys(fields).every((key) => key === 'text' || key === 'batch');
 }
 
 export async function dispatchResultText(
@@ -1274,10 +1301,11 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     channel_type: channelType,
     thread_id: destRouting?.threadId ?? null,
     content: JSON.stringify({ text: body }),
+    batch: routing.batch,
   });
 }
 
-/** Publish `routing` as the reply stamp the MCP tools read (null route clears it). */
+/** Publish `routing` as the reply stamp the MCP tools read, with its batch (null route clears it). */
 function publishReplyRoute(routing: RoutingContext): void {
   setCurrentReplyRoute(
     routing.inReplyTo
@@ -1286,6 +1314,7 @@ function publishReplyRoute(routing: RoutingContext): void {
           channelType: routing.channelType,
           platformId: routing.platformId,
           threadId: routing.threadId,
+          batch: routing.batch ?? [],
         }
       : null,
   );

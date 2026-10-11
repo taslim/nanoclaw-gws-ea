@@ -152,9 +152,9 @@ function queue(session: Session, row: { id: string; kind?: string; content: Reco
   db.close();
 }
 
-/** The runner's report that a turn failed, answering `route`. */
-function queueTurnFailed(session: Session, id: string, route: Route): void {
-  queue(session, { id, kind: 'system', content: { action: 'turn_failed', ...route }, route });
+/** The runner's report that a turn failed, answering `route` and naming the batch it answered. */
+function queueTurnFailed(session: Session, id: string, route: Route, batch: readonly string[]): void {
+  queue(session, { id, kind: 'system', content: { action: 'turn_failed', ...route, batch }, route });
 }
 
 async function drain(session: Session, times: number): Promise<void> {
@@ -172,23 +172,20 @@ async function forgetOutcome(session: Session, id: string, attempts: number): Pr
 }
 
 /** A message that arrived, which the dead container had claimed, on its last retry. */
-function seedClaimed(session: Session, id: string, seq: number, route: Route): void {
+function seedClaimed(
+  session: Session,
+  id: string,
+  seq: number,
+  route: Route,
+  content: Record<string, unknown> = { text: EMAIL_WORDS },
+): void {
   const inbound = new Database(inboundDbPath(session.agent_group_id, session.id));
   inbound
     .prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, platform_id, channel_type, thread_id, content)
        VALUES (?, ?, 'chat', ?, 'pending', ?, ?, ?, ?, ?)`,
     )
-    .run(
-      id,
-      seq,
-      now(),
-      MAX_TRIES,
-      route.platformId,
-      route.channelType,
-      route.threadId,
-      JSON.stringify({ text: EMAIL_WORDS }),
-    );
+    .run(id, seq, now(), MAX_TRIES, route.platformId, route.channelType, route.threadId, JSON.stringify(content));
   inbound.close();
   const outbound = new Database(outboundDbPath(session.agent_group_id, session.id));
   outbound
@@ -291,8 +288,8 @@ describe('an email external-email wrote that delivery gave up on', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    // Its words are all main reads: nothing typed rides beside them.
-    expect(Object.keys(fact).sort()).toEqual(['id', 'sender', 'senderId', 'text']);
+    // Its words are all main reads; beside them only the thread it names, for the host if main's turn fails.
+    expect(Object.keys(fact).sort()).toEqual(['id', 'pieces', 'sender', 'senderId', 'text']);
     expect(fact.text).toBe(
       `An email external-email wrote in the conversation with ${DANA} and ${NOEL} didn't go out, even after retrying. (thread ${key})`,
     );
@@ -363,7 +360,7 @@ describe('a failed turn in a thread', () => {
   it('tells main whose conversation may go unanswered and which thread, once, and wakes it; a replayed report adds nothing', async () => {
     const { key, session } = await emailThread();
     await arrive(session, 'in-email');
-    queueTurnFailed(session, 'turn-1', threadRoute(session));
+    queueTurnFailed(session, 'turn-1', threadRoute(session), ['in-email']);
 
     await drain(session, 1);
 
@@ -385,11 +382,11 @@ describe('a failed turn in a thread', () => {
   it('tells main again when its work fails on something new in the thread', async () => {
     const { session } = await emailThread();
     await arrive(session, 'in-first');
-    queueTurnFailed(session, 'turn-1', threadRoute(session));
+    queueTurnFailed(session, 'turn-1', threadRoute(session), ['in-first']);
     await drain(session, 1);
 
     await arrive(session, 'in-second');
-    queueTurnFailed(session, 'turn-2', threadRoute(session));
+    queueTurnFailed(session, 'turn-2', threadRoute(session), ['in-second']);
     await drain(session, 1);
 
     expect(facts()).toHaveLength(2);
@@ -404,7 +401,7 @@ describe('a failed turn in a thread', () => {
       links: [{ kind: 'thread', reference: key }],
     });
     await arrive(session, 'in-email');
-    queueTurnFailed(session, 'turn-1', threadRoute(session));
+    queueTurnFailed(session, 'turn-1', threadRoute(session), ['in-email']);
 
     await drain(session, 1);
 
@@ -421,7 +418,7 @@ describe('a failed turn in a thread', () => {
   it('names the thread by its key alone while nobody else is on it', async () => {
     const { key, session } = await emailThread([]);
     await arrive(session, 'in-email');
-    queueTurnFailed(session, 'turn-1', threadRoute(session));
+    queueTurnFailed(session, 'turn-1', threadRoute(session), ['in-email']);
 
     await drain(session, 1);
 
@@ -432,22 +429,30 @@ describe('a failed turn in a thread', () => {
 });
 
 describe('failures outside external-email’s threads', () => {
-  it('leaves main’s own conversations and another agent’s threads to their owners', async () => {
+  it('leaves the principal’s own messages in main’s conversations to them, and another agent’s threads to their owners', async () => {
     await ensurePrincipalConversation('ag-main');
     const { key } = await emailThread();
     const other = (await resolveSession('ag-other', 'mg-other', 'spaces/other/threads/t1', 'per-thread')).session;
+    const fromPat = { text: EMAIL_WORDS, sender: 'Pat', senderId: 'users/pat' };
     const failures: ReadonlyArray<{ readonly session: Session; readonly route: Route }> = [
-      // main's one session, in the principal's direct message and in one of their email threads.
+      // main's one session, in the principal's direct message and in their own email conversation.
       { session: main, route: { channelType: 'gchat', platformId: 'spaces/dm', threadId: null } },
       { session: main, route: { channelType: EMAIL_CHANNEL_TYPE, platformId: PRINCIPAL_PLATFORM_ID, threadId: key } },
       { session: other, route: { channelType: 'gchat', platformId: 'spaces/other', threadId: other.thread_id } },
     ];
 
     for (const [i, { session, route }] of failures.entries()) {
-      queue(session, { id: `out-${i}`, content: { text: EMAIL_WORDS }, route });
-      queueTurnFailed(session, `turn-${i}`, route);
+      await writeSessionMessage(session.agent_group_id, session.id, {
+        id: `asked-${i}`,
+        kind: 'chat',
+        timestamp: now(),
+        ...route,
+        content: JSON.stringify(fromPat),
+      });
+      queue(session, { id: `out-${i}`, content: { text: EMAIL_WORDS, batch: [`asked-${i}`] }, route });
+      queueTurnFailed(session, `turn-${i}`, route, [`asked-${i}`]);
       await drain(session, 3);
-      seedClaimed(session, `in-${i}`, 1_000 + 2 * i, route);
+      seedClaimed(session, `in-${i}`, 10_000 * (i + 1), route, fromPat);
       await reconcileSession(session.id);
     }
 

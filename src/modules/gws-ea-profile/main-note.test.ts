@@ -76,7 +76,7 @@ import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/no
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { addPrincipalAddress } from './db.js';
 import './index.js';
-import { resolveMainConversation, writeNoteForMain, type NotePiece } from './main-note.js';
+import { noteNames, resolveMainConversation, writeNoteForMain, type NotePiece } from './main-note.js';
 
 const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-main-note';
 const ZONE = 'America/New_York';
@@ -406,6 +406,49 @@ describe('what cannot be read', () => {
     const text = await onlyNote();
     expect(text).toBe(`Two changes.\n\n${await rendered(dinner)}`);
     expect(text).not.toContain(acme.id);
+  });
+});
+
+describe('a matter a note names by id, and what a note records for the host (KTD12)', () => {
+  it('carries the matter after its pieces’ own, and keeps both beside its words, for a failed turn to name again', async () => {
+    const acme = await open('Acme renewal', [thread(THREAD_JUNO)]);
+    const lunch = await open('Lunch with Remy Vance', [thread(THREAD_REMY)]);
+
+    await writeNoteForMain({
+      id: 'note-named',
+      timestamp: NOW,
+      text: 'Two things.',
+      wake: false,
+      pieces: [thread(THREAD_JUNO)],
+      matters: [lunch.id, acme.id],
+    });
+
+    expect(await onlyNote()).toBe(`Two things.\n\n${await rendered(acme)}\n\n${await rendered(lunch)}`);
+    const session = await mainSession();
+    const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    const row = db.prepare("SELECT content FROM messages_in WHERE id = 'note-named'").get() as { content: string };
+    db.close();
+    expect(noteNames(row.content)).toEqual({ pieces: [thread(THREAD_JUNO)], matters: [lunch.id, acme.id] });
+  });
+
+  it('reads a new piece back with who Google verified it came from', () => {
+    const invitation = { ...event(INVITATION), arrival: { from: JUNO, answers: ['<j1@acme.example>'] } };
+    const unverified = { ...thread(THREAD_REMY), arrival: { from: undefined } };
+
+    expect(noteNames(JSON.stringify({ text: 'New.', pieces: [invitation, unverified] }))).toEqual({
+      pieces: [invitation, unverified],
+      matters: [],
+    });
+  });
+
+  it('reads nothing from content that records nothing, or records it malformed', () => {
+    for (const content of [
+      JSON.stringify({ text: 'Morgan wrote this.', sender: 'Morgan Ellery', senderId: 'users/morgan' }),
+      JSON.stringify({ text: 'x', pieces: [{ kind: 'person', reference: 'p-1' }, { kind: 'thread' }], matters: [7] }),
+      'not json',
+    ]) {
+      expect(noteNames(content)).toEqual({ pieces: [], matters: [] });
+    }
   });
 });
 

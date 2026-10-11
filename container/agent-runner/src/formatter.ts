@@ -186,6 +186,17 @@ export interface RoutingContext {
    * with no sign that the agent is working on it (acknowledge.ts); absent is no.
    */
   personWaiting?: boolean;
+  /**
+   * The ids of the messages the turn answers, context that rode along
+   * included. Its failure report and each message it writes to a person name
+   * them, so the host can tell whose they were; absent is none.
+   */
+  batch?: readonly string[];
+}
+
+/** The messages a turn over `messages` answers: all but other conversations' echoes. */
+export function batchOf(messages: readonly MessageInRow[]): string[] {
+  return messages.filter((m) => !isSessionEcho(m)).map((m) => m.id);
 }
 
 /**
@@ -219,6 +230,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     // Accumulated trigger=0 context rides along but did not wake the turn.
     failureNoticeWake: waking.length > 0 && waking.every(isFailureNotice),
     personWaiting: waking.some((m) => m.kind === 'chat-sdk' && !showsWorkingIndicator(m.channel_type)),
+    batch: batchOf(messages),
   };
 }
 

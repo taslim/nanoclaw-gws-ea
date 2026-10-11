@@ -1046,8 +1046,8 @@ describe('tell_main with wake', () => {
     expect(typeof data(frame).message).toBe('string');
     const [note, ...others] = rows(main);
     expect(others).toEqual([]);
-    // Its words are all main reads: nothing typed rides beside them.
-    expect(Object.keys(note.content).sort()).toEqual(['sender', 'senderId', 'text']);
+    // Its words are all main reads; beside them only the thread it names, for the host if main's turn fails.
+    expect(Object.keys(note.content).sort()).toEqual(['pieces', 'sender', 'senderId', 'text']);
     expect(note.content.sender).toBe('system');
     const text = note.content.text ?? '';
     const opening = text.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT');

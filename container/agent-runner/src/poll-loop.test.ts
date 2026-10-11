@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting, isClearCommand, isRunnerCommand } from './formatter.js';
-import { dispatchResultText, processQuery } from './poll-loop.js';
+import { dispatchResultText, processQuery, runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import { seedSessionRouting } from './test-utils/session-routing.js';
@@ -581,31 +581,32 @@ describe('failed turns on agent and route-less wakes (never answer a notice with
     return out.map((m) => JSON.parse(m.content) as unknown);
   }
 
-  const failed = (channelType: string | null, platformId: string | null) => ({
+  const failed = (channelType: string | null, platformId: string | null, batch: readonly string[]) => ({
     action: 'turn_failed',
     channelType,
     platformId,
     threadId: null,
     error: 'Incorrect API key',
+    batch,
   });
 
   it("another agent's request that fails is reported on its route, and nothing is sent back to it", async () => {
     insertRow('a2a-1', { text: 'please summarize the report', sender: 'A' }, 'agent', 'ag-a');
     await failTurn();
-    expect(reports()).toEqual([failed('agent', 'ag-a')]);
+    expect(reports()).toEqual([failed('agent', 'ag-a', ['a2a-1'])]);
   });
 
   it('a self-addressed restart message that fails is reported once, and nothing loops back', async () => {
     const restart = { text: 'verify the new tool', sender: 'system', senderId: 'system' };
     insertRow('restart-1', restart, 'agent', 'ag-self', { onWake: 1 });
     await failTurn();
-    expect(reports()).toEqual([failed('agent', 'ag-self')]);
+    expect(reports()).toEqual([failed('agent', 'ag-self', ['restart-1'])]);
   });
 
   it('a turn woken by a message with no route (a reminder) is reported for the host to place', async () => {
     insertRow('reminder-1', { text: 'You set this reminder: follow up with Remy', sender: 'reminder' }, null, null);
     await failTurn();
-    expect(reports()).toEqual([failed(null, null)]);
+    expect(reports()).toEqual([failed(null, null, ['reminder-1'])]);
   });
 
   it('a batch mixing a failure notice with a real message is reported on the real route', async () => {
@@ -613,7 +614,7 @@ describe('failed turns on agent and route-less wakes (never answer a notice with
     insertRow('m2', { text: 'any update?', sender: 'Alice' }, 'discord', 'chan-1');
     await failTurn();
     // The requester's conversation is reported, not the agent whose notice came first.
-    expect(reports()).toEqual([failed('discord', 'chan-1')]);
+    expect(reports()).toEqual([failed('discord', 'chan-1', ['n1', 'm2'])]);
   });
 
   it.each([
@@ -875,5 +876,177 @@ describe('a conversation turn of only scheduled tasks', () => {
       (await dispatchResultText('<message to="main">The venue is booked.</message>', routing, missed)).hasUnwrapped,
     ).toBe(true);
     expect((await dispatchResultText('Nothing needs saying today.', routing, missed)).hasUnwrapped).toBe(false);
+  });
+});
+
+/**
+ * A turn names the messages it answers (KTD12): its failure report carries
+ * them, and so does every message it writes to a person, by the poll loop or
+ * by a tool, so the host can tell whether a failure is the principal's to
+ * hear of.
+ */
+describe('the batch a turn answers', () => {
+  const DM = { channelType: 'gchat', platformId: 'spaces/dm' } as const;
+
+  beforeEach(() => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('dm', 'Morgan Ellery', 'channel', 'gchat', 'spaces/dm', NULL)`,
+      )
+      .run();
+  });
+
+  function arrive(
+    id: string,
+    content: object,
+    route: { channelType: string | null; platformId: string | null } = DM,
+    trigger: 0 | 1 = 1,
+  ): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, trigger, content)
+         VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?)`,
+      )
+      .run(id, route.platformId, route.channelType, trigger, JSON.stringify(content));
+  }
+
+  const note = (text: string) => ({ text, sender: 'system', senderId: 'system' });
+  const fromMorgan = (text: string) => ({ text, sender: 'Morgan Ellery', senderId: 'users/morgan' });
+
+  /** Each row the runner wrote, as the host reads it. */
+  function written(): Array<[string, unknown]> {
+    return getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content) as unknown]);
+  }
+
+  async function waitFor(test: () => boolean): Promise<void> {
+    const until = Date.now() + 3000;
+    while (!test()) {
+      if (Date.now() > until) throw new Error('waitFor timeout');
+      await Bun.sleep(10);
+    }
+  }
+
+  it('is every message the turn reads, context included and other conversations’ echoes left out', () => {
+    arrive('n-cal', note('Juno Hale accepted Thursday’s review.'), DM, 0);
+    arrive(
+      'echo-1',
+      { text: 'from the team room', echo: { label: '#team' } },
+      { channelType: 'session-echo', platformId: null },
+      0,
+    );
+    arrive('m-ask', fromMorgan('Is Thursday still on?'));
+
+    expect([...(extractRouting(getPendingMessages()).batch ?? [])].sort()).toEqual(['m-ask', 'n-cal']);
+  });
+
+  it('is named on what the turn writes and on its failure report', async () => {
+    arrive('n-cal', note('Juno Hale accepted Thursday’s review.'));
+    arrive('m-ask', fromMorgan('Is Thursday still on?'));
+    const { query } = makeResultQuery({
+      type: 'result',
+      text: '<message to="dm">Yes, and Juno accepted.</message>',
+      isError: true,
+      error: 'overloaded',
+    });
+
+    await processQuery(query, extractRouting(getPendingMessages()), [], 'mock', undefined, 'prompt', undefined);
+
+    expect(written()).toEqual([
+      ['chat', { text: 'Yes, and Juno accepted.', batch: ['n-cal', 'm-ask'] }],
+      ['system', { action: 'turn_failed', ...DM, threadId: null, error: 'overloaded', batch: ['n-cal', 'm-ask'] }],
+    ]);
+  });
+
+  it('follows each turn of an open query to a tool’s sends, and reports queued turns that fail together once with all of theirs', async () => {
+    const { sendMessage } = await import('./mcp-tools/core.js');
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (prompt) => {
+        pushed.push(prompt);
+      },
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+          // Morgan writes while the opening turn is still answering.
+          arrive('m-ask', fromMorgan('And Friday?'));
+          await waitFor(() => pushed.length === 1);
+          yield { type: 'result', text: '<message to="dm">Thursday is on.</message>' };
+          // Morgan's turn now: a tool sends from it, and a host note queues behind it.
+          await sendMessage.handler({ to: 'dm', text: 'Checking Friday.' });
+          arrive('n-share', note('Remy Vance shared the deck.'));
+          await waitFor(() => pushed.length === 2);
+          throw new Error('stream closed');
+        },
+      },
+    };
+    const opening = { ...DM, threadId: null, inReplyTo: 'n-cal', taskRun: false, batch: ['n-cal'] };
+
+    await expect(processQuery(query, opening, ['n-cal'], 'mock', undefined, 'opening', undefined)).rejects.toThrow(
+      'stream closed',
+    );
+
+    expect(written()).toEqual([
+      ['chat', { text: 'Thursday is on.', batch: ['n-cal'] }],
+      ['chat', { text: 'Checking Friday.', batch: ['m-ask'] }],
+      ['system', { action: 'turn_failed', ...DM, threadId: null, error: 'stream closed', batch: ['m-ask', 'n-share'] }],
+    ]);
+  });
+
+  it('names the command a reply answers, and leaves the command out of the turn after it', async () => {
+    arrive('m-clear', fromMorgan('/clear'));
+    arrive('n-cal', note('Juno Hale accepted Thursday’s review.'));
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider: new MockProvider({}, () => '<message to="dm">Noted.</message>'),
+      providerContract: { textDelivery: 'mid-turn-complete', commands: { formatting: 'xml' } },
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+
+    await waitFor(() => getUndeliveredMessages().length === 2);
+    controller.abort();
+    await loop.catch(() => {});
+
+    expect(written()).toEqual([
+      ['chat', { text: 'Session cleared.', batch: ['m-clear'] }],
+      ['chat', { text: 'Noted.', batch: ['n-cal'] }],
+    ]);
+  });
+
+  it('leaves a later segment re-emitting a block the turn already sent recognized as a repeat', async () => {
+    const block = '<message to="dm">Thursday is on.</message>';
+    const query: AgentQuery = {
+      push() {},
+      end() {},
+      abort() {},
+      events: (async function* (): AsyncGenerator<ProviderEvent> {
+        yield { type: 'text', text: block };
+        yield { type: 'text', text: block };
+        yield { type: 'result', text: block };
+      })(),
+    };
+    const routing = { ...DM, threadId: null, inReplyTo: 'm-ask', taskRun: false, batch: ['m-ask'] };
+
+    await processQuery(query, routing, ['m-ask'], 'mock', undefined, 'prompt', undefined, true);
+
+    expect(written()).toEqual([['chat', { text: 'Thursday is on.', batch: ['m-ask'] }]]);
+  });
+
+  it('is never written onto a message to another agent, which reads its content as sent', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('worker', 'Worker', 'agent', NULL, NULL, 'ag-worker')`,
+      )
+      .run();
+    const { query } = makeResultQuery({ type: 'result', text: '<message to="worker">Summarize the deck.</message>' });
+    const routing = { ...DM, threadId: null, inReplyTo: 'm-ask', taskRun: false, batch: ['m-ask'] };
+
+    await processQuery(query, routing, [], 'mock', undefined, 'prompt', undefined);
+
+    expect(written()).toEqual([['chat', { text: 'Summarize the deck.' }]]);
   });
 });

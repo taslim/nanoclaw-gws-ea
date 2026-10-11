@@ -436,6 +436,48 @@ describe('recorded divergence: delivery consults outbound guards, and the runner
     // external-email is the counterpart's email thread (#3908, #3994).
     expect(pollLoop).not.toContain('deliverErrorResult');
     expect(pollLoop).not.toContain('FAILURE_NOTICE_FIELD');
+    // GWS-EA: the report, and each message the turn writes to a person, name the batch it answered (Slice 5 KTD12).
+    expect(pollLoop).toContain('...(routing.batch === undefined ? {} : { batch: routing.batch })');
+    const messagesOut = await readFile(path.join(originalCwd, 'container/agent-runner/src/db/messages-out.ts'), 'utf8');
+    expect(messagesOut).toContain('mergeEntries(msg.content, { batch })');
+  });
+});
+
+describe('recorded divergence: a module can read the inbound messages a failure names', () => {
+  it('reads each named message, whatever its status, with its kind, series, route and content', async () => {
+    const { INBOUND_SCHEMA } = await import('../mailbox/sqlite/schema.js');
+    const { wrapSqliteInbound } = await import('../mailbox/sqlite/index.js');
+    const db = new Database(':memory:');
+    cleanups.push(async () => {
+      db.close();
+    });
+    db.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(db);
+    const content = '{"senderId":"users/morgan","text":"Is Thursday still on?"}';
+    await inbound.insertMessage({
+      id: 'in-1',
+      kind: 'chat-sdk',
+      timestamp: '2026-10-10T09:00:00.000Z',
+      platformId: 'gchat:spaces/dm',
+      channelType: 'gchat',
+      threadId: null,
+      content,
+      processAfter: null,
+      recurrence: null,
+    });
+    inbound.markMessageFailed('in-1');
+
+    expect(inbound.getInboundMessages(['in-1', 'in-gone'])).toEqual([
+      {
+        id: 'in-1',
+        kind: 'chat-sdk',
+        seriesId: 'in-1',
+        channelType: 'gchat',
+        platformId: 'gchat:spaces/dm',
+        threadId: null,
+        content,
+      },
+    ]);
   });
 });
 

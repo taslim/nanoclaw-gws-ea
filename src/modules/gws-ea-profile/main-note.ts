@@ -6,10 +6,15 @@
  *
  * A note names the pieces of work it is about (KTD11). Each open matter they
  * sit in comes with it, rendered live once however many of its pieces the
- * note names, and stamped with when its links were read. A new piece in no
- * open matter (an invitation, a share or a comment) brings instead the open
- * matters it may belong to (KTD10). Both are best effort: what cannot be
- * read is left out, and the note is written all the same.
+ * note names, and stamped with when its links were read, and so does each
+ * matter it names by id. A new piece in no open matter (an invitation, a
+ * share or a comment) brings instead the open matters it may belong to
+ * (KTD10). Both are best effort: what cannot be read is left out, and the
+ * note is written all the same.
+ *
+ * The note keeps the pieces and matters it names beside its words, for the
+ * host alone: main reads only the words. A turn that fails reading the note
+ * names them again (`noteNames`, KTD12).
  *
  * Importing it loads no module entry point but the shared Google helpers'
  * (gws-ea-google), which load before every module that writes a note, so it
@@ -26,7 +31,13 @@ import { requestWake } from '../../request-wake.js';
 import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, Session } from '../../types.js';
 import { candidatesFor, renderCandidates, type NewPiece } from '../gws-ea-matters/candidates.js';
-import { canonicalReference, getMatter, listOpenMatterLinks, type PieceKind } from '../gws-ea-matters/db.js';
+import {
+  canonicalReference,
+  getMatter,
+  listOpenMatterLinks,
+  PIECE_KINDS,
+  type PieceKind,
+} from '../gws-ea-matters/db.js';
 import { renderMatter } from '../gws-ea-matters/render.js';
 import { getMainAgentGroupId, principalContact } from './db.js';
 
@@ -54,6 +65,14 @@ export interface NoteForMain {
   readonly files?: readonly OutboundFile[];
   /** The pieces it is about, whose open matters come with it. */
   readonly pieces?: readonly NotePiece[];
+  /** Matters it is about by id, each rendered with it as a piece's matter is. */
+  readonly matters?: readonly string[];
+}
+
+/** What a note records it is about. */
+export interface NoteNames {
+  readonly pieces: readonly NotePiece[];
+  readonly matters: readonly string[];
 }
 
 /** Nobody to write to: no main yet, or no principal direct message. */
@@ -140,12 +159,13 @@ async function suggestions(piece: NewPiece): Promise<string[]> {
 }
 
 /**
- * What a note's pieces bring with it: each open matter they sit in, rendered
- * live once, in the order the note first names it; then, for each new piece
- * in no open matter, the open matters it may belong to, when there are any.
+ * What a note brings with it: each open matter its pieces sit in, rendered
+ * live once, in the order the note first names it, and then each matter it
+ * names by id; then, for each new piece in no open matter, the open matters
+ * it may belong to, when there are any.
  */
-async function carried(pieces: readonly NotePiece[]): Promise<string[]> {
-  if (pieces.length === 0 || !(await getDb().hasTable('gws_ea_matter_links'))) return [];
+async function carried({ pieces, matters: named }: NoteNames): Promise<string[]> {
+  if ((pieces.length === 0 && named.length === 0) || !(await getDb().hasTable('gws_ea_matter_links'))) return [];
   const holders = new Map(
     (await listOpenMatterLinks()).map((link) => [`${link.kind}\u0000${link.reference}`, link.matter_id]),
   );
@@ -158,6 +178,7 @@ async function carried(pieces: readonly NotePiece[]): Promise<string[]> {
     if (matterId !== undefined) matterIds.add(matterId);
     else if (arrival !== undefined && !unplaced.has(key)) unplaced.set(key, { kind, reference, ...arrival });
   }
+  for (const id of named) matterIds.add(id);
   const [matters, suggested] = await Promise.all([
     Promise.all([...matterIds].map((id) => bestEffort(`matter ${id}`, () => matterView(id), []))),
     Promise.all(
@@ -169,11 +190,47 @@ async function carried(pieces: readonly NotePiece[]): Promise<string[]> {
   return [...matters.flat(), ...suggested.flat()];
 }
 
+/** The pieces and matters a note's content records beside its words; nothing from content that records none. */
+export function noteNames(content: string): NoteNames {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    if (error instanceof SyntaxError) return { pieces: [], matters: [] };
+    throw error;
+  }
+  const recorded = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  return {
+    pieces: Array.isArray(recorded.pieces) ? recorded.pieces.flatMap(notePieceOf) : [],
+    matters: Array.isArray(recorded.matters)
+      ? recorded.matters.filter((id: unknown): id is string => typeof id === 'string')
+      : [],
+  };
+}
+
+function isStrings(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry: unknown) => typeof entry === 'string');
+}
+
+/** A recorded piece, or nothing for one that is not a piece's shape. */
+function notePieceOf(value: unknown): NotePiece[] {
+  if (typeof value !== 'object' || value === null) return [];
+  const { kind, reference, arrival } = value as Record<string, unknown>;
+  const pieceKind = PIECE_KINDS.find((candidate) => candidate === kind);
+  if (pieceKind === undefined || typeof reference !== 'string') return [];
+  if (arrival === undefined) return [{ kind: pieceKind, reference }];
+  if (typeof arrival !== 'object' || arrival === null) return [];
+  const { from, answers } = arrival as Record<string, unknown>;
+  if ((from !== undefined && typeof from !== 'string') || (answers !== undefined && !isStrings(answers))) return [];
+  return [{ kind: pieceKind, reference, arrival: { from, ...(answers === undefined ? {} : { answers }) } }];
+}
+
 export async function writeNoteForMain(note: NoteForMain): Promise<NoteForMainResult> {
   const conversation = await resolveMainConversation();
   if (typeof conversation === 'string') return conversation;
   const { session, directMessage } = conversation;
-  const text = [note.text, ...(await bestEffort('its matters', () => carried(note.pieces ?? []), []))].join('\n\n');
+  const names: NoteNames = { pieces: note.pieces ?? [], matters: note.matters ?? [] };
+  const text = [note.text, ...(await bestEffort('its matters', () => carried(names), []))].join('\n\n');
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
       id: note.id,
@@ -182,7 +239,14 @@ export async function writeNoteForMain(note: NoteForMain): Promise<NoteForMainRe
       platformId: directMessage.platform_id,
       channelType: directMessage.channel_type,
       threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system', ...attachmentsOf(note.files) }),
+      content: JSON.stringify({
+        text,
+        sender: 'system',
+        senderId: 'system',
+        ...(names.pieces.length === 0 ? {} : { pieces: names.pieces }),
+        ...(names.matters.length === 0 ? {} : { matters: names.matters }),
+        ...attachmentsOf(note.files),
+      }),
       trigger: note.wake,
     });
   } catch (error) {
