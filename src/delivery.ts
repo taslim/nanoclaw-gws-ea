@@ -250,7 +250,6 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
       return platformMessageId;
     },
     ...(adapter.setTyping && { setTyping: adapter.setTyping.bind(adapter) }),
-    ...(adapter.endTyping && { endTyping: adapter.endTyping.bind(adapter) }),
   };
 }
 

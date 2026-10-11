@@ -1296,12 +1296,4 @@ describe('a send ends the working signal of every turn anchored in its conversat
       stopTypingRefresh('sess-host');
     }
   });
-
-  it('the guarded adapter hands the typing module’s ends through to the channel', async () => {
-    const ended = recordEnds();
-
-    await getDeliveryAdapter()!.endTyping!('telegram', 'telegram:123', null, ANCHOR, 'telegram');
-
-    expect(ended.map((end) => end.anchor)).toEqual([ANCHOR]);
-  });
 });
