@@ -5,7 +5,6 @@ import { getCurrentReplyRoute } from './db/session-state.js';
 import { processQuery } from './poll-loop.js';
 import type { RoutingContext } from './formatter.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
-import { seedSessionRouting } from './test-utils/session-routing.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -96,7 +95,6 @@ it('routes B then the retry of A in provider FIFO order, with matching exchange 
 });
 
 it('adopts task delivery and writes a task log when an empty warm query receives a task', async () => {
-  seedSessionRouting(null, null, 'system:tasks:check-a1b2');
   const pushed: string[] = [];
   const query: AgentQuery = {
     push: (p) => {

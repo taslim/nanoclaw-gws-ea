@@ -120,6 +120,8 @@ describe('tasks CLI resource', () => {
     expect(content).toMatchObject({ originSessionId: 'chat-1' });
     expect(content.prompt).toBe('send a briefing');
     expect(content.prompt).not.toContain('Task delivery contract');
+    // Byte for byte what an isolated task always stored: no in-conversation marker.
+    expect(row.content).toBe(JSON.stringify({ prompt: 'send a briefing', script: null, originSessionId: 'chat-1' }));
     systemDb.close();
   });
 
@@ -739,9 +741,12 @@ describe('tasks CLI resource', () => {
       expect(conversationTaskRows()).toEqual([
         expect.objectContaining({ id: created.series_id, series_id: created.series_id, status: 'pending' }),
       ]);
-      expect(JSON.parse(conversationTaskRows()[0].content)).toMatchObject({
+      // The marker, not the session it sits in, is what makes the runner answer it as a turn.
+      expect(JSON.parse(conversationTaskRows()[0].content)).toEqual({
         prompt: 'Ask Juno Hale whether the venue confirmed',
+        script: null,
         originSessionId: 'chat-1',
+        inConversation: true,
       });
     });
 
@@ -855,6 +860,8 @@ describe('tasks CLI resource', () => {
       const got = await call('tasks-get', { id: convId });
       expect(got.ok).toBe(true);
       if (got.ok) expect(got.data).toMatchObject({ session_id: 'chat-1', prompt: 'Ask Juno Hale and Remy Vance' });
+      // An update merges into the content, so the task still comes back as a turn.
+      expect(JSON.parse(conversationTaskRows()[0].content)).toMatchObject({ inConversation: true });
 
       expect((await call('tasks-pause', { id: convId })).ok).toBe(true);
       expect(conversationTaskRows()[0].status).toBe('paused');
@@ -866,7 +873,10 @@ describe('tasks CLI resource', () => {
       if (!run.ok) return;
       const runRow = conversationTaskRows().find((r) => r.id === (run.data as { row_id: string }).row_id);
       expect(runRow).toMatchObject({ series_id: convId, status: 'pending' });
-      expect(JSON.parse(runRow?.content ?? '{}').prompt).toBe('Ask Juno Hale and Remy Vance');
+      expect(JSON.parse(runRow?.content ?? '{}')).toMatchObject({
+        prompt: 'Ask Juno Hale and Remy Vance',
+        inConversation: true,
+      });
 
       expect((await call('tasks-cancel', { id: convId })).ok).toBe(true);
       const after = await call('tasks-list', {});
@@ -929,7 +939,11 @@ describe('tasks CLI resource', () => {
       const next = conversationTaskRows().filter((r) => r.status === 'pending');
       expect(next).toHaveLength(1);
       expect(next[0]).toMatchObject({ series_id: seriesId });
-      expect(JSON.parse(next[0].content).prompt).toBe('Prepare the morning for Morgan Ellery');
+      // The next occurrence comes back as a turn too.
+      expect(JSON.parse(next[0].content)).toMatchObject({
+        prompt: 'Prepare the morning for Morgan Ellery',
+        inConversation: true,
+      });
       expect((await getSessionsByAgentGroup('ag-1')).map((s) => s.id)).toEqual(['chat-1']);
     });
   });

@@ -661,7 +661,7 @@ describe('recorded divergence: a module can hold an inbound message until it rel
 });
 
 describe('recorded divergence: a scheduled task can come back as a turn of the conversation that created it', () => {
-  it('lands an --in-conversation task in the calling session, lists it, and refuses one from a task session', async () => {
+  it('lands an --in-conversation task in the calling session marked to come back, lists it, and refuses one from a task session', async () => {
     await freshInstall();
     const db = await import('../db/index.js');
     await db.runMigrations(await db.initTestDb());
@@ -681,12 +681,18 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
       created_at: now,
     });
     await import('../mailbox/compose.js');
-    const { initSessionFolder } = await import('../session-manager.js');
+    const { initSessionFolder, withExistingMailboxSession } = await import('../session-manager.js');
     initSessionFolder('ag-1', 'chat-1');
     await import('../cli/resources/tasks.js');
     const { dispatch } = await import('../cli/dispatch.js');
     const ctx = { caller: 'agent', agentGroupId: 'ag-1', sessionId: 'chat-1', messagingGroupId: 'mg-1' } as const;
     const args = { prompt: 'Check whether the venue confirmed', process_after: '2999-01-01T09:00:00Z' };
+    const storedContent = async (created: Awaited<ReturnType<typeof dispatch>>): Promise<unknown> => {
+      if (!created.ok) throw new Error(created.error.message);
+      const { session_id, series_id } = created.data as { session_id: string; series_id: string };
+      const task = await withExistingMailboxSession('ag-1', session_id, (mailbox) => mailbox.getTask(series_id));
+      return JSON.parse(task?.content ?? 'null');
+    };
 
     const conversation = await dispatch(
       { id: 'c', command: 'tasks-create', args: { ...args, in_conversation: true } },
@@ -699,6 +705,9 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
     ]);
 
     const isolated = await dispatch({ id: 'i', command: 'tasks-create', args }, ctx);
+    // The runner answers a task as a turn by this marker, never by the session it sits in.
+    expect(await storedContent(conversation)).toMatchObject({ inConversation: true });
+    expect(await storedContent(isolated)).not.toHaveProperty('inConversation');
     const taskSession = isolated.ok ? (isolated.data as { session_id: string }).session_id : '';
     const refused = await dispatch(
       { id: 'r', command: 'tasks-create', args: { ...args, in_conversation: true } },
@@ -708,13 +717,17 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
     if (!refused.ok) expect(refused.error.message).toContain('no conversation to come back to');
   });
 
-  it("runs a task in isolation only in a task session, keeps a quiet task's prose unsent, and escapes script output", async () => {
+  it("runs a task as a turn only when it is marked to come back, keeps a quiet task's prose unsent, and escapes script output", async () => {
     const runner = path.join(originalCwd, 'container/agent-runner/src');
     const formatter = await readFile(path.join(runner, 'formatter.ts'), 'utf8');
     const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
     const destinations = await readFile(path.join(runner, 'destinations.ts'), 'utf8');
 
-    expect(formatter).toContain('taskRun: tasksOnly && isTaskSession()');
+    // A v1-ported task shares a conversation's session unmarked, so the marker, not the session, decides.
+    expect(formatter).toContain("const IN_CONVERSATION_FIELD = 'inConversation';");
+    expect(formatter).toContain(
+      "taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),",
+    );
     expect(formatter).toContain('escapeXml(JSON.stringify(content.scriptOutput, null, 2))');
     expect(pollLoop).toContain('routing.tasksOnly === true ? blockUndelivered : !!scratchpad');
     expect(destinations).toContain('- `<task>` — a scheduled task you set to come back to this conversation');

@@ -56,21 +56,10 @@ export function resolveDestinationThread(
   return null;
 }
 
-const TASKS_THREAD = 'system:tasks';
-const TASK_THREAD_PREFIX = `${TASKS_THREAD}:`;
+const TASK_THREAD_PREFIX = 'system:tasks:';
 
 /** The task id encoded in this isolated task session's canonical thread id. */
 export function getTaskSeriesId(): string | null {
   const threadId = getSessionRouting().thread_id;
   return threadId?.startsWith(TASK_THREAD_PREFIX) ? threadId.slice(TASK_THREAD_PREFIX.length) : null;
-}
-
-/**
- * Whether this container serves a task session: a per-series one, or the
- * legacy shared one (the host's `isTaskThread`). Only there is a task an
- * isolated run; anywhere else a task comes back as a turn of the conversation.
- */
-export function isTaskSession(): boolean {
-  const threadId = getSessionRouting().thread_id;
-  return threadId === TASKS_THREAD || (threadId?.startsWith(TASK_THREAD_PREFIX) ?? false);
 }

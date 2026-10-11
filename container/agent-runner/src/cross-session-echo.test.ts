@@ -20,7 +20,6 @@ import {
   isRunnerCommand,
   isSessionEcho,
 } from './formatter.js';
-import { seedSessionRouting } from './test-utils/session-routing.js';
 import { TIMEZONE, formatLocalStamp } from './timezone.js';
 
 beforeEach(() => {
@@ -164,7 +163,6 @@ describe('routing (extractRouting)', () => {
   });
 
   it('taskRun stays true when echo rows ride along with a task', () => {
-    seedSessionRouting(null, null, 'system:tasks:daily-digest-a1b2');
     insertMessage('t1', 'task', { prompt: 'daily digest' }, { seq: 2 });
     insertEcho('e1', { seq: 4 });
     insertEcho('e2', { seq: 6 });

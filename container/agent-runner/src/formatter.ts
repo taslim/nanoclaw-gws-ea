@@ -1,7 +1,6 @@
 import { showsWorkingIndicator } from './acknowledge.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { isTaskSession } from './db/session-routing.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
 import './providers/index.js';
 import './provider-contracts/index.js';
@@ -29,6 +28,22 @@ export const FAILURE_NOTICE_FIELD = 'failureNotice';
 export function isFailureNotice(msg: MessageInRow): boolean {
   try {
     return JSON.parse(msg.content)?.[FAILURE_NOTICE_FIELD] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Content flag the host sets on a task created to come back as a turn of its
+ * conversation (`ncl tasks create --in-conversation`). Any other task is an
+ * isolated run wherever its row sits, a v1-ported one in a conversation's
+ * session included.
+ */
+const IN_CONVERSATION_FIELD = 'inConversation';
+
+function isConversationTask(msg: MessageInRow): boolean {
+  try {
+    return JSON.parse(msg.content)?.[IN_CONVERSATION_FIELD] === true;
   } catch {
     return false;
   }
@@ -169,15 +184,17 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
-  /** Batch is a task run in a task session. One-door delivery: only an
-   *  explicitly addressed tool delivers from a task session; final-text
+  /** Batch is a task run: every row is a scheduled task, unless each was
+   *  created to come back in its conversation. One-door delivery: only an
+   *  explicitly addressed tool delivers from a task run; final-text
    *  `<message to>` blocks are inert and the final text auto-appends to the
    *  series run log. */
   taskRun: boolean;
-  /** Every row in the batch is a scheduled task (echo rows aside). In a
-   *  conversation this is a turn like any other, except that its prose outside
-   *  a block is scratchpad, never nudged, so a task with nothing to say stays
-   *  quiet; absent is no. */
+  /** Every row in the batch is a scheduled task (echo rows aside). A task run,
+   *  unless each task was created to come back in its conversation: then it
+   *  is a turn like any other, except that its prose outside a block is
+   *  scratchpad, never nudged, so a task with nothing to say stays quiet;
+   *  absent is no. */
   tasksOnly?: boolean;
   /** Every non-echo row that woke this turn is a failure notice. */
   failureNoticeWake?: boolean;
@@ -223,9 +240,9 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
-    // Only a task session runs a task in isolation; in a conversation it is
-    // a turn of that conversation.
-    taskRun: tasksOnly && isTaskSession(),
+    // A task comes back as a turn only when it was created to, wherever its
+    // row sits; a batch mixing such tasks with others stays a run.
+    taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),
     tasksOnly,
     // Accumulated trigger=0 context rides along but did not wake the turn.
     failureNoticeWake: waking.length > 0 && waking.every(isFailureNotice),

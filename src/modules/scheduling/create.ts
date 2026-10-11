@@ -151,9 +151,8 @@ export async function createScheduledTask(
   options?: { status?: 'pending' | 'paused'; originSessionId?: string | null; session?: Session },
 ): Promise<{ session: { id: string; agent_group_id: string }; row: ScheduledTaskRow }> {
   const id = makeTaskId(task.name);
-  const session = options?.session
-    ? conversationFor(agentGroupId, options.session)
-    : (await resolveTaskSession(agentGroupId, id)).session;
+  const conversation = options?.session ? conversationFor(agentGroupId, options.session) : undefined;
+  const session = conversation ?? (await resolveTaskSession(agentGroupId, id)).session;
 
   const row = await withMailboxSession(agentGroupId, session.id, async (db) => {
     await db.insertTask({
@@ -165,6 +164,10 @@ export async function createScheduledTask(
         prompt: task.prompt,
         script: task.script,
         originSessionId: options?.originSessionId ?? null,
+        // The runner answers a task as a turn only when it carries this, not
+        // by the session it sits in: a task ported from v1 shares a
+        // conversation's session yet runs in isolation.
+        ...(conversation ? { inConversation: true } : {}),
       }),
       status: options?.status ?? 'pending',
     });

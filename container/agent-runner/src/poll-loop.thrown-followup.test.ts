@@ -7,7 +7,6 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
 import { runPollLoop } from './poll-loop.js';
 import type { AgentProvider, ProviderEvent, ProviderExchange } from './providers/types.js';
-import { seedSessionRouting } from './test-utils/session-routing.js';
 
 const CONTRACT = { textDelivery: 'mid-turn-complete', commands: { formatting: 'xml' } } as const;
 const DIAGNOSTIC = 'Private native provider diagnostic';
@@ -207,7 +206,6 @@ describe('provider throws with active or queued turns', () => {
   });
 
   it('does not turn a task-session throw into unsolicited chat', async () => {
-    seedSessionRouting(null, null, 'system:tasks:request-a');
     await runFailure(async function* () {
       throw new Error(DIAGNOSTIC);
     }, 'task');

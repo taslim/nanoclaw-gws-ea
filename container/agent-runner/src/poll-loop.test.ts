@@ -7,7 +7,6 @@ import { formatMessages, extractRouting, isClearCommand, isRunnerCommand } from 
 import { dispatchResultText, processQuery, runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
-import { seedSessionRouting } from './test-utils/session-routing.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -713,9 +712,6 @@ function taskLogRows(): Array<{ text: string }> {
 }
 
 describe('task-run turn wiring (real processQuery)', () => {
-  // The container serves the series' own task session.
-  beforeEach(() => seedSessionRouting(null, null, 'system:tasks:ser-1'));
-
   it('logs a failed task with inert message blocks once and does not retry delivery', async () => {
     const text = '<message to="main">Completed before failure.</message>\n\nBackend failed.';
     const { query, pushes } = makeResultQuery({ type: 'result', text, isError: true });
@@ -816,7 +812,7 @@ describe('task-run turn wiring (real processQuery)', () => {
 });
 
 describe('a conversation turn of only scheduled tasks', () => {
-  // No task-session thread is bound: the container serves a conversation.
+  // Each task was created to come back in this conversation, as the host marks it.
   beforeEach(() => {
     getInboundDb()
       .prepare(
@@ -827,7 +823,7 @@ describe('a conversation turn of only scheduled tasks', () => {
   });
 
   async function runTaskTurn(resultText: string): Promise<{ pushes: string[]; exchanges: ProviderExchange[] }> {
-    insertMessage('look-1', 'task', { prompt: 'Review the offsite plan' });
+    insertMessage('look-1', 'task', { prompt: 'Review the offsite plan', inConversation: true });
     const rows = getPendingMessages();
     const { query, pushes } = makeResultQuery({ type: 'result', text: resultText });
     const exchanges: ProviderExchange[] = [];
