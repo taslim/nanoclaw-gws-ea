@@ -13,16 +13,22 @@
  *    every reader of a series sees.
  * 4. Any other look task naming a matter is cancelled, so an open matter has
  *    one look and a closed one none.
+ * 5. Threads still waiting to be placed ride on main's next turn of any kind
+ *    (R27): one note that wakes nothing names them all, written once no
+ *    earlier note asking main to place them is still to be read.
  *
  * Steps 2 and 3 wait while any of main's containers runs, so they never race
  * a turn that is about to set the look itself.
  */
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isContainerRunning } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { listUnplacedThreads, recordPlacementNote } from '../gws-ea-inbox/thread-map.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { listOpenLookSlots, type LookSlot } from './db.js';
 import {
   findTasks,
@@ -35,7 +41,8 @@ import {
   stillToCome,
   type HeldTask,
 } from './looks.js';
-import { keepMorning } from './morning.js';
+import { keepMorning, unplacedThreadLine } from './morning.js';
+import { principalTimezone } from './render.js';
 
 /** How often the host makes its pass. */
 const PASS_MS = 60_000;
@@ -97,6 +104,44 @@ async function cancelStrayLooks(): Promise<void> {
   }
 }
 
+/**
+ * Step 5: one note, waking nothing, that names every thread waiting to be
+ * placed, unless each one's last note asking main to place it is still to
+ * be read in `conversation`. Its id comes from the threads and the notes
+ * before it, so a pass that wrote it and failed to record it writes no other.
+ */
+async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
+  const threads = await listUnplacedThreads();
+  if (threads.length === 0) return;
+  const asked = threads.flatMap((thread) => (thread.placementNote === null ? [] : [thread.placementNote]));
+  const unread = await withExistingMailboxSession(
+    conversation.agent_group_id,
+    conversation.id,
+    (mailbox) => new Set(asked.filter((id) => mailbox.getMessageForRetry(id, 'pending') !== undefined)),
+  );
+  if (threads.every((thread) => thread.placementNote !== null && unread?.has(thread.placementNote) === true)) return;
+  const id = `matters-unplaced-${createHash('sha256')
+    .update(threads.map((thread) => `${thread.threadKey}\u0000${thread.placementNote ?? ''}`).join('\u0000'))
+    .digest('hex')
+    .slice(0, 24)}`;
+  const timezone = await principalTimezone();
+  const written = await writeNoteForMain({
+    id,
+    timestamp: new Date().toISOString(),
+    wake: false,
+    text: [
+      'Email threads you have not placed are waiting on you, and external-email reads none of their mail until you place each one and hand it over:',
+      ...threads.map((thread) => unplacedThreadLine(thread, timezone)),
+    ].join('\n'),
+  });
+  if (written === 'written' || written === 'already-written') {
+    await recordPlacementNote(
+      threads.map((thread) => thread.threadKey),
+      id,
+    );
+  }
+}
+
 /** One pass of the host's guarantees. Nothing to keep until main and the principal's conversation exist. */
 export function keepMattersOnTime(): Promise<void> {
   return oneAtATime(async () => {
@@ -111,6 +156,7 @@ export function keepMattersOnTime(): Promise<void> {
       await bringFailedRepeatsForward(morning, slots);
     }
     await cancelStrayLooks();
+    await remindOfUnplacedThreads(conversation);
   });
 }
 

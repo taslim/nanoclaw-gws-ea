@@ -26,7 +26,14 @@
  *   the thread's bookings go: one of the principal's calendars the
  *   assistant can write to. Until `main` sets one, the thread books nothing
  *   (R11). A `matter`, one of main's open matters, is joined by the thread
- *   (Slice 5 KTD11). `main`'s words join the mail already waiting in the
+ *   (Slice 5 KTD11).
+ *   A thread is handed over only once main has placed it (Slice 5 R9,
+ *   KTD8): one main has not placed is refused, saying so, unless the handoff
+ *   names its matter, which places it there first. A thread main starts is
+ *   placed as it begins, in the matter named or nowhere. Handing a thread
+ *   over releases the mail held for it, and names external-email as working
+ *   it in its open matter, so its account shows there (Slice 5 R7). The mail
+ *   released and `main`'s words join the mail already waiting in the
  *   thread's session, or are due at once when none is (`pendingDeadline`).
  * - `tell_main` keeps `external-email`'s account of its thread on the
  *   thread, in place of the last (Slice 5 R7, KTD9): what it did, what it
@@ -69,7 +76,13 @@ import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-g
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { requestWake } from '../../request-wake.js';
-import { readOutboxFiles, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import {
+  readOutboxFiles,
+  resolveSession,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isBookableCalendar } from '../gws-ea-inbox/calendar-notifications.js';
@@ -81,15 +94,20 @@ import { assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gw
 import {
   createThread,
   getThread,
+  placeThread,
   recordThreadAddresses,
   recordThreadFile,
+  releaseThread,
   setThreadAccount,
+  THREAD_HANDLER,
   threadAddresses,
   threadMessages,
+  threadPlacement,
   type AddressSource,
   type ThreadAddress,
 } from '../gws-ea-inbox/thread-map.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { placeInMatter, setLinkHandler } from '../gws-ea-matters/db.js';
 import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { getThreadBookingCalendar, setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
@@ -370,6 +388,12 @@ async function admit(content: Record<string, unknown>, session: Session, request
   const target = await targetOf(content, context);
   const files = stagedFiles(session, requestId, names, 'Nothing was handed over');
   const matter = await requestedMatter(content.matter, session);
+  if (target.kind === 'thread' && matter === undefined && !(await isPlaced(target.threadKey))) {
+    throw forbidden(
+      `Nothing was handed over: thread ${target.threadKey} is not placed yet. Place it first with ncl matters place, ` +
+        'in an open matter, a new one or nowhere, or name its open matter here.',
+    );
+  }
   const fileTexts = files.flatMap((file) => [
     file.filename,
     ...(isUtf8(file.data) ? [file.data.toString('utf8')] : []),
@@ -381,21 +405,41 @@ async function admit(content: Record<string, unknown>, session: Session, request
   return { target, message, files, bookingCalendar, matter, context };
 }
 
-/** The thread's records: a new thread and the people main named, and the calendar it books on. */
+/** Whether main has placed the thread (Slice 5 KTD8): in an open matter, or nowhere. */
+async function isPlaced(threadKey: string): Promise<boolean> {
+  return (await threadPlacement(threadKey))?.placement !== 'unplaced';
+}
+
+/**
+ * The thread's records: a new thread, placed nowhere until it joins its
+ * matter, or an existing one placed in the matter named when main had not
+ * placed it; either handed over to external-email, which works it in its
+ * matter; the people main named; and the calendar it books on.
+ */
 async function recordHandoff(threadKey: string, handoff: Admitted, at: string): Promise<void> {
-  const { target, bookingCalendar } = handoff;
+  const { target, bookingCalendar, matter } = handoff;
+  const thread = { kind: 'thread', reference: threadKey } as const;
   const db = getDb();
   await db.transaction(async () => {
-    if (target.kind === 'new' && (await getThread(threadKey)) === undefined) await createThread(null, at, threadKey);
+    if (target.kind === 'new' && (await getThread(threadKey)) === undefined) {
+      await createThread(null, at, threadKey);
+      await placeThread(threadKey, 'nowhere');
+    }
+    if (target.kind === 'thread' && matter !== undefined && !(await isPlaced(threadKey))) {
+      await placeInMatter(matter, [thread]);
+    }
+    await releaseThread(threadKey);
+    await setLinkHandler(thread, THREAD_HANDLER);
     if (target.people.length > 0) await recordThreadAddresses(threadKey, target.people, 'main', at);
     if (bookingCalendar !== undefined) await setThreadBookingCalendar(threadKey, bookingCalendar);
   });
 }
 
 /**
- * main's words, and its files, in the thread's session: read with the mail
- * already waiting there, or now, which wakes the session. Each file is
- * recorded for the thread as core stages it, in the session's own inbox.
+ * main's words, and its files, in the thread's session, with the mail held
+ * there for main's handoff: read with the mail already waiting there, or
+ * now, which wakes the session. Each file is recorded for the thread as core
+ * stages it, in the session's own inbox.
  */
 async function writeHandoff(
   thread: Session,
@@ -429,6 +473,9 @@ async function writeHandoff(
     );
   }
   const processAfter = await pendingDeadline(thread);
+  await withExistingMailboxSession(thread.agent_group_id, thread.id, (mailbox) =>
+    mailbox.releaseHeldMessages(processAfter),
+  );
   try {
     await writeSessionMessage(thread.agent_group_id, thread.id, {
       id,
@@ -445,7 +492,7 @@ async function writeHandoff(
     // A replayed request: its handoff is already there.
     if (!isDuplicateNote(error)) throw error;
   }
-  // Mail already waiting wakes the session when it comes due; words due now wake it here.
+  // Mail already waiting wakes the session when it comes due; words and mail due now wake it here.
   if (processAfter === null) {
     const fresh = await getSession(thread.id);
     if (fresh) await requestWake(fresh, 'inbound-message');

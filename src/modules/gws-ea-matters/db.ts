@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import { hasControlCharacters, parseLine } from '../../gws-ea/validation.js';
-import { getThread } from '../gws-ea-inbox/thread-map.js';
+import { getThread, holdThread, placeThread, THREAD_HANDLER, threadPlacement } from '../gws-ea-inbox/thread-map.js';
 import { getPerson } from '../gws-ea-people/db.js';
 
 /** What a matter links to (R3), in the order a matter lists them. */
@@ -407,6 +407,15 @@ async function openHolder(
   );
 }
 
+/** The threads among a matter's links. */
+async function threadsOf(matterId: string): Promise<string[]> {
+  const rows = await getDb().all<{ readonly reference: string }>(
+    "SELECT reference FROM gws_ea_matter_links WHERE matter_id = ? AND kind = 'thread'",
+    matterId,
+  );
+  return rows.map((row) => row.reference);
+}
+
 /** Take a piece out of the open matter it sits in, inside the caller's transaction. */
 async function takeFromOpenMatter(
   link: LinkRef,
@@ -427,7 +436,8 @@ async function takeFromOpenMatter(
 /**
  * Link each of `links` to the open matter `matterId`, inside the caller's
  * transaction. A piece in another open matter moves here, with whoever
- * works it; one already here stays as it is.
+ * works it; one already here stays as it is. A thread is placed (Slice 5
+ * KTD8), and one main handed over is external-email's to work.
  */
 async function linkInto(
   matterId: string,
@@ -453,6 +463,10 @@ async function linkInto(
         handler = holder.handler;
         moved.push({ kind: link.kind, reference: link.reference, from: holder.matter_id });
       }
+    }
+    if (link.kind === 'thread') {
+      handler ??= (await threadPlacement(link.reference))?.released === true ? THREAD_HANDLER : null;
+      await placeThread(link.reference, 'matter');
     }
     await db.run(
       `INSERT INTO gws_ea_matter_links (matter_id, kind, reference, handler, matter_open, linked_at)
@@ -579,6 +593,7 @@ export async function placeNowhere(links: readonly LinkRef[]): Promise<PlacedNow
     for (const piece of pieces) {
       await assertResolvable(piece);
       const holder = await takeFromOpenMatter(piece, now);
+      if (piece.kind === 'thread') await placeThread(piece.reference, 'nowhere');
       placed.push({ ...piece, from: holder?.matter_id ?? null });
     }
     return placed;
@@ -644,12 +659,15 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
         link.reference,
       );
       if (removed.changes === 0) throw new Error(`${id} does not link ${link.kind} ${link.reference}`);
+      // Taken out of its open matter, a thread is in none, as placing it nowhere leaves it.
+      if (open && link.kind === 'thread') await placeThread(link.reference, 'nowhere');
       changed = true;
     }
     if (reopening) {
       await assertReopenable(id);
       await db.run('UPDATE gws_ea_matters SET closed_at = NULL, outcome = NULL WHERE id = ?', id);
       await db.run('UPDATE gws_ea_matter_links SET matter_open = 1 WHERE matter_id = ?', id);
+      for (const threadKey of await threadsOf(id)) await placeThread(threadKey, 'matter');
     }
     for (const [column, value] of [
       ['title', title],
@@ -668,6 +686,8 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
 /**
  * Close a matter with its outcome in a line (R5). It stays readable with its
  * links. A project closes only once none of its strands is open (KTD13).
+ * Its threads are main's to place again: new mail on one waits, held, until
+ * main does (Slice 5 R27, KTD8).
  */
 export async function closeMatter(input: CloseMatterInput): Promise<Matter> {
   const id = input.id.trim();
@@ -693,8 +713,23 @@ export async function closeMatter(input: CloseMatterInput): Promise<Matter> {
       id,
     );
     await db.run('UPDATE gws_ea_matter_links SET matter_open = 0 WHERE matter_id = ?', id);
+    for (const threadKey of await threadsOf(id)) await holdThread(threadKey);
   });
   return requireMatter(id);
+}
+
+/**
+ * Name `handler` as the one working a piece in the open matter it sits in
+ * (R7): what main handed over is the handler's to keep an account of.
+ * Nothing changes for a piece in no open matter.
+ */
+export async function setLinkHandler(link: LinkRef, handler: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_matter_links SET handler = ? WHERE kind = ? AND reference = ? AND matter_open = 1',
+    handler,
+    link.kind,
+    canonicalReference(link.kind, link.reference),
+  );
 }
 
 /**

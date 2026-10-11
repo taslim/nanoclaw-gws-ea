@@ -11,7 +11,8 @@
  *   look's does and always wakes main: whether the principal hears anything
  *   is main's judgment. The brief reads nothing live. Each look due at the
  *   morning comes in the same turn as a task of its own, read live by its
- *   own script, so the brief stays quick however many are due.
+ *   own script, so the brief stays quick however many are due. Each thread
+ *   still waiting to be placed comes back in it too (R27).
  */
 import { CronExpressionParser } from 'cron-parser';
 
@@ -20,6 +21,7 @@ import type { TaskRecord } from '../../mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
+import { listUnplacedThreads, type UnplacedThread } from '../gws-ea-inbox/thread-map.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { createScheduledTask, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
 import { listOpenLookSlots } from './db.js';
@@ -211,6 +213,19 @@ async function looksBefore(before: string): Promise<DueLook[]> {
   return due.sort((left, right) => Date.parse(left.at) - Date.parse(right.at) || left.title.localeCompare(right.title));
 }
 
+/**
+ * A thread waiting to be placed, as main reads it in the brief and in the
+ * host's reminder: its key, who its mail carried, when its latest came, and
+ * the Gmail thread to read it by.
+ */
+export function unplacedThreadLine(thread: UnplacedThread, timezone: string): string {
+  return [
+    `- ${thread.threadKey}: ${thread.people.join(', ')}`,
+    `latest mail ${formatLocalTime(thread.latestAt, timezone)}`,
+    ...(thread.gmailThreadId === null ? [] : [`Gmail thread ${thread.gmailThreadId}`]),
+  ].join('; ');
+}
+
 /** The start of tomorrow in `timezone`, ISO. */
 function endOfToday(timezone: string): string {
   return nextRun('0 0 * * *', timezone);
@@ -218,12 +233,14 @@ function endOfToday(timezone: string): string {
 
 /**
  * The morning's brief, from the host's own records alone: today's looks, by
- * time and title, and the matters the host handed back at the morning for
- * lack of a look (R14). It always wakes main.
+ * time and title, the matters the host handed back at the morning for lack
+ * of a look (R14), and the threads still waiting to be placed (R27). It
+ * always wakes main.
  */
 export async function morningBrief(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();
   const looks = await looksBefore(endOfToday(timezone));
+  const unplaced = await listUnplacedThreads();
   const sections: BriefSection[] = [
     {
       heading: 'Looks today',
@@ -234,6 +251,10 @@ export async function morningBrief(): Promise<ScriptVerdict> {
     {
       heading: 'Handed back without a next look',
       lines: looks.filter((look) => look.handedBack).map((look) => `- ${look.matterId}: ${look.title}`),
+    },
+    {
+      heading: 'Threads waiting to be placed',
+      lines: unplaced.map((thread) => unplacedThreadLine(thread, timezone)),
     },
   ];
   return { wakeAgent: true, data: sections.flatMap(sectionLines) };

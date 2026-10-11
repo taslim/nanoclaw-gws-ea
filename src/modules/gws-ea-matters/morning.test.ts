@@ -38,7 +38,7 @@ import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-inbox/index.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
-import { createThread } from '../gws-ea-inbox/thread-map.js';
+import { createThread, recordThreadAddresses, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
 import '../gws-ea-people/index.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import '../gws-ea-preferences/index.js';
@@ -212,6 +212,7 @@ describe('the morning', () => {
           `- ${standup.id}, Oct 12, 2026, 4:00 PM: Weekly step back on the office move`,
           'Handed back without a next look:',
           `- ${lease.id}: Lease`,
+          'Threads waiting to be placed: none.',
         ],
       },
     });
@@ -226,11 +227,49 @@ describe('the morning', () => {
     const brief = await run('matters-morning', { brief: true });
     expect(brief).toMatchObject({
       ok: true,
-      data: { wakeAgent: true, data: ['Looks today: none.', 'Handed back without a next look: none.'] },
+      data: {
+        wakeAgent: true,
+        data: ['Looks today: none.', 'Handed back without a next look: none.', 'Threads waiting to be placed: none.'],
+      },
     });
     expect(await runnerReads(printed(brief), scratch)).toEqual({
       wakeAgent: true,
-      data: ['Looks today: none.', 'Handed back without a next look: none.'],
+      data: ['Looks today: none.', 'Handed back without a next look: none.', 'Threads waiting to be placed: none.'],
     });
+  });
+
+  it('lists each thread waiting to be placed: who its mail carried, when the latest came, and its Gmail thread (R27)', async () => {
+    await recordThreadMessage(
+      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-1' },
+      '2026-10-12T08:15:00.000Z',
+    );
+    await recordThreadMessage(
+      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-2' },
+      '2026-10-12T09:30:00.000Z',
+    );
+    await recordThreadAddresses(THREAD, ['remy@acme.example', 'noel@acme.example'], 'message', MONDAY_6AM);
+    await recordThreadAddresses(THREAD, ['jane@partner.example'], 'written', MONDAY_6AM);
+    // A thread only the principal and the assistant are on waits for no placement.
+    await createThread('gmail-thread-b', MONDAY_6AM, 'mail-principal-only');
+    await recordThreadMessage(
+      { threadKey: 'mail-principal-only', side: 'principal', gmailMessageId: 'p-1' },
+      MONDAY_6AM,
+    );
+
+    const brief = await run('matters-morning', { brief: true });
+
+    expect(brief).toMatchObject({
+      ok: true,
+      data: {
+        wakeAgent: true,
+        data: [
+          'Looks today: none.',
+          'Handed back without a next look: none.',
+          'Threads waiting to be placed:',
+          `- ${THREAD}: noel@acme.example, remy@acme.example; latest mail Oct 12, 2026, 5:30 AM; Gmail thread gmail-thread-a`,
+        ],
+      },
+    });
+    expect(gmail.reads).toEqual([]);
   });
 });

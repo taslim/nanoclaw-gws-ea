@@ -18,11 +18,17 @@
  * neither holds new mail. Once the agent has a batch, the next row starts a
  * new wait. No other session is delayed: the principal's own email and every
  * note to `main` are worked as they come.
+ *
+ * Pace starts once `main` has handed the thread over (Slice 5 KTD8). Until
+ * then every row the router writes into the thread's session is held: no
+ * turn reads it and nothing waits on it or wakes for it. The handoff releases
+ * what is held to the thread's pending deadline, with main's words.
  */
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { isReminderId } from '../gws-ea-reminders/index.js';
 import { emailMessagingGroupIds } from './db.js';
+import { threadPlacement } from './thread-map.js';
 
 /** The shortest wait for an outside thread's first unanswered message. */
 const PACE_MIN_MS = 3 * 60_000;
@@ -33,6 +39,17 @@ const PACE_MAX_MS = 6 * 60_000;
 async function isOutsideThread(session: Session): Promise<boolean> {
   const { inbox } = await emailMessagingGroupIds();
   return inbox !== null && session.messaging_group_id === inbox && session.thread_id !== null;
+}
+
+/**
+ * Whether a row written now into `session` waits, held, for main: an
+ * outside thread's mail is read only once main has placed the thread and
+ * handed it over, however the thread began.
+ */
+export async function heldForMain(session: Session): Promise<boolean> {
+  const threadKey = session.thread_id;
+  if (threadKey === null || !(await isOutsideThread(session))) return false;
+  return (await threadPlacement(threadKey))?.released !== true;
 }
 
 /** The deadline pace set that is still ahead in the session, if any. */

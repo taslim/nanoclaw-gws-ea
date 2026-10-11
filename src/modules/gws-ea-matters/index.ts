@@ -230,7 +230,8 @@ registerResource({
       access: 'open',
       description:
         'Place pieces in an open matter, or nowhere when nothing about them needs keeping.\n\n' +
-        'A thread, event or file in another open matter moves here, and the answer names where it came from. To merge two matters, place one’s links in the other, then close it. With --nowhere, give threads, events or files and no matter: each leaves the open matter it was in, and no matter opens.',
+        'A thread, event or file in another open matter moves here, and the answer names where it came from. To merge two matters, place one’s links in the other, then close it. With --nowhere, give threads, events or files and no matter: each leaves the open matter it was in, and no matter opens. ' +
+        'A thread waits to be placed before you hand it over with email_handoff, and external-email reads none of its mail until you do.',
       args: [
         {
           name: 'id',
@@ -299,7 +300,7 @@ registerResource({
       access: 'open',
       description:
         'Close a matter with its outcome in a line, when nothing is left to come back to. Its next look ends.\n\n' +
-        'What lasts belongs in memory. A closed matter stays readable with `get`. A project closes after its strands.',
+        'What lasts belongs in memory. A closed matter stays readable with `get`. A project closes after its strands. New mail on its threads waits for you to place them again.',
       args: [ID_ARG, { name: 'outcome', type: 'string', required: true, description: 'How it ended: one line.' }],
       examples: ['ncl matters close m-1a2b3c4d5e6f --outcome "Signed on the 9th; terms in memory/clients/acme.md"'],
       handler: async (args, ctx) =>

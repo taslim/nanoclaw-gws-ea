@@ -16,6 +16,7 @@ import {
   insertMessage,
   migrateMessagesInTable,
   releaseHeldMessages,
+  settleHeldMessages,
   syncProcessingAcks,
 } from './session-db.js';
 
@@ -230,6 +231,23 @@ describe('held messages', () => {
 
     expect(() => releaseHeldMessages(db, '2026-10-12 09:00:00')).toThrow('invalid ISO-8601 UTC timestamp');
     expect(row(db, 'held-1').status).toBe('held');
+    db.close();
+  });
+
+  it('settles every held message unread, so no release brings it back, and says how many', () => {
+    const db = freshInbound();
+    write(db, 'held-1', { status: 'held' });
+    write(db, 'held-2', { status: 'held', trigger: false });
+    write(db, 'waiting');
+
+    expect(settleHeldMessages(db)).toBe(2);
+
+    expect(row(db, 'held-1')).toEqual({ status: 'completed', trigger: 1, process_after: null });
+    expect(row(db, 'held-2')).toEqual({ status: 'completed', trigger: 0, process_after: null });
+    expect(row(db, 'waiting')).toEqual({ status: 'pending', trigger: 1, process_after: null });
+    expect(releaseHeldMessages(db, null)).toBe(0);
+    expect(settleHeldMessages(db)).toBe(0);
+    expect(countDueMessages(db)).toBe(1);
     db.close();
   });
 });

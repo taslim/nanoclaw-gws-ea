@@ -113,6 +113,11 @@ export interface InboundMailbox {
    * `processAfter` (null: due now). Returns how many it released.
    */
   releaseHeldMessages(processAfter: string | null): number;
+  /**
+   * Settle every held message: each is completed unread, so no turn ever
+   * reads it and no later release brings it back. Returns how many it settled.
+   */
+  settleHeldMessages(): number;
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;

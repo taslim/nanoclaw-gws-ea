@@ -5,7 +5,7 @@ import '../gws-ea-profile/index.js';
 import '../gws-ea-people/index.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-inbox/index.js';
-import { createThread } from '../gws-ea-inbox/thread-map.js';
+import { createThread, releaseThread, threadPlacement } from '../gws-ea-inbox/thread-map.js';
 import {
   closeMatter,
   getMatter,
@@ -15,6 +15,7 @@ import {
   placeInMatter,
   placeNowhere,
   recordLookTask,
+  setLinkHandler,
   updateMatter,
   type LinkRef,
   type Matter,
@@ -346,6 +347,51 @@ describe('opening and placing', () => {
       /only a thread, event or file/i,
     );
     await expect(placeNowhere([])).rejects.toThrow(/at least one/i);
+  });
+});
+
+describe("each thread's placement (Slice 5 KTD8)", () => {
+  it('keeps a thread placed while an open matter holds it, nowhere once taken out or its matter closes, and holds its mail again once its matter closes', async () => {
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'unplaced', released: false });
+    const acme = await open('Acme renewal', [thread(THREAD_A)]);
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'matter', released: false });
+    // main hands it over, then moves it to another matter.
+    await releaseThread(THREAD_A);
+    const lisbon = await open('Lisbon offsite');
+    await placeInMatter(lisbon.id, [thread(THREAD_A)]);
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'matter', released: true });
+
+    await placeNowhere([thread(THREAD_A)]);
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'nowhere', released: true });
+    await placeInMatter(acme.id, [thread(THREAD_A)]);
+    await updateMatter({ id: acme.id, unlink: [thread(THREAD_A)] });
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'nowhere', released: true });
+
+    await placeInMatter(acme.id, [thread(THREAD_A)]);
+    await closeMatter({ id: acme.id, outcome: 'Signed.' });
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'nowhere', released: false });
+    await updateMatter({ id: acme.id, reopen: true });
+    expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'matter', released: false });
+    expect(await threadPlacement(THREAD_B)).toEqual({ placement: 'unplaced', released: false });
+  });
+
+  it('names external-email as working a thread main handed over as it joins a matter, and lets the bridge name it for one already there', async () => {
+    await placeNowhere([thread(THREAD_A)]);
+    await releaseThread(THREAD_A);
+    const acme = await open('Acme renewal', [thread(THREAD_A), thread(THREAD_B), person(juno)]);
+    expect((await getMatter(acme.id))?.links.map((link) => [link.reference, link.handler])).toEqual([
+      [THREAD_A, 'external-email'],
+      [THREAD_B, null],
+      [juno, null],
+    ]);
+
+    await setLinkHandler(thread(THREAD_B), 'external-email');
+    await setLinkHandler(thread('mail-in-no-matter'), 'external-email');
+    expect((await getMatter(acme.id))?.links.map((link) => link.handler)).toEqual([
+      'external-email',
+      'external-email',
+      null,
+    ]);
   });
 });
 

@@ -231,7 +231,8 @@ export type InboundDelay = string | typeof HOLD_UNTIL_RELEASED | null;
  * A module may instead answer HOLD_UNTIL_RELEASED, which wins over any time.
  * The message is written `held`: no turn reads it, no other session is given
  * a copy, and nothing wakes for it until a module releases the session's held
- * messages (the mailbox's `releaseHeldMessages`), which makes them due.
+ * messages (the mailbox's `releaseHeldMessages`), which makes them due, or
+ * settles them unread (`settleHeldMessages`).
  */
 export type InboundDelayFn = (event: InboundEvent, session: Session) => InboundDelay | Promise<InboundDelay>;
 

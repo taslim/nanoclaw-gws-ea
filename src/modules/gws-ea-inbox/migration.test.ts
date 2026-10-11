@@ -30,6 +30,7 @@ import {
   recordThreadFile,
   recordThreadMessage,
   threadAccount,
+  threadPlacement,
   type SendScope,
 } from './thread-map.js';
 
@@ -40,6 +41,7 @@ const RELATIVE_FILE_PATHS = 'module:gws-ea-inbox:relative-file-paths';
 const UNSIGNED_NOTICES = 'module:gws-ea-inbox:unsigned-notices';
 const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 const THREAD_ACCOUNTS = 'module:gws-ea-inbox:thread-accounts';
+const THREAD_PLACEMENT = 'module:gws-ea-inbox:thread-placement';
 
 /** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
 const INBOX_TABLES = [
@@ -196,7 +198,7 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's seven, in order, and the meetings store registers none", () => {
+  it("are the inbox's eight, in order, and the meetings store registers none", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
@@ -208,6 +210,7 @@ describe('the inbox migrations', () => {
       UNSIGNED_NOTICES,
       CALENDAR_ACCESS,
       THREAD_ACCOUNTS,
+      THREAD_PLACEMENT,
     ]);
   });
 
@@ -234,7 +237,7 @@ describe('squashed migrations', () => {
     expect(inboxTables(await install())).toEqual(ALL_INBOX_TABLES);
   });
 
-  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row, each thread with no account yet', async () => {
+  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row, each thread with no account yet and handed over', async () => {
     const db = await initSqliteTestDb();
     await runMigrations(db, earlierRelease());
     await writeSlice4Work();
@@ -249,6 +252,7 @@ describe('squashed migrations', () => {
       UNSIGNED_NOTICES,
       CALENDAR_ACCESS,
       THREAD_ACCOUNTS,
+      THREAD_PLACEMENT,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual({
@@ -257,6 +261,9 @@ describe('squashed migrations', () => {
         ...(thread as object),
         account: null,
         account_at: null,
+        placement: 'nowhere',
+        released: 1,
+        placement_note: null,
       })),
     });
     // A retry still finds its send in flight, and the thread still owns its booking.
@@ -325,5 +332,43 @@ describe('thread-accounts', () => {
       ).rejects.toThrow(/CHECK constraint failed/u);
     }
     expect(await threadAccount(THREAD)).toBeUndefined();
+  });
+});
+
+describe('thread-placement', () => {
+  it("hands over every thread an earlier release had, external-email's already, and holds each new one until main places it", async () => {
+    const db = await initSqliteTestDb();
+    await runMigrations(
+      db,
+      getRegisteredMigrations().filter((migration) => migration.name !== THREAD_PLACEMENT),
+    );
+    await createThread(GMAIL_THREAD, AT, THREAD);
+
+    await runMigrations(db);
+
+    expect(await threadPlacement(THREAD)).toEqual({ placement: 'nowhere', released: true });
+    await createThread('gt-new', AT, 'mail-new');
+    expect(await threadPlacement('mail-new')).toEqual({ placement: 'unplaced', released: false });
+  });
+
+  it('never holds a thread handed over before main placed it, nor a placement it does not know', async () => {
+    const db = await freshInstall();
+    await createThread(GMAIL_THREAD, AT, THREAD);
+
+    for (const [placement, released] of [
+      ['unplaced', 1],
+      ['somewhere', 0],
+    ] as const) {
+      await expect(
+        db.run(
+          'UPDATE gws_ea_threads SET placement = ?, released = ? WHERE thread_key = ?',
+          placement,
+          released,
+          THREAD,
+        ),
+        `${placement}, released ${released}`,
+      ).rejects.toThrow(/CHECK constraint failed/u);
+    }
+    expect(await threadPlacement(THREAD)).toEqual({ placement: 'unplaced', released: false });
   });
 });

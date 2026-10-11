@@ -27,6 +27,7 @@ import {
   releaseHeldMessages,
   replaceDestinations,
   retryWithBackoff,
+  settleHeldMessages,
   upsertSessionRouting,
 } from './session-db.js';
 import {
@@ -202,6 +203,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
     releaseHeldMessages: (processAfter) => releaseHeldMessages(db, processAfter),
+    settleHeldMessages: () => settleHeldMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
     getMessageForRetry: (messageId, status) => {

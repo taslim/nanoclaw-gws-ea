@@ -2,7 +2,9 @@
  * The bridge between main and external-email (KTD4; R65–R68, R74, R75;
  * AE64): `email_handoff`, main's work for one email thread, and `tell_main`,
  * external-email's account of its thread, which wakes main only when asked
- * to, with any files that came in it (Slice 6 R15; Slice 5 R7, KTD9).
+ * to, with any files that came in it (Slice 6 R15; Slice 5 R7, KTD9). A
+ * thread is handed over only once main has placed it, and the handoff
+ * releases the mail held for it (Slice 5 R9, KTD8).
  *
  * Drives the real delivery actions and their guards, the thread map, the
  * privacy check, human pace, the session DBs, and the matters renderer with
@@ -104,10 +106,11 @@ import {
   recordThreadMessage,
   threadAccount,
   threadAddresses,
+  threadPlacement,
 } from '../gws-ea-inbox/thread-map.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
 import { MAX_ATTACHMENT_BYTES } from '../gws-ea-inbox/route-mail.js';
-import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
+import { closeMatter, getMatter, openMatter, placeInMatter, placeNowhere } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { hostSources } from '../gws-ea-matters/live.js';
 import { principalTimezone, renderMatter } from '../gws-ea-matters/render.js';
@@ -195,6 +198,8 @@ function keyOf(frame: ResponseFrame): string {
 
 interface Row {
   readonly id: string;
+  readonly status: string;
+  readonly trigger: number;
   readonly platform_id: string | null;
   readonly channel_type: string | null;
   readonly thread_id: string | null;
@@ -207,7 +212,9 @@ function rows(session: Session): Row[] {
   if (!fs.existsSync(file)) return [];
   const db = new Database(file, { readonly: true });
   const found = db
-    .prepare('SELECT id, platform_id, channel_type, thread_id, process_after, content FROM messages_in ORDER BY seq')
+    .prepare(
+      'SELECT id, status, trigger, platform_id, channel_type, thread_id, process_after, content FROM messages_in ORDER BY seq',
+    )
     .all() as Array<Omit<Row, 'content'> & { content: string }>;
   db.close();
   return found.map((row) => ({ ...row, content: JSON.parse(row.content) as Row['content'] }));
@@ -248,13 +255,46 @@ async function externalEmailSessions(): Promise<number> {
   );
 }
 
-/** A thread that began with an outsider's email, and the session the router opened for it. */
-async function inboundThread(gmailThreadId: string, from: string): Promise<{ key: string; session: Session }> {
+/**
+ * A thread that began with an outsider's email, and the session the router
+ * opened for it: placed nowhere by main unless `placed` says it is not yet.
+ */
+async function inboundThread(
+  gmailThreadId: string,
+  from: string,
+  placed: 'nowhere' | 'unplaced' = 'nowhere',
+): Promise<{ key: string; session: Session }> {
   const { threadKey } = await createThread(gmailThreadId, now());
   await recordThreadMessage({ threadKey, side: 'outside', gmailMessageId: `${gmailThreadId}-1` }, now());
   await recordThreadAddresses(threadKey, [from], 'message', now());
+  if (placed === 'nowhere') await placeNowhere([{ kind: 'thread', reference: threadKey }]);
   const { session } = await resolveSession('ag-external', inbox, threadKey, 'per-thread');
   return { key: threadKey, session };
+}
+
+/** An email the router held in the thread's session until main hands the thread over. */
+async function heldMail(session: Session, threadKey: string, id: string, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
+    id,
+    kind: 'chat',
+    timestamp: now(),
+    platformId: INBOX_PLATFORM_ID,
+    channelType: 'email',
+    threadId: threadKey,
+    content: JSON.stringify({ text }),
+    trigger: true,
+    status: 'held',
+  });
+}
+
+/** Who works the thread in the open matter it sits in. */
+async function handlerOf(threadKey: string): Promise<string | null | undefined> {
+  return (
+    await getDb().get<{ handler: string | null }>(
+      "SELECT handler FROM gws_ea_matter_links WHERE kind = 'thread' AND reference = ? AND matter_open = 1",
+      threadKey,
+    )
+  )?.handler;
 }
 
 function sha256(data: Buffer): string {
@@ -657,6 +697,110 @@ describe('email_handoff', () => {
     );
     expect(await count('gws_ea_threads')).toBe(0);
     expect(await externalEmailSessions()).toBe(0);
+  });
+});
+
+describe('email_handoff and placement (Slice 5 R9, KTD8)', () => {
+  it('refuses a thread main has not placed, saying why, and leaves its mail held', async () => {
+    const { key, session } = await inboundThread('g-coffee', JANE, 'unplaced');
+    await heldMail(session, key, 'jane-1', 'Is Tuesday good for Pat?');
+
+    expect(refusal(await handoff({ thread_key: key, message: 'Offer Tuesday.' }))).toBe(
+      `Nothing was handed over: thread ${key} is not placed yet. Place it first with ncl matters place, ` +
+        'in an open matter, a new one or nowhere, or name its open matter here.',
+    );
+    expect(rows(session).map((row) => [row.id, row.status])).toEqual([['jane-1', 'held']]);
+    expect(await threadPlacement(key)).toEqual({ placement: 'unplaced', released: false });
+    expect(requestWake).not.toHaveBeenCalled();
+  });
+
+  it('places a thread main has not placed in the open matter the handoff names, then hands it over', async () => {
+    const { matter } = await openMatter({ title: 'Coffee with Jane', openLoop: 'Pat wants coffee.', links: [] });
+    const { key, session } = await inboundThread('g-coffee', JANE, 'unplaced');
+    await heldMail(session, key, 'jane-1', 'Is Tuesday good for Pat?');
+
+    const frame = await handoff(
+      { thread_key: key, message: 'Offer Tuesday.', matter: matter.id },
+      undefined,
+      'act-placed',
+    );
+
+    expect(String(data(frame).message)).toMatch(new RegExp(` It joins matter ${matter.id}\\.$`, 'u'));
+    expect(await threadPlacement(key)).toEqual({ placement: 'matter', released: true });
+    expect(await handlerOf(key)).toBe('external-email');
+    expect(rows(session).map((row) => [row.id, row.status])).toEqual([
+      ['jane-1', 'pending'],
+      ['handoff-act-placed', 'pending'],
+    ]);
+  });
+
+  it("releases the mail held for main's handoff with main's words, due now, and names external-email as working the thread", async () => {
+    const { matter } = await openMatter({ title: 'Acme renewal', openLoop: 'Pat wants the renewal at 5%.', links: [] });
+    const { key, session } = await inboundThread('g-acme', JANE, 'unplaced');
+    await heldMail(session, key, 'jane-1', 'Can we talk renewal on Tuesday?');
+    await heldMail(session, key, 'jane-2', 'Or Wednesday works too.');
+    // main places it, and the mail still waits for main's handoff.
+    await placeInMatter(matter.id, [{ kind: 'thread', reference: key }]);
+    expect(await threadPlacement(key)).toEqual({ placement: 'matter', released: false });
+    expect(await handlerOf(key)).toBeNull();
+
+    data(await handoff({ thread_key: key, message: 'Offer Tuesday at 10.' }, undefined, 'act-release'));
+
+    expect(rows(session).map((row) => [row.id, row.status, row.trigger, row.process_after])).toEqual([
+      ['jane-1', 'pending', 1, null],
+      ['jane-2', 'pending', 1, null],
+      ['handoff-act-release', 'pending', 1, null],
+    ]);
+    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
+    expect(await threadPlacement(key)).toEqual({ placement: 'matter', released: true });
+    expect(await handlerOf(key)).toBe('external-email');
+
+    // external-email's account of the thread now shows under it wherever the matter renders.
+    data(await request(session, 'tell_main', { account: 'Offered Jane Tuesday at 10.' }));
+    const current = await getMatter(matter.id);
+    if (current === undefined) throw new Error('The matter is gone');
+    const rendered = await renderMatter(current, { ...hostSources(), gmail: new FakeGmailThreads() });
+    expect(rendered).toMatch(/ {2}handled by external-email; its account, [^\n]+:\n[^]*Offered Jane Tuesday at 10\./u);
+  });
+
+  it("releases held mail to the wait the thread's earlier mail already set, with main's words", async () => {
+    const { key, session } = await inboundThread('g-acme', JANE, 'unplaced');
+    // Mail from before the thread was held again still waits out the thread's pace.
+    const wait = new Date(Date.now() + 4 * 60_000).toISOString();
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: 'jane-1',
+      kind: 'chat',
+      timestamp: now(),
+      content: JSON.stringify({ text: 'Is Tuesday good for Pat?' }),
+      processAfter: wait,
+      trigger: true,
+    });
+    await heldMail(session, key, 'jane-2', 'Or Wednesday works too.');
+    await placeNowhere([{ kind: 'thread', reference: key }]);
+
+    data(await handoff({ thread_key: key, message: 'Offer Tuesday.' }, undefined, 'act-joined'));
+
+    expect(rows(session).map((row) => [row.id, row.status, row.process_after])).toEqual([
+      ['jane-1', 'pending', wait],
+      ['jane-2', 'pending', wait],
+      ['handoff-act-joined', 'pending', wait],
+    ]);
+    // The sweep wakes the session when the wait is over.
+    expect(requestWake).not.toHaveBeenCalled();
+    expect(await threadPlacement(key)).toEqual({ placement: 'nowhere', released: true });
+  });
+
+  it('places a thread main starts and hands it over as it begins: nowhere, or in the matter it names, worked by external-email', async () => {
+    const { matter } = await openMatter({ title: 'Lunch with Remy', openLoop: 'Pat owes Remy lunch.', links: [] });
+
+    const alone = keyOf(await handoff({ people: [REMY], message: 'Thank Remy for the book.' }));
+    const kept = keyOf(await handoff({ people: [REMY], message: 'Find a lunch slot.', matter: matter.id }));
+
+    expect(await threadPlacement(alone)).toEqual({ placement: 'nowhere', released: true });
+    expect(await threadPlacement(kept)).toEqual({ placement: 'matter', released: true });
+    expect((await getMatter(matter.id))?.links).toEqual([
+      expect.objectContaining({ kind: 'thread', reference: kept, handler: 'external-email' }),
+    ]);
   });
 });
 

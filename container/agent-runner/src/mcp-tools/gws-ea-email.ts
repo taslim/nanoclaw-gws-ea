@@ -110,7 +110,7 @@ export const emailHandoff = requestTool({
   ...common,
   name: 'email_handoff',
   description:
-    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message, decides who each email goes to and who is copied, and writes the emails. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
+    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message and the thread's mail waiting for you, decides who each email goes to and who is copied, and writes the emails. A thread you have not placed is refused until you place it, or name its matter here. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
   properties: {
     thread_key: { type: 'string', description: 'The mail-… key of an existing thread, as a message about it gave it.' },
     people: {
@@ -131,7 +131,8 @@ export const emailHandoff = requestTool({
     },
     matter: {
       type: 'string',
-      description: 'The id of the open matter the thread belongs to, such as m-1a2b3c4d5e6f: the thread joins it.',
+      description:
+        'The id of the open matter the thread belongs to, such as m-1a2b3c4d5e6f: the thread joins it, placing it there if you had not placed it. A new thread without one is placed nowhere.',
     },
   },
   required: ['message'],

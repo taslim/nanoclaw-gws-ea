@@ -50,7 +50,7 @@ import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { createDriveApi } from '../gws-ea-workspace/drive-api.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
-import { registerInboundDelay } from '../../router.js';
+import { HOLD_UNTIL_RELEASED, registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
@@ -61,10 +61,11 @@ import {
   gwsEaInboxMigration,
   gwsEaInboxRelativeFilePathsMigration,
   gwsEaInboxThreadAccountsMigration,
+  gwsEaInboxThreadPlacementMigration,
   gwsEaInboxUnsignedNoticesMigration,
 } from './migration.js';
 import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
-import { paceDeadline } from './pace.js';
+import { heldForMain, paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 import { emailWords, sendKey } from './send.js';
@@ -79,6 +80,7 @@ registerMigration(gwsEaInboxRelativeFilePathsMigration);
 registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
 registerMigration(gwsEaInboxThreadAccountsMigration);
+registerMigration(gwsEaInboxThreadPlacementMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;
@@ -122,6 +124,8 @@ registerRoleGrantPolicy('gws-ea-inbox:no-email-privilege', (grant) =>
 
 // An outside thread is worked at a human pace: what reaches its session waits for the thread's next turn (KTD3).
 registerInboundDelay((_event, session) => paceDeadline(session));
+// Before that, its mail waits, held, until main places the thread and hands it over (Slice 5 KTD8).
+registerInboundDelay(async (_event, session) => ((await heldForMain(session)) ? HOLD_UNTIL_RELEASED : null));
 
 /** The send record of a row the channel sent: an agent's email on one side of its thread. */
 function emailSend(msg: OutboundMessage): { readonly scope: SendScope; readonly key: string } | undefined {

@@ -512,8 +512,8 @@ describe('recorded divergence: a module can hold an inbound message until a time
   });
 });
 
-describe('recorded divergence: a module can hold an inbound message until it releases it', () => {
-  it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named', async () => {
+describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
+  it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named, or settles it unread', async () => {
     await freshInstall();
     const db = await import('../db/index.js');
     await db.runMigrations(await db.initTestDb());
@@ -552,8 +552,8 @@ describe('recorded divergence: a module can hold an inbound message until it rel
     const { findSessionForAgent } = await import('../db/sessions.js');
     const { withExistingMailboxSession } = await import('../session-manager.js');
     const later = new Date(Date.now() + 4 * 60_000).toISOString();
-    router.registerInboundDelay((event) => (event.message.id === 'held' ? router.HOLD_UNTIL_RELEASED : null));
-    router.registerInboundDelay((event) => (event.message.id === 'held' ? later : null));
+    router.registerInboundDelay((event) => (event.message.id.startsWith('held') ? router.HOLD_UNTIL_RELEASED : null));
+    router.registerInboundDelay((event) => (event.message.id.startsWith('held') ? later : null));
     external.requestWake.mockClear();
 
     await router.routeInbound({
@@ -584,6 +584,27 @@ describe('recorded divergence: a module can hold an inbound message until it rel
     expect(await withExistingMailboxSession('ag-1', sessionId, (mailbox) => mailbox.getWaitingMessages())).toEqual([
       { id: 'held:ag-1', tries: 0, processAfter: later },
     ]);
+
+    await router.routeInbound({
+      channelType: 'gchat',
+      platformId: 'gchat:spaces/dm',
+      threadId: null,
+      message: {
+        id: 'held-again',
+        kind: 'chat',
+        content: '{"text":"hello again"}',
+        timestamp: createdAt,
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    expect(await withExistingMailboxSession('ag-1', sessionId, (mailbox) => mailbox.settleHeldMessages())).toBe(1);
+    expect(
+      await withExistingMailboxSession('ag-1', sessionId, (mailbox) => [
+        mailbox.releaseHeldMessages(null),
+        mailbox.countDueMessages(),
+      ]),
+    ).toEqual([0, 0]);
   });
 
   it("keeps held rows out of the runner's pending read", async () => {

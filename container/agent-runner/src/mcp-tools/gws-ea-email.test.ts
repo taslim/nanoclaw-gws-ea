@@ -219,6 +219,15 @@ describe('the email tools', () => {
     expect(calendar.description).not.toMatch(/primary/iu);
   });
 
+  it('tell main a thread is handed over only once placed, and that naming its matter places it', () => {
+    expect(emailHandoff.tool.description).toContain(
+      'A thread you have not placed is refused until you place it, or name its matter here.',
+    );
+    const matter = emailHandoff.tool.inputSchema.properties?.matter as { readonly description: string };
+    expect(matter.description).toContain('placing it there if you had not placed it');
+    expect(matter.description).toContain('A new thread without one is placed nowhere.');
+  });
+
   it('leave a handoff that names no thread and no one for the host to judge', async () => {
     await emailHandoff.handler({ message: 'Find Remy 30 minutes.' }, { signal: AbortSignal.timeout(50) });
     expect(getUndeliveredMessages().map((row) => JSON.parse(row.content) as unknown)).toMatchObject([

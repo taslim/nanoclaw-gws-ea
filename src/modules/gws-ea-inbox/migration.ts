@@ -271,3 +271,32 @@ export const gwsEaInboxThreadAccountsMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * Where `main` placed each thread (Slice 5 R9, R27, KTD8), and whether it
+ * handed the thread over to `external-email`, which reads the thread's mail
+ * only once it has; until then each email waits, held.
+ *
+ * - `placement`: `unplaced` until main places it, in an open matter
+ *   (`matter`), or `nowhere`, which is also where a thread is left once its
+ *   matter closes. A thread is never handed over before main places it.
+ * - `released`: main handed it over. A thread main starts is placed and
+ *   handed over as it begins, and every thread an earlier release had was
+ *   already external-email's.
+ * - `placement_note`: the note that last asked main to place it, so the host
+ *   asks again only once main has read that one.
+ */
+export const gwsEaInboxThreadPlacementMigration: ModuleMigration = {
+  version: 8,
+  name: 'module:gws-ea-inbox:thread-placement',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_threads ADD COLUMN placement TEXT NOT NULL DEFAULT 'unplaced'
+        CHECK (placement IN ('unplaced', 'matter', 'nowhere'));
+      ALTER TABLE gws_ea_threads ADD COLUMN released INTEGER NOT NULL DEFAULT 0
+        CHECK (released IN (0, 1) AND (released = 0 OR placement <> 'unplaced'));
+      ALTER TABLE gws_ea_threads ADD COLUMN placement_note TEXT CHECK (placement_note <> '');
+      UPDATE gws_ea_threads SET placement = 'nowhere', released = 1;
+    `);
+  },
+};

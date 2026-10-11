@@ -131,6 +131,14 @@ export function releaseHeldMessages(db: Database.Database, processAfter: string 
     .run(due).changes;
 }
 
+/**
+ * Settle every held message: each is completed unread, so no turn ever reads
+ * it and no later release brings it back. Returns how many it settled.
+ */
+export function settleHeldMessages(db: Database.Database): number {
+  return db.prepare("UPDATE messages_in SET status = 'completed' WHERE status = 'held'").run().changes;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }

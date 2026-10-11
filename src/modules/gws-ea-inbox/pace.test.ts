@@ -1,6 +1,7 @@
 /**
  * Human pace (KTD3, R62, AE62): an outside thread is worked 3 to 6 minutes
- * after its first message not yet answered, all at once.
+ * after its first message not yet answered, all at once, once main has
+ * handed it over; until then its mail is held (Slice 5 KTD8).
  *
  * Drives the real router, with pace registered as the inbox registers it,
  * the real session mailboxes and the real reconcile that wakes a session.
@@ -8,9 +9,7 @@
  * container. Only the container runner and the wake are mocked, and
  * external-email's group pointer.
  */
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import path from 'node:path';
 
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -58,6 +57,8 @@ import { EMAIL_CHANNEL_DEFAULTS, ensureInbox, ensurePrincipalConversation } from
 import { emailMessagingGroupIds } from './db.js';
 import { paceDeadline } from './pace.js';
 import { INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
+import { runnerPoll } from './testing/runner-poll.js';
+import { createThread, placeThread, releaseThread } from './thread-map.js';
 
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
@@ -175,37 +176,6 @@ function runnerClaims(session: Session, ...ids: string[]): void {
   }
 }
 
-const RUNNER_MAILBOX = path.join(process.cwd(), 'container/agent-runner/src/mailbox/sqlite');
-const RUNNER_COLUMNS =
-  'id, seq, kind, timestamp, status, process_after, recurrence, series_id, tries, "trigger", platform_id, channel_type, thread_id, content, on_wake';
-
-/**
- * The rows the agent runner's next poll hands its agent: the runner's own
- * due-row query, run by Bun as in the container, over the session's inbound
- * rows and the runner's claims.
- */
-function runnerPoll(session: Session): string[] {
-  const script = [
-    `import { initTestSessionDb } from ${JSON.stringify(path.join(RUNNER_MAILBOX, 'connection.ts'))};`,
-    `import { sqliteGetPendingMessages } from ${JSON.stringify(path.join(RUNNER_MAILBOX, 'operations.ts'))};`,
-    'const { inbound, outbound } = initTestSessionDb();',
-    "inbound.prepare('ATTACH DATABASE ? AS host').run(process.env.PACE_INBOUND_DB);",
-    `inbound.exec('INSERT INTO messages_in (${RUNNER_COLUMNS}) SELECT ${RUNNER_COLUMNS} FROM host.messages_in');`,
-    "outbound.prepare('ATTACH DATABASE ? AS host').run(process.env.PACE_OUTBOUND_DB);",
-    "outbound.exec('INSERT INTO processing_ack SELECT message_id, status, status_changed FROM host.processing_ack');",
-    'console.log(JSON.stringify(sqliteGetPendingMessages(false, 10).map(({ id }) => id)));',
-  ].join('\n');
-  const output = execFileSync('bun', ['-e', script], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      PACE_INBOUND_DB: inboundDbPath(session.agent_group_id, session.id),
-      PACE_OUTBOUND_DB: outboundDbPath(session.agent_group_id, session.id),
-    },
-  });
-  return JSON.parse(output) as string[];
-}
-
 function wokenSessions(): string[] {
   return vi.mocked(requestWake).mock.calls.map(([session, reason]) => `${session.id}:${reason}`);
 }
@@ -237,6 +207,10 @@ beforeEach(async () => {
   await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'ag-main');
   await ensureInbox('ag-external');
   await ensurePrincipalConversation('ag-main');
+  // A thread main placed and handed over: its mail is worked at the thread's pace.
+  await createThread(null, now(), 'mail-acme');
+  await placeThread('mail-acme', 'nowhere');
+  await releaseThread('mail-acme');
   registerChannelAdapter('email', { factory: emailAdapter, defaults: EMAIL_CHANNEL_DEFAULTS });
   await initChannelAdapters(() => ({
     onInbound: () => undefined,
@@ -370,5 +344,31 @@ describe('human pace', () => {
     expectFreshWait(processAfter(thread, rowId('m3')), before, Date.now());
     expect(runnerPoll(thread)).toEqual([]);
     expect(wokenSessions()).toEqual([`${thread.id}:due-message`]);
+  });
+
+  it('holds mail in a thread main has not handed over, waiting on no pace and waking nothing, and paces mail once it has', async () => {
+    await createThread('gt-new', now(), 'mail-new');
+    await mail('m1', 'mail-new');
+    const thread = await threadSession('mail-new');
+
+    expect(processAfter(thread, rowId('m1'))).toBeNull();
+    expect(
+      await withExistingMailboxSession(thread.agent_group_id, thread.id, (mailbox) => [
+        mailbox.countDueMessages(),
+        mailbox.getWaitingMessages(),
+      ]),
+    ).toEqual([0, []]);
+    await reconcileSession(thread.id);
+    expect(runnerPoll(thread)).toEqual([]);
+    expect(wokenSessions()).toEqual([]);
+
+    // main places the thread and hands it over: mail from then on is paced as before.
+    await placeThread('mail-new', 'nowhere');
+    await releaseThread('mail-new');
+    const before = Date.now();
+    await mail('m2', 'mail-new');
+
+    expectFreshWait(processAfter(thread, rowId('m2')), before, Date.now());
+    expect(wokenSessions()).toEqual([]);
   });
 });
