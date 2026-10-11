@@ -24,6 +24,7 @@ import {
   AGENT_GOOGLE_CREDENTIALS,
   googleCredentialFor,
   missingGoogleScopes,
+  scopesOfGrant,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
@@ -150,7 +151,7 @@ function signInProblem(grant: GoogleGrant | undefined, account: string): string 
 
 /** Which scopes this release asks for that `grant` lacks, as a reason, or undefined when it holds them all. */
 function scopeProblem(grant: GoogleGrant): string | undefined {
-  const missing = missingGoogleScopes(grant.scopes);
+  const missing = missingGoogleScopes(scopesOfGrant(grant));
   return missing.length > 0 ? `the sign-in lacks ${missing.join(', ')}` : undefined;
 }
 

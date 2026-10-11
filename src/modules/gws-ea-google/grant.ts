@@ -1,9 +1,9 @@
 /**
  * The assistant's one Google sign-in (KTD2), shared by the control plane,
  * which writes it at setup, and the host, which refreshes it. The grant file
- * holds the OAuth client, the refresh token, the scopes Google granted, and
- * the account with its Google ID; it lives in the instance's owner-only
- * `secrets/` directory and never in a container.
+ * holds the OAuth client, each consent's refresh token with the scopes Google
+ * granted it, and the account with its Google ID; it lives in the instance's
+ * owner-only `secrets/` directory and never in a container.
  */
 import { canonicalTimestamp, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 
@@ -192,7 +192,7 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
 }
 
 /**
- * What the sign-in asks for beyond its services' scopes. The grant never
+ * What the sign-in asks for besides the account's identity. The grant never
  * leaves the host and is the assistant's own account, so the sign-in lists
  * every scope of each supported product that could be handed to an agent or
  * to the host: a new capability or a narrower token then needs no new
@@ -208,88 +208,103 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
  * (`chat.bot`, `chat.app.*`), which only a Chat app's service account holds,
  * and `chat.import`, which only an app with domain-wide delegation can use;
  * and admin and Apps Script scopes, which lie outside the products.
+ *
+ * The scopes are asked for in more than one consent. Google's consent stops
+ * finishing above about 50 scopes in one request: checked live on
+ * 2026-10-11, 49 came back and 57 hung after Allow. And Google never merges
+ * a Desktop client's consents, since it offers installed apps no incremental
+ * authorization: each consent's refresh token mints only that consent's
+ * scopes. So each consent asks for at most 40, and holds every scope a token
+ * is minted with: agents' `www.googleapis.com` token carries Calendar and
+ * Drive together.
  */
-const SIGN_IN_CEILING: readonly string[] = [
-  'https://www.googleapis.com/auth/calendar',
-  'https://www.googleapis.com/auth/calendar.readonly',
-  'https://www.googleapis.com/auth/calendar.events',
-  'https://www.googleapis.com/auth/calendar.events.readonly',
-  'https://www.googleapis.com/auth/calendar.events.owned',
-  'https://www.googleapis.com/auth/calendar.events.owned.readonly',
-  'https://www.googleapis.com/auth/calendar.events.freebusy',
-  'https://www.googleapis.com/auth/calendar.events.public.readonly',
-  'https://www.googleapis.com/auth/calendar.freebusy',
-  'https://www.googleapis.com/auth/calendar.calendarlist',
-  'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
-  'https://www.googleapis.com/auth/calendar.calendars',
-  'https://www.googleapis.com/auth/calendar.calendars.readonly',
-  'https://www.googleapis.com/auth/calendar.acls',
-  'https://www.googleapis.com/auth/calendar.acls.readonly',
-  'https://www.googleapis.com/auth/calendar.settings.readonly',
-  'https://mail.google.com/',
-  'https://www.googleapis.com/auth/gmail.modify',
-  'https://www.googleapis.com/auth/gmail.readonly',
-  'https://www.googleapis.com/auth/gmail.metadata',
-  'https://www.googleapis.com/auth/gmail.compose',
-  'https://www.googleapis.com/auth/gmail.send',
-  'https://www.googleapis.com/auth/gmail.insert',
-  'https://www.googleapis.com/auth/gmail.labels',
-  'https://www.googleapis.com/auth/gmail.settings.basic',
-  'https://www.googleapis.com/auth/gmail.settings.sharing',
-  'https://www.googleapis.com/auth/drive',
-  'https://www.googleapis.com/auth/drive.readonly',
-  'https://www.googleapis.com/auth/drive.metadata',
-  'https://www.googleapis.com/auth/drive.metadata.readonly',
-  'https://www.googleapis.com/auth/drive.activity',
-  'https://www.googleapis.com/auth/drive.activity.readonly',
-  'https://www.googleapis.com/auth/drive.labels',
-  'https://www.googleapis.com/auth/drive.labels.readonly',
-  'https://www.googleapis.com/auth/drive.meet.readonly',
-  'https://www.googleapis.com/auth/documents',
-  'https://www.googleapis.com/auth/documents.readonly',
-  'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/spreadsheets.readonly',
-  'https://www.googleapis.com/auth/presentations',
-  'https://www.googleapis.com/auth/presentations.readonly',
-  'https://www.googleapis.com/auth/forms.body',
-  'https://www.googleapis.com/auth/forms.body.readonly',
-  'https://www.googleapis.com/auth/forms.responses.readonly',
-  'https://www.googleapis.com/auth/directory.readonly',
-  'https://www.googleapis.com/auth/chat.spaces',
-  'https://www.googleapis.com/auth/chat.spaces.readonly',
-  'https://www.googleapis.com/auth/chat.spaces.create',
-  'https://www.googleapis.com/auth/chat.delete',
-  'https://www.googleapis.com/auth/chat.memberships',
-  'https://www.googleapis.com/auth/chat.memberships.readonly',
-  'https://www.googleapis.com/auth/chat.memberships.app',
-  'https://www.googleapis.com/auth/chat.messages',
-  'https://www.googleapis.com/auth/chat.messages.readonly',
-  'https://www.googleapis.com/auth/chat.messages.create',
-  'https://www.googleapis.com/auth/chat.messages.reactions',
-  'https://www.googleapis.com/auth/chat.messages.reactions.readonly',
-  'https://www.googleapis.com/auth/chat.messages.reactions.create',
-  'https://www.googleapis.com/auth/chat.users.readstate',
-  'https://www.googleapis.com/auth/chat.users.readstate.readonly',
-  'https://www.googleapis.com/auth/chat.users.spacesettings',
-  'https://www.googleapis.com/auth/chat.users.sections',
-  'https://www.googleapis.com/auth/chat.users.sections.readonly',
-  'https://www.googleapis.com/auth/chat.customemojis',
-  'https://www.googleapis.com/auth/chat.customemojis.readonly',
+const SIGN_IN_CONSENTS: readonly (readonly string[])[] = [
+  // Calendar, Gmail and Drive.
+  [
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/calendar.events.readonly',
+    'https://www.googleapis.com/auth/calendar.events.owned',
+    'https://www.googleapis.com/auth/calendar.events.owned.readonly',
+    'https://www.googleapis.com/auth/calendar.events.freebusy',
+    'https://www.googleapis.com/auth/calendar.events.public.readonly',
+    'https://www.googleapis.com/auth/calendar.freebusy',
+    'https://www.googleapis.com/auth/calendar.calendarlist',
+    'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+    'https://www.googleapis.com/auth/calendar.calendars',
+    'https://www.googleapis.com/auth/calendar.calendars.readonly',
+    'https://www.googleapis.com/auth/calendar.acls',
+    'https://www.googleapis.com/auth/calendar.acls.readonly',
+    'https://www.googleapis.com/auth/calendar.settings.readonly',
+    'https://mail.google.com/',
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.metadata',
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.insert',
+    'https://www.googleapis.com/auth/gmail.labels',
+    'https://www.googleapis.com/auth/gmail.settings.basic',
+    'https://www.googleapis.com/auth/gmail.settings.sharing',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.metadata',
+    'https://www.googleapis.com/auth/drive.metadata.readonly',
+    'https://www.googleapis.com/auth/drive.activity',
+    'https://www.googleapis.com/auth/drive.activity.readonly',
+    'https://www.googleapis.com/auth/drive.labels',
+    'https://www.googleapis.com/auth/drive.labels.readonly',
+    'https://www.googleapis.com/auth/drive.meet.readonly',
+  ],
+  // Docs, Sheets, Slides, Forms, the directory, and Chat.
+  [
+    'https://www.googleapis.com/auth/documents',
+    'https://www.googleapis.com/auth/documents.readonly',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/spreadsheets.readonly',
+    'https://www.googleapis.com/auth/presentations',
+    'https://www.googleapis.com/auth/presentations.readonly',
+    'https://www.googleapis.com/auth/forms.body',
+    'https://www.googleapis.com/auth/forms.body.readonly',
+    'https://www.googleapis.com/auth/forms.responses.readonly',
+    'https://www.googleapis.com/auth/directory.readonly',
+    'https://www.googleapis.com/auth/chat.spaces',
+    'https://www.googleapis.com/auth/chat.spaces.readonly',
+    'https://www.googleapis.com/auth/chat.spaces.create',
+    'https://www.googleapis.com/auth/chat.delete',
+    'https://www.googleapis.com/auth/chat.memberships',
+    'https://www.googleapis.com/auth/chat.memberships.readonly',
+    'https://www.googleapis.com/auth/chat.memberships.app',
+    'https://www.googleapis.com/auth/chat.messages',
+    'https://www.googleapis.com/auth/chat.messages.readonly',
+    'https://www.googleapis.com/auth/chat.messages.create',
+    'https://www.googleapis.com/auth/chat.messages.reactions',
+    'https://www.googleapis.com/auth/chat.messages.reactions.readonly',
+    'https://www.googleapis.com/auth/chat.messages.reactions.create',
+    'https://www.googleapis.com/auth/chat.users.readstate',
+    'https://www.googleapis.com/auth/chat.users.readstate.readonly',
+    'https://www.googleapis.com/auth/chat.users.spacesettings',
+    'https://www.googleapis.com/auth/chat.users.sections',
+    'https://www.googleapis.com/auth/chat.users.sections.readonly',
+    'https://www.googleapis.com/auth/chat.customemojis',
+    'https://www.googleapis.com/auth/chat.customemojis.readonly',
+  ],
 ];
 
 /**
- * What the sign-in asks for, each once: the account's identity, every
- * service's scopes (agent-facing and host-only), and the ceiling beyond them.
- * A grant lacking any of them needs a new sign-in.
+ * What the sign-in asks for, one consent at a time: the account's identity,
+ * so each consent proves who granted it, and its share of the products'
+ * scopes, which hold every service's (agent-facing and host-only).
  */
-export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [
-  ...new Set([
-    'openid',
-    'email',
-    ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes),
-    ...SIGN_IN_CEILING,
-  ]),
-];
+export const GOOGLE_SIGN_IN_CONSENTS: readonly (readonly string[])[] = SIGN_IN_CONSENTS.map((scopes) => [
+  'openid',
+  'email',
+  ...scopes,
+]);
+
+/** Every scope the sign-in asks for, each once. A grant lacking any of them needs a new sign-in. */
+export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [...new Set(GOOGLE_SIGN_IN_CONSENTS.flat())];
 
 /** The scopes a grant must hold: the identity scopes Google reports in full form, and the rest of the sign-in's. */
 const IDENTITY_SCOPE_FORMS: Readonly<Record<string, readonly string[]>> = {
@@ -303,7 +318,7 @@ export function missingGoogleScopes(granted: readonly string[]): string[] {
   return GOOGLE_SIGN_IN_SCOPES.filter((scope) => !(IDENTITY_SCOPE_FORMS[scope] ?? [scope]).some((f) => held.has(f)));
 }
 
-export const GOOGLE_GRANT_SCHEMA_VERSION = 2 as const;
+export const GOOGLE_GRANT_SCHEMA_VERSION = 3 as const;
 
 /**
  * Google's ID for an account, the OpenID `sub`: the number Chat names the
@@ -311,6 +326,13 @@ export const GOOGLE_GRANT_SCHEMA_VERSION = 2 as const;
  */
 export function isGoogleAccountId(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9]{1,255}$/u.test(value);
+}
+
+/** One consent of the sign-in: its refresh token mints only the scopes Google granted with it. */
+export interface GoogleConsent {
+  readonly refresh_token: string;
+  /** The scopes Google reported granting. */
+  readonly scopes: readonly string[];
 }
 
 export interface GoogleGrant {
@@ -321,10 +343,14 @@ export interface GoogleGrant {
   readonly sub: string;
   readonly client_id: string;
   readonly client_secret: string;
-  readonly refresh_token: string;
-  /** The scopes Google reported granting. */
-  readonly scopes: readonly string[];
+  /** One per consent of the sign-in, in its order. */
+  readonly consents: readonly GoogleConsent[];
   readonly granted_at: string;
+}
+
+/** Every scope the grant holds, across its consents, each once. */
+export function scopesOfGrant(grant: GoogleGrant): string[] {
+  return [...new Set(grant.consents.flatMap((consent) => consent.scopes))];
 }
 
 /** The grant file's name in the instance's `secrets/` directory. */
@@ -345,12 +371,22 @@ function requireText(value: unknown, label: string, maximum = 4_096): string {
   return value;
 }
 
+function parseConsent(value: unknown, label: string): GoogleConsent {
+  if (!isRecord(value)) throw new Error(`Google grant ${label} is invalid`);
+  const scopes = value.scopes;
+  if (!Array.isArray(scopes) || scopes.length === 0) throw new Error(`Google grant ${label} scopes are invalid`);
+  return {
+    refresh_token: requireText(value.refresh_token, `${label} refresh token`),
+    scopes: scopes.map((scope, index) => requireText(scope, `${label} scope ${index + 1}`, 512)),
+  };
+}
+
 /** Parse a grant file's content; any other shape is refused rather than used. */
 export function parseGoogleGrant(value: unknown): GoogleGrant {
   if (!isRecord(value)) throw new Error('Google grant is invalid');
   if (value.schema_version !== GOOGLE_GRANT_SCHEMA_VERSION) throw new Error('Google grant schema is unsupported');
-  const scopes = value.scopes;
-  if (!Array.isArray(scopes) || scopes.length === 0) throw new Error('Google grant scopes are invalid');
+  const consents = value.consents;
+  if (!Array.isArray(consents) || consents.length === 0) throw new Error('Google grant consents are invalid');
   const grantedAt = requireText(value.granted_at, 'time', 64);
   if (canonicalTimestamp(grantedAt) === undefined) throw new Error('Google grant time is invalid');
   if (!isGoogleAccountId(value.sub)) throw new Error('Google grant account ID is invalid');
@@ -360,8 +396,7 @@ export function parseGoogleGrant(value: unknown): GoogleGrant {
     sub: value.sub,
     client_id: requireText(value.client_id, 'client ID', 512),
     client_secret: requireText(value.client_secret, 'client secret', 512),
-    refresh_token: requireText(value.refresh_token, 'refresh token'),
-    scopes: scopes.map((scope, index) => requireText(scope, `scope ${index + 1}`, 512)),
+    consents: consents.map((consent, index) => parseConsent(consent, `consent ${index + 1}`)),
     granted_at: grantedAt,
   };
 }

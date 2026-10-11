@@ -11,6 +11,7 @@ import {
   GOOGLE_SERVICES,
   googleGrantIdentity,
   grantedScopes,
+  scopesOfGrant,
   type AgentGoogleCredential,
   type GoogleGrant,
   type GoogleServiceId,
@@ -67,7 +68,10 @@ export interface TokenOptions {
   readonly now?: () => number;
 }
 
-/** Exchange the grant's refresh token for an access token limited to exactly `scopes`; `label` names it in errors. */
+/**
+ * Exchange the refresh token of the consent that granted `scopes` for an
+ * access token limited to exactly them; `label` names it in errors.
+ */
 async function mintToken(
   grant: GoogleGrant,
   label: string,
@@ -76,9 +80,17 @@ async function mintToken(
 ): Promise<ServiceToken> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const now = options.now ?? Date.now;
+  const consent = grant.consents.find((candidate) => scopes.every((scope) => candidate.scopes.includes(scope)));
+  if (!consent) {
+    throw new GoogleTokenError(
+      `No one consent of the assistant's sign-in granted every ${label} scope`,
+      'its scopes span consents',
+      true,
+    );
+  }
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
-    refresh_token: grant.refresh_token,
+    refresh_token: consent.refresh_token,
     client_id: grant.client_id,
     client_secret: grant.client_secret,
     scope: scopes.join(' '),
@@ -129,7 +141,7 @@ export async function mintServiceToken(
   service: GoogleServiceId,
   options: TokenOptions = {},
 ): Promise<ServiceToken> {
-  const scopes = grantedScopes(GOOGLE_SERVICES[service].scopes, grant.scopes);
+  const scopes = grantedScopes(GOOGLE_SERVICES[service].scopes, scopesOfGrant(grant));
   if (scopes.length === 0) throw new GoogleScopeNotGrantedError(service);
   return mintToken(grant, service, scopes, options);
 }
@@ -164,14 +176,14 @@ export async function mintCredentialToken(
   credential: AgentGoogleCredential,
   options: CredentialTokenOptions = {},
 ): Promise<CredentialToken | undefined> {
-  const scopes = credentialScopes(credential, grant.scopes);
+  const scopes = credentialScopes(credential, scopesOfGrant(grant));
   if (scopes.length === 0) return undefined;
   try {
     return await mintToken(grant, credential.host, scopes, options);
   } catch (error) {
     const first = credential.services.slice(0, 1);
     if (!(error instanceof GoogleTokenError) || !error.refused || options.fallBack === false) throw error;
-    const kept = credentialScopes({ ...credential, services: first }, grant.scopes);
+    const kept = credentialScopes({ ...credential, services: first }, scopesOfGrant(grant));
     const refused = scopes.filter((scope) => !kept.includes(scope));
     if (kept.length === 0 || refused.length === 0) throw error;
     const token = await mintToken(grant, credential.host, kept, options);

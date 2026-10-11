@@ -518,13 +518,12 @@ function grantFile(paths: ControlPlanePaths, input: InstanceReservationInput): s
 /** The assistant signed in to Google, as `sign_in_google` leaves it. */
 async function signIn(paths: ControlPlanePaths, input: InstanceReservationInput): Promise<void> {
   await writePrivate(grantFile(paths, input), {
-    schema_version: 2,
+    schema_version: 3,
     account: input.exclusive_resource_claims.workspace_email,
     sub: '104857395723948572901',
     client_id: 'juno-hale-client.apps.googleusercontent.com',
     client_secret: 'juno-hale-client-secret',
-    refresh_token: REFRESH_TOKEN,
-    scopes: GOOGLE_SIGN_IN_SCOPES,
+    consents: [{ refresh_token: REFRESH_TOKEN, scopes: GOOGLE_SIGN_IN_SCOPES }],
     granted_at: '2026-10-01T12:00:00.000Z',
   });
 }

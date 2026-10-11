@@ -4,25 +4,30 @@ import type {
   GatewayCredentialTarget,
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
-import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from './grant.js';
+import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_CONSENTS, type GoogleGrant } from './grant.js';
 import { createGoogleTokenRefresher } from './refresher.js';
 import { GOOGLE_TOKEN_ENDPOINT, RENEW_BEFORE_EXPIRY_MS } from './tokens.js';
 
 const GRANT: GoogleGrant = {
-  schema_version: 2,
+  schema_version: 3,
   account: 'juno@example.test',
   sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
-  refresh_token: '1//refresh-token',
-  scopes: [...GOOGLE_SIGN_IN_SCOPES],
+  consents: GOOGLE_SIGN_IN_CONSENTS.map((scopes, index) => ({
+    refresh_token: `1//refresh-token-${index + 1}`,
+    scopes: [...scopes],
+  })),
   granted_at: '2026-09-30T10:00:00.000Z',
 };
 
 /** A grant from before Drive, Docs, Sheets, Slides and Forms joined the sign-in. */
 const OLD_GRANT: GoogleGrant = {
   ...GRANT,
-  scopes: GRANT.scopes.filter((scope) => !/\/(drive|documents|spreadsheets|presentations|forms\.)/u.test(scope)),
+  consents: GRANT.consents.map((consent) => ({
+    ...consent,
+    scopes: consent.scopes.filter((scope) => !/\/(drive|documents|spreadsheets|presentations|forms\.)/u.test(scope)),
+  })),
 };
 
 const MODIFY = 'https://www.googleapis.com/auth/gmail.modify';
@@ -227,7 +232,7 @@ describe('the Google token refresher', () => {
     const { refresher: r } = refresher(w, () => grant, { now: 0 });
     await r.tick();
 
-    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-10-09T18:00:00.000Z' };
+    grant = { ...GRANT, granted_at: '2026-10-09T18:00:00.000Z' };
     await r.tick();
 
     expect(w.asked().slice(3)).toEqual(FULL_SCOPES);
@@ -334,7 +339,7 @@ describe('the Google token refresher', () => {
     expect(log.error).toHaveBeenCalledTimes(1);
     expect(log.warn).not.toHaveBeenCalled();
 
-    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-09-30T13:00:00.000Z' };
+    grant = { ...GRANT, granted_at: '2026-09-30T13:00:00.000Z' };
     await r.tick();
     expect(w.minted).toHaveLength(2);
   });
@@ -378,7 +383,7 @@ describe('the Google token refresher', () => {
       runs.map(({ log }) => [log.info.mock.calls, log.warn.mock.calls, log.error.mock.calls]),
     );
     expect(logged).not.toContain('ya29.');
-    expect(logged).not.toContain(GRANT.refresh_token);
+    for (const consent of GRANT.consents) expect(logged).not.toContain(consent.refresh_token);
     expect(logged).not.toContain(GRANT.client_secret);
   });
 });
