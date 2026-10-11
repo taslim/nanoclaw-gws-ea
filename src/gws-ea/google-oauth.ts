@@ -144,9 +144,6 @@ function signInFailed(message: string): GwsEaError {
 const CALLBACK_PAGE = (heading: string): string =>
   `<!doctype html><meta charset="utf-8"><title>${heading}</title><p>${heading} You can close this tab.</p>`;
 
-/** The short link the operator opens, on the loopback server: it sends the browser to Google's first consent. */
-const SIGN_IN_PATH = '/sign-in';
-
 /** One consent's request to Google: its PKCE verifier, its state, and the consent URL. */
 interface ConsentRequest {
   readonly verifier: string;
@@ -180,19 +177,27 @@ function consentRequest(
 
 /**
  * Google's redirects to the loopback server, one per consent, each resolving
- * with its query. The sign-in link sends the browser to the first consent;
- * each consent's redirect but the last sends it on to the next, and the last
- * shows how the sign-in went. It listens at once, so no redirect is missed,
- * but the time limit, for the whole sign-in, starts only at `arm`, once the
- * operator is ready to sign in; `cancel` stops the wait. Only a redirect
- * carrying a consent's `state` counts: any other request to the port is
- * refused, so another local process cannot cut the operator's sign-in short.
+ * with its query. The sign-in link the operator opens, on a path only this
+ * sign-in knows, sends the browser to the first consent; each consent's
+ * redirect but the last sends it on to the next, and the last shows how the
+ * sign-in went. It listens at once, so no redirect is missed, but the time
+ * limit, for the whole sign-in, starts only at `arm`, once the operator is
+ * ready to sign in; `cancel` stops the wait. Only a redirect carrying a
+ * consent's `state` counts: any other request to the port is refused, so
+ * another local process can neither learn a consent's `state` nor cut the
+ * operator's sign-in short.
  */
 function awaitRedirects(
   server: Server,
   consents: readonly ConsentRequest[],
   timeoutMs: number,
-): { readonly redirects: readonly Promise<URLSearchParams>[]; arm(): void; cancel(): void } {
+): {
+  readonly signInPath: string;
+  readonly redirects: readonly Promise<URLSearchParams>[];
+  arm(): void;
+  cancel(): void;
+} {
+  const signInPath = `/sign-in/${randomBytes(24).toString('base64url')}`;
   let timer: NodeJS.Timeout | undefined;
   const waits = consents.map(() => {
     let arrive: (query: URLSearchParams) => void = () => undefined;
@@ -208,7 +213,7 @@ function awaitRedirects(
   server.on('request', (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     const first = consents.at(0);
-    if (url.pathname === SIGN_IN_PATH && first) {
+    if (url.pathname === signInPath && first) {
       response.writeHead(302, { location: first.url }).end();
       return;
     }
@@ -234,6 +239,7 @@ function awaitRedirects(
     waits[index]?.arrive(url.searchParams);
   });
   return {
+    signInPath,
     redirects: waits.map((wait) => wait.redirect),
     arm: () => {
       timer = setTimeout(() => {
@@ -348,7 +354,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
   let waiting: ReturnType<typeof awaitRedirects> | undefined;
   try {
     waiting = awaitRedirects(server, consents, input.timeoutMs ?? SIGN_IN_TIMEOUT_MS);
-    await input.present(`${redirectUri}${SIGN_IN_PATH}`);
+    await input.present(`${redirectUri}${waiting.signInPath}`);
     waiting.arm();
     for (const [index, consent] of consents.entries()) {
       const completed = await completeConsent(input, account, redirectUri, consent, await waiting.redirects[index]);

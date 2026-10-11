@@ -153,8 +153,10 @@ const allow = (consent: URL, index: number): Record<string, string> => ({
 /**
  * Plays the browser: opens the sign-in link, then answers each consent Google
  * shows as `reply` says, following the loopback's redirects as a browser would.
+ * A consent `reply` answers with undefined is left open, as an operator who
+ * never clicks Allow leaves it.
  */
-function browser(reply: (consent: URL, index: number) => Record<string, string> = allow) {
+function browser(reply: (consent: URL, index: number) => Record<string, string> | undefined = allow) {
   const seen: URL[] = [];
   const presented: string[] = [];
   async function walk(signInLink: string): Promise<void> {
@@ -162,8 +164,10 @@ function browser(reply: (consent: URL, index: number) => Record<string, string> 
     while (next?.startsWith(GOOGLE_AUTHORIZATION_ENDPOINT)) {
       const consent = new URL(next);
       seen.push(consent);
+      const answer = reply(consent, seen.length - 1);
+      if (answer === undefined) return;
       const redirect = new URL(consent.searchParams.get('redirect_uri') ?? '');
-      for (const [key, value] of Object.entries(reply(consent, seen.length - 1))) redirect.searchParams.set(key, value);
+      for (const [key, value] of Object.entries(answer)) redirect.searchParams.set(key, value);
       next = (await fetch(redirect, { redirect: 'manual' })).headers.get('location');
     }
   }
@@ -187,14 +191,14 @@ describe('signing in as the assistant', () => {
       now: () => Date.parse('2026-09-30T12:00:00.000Z'),
     });
 
-    expect(b.presented).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/sign-in$/)]);
+    expect(b.presented).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/sign-in\/[\w-]{32}$/)]);
     expect(b.seen.map((consent) => consent.searchParams.get('scope'))).toEqual(
       GOOGLE_SIGN_IN_CONSENTS.map((scopes) => scopes.join(' ')),
     );
     for (const [index, consent] of b.seen.entries()) {
       expect(consent.origin + consent.pathname).toBe(GOOGLE_AUTHORIZATION_ENDPOINT);
       expect(consent.searchParams.get('client_id')).toBe(CLIENT.client_id);
-      expect(`${consent.searchParams.get('redirect_uri')}/sign-in`).toBe(b.presented[0]);
+      expect(b.presented[0]).toContain(`${consent.searchParams.get('redirect_uri')}/sign-in/`);
       expect(consent.searchParams.get('access_type')).toBe('offline');
       expect(consent.searchParams.get('prompt')).toBe('consent');
       expect(consent.searchParams.get('login_hint')).toBe('juno@example.test');
@@ -370,6 +374,21 @@ describe('signing in as the assistant', () => {
     expect(grant.account).toBe('juno@example.test');
   });
 
+  it("sends the browser on to Google only from this sign-in's own link, so no other local process learns a consent's state", async () => {
+    const g = google();
+    const b = browser();
+    const guessed: number[] = [];
+    const present = vi.fn(async (url: string) => {
+      guessed.push((await fetch(new URL('/sign-in', url), { redirect: 'manual' })).status);
+      void b.walk(url).catch(() => undefined);
+    });
+
+    await expect(
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present, fetch: g.fetch }),
+    ).resolves.toMatchObject({ account: 'juno@example.test' });
+    expect(guessed).toEqual([404]);
+  });
+
   it('never exchanges a code that arrives with another state', async () => {
     const g = google();
     const b = browser(() => ({ code: 'forged-code', state: 'not-the-state' }));
@@ -441,6 +460,23 @@ describe('signing in as the assistant', () => {
         timeoutMs: 50,
       }),
     ).rejects.toMatchObject({ code: 'google_sign_in_timeout' });
+  });
+
+  it('gives up when a later consent is not finished in time, one limit covering the whole sign-in', async () => {
+    const g = google();
+    const b = browser((consent, index) => (index === 0 ? allow(consent, index) : undefined));
+
+    await expect(
+      signInAsAssistant({
+        client: CLIENT,
+        account: 'juno@example.test',
+        present: b.present,
+        fetch: g.fetch,
+        timeoutMs: 300,
+      }),
+    ).rejects.toMatchObject({ code: 'google_sign_in_timeout' });
+    expect(b.seen).toHaveLength(2);
+    expect(g.exchanges.map((exchange) => exchange.get('code'))).toEqual(['auth-code-1']);
   });
 });
 
