@@ -13,6 +13,7 @@
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
  */
+import { REJECT_WITH_REASON_OPTION } from '../../channels/ask-question.js';
 import { requestWake } from '../../request-wake.js';
 import {
   deletePendingApproval,
@@ -27,7 +28,7 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { finalizeReject } from './finalize.js';
-import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
+import { getApprovalHandler, notifyApprovalResolved } from './primitive.js';
 import { armReasonCapture, clampReason } from './reason-capture.js';
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
@@ -77,7 +78,7 @@ async function handleRegisteredApproval(
   // "Reject with reason…" — hold the row and capture the admin's next DM
   // instead of finalizing now. The agent is notified exactly once: after the
   // reason arrives, or after the sweep's timeout if the admin ghosts.
-  if (selectedOption === REJECT_WITH_REASON_VALUE) {
+  if (selectedOption === REJECT_WITH_REASON_OPTION) {
     await armReasonCapture(approval, session, userId);
     return;
   }

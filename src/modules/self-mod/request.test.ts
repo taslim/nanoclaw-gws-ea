@@ -24,7 +24,7 @@ import { createChatSdkBridge } from '../../channels/chat-sdk-bridge.js';
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { createMessagingGroup } from '../../db/messaging-groups.js';
+import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -32,7 +32,8 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import type { Session } from '../../types.js';
-import { escapeInvisibles, requestAddMcpServerHold, validateAddMcpServer } from './request.js';
+import { escapeInvisibles } from '../approvals/request-text.js';
+import { requestAddMcpServerHold, validateAddMcpServer } from './request.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -117,6 +118,19 @@ beforeEach(async () => {
     channel_type: DM_CHANNEL,
     messaging_group_id: 'mg-dm-1',
     resolved_at: now(),
+  });
+  // The asking agent works in the approver's DM, so its card needs no line on where it comes from.
+  await createMessagingGroupAgent({
+    id: 'mga-dm-1',
+    messaging_group_id: 'mg-dm-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'known',
+    ignored_message_policy: 'accumulate',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: now(),
   });
 
   setDeliveryAdapter(fakeAdapter);
@@ -219,7 +233,7 @@ describe('add_mcp_server approval card', () => {
     );
 
     const question = lastQuestion();
-    // Header + opening fence + name + command + args + env + closing fence —
+    // Opening fence + name + command + args + env + closing fence + request —
     // payload content adds no lines.
     expect(question.split('\n').length).toBe(7);
     // Embedded newlines surface as visible \n escapes.

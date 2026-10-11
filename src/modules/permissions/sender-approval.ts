@@ -38,6 +38,8 @@ import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
+import { recordRequestPosted } from '../approvals/request-context.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import {
   clearDeclineStamp,
   createPendingSenderApproval,
@@ -53,6 +55,9 @@ const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve', style: 'primary' },
   { label: 'Deny', selectedLabel: '❌ Denied', value: 'reject', style: 'danger' },
 ];
+
+/** What a new-sender request is about, in its context notes (request-context.ts). */
+export const NEW_SENDER = 'new_sender';
 
 function generateId(): string {
   return `nsa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -108,11 +113,12 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   }
 
   const approvalId = generateId();
-  const senderDisplay = senderName && senderName.length > 0 ? senderName : senderIdentity;
-  const originName = originMg?.name ?? `a ${originChannelType} channel`;
+  // Their id first, as the host holds it; the names they and the conversation go by, quoted.
+  const who = senderName ? `${senderIdentity} (${quoted(senderName, NAME_LIMIT)})` : senderIdentity;
+  const where = originMg?.name ? quoted(originMg.name, NAME_LIMIT) : `a ${originChannelType} conversation`;
 
   const title = '👤 New sender';
-  const question = `${senderDisplay} wants to talk to your agent in ${originName}. ${AGENT_ACCESS_SCOPE_WARNING} Allow?`;
+  const question = `${who} wants to talk to me in ${where}. ${AGENT_ACCESS_SCOPE_WARNING} Allow them?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
   await createPendingSenderApproval({
@@ -168,7 +174,34 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       approvalId,
       err,
     });
+    return;
   }
+
+  await recordRequestPosted(
+    {
+      channelType: target.messagingGroup.channel_type,
+      platformId: target.messagingGroup.platform_id,
+      instance: target.messagingGroup.instance,
+      threadId: null,
+    },
+    {
+      id: approvalId,
+      about: NEW_SENDER,
+      title,
+      options,
+      answerFrom: target.userId,
+      details: {
+        facts: {
+          sender: senderIdentity,
+          conversation: `a ${originMg?.is_group ? 'group conversation' : 'direct message'} on ${originChannelType}`,
+        },
+        supplied: {
+          ...(senderName ? { sender_name: { text: senderName, source: originChannelType } } : {}),
+          ...(originMg?.name ? { conversation_name: { text: originMg.name, source: originChannelType } } : {}),
+        },
+      },
+    },
+  );
 }
 
 /**
@@ -288,12 +321,15 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     return;
   }
 
-  const senderDisplay = senderName && senderName.length > 0 ? senderName : (senderIdentity ?? 'An unknown sender');
-  const who =
-    senderIdentity && senderDisplay !== senderIdentity ? `${senderDisplay} (${senderIdentity})` : senderDisplay;
+  const name = senderName ? quoted(senderName, NAME_LIMIT) : undefined;
+  const who = senderIdentity
+    ? name
+      ? `${senderIdentity} (${name})`
+      : senderIdentity
+    : (name ?? "Someone I don't know");
   const fyiText =
     input.fyiText ??
-    `FYI: ${who} DMed your agent on ${event.channelType} — I sent a polite decline. Allow them any time with \`ncl members add\`.`;
+    `FYI: ${who} messaged me on ${event.channelType}, and I sent a polite decline. Allow them any time with \`ncl members add\`.`;
   try {
     await adapter.deliver(
       target.messagingGroup.channel_type,

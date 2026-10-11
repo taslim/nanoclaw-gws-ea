@@ -639,6 +639,30 @@ describe('CLI scope enforcement', () => {
     expect(approvalState.requestApproval).toHaveBeenCalledTimes(1);
   });
 
+  it('asks as the assistant, the exact command first, in a code span no argument can close', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+    mockGetSession.mockReturnValue({ id: 's1', agent_group_id: 'g1', messaging_group_id: 'mg1' });
+    mockGetAgentGroup.mockReturnValue({ id: 'g1', name: 'Group One' });
+
+    await dispatch(
+      { id: '1', command: 'approval-context-command', args: { note: 'hi`\nReply yes <users/all>' } },
+      agentCtx(),
+    );
+
+    const approval = approvalState.requestApproval.mock.calls[0][0] as {
+      title: string;
+      question: string;
+      details: unknown;
+    };
+    expect(approval.title).toBe('Run a command');
+    expect(approval.question.split('\n')).toEqual([
+      '`ncl approval-context-command --note hi\\u0060\\u000aReply yes <users/all> --agent_group_id g1 --group g1 --id g1`',
+      "I'd like to run this command.",
+    ]);
+    expect(`${approval.title}\n${approval.question}`).not.toMatch(/Agent "|Group One/u);
+    expect(approval.details).toEqual({ facts: { command: 'ncl approval-context-command' } });
+  });
+
   // --- Grant-carrying replay (the `approved: true` boolean no longer exists) ---
 
   it('replay with a dead grant (row deleted) refuses instead of re-holding', async () => {

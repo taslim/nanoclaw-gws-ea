@@ -29,6 +29,7 @@ import {
   type AccessGateResult,
 } from '../../router.js';
 import type { InboundEvent } from '../../channels/adapter.js';
+import type { NormalizedOption } from '../../channels/ask-question.js';
 import { registerResponseHandler, showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
@@ -36,9 +37,11 @@ import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { guard } from '../../guard/index.js';
 import { channelsRegister, sendersAdmit } from './guard.js';
 import { canAccessAgentGroup } from './access.js';
+import { recordRequestOutcome, recordRequestPosted } from '../approvals/request-context.js';
 import {
   AGENT_ACCESS_SCOPE_WARNING,
   buildAgentSelectionOptions,
+  CHANNEL_REGISTRATION,
   CHOOSE_EXISTING_VALUE,
   CONNECT_PREFIX,
   createNewAgentGroup,
@@ -56,7 +59,7 @@ import {
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
-import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
+import { declineAndNotify, NEW_SENDER, requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
 
 // ── Free-text name input state ──
@@ -135,17 +138,34 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
 }
 
 /**
- * An answered approval edited to its outcome, when the channel left it as
+ * An answered approval's outcome: noted in the conversation it was posted in
+ * (request-context.ts), and edited in place when the channel left it as
  * posted: what it asked, and the option the approver chose.
  */
-function showApprovalOutcome(
+async function showApprovalOutcome(
+  about: string,
   answer: ResponsePayload,
   request: { title: string; question: string; options_json: string },
 ): Promise<void> {
-  return showRequestOutcome(getDeliveryAdapter(), answer, {
+  const options = JSON.parse(request.options_json) as NormalizedOption[];
+  await recordRequestOutcome(
+    {
+      channelType: answer.channelType,
+      platformId: answer.platformId,
+      instance: answer.instance,
+      threadId: answer.threadId,
+    },
+    {
+      id: answer.questionId,
+      about,
+      title: request.title,
+      outcome: options.find((option) => option.value === answer.value)?.selectedLabel ?? answer.value,
+    },
+  );
+  await showRequestOutcome(getDeliveryAdapter(), answer, {
     title: request.title,
     question: request.question,
-    options: JSON.parse(request.options_json),
+    options,
   });
 }
 
@@ -346,7 +366,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // Clear the pending row BEFORE re-routing so the gate check on the
     // second attempt doesn't see the in-flight row and short-circuit.
     await deletePendingSenderApproval(row.id);
-    await showApprovalOutcome(payload, row);
+    await showApprovalOutcome(NEW_SENDER, payload, row);
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
@@ -364,7 +384,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     approverId,
   });
   await deletePendingSenderApproval(row.id);
-  await showApprovalOutcome(payload, row);
+  await showApprovalOutcome(NEW_SENDER, payload, row);
   return true;
 }
 
@@ -463,7 +483,7 @@ async function wireApprovedChannel(
   }
 
   await deletePendingChannelApproval(row.messaging_group_id);
-  if (answer) await showApprovalOutcome(answer, row);
+  if (answer) await showApprovalOutcome(CHANNEL_REGISTRATION, answer, row);
 
   try {
     await routeInbound(event);
@@ -520,7 +540,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   if (payload.value === REJECT_VALUE) {
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     await deletePendingChannelApproval(row.messaging_group_id);
-    await showApprovalOutcome(payload, row);
+    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
@@ -546,7 +566,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     if (!adapter) return true;
 
     // This request is answered; the choice of an agent is asked next, under the same question id.
-    await showApprovalOutcome(payload, row);
+    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
     const agentGroups = await getAllAgentGroups();
     const options = await buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
@@ -574,7 +594,17 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         messagingGroupId: row.messaging_group_id,
         err,
       });
+      return true;
     }
+    await recordRequestPosted(
+      {
+        channelType: approverDm.channel_type,
+        platformId: approverDm.platform_id,
+        instance: approverDm.instance,
+        threadId: null,
+      },
+      { id: row.messaging_group_id, about: CHANNEL_REGISTRATION, title, options, answerFrom: row.approver_user_id },
+    );
     return true;
   }
 
@@ -599,7 +629,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       });
       return true;
     }
-    await showApprovalOutcome(payload, row);
+    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
     awaitingNameInput.set(row.approver_user_id, {
       channelMgId: row.messaging_group_id,
       dmChannelType: approverDm.channel_type,

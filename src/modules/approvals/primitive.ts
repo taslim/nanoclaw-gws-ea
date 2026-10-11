@@ -21,7 +21,14 @@
  * exposing just user-roles/user-dms) is more churn than it's worth. Revisit
  * if either module becomes genuinely optional (see REFACTOR_PLAN open q #3).
  */
-import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
+import {
+  APPROVE_OPTION,
+  normalizeOptions,
+  REJECT_OPTION,
+  REJECT_WITH_REASON_OPTION,
+  type NormalizedOption,
+  type RawOption,
+} from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createPendingApproval, deletePendingApproval, getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
@@ -31,24 +38,22 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
-
-/**
- * Card value for the "Reject with reason…" button. Selecting it doesn't
- * finalize the reject — it holds the row and captures the approver's next DM
- * as a one-line reason relayed to the requesting agent. See reason-capture.ts.
- */
-export const REJECT_WITH_REASON_VALUE = 'reject_with_reason';
+import { combineDetails, recordRequestOutcome, recordRequestPosted, type RequestDetails } from './request-context.js';
+import { requestOrigin } from './request-text.js';
 
 /**
  * Three-button approval UI. Plain Reject is the instant fast path; "Reject with
- * reason…" opts into the reason-capture flow. Shared by every module approval
- * (create_agent, install_packages, add_mcp_server). Gateway approvals use the
- * core gateway coordinator's two-button decision flow.
+ * reason…" opts into the reason-capture flow, which holds the row and captures
+ * the approver's next DM as a one-line reason relayed to the requesting agent
+ * (reason-capture.ts). Where requests are text, the reason follows the no.
+ * Shared by every module approval (create_agent, install_packages,
+ * add_mcp_server). Gateway approvals use the core gateway coordinator's
+ * two-button decision flow.
  */
 const APPROVAL_OPTIONS: RawOption[] = [
-  { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
-  { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
-  { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: REJECT_WITH_REASON_VALUE },
+  { label: 'Approve', selectedLabel: '✅ Approved', value: APPROVE_OPTION, style: 'primary' },
+  { label: 'Reject', selectedLabel: '❌ Rejected', value: REJECT_OPTION, style: 'danger' },
+  { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: REJECT_WITH_REASON_OPTION },
 ];
 
 // ── Approval handler registry ──
@@ -103,6 +108,8 @@ export interface ApprovalResolvedEvent {
   outcome: 'approve' | 'reject';
   /** Namespaced user ID (`<channel>:<handle>`) of the resolving admin. Empty string if unknown. */
   userId: string;
+  /** The reason given with a rejection. */
+  reason?: string;
 }
 
 export type ApprovalResolvedHandler = (event: ApprovalResolvedEvent) => Promise<void> | void;
@@ -113,8 +120,13 @@ export function registerApprovalResolvedHandler(handler: ApprovalResolvedHandler
   approvalResolvedHandlers.push(handler);
 }
 
-/** Fire every registered approval-resolved callback. Called by the response handler. */
+/**
+ * Note the outcome in the conversation the request was posted in
+ * (request-context.ts), then fire every registered approval-resolved
+ * callback. Called by the response handler and finalizeReject.
+ */
 export async function notifyApprovalResolved(event: ApprovalResolvedEvent): Promise<void> {
+  await recordApprovalOutcome(event);
   for (const handler of approvalResolvedHandlers) {
     try {
       await handler(event);
@@ -128,6 +140,26 @@ export async function notifyApprovalResolved(event: ApprovalResolvedEvent): Prom
       });
     }
   }
+}
+
+async function recordApprovalOutcome({ approval, outcome, reason }: ApprovalResolvedEvent): Promise<void> {
+  if (!approval.channel_type || !approval.platform_id) return;
+  const options = JSON.parse(approval.options_json) as NormalizedOption[];
+  await recordRequestOutcome(
+    {
+      channelType: approval.channel_type,
+      platformId: approval.platform_id,
+      instance: approval.instance,
+      threadId: null,
+    },
+    {
+      id: approval.approval_id,
+      about: approval.action,
+      title: approval.title,
+      outcome: options.find((option) => option.value === outcome)?.selectedLabel ?? outcome,
+      reason,
+    },
+  );
 }
 
 // ── Approver picking ──
@@ -212,10 +244,21 @@ export interface RequestApprovalOptions {
   action: string;
   /** JSON-serializable opaque payload. Carried on the pending_approvals row, handed to the handler on approve. */
   payload: Record<string, unknown>;
-  /** Card title shown to the admin. */
+  /** Card title shown to the admin, in the assistant's voice (request-text.ts). */
   title: string;
-  /** Card body shown to the admin. */
+  /**
+   * Card body shown to the admin, in the assistant's voice: what the host
+   * holds first, anything someone else supplied quoted (request-text.ts).
+   * A request from an agent that does not work in the approver's
+   * conversation ends with where it comes from.
+   */
   question: string;
+  /**
+   * What the agent in the approver's conversation reads about the request
+   * besides its title and answers (request-context.ts). Never the payload,
+   * which may hold secrets.
+   */
+  details?: RequestDetails;
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
 }
@@ -227,7 +270,7 @@ export interface RequestApprovalOptions {
  * approval handler for this action via the response dispatcher.
  */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<void> {
-  const { session, action, payload, title, question, agentName, approverUserId } = opts;
+  const { session, action, payload, title, agentName, approverUserId } = opts;
 
   const approvers = approverUserId ? [approverUserId] : await pickApprover(session.agent_group_id);
   if (approvers.length === 0) {
@@ -244,8 +287,11 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     return;
   }
 
+  const asking = await requestOrigin(session.agent_group_id, origin, target.messagingGroup);
+  const question = asking ? `${opts.question}\n\n${asking.line}` : opts.question;
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
+  const approver = approverUserId ?? target.userId;
   await createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
@@ -261,7 +307,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     options_json: JSON.stringify(normalizedOptions),
     // The DM'd approver is the identity this card was routed to; recording it
     // makes resolution exact — only that user may decide the row.
-    approver_user_id: approverUserId ?? target.userId ?? null,
+    approver_user_id: approver,
   });
 
   const adapter = getDeliveryAdapter();
@@ -290,6 +336,22 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
       await notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
       return;
     }
+    await recordRequestPosted(
+      {
+        channelType: target.messagingGroup.channel_type,
+        platformId: target.messagingGroup.platform_id,
+        instance: target.messagingGroup.instance,
+        threadId: null,
+      },
+      {
+        id: approvalId,
+        about: action,
+        title,
+        options: normalizedOptions,
+        answerFrom: approver,
+        details: combineDetails(opts.details, asking?.details),
+      },
+    );
   }
 
   log.info('Approval requested', { action, approvalId, agentName, approver: target.userId });

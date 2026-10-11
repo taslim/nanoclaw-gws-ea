@@ -146,6 +146,7 @@ function stranger(text: string) {
       kind: 'chat' as const,
       content: JSON.stringify({
         senderId: 'tg:stranger',
+        sender: 'Stranger',
         senderName: 'Stranger',
         text,
       }),
@@ -176,7 +177,10 @@ describe('unknown-sender request_approval flow', () => {
     const payload = JSON.parse(content as string);
     expect(payload.type).toBe('ask_question');
     expect(payload.questionId).toMatch(/^nsa-/);
-    expect(payload.question).toContain(AGENT_ACCESS_SCOPE_WARNING);
+    expect(payload.title).toBe('👤 New sender');
+    expect(payload.question).toBe(
+      `tg:stranger ("Stranger") wants to talk to me in "Group Chat". ${AGENT_ACCESS_SCOPE_WARNING} Allow them?`,
+    );
 
     const { getDb } = await import('../../db/connection.js');
     const rows = await getDb().all('SELECT * FROM pending_sender_approvals');
@@ -421,5 +425,88 @@ describe('unknown-sender approval answered on a channel that left it as posted',
     expect(editsSinceRequest().map((edit) => (edit.content.terminalCard as { resolution: string }).resolution)).toEqual(
       ['❌ Denied'],
     );
+  });
+});
+
+describe("a new sender in the context of the agent that works in the approver's DM", () => {
+  // ag-1 also works in the owner's DM, under one shared session, as main does.
+  let inboundDb: string;
+
+  beforeEach(async () => {
+    const { resolveSession, sessionDir } = await import('../../session-manager.js');
+    await createMessagingGroupAgent({
+      id: 'mga-dm-owner',
+      messaging_group_id: 'mg-dm-owner',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+    const { session } = await resolveSession('ag-1', 'mg-dm-owner', null, 'agent-shared');
+    inboundDb = `${sessionDir('ag-1', session.id)}/inbound.db`;
+  });
+
+  /** The quiet notes in ag-1's session, as fields. */
+  async function notes(): Promise<Array<Record<string, unknown>>> {
+    const Database = (await import('better-sqlite3')).default;
+    const inbound = new Database(inboundDb, { readonly: true });
+    try {
+      return (
+        inbound.prepare('SELECT trigger, content FROM messages_in WHERE trigger = 0 ORDER BY seq').all() as Array<{
+          content: string;
+        }>
+      ).map(
+        (row) =>
+          JSON.parse((JSON.parse(row.content) as { text: string }).text.split('\n')[1]!) as Record<string, unknown>,
+      );
+    } finally {
+      inbound.close();
+    }
+  }
+
+  it('notes the request, holding the names only as marked fields, and then its outcome', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    await expectAsyncDelivery(() => routeInbound(stranger('hello')));
+    const { getDb } = await import('../../db/connection.js');
+    const pending = (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!;
+
+    const [posted] = await notes();
+    expect(posted).toMatchObject({
+      request: pending.id,
+      about: 'new_sender',
+      title: '👤 New sender',
+      answer_from: 'telegram:owner',
+      answers: ['Allow', 'Deny'],
+      details: { sender: 'tg:stranger', conversation: 'a group conversation on telegram' },
+    });
+    const details = posted!.details as Record<string, string>;
+    expect(details.sender_name).toMatch(
+      /^<<<EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\nSource: telegram\n---\nStranger\n/u,
+    );
+    expect(details.conversation_name).toMatch(/\n---\nGroup Chat\n<<<END_EXTERNAL_UNTRUSTED_CONTENT/u);
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'reject',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    expect((await notes()).at(-1)).toEqual({
+      request: pending.id,
+      about: 'new_sender',
+      title: '👤 New sender',
+      outcome: '❌ Denied',
+    });
   });
 });

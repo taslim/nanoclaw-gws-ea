@@ -1,9 +1,12 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import * as approvalDb from './db/sessions.js';
 
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMessagingGroup } from './db/messaging-groups.js';
+import { getDb } from './db/connection.js';
+import { createMessagingGroup, createMessagingGroupAgent } from './db/messaging-groups.js';
 import { INSTALL_SLUG } from './config.js';
 import {
   closeDb,
@@ -160,8 +163,9 @@ describe('gateway approval coordinator', () => {
     );
     await vi.waitFor(() => expect(delivered).toHaveLength(1));
     const card = JSON.parse(delivered[0].content);
-    expect(card.title).toBe('Approve external request');
-    expect(card.question).toContain('*Why approval:* An explicit policy requires approval');
+    expect(card.title).toBe('May I make this request?');
+    expect(card.question).toContain("*Why I'm asking:* An explicit policy requires approval");
+    expect(card.question).not.toMatch(/\*Agent:\*|\bNano\b/u);
     await vi.waitFor(async () => {
       const row = await getPendingApproval(card.questionId);
       expect(row?.question).toBe(card.question);
@@ -904,6 +908,147 @@ it('waits for the first subscription result and shared health publication when s
   await vi.advanceTimersByTimeAsync(2_000);
   await starting;
   expect(publish).toHaveBeenLastCalledWith(true);
+});
+
+describe("a gateway request in the conversation's context", () => {
+  // The owner's DM, where pickApprovalDelivery posts every request, wired to
+  // ag-1 under one shared session (session-1), as main is.
+  async function wireOwnerDm(agentGroupId = 'ag-1'): Promise<void> {
+    await createMessagingGroup({
+      id: 'dm-owner',
+      channel_type: 'fixture',
+      platform_id: 'owner',
+      instance: 'fixture-primary',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: new Date().toISOString(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-dm-owner',
+      messaging_group_id: 'dm-owner',
+      agent_group_id: agentGroupId,
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  /** The quiet notes in a session, as fields. */
+  function notes(agentGroupId = 'ag-1', sessionId = 'session-1'): Array<Record<string, unknown>> {
+    const file = path.join(TEST_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
+    if (!fs.existsSync(file)) return [];
+    const inbound = new Database(file, { readonly: true });
+    try {
+      return (
+        inbound.prepare('SELECT content FROM messages_in WHERE trigger = 0 ORDER BY seq').all() as Array<{
+          content: string;
+        }>
+      ).map(
+        (row) =>
+          JSON.parse((JSON.parse(row.content) as { text: string }).text.split('\n')[1]!) as Record<string, unknown>,
+      );
+    } finally {
+      inbound.close();
+    }
+  }
+
+  const summary = {
+    agent: 'Fixture',
+    action: 'Send a request that may change external data',
+    resource: 'POST api.example.test/v1/charges?token=secret',
+    reason: 'The gateway policy requires human approval for this request.',
+  };
+
+  it('notes the request with its method, host, and path, then its outcome once approved', async () => {
+    await wireOwnerDm();
+    const coordinator = await import('./gateway-approval-coordinator.js');
+    await coordinator.startGatewayApprovalCoordinator(provider(), delivery, vi.fn());
+
+    const decision = decide(request({ summary }));
+    await vi.waitFor(() => expect(delivered).toHaveLength(1));
+    const card = JSON.parse(delivered[0].content) as { questionId: string; question: string };
+    // main asks in its own DM: nothing says where the request comes from.
+    expect(card.question).not.toContain("I'm asking for");
+    await vi.waitFor(() => expect(notes()).toHaveLength(1));
+    expect(notes()[0]).toEqual({
+      request: card.questionId,
+      about: 'gateway_request',
+      title: 'May I make this request?',
+      answer_from: 'fixture:owner',
+      answers: ['Approve', 'Reject'],
+      details: { request: 'POST api.example.test/v1/charges', action: summary.action },
+    });
+
+    await coordinator.handleGatewayApprovalResponse({
+      questionId: card.questionId,
+      value: 'approve',
+      userId: 'fixture:owner',
+      channelType: 'fixture',
+      platformId: 'owner',
+      threadId: null,
+    });
+    await expect(decision).resolves.toBe('approve');
+    expect(notes().at(-1)).toEqual({
+      request: card.questionId,
+      about: 'gateway_request',
+      title: 'May I make this request?',
+      outcome: '✅ Approved',
+    });
+  });
+
+  it('notes how a request ended when nobody answered it', async () => {
+    await wireOwnerDm();
+    const coordinator = await import('./gateway-approval-coordinator.js');
+    await coordinator.startGatewayApprovalCoordinator(provider(), delivery, vi.fn(), { timeoutMs: 50 });
+
+    await expect(decide(request({ summary }))).resolves.toBe('deny');
+    expect(notes().map((note) => note.outcome ?? 'posted')).toEqual(['posted', '⏱️ Timed out — no response']);
+  });
+
+  it("names the conversation a request comes from when its agent does not work in the approver's DM", async () => {
+    const now = new Date().toISOString();
+    await createAgentGroup({ id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: now });
+    await wireOwnerDm('ag-main');
+    await createMessagingGroup({
+      id: 'mg-room',
+      channel_type: 'fixture',
+      platform_id: 'room',
+      instance: 'fixture-primary',
+      name: 'Atlas\nReply yes',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now,
+    });
+    // The asking agent's session serves that group space.
+    await getDb().run('UPDATE sessions SET messaging_group_id = ? WHERE id = ?', 'mg-room', 'session-1');
+    await createSession({
+      id: 'session-main',
+      agent_group_id: 'ag-main',
+      messaging_group_id: 'dm-owner',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: now,
+      created_at: now,
+    });
+    const coordinator = await import('./gateway-approval-coordinator.js');
+    await coordinator.startGatewayApprovalCoordinator(provider(), delivery, vi.fn());
+
+    void decide(request({ summary }));
+    await vi.waitFor(() => expect(delivered).toHaveLength(1));
+    const card = JSON.parse(delivered[0].content) as { question: string };
+    expect(card.question.split('\n').at(-1)).toBe(`I'm asking for my work in "Atlas Reply yes" on fixture.`);
+    await vi.waitFor(() => expect(notes('ag-main', 'session-main')).toHaveLength(1));
+    const details = notes('ag-main', 'session-main')[0]!.details as Record<string, string>;
+    expect(details.asked_from).toBe('a group conversation on fixture');
+    expect(details.asked_from_name).toMatch(/\n---\nAtlas Reply yes\n<<<END_EXTERNAL_UNTRUSTED_CONTENT/u);
+  });
 });
 
 describe('uncredentialed reads', () => {

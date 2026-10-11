@@ -1,4 +1,4 @@
-import { gatewayApprovalPresentation } from './gateway-approval-presentation.js';
+import { gatewayApprovalPresentation, gatewayRequestResource } from './gateway-approval-presentation.js';
 import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getProviderHostContract } from './provider-contracts/index.js';
@@ -28,6 +28,13 @@ import {
 } from './gateway-providers/index.js';
 import { log } from './log.js';
 import { pickApprovalDelivery, pickApprover } from './modules/approvals/primitive.js';
+import {
+  combineDetails,
+  recordRequestOutcome,
+  recordRequestPosted,
+  type RequestDetails,
+} from './modules/approvals/request-context.js';
+import { requestOrigin } from './modules/approvals/request-text.js';
 import { isAuthorizedApprovalClick } from './modules/approvals/response-handler.js';
 import { registerResponseHandler, type ResponsePayload } from './response-registry.js';
 import type { PendingApproval } from './types.js';
@@ -429,9 +436,8 @@ async function processGatewayRequest(
 
     const approvers = request.approverUserId ? [request.approverUserId] : await pickApprover(request.agentGroupId);
     if (approvers.length === 0) return unavailableDecision();
-    const originChannelType = session?.messaging_group_id
-      ? ((await getMessagingGroup(session.messaging_group_id))?.channel_type ?? '')
-      : '';
+    const origin = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+    const originChannelType = origin?.channel_type ?? '';
     const policyGroup = request.delivery ? await getMessagingGroup(request.delivery.messagingGroupId) : undefined;
     const target = request.delivery
       ? policyGroup && request.approverUserId
@@ -445,8 +451,10 @@ async function processGatewayRequest(
     )
       return unavailableDecision();
 
-    if (!current()) return unavailableDecision();
     const presentation = gatewayApprovalPresentation(request);
+    const asking = await requestOrigin(request.agentGroupId, origin, target.messagingGroup);
+    const question = asking ? `${presentation.question}\n\n${asking.line}` : presentation.question;
+    if (!current()) return unavailableDecision();
     const approvalId = `ga-${randomBytes(10).toString('hex')}`;
     const sendCard = () =>
       adapter!.deliver(
@@ -459,7 +467,7 @@ async function processGatewayRequest(
           requirePresentation: Boolean(request.displayFields),
           questionId: approvalId,
           title: presentation.title,
-          question: presentation.question,
+          question,
           options: OPTIONS,
         }),
         undefined,
@@ -485,22 +493,42 @@ async function processGatewayRequest(
       expires_at: new Date(deadline).toISOString(),
       status: 'pending' as const,
       title: presentation.title,
-      question: presentation.question,
+      question,
       options_json: JSON.stringify(normalizeOptions(OPTIONS)),
       approver_user_id: target.userId,
     };
+    let messageId: string | undefined;
     if (approvalSource?.durable) {
       if (!(await createPendingApproval(row))) return 'unavailable';
-      const messageId = await sendCard();
+      messageId = await sendCard();
       if (!messageId) {
         await expireApproval(approvalId, 'no response');
         return 'unavailable';
       }
       await bindPendingApprovalMessage(approvalId, messageId);
     } else {
-      const messageId = await sendCard();
+      messageId = await sendCard();
       if (!(await createPendingApproval({ ...row, platform_message_id: messageId ?? null })))
         return unavailableDecision();
+    }
+    // A request is noted where it was posted; one with no message to edit gets no outcome note either.
+    if (messageId) {
+      await recordRequestPosted(
+        {
+          channelType: target.messagingGroup.channel_type,
+          platformId: target.messagingGroup.platform_id,
+          instance: target.messagingGroup.instance,
+          threadId: request.delivery?.threadId ?? null,
+        },
+        {
+          id: approvalId,
+          about: GATEWAY_APPROVAL_ACTION,
+          title: presentation.title,
+          options: normalizeOptions(OPTIONS),
+          answerFrom: target.userId,
+          details: combineDetails(gatewayRequestDetails(request), asking?.details),
+        },
+      );
     }
 
     if (!current()) {
@@ -512,6 +540,18 @@ async function processGatewayRequest(
     log.error('Gateway approval request failed closed', { gatewayProvider: providerKind, requestId: request.id, err });
     return unavailableDecision();
   }
+}
+
+/** What the host holds about a gateway request: where it goes, and what the gateway calls it. */
+function gatewayRequestDetails(request: GatewayApprovalRequest): RequestDetails {
+  const facts: Record<string, string> = {};
+  if (request.summary) {
+    facts.request = gatewayRequestResource(request.summary.resource);
+    facts.action = request.summary.action;
+  } else if (request.destination) {
+    facts.request = [request.destination.method, request.destination.host].filter(Boolean).join(' ');
+  }
+  return { facts };
 }
 
 function armPending(
@@ -587,7 +627,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
       if (decision === 'approve' && !delivered) {
         await editGatewayApprovalCard(
           approval,
-          '✅ Approved — recorded, but the original request ended when the host restarted. Ask the agent to retry the action.',
+          '✅ Approved, but the request ended when I restarted. Ask me to retry it.',
         );
       }
     }
@@ -645,20 +685,26 @@ export async function editExpiredGatewayApprovalCard(
     reason === 'no response'
       ? '⏱️ Timed out — no response'
       : reason === 'host restarted'
-        ? '⏱️ Timed out — host restarted before resolution'
+        ? '⏱️ Timed out — I restarted before it was answered'
         : reason === 'request changed'
           ? '❌ Expired — request changed'
           : '❌ Denied — approval bridge failed';
   await editGatewayApprovalCard(row, resolution);
 }
 
+/** Show a request's outcome in place, and note it in the conversation it was posted in (request-context.ts). */
 async function editGatewayApprovalCard(row: PendingApproval, resolution: string): Promise<void> {
   if (!adapter || !row.platform_message_id || !row.channel_type || !row.platform_id) return;
+  const threadId = (JSON.parse(row.payload) as { threadId?: string | null }).threadId ?? null;
+  await recordRequestOutcome(
+    { channelType: row.channel_type, platformId: row.platform_id, instance: row.instance, threadId },
+    { id: row.approval_id, about: row.action, title: row.title, outcome: resolution },
+  );
   try {
     await adapter.deliver(
       row.channel_type,
       row.platform_id,
-      JSON.parse(row.payload).threadId ?? null,
+      threadId,
       'chat-sdk',
       JSON.stringify({
         questionId: row.approval_id,

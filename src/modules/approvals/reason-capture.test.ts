@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent } from '../../channels/adapter.js';
+import { REJECT_WITH_REASON_OPTION } from '../../channels/ask-question.js';
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import {
@@ -27,7 +28,6 @@ import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.
 import { writeSessionMessage } from '../../session-manager.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
-import { REJECT_WITH_REASON_VALUE } from './primitive.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -94,7 +94,7 @@ async function clickRejectWithReason(approvalId: string): Promise<void> {
   const { handleApprovalsResponse } = await import('./response-handler.js');
   await handleApprovalsResponse({
     questionId: approvalId,
-    value: REJECT_WITH_REASON_VALUE,
+    value: REJECT_WITH_REASON_OPTION,
     userId: 'admin-1',
     channelType: DM_CHANNEL,
     platformId: DM_PLATFORM,

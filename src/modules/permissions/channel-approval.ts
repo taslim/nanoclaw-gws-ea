@@ -56,6 +56,8 @@ import { log } from '../../log.js';
 import type { InboundEvent, ResolvedConversation } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
+import { recordRequestPosted, type SuppliedText } from '../approvals/request-context.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
@@ -65,10 +67,12 @@ export const CONNECT_PREFIX = 'connect:';
 export const NEW_AGENT_VALUE = 'new_agent';
 export const CHOOSE_EXISTING_VALUE = 'choose_existing';
 export const REJECT_VALUE = 'reject';
+/** What a channel registration request is about, in its context notes (request-context.ts). */
+export const CHANNEL_REGISTRATION = 'channel_registration';
 // This deliberately does not claim "the same authority as you": approved members cannot run admin commands,
 // which command-gate.ts gates on hasAdminPrivilege, but it names the real shared context, workspace, memory, and tool blast radius.
 export const AGENT_ACCESS_SCOPE_WARNING =
-  "Anyone approved here can interact with the agent and potentially access anything the agent can access, including other conversations' context, its workspace files and memory, and any connected tools.";
+  "Anyone you approve here can talk to me and may reach anything I can, including what was said in other conversations, my files and memory, and the tools I'm connected to.";
 
 // ── Channel-card interceptor seam (B2/D24) ──
 // A channel module can claim the escalation for its own channel type before
@@ -149,34 +153,56 @@ async function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: 
   return options;
 }
 
+/** The people in a group chat besides whoever wrote, by name. */
+function otherParticipants(
+  senderName: string | undefined,
+  senderId: string | undefined,
+  resolvedConversation: ResolvedConversation | null,
+): string[] {
+  const participantNames = resolvedConversation?.participantNames ?? [];
+  const participantIds = resolvedConversation?.participantIds;
+  const useParticipantIds = Boolean(senderId) && participantIds?.length === participantNames.length;
+  return participantNames.filter((name, index) =>
+    useParticipantIds ? participantIds![index] !== senderId : name.toLowerCase() !== senderName?.toLowerCase(),
+  );
+}
+
+/** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted. */
+function describeSender(senderUserId: string | undefined, senderName: string | undefined): string {
+  const name = senderName ? quoted(senderName, NAME_LIMIT) : undefined;
+  if (!senderUserId) return name ?? 'Someone';
+  return name ? `${senderUserId} (${name})` : senderUserId;
+}
+
 function buildQuestionText(
   conversationType: ResolvedConversation['type'],
   senderName: string | undefined,
-  senderId: string | undefined,
+  senderUserId: string | undefined,
+  participants: readonly string[],
   channelName: string | null,
   channelType: string,
   ruleNote: string | null,
-  resolvedConversation: ResolvedConversation | null,
 ): string {
-  const who = senderName ?? 'Someone';
-  const note = ruleNote ? ` If connected, the agent ${ruleNote}.` : '';
+  const who = describeSender(senderUserId, senderName);
+  const note = ruleNote ? ` If you connect it, I ${ruleNote}.` : '';
   if (conversationType === 'channel') {
-    const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
-    return `${who} mentioned your bot in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
+    const where = channelName ? `${quoted(channelName, NAME_LIMIT)} on ${channelType}` : `a ${channelType} channel`;
+    return `${who} mentioned me in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
   }
   if (conversationType === 'group_dm') {
-    const participantNames = resolvedConversation?.participantNames ?? [];
-    const participantIds = resolvedConversation?.participantIds;
-    const useParticipantIds = Boolean(senderId) && participantIds?.length === participantNames.length;
-    const otherParticipants = participantNames.filter((name, index) =>
-      useParticipantIds ? participantIds![index] !== senderId : name.toLowerCase() !== senderName?.toLowerCase(),
-    );
-    const participants = formatParticipantList(otherParticipants);
-    const withParticipants = participants ? ` with ${participants}` : '';
-    return `${who} mentioned your bot in a group chat${withParticipants} on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this group chat?`;
+    const others = formatParticipantList(participants.map((name) => quoted(name, NAME_LIMIT)));
+    const withParticipants = others ? ` with ${others}` : '';
+    return `${who} mentioned me in a group chat${withParticipants} on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this group chat?`;
   }
-  return `${who} sent your bot a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
+  return `${who} sent me a direct message on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
 }
+
+/** The kind of conversation a registration asks about, in words. */
+const CONVERSATION_KINDS: Record<ResolvedConversation['type'], string> = {
+  channel: 'a channel',
+  group_dm: 'a group chat',
+  direct: 'a direct message',
+};
 
 function formatParticipantList(names: string[]): string {
   if (names.length < 2) return names[0] ?? '';
@@ -316,14 +342,19 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     // non-critical
   }
 
+  // The sender's id as the host namespaces it (`<channel>:<handle>`).
+  const senderUserId =
+    senderId && originChannelType && !senderId.includes(':') ? `${originChannelType}:${senderId}` : senderId;
   const conversationType = resolvedConversation?.type ?? (isGroup ? 'channel' : 'direct');
   const channelName = originMg?.name ?? null;
+  const participants =
+    conversationType === 'group_dm' ? otherParticipants(senderName, senderId, resolvedConversation) : [];
   const title =
     conversationType === 'channel'
-      ? '📣 Bot mentioned in new channel'
+      ? '📣 Mentioned in a new channel'
       : conversationType === 'group_dm'
-        ? '👥 Bot mentioned in new group chat'
-        : '💬 New direct message';
+        ? '👥 Mentioned in a new group chat'
+        : '💬 A new direct message';
   // Preview the engage rule an approval would create. The reference group's
   // name only feeds {name} pattern substitution — a best-effort preview when
   // the approver ends up picking a different agent.
@@ -336,11 +367,11 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const question = buildQuestionText(
     conversationType,
     senderName,
-    senderId,
+    senderUserId,
+    participants,
     channelName,
     originChannelType,
     ruleNote,
-    resolvedConversation,
   );
   const options = normalizeOptions(await buildApprovalOptions(agentGroups, delivery.userId));
 
@@ -384,7 +415,35 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     });
   } catch (err) {
     log.error('Channel registration card delivery failed', { messagingGroupId, err });
+    return;
   }
+
+  const supplied: Record<string, SuppliedText> = {};
+  if (senderName) supplied.sender_name = { text: senderName, source: originChannelType };
+  if (channelName) supplied.conversation_name = { text: channelName, source: originChannelType };
+  if (participants.length > 0) supplied.participants = { text: participants.join(', '), source: originChannelType };
+  await recordRequestPosted(
+    {
+      channelType: delivery.messagingGroup.channel_type,
+      platformId: delivery.messagingGroup.platform_id,
+      instance: delivery.messagingGroup.instance,
+      threadId: null,
+    },
+    {
+      id: messagingGroupId,
+      about: CHANNEL_REGISTRATION,
+      title,
+      options,
+      answerFrom: delivery.userId,
+      details: {
+        facts: {
+          ...(senderUserId ? { sender: senderUserId } : {}),
+          conversation: `${CONVERSATION_KINDS[conversationType]} on ${originChannelType}`,
+        },
+        supplied,
+      },
+    },
+  );
 }
 
 // ── Helpers for the response handler (index.ts) ──
