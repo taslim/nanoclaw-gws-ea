@@ -881,6 +881,39 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     expect(removal.order).toEqual(['nanoclaw', 'chat-subscription', 'gcp', 'onecli']);
     await expectGone(paths, input);
   });
+
+  it('counts the subscription removed, and deletes the project, only once Google shows none left after its deletion', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    await signIn(paths, input);
+    const removal = world(input);
+    removal.gcloud.owned();
+    removal.google.events.seedSubscription();
+    // A host still running makes the assistant a new subscription as soon as its own is deleted.
+    let hostRunning = true;
+    const fetch: typeof globalThis.fetch = async (request, init) => {
+      const response = await removal.dependencies.fetch!(request, init);
+      if (init?.method === 'DELETE' && hostRunning) removal.google.events.seedSubscription();
+      return response;
+    };
+    const dependencies = { ...removal.dependencies, fetch };
+
+    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
+      code: 'chat_subscription_removal_incomplete',
+    });
+    expect(removal.order).toEqual(['nanoclaw', 'chat-subscription']);
+    expect(removal.gcloud.mutations).toEqual([]);
+
+    hostRunning = false;
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
+
+    expect(removal.google.events.subscriptions.size).toBe(0);
+    expect(outcome).toEqual({
+      removed: ['nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'],
+      abandoned: [],
+    });
+    await expectGone(paths, input);
+  });
 });
 
 describe('removal after an update or rollback', () => {

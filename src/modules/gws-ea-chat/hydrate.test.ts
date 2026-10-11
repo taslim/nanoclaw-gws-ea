@@ -36,7 +36,7 @@ function event(type: string, data: Record<string, unknown>): WorkspaceEvent {
   return {
     messageId: 'pubsub-1',
     type,
-    source: '//chat.googleapis.com/spaces/-',
+    source: '//workspaceevents.googleapis.com/subscriptions/chat-1',
     subject: `//chat.googleapis.com/${DM}`,
     time: '2026-10-10T17:00:00Z',
     data,

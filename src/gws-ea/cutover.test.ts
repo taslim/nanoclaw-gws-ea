@@ -274,7 +274,8 @@ function signInNeeded(instanceId: string): string {
   );
 }
 
-describe('the serving gate: a release serves once its Google Chat receives (KTD12)', () => {
+// Each case builds a git-backed machine and assistant, as the update and rollback cases below do.
+describe('the serving gate: a release serves once its Google Chat receives (KTD12)', { timeout: 90_000 }, () => {
   /** Run the gate on the assistant's live release, as an update or rollback runs it once the release started. */
   async function verifyLive(
     host: Machine,

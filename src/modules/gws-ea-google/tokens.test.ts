@@ -5,7 +5,6 @@ import {
   AGENT_GOOGLE_SERVICES,
   GOOGLE_SIGN_IN_SCOPES,
   googleCredentialFor,
-  HOST_GOOGLE_SERVICES,
   type GoogleGrant,
 } from './grant.js';
 import {
@@ -332,12 +331,6 @@ describe("the host's token source", () => {
 
   /** Past the point where a token minted at `minted` is renewed. */
   const renewalAfter = (minted: number): number => minted + 3_599_000 - RENEW_BEFORE_EXPIRY_MS + 1;
-
-  it('mints the Chat token from the grant with exactly the chat service scopes', async () => {
-    const world = numbered();
-    await expect(source(world, () => GRANT).accessToken('chat')).resolves.toBe('ya29.host-1');
-    expect(world.asked).toEqual([HOST_GOOGLE_SERVICES.chat.scopes.join(' ')]);
-  });
 
   it('holds each token in memory, renewing it only near expiry', async () => {
     const world = numbered();

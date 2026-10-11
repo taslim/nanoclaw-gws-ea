@@ -16,8 +16,6 @@ import {
   type RecordedRequest,
 } from './testing/fake-google-events.js';
 
-const BATCH_CREATED = 'google.workspace.chat.message.v1.batchCreated';
-
 let fake: FakeGoogleEvents;
 let health: ChatHealthRecorder;
 let consumer: PullConsumer | undefined;
@@ -154,39 +152,6 @@ describe('acking', () => {
     await vi.advanceTimersByTimeAsync(ACK_DEADLINE_SECONDS * 1_000);
     await until(() => fake.acks(id) === 1);
     expect(attempts).toBe(2);
-  });
-
-  it('acks a batch event only once every part is routed; its routed parts are dropped when it comes again', async () => {
-    const routed: string[] = [];
-    const failOnce = new Set(['spaces/AAAAjuno/messages/remy.7']);
-    start(async (event) => {
-      const parts = (event.data.messages as { message: { name: string } }[]).map((part) => part.message.name);
-      for (const name of parts) {
-        // The router's dedupe: a part already routed is dropped.
-        if (routed.includes(name)) continue;
-        if (failOnce.delete(name)) throw new Error('Chat answered 503');
-        routed.push(name);
-      }
-    });
-    const id = fake.publish({
-      type: BATCH_CREATED,
-      data: {
-        messages: ['remy.5', 'remy.6', 'remy.7'].map((part) => ({
-          message: { name: `spaces/AAAAjuno/messages/${part}` },
-        })),
-      },
-    });
-    await until(() => routed.length === 2);
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(fake.acks(id)).toBe(0);
-
-    await vi.advanceTimersByTimeAsync(ACK_DEADLINE_SECONDS * 1_000);
-    await until(() => fake.acks(id) === 1);
-    expect(routed).toEqual([
-      'spaces/AAAAjuno/messages/remy.5',
-      'spaces/AAAAjuno/messages/remy.6',
-      'spaces/AAAAjuno/messages/remy.7',
-    ]);
   });
 
   it('hands a pulled batch over in event-time order, one event after another', async () => {

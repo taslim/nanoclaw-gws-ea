@@ -137,6 +137,19 @@ describe('adoption', () => {
     ]);
   });
 
+  it('deletes one that has expired and creates it again', async () => {
+    const lapsed = fake.seedSubscription({ expireTime: new Date(Date.now() - HOUR).toISOString() });
+    start();
+
+    await until(active);
+    expect(workspaceCalls('DELETE', `/v1/${lapsed.name}`)).toBe(1);
+    const [created, ...others] = [...fake.subscriptions.values()];
+    expect(others).toEqual([]);
+    expect(created).toMatchObject({ state: 'ACTIVE', notificationEndpoint: { pubsubTopic: TOPIC } });
+    expect(created!.name).not.toBe(lapsed.name);
+    expect(health.read().subscription.name).toBe(created!.name);
+  });
+
   it("creates one with the two event types, name-only, for a 7-day life, with the assistant's own token", async () => {
     fake.slowOperations = 1;
     start();
@@ -281,6 +294,7 @@ describe('lifecycle', () => {
   it('hands over a Chat event retained from a previous, expired subscription', async () => {
     const retained = fake.publish({
       type: CHAT_MESSAGE_CREATED,
+      source: '//workspaceevents.googleapis.com/subscriptions/chat-retired-1',
       time: '2026-10-09T23:59:00.000Z',
       data: { message: { name: 'spaces/AAAAjuno/messages/morgan.1' } },
     });

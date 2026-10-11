@@ -90,9 +90,12 @@ describe('the subscriber token', () => {
     await expect(token()).rejects.toThrow(SubscriberCredentialError);
     await expect(token()).rejects.toThrow('invalid_grant');
 
-    // The operator replaces the key.
+    // The operator replaces the key with a new account's: the next token is signed with it.
     fake.tokenFailure = undefined;
-    writeKey(serviceAccountKey());
+    const replaced = `gws-ea-chat-2@${PROJECT}.iam.gserviceaccount.com`;
+    writeKey({ ...serviceAccountKey(), client_email: replaced });
     await expect(token()).resolves.toBe(SUBSCRIBER_TOKEN);
+    const exchange = fake.requests.at(-1)?.body as Record<string, string>;
+    expect(jwtClaims(exchange.assertion ?? '')).toMatchObject({ iss: replaced });
   });
 });

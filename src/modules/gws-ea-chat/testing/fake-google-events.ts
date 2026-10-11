@@ -9,6 +9,8 @@
  *   pull with nothing to hand out is held open until a message is ready, or
  *   for `emptyPullHoldMs` when set. A message may also be handed out again
  *   while leased (`redeliverNow`), as at-least-once delivery allows.
+ * - Each event's source (`ce-source`) names the subscription it came
+ *   through, not the Chat resource it is about (`ce-subject`).
  * - Workspace Events keeps one subscription per target: creating a second
  *   is ALREADY_EXISTS. Each change is a long-running operation, finished at
  *   once unless `slowOperations` makes the next ones finish on a later poll.
@@ -53,6 +55,7 @@ interface StoredMessage {
 export interface PublishedEvent {
   readonly type: string;
   readonly data: Readonly<Record<string, unknown>>;
+  /** `ce-source`: the subscription the event came through, the one Google holds now unless a test names another. */
   readonly source?: string;
   readonly subject?: string;
   readonly time?: string;
@@ -150,7 +153,7 @@ export class FakeGoogleEvents {
       attributes: {
         'ce-id': `event-${id}`,
         'ce-type': event.type,
-        'ce-source': event.source ?? '//chat.googleapis.com/spaces/AAAAjuno',
+        'ce-source': event.source ?? this.deliveringSubscription(),
         'ce-subject': event.subject ?? '//chat.googleapis.com/spaces/AAAAjuno',
         'ce-time': time,
         'ce-specversion': '1.0',
@@ -219,6 +222,16 @@ export class FakeGoogleEvents {
     };
     this.subscriptions.set(subscription.name, subscription);
     return subscription;
+  }
+
+  /**
+   * An event's source, as Google names it: the full name of the subscription
+   * it came through, not the Chat resource. That is the one Google holds now,
+   * or an earlier one when it holds none.
+   */
+  private deliveringSubscription(): string {
+    const [current] = this.subscriptions.values();
+    return `//workspaceevents.googleapis.com/${current?.name ?? 'subscriptions/chat-earlier'}`;
   }
 
   private wake(): void {

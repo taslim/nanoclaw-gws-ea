@@ -955,6 +955,27 @@ describe('Google Cloud setup through the step engine', () => {
     ]);
   });
 
+  it('grants Google Chat publishing and the subscriber pulling while each holds only another role there, and someone else already pulls', async () => {
+    const setup = await harness();
+    const { projectId, serviceAccountEmail } = setup.gcp;
+    const subscriber = `serviceAccount:${serviceAccountEmail}`;
+    setup.cloud.ready().userKeys.add('k1');
+    await writeCredential(setup.gcp.credentialFile, keyFile(projectId, serviceAccountEmail, 'k1'));
+    // A grant is there only when its own member holds its own role.
+    setup.cloud.topicPolicy.clear();
+    setup.cloud.topicPolicy.set('roles/pubsub.viewer', new Set([CHAT_PUBLISHER]));
+    setup.cloud.subscriptionPolicy.clear();
+    setup.cloud.subscriptionPolicy.set('roles/pubsub.viewer', new Set([subscriber]));
+    setup.cloud.subscriptionPolicy.set('roles/pubsub.subscriber', new Set([`user:${ACCOUNT}`]));
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([
+      `pubsub topics add-iam-policy-binding gws-ea-chat-events --member=${CHAT_PUBLISHER} --role=roles/pubsub.publisher --project=${projectId}`,
+      `pubsub subscriptions add-iam-policy-binding gws-ea-chat-events-pull --member=${subscriber} --role=roles/pubsub.subscriber --project=${projectId}`,
+    ]);
+  });
+
   it('pauses with each open billing account as a choice when there are several, then links the one chosen', async () => {
     const setup = await harness();
     setup.cloud.billingAccounts.push(

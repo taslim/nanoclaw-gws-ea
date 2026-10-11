@@ -2035,6 +2035,9 @@ const PRINCIPAL = {
   userId: 'gchat:users/2001',
 } as const;
 
+/** One of the principal's addresses that create did not name for Google Chat. */
+const OTHER_ADDRESS = 'principal@home.example.test';
+
 /**
  * A release staged as `stageRelease` leaves it, without a checkout to build:
  * its folder linked to the assistant's state, and what is kept with it, its
@@ -2096,6 +2099,11 @@ async function productionHarness(): Promise<ProductionHarness> {
           input: {
             ...base.input,
             ...(harness.providerCredential ? {} : { requestProviderCredential: undefined }),
+            // The principal has another address; only the one create named for Chat may be opened.
+            identity: {
+              ...base.input.identity,
+              principal: { ...base.input.identity.principal!, emails: ['principal@example.test', OTHER_ADDRESS] },
+            },
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
             hostStatus: {
@@ -2374,7 +2382,7 @@ describe('production step order and pause outcomes', () => {
 
     harness.principal = 'bound';
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
-    expect(new Set(harness.binds.map((bind) => bind.chatEmail))).toEqual(new Set(['principal@example.test']));
+    expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test', 'principal@example.test']);
   });
 
   it('resumes after the principal was bound but before the step completed, without binding again', async () => {
