@@ -549,6 +549,12 @@ describe('a matter as main reads it', () => {
 
     expect(await view(acme, sources)).toContain('Next look: Oct 14, 2026, 9:00 AM.');
     expect(await view(office, sources)).toContain('Next look: Oct 12, 2026, 9:00 AM, repeating on "0 9 * * 1".');
+
+    // During the look itself its occurrence is still pending at a time now past: a one-off
+    // leaves nothing after it, and a repeating look is next due on its following date.
+    vi.setSystemTime(new Date('2026-10-14T13:05:00.000Z'));
+    expect(await view(acme, sources)).toContain('Next look: none pending.');
+    expect(await view(office, sources)).toContain('Next look: Oct 19, 2026, 9:00 AM, repeating on "0 9 * * 1".');
   });
 });
 

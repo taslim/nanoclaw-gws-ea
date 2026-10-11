@@ -12,6 +12,8 @@
  *
  * Bare data for `main`, never words for the principal (R6).
  */
+import { CronExpressionParser } from 'cron-parser';
+
 import { TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { findConversationSessions } from '../../db/sessions.js';
@@ -46,9 +48,19 @@ export async function readNextLook(taskId: string): Promise<NextLookView | undef
   if (mainAgentGroupId === null) return undefined;
   for (const session of await findConversationSessions(mainAgentGroupId)) {
     const task = await withExistingMailboxSession(mainAgentGroupId, session.id, (mailbox) => mailbox.getTask(taskId));
-    if (task !== undefined && task.processAfter !== null && (task.status === 'pending' || task.status === 'paused')) {
-      return { at: task.processAfter, repeats: task.recurrence, paused: task.status === 'paused' };
+    if (task === undefined || task.processAfter === null || (task.status !== 'pending' && task.status !== 'paused')) {
+      continue;
     }
+    const paused = task.status === 'paused';
+    // A pending occurrence whose time has passed is the look being taken now: nothing comes
+    // after a one-off, and a repeating look comes back on its next date.
+    if (paused || Date.parse(task.processAfter) > Date.now()) {
+      return { at: task.processAfter, repeats: task.recurrence, paused };
+    }
+    if (task.recurrence === null) return undefined;
+    const timezone = await resolveGroupTimezone(mainAgentGroupId);
+    const next = CronExpressionParser.parse(task.recurrence, { tz: timezone }).next().toISOString();
+    return next === null ? undefined : { at: next, repeats: task.recurrence, paused };
   }
   return undefined;
 }
