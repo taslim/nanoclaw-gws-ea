@@ -39,7 +39,7 @@ import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { recordRequestPosted } from '../approvals/request-context.js';
-import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
+import { describeSender, NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import {
   clearDeclineStamp,
   createPendingSenderApproval,
@@ -114,7 +114,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
 
   const approvalId = generateId();
   // Their id first, as the host holds it; the names they and the conversation go by, quoted.
-  const who = senderName ? `${senderIdentity} (${quoted(senderName, NAME_LIMIT)})` : senderIdentity;
+  const who = describeSender(senderIdentity, senderName, 'Someone');
   const where = originMg?.name ? quoted(originMg.name, NAME_LIMIT) : `a ${originChannelType} conversation`;
 
   const title = '👤 New sender';
@@ -321,12 +321,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     return;
   }
 
-  const name = senderName ? quoted(senderName, NAME_LIMIT) : undefined;
-  const who = senderIdentity
-    ? name
-      ? `${senderIdentity} (${name})`
-      : senderIdentity
-    : (name ?? "Someone I don't know");
+  const who = describeSender(senderIdentity, senderName, "Someone I don't know");
   const fyiText =
     input.fyiText ??
     `FYI: ${who} messaged me on ${event.channelType}, and I sent a polite decline. Allow them any time with \`ncl members add\`.`;

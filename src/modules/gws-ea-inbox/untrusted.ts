@@ -49,7 +49,8 @@ function sanitize(text: string): string {
   return withoutControls(clean.replace(RESERVED_SPECIAL_TOKEN, '[REMOVED_SPECIAL_TOKEN]'));
 }
 
-function cap(text: string, limit: number): string {
+/** `text`, at most `limit` characters (code points, so no emoji or surrogate pair is split); a cut one ends in `…`. */
+export function cap(text: string, limit: number): string {
   const characters = Array.from(text);
   return characters.length <= limit
     ? text

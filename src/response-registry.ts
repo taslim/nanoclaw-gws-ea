@@ -7,13 +7,16 @@
  * module registrations that would otherwise happen before index.ts's own
  * const initializers have run.
  *
- * Keep this file dependency-free (log.js is fine, but nothing from
- * modules/* or index.ts itself). Any file imported here must not in turn
- * import from src/index.ts, or the cycle returns.
+ * Keep this file's imports minimal: log.js, and request-text.js for how an
+ * approver's reason is quoted (its imports reach the DB layer, but nothing
+ * that imports this file or registers a response handler). Nothing else
+ * from modules/* or index.ts itself. Any file imported here must not in
+ * turn import from src/index.ts, or the cycle returns.
  */
 import type { NormalizedOption } from './channels/ask-question.js';
 import type { ChannelDeliveryAdapter } from './delivery.js';
 import { log } from './log.js';
+import { quoted, REASON_LIMIT } from './modules/approvals/request-text.js';
 
 export interface ResponsePayload {
   questionId: string;
@@ -59,9 +62,10 @@ export interface AnsweredRequest {
  * request as posted (ResponsePayload.deferResolution): edit it, addressed by
  * its question id in the conversation the answer came from, to what was
  * asked and the option the answer chose, with the reason given for a
- * rejection. The handler calls this only once it has authorized the answer
- * and resolved the request; an answer it refuses leaves the request as it
- * is. A failed edit is logged, and the resolution stands.
+ * rejection, quoted as someone else's text (quoted). The handler calls this
+ * only once it has authorized the answer and resolved the request; an answer
+ * it refuses leaves the request as it is. A failed edit is logged, and the
+ * resolution stands.
  */
 export async function showRequestOutcome(
   adapter: ChannelDeliveryAdapter | null,
@@ -75,7 +79,7 @@ export async function showRequestOutcome(
     return;
   }
   const chosen = request.options.find((option) => option.value === payload.value)?.selectedLabel ?? payload.value;
-  const resolution = reason ? `${chosen}: "${reason}"` : chosen;
+  const resolution = reason ? `${chosen}: ${quoted(reason, REASON_LIMIT)}` : chosen;
   try {
     await adapter.deliver(
       payload.channelType,

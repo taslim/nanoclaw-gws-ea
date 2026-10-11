@@ -57,7 +57,7 @@ import type { InboundEvent, ResolvedConversation } from '../../channels/adapter.
 import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { recordRequestPosted, type SuppliedText } from '../approvals/request-context.js';
-import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
+import { describeSender, NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
@@ -167,13 +167,6 @@ function otherParticipants(
   );
 }
 
-/** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted. */
-function describeSender(senderUserId: string | undefined, senderName: string | undefined): string {
-  const name = senderName ? quoted(senderName, NAME_LIMIT) : undefined;
-  if (!senderUserId) return name ?? 'Someone';
-  return name ? `${senderUserId} (${name})` : senderUserId;
-}
-
 function buildQuestionText(
   conversationType: ResolvedConversation['type'],
   senderName: string | undefined,
@@ -183,7 +176,7 @@ function buildQuestionText(
   channelType: string,
   ruleNote: string | null,
 ): string {
-  const who = describeSender(senderUserId, senderName);
+  const who = describeSender(senderUserId, senderName, 'Someone');
   const note = ruleNote ? ` If you connect it, I ${ruleNote}.` : '';
   if (conversationType === 'channel') {
     const where = channelName ? `${quoted(channelName, NAME_LIMIT)} on ${channelType}` : `a ${channelType} channel`;

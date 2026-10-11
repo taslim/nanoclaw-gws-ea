@@ -37,7 +37,13 @@ import { backfillSession, fanInboundMessage } from './modules/cross-session-cont
 import { canAccessAgentGroup } from './modules/permissions/access.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { findSession, resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  effectiveSessionMode,
+  findSession,
+  resolveSession,
+  writeSessionMessage,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
@@ -637,27 +643,21 @@ async function deliverToAgent(
 ): Promise<void> {
   const wake = delivery === 'wake';
   // Apply the resolved thread policy (wiring override AND channel declaration
-  // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
-  // wiring in a group chat → per-thread session regardless of wiring
-  // session_mode. agent-shared preserved (it's a cross-channel directive the
-  // adapter doesn't know about). DMs collapse sub-threads to one session
-  // (is_group=0 short-circuit).
-  let effectiveSessionMode = agent.session_mode;
-  if (threadsEnabled && effectiveSessionMode !== 'agent-shared' && mg.is_group !== 0) {
-    effectiveSessionMode = 'per-thread';
-  }
+  // AND adapter capability — resolveThreadPolicy at fanout) to the wiring's
+  // session_mode.
+  const sessionMode = effectiveSessionMode(agent, mg, threadsEnabled);
 
   let session: Session;
   let created = false;
   if (delivery === 'quiet') {
-    const existing = await findSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
+    const existing = await findSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode);
     if (!existing) {
       log.debug('Quiet event dropped — the conversation has no session', { agentGroupId: agent.agent_group_id });
       return;
     }
     session = existing;
   } else {
-    ({ session, created } = await resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode));
+    ({ session, created } = await resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode));
   }
 
   // The inbound row's (channel_type, platform_id, thread_id) is the address
@@ -735,7 +735,7 @@ async function deliverToAgent(
       mg,
       platformId: event.platformId,
       threadId: effectiveThreadId,
-      sessionMode: effectiveSessionMode,
+      sessionMode,
       message: {
         id: event.message.id,
         kind: event.message.kind,

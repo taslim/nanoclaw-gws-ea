@@ -23,7 +23,7 @@ import { resolveThreadPolicy } from '../../channels/channel-defaults.js';
 import { getChannelAdapter, getChannelDefaults } from '../../channels/channel-registry.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
-import { findSession, writeSessionMessage } from '../../session-manager.js';
+import { effectiveSessionMode, findSession, writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, MessagingGroupAgent, Session } from '../../types.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 
@@ -176,8 +176,6 @@ async function conversationSession(
     getChannelAdapter(key)?.supportsThreads === true,
   );
   const thread = threads ? threadId : null;
-  const mode =
-    threads && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0 ? 'per-thread' : wiring.session_mode;
-  const session = await findSession(wiring.agent_group_id, mg.id, thread, mode);
+  const session = await findSession(wiring.agent_group_id, mg.id, thread, effectiveSessionMode(wiring, mg, threads));
   return session ? { session, threadId: thread } : undefined;
 }

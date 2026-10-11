@@ -25,7 +25,7 @@ import {
 import { log } from './log.js';
 import { getAgentMailbox, type InboundMessage, type MailboxSession } from './mailbox/index.js';
 import { enqueueSessionReconcile } from './reconcile-feeds.js';
-import type { Session } from './types.js';
+import type { MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -90,6 +90,23 @@ function sessionCreationKey(
 ): string {
   if (sessionMode === 'agent-shared') return `agent\0${agentGroupId}`;
   return `route\0${agentGroupId}\0${messagingGroupId ?? ''}\0${sessionMode === 'shared' ? '' : (threadId ?? '')}`;
+}
+
+/**
+ * The session mode a wiring's messages in a conversation resolve under, given
+ * its resolved thread policy (resolveThreadPolicy): a thread-enabled wiring in
+ * a group chat gets a per-thread session regardless of its session_mode.
+ * agent-shared is preserved (it's a cross-channel directive the adapter doesn't
+ * know about), and DMs collapse sub-threads to one session (is_group=0).
+ */
+export function effectiveSessionMode(
+  wiring: Pick<MessagingGroupAgent, 'session_mode'>,
+  mg: Pick<MessagingGroup, 'is_group'>,
+  threadsEnabled: boolean,
+): MessagingGroupAgent['session_mode'] {
+  return threadsEnabled && wiring.session_mode !== 'agent-shared' && mg.is_group !== 0
+    ? 'per-thread'
+    : wiring.session_mode;
 }
 
 /**

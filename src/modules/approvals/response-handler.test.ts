@@ -381,6 +381,14 @@ describe('an answer on a channel that left the request as posted', () => {
     expect(await getPendingApproval('appr-text')).toBeUndefined();
   });
 
+  it('shows a reason as quoted text that cannot mention anyone or format itself', async () => {
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+
+    await handleApprovalsResponse(answer('reject', 'users/2001', 'ask <users/all> "first", *bold*'));
+
+    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "ask ‹users/all› 'first', \\*bold\\*"`)]);
+  });
+
   it('leaves a card the channel already resolved alone', async () => {
     const { handleApprovalsResponse } = await import('./response-handler.js');
 

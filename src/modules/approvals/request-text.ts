@@ -8,6 +8,7 @@
  */
 import { getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
 import type { MessagingGroup } from '../../types.js';
+import { cap } from '../gws-ea-inbox/untrusted.js';
 import type { RequestDetails } from './request-context.js';
 
 /** The longest name (a person's, a conversation's) a request quotes. */
@@ -31,16 +32,23 @@ const MARKDOWN = /[\\`*_~[\]()]/gu;
  */
 export function quoted(text: string, limit: number): string {
   const line = text.replace(FORMAT_CHARACTERS, '').replace(BREAKS, ' ').trim();
-  const characters = Array.from(line);
-  const capped =
-    characters.length <= limit
-      ? line
-      : `${characters
-          .slice(0, limit - 1)
-          .join('')
-          .trimEnd()}…`;
-  const shown = capped.replace(/["“”]/gu, "'").replace(/</gu, '‹').replace(/>/gu, '›').replace(MARKDOWN, '\\$&');
+  const shown = cap(line, limit)
+    .replace(/["“”]/gu, "'")
+    .replace(/</gu, '‹')
+    .replace(/>/gu, '›')
+    .replace(MARKDOWN, '\\$&');
   return `"${shown}"`;
+}
+
+/** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted; `unknown` with neither. */
+export function describeSender(
+  id: string | null | undefined,
+  name: string | null | undefined,
+  unknown: string,
+): string {
+  const shown = name ? quoted(name, NAME_LIMIT) : undefined;
+  if (!id) return shown ?? unknown;
+  return shown ? `${id} (${shown})` : id;
 }
 
 /**
