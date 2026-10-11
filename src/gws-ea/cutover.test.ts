@@ -50,89 +50,19 @@ interface Observed {
   openFiles: string;
   /** What lsof reports on stderr: an error it met. */
   lsofError?: string;
-  desktopInfo?: string;
-  vmCommand?: string;
-  vmFiles?: string;
-  allContainers?: readonly string[];
-  inspectedContainers?: string;
-  inspectedVolumes?: string;
-  inspectionError?: Error;
   readonly commands: SanitizedCommand[];
 }
 
 function observing(state: Observed): SanitizedCommandRunner {
   return async (command) => {
     state.commands.push(command);
-    if (command.command === 'ps') {
-      return { stdout: command.args.includes('-p') ? (state.vmCommand ?? '') : state.processes, stderr: '' };
-    }
-    if (command.command === 'docker') {
-      if (command.args[0] === 'info') return { stdout: state.desktopInfo ?? '{}', stderr: '' };
-      if (command.args[1] === 'inspect') {
-        if (state.inspectionError) throw state.inspectionError;
-        return {
-          stdout: command.args[0] === 'volume' ? (state.inspectedVolumes ?? '') : (state.inspectedContainers ?? ''),
-          stderr: '',
-        };
-      }
-      if (command.args[0] === 'ps') {
-        return {
-          stdout: (command.args.includes('--filter')
-            ? (state.containers.shift() ?? [])
-            : (state.allContainers ?? [])
-          ).join('\n'),
-          stderr: '',
-        };
-      }
-    }
+    if (command.command === 'ps') return { stdout: state.processes, stderr: '' };
+    if (command.command === 'docker') return { stdout: (state.containers.shift() ?? []).join('\n'), stderr: '' };
     if (command.command === 'sh' && command.args[2] === 'lsof') {
-      return {
-        stdout: command.args.includes('-p') ? (state.vmFiles ?? '') : state.openFiles,
-        stderr: state.lsofError ?? '',
-      };
+      return { stdout: state.openFiles, stderr: state.lsofError ?? '' };
     }
     throw new Error(`unexpected command: ${command.command} ${command.args.join(' ')}`);
   };
-}
-
-const seams = (state: Observed) => ({
-  runCommand: observing(state),
-  platform: 'darwin' as const,
-  ambientEnv: {},
-  sleep: async () => undefined,
-});
-
-const APPLE_VM =
-  '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine';
-
-function desktopObservation(target: QuietInstance): Observed {
-  const desktopData = path.join(target.homeDirectory, 'Library/Containers/com.docker.docker/Data');
-  return {
-    processes: '',
-    containers: [[]],
-    openFiles: `p5677\nccom.apple.Virtualization.Virtua\nn${target.state}/data/v2.db\n`,
-    desktopInfo: JSON.stringify({
-      os: 'Docker Desktop',
-      kernel: '7.0.14-linuxkit',
-      version: '29.6.0',
-      labels: [`com.docker.desktop.address=unix://${desktopData}/docker-cli.sock`],
-    }),
-    vmCommand: `${APPLE_VM}\n`,
-    vmFiles: `p5677\nccom.apple.Virtualization.Virtua\nn${desktopData}/vms/0/data/Docker.raw\n`,
-    commands: [],
-  };
-}
-
-function inspectedContainer(source: string, status = 'running', type = 'bind'): string {
-  return JSON.stringify({
-    id: 'other-container',
-    name: '/another-assistant',
-    status,
-    mounts: [{ Type: type, Source: source, Name: 'shared-volume', RW: true }],
-    configuredMounts: null,
-    privileged: false,
-    capabilities: null,
-  });
 }
 
 async function quietTarget(): Promise<QuietInstance> {
@@ -150,6 +80,13 @@ async function quietTarget(): Promise<QuietInstance> {
 }
 
 describe('proving a stopped assistant quiet', () => {
+  const seams = (state: Observed) => ({
+    runCommand: observing(state),
+    platform: 'darwin' as const,
+    ambientEnv: {},
+    sleep: async () => undefined,
+  });
+
   it('passes when nothing runs from it, holds its state open, or carries its label, ignoring a log reader', async () => {
     const target = await quietTarget();
     const state: Observed = {
@@ -209,37 +146,48 @@ describe('proving a stopped assistant quiet', () => {
     });
   });
 
-  it('refuses any process holding a file under its state open, even idle, naming the file', async () => {
-    const target = await quietTarget();
-    const wal = path.join(target.state, 'data', 'v2.db-wal');
-    const state: Observed = {
-      processes: '',
-      containers: [[]],
-      openFiles: `p777\ncsqlite3\nf3\nn${wal}\n`,
-      commands: [],
-    };
+  it.each(['sqlite3', 'com.apple.Virtualization.Virtua'])(
+    'refuses any %s process holding state open, even after containers are gone',
+    async (command) => {
+      const target = await quietTarget();
+      const wal = path.join(target.state, 'data', 'v2.db-wal');
+      const state: Observed = {
+        processes: '',
+        containers: [[]],
+        openFiles: `p777\nc${command}\nf3\nn${wal}\n`,
+        commands: [],
+      };
 
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
-      code: 'instance_not_quiet',
-      message: expect.stringContaining(`sqlite3 (PID 777) holds ${wal}`),
-    });
-  });
+      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+        code: 'instance_not_quiet',
+        message: expect.stringContaining(`${command} (PID 777) holds ${wal}`),
+      });
+      expect(state.commands.map((entry) => entry.command)).toEqual(['ps', 'docker', 'sh']);
+    },
+  );
 });
 
 describe('what lsof reports', () => {
-  it('summarizes repeated holders by process with only a few examples', async () => {
+  it('groups repeated paths by PID and limits examples without hiding another holder', async () => {
     const target = await quietTarget();
     const state: Observed = {
       processes: '',
       containers: [[]],
-      openFiles: `p777\ncsqlite3\n${Array.from({ length: 12 }, (_, index) => `n${target.state}/data/file-${index}`).join('\n')}\n`,
+      openFiles: `p5677\nccom.apple.Virtualization.Virtua\n${Array.from({ length: 12 }, (_, index) => `n${target.state}/data/file-${index}`).join('\n')}\nn${target.state}/data/file-0\np777\ncsqlite3\nn${target.state}/data/v2.db\n`,
       commands: [],
     };
 
-    const proof = assertInstanceQuiet(target, seams(state));
+    const proof = assertInstanceQuiet(target, {
+      runCommand: observing(state),
+      platform: 'darwin',
+      ambientEnv: {},
+      sleep: async () => undefined,
+    });
     await expect(proof).rejects.toMatchObject({
       code: 'instance_not_quiet',
-      message: expect.stringContaining('sqlite3 (PID 777) holds 12 paths'),
+      message: expect.stringContaining(
+        `com.apple.Virtualization.Virtua (PID 5677) holds 12 paths (${target.state}/data/file-0, ${target.state}/data/file-1, ${target.state}/data/file-2, ...); sqlite3 (PID 777) holds ${target.state}/data/v2.db`,
+      ),
     });
     await expect(proof).rejects.not.toThrow('file-11');
   });
@@ -257,311 +205,6 @@ describe('what lsof reports', () => {
     await expect(
       assertInstanceQuiet(target, { runCommand: observing(state), platform: 'darwin', sleep: async () => undefined }),
     ).rejects.toMatchObject({ code: 'command_failed', message: expect.stringContaining('Input/output error') });
-  });
-});
-
-describe('Docker Desktop filesystem handles after agents have exited', () => {
-  it('allows confirmed read-only binds such as gateway secret files', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: JSON.stringify({
-        id: 'other-container',
-        name: '/gateway',
-        status: 'running',
-        mounts: [{ Type: 'bind', Destination: '/run/secrets/probe', RW: false }],
-        configuredMounts: [{ Type: 'bind', Target: '/run/secrets/probe', ReadOnly: true, BindOptions: {} }],
-        privileged: false,
-        capabilities: null,
-      }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).resolves.toBeUndefined();
-  });
-
-  it.each(['legacy', 'missing options', 'null options', 'different target', 'unknown readonly', 'missing destination'])(
-    'refuses an ambiguously read-only bind: %s',
-    async (kind) => {
-      const target = await quietTarget();
-      const state = {
-        ...desktopObservation(target),
-        allContainers: ['other-container'],
-        inspectedContainers: JSON.stringify({
-          id: 'other-container',
-          name: '/ambiguous-reader',
-          status: 'running',
-          mounts: [{ Type: 'bind', Destination: kind === 'missing destination' ? undefined : '/proof', RW: false }],
-          configuredMounts:
-            kind === 'legacy'
-              ? null
-              : [
-                  {
-                    Type: 'bind',
-                    Target: kind === 'different target' ? '/elsewhere' : '/proof',
-                    ReadOnly: kind === 'unknown readonly' ? undefined : true,
-                    BindOptions: kind === 'missing options' ? undefined : kind === 'null options' ? null : {},
-                  },
-                ],
-          privileged: false,
-          capabilities: null,
-        }),
-      };
-
-      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
-        code: 'instance_not_quiet',
-        message: expect.stringContaining('ambiguous-reader'),
-      });
-    },
-  );
-
-  it.each([undefined, 'false'])('refuses a bind with an unknown write flag: %s', async (rw) => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: JSON.stringify({
-        id: 'other-container',
-        name: '/unknown-writer',
-        status: 'running',
-        mounts: [{ Type: 'bind', Destination: '/proof', RW: rw }],
-        configuredMounts: [{ Type: 'bind', Target: '/proof', ReadOnly: true, BindOptions: {} }],
-        privileged: false,
-        capabilities: null,
-      }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-  });
-
-  it('refuses a read-only bind explicitly leaving submounts writable', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: JSON.stringify({
-        id: 'other-container',
-        name: '/recursive-writer',
-        status: 'running',
-        mounts: [{ Type: 'bind', Destination: '/proof', RW: false }],
-        configuredMounts: [
-          { Type: 'bind', Target: '/proof', ReadOnly: true, BindOptions: { ReadOnlyNonRecursive: true } },
-        ],
-        privileged: false,
-        capabilities: null,
-      }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-  });
-
-  it.each(['privileged', 'mount admin', 'unknown capabilities'])(
-    'refuses read-only binds whose protections can be changed: %s',
-    async (kind) => {
-      const target = await quietTarget();
-      const state = {
-        ...desktopObservation(target),
-        allContainers: ['other-container'],
-        inspectedContainers: JSON.stringify({
-          id: 'other-container',
-          name: '/mount-admin',
-          status: 'running',
-          mounts: [{ Type: 'bind', Destination: '/proof', RW: false }],
-          configuredMounts: [{ Type: 'bind', Target: '/proof', ReadOnly: true, BindOptions: {} }],
-          privileged: kind === 'privileged',
-          capabilities: kind === 'mount admin' ? ['SYS_ADMIN'] : kind === 'unknown capabilities' ? 'unknown' : null,
-        }),
-      };
-
-      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-    },
-  );
-
-  it.each(['5.11.0-linuxkit', 'unknown'])(
-    'cannot discount VM handles without recursive read-only kernel support: %s',
-    async (kernel) => {
-      const target = await quietTarget();
-      const state = desktopObservation(target);
-      state.desktopInfo = JSON.stringify({
-        ...(JSON.parse(state.desktopInfo ?? '{}') as Record<string, unknown>),
-        kernel,
-      });
-
-      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-    },
-  );
-
-  it.each(['24.0.9', 'unknown'])('keeps refusing VM handles on an unsupported Docker engine: %s', async (version) => {
-    const target = await quietTarget();
-    const state = desktopObservation(target);
-    state.desktopInfo = JSON.stringify({
-      ...(JSON.parse(state.desktopInfo ?? '{}') as Record<string, unknown>),
-      version,
-    });
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-  });
-
-  it('passes retained handles only for the Apple VM holding this Docker Desktop runtime disk', async () => {
-    const target = await quietTarget();
-    const state = desktopObservation(target);
-
-    await expect(assertInstanceQuiet(target, seams(state))).resolves.toBeUndefined();
-    for (const command of state.commands.filter((entry) => entry.command === 'docker')) {
-      expect(command.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
-    }
-  });
-
-  it.each(['direct', 'release link', 'parent', 'unrelated', 'retargeted link'])(
-    'refuses an active host bind even when its current source is %s',
-    async (kind) => {
-      const target = await quietTarget();
-      let source = path.join(target.state, 'data');
-      if (kind === 'release link') {
-        const release = path.join(target.instanceRoot, '12345678');
-        await mkdir(release);
-        source = path.join(release, 'data');
-        await symlink('../state/data', source);
-      } else if (kind === 'parent') source = target.instanceRoot;
-      else if (kind === 'unrelated') source = await temporaryRoot('gws-ea-unrelated-');
-      else if (kind === 'retargeted link') {
-        source = path.join(target.homeDirectory, 'alias');
-        await symlink(target.instanceRoot, source);
-        await rm(source);
-        await symlink(await temporaryRoot('gws-ea-retarget-'), source);
-      }
-      const state = {
-        ...desktopObservation(target),
-        allContainers: ['other-container'],
-        inspectedContainers: inspectedContainer(source),
-      };
-
-      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
-        code: 'instance_not_quiet',
-        message: expect.stringContaining('another-assistant'),
-      });
-    },
-  );
-
-  it.each(['paused', 'restarting', 'removing'])('refuses a %s container with a host bind', async (status) => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: inspectedContainer(target.state, status),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'instance_not_quiet' });
-  });
-
-  it.each(['created', 'exited', 'dead'])(
-    'does not mistake a %s unrelated container for an active writer',
-    async (status) => {
-      const target = await quietTarget();
-      const state = {
-        ...desktopObservation(target),
-        allContainers: ['other-container'],
-        inspectedContainers: inspectedContainer(target.state, status),
-      };
-
-      await expect(assertInstanceQuiet(target, seams(state))).resolves.toBeUndefined();
-    },
-  );
-
-  it.each(['other runtime', 'other executable', 'other disk'])('keeps refusing an unverified VM: %s', async (kind) => {
-    const target = await quietTarget();
-    const state = desktopObservation(target);
-    if (kind === 'other runtime') state.desktopInfo = JSON.stringify({ os: 'OrbStack', labels: [] });
-    else if (kind === 'other executable')
-      state.vmCommand = '/Applications/Other.app/Contents/MacOS/com.apple.Virtualization.VirtualMachine';
-    else state.vmFiles = 'p5677\nn/private/tmp/another-vm.raw\n';
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
-      code: 'instance_not_quiet',
-      message: expect.stringContaining('PID 5677'),
-    });
-  });
-
-  it.each(['malformed inspection', 'missing container', 'unknown mount', 'unknown status'])(
-    'cannot pass on %s',
-    async (kind) => {
-      const target = await quietTarget();
-      const state: Observed = {
-        ...desktopObservation(target),
-        allContainers: ['other-container'],
-        inspectedContainers: inspectedContainer(target.state),
-      };
-      if (kind === 'malformed inspection') state.inspectedContainers = '{';
-      else if (kind === 'missing container') state.inspectedContainers = '';
-      else if (kind === 'unknown mount')
-        state.inspectedContainers = inspectedContainer(target.state, 'running', 'unknown');
-      else state.inspectedContainers = inspectedContainer(target.state, 'unknown');
-
-      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'invalid_docker_output' });
-    },
-  );
-
-  it('propagates a failed inspection instead of discounting VM holders', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectionError: new Error('Docker inspection failed'),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toThrow('Docker inspection failed');
-  });
-
-  it('refuses a named volume backed by a host bind regardless of source', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: inspectedContainer('/var/lib/docker/volumes/shared-volume/_data', 'running', 'volume'),
-      inspectedVolumes: JSON.stringify({
-        name: 'shared-volume',
-        driver: 'local',
-        options: { type: 'none', o: 'bind', device: '/unrelated/path' },
-      }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toThrow();
-  });
-
-  it('allows ordinary Docker-managed volumes inside the VM', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: inspectedContainer('/var/lib/docker/volumes/shared-volume/_data', 'running', 'volume'),
-      inspectedVolumes: JSON.stringify({ name: 'shared-volume', driver: 'local', options: null }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).resolves.toBeUndefined();
-  });
-
-  it('refuses a volume whose host access cannot be determined', async () => {
-    const target = await quietTarget();
-    const state = {
-      ...desktopObservation(target),
-      allContainers: ['other-container'],
-      inspectedContainers: inspectedContainer('/plugin/volume', 'running', 'volume'),
-      inspectedVolumes: JSON.stringify({ name: 'shared-volume', driver: 'unknown', options: null }),
-    };
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toThrow();
-  });
-
-  it('still refuses a host database opener alongside retained VM handles', async () => {
-    const target = await quietTarget();
-    const state = desktopObservation(target);
-    state.openFiles += `p777\ncsqlite3\nn${target.state}/data/v2.db-wal\n`;
-
-    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
-      code: 'instance_not_quiet',
-      message: expect.stringContaining('sqlite3 (PID 777)'),
-    });
-    expect(state.commands.some((command) => command.args[0] === 'info')).toBe(false);
   });
 });
 
