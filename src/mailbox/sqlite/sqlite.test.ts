@@ -211,4 +211,41 @@ describe('SQLite mailbox canonical serialization', () => {
       { id: 'later', tries: 0, processAfter: later },
     ]);
   });
+
+  it('neither waits nor opens the conversation with a held message until it is released', async () => {
+    const inboundDb = new Database(':memory:');
+    databases.push(inboundDb);
+    inboundDb.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(inboundDb);
+    const write = (id: string, text: string, status?: 'held') =>
+      inbound.insertMessage({
+        id,
+        kind: 'chat',
+        timestamp: '2026-10-10T09:00:00.000Z',
+        platformId: 'email:inbox',
+        channelType: 'email',
+        threadId: 'thread-juno-hale',
+        content: JSON.stringify({ text }),
+        processAfter: null,
+        recurrence: null,
+        ...(status ? { status } : {}),
+      });
+    await write('held', 'Juno Hale asked for the contract terms', 'held');
+    await write('reply', 'Remy Vance answered');
+    const later = new Date(Date.now() + 4 * 60_000).toISOString();
+
+    expect(inbound.getConversationRoot()).toEqual({
+      timestamp: '2026-10-10T09:00:00.000Z',
+      content: '{"text":"Remy Vance answered"}',
+    });
+    expect(inbound.getWaitingMessages()).toEqual([]);
+
+    expect(inbound.releaseHeldMessages(later)).toBe(1);
+
+    expect(inbound.getConversationRoot()).toEqual({
+      timestamp: '2026-10-10T09:00:00.000Z',
+      content: '{"text":"Juno Hale asked for the contract terms"}',
+    });
+    expect(inbound.getWaitingMessages()).toEqual([{ id: 'held', tries: 0, processAfter: later }]);
+  });
 });

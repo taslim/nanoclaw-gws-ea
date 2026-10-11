@@ -7,7 +7,7 @@
  */
 import Database from 'better-sqlite3';
 
-import { createInboundRecord } from '../model.js';
+import { createInboundRecord, parseIsoTimestamp } from '../model.js';
 import type { InboundWrite } from '../model.js';
 import type { MessageRetry } from '../types.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
@@ -117,6 +117,18 @@ export function countDueMessages(db: Database.Database): number {
       )
       .get() as { count: number }
   ).count;
+}
+
+/**
+ * Release every held message: each becomes a pending trigger, due at
+ * `processAfter` (null: due now), so the sweep wakes the session for it once
+ * it is due. Returns how many it released.
+ */
+export function releaseHeldMessages(db: Database.Database, processAfter: string | null): number {
+  const due = processAfter === null ? null : parseIsoTimestamp(processAfter);
+  return db
+    .prepare("UPDATE messages_in SET status = 'pending', trigger = 1, process_after = ? WHERE status = 'held'")
+    .run(due).changes;
 }
 
 export function markMessageFailed(db: Database.Database, messageId: string): void {

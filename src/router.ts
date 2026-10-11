@@ -212,6 +212,12 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
   }
 }
 
+/** An inbound delay's answer that holds the message until a module releases it. */
+export const HOLD_UNTIL_RELEASED: unique symbol = Symbol('hold-until-released');
+
+/** A time the message waits for, a hold until a module releases it, or null for due now. */
+export type InboundDelay = string | typeof HOLD_UNTIL_RELEASED | null;
+
 /**
  * Inbound-delay hook. Runs as the router writes a message into the session
  * it resolved for an agent, after the command gate.
@@ -221,8 +227,13 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
  * several registered, the message waits for the latest time any names. A
  * delayed message does not wake the container: the host sweep wakes the
  * session once the message is due, and a running container reads it then.
+ *
+ * A module may instead answer HOLD_UNTIL_RELEASED, which wins over any time.
+ * The message is written `held`: no turn reads it, no other session is given
+ * a copy, and nothing wakes for it until a module releases the session's held
+ * messages (the mailbox's `releaseHeldMessages`), which makes them due.
  */
-export type InboundDelayFn = (event: InboundEvent, session: Session) => string | null | Promise<string | null>;
+export type InboundDelayFn = (event: InboundEvent, session: Session) => InboundDelay | Promise<InboundDelay>;
 
 const inboundDelays: InboundDelayFn[] = [];
 
@@ -230,13 +241,15 @@ export function registerInboundDelay(fn: InboundDelayFn): void {
   inboundDelays.push(fn);
 }
 
-async function inboundDelay(event: InboundEvent, session: Session): Promise<string | null> {
+async function inboundDelay(event: InboundEvent, session: Session): Promise<InboundDelay> {
   let latest: string | null = null;
+  let held = false;
   for (const delay of inboundDelays) {
     const until = await delay(event, session);
-    if (until !== null && (latest === null || Date.parse(until) > Date.parse(latest))) latest = until;
+    if (until === HOLD_UNTIL_RELEASED) held = true;
+    else if (until !== null && (latest === null || Date.parse(until) > Date.parse(latest))) latest = until;
   }
-  return latest;
+  return held ? HOLD_UNTIL_RELEASED : latest;
 }
 
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
@@ -706,7 +719,9 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
-  const processAfter = await inboundDelay(event, session);
+  const delay = await inboundDelay(event, session);
+  const held = delay === HOLD_UNTIL_RELEASED;
+  const processAfter = held ? null : delay;
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
       id: messageId,
@@ -718,6 +733,7 @@ async function deliverToAgent(
       content: event.message.content,
       processAfter,
       trigger: wake,
+      status: held ? 'held' : 'pending',
     });
   } catch (error) {
     if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
@@ -754,13 +770,15 @@ async function deliverToAgent(
     delivery,
     created,
     ...(processAfter === null ? {} : { processAfter }),
+    ...(held ? { held } : {}),
     agentGroupName: agentGroup.name,
   });
 
-  if (wake && processAfter === null) {
+  if (wake && delay === null) {
     // Typing indicator + wake are only for the engaged branch; accumulated
-    // messages sit silently until a real trigger fires, and a delayed one
-    // until the host sweep wakes the session once it is due.
+    // messages sit silently until a real trigger fires, a delayed one until
+    // the host sweep wakes the session once it is due, and a held one until
+    // a module releases it.
     // Typing fires via the adapter instance that owns this chat's row. Its
     // anchor is the platform's id for the message the turn now works on; a
     // reaction is no one's message, so it leaves the conversation's anchor be.
@@ -783,14 +801,16 @@ async function deliverToAgent(
     }
   }
 
-  if (wake) {
+  if (wake && !held) {
     // Cross-session context: fan the triggering message into the
     // conversation's recently active sibling sessions as trigger=0
     // 'session-echo' rows. Only the engaged branch fans — the accumulate
     // branch (trigger=0) never does, so ambient backlog is never copied
-    // twice. Fired AFTER the wake and left unawaited: echoes are ambient
-    // context for OTHER sessions and must never sit between a user's message
-    // and its container. Bounded audience + concurrent writes; never throws.
+    // twice — and a held message never fans, so no sibling reads what its
+    // own session may not yet. Fired AFTER the wake and left unawaited:
+    // echoes are ambient context for OTHER sessions and must never sit
+    // between a user's message and its container. Bounded audience +
+    // concurrent writes; never throws.
     void fanInboundMessage({
       session,
       mg,

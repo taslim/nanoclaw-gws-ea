@@ -21,7 +21,8 @@ export function parseIsoTimestamp(value: unknown): IsoTimestamp {
 
 export type ProcessingStatus = 'processing' | 'completed' | 'failed' | 'script-skip:error';
 export type TaskStatus = 'pending' | 'paused' | 'completed' | 'failed' | 'cancelled';
-export type InboundStatus = TaskStatus | 'processing';
+/** `held`: written for a module to release; no turn reads it and nothing wakes for it until then. */
+export type InboundStatus = TaskStatus | 'processing' | 'held';
 
 const INBOUND_KINDS = ['chat', 'chat-sdk', 'task', 'webhook', 'system'] as const;
 
@@ -40,6 +41,7 @@ export interface InboundWrite {
   trigger?: boolean;
   sourceSessionId?: string | null;
   onWake?: boolean;
+  status?: 'pending' | 'held';
 }
 
 export interface InboundRecord {
@@ -298,6 +300,7 @@ export function parseInboundWrite(value: unknown): InboundWrite {
     'trigger',
     'sourceSessionId',
     'onWake',
+    'status',
   ]);
   return {
     id: text(record, 'id'),
@@ -312,6 +315,7 @@ export function parseInboundWrite(value: unknown): InboundWrite {
     ...('trigger' in record ? { trigger: optionalBoolean(record, 'trigger') } : {}),
     ...('sourceSessionId' in record ? { sourceSessionId: optionalNullableText(record, 'sourceSessionId') } : {}),
     ...('onWake' in record ? { onWake: optionalBoolean(record, 'onWake') } : {}),
+    ...('status' in record ? { status: oneOf(record, 'status', ['pending', 'held'] as const) } : {}),
   };
 }
 
@@ -339,7 +343,15 @@ export function parseInboundRecord(value: unknown): InboundRecord {
     sequence: nullableNonNegativeInteger(record, 'sequence'),
     kind: oneOf(record, 'kind', INBOUND_KINDS),
     timestamp: timestamp(record, 'timestamp'),
-    status: oneOf(record, 'status', ['pending', 'paused', 'processing', 'completed', 'failed', 'cancelled'] as const),
+    status: oneOf(record, 'status', [
+      'pending',
+      'paused',
+      'processing',
+      'completed',
+      'failed',
+      'cancelled',
+      'held',
+    ] as const),
     processAfter: nullableTimestamp(record, 'processAfter'),
     recurrence: nullableText(record, 'recurrence'),
     seriesId: nullableText(record, 'seriesId'),
@@ -574,7 +586,7 @@ export function createInboundRecord(message: InboundWrite, sequence: number): In
   return parseInboundRecord({
     ...input,
     sequence,
-    status: 'pending',
+    status: input.status ?? 'pending',
     seriesId: input.id,
     tries: 0,
     trigger: input.trigger ?? true,

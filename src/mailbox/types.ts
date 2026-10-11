@@ -108,6 +108,11 @@ export interface InboundMailbox {
   replaceDestinations(entries: Destination[]): void;
   insertMessage(message: InboundMessage): Promise<void>;
   countDueMessages(): number;
+  /**
+   * Release every held message: each becomes a pending trigger, due at
+   * `processAfter` (null: due now). Returns how many it released.
+   */
+  releaseHeldMessages(processAfter: string | null): number;
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;

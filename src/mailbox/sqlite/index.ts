@@ -24,6 +24,7 @@ import {
   openInboundDb,
   openOutboundDb,
   openOutboundDbRw,
+  releaseHeldMessages,
   replaceDestinations,
   retryWithBackoff,
   upsertSessionRouting,
@@ -200,6 +201,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
       ),
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
+    releaseHeldMessages: (processAfter) => releaseHeldMessages(db, processAfter),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
     getMessageForRetry: (messageId, status) => {
@@ -287,10 +289,12 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .all(limit) as MailboxHistoryMessage[]
       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
     getConversationRoot: () => {
+      // A held message is no opener until it is released: backfill would copy it into other sessions.
       const row = db
         .prepare(
           "SELECT timestamp, content FROM messages_in WHERE kind IN ('chat','chat-sdk') " +
-            "AND trigger = 1 AND (channel_type IS NULL OR channel_type NOT IN ('session-echo', 'agent')) " +
+            "AND trigger = 1 AND status IS NOT 'held' " +
+            "AND (channel_type IS NULL OR channel_type NOT IN ('session-echo', 'agent')) " +
             'ORDER BY seq ASC LIMIT 1',
         )
         .get() as MailboxTimelineMessage | undefined;

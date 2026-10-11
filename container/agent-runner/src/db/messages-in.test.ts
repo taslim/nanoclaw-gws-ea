@@ -178,3 +178,21 @@ describe('existing selection semantics preserved', () => {
     expect(getPendingMessages(false)).toHaveLength(0);
   });
 });
+
+describe('held rows reach no batch until released', () => {
+  // A module can hold an inbound row until it releases it (the router writes
+  // it status='held'); release sets it pending. The runner's selection reads
+  // pending rows only, so a held row stays unread whatever else comes due.
+  it('a due message starts a turn without the held rows beside it, in either phase', () => {
+    insertMessage('held', 2, 'chat', { sender: 'Juno Hale', text: 'contract terms' });
+    insertContextRow('held-ctx', 4, 'held ambient');
+    getInboundDb().prepare(`UPDATE messages_in SET status = 'held' WHERE id IN ('held', 'held-ctx')`).run();
+    insertMessage('due', 6, 'chat', { sender: 'Remy Vance', text: 'Thursday works' });
+
+    expect(getPendingMessages(true).map((m) => m.id)).toEqual(['due']);
+
+    getInboundDb().prepare(`UPDATE messages_in SET status = 'pending' WHERE id = 'held'`).run();
+    expect(getPendingMessages().map((m) => m.id)).toEqual(['held', 'due']);
+  });
+});
+
