@@ -68,7 +68,7 @@ export const CREATE_INPUT_FLAGS = [
   'principal-last-name',
   'principal-timezone',
   PRINCIPAL_CHAT_EMAIL_FLAG,
-  'workspace-email',
+  'assistant-workspace-email',
   'provider',
 ] as const;
 

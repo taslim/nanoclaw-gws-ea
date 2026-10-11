@@ -67,7 +67,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: { 'workspace-email': 'ada@example.test' },
+        provided: { 'assistant-workspace-email': 'ada@example.test' },
       },
       {
         providers: [claude],
@@ -151,7 +151,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: { 'workspace-email': 'ada@example.test' },
+        provided: { 'assistant-workspace-email': 'ada@example.test' },
       },
       {
         providers: [provider('claude', 'Claude')],
@@ -196,7 +196,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
-        provided: { 'workspace-email': 'aya@example.test' },
+        provided: { 'assistant-workspace-email': 'aya@example.test' },
       },
       {
         providers: [claude, codex],
@@ -296,7 +296,7 @@ describe('GWS-EA unattended create input', () => {
     'principal-first-name': 'Morgan',
     'principal-last-name': 'Ellery',
     'principal-timezone': 'America/Los_Angeles',
-    'workspace-email': 'aya@example.test',
+    'assistant-workspace-email': 'aya@example.test',
   } as const;
 
   function unattended(
@@ -400,7 +400,7 @@ describe('GWS-EA unattended create input', () => {
     });
   });
 
-  it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'workspace-email'] as const)(
+  it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'assistant-workspace-email'] as const)(
     'names --%s when it is missing',
     async (flag) => {
       const { [flag]: _omitted, ...provided } = FLAGS;
@@ -416,12 +416,12 @@ describe('GWS-EA unattended create input', () => {
       code: 'invalid_arguments',
       message: expect.stringContaining('--principal-timezone'),
     });
-    await expect(unattended({ ...FLAGS, 'workspace-email': 'not-an-email' })).rejects.toMatchObject({
-      message: expect.stringContaining('--workspace-email'),
+    await expect(unattended({ ...FLAGS, 'assistant-workspace-email': 'not-an-email' })).rejects.toMatchObject({
+      message: expect.stringContaining('--assistant-workspace-email'),
     });
-    await expect(unattended({ ...FLAGS, 'workspace-email': 'aya@gmail.com' })).rejects.toMatchObject({
+    await expect(unattended({ ...FLAGS, 'assistant-workspace-email': 'aya@gmail.com' })).rejects.toMatchObject({
       code: 'invalid_arguments',
-      message: expect.stringMatching(/--workspace-email.*Google Workspace/su),
+      message: expect.stringMatching(/--assistant-workspace-email.*Google Workspace/su),
     });
   });
 

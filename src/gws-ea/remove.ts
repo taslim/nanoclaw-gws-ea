@@ -46,6 +46,7 @@ import {
   assertGcloudSignedIn,
   deleteOwnedGcpProject,
   restoreKeyCreationPolicyForRemoval,
+  restoreMemberDomainPolicyForRemoval,
   type GcloudCommandRunner,
   type GcpProjectCoordinates,
 } from './gcloud.js';
@@ -136,6 +137,8 @@ interface RemovalReceipt {
   readonly abandoned: Readonly<Partial<Record<AbandonableResource, Evidence>>>;
   /** A key-creation policy `provision_gcp` lifted that Google refused to restore. */
   readonly key_policy_unrestored?: Evidence;
+  /** A member-domain policy `provision_gcp` relaxed that Google refused to restore. */
+  readonly member_policy_unrestored?: Evidence;
 }
 
 /** What local teardown uses, as the instance recorded it. */
@@ -185,6 +188,8 @@ export interface RemovalOutcome {
   readonly abandoned: readonly AbandonedResource[];
   /** Why a lifted key-creation policy could not be restored. */
   readonly keyPolicyUnrestored?: string;
+  /** Why a relaxed member-domain policy could not be restored. */
+  readonly memberPolicyUnrestored?: string;
 }
 
 /**
@@ -250,7 +255,8 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     if (reservation.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt reservation does not match this instance');
     }
-    const unrestored = evidenceOf(raw.key_policy_unrestored);
+    const keyPolicyUnrestored = evidenceOf(raw.key_policy_unrestored);
+    const memberPolicyUnrestored = evidenceOf(raw.member_policy_unrestored);
     return {
       schema_version: RECEIPT_SCHEMA_VERSION,
       instance_id: instanceId,
@@ -258,7 +264,8 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       started_at: canonicalTimestamp(raw.started_at) ?? new Date().toISOString(),
       completed: entries(REMOVAL_RESOURCES, raw.completed, canonicalTimestamp),
       abandoned: entries(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf),
-      ...(unrestored ? { key_policy_unrestored: unrestored } : {}),
+      ...(keyPolicyUnrestored ? { key_policy_unrestored: keyPolicyUnrestored } : {}),
+      ...(memberPolicyUnrestored ? { member_policy_unrestored: memberPolicyUnrestored } : {}),
     };
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
@@ -857,22 +864,35 @@ async function removeLocked(
         cwd: CONTROL_PLANE_ROOT,
       };
       const gcloud = { runCommand: runGcloud };
-      const unrestored = (evidence: string | undefined) =>
+      const unrestored = (
+        policy: 'key_policy_unrestored' | 'member_policy_unrestored',
+        evidence: string | undefined,
+      ) =>
         evidence
-          ? record((current) => ({ ...current, key_policy_unrestored: { at: new Date().toISOString(), evidence } }))
+          ? record((current) => ({
+              ...current,
+              [policy]: { at: new Date().toISOString(), evidence } satisfies Evidence,
+            }))
           : undefined;
       const seen = await withSignIn(() =>
         deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: provisioning.keyPolicyLifted }, gcloud),
       );
       if (seen.status === 'deleted') {
-        await unrestored(seen.keyPolicyUnrestored);
+        await unrestored('key_policy_unrestored', seen.keyPolicyUnrestored);
+        await unrestored('member_policy_unrestored', seen.memberPolicyUnrestored);
         return undefined;
       }
       activeStep()?.write(`${seen.reason}\n${seen.evidence}\n`);
       if (!abandon.has('gcp-project')) throw new RemovalPause('gcp-project', seen.reason, seen.evidence);
       if (provisioning.keyPolicyLifted) {
-        await unrestored(await withSignIn(() => restoreKeyCreationPolicyForRemoval(coordinates, gcloud)));
+        await unrestored(
+          'key_policy_unrestored',
+          await withSignIn(() => restoreKeyCreationPolicyForRemoval(coordinates, gcloud)),
+        );
       }
+      // Policies Google will not show belong to the project left behind; only a refused delete is news.
+      const member = await withSignIn(() => restoreMemberDomainPolicyForRemoval(coordinates, gcloud));
+      if (member?.refused === 'delete') await unrestored('member_policy_unrestored', member.evidence);
       return { at: new Date().toISOString(), evidence: seen.evidence };
     },
     onecli: async () => {
@@ -907,5 +927,6 @@ async function removeLocked(
       return entry ? [{ resource, evidence: entry.evidence }] : [];
     }),
     ...(receipt.key_policy_unrestored ? { keyPolicyUnrestored: receipt.key_policy_unrestored.evidence } : {}),
+    ...(receipt.member_policy_unrestored ? { memberPolicyUnrestored: receipt.member_policy_unrestored.evidence } : {}),
   };
 }

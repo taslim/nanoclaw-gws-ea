@@ -1689,19 +1689,24 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
           `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
         ]
       : []),
+    ...(outcome?.memberPolicyUnrestored
+      ? [
+          `The member-domain policy relaxed on ${project} was not restored: ${outcome.memberPolicyUnrestored.split('\n')[0]}`,
+        ]
+      : []),
   ];
 }
 
 function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <command> [options]');
   output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
-  output('         [--assistant-first-name <name> --assistant-last-name <name>]');
+  output('         [--assistant-first-name <name> --assistant-last-name <name> --assistant-workspace-email <email>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--principal-email <email>]...  (once per address the principal uses)');
   output(
     '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
   );
-  output('         [--workspace-email <email>] [--provider <id>]');
+  output('         [--provider <id>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]');
   output(

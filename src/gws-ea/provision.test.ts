@@ -1236,7 +1236,7 @@ describe('production provision step composition', () => {
     expect(progress).toEqual([{ type: 'step-waiting', step: 'provision_gcp', reason }]);
   });
 
-  it('observes Google Cloud as its own resources, restoring a lifted key policy only after the key', async () => {
+  it('observes Google Cloud as its own resources, restoring a relaxed member-domain policy after the publisher grant and a lifted key policy only after the key', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
 
@@ -1250,6 +1250,7 @@ describe('production provision step composition', () => {
         ['the Google Chat events topic', 'wait'],
         ['the Google Chat events subscription', 'wait'],
         ['the publisher grant on the topic', 'wait'],
+        ['the member-domain policy', 'wait'],
         ['the Chat subscriber account', 'wait'],
         ["the subscriber's grant on the subscription", 'wait'],
         ['the Chat subscriber key', 'wait'],

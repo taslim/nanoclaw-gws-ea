@@ -239,11 +239,11 @@ describe('gws-ea usage', () => {
       io.out.slice(usage, io.out.indexOf('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]')),
     ).toEqual([
       '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
-      '         [--assistant-first-name <name> --assistant-last-name <name>]',
+      '         [--assistant-first-name <name> --assistant-last-name <name> --assistant-workspace-email <email>]',
       '         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]',
       '         [--principal-email <email>]...  (once per address the principal uses)',
       '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
-      '         [--workspace-email <email>] [--provider <id>]',
+      '         [--provider <id>]',
       "         Deploys this gws-ea's own release, which must be committed, clean, and on the track.",
     ]);
     expect(io.out).toContain('  create, resume: [--secrets-file <owner-only file under the config root>]');
