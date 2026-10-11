@@ -1,4 +1,12 @@
+import fs from 'node:fs';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: '/tmp/nanoclaw-test-gws-ea-matters-index',
+  GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-matters-index/groups',
+}));
 
 /** Google as the host's own clients reach it, in memory: each test gets its own. */
 const google = vi.hoisted(() => ({ gmail: undefined as unknown, calendar: undefined as unknown }));
@@ -23,7 +31,7 @@ import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { commandGuard, lookup } from '../../cli/registry.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-people/index.js';
@@ -34,8 +42,10 @@ import { createThread } from '../gws-ea-inbox/thread-map.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { getMatter, listOpenMatters, type Matter, type Placed } from './db.js';
 import './index.js';
+import { seedMain } from './testing/main-conversation.js';
 
-const VERBS = ['open', 'place', 'update', 'close', 'get', 'list'] as const;
+const VERBS = ['open', 'place', 'update', 'close', 'get', 'look', 'morning', 'list'] as const;
+const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-matters-index';
 
 const NOW = '2026-10-10T12:00:00.000Z';
 const THREAD_A = 'mail-8d1f2c34-5b6a-4e7f-9a01-23456789abcd';
@@ -77,15 +87,14 @@ beforeEach(async () => {
   google.calendar = new FakeCalendar();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date(NOW));
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
   await runMigrations(await initTestDb());
-  for (const candidate of [main, other]) {
-    await createAgentGroup(candidate);
-    await ensureContainerConfig(candidate.id);
-    await updateContainerConfigScalars(candidate.id, { cli_scope: 'global' });
-  }
-  await updateContainerConfigScalars(main.id, { timezone: 'Africa/Lagos' });
-  // The canonical main, as the profile module's reconcile records it.
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', main.id);
+  // The canonical main, as the profile module's reconcile records it, with the conversation its looks come back to.
+  await seedMain('Africa/Lagos');
+  await createAgentGroup(other);
+  await ensureContainerConfig(other.id);
+  await updateContainerConfigScalars(other.id, { cli_scope: 'global' });
   await createThread('gmail-thread-a', NOW, THREAD_A);
   await createThread('gmail-thread-b', NOW, THREAD_B);
   remy = (await addPerson({ name: 'Remy Vance', level: 'known', source: 'principal', basis: 'Acme buyer.' })).id;
@@ -94,6 +103,7 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.useRealTimers();
   await closeDb();
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
 describe('GWS-EA matters ncl resource', () => {
@@ -313,6 +323,7 @@ describe('GWS-EA matters ncl resource', () => {
     // Every string is main's own words, a reference main gave, or an id, a kind or a timestamp.
     const shapes = [
       /^m-[0-9a-f]{12}$/,
+      /^look-m-[0-9a-f]{12}-[0-9a-f]{4}$/,
       /^(thread|event|file|person|memory)$/,
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
     ];
@@ -363,7 +374,7 @@ describe('GWS-EA matters ncl resource', () => {
         'Links read Oct 10, 2026, 1:00 PM.',
         'Open loop:',
         'Wants it signed by Friday.',
-        'Next look: none pending.',
+        'Next look: Oct 14, 2026, 9:00 AM.',
         'Links:',
         `- thread ${THREAD_A}: latest Oct 10, 2026, 10:30 AM, from them: waiting on us`,
         '<<<EXTERNAL_UNTRUSTED_CONTENT>>>',
@@ -404,6 +415,8 @@ describe('GWS-EA matters ncl resource', () => {
       ['update', { id, title: 'Renamed' }],
       ['close', { id, outcome: 'Done.' }],
       ['get', { id }],
+      ['look', { id }],
+      ['morning', {}],
       ['list', {}],
     ];
     expect(attempts.map(([verb]) => verb)).toEqual([...VERBS]);

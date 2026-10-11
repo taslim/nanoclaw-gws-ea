@@ -6,29 +6,40 @@
  * (R29, KTD13). Only `main` keeps matters, through main-only `ncl matters`
  * verbs whose answers are bare data for it, never words for the principal
  * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
+ *
+ * A matter's next look is one scheduled task in main's conversation
+ * (KTD4, `looks.ts`), the morning brings main back once a day
+ * (KTD6, `morning.ts`), and the host keeps both on time without the model
+ * (KTD7, `loop.ts`).
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
+import { onHostStart } from '../../host-lifecycle.js';
 import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
-  closeMatter,
   getMatter,
   LINK_KINDS,
   listClosedMatters,
   listOpenMatters,
-  openMatter,
   placeInMatter,
   placeNowhere,
-  updateMatter,
   type LinkRef,
 } from './db.js';
+import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
+import { runMattersLoop } from './loop.js';
 import { gwsEaMattersMigration } from './migration.js';
+import { currentMorning, formatMorningAnswer, morningBrief, moveMorning } from './morning.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
 
 registerMigration(gwsEaMattersMigration);
+
+onHostStart(({ signal }) => {
+  // Started, not awaited: host startup never waits on a pass.
+  void runMattersLoop(signal);
+});
 
 // ---------------------------------------------------------------------------
 // `ncl matters …` — main's read and write path.
@@ -204,12 +215,15 @@ registerResource({
         asMain(ctx, async () => {
           const look = await nextLookFrom(args);
           if (look === undefined) throw new Error('A matter opens with its next look: give --look or --look-cron');
-          return openMatter({
-            title: requiredString(args, 'title'),
-            openLoop: requiredString(args, 'open_loop'),
-            parentId: parentFrom(args) ?? undefined,
-            links: linksFrom(args),
-          });
+          return openMatterWithLook(
+            {
+              title: requiredString(args, 'title'),
+              openLoop: requiredString(args, 'open_loop'),
+              parentId: parentFrom(args) ?? undefined,
+              links: linksFrom(args),
+            },
+            look,
+          );
         }),
     },
     place: {
@@ -246,7 +260,7 @@ registerResource({
       access: 'open',
       description:
         'Change a matter: reword it, move its next look, change its project, or take links off it.\n\n' +
-        'Its title, open loop and, once closed, its outcome change without reopening it. A next look on a closed matter reopens it, unless one of its threads, events or files now sits in another open matter, which the refusal names. --unlink and --parent apply to an open matter. To add links, use place.',
+        'Its title, open loop and, once closed, its outcome change without reopening it. A next look replaces the one it has; on a closed matter it reopens it, unless one of its threads, events or files now sits in another open matter, which the refusal names. A repeating next look is never replaced by a one-off: a one-off follow-up, such as checking a gift arrived, is a matter of its own. --unlink and --parent apply to an open matter. To add links, use place.',
       args: [
         ID_ARG,
         TITLE_ARG,
@@ -268,15 +282,17 @@ registerResource({
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
           const look = await nextLookFrom(args);
-          return updateMatter({
-            id: requiredString(args, 'id'),
-            title: optionalString(args.title),
-            openLoop: optionalString(args.open_loop),
-            outcome: optionalString(args.outcome),
-            parentId: parentFrom(args),
-            reopen: look !== undefined,
-            unlink: unlinksFrom(args),
-          });
+          return updateMatterAndLook(
+            {
+              id: requiredString(args, 'id'),
+              title: optionalString(args.title),
+              openLoop: optionalString(args.open_loop),
+              outcome: optionalString(args.outcome),
+              parentId: parentFrom(args),
+              unlink: unlinksFrom(args),
+            },
+            look,
+          );
         }),
     },
     close: {
@@ -288,7 +304,7 @@ registerResource({
       examples: ['ncl matters close m-1a2b3c4d5e6f --outcome "Signed on the 9th; terms in memory/clients/acme.md"'],
       handler: async (args, ctx) =>
         asMain(ctx, async () =>
-          closeMatter({ id: requiredString(args, 'id'), outcome: requiredString(args, 'outcome') }),
+          closeMatterAndLook({ id: requiredString(args, 'id'), outcome: requiredString(args, 'outcome') }),
         ),
     },
     get: {
@@ -306,6 +322,42 @@ registerResource({
           const matter = await getMatter(id);
           if (!matter) throw new Error(`No matter ${JSON.stringify(id.trim())} exists`);
           return renderMatter(matter);
+        }),
+    },
+    look: {
+      access: 'open',
+      description:
+        "A next look's pre-task script, which runs on its own when the look comes: whether it wakes you, and while the matter is open, the matter read live as get reads it. To read a matter yourself, use get.",
+      args: [ID_ARG],
+      examples: ['ncl matters look m-1a2b3c4d5e6f'],
+      // The runner reads the last line of a script's output as its verdict: one line of JSON.
+      formatHuman: (verdict) => JSON.stringify(verdict),
+      handler: async (args, ctx) => asMain(ctx, () => lookVerdict(requiredString(args, 'id'))),
+    },
+    morning: {
+      access: 'open',
+      description:
+        "The morning: once a day, before the principal's day starts, you come back with today's brief. With no flags, its time in the principal's time zone; --at moves it, as you do while the principal travels.",
+      args: [
+        {
+          name: 'at',
+          type: 'string',
+          description: "The morning's new time: 24-hour HH:MM in the principal's time zone.",
+        },
+        {
+          name: 'brief',
+          type: 'boolean',
+          description: "The morning's pre-task script, which runs on its own each morning: today's brief.",
+        },
+      ],
+      examples: ['ncl matters morning', 'ncl matters morning --at 06:45'],
+      formatHuman: formatMorningAnswer,
+      handler: async (args, ctx) =>
+        asMain(ctx, async () => {
+          const at = optionalString(args.at);
+          if (args.brief !== true) return at === undefined ? currentMorning() : moveMorning(at);
+          if (at !== undefined) throw new Error('--brief prints the brief and --at moves the morning: give one');
+          return morningBrief();
         }),
     },
     list: {

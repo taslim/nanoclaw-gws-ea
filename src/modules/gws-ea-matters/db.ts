@@ -315,10 +315,24 @@ export async function getMatter(id: string): Promise<Matter | undefined> {
   };
 }
 
-async function requireMatter(id: string): Promise<Matter> {
+export async function requireMatter(id: string): Promise<Matter> {
   const matter = await getMatter(id);
   if (!matter) throw noMatter(id);
   return matter;
+}
+
+/** An open matter's slot for its next look (KTD4): the task it records, or null while it records none. */
+export interface LookSlot {
+  readonly id: string;
+  readonly title: string;
+  readonly look_task_id: string | null;
+}
+
+/** Every open matter's look slot, oldest first. */
+export async function listOpenLookSlots(): Promise<LookSlot[]> {
+  return getDb().all<LookSlot>(
+    'SELECT id, title, look_task_id FROM gws_ea_matters WHERE closed_at IS NULL ORDER BY created_at, id',
+  );
 }
 
 /** Every open matter, most recently changed first, each project with its open strands under it. */
