@@ -129,6 +129,10 @@ export const emailHandoff = requestTool({
       description:
         "Which of the principal's calendars this thread's bookings go on, by its ID. Until one is set, external-email can offer times but books nothing.",
     },
+    matter: {
+      type: 'string',
+      description: 'The id of the open matter the thread belongs to, such as m-1a2b3c4d5e6f: the thread joins it.',
+    },
   },
   required: ['message'],
   repeatable: false,

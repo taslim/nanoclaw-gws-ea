@@ -76,6 +76,8 @@ import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
+import '../gws-ea-matters/index.js';
 import './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
@@ -944,6 +946,73 @@ describe('the assistant’s own calendar (R19)', () => {
     calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'replysync01' });
     data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'replysync01', add: [NOEL] }));
     expect(consumeOwnCalendarChange(PRINCIPAL, 'replysync01', minutesLater())).toBe(true);
+  });
+});
+
+describe('an open matter main names (KTD11)', () => {
+  async function boardDeck(): Promise<string> {
+    const { matter } = await openMatter({
+      title: 'Board deck',
+      openLoop: 'Morgan presents it Friday.\nFocus time, then a dry run with Remy.',
+      links: [],
+    });
+    return matter.id;
+  }
+
+  async function linked(matterId: string): Promise<string[]> {
+    return ((await getMatter(matterId))?.links ?? []).map((link) => `${link.kind} ${link.reference}`);
+  }
+
+  it('is joined by the event create_event adds and the event change_guests changes', async () => {
+    const matterId = await boardDeck();
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+
+    const created = data(await send(main, 'create_event', { ...FOCUS, matter: matterId }));
+    const changed = data(
+      await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY], matter: matterId }),
+    );
+
+    expect(await linked(matterId)).toEqual([
+      `event ${PRINCIPAL}/${String(created.event)}`,
+      `event ${PRINCIPAL}/teamsync01`,
+    ]);
+    expect(created.message).toMatch(new RegExp(` It joins matter ${matterId}\\.$`, 'u'));
+    expect(changed.message).toMatch(new RegExp(` It joins matter ${matterId}\\.$`, 'u'));
+  });
+
+  it('is refused, writing nothing, when it is no matter id, names no matter, or names a closed one', async () => {
+    const closed = await boardDeck();
+    await closeMatter({ id: closed, outcome: 'Presented.' });
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+
+    for (const [matter, reason] of [
+      ['Board deck', 'matter must be the id of an open matter, such as m-1a2b3c4d5e6f'],
+      [42, 'matter must be the id of an open matter, such as m-1a2b3c4d5e6f'],
+      [
+        'm-000000000000',
+        'There is no matter m-000000000000: name an open one by its id, as ncl matters list gives it.',
+      ],
+      [closed, `${closed} is closed: a next look reopens it before anything joins it.`],
+    ] as const) {
+      expect(refusal(await send(main, 'create_event', { ...FOCUS, matter }))).toBe(reason);
+      expect(
+        refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY], matter })),
+      ).toBe(reason);
+    }
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it("is refused from any group but main, though it holds Google Calendar: matters are main's alone (R8)", async () => {
+    await createAgentGroup({ id: 'ag-other', name: 'other', folder: 'other', agent_provider: null, created_at: now() });
+    await ensureContainerConfig('ag-other');
+    const other = (await resolveSession('ag-other', 'mg-dm', null, 'agent-shared')).session;
+    const matterId = await boardDeck();
+
+    expect(refusal(await send(other, 'create_event', { ...FOCUS, matter: matterId }))).toBe(
+      'Only main keeps matters, so only main names one.',
+    );
+    expect(calendar.writes).toEqual([]);
+    expect(await linked(matterId)).toEqual([]);
   });
 });
 

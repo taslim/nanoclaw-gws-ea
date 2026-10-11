@@ -202,7 +202,7 @@ function memoryPath(text: string, value: string): string {
 }
 
 /** A reference in the one spelling the store keeps, so the same piece always matches itself. */
-function canonicalReference(kind: LinkKind, value: string): string {
+export function canonicalReference(kind: LinkKind, value: string): string {
   const text = value.trim();
   switch (kind) {
     case 'thread':

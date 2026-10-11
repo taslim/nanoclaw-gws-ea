@@ -51,9 +51,10 @@ import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { formatLocalTime } from '../../timezone.js';
+import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
 import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
-import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { isDuplicateNote, writeNoteForMain, type NoteForMain, type NotePiece } from '../gws-ea-profile/main-note.js';
 import { parseWorkspaceNotification, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import {
   authenticateSender,
@@ -467,12 +468,9 @@ async function deliver(
   }
 }
 
-/** A note in `main`'s own session; writing the same id again is a no-op. */
-async function writeMainNote(
-  { id, text, wake }: { readonly id: string; readonly text: string; readonly wake: boolean },
-  at: Date,
-): Promise<void> {
-  const result = await writeNoteForMain({ id, timestamp: at.toISOString(), text, wake });
+/** A note in `main`'s own session, with the matters of the pieces it is about; writing the same id again is a no-op. */
+async function writeMainNote(note: Pick<NoteForMain, 'id' | 'text' | 'wake' | 'pieces'>, at: Date): Promise<void> {
+  const result = await writeNoteForMain({ ...note, timestamp: at.toISOString() });
   if (result === 'no-main' || result === 'no-principal') {
     throw new Error('The inbox has no main agent or no principal direct message to report to');
   }
@@ -552,6 +550,7 @@ async function noticeUnsigned(
       'and external-email is handling it as mail from someone unknown. ' +
       `${told ? `${principal} was told privately.` : `The host could not reach ${principal} to tell them.`}\n` +
       `Its subject, as its sender wrote it:\n${untrustedLine(mail.subject, LINE_LIMIT)}\n(thread ${threadKey})`,
+    pieces: [{ kind: 'thread', reference: threadKey }],
   });
   if (result === 'no-main' || result === 'no-principal') {
     log.warn("Nobody to tell of unsigned mail in the principal's name", { gmailMessageId: mail.id, result });
@@ -584,6 +583,7 @@ async function toThread(
             ? 'They wrote nothing of their own above what they quoted or forwarded.'
             : `Their own words, without what they quoted:\n${own.slice(0, WORDS_LIMIT)}`) +
           `\n(thread ${threadKey})`,
+        pieces: [{ kind: 'thread', reference: threadKey }],
       },
       context.at,
     );
@@ -707,9 +707,37 @@ const CHANGE_WORDS: Readonly<Record<CalendarNotice['change'], string>> = {
   unknown: 'Something changed on an event',
 };
 
-/** One note for every calendar notification of a poll, each change naming its calendar, with no text from the emails. */
+/**
+ * Who Calendar names as a new event's organizer, for the open matters it may
+ * belong to (KTD10); undefined when Calendar cannot show it just now.
+ */
+async function organizerOf(
+  events: Pick<MeetingsCalendarApi, 'getEvent'>,
+  notice: CalendarNotice,
+): Promise<string | undefined> {
+  /* eslint-disable no-catch-all/no-catch-all -- an organizer Calendar cannot show costs the note its suggestions, never the note */
+  try {
+    return (await events.getEvent(notice.calendarId, notice.eventId))?.organizer?.email;
+  } catch (error) {
+    log.warn("Could not read a new event's organizer from Calendar", {
+      calendarId: notice.calendarId,
+      eventId: notice.eventId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * One note for every calendar notification of a poll, each change naming its
+ * calendar, with no text from the emails. Each event's open matter comes with
+ * it, and a new event in none brings the open matters its organizer, as
+ * Calendar names them, may tie it to (KTD11).
+ */
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],
+  events: Pick<MeetingsCalendarApi, 'getEvent'>,
   at: Date,
 ): Promise<void> {
   // Each change once, however many emails reported it.
@@ -729,6 +757,20 @@ export async function writeCalendarNote(
     )
     .digest('hex')
     .slice(0, 24);
+  // Each event once, new when any of its notifications says so.
+  const byEvent = new Map<string, CalendarNotice>();
+  for (const { notice } of notices) {
+    const reference = `${notice.calendarId}/${notice.eventId}`;
+    if (!byEvent.has(reference) || notice.change === 'created') byEvent.set(reference, notice);
+  }
+  const pieces = await Promise.all(
+    [...byEvent].map(
+      async ([reference, notice]): Promise<NotePiece> =>
+        notice.change === 'created'
+          ? { kind: 'event', reference, arrival: { from: await organizerOf(events, notice) } }
+          : { kind: 'event', reference },
+    ),
+  );
   await writeMainNote(
     {
       id: `inbox-calendar-${batch}`,
@@ -736,6 +778,7 @@ export async function writeCalendarNote(
       text:
         `Google Calendar reports ${lines.length === 1 ? 'a change' : `${lines.length} changes`}:\n` +
         `${lines.join('\n')}\nRead each event from the calendar before you act on it.`,
+      pieces,
     },
     at,
   );

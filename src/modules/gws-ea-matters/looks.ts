@@ -26,9 +26,10 @@
 import { resolveGroupTimezone } from '../../container-config.js';
 import { findConversationSessions } from '../../db/sessions.js';
 import type { TaskRecord } from '../../mailbox/index.js';
-import { resolveSession, withExistingMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { getMainAgentGroupId, principalContact } from '../gws-ea-profile/db.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { resolveMainConversation } from '../gws-ea-profile/main-note.js';
 import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
 import {
   closeMatter,
@@ -59,16 +60,13 @@ export function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
 }
 
 /**
- * `main`'s one shared conversation, the session `writeNoteForMain` resolves,
- * where every look and the morning come back: undefined until the profile
- * names main and the principal has a direct message.
+ * `main`'s one shared conversation (`resolveMainConversation`), where every
+ * note lands and every look and the morning come back: undefined until the
+ * profile names main and the principal has a direct message.
  */
 export async function mainConversation(): Promise<Session | undefined> {
-  const mainAgentGroupId = await getMainAgentGroupId();
-  if (mainAgentGroupId === null) return undefined;
-  const principal = await principalContact();
-  if (principal === undefined) return undefined;
-  return (await resolveSession(mainAgentGroupId, principal.directMessage.id, null, 'agent-shared')).session;
+  const conversation = await resolveMainConversation();
+  return typeof conversation === 'string' ? undefined : conversation.session;
 }
 
 export async function requireMainConversation(): Promise<Session> {

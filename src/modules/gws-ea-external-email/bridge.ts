@@ -5,8 +5,8 @@
  * routing picks a target session by peer affinity, which would misroute
  * between concurrent threads, and it frames and checks nothing.
  *
- *   email_handoff (main)           { thread_key?, people?, message, files?, calendar? } → { thread_key, message }
- *   tell_main     (external-email) { account, wake?, files? }                         → { message }
+ *   email_handoff (main)           { thread_key?, people?, message, files?, calendar?, matter? } → { thread_key, message }
+ *   tell_main     (external-email) { account, wake?, files? }                                  → { message }
  *
  * - `email_handoff` names one thread by its `mail-…` key, or starts one with
  *   the `people` it names. Either way the people it names are the thread's
@@ -25,19 +25,21 @@
  *   SHA-256, the only way a file goes out (KTD9). A `calendar` sets where
  *   the thread's bookings go: one of the principal's calendars the
  *   assistant can write to. Until `main` sets one, the thread books nothing
- *   (R11). `main`'s words join the mail already waiting in the thread's
- *   session, or are due at once when none is (`pendingDeadline`).
+ *   (R11). A `matter`, one of main's open matters, is joined by the thread
+ *   (Slice 5 KTD11). `main`'s words join the mail already waiting in the
+ *   thread's session, or are due at once when none is (`pendingDeadline`).
  * - `tell_main` keeps `external-email`'s account of its thread on the
  *   thread, in place of the last (Slice 5 R7, KTD9): what it did, what it
  *   learned that no source records, and where the thread stands. `main`
  *   reads it under the thread wherever a matter shows it, so the account is
  *   capped at what a matter shows whole. Only with `wake`, when main must
  *   act now, does it also go into `main`'s session as information, framed
- *   untrusted because it draws on what outsiders wrote, and wake it. The
- *   host's own words name only the thread's key, its addresses, each of the
- *   principal's marked by how it came to the thread, and the calendar the
- *   thread books on, so no name or subject a sender wrote passes as the
- *   host's, and main has what it weighs in setting that calendar (R13).
+ *   untrusted because it draws on what outsiders wrote, with the thread's
+ *   open matter (Slice 5 KTD11), and wake it. The host's own words name only
+ *   the thread's key, its addresses, each of the principal's marked by how
+ *   it came to the thread, and the calendar the thread books on, so no name
+ *   or subject a sender wrote passes as the host's, and main has what it
+ *   weighs in setting that calendar (R13).
  *   Files that came in the thread go with a wake (Slice 6 KTD7), so main can
  *   keep one for the principal: read, as a handoff's are, only from the
  *   request's own outbox, none larger than mail brings into a thread, and
@@ -88,6 +90,7 @@ import {
   type ThreadAddress,
 } from '../gws-ea-inbox/thread-map.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { getThreadBookingCalendar, setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
 import { checkOutbound } from '../gws-ea-privacy/index.js';
@@ -323,6 +326,8 @@ interface Admitted {
   readonly message: string;
   readonly files: readonly OutboundFile[];
   readonly bookingCalendar: string | undefined;
+  /** The open matter the thread joins. */
+  readonly matter: string | undefined;
   readonly context: RoutingContext;
 }
 
@@ -354,8 +359,8 @@ async function assertLinksOpenable(texts: readonly string[], target: Target): Pr
 
 /**
  * Check everything a handoff carries before anything is written: its
- * fields, its thread or people, its files, the private-values check over
- * every part that crosses, the link check, and its calendar.
+ * fields, its thread or people, its files, its matter, the private-values
+ * check over every part that crosses, the link check, and its calendar.
  */
 async function admit(content: Record<string, unknown>, session: Session, requestId: string): Promise<Admitted> {
   const message = messageOf(content.message);
@@ -364,6 +369,7 @@ async function admit(content: Record<string, unknown>, session: Session, request
   const context = await loadRoutingContext(await assistantAddresses(), new Date());
   const target = await targetOf(content, context);
   const files = stagedFiles(session, requestId, names, 'Nothing was handed over');
+  const matter = await requestedMatter(content.matter, session);
   const fileTexts = files.flatMap((file) => [
     file.filename,
     ...(isUtf8(file.data) ? [file.data.toString('utf8')] : []),
@@ -372,7 +378,7 @@ async function admit(content: Record<string, unknown>, session: Session, request
   if (!check.allowed) throw forbidden(`Nothing was handed over: ${check.reason}`);
   await assertLinksOpenable([message, ...fileTexts], target);
   const bookingCalendar = calendarId === undefined ? undefined : await bookingCalendarOf(calendarId, context);
-  return { target, message, files, bookingCalendar, context };
+  return { target, message, files, bookingCalendar, matter, context };
 }
 
 /** The thread's records: a new thread and the people main named, and the calendar it books on. */
@@ -450,12 +456,14 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
   const [externalEmail, { inbox }] = await Promise.all([getExternalEmailAgentGroupId(), emailMessagingGroupIds()]);
   if (externalEmail === null || inbox === null) throw new Error('external-email and its inbox do not exist yet');
   const handoff = await admit(content, session, requestId);
-  const { target, files, bookingCalendar } = handoff;
+  const { target, files, bookingCalendar, matter } = handoff;
   const at = handoff.context.at.toISOString();
   const threadKey = target.kind === 'thread' ? target.threadKey : newThreadKey(session, requestId);
   await recordHandoff(threadKey, handoff, at);
   const { session: thread } = await resolveSession(externalEmail, inbox, threadKey, 'per-thread');
   await writeHandoff(thread, threadKey, handoff, requestId, at);
+  const joined =
+    matter === undefined ? [] : [await joinRequestedMatter(matter, { kind: 'thread', reference: threadKey })];
   return {
     thread_key: threadKey,
     message: [
@@ -466,6 +474,7 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
           }`,
       ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
       ...(bookingCalendar === undefined ? [] : [`Its bookings go on calendar ${bookingCalendar}.`]),
+      ...joined,
     ].join(' '),
   };
 };
@@ -610,6 +619,7 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
     text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, ACCOUNT_MAX)}`,
     wake: true,
     files,
+    pieces: [{ kind: 'thread', reference: threadKey }],
   });
   if (result === 'no-main' || result === 'no-principal') {
     throw new Error('There is no main, or no principal direct message, to tell');

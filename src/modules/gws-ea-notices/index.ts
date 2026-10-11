@@ -167,7 +167,10 @@ function whatFailed(cause: Cause, threadKey: string, people: readonly string[]):
   }
 }
 
-/** Tell main of `failed` in an outside thread; the same failures told again write nothing. */
+/**
+ * Tell main of `failed` in an outside thread, with the thread's open matter;
+ * the same failures told again write nothing.
+ */
 async function tellMain(cause: Cause, threadKey: string, failed: readonly string[]): Promise<void> {
   const digest = createHash('sha256')
     .update([threadKey, ...[...failed].sort()].join('\n'))
@@ -178,6 +181,7 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
     timestamp: new Date().toISOString(),
     text: whatFailed(cause, threadKey, await conversationPeople(threadKey)),
     wake: true,
+    pieces: [{ kind: 'thread', reference: threadKey }],
   });
   if (result === 'no-main' || result === 'no-principal') {
     log.warn('Nobody to tell of an external-email failure', { threadKey, cause, result });

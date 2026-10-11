@@ -43,6 +43,7 @@ describe("main's calendar writes", () => {
       guests: ['remy@northwind.example'],
       recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=TH'],
       video_call: true,
+      matter: 'm-1a2b3c4d5e6f',
     };
     const [result, request] = await Promise.all([
       createEvent.handler(args),
@@ -53,7 +54,12 @@ describe("main's calendar writes", () => {
   });
 
   it('change who an event invites', async () => {
-    const args = { calendar: 'morgan@northwind.example', event: 'abc123', add: ['noel@friends.example'] };
+    const args = {
+      calendar: 'morgan@northwind.example',
+      event: 'abc123',
+      add: ['noel@friends.example'],
+      matter: 'm-1a2b3c4d5e6f',
+    };
     const [result, request] = await Promise.all([
       changeGuests.handler(args),
       answerNext({ guests: ['noel@friends.example'], message: 'Its guests now: noel@friends.example.' }),

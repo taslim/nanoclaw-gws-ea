@@ -37,7 +37,9 @@
  *   preference is.
  * - Every booking lists the principal as an accepted guest, its organizer
  *   (`guestsOn`); who a booking invites never counts them.
- * - `main` hears in one fact when a booking is made, changed or cancelled.
+ * - `main` hears in one fact when a booking is made, changed or cancelled,
+ *   with the thread's open matter, which a new booking joins (KTD11), and
+ *   that matter's other threads to brief (R28).
  *
  * Bookings go only on the calendar `main` set for the thread (R11), while it
  * is a principal calendar the assistant can write to; no other calendar
@@ -62,6 +64,7 @@ import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
+import { listOpenMatterLinks, placeInMatter } from '../gws-ea-matters/db.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import {
   getGwsEaProfile,
@@ -197,6 +200,34 @@ function threadKeyOf(session: Session): string {
 interface ThreadView {
   readonly threadKey: string;
   readonly principal: Principal;
+}
+
+/**
+ * The other threads of the open matter a booking's thread sits in, which the
+ * time it settles must reach (R28). With `joining`, the booking's event first
+ * joins that matter (KTD11), so the matter holds the time its thread settled.
+ * The booking stands and main hears of it whatever happens here, so a failure
+ * is logged and names no other thread.
+ */
+async function matterThreads(booking: ThreadBooking, joining: boolean): Promise<string[]> {
+  /* eslint-disable no-catch-all/no-catch-all -- the booking already stands; its matter is best effort, never a retry that books again */
+  try {
+    const links = await listOpenMatterLinks();
+    const matterId = links.find((link) => link.kind === 'thread' && link.reference === booking.threadKey)?.matter_id;
+    if (matterId === undefined) return [];
+    if (joining) {
+      await placeInMatter(matterId, [{ kind: 'event', reference: `${booking.calendarId}/${booking.eventId}` }]);
+    }
+    return links.flatMap((link) =>
+      link.matter_id === matterId && link.kind === 'thread' && link.reference !== booking.threadKey
+        ? [link.reference]
+        : [],
+    );
+  } catch (err) {
+    log.error("A booking's matter could not be read or joined", { threadKey: booking.threadKey, err });
+    return [];
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 export interface SchedulingToolsDeps {
@@ -338,13 +369,16 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   /**
    * Tell main of a booking the thread made, changed or cancelled, once: the
    * note's id derives from the change. The note leads with what happened and
-   * to whom, in main's time zone, and ends with the ids main acts on. The
-   * booking stands whatever happens here, so a failure is logged, never
-   * thrown into a retry that would book again. A title, which external-email
-   * wrote from the thread, is framed as untrusted.
+   * to whom, in main's time zone, and ends with the ids main acts on, then
+   * the other threads of the thread's open matter (R28), which a new booking
+   * joins first (KTD11), and the matter itself. The booking stands whatever
+   * happens here, so a failure is logged, never thrown into a retry that
+   * would book again. A title, which external-email wrote from the thread,
+   * is framed as untrusted.
    */
   async function tellMain(fact: BookingFact): Promise<void> {
     const { threadKey, booking, span, invitees, change } = fact;
+    const others = await matterThreads(booking, change.kind === 'booked');
     /* eslint-disable no-catch-all/no-catch-all -- the calendar change already stands; main's note is reported, never retried into a second change */
     try {
       const mainAgentGroupId = await getMainAgentGroupId();
@@ -390,7 +424,20 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           throw new Error(`Unknown booking change: ${JSON.stringify(unreachable)}`);
         }
       }
-      const result = await writeNoteForMain({ id, timestamp: new Date().toISOString(), text, wake: true });
+      const brief =
+        others.length === 0
+          ? ''
+          : `\nIts matter's other threads, to brief at once: ${LIST.format(others.map((other) => `thread ${other}`))}.`;
+      const result = await writeNoteForMain({
+        id,
+        timestamp: new Date().toISOString(),
+        text: `${text}${brief}`,
+        wake: true,
+        pieces: [
+          { kind: 'thread', reference: threadKey },
+          { kind: 'event', reference: `${booking.calendarId}/${booking.eventId}` },
+        ],
+      });
       if (result === 'no-main' || result === 'no-principal') {
         log.warn('Nobody to tell of a booking change', { threadKey, change: change.kind, result });
       }

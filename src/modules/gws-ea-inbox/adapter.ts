@@ -28,6 +28,7 @@
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
+import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import type { DriveApi } from '../gws-ea-workspace/drive-api.js';
 import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import { syncCalendarList, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
@@ -87,6 +88,8 @@ export const EMAIL_CHANNEL_DEFAULTS: ChannelDefaults = { dm: EMAIL_CONTEXT, grou
 export interface InboxDeps {
   readonly gmail: GmailApi;
   readonly calendar: CalendarListApi;
+  /** The principal's events as the host's own Calendar token reads them, for who organized a new one. */
+  readonly events: Pick<MeetingsCalendarApi, 'getEvent'>;
   /** Drive as the host's own Drive token reaches it, for the details of Docs and Drive activity. */
   readonly drive: DriveApi;
   readonly now?: () => Date;
@@ -207,7 +210,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       /* eslint-enable no-catch-all/no-catch-all */
     };
-    await writeBatch(calendar, () => writeCalendarNote(calendar, context.at), 'calendar-note');
+    await writeBatch(calendar, () => writeCalendarNote(calendar, deps.events, context.at), 'calendar-note');
     await writeBatch(workspace, () => writeWorkspaceNote(workspace, deps.drive, context.at), 'workspace-note');
     if (setAside.length > 0) await noticeSetAside(setAside);
     return complete;

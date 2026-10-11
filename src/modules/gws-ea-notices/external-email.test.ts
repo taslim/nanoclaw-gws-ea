@@ -57,6 +57,8 @@ import {
 import { ensureInbox, ensurePrincipalConversation } from '../gws-ea-inbox/index.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { openMatter } from '../gws-ea-matters/db.js';
+import '../gws-ea-matters/index.js';
 import './index.js';
 
 const PRINCIPAL_USER = 'gchat:users/pat';
@@ -392,6 +394,28 @@ describe('a failed turn in a thread', () => {
 
     expect(facts()).toHaveLength(2);
     expect(mainWakes()).toBe(2);
+  });
+
+  it('carries the open matter the thread sits in (Slice 5 R11)', async () => {
+    const { key, session } = await emailThread();
+    const { matter } = await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal signed this quarter.',
+      links: [{ kind: 'thread', reference: key }],
+    });
+    await arrive(session, 'in-email');
+    queueTurnFailed(session, 'turn-1', threadRoute(session));
+
+    await drain(session, 1);
+
+    const [fact, ...others] = facts();
+    expect(others).toEqual([]);
+    expect(fact.text).toMatch(
+      new RegExp(
+        `failed before it finished\\. \\(thread ${key}\\)\\n\\nMatter ${matter.id}, open: Acme renewal\\n`,
+        'u',
+      ),
+    );
   });
 
   it('names the thread by its key alone while nobody else is on it', async () => {

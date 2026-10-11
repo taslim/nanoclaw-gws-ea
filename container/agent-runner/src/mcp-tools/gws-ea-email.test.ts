@@ -80,6 +80,15 @@ describe('the email tools', () => {
       [
         emailHandoff,
         'email_handoff',
+        {
+          people: ['remy@acme.example'],
+          message: 'Tell Remy the renewal call is being set with Juno.',
+          matter: 'm-1a2b3c4d5e6f',
+        },
+      ],
+      [
+        emailHandoff,
+        'email_handoff',
         { thread_key: 'mail-inbound-1', people: ['jane@acme.example'], message: 'Morgan asked to copy Jane in.' },
       ],
       [

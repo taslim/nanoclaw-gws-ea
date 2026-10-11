@@ -94,6 +94,8 @@ import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
+import '../gws-ea-matters/index.js';
 import './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
@@ -1283,6 +1285,79 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       [first.booking, 'cancelled'],
       [second.booking, 'confirmed'],
     ]);
+  });
+});
+
+describe('a booking from a thread in an open matter (KTD11, R28)', () => {
+  /** Remy's thread settles the time, and Jane's relays to it. */
+  async function renewal(): Promise<string> {
+    const { matter } = await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal call this week.\nThread A settles the time, and thread B relays to it.',
+      links: [
+        { kind: 'thread', reference: threadA },
+        { kind: 'thread', reference: threadB },
+      ],
+    });
+    return matter.id;
+  }
+
+  function brief(): string {
+    return `Its matter's other threads, to brief at once: thread ${threadB}.`;
+  }
+
+  it("joins the thread's matter, and reaches main with the matter and its other threads to brief", async () => {
+    const matterId = await renewal();
+
+    const booked = data(
+      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Renewal call', invitees: [REMY] }),
+    );
+
+    const event = `${PRINCIPAL}/${String(booked.booking)}`;
+    expect((await getMatter(matterId))?.links.map((link) => `${link.kind} ${link.reference}`)).toEqual([
+      `thread ${threadA}`,
+      `thread ${threadB}`,
+      `event ${event}`,
+    ]);
+    const [fact, ...others] = mainHeard();
+    expect(others).toEqual([]);
+    expect(fact).toContain(
+      `\n(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})\n${brief()}\n\n` +
+        `Matter ${matterId}, open: Acme renewal\n`,
+    );
+    // The matter once, though the note names both its thread and its new event.
+    expect(fact.split(`Matter ${matterId}, open`)).toHaveLength(2);
+    expect(fact).toMatch(new RegExp(`\\n- event ${event}: Oct 6, 2026, [^\\n]*; confirmed;`, 'u'));
+  });
+
+  it('names the other threads again when the booking moves, and when it is cancelled', async () => {
+    await renewal();
+    const booked = data(
+      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Renewal call', invitees: [REMY] }),
+    );
+
+    data(await send(sessionA, 'change_booking', { booking: booked.booking, start: WEDNESDAY_10AM }));
+    data(await send(sessionA, 'cancel_booking', { booking: booked.booking }));
+
+    const [, moved, cancelled] = mainHeard();
+    expect(moved).toMatch(/^Rescheduled the meeting /u);
+    expect(moved).toContain(`on calendar ${PRINCIPAL})\n${brief()}\n\n`);
+    expect(cancelled).toMatch(/^Cancelled the meeting /u);
+    expect(cancelled).toContain(`on calendar ${PRINCIPAL})\n${brief()}\n\n`);
+  });
+
+  it('joins no matter, and names no thread, once the matter has closed', async () => {
+    const matterId = await renewal();
+    await closeMatter({ id: matterId, outcome: 'Renewed at 5%.' });
+
+    const booked = data(
+      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Renewal call', invitees: [REMY] }),
+    );
+
+    expect((await getMatter(matterId))?.links.map((link) => link.kind)).toEqual(['thread', 'thread']);
+    expect(mainHeard()[0]).toMatch(
+      new RegExp(`\\(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL}\\)$`, 'u'),
+    );
   });
 });
 

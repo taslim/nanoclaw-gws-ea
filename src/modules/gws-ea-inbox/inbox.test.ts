@@ -90,6 +90,9 @@ import '../gws-ea-people/index.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
+import { openMatter } from '../gws-ea-matters/db.js';
+import '../gws-ea-matters/index.js';
+import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';
 import { MAX_NOTE_ITEMS } from '../gws-ea-workspace/notices.js';
@@ -532,6 +535,8 @@ class FakeCalendar implements CalendarListApi {
 
 let gmail: FakeGmail;
 let calendar: FakeCalendar;
+/** The principal's events, as the host's Calendar token reads them. */
+let events: FakeEvents;
 let drive: FakeDrive;
 let inbox: Inbox;
 let main: Session;
@@ -592,6 +597,7 @@ async function startInbox(): Promise<void> {
   inbox = createInbox({
     gmail,
     calendar,
+    events,
     drive,
     now: () => new Date(Date.now() + clockOffsetMs),
     sleep: async () => undefined,
@@ -745,6 +751,7 @@ beforeEach(async () => {
   gmail = new FakeGmail();
   calendar = new FakeCalendar();
   calendar.entries = [{ id: PRINCIPAL, accessRole: 'writer' }];
+  events = new FakeEvents();
   drive = new FakeDrive(JUNO);
   await ensureInbox('ag-external');
   await ensurePrincipalConversation('ag-main');
@@ -1395,6 +1402,77 @@ describe('routing by audience', () => {
     await inbox.tick();
     expect(rows(main)).toEqual([]);
     expect(await outsideMail()).toEqual([]);
+  });
+});
+
+describe('notes that carry their matter (Slice 5 KTD11)', () => {
+  it("brings the principal's words in a thread with that thread's open matter", async () => {
+    gmail.receive({ from: `Acme Sales <${SALES}>`, threadId: 'gt-acme', subject: 'Renewal', body: 'Shall we talk?' });
+    await inbox.tick();
+    const threadKey = (await getDb().get<{ thread_key: string }>('SELECT thread_key FROM gws_ea_threads'))?.thread_key;
+    if (threadKey === undefined) throw new Error('The thread was not recorded');
+    const { matter } = await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal at 5%.',
+      links: [{ kind: 'thread', reference: threadKey }],
+    });
+
+    gmail.receive({
+      from: `Pat <${PRINCIPAL}>`,
+      auth: 'principal',
+      threadId: 'gt-acme',
+      to: [SALES],
+      cc: [JUNO],
+      body: 'Juno, please find us a time.',
+    });
+    await inbox.tick();
+
+    const [copy, ...others] = notes(PRINCIPAL_WROTE);
+    expect(others).toEqual([]);
+    expect(copy.text).toContain(
+      `Juno, please find us a time.\n(thread ${threadKey})\n\nMatter ${matter.id}, open: Acme renewal\n`,
+    );
+  });
+
+  it('brings a new invitation the open matters its organizer, as Calendar names them, may tie it to (F1)', async () => {
+    const sales = await addPerson({
+      name: 'Remy Vance',
+      level: 'active',
+      source: 'principal',
+      basis: 'Acme account lead.',
+      identity: `email:${SALES}`,
+    });
+    const { matter } = await openMatter({
+      title: 'Acme renewal',
+      openLoop: 'Pat wants the renewal at 5%.',
+      links: [{ kind: 'person', reference: sales.id }],
+    });
+    events.put({
+      calendarId: PRINCIPAL,
+      id: 'acmecall1',
+      status: 'confirmed',
+      organizer: { email: SALES },
+      start: { dateTime: '2026-10-14T14:00:00.000Z' },
+      end: { dateTime: '2026-10-14T14:30:00.000Z' },
+    });
+    gmail.receive({
+      from: 'Google Calendar <calendar-notification@google.com>',
+      auth: 'calendar',
+      subject: 'New event: Renewal call @ Wed',
+      body: `https://calendar.google.com/calendar/event?action=VIEW&eid=${Buffer.from(`acmecall1 ${PRINCIPAL}`).toString('base64url')}`,
+    });
+    await inbox.tick();
+
+    const [note, ...others] = notes(/^Google Calendar reports/u);
+    expect(others).toEqual([]);
+    expect(note.text).toBe(
+      'Google Calendar reports a change:\n' +
+        `- A new event (event acmecall1 on calendar ${PRINCIPAL})\n` +
+        'Read each event from the calendar before you act on it.\n\n' +
+        `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
+        'Open matters it may belong to:\n' +
+        `- ${matter.id}: Acme renewal (same person)`,
+    );
   });
 });
 
