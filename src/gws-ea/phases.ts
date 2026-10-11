@@ -26,7 +26,9 @@ export interface ProvisionHumanPause {
   readonly message: string;
   readonly details?: readonly string[];
   readonly actionUrl?: string;
+  /** What the resume command adds once the person has acted; with `choices`, the chosen `id` follows it. */
   readonly resumeFlag?: string;
+  /** The options the person picks one of, such as the billing account to link. */
   readonly choices?: readonly { readonly id: string; readonly label: string }[];
   /**
    * Whether what the person was asked to do has happened, checked cheaply and

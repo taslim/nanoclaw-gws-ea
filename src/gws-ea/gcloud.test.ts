@@ -23,12 +23,19 @@ import {
   type GcpProjectInput,
   type GcpStepContext,
 } from './gcloud.js';
+import {
+  deriveGchatEventsSubscription,
+  deriveGchatEventsTopic,
+  GCHAT_EVENTS_SUBSCRIPTION_ID,
+  GCHAT_EVENTS_TOPIC_ID,
+} from './gcp-identity.js';
 import { readProvisionJournal, reserveInstance, withInstanceOperation, type ProvisionJournal } from './journal.js';
 import { resolveControlPlanePaths } from './paths.js';
 import {
   OBSERVATION_WAITS_SECONDS,
   PRESENT,
   runProvisionSteps,
+  type ProvisionHumanPause,
   type ProvisionResult,
   type ProvisionStep,
   type ProvisionSteps,
@@ -52,6 +59,25 @@ async function tempRoot(): Promise<string> {
 const ACCOUNT = 'operator@example.com';
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 const KEY_CONSTRAINTS = ['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation'];
+const CHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com';
+const BILLING_ACCOUNT = '01A2B3-C4D5E6-F70819';
+const SECOND_BILLING_ACCOUNT = '0F1E2D-3C4B5A-697887';
+const CLOSED_BILLING_ACCOUNT = '00AA11-22BB33-44CC55';
+const REQUIRED_APIS = [
+  'chat.googleapis.com',
+  'iam.googleapis.com',
+  'orgpolicy.googleapis.com',
+  'pubsub.googleapis.com',
+  'workspaceevents.googleapis.com',
+];
+/** The pull subscription's settings, as its create flags set them. */
+const SUBSCRIPTION_SETTINGS = {
+  topic: GCHAT_EVENTS_TOPIC_ID,
+  'ack-deadline': '60',
+  'message-retention-duration': '7d',
+  'expiration-period': 'never',
+  'retain-acked-messages': false,
+};
 
 // Recorded live (fixtures/README.md): an expired sign-in, behind the Python warning that gcloud prints first.
 const REAUTHENTICATION_FAILED = RECORDED_GCLOUD_REAUTHENTICATION_FAILED.stderr;
@@ -82,6 +108,18 @@ const GCLOUD_CRASHED = [
   '  gcloud feedback',
 ].join('\n');
 
+// Google's documented answer when domain restricted sharing refuses a member (constraints/iam.allowedPolicyMemberDomains).
+const DOMAIN_RESTRICTED =
+  'ERROR: (gcloud.pubsub.topics.add-iam-policy-binding) FAILED_PRECONDITION: One or more users named in the policy do not belong to a permitted customer.';
+// The same refusal naming its constraint, in the shape of Google's PreconditionFailure; not recorded live.
+const MANAGED_MEMBERS_REFUSED = [
+  'ERROR: (gcloud.pubsub.topics.add-iam-policy-binding) FAILED_PRECONDITION: One or more users named in the policy do not belong to a permitted customer.',
+  "- '@type': type.googleapis.com/google.rpc.PreconditionFailure",
+  '  violations:',
+  `  - subject: orgpolicy:projects/p?configvalue=${encodeURIComponent(CHAT_PUBLISHER)}`,
+  '    type: constraints/iam.managed.allowedPolicyMembers',
+].join('\n');
+
 function projectNotVisible(projectId: string): string {
   return `ERROR: (gcloud.projects.describe) [${ACCOUNT}] does not have permission to access projects instance [${projectId}] (or it may not exist): The caller does not have permission. This command is authenticated as ${ACCOUNT} which is the active account specified by the [core/account] property.`;
 }
@@ -107,6 +145,31 @@ function failed(stderr: string): SanitizedCommandOutcome {
 
 function json(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+/** An IAM policy as `gcloud ... get-iam-policy --format=json` prints it; gcloud omits empty bindings. */
+function iamPolicy(policy: ReadonlyMap<string, ReadonlySet<string>>): Record<string, unknown> {
+  if (policy.size === 0) return { etag: 'ACAB' };
+  return {
+    bindings: [...policy].map(([role, members]) => ({ members: [...members].sort(), role })),
+    etag: 'BwYlr1x3b2s=',
+    version: 1,
+  };
+}
+
+function pubsubNotFound(kind: string, id: string): SanitizedCommandOutcome {
+  return failed(`ERROR: (gcloud.pubsub.${kind}) NOT_FOUND: Resource not found (resource=${id}).`);
+}
+
+/** The member and role of `gcloud pubsub ... add-iam-policy-binding ID --member=M --role=R --project=P`. */
+function binding(words: readonly string[]): { member: string; role: string } {
+  const flag = (name: string): string => {
+    const prefix = `--${name}=`;
+    const word = words.find((candidate) => candidate.startsWith(prefix));
+    if (!word) throw new Error(`Missing ${prefix}`);
+    return word.slice(prefix.length);
+  };
+  return { member: flag('member'), role: flag('role') };
 }
 
 /** A service-account key file as `gcloud iam service-accounts keys create` writes it. */
@@ -145,10 +208,26 @@ class FakeGoogleCloud {
     'serviceusage.googleapis.com',
     'storage.googleapis.com',
   ]);
+  /** The billing accounts the reserved account can see. */
+  billingAccounts: { id: string; displayName: string; open: boolean }[] = [
+    { id: BILLING_ACCOUNT, displayName: 'Ellery Household', open: true },
+  ];
+  linkedBillingAccount: string | undefined;
+  topic = false;
+  /** Lists that still omit the topic after it was created. */
+  unlistedTopicReads = 0;
+  /** The pull subscription, as the flags it was created with set it. */
+  subscription: Record<string, string | boolean> | undefined;
+  readonly topicPolicy = new Map<string, Set<string>>();
+  readonly subscriptionPolicy = new Map<string, Set<string>>();
+  /** What Google answers a grant to Google Chat's publisher when an organization policy refuses it. */
+  publisherRefusal: string | undefined;
+  /** Subscriber grants Google still refuses after the account was created, until IAM knows it. */
+  unknownMemberGrants = 0;
   serviceAccount: { displayName: string; description: string } | undefined;
-  /** Lists that still omit the Chat service account after it was created. */
+  /** Lists that still omit the subscriber account after it was created. */
   unlistedServiceAccountReads = 0;
-  /** Key lists that still answer NOT_FOUND after the Chat service account was created. */
+  /** Key lists that still answer NOT_FOUND after the subscriber account was created. */
   unresolvedKeyReads = 0;
   /** Key lists that still omit the key Google created last. */
   unlistedNewKeyReads = 0;
@@ -174,14 +253,51 @@ class FakeGoogleCloud {
     this.commands.push(line);
     const { projectId: project, serviceAccountEmail: email } = this.gcp;
     const scoped = `--project=${project}`;
+    const topic = GCHAT_EVENTS_TOPIC_ID;
+    const subscription = GCHAT_EVENTS_SUBSCRIPTION_ID;
 
     if (line === `projects describe ${project} --format=json`) return this.#describeProject();
     if (line.startsWith(`projects create ${project} `)) return this.#createProject(words);
     if (line === `projects delete ${project}`) return this.#deleteProject();
+    if (line === 'billing accounts list --format=json') return this.#listBillingAccounts();
     if (!this.project) {
       return failed(
         `ERROR: (gcloud.${words.slice(0, 3).join('.')}) PERMISSION_DENIED: Permission denied on resource project ${project}.`,
       );
+    }
+    if (line === `billing projects describe ${project} --format=json`) return ok(json(this.billingInfo));
+    if (words.length === 5 && line.startsWith(`billing projects link ${project} --billing-account=`)) {
+      return this.#linkBilling(line, words[4]!.slice('--billing-account='.length));
+    }
+    if (line === `pubsub topics list ${scoped} --format=json`) return this.#listTopics();
+    if (line === `pubsub topics create ${topic} ${scoped}`) return this.#createTopic(line);
+    if (line === `pubsub subscriptions list ${scoped} --format=json`) {
+      return ok(json(this.subscription ? [this.subscriptionDescription] : []));
+    }
+    if (line.startsWith(`pubsub subscriptions create ${subscription} `) && words.at(-1) === scoped) {
+      return this.#createSubscription(words);
+    }
+    if (line === `pubsub topics get-iam-policy ${topic} ${scoped} --format=json`) {
+      return this.topic ? ok(json(iamPolicy(this.topicPolicy))) : pubsubNotFound('topics', topic);
+    }
+    if (line === `pubsub subscriptions get-iam-policy ${subscription} ${scoped} --format=json`) {
+      return this.subscription
+        ? ok(json(iamPolicy(this.subscriptionPolicy)))
+        : pubsubNotFound('subscriptions', subscription);
+    }
+    if (
+      words.length === 7 &&
+      line.startsWith(`pubsub topics add-iam-policy-binding ${topic} `) &&
+      words[6] === scoped
+    ) {
+      return this.topic ? this.#grantOnTopic(words) : pubsubNotFound('topics', topic);
+    }
+    if (
+      words.length === 7 &&
+      line.startsWith(`pubsub subscriptions add-iam-policy-binding ${subscription} `) &&
+      words[6] === scoped
+    ) {
+      return this.subscription ? this.#grantOnSubscription(words) : pubsubNotFound('subscriptions', subscription);
     }
     if (line === `services list --enabled ${scoped} --format=value(config.name)`) {
       return ok([...this.enabled].sort().join('\n') + '\n');
@@ -256,6 +372,138 @@ class FakeGoogleCloud {
     this.project!.lifecycleState = 'DELETE_REQUESTED';
     this.mutations.push(`projects delete ${this.gcp.projectId}`);
     return ok('', `Deleted [https://cloudresourcemanager.googleapis.com/v1/projects/${this.gcp.projectId}].\n`);
+  }
+
+  #listBillingAccounts(): SanitizedCommandOutcome {
+    return ok(
+      json(
+        this.billingAccounts.map(({ id, displayName, open }) => ({
+          displayName,
+          masterBillingAccount: '',
+          name: `billingAccounts/${id}`,
+          open,
+        })),
+      ),
+    );
+  }
+
+  get billingInfo(): Record<string, unknown> {
+    const { projectId } = this.gcp;
+    return {
+      billingAccountName: this.linkedBillingAccount ? `billingAccounts/${this.linkedBillingAccount}` : '',
+      billingEnabled: this.linkedBillingAccount !== undefined,
+      name: `projects/${projectId}/billingInfo`,
+      projectId,
+    };
+  }
+
+  #linkBilling(line: string, id: string): SanitizedCommandOutcome {
+    if (!this.billingAccounts.some((account) => account.id === id && account.open)) {
+      return failed(
+        `ERROR: (gcloud.billing.projects.link) PERMISSION_DENIED: The caller does not have permission (or it may not exist).`,
+      );
+    }
+    this.linkedBillingAccount = id;
+    this.mutations.push(line);
+    return ok(json(this.billingInfo));
+  }
+
+  #listTopics(): SanitizedCommandOutcome {
+    if (!this.topic || this.unlistedTopicReads > 0) {
+      if (this.topic) this.unlistedTopicReads -= 1;
+      return ok('[]\n');
+    }
+    return ok(json([{ name: deriveGchatEventsTopic(this.gcp.projectId) }]));
+  }
+
+  #createTopic(line: string): SanitizedCommandOutcome {
+    const name = deriveGchatEventsTopic(this.gcp.projectId);
+    if (this.topic) {
+      return failed(
+        [
+          `ERROR: Failed to create topic [${name}]: Resource already exists in the project (resource=${GCHAT_EVENTS_TOPIC_ID}).`,
+          `ERROR: (gcloud.pubsub.topics.create) Failed to create the following: [${GCHAT_EVENTS_TOPIC_ID}].`,
+        ].join('\n'),
+      );
+    }
+    this.topic = true;
+    this.mutations.push(line);
+    return ok('', `Created topic [${name}].\n`);
+  }
+
+  get subscriptionDescription(): Record<string, unknown> {
+    return {
+      ackDeadlineSeconds: Number(this.subscription?.['ack-deadline']),
+      expirationPolicy: {},
+      messageRetentionDuration: '604800s',
+      name: deriveGchatEventsSubscription(this.gcp.projectId),
+      pushConfig: {},
+      state: 'ACTIVE',
+      topic: `projects/${this.gcp.projectId}/topics/${String(this.subscription?.topic)}`,
+    };
+  }
+
+  #createSubscription(words: readonly string[]): SanitizedCommandOutcome {
+    const name = deriveGchatEventsSubscription(this.gcp.projectId);
+    if (this.subscription) {
+      return failed(
+        [
+          `ERROR: Failed to create subscription [${name}]: Resource already exists in the project (resource=${GCHAT_EVENTS_SUBSCRIPTION_ID}).`,
+          `ERROR: (gcloud.pubsub.subscriptions.create) Failed to create the following: [${GCHAT_EVENTS_SUBSCRIPTION_ID}].`,
+        ].join('\n'),
+      );
+    }
+    if (!this.topic) {
+      return failed(
+        `ERROR: (gcloud.pubsub.subscriptions.create) NOT_FOUND: Resource not found (resource=${GCHAT_EVENTS_TOPIC_ID}).`,
+      );
+    }
+    const flags = words.slice(4, -1).map((flag): [string, string | boolean] => {
+      const [key, value] = flag.slice(2).split('=') as [string, string | undefined];
+      if (value !== undefined) return [key, value];
+      return key.startsWith('no-') ? [key.slice(3), false] : [key, true];
+    });
+    this.subscription = Object.fromEntries(flags);
+    this.mutations.push(words.join(' '));
+    return ok('', `Created subscription [${name}].\n`);
+  }
+
+  #grantOnTopic(words: readonly string[]): SanitizedCommandOutcome {
+    const { member, role } = binding(words);
+    if (member === CHAT_PUBLISHER && this.publisherRefusal) return failed(this.publisherRefusal);
+    return this.#grant(this.topicPolicy, words, member, role);
+  }
+
+  #grantOnSubscription(words: readonly string[]): SanitizedCommandOutcome {
+    const { member, role } = binding(words);
+    const email = this.gcp.serviceAccountEmail;
+    if (member === `serviceAccount:${email}` && (!this.serviceAccount || this.unknownMemberGrants > 0)) {
+      if (this.serviceAccount) this.unknownMemberGrants -= 1;
+      return failed(
+        `ERROR: (gcloud.pubsub.subscriptions.add-iam-policy-binding) INVALID_ARGUMENT: Service account ${email} does not exist.`,
+      );
+    }
+    return this.#grant(this.subscriptionPolicy, words, member, role);
+  }
+
+  #grant(
+    policy: Map<string, Set<string>>,
+    words: readonly string[],
+    member: string,
+    role: string,
+  ): SanitizedCommandOutcome {
+    const members = policy.get(role) ?? new Set<string>();
+    members.add(member);
+    policy.set(role, members);
+    this.mutations.push(words.join(' '));
+    return ok(json(iamPolicy(policy)), `Updated IAM policy for ${words[1]!.slice(0, -1)} [${words[3]}].\n`);
+  }
+
+  /** Who may do what on the topic and the subscription. */
+  get grants(): Record<'topic' | 'subscription', Record<string, string[]>> {
+    const plain = (policy: Map<string, Set<string>>): Record<string, string[]> =>
+      Object.fromEntries([...policy].map(([role, members]) => [role, [...members]]));
+    return { topic: plain(this.topicPolicy), subscription: plain(this.subscriptionPolicy) };
   }
 
   get serviceAccountDescription(): Record<string, unknown> {
@@ -375,11 +623,16 @@ class FakeGoogleCloud {
       labels: { 'gws-ea-instance': this.gcp.instanceId, 'gws-ea-managed': 'true' },
       lifecycleState: 'ACTIVE',
     };
-    for (const api of ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com']) this.enabled.add(api);
+    this.linkedBillingAccount = BILLING_ACCOUNT;
+    for (const api of REQUIRED_APIS) this.enabled.add(api);
+    this.topic = true;
+    this.subscription = { ...SUBSCRIPTION_SETTINGS };
+    this.topicPolicy.set('roles/pubsub.publisher', new Set([CHAT_PUBLISHER]));
     this.serviceAccount = {
-      displayName: 'GWS-EA Google Chat',
+      displayName: 'GWS-EA Chat subscriber',
       description: `Owned by GWS-EA instance ${this.gcp.instanceId}`,
     };
+    this.subscriptionPolicy.set('roles/pubsub.subscriber', new Set([`serviceAccount:${this.gcp.serviceAccountEmail}`]));
     return this;
   }
 }
@@ -391,8 +644,8 @@ interface Harness {
   readonly sleeps: number[];
   readonly events: RunEvent[];
   readonly signIns: string[];
-  /** Run `provision_gcp` through the step engine, as `create` and `resume` do. */
-  run(runCommand?: GcloudCommandRunner): Promise<ProvisionResult>;
+  /** Run `provision_gcp` through the step engine, as `create` and `resume` do, with any decisions made. */
+  run(runCommand?: GcloudCommandRunner, decisions?: Pick<GcpProjectInput, 'billingAccount'>): Promise<ProvisionResult>;
   journal(): Promise<ProvisionJournal>;
 }
 
@@ -445,7 +698,7 @@ async function harness(): Promise<Harness> {
     sleeps,
     events,
     signIns,
-    run: async (runCommand = cloud.run) => {
+    run: async (runCommand = cloud.run, decisions = {}) => {
       const steps = {
         ...Object.fromEntries(PROVISION_STEPS.map((id) => [id, satisfied])),
         provision_gcp: {
@@ -458,7 +711,7 @@ async function harness(): Promise<Harness> {
         },
       } as ProvisionSteps<GcpStepContext>;
       const result = await withInstanceOperation(paths, instanceId, (operation) =>
-        runProvisionSteps(operation, { operation, input: { gcp } }, steps, {
+        runProvisionSteps(operation, { operation, input: { gcp: { ...gcp, ...decisions } } }, steps, {
           sleep,
           emit,
           signIn: async () => void signIns.push(ACCOUNT),
@@ -582,7 +835,32 @@ describe('gcloud sign-in and installation', () => {
   });
 });
 
-describe('Google Chat service-account key', () => {
+describe("the assistant's Chat delivery names", () => {
+  it("derives the topic, the subscription, and the subscriber account from the instance's project", () => {
+    const projectId = deriveGcpProjectId('12345678-1234-4234-8234-123456789abc');
+
+    expect(projectId).toBe('gws-ea-12345678123442348234');
+    expect([
+      deriveGchatEventsTopic(projectId),
+      deriveGchatEventsSubscription(projectId),
+      deriveGchatServiceAccountEmail(projectId),
+    ]).toEqual([
+      'projects/gws-ea-12345678123442348234/topics/gws-ea-chat-events',
+      'projects/gws-ea-12345678123442348234/subscriptions/gws-ea-chat-events-pull',
+      'gws-ea-chat@gws-ea-12345678123442348234.iam.gserviceaccount.com',
+    ]);
+  });
+
+  it.each([
+    ['topic', deriveGchatEventsTopic],
+    ['subscription', deriveGchatEventsSubscription],
+    ['subscriber account', deriveGchatServiceAccountEmail],
+  ])('refuses to name a %s in an invalid project', (_name, derive) => {
+    expect(() => derive('Not A Project')).toThrow(expect.objectContaining({ code: 'invalid_claim' }) as Error);
+  });
+});
+
+describe('Chat subscriber key', () => {
   const projectId = 'gws-ea-12345678123442348234';
   const email = deriveGchatServiceAccountEmail(projectId);
   const expected = { projectId, serviceAccountEmail: email };
@@ -629,7 +907,7 @@ describe('Google Chat service-account key', () => {
 });
 
 describe('Google Cloud setup through the step engine', () => {
-  it('creates a never-created project Google will not confirm, then its APIs, account, and one published key', async () => {
+  it('creates a never-created project Google will not confirm, then its billing, APIs, Chat delivery, subscriber, and one published key', async () => {
     const setup = await harness();
 
     await expect(setup.run()).resolves.toEqual({ status: 'ready' });
@@ -638,11 +916,17 @@ describe('Google Cloud setup through the step engine', () => {
     const keyId = await publishedKeyId(setup.gcp);
     expect(setup.cloud.mutations).toEqual([
       `projects create ${projectId} --name=GWS-EA assistant --labels=gws-ea-instance=${instanceId},gws-ea-managed=true --format=json`,
-      `services enable chat.googleapis.com iam.googleapis.com orgpolicy.googleapis.com --project=${projectId}`,
-      `iam service-accounts create gws-ea-chat --display-name=GWS-EA Google Chat --description=Owned by GWS-EA instance ${instanceId} --project=${projectId} --format=json`,
+      `billing projects link ${projectId} --billing-account=${BILLING_ACCOUNT}`,
+      `services enable ${REQUIRED_APIS.join(' ')} --project=${projectId}`,
+      `pubsub topics create gws-ea-chat-events --project=${projectId}`,
+      `pubsub subscriptions create gws-ea-chat-events-pull --topic=gws-ea-chat-events --ack-deadline=60 --message-retention-duration=7d --expiration-period=never --no-retain-acked-messages --project=${projectId}`,
+      `pubsub topics add-iam-policy-binding gws-ea-chat-events --member=${CHAT_PUBLISHER} --role=roles/pubsub.publisher --project=${projectId}`,
+      `iam service-accounts create gws-ea-chat --display-name=GWS-EA Chat subscriber --description=Owned by GWS-EA instance ${instanceId} --project=${projectId} --format=json`,
+      `pubsub subscriptions add-iam-policy-binding gws-ea-chat-events-pull --member=serviceAccount:${serviceAccountEmail} --role=roles/pubsub.subscriber --project=${projectId}`,
       `keys create ${keyId}`,
     ]);
     expect(setup.cloud.commands[0]).toBe(`projects describe ${projectId} --format=json`);
+    expect(setup.cloud.subscription).toEqual(SUBSCRIPTION_SETTINGS);
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
     expect(serviceAccountEmail).toBe(`gws-ea-chat@${projectId}.iam.gserviceaccount.com`);
     await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -650,6 +934,175 @@ describe('Google Cloud setup through the step engine', () => {
     expect(journal.steps.provision_gcp?.completed_at).toBeDefined();
     expect(journal.key_policy_lifted).toBe(false);
     expect(setup.sleeps).toEqual([]);
+  });
+
+  it('lets only Google Chat publish to the topic, and lets the subscriber account only pull the one subscription', async () => {
+    const setup = await harness();
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.grants).toEqual({
+      topic: { 'roles/pubsub.publisher': [CHAT_PUBLISHER] },
+      subscription: { 'roles/pubsub.subscriber': [`serviceAccount:${setup.gcp.serviceAccountEmail}`] },
+    });
+    // The fake refuses any other grant, a project-wide one included, as an unexpected command.
+    expect(setup.cloud.commands.filter((command) => command.includes('iam-policy-binding'))).toEqual([
+      expect.stringMatching(
+        /^pubsub topics add-iam-policy-binding gws-ea-chat-events --member=serviceAccount:chat-api-push@/u,
+      ),
+      expect.stringMatching(
+        /^pubsub subscriptions add-iam-policy-binding gws-ea-chat-events-pull --member=serviceAccount:gws-ea-chat@/u,
+      ),
+    ]);
+  });
+
+  it('pauses with each open billing account as a choice when there are several, then links the one chosen', async () => {
+    const setup = await harness();
+    setup.cloud.billingAccounts.push(
+      { id: SECOND_BILLING_ACCOUNT, displayName: 'Hale Studio', open: true },
+      { id: CLOSED_BILLING_ACCOUNT, displayName: 'Vance Expired Card', open: false },
+    );
+
+    const result = await setup.run();
+
+    expect(result).toEqual({
+      status: 'paused',
+      pause: {
+        kind: 'human-action',
+        phase: 'provision_gcp',
+        code: 'gcp_billing_account_choice_required',
+        message: expect.stringContaining(setup.gcp.projectId),
+        choices: [
+          { id: BILLING_ACCOUNT, label: `Ellery Household (${BILLING_ACCOUNT})` },
+          { id: SECOND_BILLING_ACCOUNT, label: `Hale Studio (${SECOND_BILLING_ACCOUNT})` },
+        ],
+        resumeFlag: '--billing-account',
+      },
+    });
+    expect(setup.cloud.mutations).toEqual([expect.stringMatching(/^projects create /u)]);
+    expect(setup.cloud.linkedBillingAccount).toBeUndefined();
+
+    await expect(setup.run(undefined, { billingAccount: SECOND_BILLING_ACCOUNT })).resolves.toEqual({
+      status: 'ready',
+    });
+    expect(setup.cloud.linkedBillingAccount).toBe(SECOND_BILLING_ACCOUNT);
+    expect(setup.cloud.mutations.filter((entry) => entry.startsWith('billing '))).toEqual([
+      `billing projects link ${setup.gcp.projectId} --billing-account=${SECOND_BILLING_ACCOUNT}`,
+    ]);
+  });
+
+  it('pauses, naming the billing account it needs, when the account has no open one, until one is open', async () => {
+    const setup = await harness();
+    setup.cloud.billingAccounts = [{ id: CLOSED_BILLING_ACCOUNT, displayName: 'Vance Expired Card', open: false }];
+
+    const result = await setup.run();
+
+    expect(result).toMatchObject({
+      status: 'paused',
+      pause: {
+        phase: 'provision_gcp',
+        code: 'gcp_billing_account_required',
+        message: expect.stringMatching(new RegExp(`${setup.gcp.projectId} needs a billing account.*${ACCOUNT}`, 'u')),
+        details: [expect.stringContaining('Billing Account User (roles/billing.user)')],
+        actionUrl: 'https://console.cloud.google.com/billing',
+      },
+    });
+    expect(setup.cloud.mutations).toEqual([expect.stringMatching(/^projects create /u)]);
+    const { settled } = (result as { readonly pause: ProvisionHumanPause }).pause;
+    await expect(settled?.()).resolves.toBe(false);
+
+    setup.cloud.billingAccounts.push({ id: BILLING_ACCOUNT, displayName: 'Ellery Household', open: true });
+    await expect(settled?.()).resolves.toBe(true);
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+    expect(setup.cloud.linkedBillingAccount).toBe(BILLING_ACCOUNT);
+  });
+
+  it('stops with Google’s answer, linking nothing, when the chosen billing account cannot be linked', async () => {
+    const setup = await harness();
+
+    await expect(setup.run(undefined, { billingAccount: CLOSED_BILLING_ACCOUNT })).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringContaining(`could not link billing account ${CLOSED_BILLING_ACCOUNT}`),
+      details: { stderrTail: expect.stringContaining('PERMISSION_DENIED') },
+    });
+    expect(setup.cloud.linkedBillingAccount).toBeUndefined();
+  });
+
+  it('refuses a chosen billing account that is not a billing account ID, running nothing', async () => {
+    const setup = await harness();
+
+    await expect(setup.run(undefined, { billingAccount: 'billingAccounts/01A2B3' })).rejects.toMatchObject({
+      code: 'invalid_billing_account',
+    });
+    expect(setup.cloud.commands).toEqual([]);
+  });
+
+  it.each([
+    ['domain restricted sharing', DOMAIN_RESTRICTED, 'iam.allowedPolicyMemberDomains'],
+    ['a constraint Google names', MANAGED_MEMBERS_REFUSED, 'iam.managed.allowedPolicyMembers'],
+  ])(
+    'stops, naming the constraint, when %s refuses Google Chat as the topic publisher',
+    async (_case, refusal, constraint) => {
+      const setup = await harness();
+      setup.cloud.ready().topicPolicy.clear();
+      setup.cloud.serviceAccount = undefined;
+      setup.cloud.publisherRefusal = refusal;
+
+      await expect(setup.run()).rejects.toMatchObject({
+        code: 'gcp_publisher_grant_refused',
+        message: expect.stringMatching(
+          new RegExp(
+            `constraints/${constraint.replaceAll('.', '\\.')}.*chat-api-push@system\\.gserviceaccount\\.com`,
+            'u',
+          ),
+        ),
+        details: { stderrTail: expect.stringContaining('FAILED_PRECONDITION') },
+      });
+      expect(setup.cloud.mutations).toEqual([]);
+      expect(setup.cloud.serviceAccount).toBeUndefined();
+    },
+  );
+
+  it('treats a topic Google already holds but does not yet list as created', async () => {
+    const setup = await harness();
+    setup.cloud.ready().unlistedTopicReads = 1;
+    await writeCredential(setup.gcp.credentialFile, keyFile(setup.gcp.projectId, setup.gcp.serviceAccountEmail, 'k1'));
+    setup.cloud.userKeys.add('k1');
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.commands).toContain(`pubsub topics create gws-ea-chat-events --project=${setup.gcp.projectId}`);
+    expect(setup.cloud.mutations).toEqual([]);
+  });
+
+  it('waits for Google to know a subscriber account it just created before granting it the subscription', async () => {
+    const setup = await harness();
+    setup.cloud.unknownMemberGrants = 2;
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.sleeps).toEqual([1_000, 2_000]);
+    expect(setup.events).toContainEqual({
+      type: 'step-waiting',
+      step: 'provision_gcp',
+      reason: 'Waiting for Google Cloud to make the new service account usable…',
+    });
+    expect(setup.cloud.grants.subscription).toEqual({
+      'roles/pubsub.subscriber': [`serviceAccount:${setup.gcp.serviceAccountEmail}`],
+    });
+  });
+
+  it('stops with Google’s answer when the new subscriber account is still unknown after 7 minutes', async () => {
+    const setup = await harness();
+    setup.cloud.unknownMemberGrants = 999;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringContaining(`could not let ${setup.gcp.serviceAccountEmail} pull`),
+      details: { stderrTail: expect.stringContaining('does not exist') },
+    });
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(7 * 60_000);
+    expect(setup.cloud.grants.subscription).toEqual({});
   });
 
   it('adopts a project whose creation reports it already exists when its labels name this assistant', async () => {
@@ -695,7 +1148,7 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.events).toContainEqual({
       type: 'step-waiting',
       step: 'provision_gcp',
-      reason: 'Waiting for the Google Chat service account…',
+      reason: 'Waiting for the Chat subscriber account…',
     });
     await publishedKeyId(setup.gcp);
   });
@@ -761,7 +1214,7 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.events).toContainEqual({
       type: 'step-waiting',
       step: 'provision_gcp',
-      reason: 'Waiting for Google Cloud to list the new Google Chat key…',
+      reason: 'Waiting for Google Cloud to list the new subscriber key…',
     });
   });
 
@@ -845,7 +1298,7 @@ describe('Google Cloud setup through the step engine', () => {
 
   const unusableKeyFiles: ReadonlyArray<readonly [string, number, string]> = [
     ['at the wrong mode', 0o644, 'readable only by its owner'],
-    ['not a key', 0o600, 'Google Chat credential'],
+    ['not a key', 0o600, 'Chat subscriber key'],
     // The owner can read any file when running as root.
     ...(process.getuid?.() === 0 ? [] : [['unreadable', 0o200, 'EACCES'] as const]),
   ];
@@ -854,7 +1307,7 @@ describe('Google Cloud setup through the step engine', () => {
     const setup = await harness();
     setup.cloud.ready().userKeys.add('k1');
     const contents =
-      evidence === 'Google Chat credential'
+      evidence === 'Chat subscriber key'
         ? '{"type":"authorized_user"}'
         : keyFile(setup.gcp.projectId, setup.gcp.serviceAccountEmail, 'k1');
     await writeCredential(setup.gcp.credentialFile, contents, mode);
@@ -897,7 +1350,7 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.events).toContainEqual({
       type: 'step-waiting',
       step: 'provision_gcp',
-      reason: 'Waiting for Google Cloud to allow Google Chat key creation…',
+      reason: 'Waiting for Google Cloud to allow service-account key creation…',
     });
     const journal = await setup.journal();
     expect(journal.key_policy_lifted).toBe(false);
@@ -970,6 +1423,32 @@ describe('Google Cloud setup through the step engine', () => {
     expect((await setup.journal()).key_policy_lifted).toBe(false);
   });
 
+  it('resumed after the key was published, restores the lifted policy and creates nothing', async () => {
+    const setup = await harness();
+    setup.cloud.orgEnforced.add('iam.disableServiceAccountKeyCreation');
+    let policyChanges = 0;
+    const dying: GcloudCommandRunner = async (command) => {
+      if (command.args[1] === 'set-policy' && ++policyChanges > KEY_CONSTRAINTS.length) {
+        throw new Error('The process died');
+      }
+      return setup.cloud.run(command);
+    };
+
+    await expect(setup.run(dying)).rejects.toThrow('The process died');
+    const keyId = await publishedKeyId(setup.gcp);
+    expect((await setup.journal()).key_policy_lifted).toBe(true);
+
+    const before = setup.cloud.mutations.length;
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations.slice(before)).toEqual(
+      KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
+    );
+    expect(await publishedKeyId(setup.gcp)).toBe(keyId);
+    expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
+    expect((await setup.journal()).key_policy_lifted).toBe(false);
+  });
+
   it('pauses, naming the policy role and the project, when the policy cannot be changed', async () => {
     const setup = await harness();
     setup.cloud.ready().orgEnforced.add('iam.disableServiceAccountKeyCreation');
@@ -1012,7 +1491,7 @@ describe('Google Cloud setup through the step engine', () => {
 
     expect(failure).toMatchObject({
       code: 'observation_unknown',
-      message: expect.stringContaining('the Google Chat service account'),
+      message: expect.stringContaining('the Chat subscriber account'),
       details: { evidence: expect.stringContaining('gcloud crashed (TypeError)') },
     });
     expect(setup.sleeps).toEqual(FULL_WAIT);

@@ -1223,10 +1223,15 @@ describe('production provision step composition', () => {
 
       expect(resources.map((resource) => [resource.name, resource.unknown ?? 'wait'])).toEqual([
         ['the Google Cloud project', 'create-by-unique-id'],
+        ['the billing account link', 'wait'],
         ['the Google Cloud APIs', 'wait'],
-        ['the Google Chat service account', 'wait'],
-        ['the Google Chat credential', 'wait'],
-        ['the Google Chat key-creation policy', 'wait'],
+        ['the Google Chat events topic', 'wait'],
+        ['the Google Chat events subscription', 'wait'],
+        ['the publisher grant on the topic', 'wait'],
+        ['the Chat subscriber account', 'wait'],
+        ["the subscriber's grant on the subscription", 'wait'],
+        ['the Chat subscriber key', 'wait'],
+        ['the key-creation policy', 'wait'],
       ]);
     });
   });
