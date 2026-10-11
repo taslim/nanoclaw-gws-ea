@@ -60,6 +60,8 @@ async function tempRoot(): Promise<string> {
 const ACCOUNT = 'operator@example.com';
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 const KEY_CONSTRAINTS = ['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation'];
+/** Domain restricted sharing: the legacy list constraint, then the managed one. */
+const MEMBER_CONSTRAINTS = ['iam.allowedPolicyMemberDomains', 'iam.managed.allowedPolicyMembers'];
 const CHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com';
 const BILLING_ACCOUNT = '01A2B3-C4D5E6-F70819';
 const SECOND_BILLING_ACCOUNT = '0F1E2D-3C4B5A-697887';
@@ -120,6 +122,30 @@ const MANAGED_MEMBERS_REFUSED = [
   `  - subject: orgpolicy:projects/p?configvalue=${encodeURIComponent(CHAT_PUBLISHER)}`,
   '    type: constraints/iam.managed.allowedPolicyMembers',
 ].join('\n');
+/** What Google answers a grant to Google Chat's publisher that each member-domain constraint refuses. */
+const MEMBER_REFUSALS: Readonly<Record<string, string>> = {
+  'iam.allowedPolicyMemberDomains': DOMAIN_RESTRICTED,
+  'iam.managed.allowedPolicyMembers': MANAGED_MEMBERS_REFUSED,
+};
+
+// gcloud's answer for a policy the project does not have of its own (describe recorded live, for both constraints).
+function policyNotFound(verb: 'describe' | 'delete', constraint: string): string {
+  return [
+    `ERROR: (gcloud.org-policies.${verb}) NOT_FOUND: A Policy of constraint constraints/${constraint} on resource projects/472476071913 does not exist. This command is authenticated as ${ACCOUNT} which is the active account specified by the [core/account] property.`,
+    "- '@type': type.googleapis.com/google.rpc.ErrorInfo",
+    '  domain: orgpolicy.googleapis.com',
+    '  reason: POLICY_NOT_FOUND',
+  ].join('\n');
+}
+
+function policyChangeDenied(verb: 'set-policy' | 'delete', permission: string, projectId: string): string {
+  return `ERROR: (gcloud.org-policies.${verb}) PERMISSION_DENIED: Permission '${permission}' denied on resource '//cloudresourcemanager.googleapis.com/projects/${projectId}' (or it may not exist).`;
+}
+
+/** The command that grants Google Chat's publisher the topic, as the fake records it. */
+function publisherGrant(projectId: string): string {
+  return `pubsub topics add-iam-policy-binding gws-ea-chat-events --member=${CHAT_PUBLISHER} --role=roles/pubsub.publisher --project=${projectId}`;
+}
 
 function projectNotVisible(projectId: string): string {
   return `ERROR: (gcloud.projects.describe) [${ACCOUNT}] does not have permission to access projects instance [${projectId}] (or it may not exist): The caller does not have permission. This command is authenticated as ${ACCOUNT} which is the active account specified by the [core/account] property.`;
@@ -217,8 +243,6 @@ class FakeGoogleCloud {
   subscription: Record<string, string | boolean> | undefined;
   readonly topicPolicy = new Map<string, Set<string>>();
   readonly subscriptionPolicy = new Map<string, Set<string>>();
-  /** What Google answers a grant to Google Chat's publisher when an organization policy refuses it. */
-  publisherRefusal: string | undefined;
   /** Subscriber grants Google still refuses after the account was created, until IAM knows it. */
   unknownMemberGrants = 0;
   serviceAccount: { displayName: string; description: string } | undefined;
@@ -229,11 +253,15 @@ class FakeGoogleCloud {
   /** Key lists that still omit the key Google created last. */
   unlistedNewKeyReads = 0;
   readonly userKeys = new Set<string>();
-  /** Key-creation constraints the organization enforces. */
+  /** Key-creation and member-domain constraints the organization enforces. */
   readonly orgEnforced = new Set<string>();
+  /** The project's own policies: whether each enforces its constraint. */
   readonly projectPolicies = new Map<string, boolean>();
   /** Key creations Google still refuses after a lift, while the change propagates. */
   policyLag = 0;
+  /** Publisher grants Google still refuses after a member-domain constraint is relaxed, while the change propagates. */
+  memberPolicyLag = 0;
+  /** The reserved account may set and delete the project's own policies. */
   canSetPolicy = true;
   readonly commands: string[] = [];
   readonly mutations: string[] = [];
@@ -322,6 +350,12 @@ class FakeGoogleCloud {
       return this.#createKey(words[4]!);
     }
     if (line.startsWith('org-policies set-policy ') && words.at(-1) === scoped) return this.#setPolicy(words[2]!);
+    for (const constraint of MEMBER_CONSTRAINTS) {
+      if (line === `org-policies describe ${constraint} ${scoped} --format=json`) {
+        return this.#describePolicy(constraint);
+      }
+      if (line === `org-policies delete ${constraint} ${scoped}`) return this.#deletePolicy(constraint);
+    }
     throw new Error(`Unexpected gcloud command: ${line}`);
   };
 
@@ -451,7 +485,17 @@ class FakeGoogleCloud {
 
   #grantOnTopic(words: readonly string[]): SanitizedCommandOutcome {
     const { member, role } = binding(words);
-    if (member === CHAT_PUBLISHER && this.publisherRefusal) return failed(this.publisherRefusal);
+    if (member === CHAT_PUBLISHER) {
+      const enforced = MEMBER_CONSTRAINTS.find(
+        (constraint) => this.projectPolicies.get(constraint) ?? this.orgEnforced.has(constraint),
+      );
+      const relaxed = MEMBER_CONSTRAINTS.find((constraint) => this.projectPolicies.get(constraint) === false);
+      const refusing = enforced ?? (this.memberPolicyLag > 0 ? relaxed : undefined);
+      if (refusing) {
+        if (!enforced) this.memberPolicyLag -= 1;
+        return failed(MEMBER_REFUSALS[refusing]);
+      }
+    }
     return this.#grant(this.topicPolicy, words, member, role);
   }
 
@@ -575,20 +619,46 @@ class FakeGoogleCloud {
   async #setPolicy(file: string): Promise<SanitizedCommandOutcome> {
     const policy = JSON.parse(await readFile(file, 'utf8')) as {
       name: string;
-      spec: { rules: { enforce: boolean }[] };
+      spec: { rules: { enforce?: boolean; allowAll?: boolean }[] };
     };
     const [, project, , constraint] = policy.name.split('/');
     expect(project).toBe(this.gcp.projectId);
-    expect(KEY_CONSTRAINTS).toContain(constraint);
+    expect([...KEY_CONSTRAINTS, ...MEMBER_CONSTRAINTS]).toContain(constraint);
+    // The legacy member-domain constraint is a list constraint, which only allowing all relaxes.
+    const listConstraint = constraint === MEMBER_CONSTRAINTS[0];
+    expect(policy.spec.rules).toEqual([listConstraint ? { allowAll: true } : { enforce: expect.any(Boolean) }]);
     if (!this.canSetPolicy) {
-      return failed(
-        `ERROR: (gcloud.org-policies.set-policy) PERMISSION_DENIED: Permission 'orgpolicy.policies.create' denied on resource '//cloudresourcemanager.googleapis.com/projects/${this.gcp.projectId}' (or it may not exist).`,
-      );
+      return failed(policyChangeDenied('set-policy', 'orgpolicy.policies.create', this.gcp.projectId));
     }
-    const enforce = policy.spec.rules[0]!.enforce;
-    this.projectPolicies.set(constraint!, enforce);
-    this.mutations.push(`set-policy ${constraint} enforce=${enforce}`);
+    const rule = listConstraint ? 'allowAll=true' : `enforce=${policy.spec.rules[0]!.enforce}`;
+    this.projectPolicies.set(constraint!, policy.spec.rules[0]!.enforce === true);
+    this.mutations.push(`set-policy ${constraint} ${rule}`);
     return ok('', `Updated policy [${policy.name}].\n`);
+  }
+
+  #describePolicy(constraint: string): SanitizedCommandOutcome {
+    const enforced = this.projectPolicies.get(constraint);
+    if (enforced === undefined) return failed(policyNotFound('describe', constraint));
+    return ok(
+      json({
+        etag: 'CLWPsr4GEKDvzOcC',
+        name: `projects/441811502258/policies/${constraint}`,
+        spec: {
+          etag: 'CLWPsr4GEKDvzOcC',
+          rules: [constraint === MEMBER_CONSTRAINTS[0] ? { allowAll: true } : { enforce: enforced }],
+          updateTime: '2026-09-20T17:03:41.118Z',
+        },
+      }),
+    );
+  }
+
+  #deletePolicy(constraint: string): SanitizedCommandOutcome {
+    if (!this.canSetPolicy) {
+      return failed(policyChangeDenied('delete', 'orgpolicy.policies.delete', this.gcp.projectId));
+    }
+    if (!this.projectPolicies.delete(constraint)) return failed(policyNotFound('delete', constraint));
+    this.mutations.push(`delete-policy ${constraint}`);
+    return ok('{}\n', `Deleted policy [projects/${this.gcp.projectId}/policies/${constraint}].\n`);
   }
 
   /** Everything provisioning creates, as the owner left it. */
@@ -694,6 +764,15 @@ async function harness(): Promise<Harness> {
     },
     journal: () => readProvisionJournal(paths, instanceId),
   };
+}
+
+/** A harness whose Google Cloud is ready and whose key is published, except for Google Chat's publisher grant. */
+async function awaitingPublisher(): Promise<Harness> {
+  const setup = await harness();
+  setup.cloud.ready().topicPolicy.clear();
+  setup.cloud.userKeys.add('k1');
+  await writeCredential(setup.gcp.credentialFile, keyFile(setup.gcp.projectId, setup.gcp.serviceAccountEmail, 'k1'));
+  return setup;
 }
 
 async function writeCredential(file: string, contents: string, mode = 0o600): Promise<void> {
@@ -900,6 +979,12 @@ describe('Google Cloud setup through the step engine', () => {
       `keys create ${keyId}`,
     ]);
     expect(setup.cloud.commands[0]).toBe(`projects describe ${projectId} --format=json`);
+    // Without domain restricted sharing, the member-domain policy is only read.
+    expect(setup.cloud.commands.filter((command) => command.startsWith('org-policies '))).toEqual(
+      MEMBER_CONSTRAINTS.map(
+        (constraint) => `org-policies describe ${constraint} --project=${projectId} --format=json`,
+      ),
+    );
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
     expect(serviceAccountEmail).toBe(`gws-ea-chat@${projectId}.iam.gserviceaccount.com`);
     await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -1012,30 +1097,144 @@ describe('Google Cloud setup through the step engine', () => {
   });
 
   it.each([
-    ['domain restricted sharing', DOMAIN_RESTRICTED, 'iam.allowedPolicyMemberDomains'],
-    ['a constraint Google names', MANAGED_MEMBERS_REFUSED, 'iam.managed.allowedPolicyMembers'],
+    // Google refuses for the legacy constraint in its documented wording, and names the managed one.
+    ['legacy', 'iam.allowedPolicyMemberDomains', 'allowAll=true'],
+    ['managed', 'iam.managed.allowedPolicyMembers', 'enforce=false'],
   ])(
-    'stops, naming the constraint, when %s refuses Google Chat as the topic publisher',
-    async (_case, refusal, constraint) => {
-      const setup = await harness();
-      setup.cloud.ready().topicPolicy.clear();
-      setup.cloud.serviceAccount = undefined;
-      setup.cloud.publisherRefusal = refusal;
+    'when the %s member-domain constraint refuses Google Chat, relaxes it on this project only until Google grants publishing, then restores it',
+    async (_case, constraint, relaxed) => {
+      const setup = await awaitingPublisher();
+      setup.cloud.orgEnforced.add(constraint);
+      setup.cloud.memberPolicyLag = 3;
 
-      await expect(setup.run()).rejects.toMatchObject({
-        code: 'gcp_publisher_grant_refused',
-        message: expect.stringMatching(
-          new RegExp(
-            `constraints/${constraint.replaceAll('.', '\\.')}.*chat-api-push@system\\.gserviceaccount\\.com`,
-            'u',
-          ),
-        ),
-        details: { stderrTail: expect.stringContaining('FAILED_PRECONDITION') },
+      await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+      expect(setup.cloud.mutations).toEqual([
+        `set-policy ${constraint} ${relaxed}`,
+        publisherGrant(setup.gcp.projectId),
+        `delete-policy ${constraint}`,
+      ]);
+      expect(setup.cloud.projectPolicies).toEqual(new Map());
+      expect(setup.sleeps).toEqual([1_000, 2_000, 4_000]);
+      expect(setup.events).toContainEqual({
+        type: 'step-waiting',
+        step: 'provision_gcp',
+        reason: 'Waiting for Google Cloud to let Google Chat publish to the topic…',
       });
-      expect(setup.cloud.mutations).toEqual([]);
-      expect(setup.cloud.serviceAccount).toBeUndefined();
     },
   );
+
+  it('relaxes each constraint in turn when the organization enforces both, then restores both', async () => {
+    const setup = await awaitingPublisher();
+    for (const constraint of MEMBER_CONSTRAINTS) setup.cloud.orgEnforced.add(constraint);
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([
+      'set-policy iam.allowedPolicyMemberDomains allowAll=true',
+      'set-policy iam.managed.allowedPolicyMembers enforce=false',
+      publisherGrant(setup.gcp.projectId),
+      'delete-policy iam.allowedPolicyMemberDomains',
+      'delete-policy iam.managed.allowedPolicyMembers',
+    ]);
+    expect(setup.cloud.projectPolicies).toEqual(new Map());
+    expect(setup.sleeps).toEqual([]);
+  });
+
+  it('pauses, naming the member-domain policy, the policy role, and the project, when it cannot be relaxed', async () => {
+    const setup = await awaitingPublisher();
+    setup.cloud.orgEnforced.add('iam.managed.allowedPolicyMembers');
+    setup.cloud.canSetPolicy = false;
+    const { projectId } = setup.gcp;
+
+    await expect(setup.run()).resolves.toEqual({
+      status: 'paused',
+      pause: {
+        kind: 'human-action',
+        phase: 'provision_gcp',
+        code: 'gcp_policy_permission_required',
+        message: `Google Cloud refused to change the member-domain policy (constraints/iam.managed.allowedPolicyMembers) on project ${projectId}.`,
+        details: [
+          `Grant ${ACCOUNT} Organization Policy Administrator (roles/orgpolicy.policyAdmin) on the organization that contains project ${projectId}, then resume.`,
+        ],
+      },
+    });
+    expect(setup.cloud.mutations).toEqual([]);
+  });
+
+  it('keeps the override and stops with Google’s answer when Google Chat is still refused 15 minutes after it, then a resume grants and restores', async () => {
+    const setup = await awaitingPublisher();
+    setup.cloud.orgEnforced.add('iam.allowedPolicyMemberDomains');
+    setup.cloud.memberPolicyLag = 999;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringMatching(
+        /still refused.*15 minutes after constraints\/iam\.allowedPolicyMemberDomains was relaxed.*override stays until the grant exists/su,
+      ),
+      details: { stderrTail: expect.stringContaining('FAILED_PRECONDITION') },
+    });
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(15 * 60_000);
+    const relax = 'set-policy iam.allowedPolicyMemberDomains allowAll=true';
+    expect(setup.cloud.mutations).toEqual([relax]);
+
+    setup.cloud.memberPolicyLag = 0;
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+    expect(setup.cloud.mutations).toEqual([
+      relax,
+      publisherGrant(setup.gcp.projectId),
+      'delete-policy iam.allowedPolicyMemberDomains',
+    ]);
+    expect(setup.cloud.projectPolicies).toEqual(new Map());
+  });
+
+  it('restores an override left by a run that died once Google Chat was granted, granting nothing again', async () => {
+    const setup = await awaitingPublisher();
+    setup.cloud.orgEnforced.add('iam.managed.allowedPolicyMembers');
+    // The first read of the member-domain policy follows the grant.
+    const dying: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 2).join(' ') === 'org-policies describe') throw new Error('The process died');
+      return setup.cloud.run(command);
+    };
+
+    await expect(setup.run(dying)).rejects.toThrow('The process died');
+    expect(setup.cloud.topicPolicy.get('roles/pubsub.publisher')).toEqual(new Set([CHAT_PUBLISHER]));
+    expect(setup.cloud.projectPolicies).toEqual(new Map([['iam.managed.allowedPolicyMembers', false]]));
+
+    const before = setup.cloud.mutations.length;
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations.slice(before)).toEqual(['delete-policy iam.managed.allowedPolicyMembers']);
+    expect(setup.cloud.projectPolicies).toEqual(new Map());
+  });
+
+  it('stops, naming the constraint and relaxing nothing, when another organization policy refuses Google Chat as the topic publisher', async () => {
+    const setup = await harness();
+    setup.cloud.ready().topicPolicy.clear();
+    setup.cloud.serviceAccount = undefined;
+    // In the shape of Google's PreconditionFailure; not recorded live.
+    const refusal = [
+      'ERROR: (gcloud.pubsub.topics.add-iam-policy-binding) FAILED_PRECONDITION: Operation denied by org policy.',
+      "- '@type': type.googleapis.com/google.rpc.PreconditionFailure",
+      '  violations:',
+      `  - subject: orgpolicy:projects/${setup.gcp.projectId}`,
+      '    type: constraints/custom.restrictTopicPublishers',
+    ].join('\n');
+    const runCommand: GcloudCommandRunner = async (command) =>
+      command.args.slice(0, 3).join(' ') === 'pubsub topics add-iam-policy-binding'
+        ? failed(refusal)
+        : setup.cloud.run(command);
+
+    await expect(setup.run(runCommand)).rejects.toMatchObject({
+      code: 'gcp_publisher_grant_refused',
+      message: expect.stringMatching(
+        /constraints\/custom\.restrictTopicPublishers.*chat-api-push@system\.gserviceaccount\.com/u,
+      ),
+      details: { stderrTail: expect.stringContaining('FAILED_PRECONDITION') },
+    });
+    expect(setup.cloud.mutations).toEqual([]);
+    expect(setup.cloud.serviceAccount).toBeUndefined();
+  });
 
   it('treats a topic Google already holds but does not yet list as created', async () => {
     const setup = await harness();

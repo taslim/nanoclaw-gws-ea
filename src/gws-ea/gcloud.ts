@@ -5,10 +5,12 @@
  * only pull it. It observes its resources with reads whose failures are
  * classified, never guessed: an expired sign-in signs in again, and anything a
  * read cannot decide is unknown and changes nothing, except creating the
- * project under the instance's own random ID. The subscriber key converges by
- * replacement, and a key-creation policy lifted to create it is recorded in
- * the journal first and restored before the step can complete. Every command
- * is logged in a form an operator can rerun.
+ * project under the instance's own random ID. Domain restricted sharing that
+ * refuses Google Chat as the topic's publisher is relaxed on the project only,
+ * and restored once the grant exists, read back from Google. The subscriber
+ * key converges by replacement, and a key-creation policy lifted to create it
+ * is recorded in the journal first and restored before the step can complete.
+ * Every command is logged in a form an operator can rerun.
  */
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -82,6 +84,21 @@ const SUBSCRIPTION_SETTINGS = [
  */
 const DOMAIN_RESTRICTED_SHARING = /do not belong to a permitted customer/u;
 const DOMAIN_RESTRICTED_SHARING_CONSTRAINT = 'iam.allowedPolicyMemberDomains';
+/** The legacy and managed constraints of domain restricted sharing, either of which can refuse Google Chat. */
+const MEMBER_DOMAIN_CONSTRAINTS = [DOMAIN_RESTRICTED_SHARING_CONSTRAINT, 'iam.managed.allowedPolicyMembers'] as const;
+type MemberDomainConstraint = (typeof MEMBER_DOMAIN_CONSTRAINTS)[number];
+/** The one rule of a project-level organization policy (org-policies v2). */
+type PolicyRule = { readonly enforce: boolean } | { readonly allowAll: true };
+/**
+ * The project-level rule that relaxes each: the legacy constraint is a list
+ * constraint, which allows all, and the managed one is not enforced.
+ */
+const MEMBER_DOMAIN_RELAXED: Readonly<Record<MemberDomainConstraint, PolicyRule>> = {
+  'iam.allowedPolicyMemberDomains': { allowAll: true },
+  'iam.managed.allowedPolicyMembers': { enforce: false },
+};
+/** Google's reason when the project has no policy of its own for a constraint. */
+const NO_PROJECT_POLICY = /\bPOLICY_NOT_FOUND\b/u;
 /**
  * The Workspace APIs the assistant's own Google sign-in holds scopes for
  * (KTD2), enabled by the Google connection. Nothing calls Drive Activity or
@@ -529,37 +546,57 @@ function stagingFile(gcp: GcpProjectInput): string {
   return `${gcp.credentialFile}.staging`;
 }
 
-function policyPermissionPause(coordinates: GcpProjectCoordinates): ProvisionHumanPause {
+/** `policy` names the organization policy Google refused to let the reserved account change. */
+function policyPermissionPause(coordinates: GcpProjectCoordinates, policy: string): ProvisionHumanPause {
   return {
     kind: 'human-action',
     phase: 'provision_gcp',
     code: 'gcp_policy_permission_required',
-    message: `Google Cloud refused to change the service-account key-creation policy on project ${coordinates.projectId}.`,
+    message: `Google Cloud refused to change ${policy} on project ${coordinates.projectId}.`,
     details: [
       `Grant ${coordinates.account} Organization Policy Administrator (${POLICY_ADMIN_ROLE}) on the organization that contains project ${coordinates.projectId}, then resume.`,
     ],
   };
 }
 
-/** A key-creation constraint Google refused to set, and the refused command. */
+/** A constraint Google refused to change, and the refused command. */
 interface PolicyRefusal {
   readonly constraint: string;
   readonly refused: Ran;
 }
 
-/** Set both key-creation constraints on the dedicated project only (org-policies v2). */
-async function setKeyCreationPolicy(
+/**
+ * For `provision_gcp`: a policy change refused for want of permission pauses
+ * for the operator, naming `policy`; any other refusal stops.
+ */
+function refusedPolicyChange(
   coordinates: GcpProjectCoordinates,
-  enforce: boolean,
+  policy: string,
+  change: 'lift' | 'relax' | 'restore',
+  { constraint, refused }: PolicyRefusal,
+): ProvisionHumanPause {
+  if (classifyGcloudFailure(refused.outcome) === 'permission-or-missing') {
+    return policyPermissionPause(coordinates, policy);
+  }
+  throw gcloudFailed(`Google Cloud could not ${change} ${constraint} on project ${coordinates.projectId}`, refused);
+}
+
+/**
+ * Set each constraint's rule on the dedicated project only (org-policies v2),
+ * from owner-only files, stopping at the first Google refuses.
+ */
+async function setProjectPolicies(
+  coordinates: GcpProjectCoordinates,
+  policies: ReadonlyArray<{ readonly constraint: string; readonly rule: PolicyRule }>,
   dependencies: GcloudDependencies,
 ): Promise<PolicyRefusal | undefined> {
   const gcloud = gcloudFor(coordinates, dependencies);
   const { projectId } = coordinates;
   const directory = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-org-policy-'));
   try {
-    for (const constraint of KEY_CREATION_CONSTRAINTS) {
+    for (const { constraint, rule } of policies) {
       const file = path.join(directory, `${constraint}.json`);
-      const policy = { name: `projects/${projectId}/policies/${constraint}`, spec: { rules: [{ enforce }] } };
+      const policy = { name: `projects/${projectId}/policies/${constraint}`, spec: { rules: [rule] } };
       await writeFile(file, JSON.stringify(policy), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
       const set = await gcloud(['org-policies', 'set-policy', file, `--project=${projectId}`]);
       if (!succeeded(set)) return { constraint, refused: set };
@@ -570,6 +607,16 @@ async function setKeyCreationPolicy(
   }
 }
 
+/** Set both key-creation constraints on the dedicated project only. */
+function setKeyCreationPolicy(
+  coordinates: GcpProjectCoordinates,
+  enforce: boolean,
+  dependencies: GcloudDependencies,
+): Promise<PolicyRefusal | undefined> {
+  const policies = KEY_CREATION_CONSTRAINTS.map((constraint) => ({ constraint, rule: { enforce } }));
+  return setProjectPolicies(coordinates, policies, dependencies);
+}
+
 /** For `provision_gcp`: a missing policy permission pauses for the operator; any other refusal stops. */
 async function changeKeyCreationPolicy(
   coordinates: GcpProjectCoordinates,
@@ -578,14 +625,42 @@ async function changeKeyCreationPolicy(
 ): Promise<Pause> {
   const refusal = await setKeyCreationPolicy(coordinates, enforce, dependencies);
   if (!refusal) return undefined;
-  if (classifyGcloudFailure(refusal.refused.outcome) === 'permission-or-missing') {
-    return policyPermissionPause(coordinates);
+  const policy = 'the service-account key-creation policy';
+  return refusedPolicyChange(coordinates, policy, enforce ? 'restore' : 'lift', refusal);
+}
+
+function memberDomainPolicy(constraint: MemberDomainConstraint): string {
+  return `the member-domain policy (constraints/${constraint})`;
+}
+
+/** For `provision_gcp`: relax one member-domain constraint on the dedicated project only. */
+async function relaxMemberDomainConstraint(
+  coordinates: GcpProjectCoordinates,
+  constraint: MemberDomainConstraint,
+  dependencies: GcloudDependencies,
+): Promise<Pause> {
+  const rule = MEMBER_DOMAIN_RELAXED[constraint];
+  const refusal = await setProjectPolicies(coordinates, [{ constraint, rule }], dependencies);
+  if (!refusal) return undefined;
+  return refusedPolicyChange(coordinates, memberDomainPolicy(constraint), 'relax', refusal);
+}
+
+/**
+ * The member-domain constraints the project has a policy of its own for, not
+ * the policy it inherits. The project is gws-ea's own, so such a policy can
+ * only be the override the publisher grant set.
+ */
+async function readMemberDomainOverrides(
+  gcloud: Gcloud,
+  projectId: string,
+): Promise<Read<readonly MemberDomainConstraint[]>> {
+  const overridden: MemberDomainConstraint[] = [];
+  for (const constraint of MEMBER_DOMAIN_CONSTRAINTS) {
+    const described = await gcloud(['org-policies', 'describe', constraint, `--project=${projectId}`, '--format=json']);
+    if (succeeded(described)) overridden.push(constraint);
+    else if (!NO_PROJECT_POLICY.test(described.outcome.stderr)) return { failed: described };
   }
-  const change = enforce ? 'restore' : 'lift';
-  throw gcloudFailed(
-    `Google Cloud could not ${change} ${refusal.constraint} on project ${coordinates.projectId}`,
-    refusal.refused,
-  );
+  return { value: overridden };
 }
 
 /** Restore the dedicated project's key-creation policy, then clear the journal's lift. */
@@ -999,7 +1074,22 @@ function refusingConstraint({ outcome }: Ran): string | undefined {
   return DOMAIN_RESTRICTED_SHARING.test(outcome.stderr) ? DOMAIN_RESTRICTED_SHARING_CONSTRAINT : undefined;
 }
 
-/** Google Chat may publish to the topic; this step lets no one else. */
+/** The member-domain constraint that refused an attempt, if one did. */
+function memberDomainRefusal(attempt: Ran): MemberDomainConstraint | undefined {
+  if (succeeded(attempt)) return undefined;
+  const constraint = refusingConstraint(attempt);
+  return MEMBER_DOMAIN_CONSTRAINTS.find((candidate) => candidate === constraint);
+}
+
+/**
+ * Google Chat may publish to the topic; this step lets no one else. When
+ * domain restricted sharing refuses Google Chat, the constraint Google names
+ * is relaxed on the dedicated project only, and the grant is retried while
+ * Google applies the change; an organization that enforces both constraints
+ * has each relaxed in turn. The override stays until the grant exists, since
+ * removing it early restarts Google's clock, and the member-domain policy
+ * that follows removes it. Any other constraint stops for its administrator.
+ */
 function publisherResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
   const grant: PubsubGrant = {
@@ -1013,10 +1103,38 @@ function publisherResource(dependencies: GcloudDependencies): StepResource<GcpSt
     observe: (context) => observeGrant(gcloud(context), context.input.gcp.projectId, grant),
     apply: async (context) => {
       const { projectId } = context.input.gcp;
-      const granted = await addGrant(gcloud(context), projectId, grant);
+      const add = (): Promise<Ran> => addGrant(gcloud(context), projectId, grant);
+      const relaxed = new Set<MemberDomainConstraint>();
+      /** Refused by a constraint already relaxed, while Google applies the change. */
+      const settling = (attempt: Ran): boolean => {
+        const constraint = memberDomainRefusal(attempt);
+        return constraint !== undefined && relaxed.has(constraint);
+      };
+
+      let granted = await add();
+      let refusing = memberDomainRefusal(granted);
+      while (refusing && !relaxed.has(refusing)) {
+        const denied = await relaxMemberDomainConstraint(context.input.gcp, refusing, dependencies);
+        if (denied) return denied;
+        relaxed.add(refusing);
+        granted = await retryWhile(
+          add,
+          settling,
+          ORG_POLICY_SETTLES_MS,
+          'Waiting for Google Cloud to let Google Chat publish to the topic…',
+          dependencies,
+        );
+        refusing = memberDomainRefusal(granted);
+      }
       if (succeeded(granted)) return undefined;
       const topic = deriveGchatEventsTopic(projectId);
       const constraint = refusingConstraint(granted);
+      if (settling(granted)) {
+        throw gcloudFailed(
+          `Google Cloud still refused to let Google Chat publish to ${topic} ${minutes(ORG_POLICY_SETTLES_MS)} after constraints/${constraint} was relaxed on project ${projectId}, longer than Google documents; the project's override stays until the grant exists, and resuming restores it`,
+          granted,
+        );
+      }
       if (constraint) {
         throw gcloudFailed(
           `An organization policy (constraints/${constraint}) refuses to let Google Chat publish to ${topic}. An organization policy administrator must allow ${GCHAT_PUBLISHER} under it for project ${projectId}, then resume.`,
@@ -1025,6 +1143,44 @@ function publisherResource(dependencies: GcloudDependencies): StepResource<GcpSt
         );
       }
       throw gcloudFailed(`Google Cloud could not let Google Chat publish to ${topic}`, granted);
+    },
+  };
+}
+
+/**
+ * The project inherits its organization's member-domain policy once Google
+ * Chat may publish: each policy of the project's own on those constraints is
+ * the publisher grant's override, and is deleted. Domain restricted sharing
+ * is not retroactive, so the grant stays. Google holds the override, so a run
+ * interrupted before deleting it finds it here.
+ */
+function memberDomainPolicyResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
+  const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  return {
+    name: 'the member-domain policy',
+    observe: async (context) => {
+      const { projectId } = context.input.gcp;
+      const read = await readMemberDomainOverrides(gcloud(context), projectId);
+      if ('failed' in read) return unknownRead(`the member-domain policy of project ${projectId}`, read.failed);
+      return read.value.length > 0 ? ABSENT : PRESENT;
+    },
+    apply: async (context) => {
+      const gcp = context.input.gcp;
+      const read = await readMemberDomainOverrides(gcloud(context), gcp.projectId);
+      if ('failed' in read) {
+        throw gcloudFailed(
+          `Google Cloud could not read the member-domain policy of project ${gcp.projectId}`,
+          read.failed,
+        );
+      }
+      for (const constraint of read.value) {
+        const deleted = await gcloud(context)(['org-policies', 'delete', constraint, `--project=${gcp.projectId}`]);
+        // Gone since it was read: the project already inherits the organization's policy.
+        if (!succeeded(deleted) && !NO_PROJECT_POLICY.test(deleted.outcome.stderr)) {
+          return refusedPolicyChange(gcp, memberDomainPolicy(constraint), 'restore', { constraint, refused: deleted });
+        }
+      }
+      return undefined;
     },
   };
 }
@@ -1074,9 +1230,10 @@ function subscriberResource(dependencies: GcloudDependencies): StepResource<GcpS
 /**
  * `provision_gcp`'s resources, in order: Pub/Sub needs billing, and each
  * grant needs what it grants on. The project is the one resource created on
- * an unknown observation, under the instance's own ID. A lifted key-creation
- * policy is restored last, once the key exists, including a lift an
- * interrupted run left behind.
+ * an unknown observation, under the instance's own ID. A member-domain policy
+ * relaxed for the publisher grant is restored right after the grant, and a
+ * lifted key-creation policy last, once the key exists; each restore includes
+ * a change an interrupted run left behind.
  */
 export function googleCloudResources(dependencies: GcloudDependencies = {}): readonly StepResource<GcpStepContext>[] {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
@@ -1128,6 +1285,7 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
       dependencies,
     ),
     publisherResource(dependencies),
+    memberDomainPolicyResource(dependencies),
     {
       name: 'the Chat subscriber account',
       observe: async (context) => {
