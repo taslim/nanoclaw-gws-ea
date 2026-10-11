@@ -747,6 +747,36 @@ describe('a failed turn the runner reports', () => {
     expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)?.process_after).not.toBe(morning);
   });
 
+  it("of a repeating look, brings it back at the next morning even when main's fact cannot be written", async () => {
+    const yearly = '0 9 14 3 *';
+    const { matter } = await openMatterWithLook(
+      { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
+      { kind: 'repeat', cron: yearly },
+    );
+    await keepMattersOnTime();
+    const look = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
+    if (look === undefined) throw new Error('No look');
+    await runOccurrence(main, look.id, 'completed');
+    // Main's conversation takes no note, so telling main fails, and the report with it, for delivery to retry.
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.exec(
+      `CREATE TRIGGER no_notes BEFORE INSERT ON messages_in WHEN NEW.content LIKE '%"senderId":"system"%'
+       BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`,
+    );
+    inbound.close();
+    turnFailed(main, { batch: [look.id], error: 'API Error: 529 overloaded' });
+
+    await drain(main, 1);
+    await keepMattersOnTime();
+
+    expect(facts()).toEqual([]);
+    const morning = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-morning-'))?.process_after;
+    expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)).toMatchObject({
+      recurrence: yearly,
+      process_after: morning,
+    });
+  });
+
   it('holding a calendar note and a waking tell_main, puts both with their matters on main’s next turn as one note, and tells Morgan nothing', async () => {
     await createThread('g-juno', now(), THREAD_JUNO);
     const renewal = (

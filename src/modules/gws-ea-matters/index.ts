@@ -32,13 +32,12 @@ import {
 import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
-import { gwsEaMattersLookFailedMigration, gwsEaMattersMigration } from './migration.js';
+import { gwsEaMattersMigration } from './migration.js';
 import { currentMorning, formatMorningAnswer, morningBrief, moveMorning } from './morning.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
 
 registerMigration(gwsEaMattersMigration);
-registerMigration(gwsEaMattersLookFailedMigration);
 
 onHostStart(({ signal }) => {
   // Started, not awaited: host startup never waits on a pass.

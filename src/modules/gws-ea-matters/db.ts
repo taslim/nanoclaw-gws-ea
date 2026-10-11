@@ -331,7 +331,7 @@ export interface LookSlot {
   readonly id: string;
   readonly title: string;
   readonly look_task_id: string | null;
-  /** When the host heard that a run of this matter's look failed, until its loop has brought the look back. */
+  /** When the host heard that a run of this matter's look failed, until its loop brings the look back or another replaces it. */
   readonly look_failed_at: string | null;
 }
 
@@ -771,10 +771,15 @@ export async function markLookFailed(id: string, at: string | null): Promise<voi
 /**
  * Record the scheduled task that is a matter's next look, or null when it
  * has none (KTD4). The task is the clock, so this is not a change to the
- * matter itself and leaves `updated_at` as it was.
+ * matter itself and leaves `updated_at` as it was. A new look has not
+ * failed: it clears any mark the look it replaces left (KTD7 step 3).
  */
 export async function recordLookTask(id: string, taskId: string | null): Promise<void> {
   const matterId = id.trim();
-  const result = await getDb().run('UPDATE gws_ea_matters SET look_task_id = ? WHERE id = ?', taskId, matterId);
+  const result = await getDb().run(
+    'UPDATE gws_ea_matters SET look_task_id = ?, look_failed_at = NULL WHERE id = ?',
+    taskId,
+    matterId,
+  );
   if (result.changes === 0) throw noMatter(matterId);
 }

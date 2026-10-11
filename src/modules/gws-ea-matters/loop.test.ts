@@ -34,7 +34,7 @@ import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-profile/index.js';
 import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
-import { getMatter, type Matter, type Placed } from './db.js';
+import { getMatter, markLookFailed, type Matter, type Placed } from './db.js';
 import './index.js';
 import { lookSeries } from './looks.js';
 import { keepMattersOnTime, runMattersLoop } from './loop.js';
@@ -216,6 +216,25 @@ describe("the host's guarantees for matters", () => {
     await keepMattersOnTime();
     expect((await liveRow(birthday.look_task_id)).process_after).toBe(nextYear);
     expect(await looksByMatter()).toEqual(new Map([[birthday.id, [birthday.look_task_id]]]));
+  });
+
+  it('keeps a yearly look on its date when the failed run was of a look it replaced', async () => {
+    const birthday = await open("Juno Hale's birthday", { look: inDays(3) });
+    const main = await mainSession();
+    // The one-off look's turn fails: the runner settles its row as done, and the notices module marks the matter.
+    await runOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');
+    await markLookFailed(birthday.id, new Date().toISOString());
+    // The morning hands the matter back, and main then makes its look yearly.
+    await keepMattersOnTime();
+    expect(lookSeries((await fresh(birthday)).look_task_id ?? '')).toEqual({ matterId: birthday.id, handedBack: true });
+    await data(run('matters-update', { id: birthday.id, 'look-cron': YEARLY }));
+
+    await keepMattersOnTime();
+
+    expect(await liveRow((await fresh(birthday)).look_task_id)).toMatchObject({
+      recurrence: YEARLY,
+      process_after: CronExpressionParser.parse(YEARLY, { tz: ZONE }).next().toISOString(),
+    });
   });
 
   it('cancels any other look naming a matter, and every look naming a closed one, even while main works', async () => {

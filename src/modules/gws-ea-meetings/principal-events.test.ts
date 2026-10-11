@@ -998,6 +998,23 @@ describe('an open matter main names (KTD11)', () => {
     expect(calendar.writes).toEqual([]);
   });
 
+  it('that closes while create_event writes, leaves the event standing, and the answer says it did not join', async () => {
+    const matterId = await boardDeck();
+    const insert = calendar.insertEvent.bind(calendar);
+    // The matter was open when the request was checked, and closes before the event joins it.
+    vi.spyOn(calendar, 'insertEvent').mockImplementationOnce(async (...args) => {
+      await closeMatter({ id: matterId, outcome: 'Presented.' });
+      return insert(...args);
+    });
+
+    const created = data(await send(main, 'create_event', { ...FOCUS, matter: matterId }));
+
+    expect(created.message).toMatch(new RegExp(` It did not join matter ${matterId}: .+\\.$`, 'u'));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', eventId: created.event })]);
+    expect(calendar.event(PRINCIPAL, String(created.event))).toMatchObject({ summary: FOCUS.title });
+    expect(await linked(matterId)).toEqual([]);
+  });
+
   it("is refused from any group but main, though it holds Google Calendar: matters are main's alone (R8)", async () => {
     await createAgentGroup({ id: 'ag-other', name: 'other', folder: 'other', agent_provider: null, created_at: now() });
     await ensureContainerConfig('ag-other');

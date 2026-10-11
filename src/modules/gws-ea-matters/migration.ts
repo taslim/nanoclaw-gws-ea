@@ -11,6 +11,12 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   until it closes with an outcome, so an open matter never has one and a
  *   closed one always does (R5). There is no status, stage, priority, due
  *   date, owner or log;
+ * - `look_failed_at` marks a failed look (KTD7 step 3). The runner settles a
+ *   failed turn's rows as done, so a repeating look's next occurrence is
+ *   armed on its next date as if it had run; the host marks the matter when
+ *   it hears of the failure, and its loop brings that occurrence to the next
+ *   morning, then clears the mark. It is the host's bookkeeping for one
+ *   guarantee, never shown to `main` or anyone, and no status of the matter;
  * - a link is a reference by id: a thread key, `<calendar id>/<event id>`, a
  *   Drive file id, a person id, or a memory path. `handler` names the agent
  *   that works it (R7);
@@ -34,6 +40,7 @@ export const gwsEaMattersMigration: ModuleMigration = {
         parent_id     TEXT REFERENCES gws_ea_matters(id),
         outcome       TEXT CHECK (outcome <> ''),
         look_task_id  TEXT CHECK (look_task_id <> ''),
+        look_failed_at TEXT,
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL,
         closed_at     TEXT,
@@ -56,21 +63,5 @@ export const gwsEaMattersMigration: ModuleMigration = {
         ON gws_ea_matter_links (kind, reference)
         WHERE matter_open = 1 AND kind IN ('thread', 'event', 'file');
     `);
-  },
-};
-
-/**
- * A failed look (KTD7 step 3). The runner settles a failed turn's rows as
- * done, so a repeating look's next occurrence is armed on its next date as if
- * it had run; the host marks the matter here when it hears of the failure,
- * and its loop brings that occurrence to the next morning, then clears the
- * mark. It is the host's bookkeeping for one guarantee, never shown to `main`
- * or anyone, and no status of the matter.
- */
-export const gwsEaMattersLookFailedMigration: ModuleMigration = {
-  version: 2,
-  name: 'module:gws-ea-matters:look-failed',
-  async up(db) {
-    await db.exec('ALTER TABLE gws_ea_matters ADD COLUMN look_failed_at TEXT');
   },
 };
