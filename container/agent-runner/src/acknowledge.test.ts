@@ -72,6 +72,10 @@ function row(
 }
 
 describe('who is waiting', () => {
+  // A batch of tasks reads whether this session is a task session.
+  beforeEach(() => initTestSessionDb());
+  afterEach(() => closeSessionDb());
+
   it('is someone who wrote in a live chat, not a host note, an email, or a scheduled task', () => {
     expect(extractRouting([row('chat-sdk', { text: 'find me an hour', senderId: '15550100' })]).personWaiting).toBe(
       true,

@@ -1,28 +1,30 @@
 /**
- * One-door delivery in task sessions.
+ * One-door delivery in task sessions, and a task that comes back as a turn of
+ * a conversation.
  *
  * Every outbound tool call names its destination. In a task run, final output
- * is inert delivery-wise and becomes the automatic run summary instead.
+ * is inert delivery-wise and becomes the automatic run summary instead. A task
+ * in a conversation is a turn of it: its blocks deliver and nothing is logged.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
+import { getPendingMessages } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { sendFile, sendMessage } from './mcp-tools/core.js';
-import { autoAppendTaskLog, buildTaskBlockNudge, dispatchResultText, shouldNudgeTaskBlocks } from './poll-loop.js';
-import type { RoutingContext } from './formatter.js';
-
-function seedSessionRouting(channelType: string | null, platformId: string | null, threadId: string | null): void {
-  const db = getInboundDb();
-  db.exec(`CREATE TABLE IF NOT EXISTS session_routing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    channel_type TEXT, platform_id TEXT, thread_id TEXT
-  )`);
-  db.prepare(
-    'INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)',
-  ).run(channelType, platformId, threadId);
-}
+import {
+  autoAppendTaskLog,
+  buildTaskBlockNudge,
+  dispatchResultText,
+  processQuery,
+  runPollLoop,
+  shouldNudgeTaskBlocks,
+} from './poll-loop.js';
+import { extractRouting, type RoutingContext } from './formatter.js';
+import { MockProvider } from './providers/mock.js';
+import type { AgentQuery, ProviderEvent } from './providers/types.js';
+import { seedSessionRouting } from './test-utils/session-routing.js';
 
 function seedDestination(name = 'family', channelType = 'telegram', platformId = 'telegram:99'): void {
   getInboundDb()
@@ -233,5 +235,139 @@ describe('automatic task run summary', () => {
     await autoAppendTaskLog('final summary');
 
     expect(getOutboundDb().prepare("SELECT 1 FROM messages_out WHERE kind = 'task_log'").all()).toHaveLength(1);
+  });
+});
+
+describe('a scheduled task in a conversation', () => {
+  const LOOK = '<message to="principal">Juno Hale confirmed the venue for Thursday.</message>';
+
+  /** The conversation the agent has with the principal, as the host binds it on a wake. */
+  function seedConversation(): void {
+    seedSessionRouting('gchat', 'gchat:spaces/dm', null);
+    seedDestination('principal', 'gchat', 'gchat:spaces/dm');
+  }
+
+  /** A task row as the host writes it: no route of its own. */
+  function insertTask(id: string, content: object): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, series_id, content)
+         VALUES (?, 2, 'task', ?, 'pending', ?, ?)`,
+      )
+      .run(id, new Date().toISOString(), id, JSON.stringify(content));
+  }
+
+  function taskLogRows(): Array<{ text: string }> {
+    return (
+      getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as Array<{
+        content: string;
+      }>
+    ).map((row) => JSON.parse(row.content) as { text: string });
+  }
+
+  function ackStatus(id: string): string | undefined {
+    return (
+      getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+        | { status: string }
+        | undefined
+    )?.status;
+  }
+
+  /** Run the real poll loop until `done` holds, then stop it. */
+  async function runLoopUntil(provider: MockProvider, done: () => boolean): Promise<void> {
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', signal: controller.signal }).catch(
+      () => {},
+    );
+    const deadline = Date.now() + 5000;
+    while (!done() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await loop;
+  }
+
+  function resultQuery(result: ProviderEvent): AgentQuery {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'look-session' };
+      yield result;
+    }
+    return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+  }
+
+  it('is a task run only inside a task session, per-series or the legacy shared one', () => {
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed' });
+
+    seedSessionRouting('gchat', 'gchat:spaces/dm', null);
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: false, tasksOnly: true });
+    seedSessionRouting(null, null, 'system:tasks:look-a1b2');
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: true, tasksOnly: true });
+    seedSessionRouting(null, null, 'system:tasks');
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: true, tasksOnly: true });
+  });
+
+  it("delivers its <message> blocks to the conversation's route and writes no task_log", async () => {
+    seedConversation();
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed' });
+
+    await runLoopUntil(new MockProvider({}, () => LOOK), () => getUndeliveredMessages().length > 0);
+
+    const out = getUndeliveredMessages();
+    expect(out.map((row) => [row.kind, row.channel_type, row.platform_id, JSON.parse(row.content).text])).toEqual([
+      ['chat', 'gchat', 'gchat:spaces/dm', 'Juno Hale confirmed the venue for Thursday.'],
+    ]);
+    expect(out[0].in_reply_to).toBe('look-a1b2');
+    expect(taskLogRows()).toEqual([]);
+  });
+
+  it('reports a failed turn for the host to place, and logs nothing', async () => {
+    seedConversation();
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed' });
+    const rows = getPendingMessages();
+
+    await processQuery(
+      resultQuery({ type: 'result', text: '', isError: true, error: 'Incorrect API key' }),
+      extractRouting(rows),
+      rows.map((row) => row.id),
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+    );
+
+    expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+      [
+        'system',
+        { action: 'turn_failed', channelType: null, platformId: null, threadId: null, error: 'Incorrect API key' },
+      ],
+    ]);
+    expect(taskLogRows()).toEqual([]);
+  });
+
+  it('in a task session the same batch is still an isolated run: one-door delivery and a task_log', async () => {
+    seedSessionRouting(null, null, 'system:tasks:look-a1b2');
+    seedDestination('principal', 'gchat', 'gchat:spaces/dm');
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed' });
+
+    await runLoopUntil(new MockProvider({}, () => LOOK), () => taskLogRows().length > 0);
+
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toEqual([]);
+    expect(taskLogRows()).toEqual([{ text: '[undelivered → principal] Juno Hale confirmed the venue for Thursday.' }]);
+  });
+
+  it('completes without a turn when its pre-task script answers wakeAgent false', async () => {
+    seedConversation();
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed', script: `echo '{"wakeAgent": false}'` });
+    const prompts: string[] = [];
+
+    await runLoopUntil(
+      new MockProvider({}, (prompt) => {
+        prompts.push(prompt);
+        return LOOK;
+      }),
+      () => ackStatus('look-a1b2') === 'completed',
+    );
+
+    expect(ackStatus('look-a1b2')).toBe('completed');
+    expect(prompts).toEqual([]);
+    expect(getUndeliveredMessages()).toEqual([]);
   });
 });

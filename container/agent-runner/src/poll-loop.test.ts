@@ -4,9 +4,10 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting, isClearCommand, isRunnerCommand } from './formatter.js';
-import { processQuery } from './poll-loop.js';
+import { dispatchResultText, processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import { seedSessionRouting } from './test-utils/session-routing.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -711,6 +712,9 @@ function taskLogRows(): Array<{ text: string }> {
 }
 
 describe('task-run turn wiring (real processQuery)', () => {
+  // The container serves the series' own task session.
+  beforeEach(() => seedSessionRouting(null, null, 'system:tasks:ser-1'));
+
   it('logs a failed task with inert message blocks once and does not retry delivery', async () => {
     const text = '<message to="main">Completed before failure.</message>\n\nBackend failed.';
     const { query, pushes } = makeResultQuery({ type: 'result', text, isError: true });
@@ -808,4 +812,68 @@ describe('task-run turn wiring (real processQuery)', () => {
     // slow runners the test died as a mute timeout instead of reaching the
     // diagnostic throw above (observed consistently on CI-hosted runners).
   }, 20_000);
+});
+
+describe('a conversation turn of only scheduled tasks', () => {
+  // No task-session thread is bound: the container serves a conversation.
+  beforeEach(() => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('main', 'main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+  });
+
+  async function runTaskTurn(resultText: string): Promise<{ pushes: string[]; exchanges: ProviderExchange[] }> {
+    insertMessage('look-1', 'task', { prompt: 'Review the offsite plan' });
+    const rows = getPendingMessages();
+    const { query, pushes } = makeResultQuery({ type: 'result', text: resultText });
+    const exchanges: ProviderExchange[] = [];
+    await processQuery(
+      query,
+      extractRouting(rows),
+      rows.map((row) => row.id),
+      'mock',
+      (exchange) => exchanges.push(exchange),
+      'prompt',
+      undefined,
+    );
+    return { pushes, exchanges };
+  }
+
+  it('keeps unwrapped final text as scratchpad: no wrap nudge, and nothing sent', async () => {
+    const { pushes, exchanges } = await runTaskTurn('Checked the offsite plan; nothing needs saying today.');
+
+    expect(pushes).toEqual([]);
+    expect(getUndeliveredMessages()).toEqual([]);
+    expect(exchanges.map((exchange) => exchange.status)).toEqual(['completed']);
+  });
+
+  it('delivers its <message> blocks as any turn does', async () => {
+    const { pushes } = await runTaskTurn(
+      '<message to="main">Remy Vance sent the venue options.</message>\nChecked the offsite plan.',
+    );
+
+    expect(outbound()).toEqual(['Remy Vance sent the venue options.']);
+    expect(pushes).toEqual([]);
+  });
+
+  it('still asks for a re-send of a block that did not go out', async () => {
+    const { pushes } = await runTaskTurn('<message to="nobody">Remy Vance sent the venue options.</message>');
+
+    expect(getUndeliveredMessages()).toEqual([]);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('was not delivered');
+  });
+
+  it('nudges for a block the streaming door missed, never for prose', async () => {
+    const routing = { ...ERR_ROUTING, taskRun: false, tasksOnly: true };
+    const missed = { suppressDelivery: true, turnDelivered: false };
+
+    expect(
+      (await dispatchResultText('<message to="main">The venue is booked.</message>', routing, missed)).hasUnwrapped,
+    ).toBe(true);
+    expect((await dispatchResultText('Nothing needs saying today.', routing, missed)).hasUnwrapped).toBe(false);
+  });
 });

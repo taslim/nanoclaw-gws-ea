@@ -1108,6 +1108,9 @@ export async function dispatchResultText(
   // <message to> blocks left inert in a task run — drives the same-turn
   // "use send_message" nudge in processQuery.
   const taskBlocks: TaskMessageBlock[] = [];
+  // A <message> block that did not go out, as opposed to prose outside any
+  // block: only this asks a turn of only tasks for a re-send.
+  let blockUndelivered = false;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
 
@@ -1135,6 +1138,7 @@ export async function dispatchResultText(
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
+      blockUndelivered = true;
       continue;
     }
     // Never deliver a blank message: a body that is empty (or was only
@@ -1143,6 +1147,7 @@ export async function dispatchResultText(
     if (!body) {
       log(`Empty <message to="${toName}"> body after sanitization — not delivered`);
       scratchpadParts.push(`[not delivered — empty after sanitization; to="${toName}"]`);
+      blockUndelivered = true;
       continue;
     }
     // One content door: with a mid-turn delivery provider the result door
@@ -1160,6 +1165,7 @@ export async function dispatchResultText(
           `<message to="${toName}"> in final result but nothing was delivered this turn — nudging for a mid-turn resend`,
         );
         scratchpadParts.push(`[not delivered — the result door does not send; to="${toName}"] ${body}`);
+        blockUndelivered = true;
       }
       continue;
     }
@@ -1178,11 +1184,15 @@ export async function dispatchResultText(
 
   // In a task run, plain final text is the NORMAL ending (it becomes the run
   // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
+  // A conversation turn of only tasks keeps its prose as scratchpad too, so a
+  // task with nothing to say stays quiet; a block that did not go out still
+  // asks for a re-send.
   // With suppressDelivery the delivered-this-turn question is answered by
   // turnDelivered (door deliveries + DB-visible sends like MCP send_message);
   // otherwise by this dispatch's own send count.
   const anythingDelivered = options?.suppressDelivery ? options.turnDelivered === true : sent > 0;
-  const hasUnwrapped = !routing.taskRun && !anythingDelivered && !!scratchpad;
+  const undelivered = routing.tasksOnly === true ? blockUndelivered : !!scratchpad;
+  const hasUnwrapped = !routing.taskRun && !anythingDelivered && undelivered;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }

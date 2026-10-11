@@ -2,9 +2,11 @@ import { randomUUID } from 'crypto';
 import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
+import { isTaskThread } from '../../db/sessions.js';
 import type { TaskRecord } from '../../mailbox/index.js';
 import { resolveTaskSession, withMailboxSession } from '../../session-manager.js';
 import { parseZonedToUtc } from '../../timezone.js';
+import type { Session } from '../../types.js';
 
 export const MAX_DAILY_FIRES = 4;
 
@@ -128,14 +130,30 @@ export function prepareScheduledTask(input: {
   return { name: input.name, prompt: input.prompt, recurrence, script, processAfter };
 }
 
-/** Persist a prepared task through NanoClaw's single task/session representation. */
+/** The group's live conversation a task comes back to; a task session has none. */
+function conversationFor(agentGroupId: string, session: Session): Session {
+  if (session.agent_group_id !== agentGroupId) {
+    throw new Error(`session ${session.id} belongs to agent group ${session.agent_group_id}, not ${agentGroupId}`);
+  }
+  if (isTaskThread(session.thread_id)) throw new Error('A scheduled task run has no conversation to come back to.');
+  if (session.status !== 'active') throw new Error(`session ${session.id} is closed, so a task there would never run`);
+  return session;
+}
+
+/**
+ * Persist a prepared task through NanoClaw's single task/session representation.
+ * It runs in an isolated session of its own, or, given `session`, comes back
+ * as a turn of that conversation.
+ */
 export async function createScheduledTask(
   agentGroupId: string,
   task: PreparedScheduledTask,
-  options?: { status?: 'pending' | 'paused'; originSessionId?: string | null },
+  options?: { status?: 'pending' | 'paused'; originSessionId?: string | null; session?: Session },
 ): Promise<{ session: { id: string; agent_group_id: string }; row: ScheduledTaskRow }> {
   const id = makeTaskId(task.name);
-  const { session } = await resolveTaskSession(agentGroupId, id);
+  const session = options?.session
+    ? conversationFor(agentGroupId, options.session)
+    : (await resolveTaskSession(agentGroupId, id)).session;
 
   const row = await withMailboxSession(agentGroupId, session.id, async (db) => {
     await db.insertTask({

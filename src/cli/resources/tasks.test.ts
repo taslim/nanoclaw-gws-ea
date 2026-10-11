@@ -32,6 +32,9 @@ import {
 } from '../../db/sessions.js';
 import { initSessionFolder, sessionDir, withMailboxSession } from '../../session-manager.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { isContainerRunning } from '../../container-runner.js';
+import { createScheduledTask, prepareScheduledTask } from '../../modules/scheduling/create.js';
+import { handleRecurrence } from '../../modules/scheduling/recurrence.js';
 import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
@@ -79,6 +82,7 @@ describe('tasks CLI resource', () => {
   });
 
   afterEach(async () => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
     await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
@@ -670,6 +674,255 @@ describe('tasks CLI resource', () => {
     );
     expect(retried.ok).toBe(true);
     expect(await getSession(session_id)).toBeUndefined();
+  });
+
+  it('still refuses to delete an isolated task while its own container is running', async () => {
+    const created = await dispatch(
+      {
+        id: 'busy-c',
+        command: 'tasks-create',
+        args: { name: 'digest', prompt: 'x', process_after: '2999-01-01T00:00:00Z' },
+      },
+      agentCtx(),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const { series_id, session_id } = created.data as { series_id: string; session_id: string };
+    vi.mocked(isContainerRunning).mockImplementation((sessionId) => sessionId === session_id);
+
+    const refused = await dispatch({ id: 'busy-del', command: 'tasks-delete', args: { id: series_id } }, agentCtx());
+
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error.message).toContain('task is running');
+    expect(await getSession(session_id)).toBeDefined();
+    expect(fs.existsSync(sessionDir('ag-1', session_id))).toBe(true);
+  });
+
+  describe('a task that comes back as a turn of the conversation (--in-conversation)', () => {
+    async function createInConversation(args: Record<string, unknown>, ctx: CallerContext = agentCtx()) {
+      const resp = await dispatch(
+        { id: 'c-conv', command: 'tasks-create', args: { in_conversation: true, ...args } },
+        ctx,
+      );
+      return resp;
+    }
+
+    function conversationTaskRows(): Array<{ id: string; series_id: string; status: string; content: string }> {
+      const db = new Database(inboundDbPath('ag-1', 'chat-1'), { readonly: true });
+      try {
+        return db
+          .prepare("SELECT id, series_id, status, content FROM messages_in WHERE kind = 'task' ORDER BY seq")
+          .all() as Array<{
+          id: string;
+          series_id: string;
+          status: string;
+          content: string;
+        }>;
+      } finally {
+        db.close();
+      }
+    }
+
+    it("lands in the calling conversation's mailbox, not in a task session of its own", async () => {
+      const resp = await createInConversation({
+        name: 'venue check',
+        prompt: 'Ask Juno Hale whether the venue confirmed',
+        process_after: '2999-01-01T09:00:00Z',
+      });
+
+      expect(resp.ok).toBe(true);
+      if (!resp.ok) return;
+      const created = resp.data as { series_id: string; session_id: string; origin_session_id: string | null };
+      expect(created.session_id).toBe('chat-1');
+      expect(created.origin_session_id).toBe('chat-1');
+      expect((await getSessionsByAgentGroup('ag-1')).map((s) => s.id)).toEqual(['chat-1']);
+      expect(conversationTaskRows()).toEqual([
+        expect.objectContaining({ id: created.series_id, series_id: created.series_id, status: 'pending' }),
+      ]);
+      expect(JSON.parse(conversationTaskRows()[0].content)).toMatchObject({
+        prompt: 'Ask Juno Hale whether the venue confirmed',
+        originSessionId: 'chat-1',
+      });
+    });
+
+    it('is refused inside a task run, which has no conversation to come back to', async () => {
+      const isolated = await dispatch(
+        {
+          id: 'c-iso',
+          command: 'tasks-create',
+          args: { name: 'digest', prompt: 'x', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx(),
+      );
+      expect(isolated.ok).toBe(true);
+      if (!isolated.ok) return;
+      const taskSession = (isolated.data as { session_id: string }).session_id;
+
+      const resp = await createInConversation(
+        { prompt: 'come back to this later', process_after: '2999-01-01T00:00:00Z' },
+        agentCtx('ag-1', taskSession),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('no conversation to come back to');
+      const db = new Database(inboundDbPath('ag-1', taskSession), { readonly: true });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM messages_in WHERE kind = 'task'").get()).toEqual({ count: 1 });
+      db.close();
+    });
+
+    it('is refused from the host, which has no conversation of its own to come back to', async () => {
+      const resp = await dispatch(
+        {
+          id: 'c-host',
+          command: 'tasks-create',
+          args: { group: 'ag-1', in_conversation: true, prompt: 'x', process_after: '2999-01-01T00:00:00Z' },
+        },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('only an agent in a conversation can use --in-conversation');
+      expect(await getSessionsByAgentGroup('ag-1')).toHaveLength(1);
+    });
+
+    it("lets a host module schedule into a conversation directly, and refuses a task session or another group's", async () => {
+      const prepared = prepareScheduledTask({
+        name: 'look',
+        prompt: 'Review the offsite plan with Remy Vance',
+        processAfter: '2999-01-01T00:00:00Z',
+      });
+      const chat = await getSession('chat-1');
+      if (!chat) throw new Error('chat-1 missing');
+
+      const { session, row } = await createScheduledTask('ag-1', prepared, { session: chat });
+
+      expect(session.id).toBe('chat-1');
+      expect(row.seriesId).toBe(row.id);
+      expect(conversationTaskRows().map((r) => r.id)).toEqual([row.id]);
+      await expect(createScheduledTask('ag-2', prepared, { session: chat })).rejects.toThrow(
+        /belongs to agent group ag-1/,
+      );
+
+      const isolated = await createScheduledTask('ag-1', prepared);
+      const taskSession = await getSession(isolated.session.id);
+      if (!taskSession) throw new Error('task session missing');
+      await expect(createScheduledTask('ag-1', prepared, { session: taskSession })).rejects.toThrow(
+        'no conversation to come back to',
+      );
+      await expect(createScheduledTask('ag-1', prepared, { session: { ...chat, status: 'closed' } })).rejects.toThrow(
+        'would never run',
+      );
+      expect(conversationTaskRows().map((r) => r.id)).toEqual([row.id]);
+    });
+
+    it('is listed alongside isolated tasks, and get, update, pause, resume, run and cancel act on it', async () => {
+      const conv = await createInConversation({
+        name: 'venue check',
+        prompt: 'Ask Juno Hale',
+        process_after: '2999-01-01T09:00:00Z',
+      });
+      const iso = await dispatch(
+        {
+          id: 'c-iso',
+          command: 'tasks-create',
+          args: { name: 'digest', prompt: 'x', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx(),
+      );
+      expect(conv.ok && iso.ok).toBe(true);
+      if (!conv.ok || !iso.ok) return;
+      const convId = (conv.data as { series_id: string }).series_id;
+      const isoId = (iso.data as { series_id: string }).series_id;
+      const call = (command: string, args: Record<string, unknown>) =>
+        dispatch({ id: command, command, args }, agentCtx());
+
+      const listed = await call('tasks-list', {});
+      expect(listed.ok).toBe(true);
+      if (!listed.ok) return;
+      const rows = listed.data as Array<{ series_id: string; session_id: string }>;
+      expect(rows.find((r) => r.series_id === convId)?.session_id).toBe('chat-1');
+      expect(rows.find((r) => r.series_id === isoId)?.session_id).not.toBe('chat-1');
+
+      expect((await call('tasks-update', { id: convId, prompt: 'Ask Juno Hale and Remy Vance' })).ok).toBe(true);
+      const got = await call('tasks-get', { id: convId });
+      expect(got.ok).toBe(true);
+      if (got.ok) expect(got.data).toMatchObject({ session_id: 'chat-1', prompt: 'Ask Juno Hale and Remy Vance' });
+
+      expect((await call('tasks-pause', { id: convId })).ok).toBe(true);
+      expect(conversationTaskRows()[0].status).toBe('paused');
+      expect((await call('tasks-resume', { id: convId })).ok).toBe(true);
+      expect(conversationTaskRows()[0].status).toBe('pending');
+
+      const run = await call('tasks-run', { id: convId });
+      expect(run.ok).toBe(true);
+      if (!run.ok) return;
+      const runRow = conversationTaskRows().find((r) => r.id === (run.data as { row_id: string }).row_id);
+      expect(runRow).toMatchObject({ series_id: convId, status: 'pending' });
+      expect(JSON.parse(runRow?.content ?? '{}').prompt).toBe('Ask Juno Hale and Remy Vance');
+
+      expect((await call('tasks-cancel', { id: convId })).ok).toBe(true);
+      const after = await call('tasks-list', {});
+      expect(after.ok).toBe(true);
+      if (after.ok) expect((after.data as Array<{ series_id: string }>).map((r) => r.series_id)).toEqual([isoId]);
+    });
+
+    it("deletes a waiting conversation task while the conversation's container is warm, and refuses one being processed", async () => {
+      const waiting = await createInConversation({
+        name: 'look',
+        prompt: 'later',
+        process_after: '2999-01-01T09:00:00Z',
+      });
+      const busy = await createInConversation({
+        name: 'busy look',
+        prompt: 'now',
+        process_after: '2020-01-01T00:00:00Z',
+      });
+      expect(waiting.ok && busy.ok).toBe(true);
+      if (!waiting.ok || !busy.ok) return;
+      const waitingId = (waiting.data as { series_id: string }).series_id;
+      const busyId = (busy.data as { series_id: string }).series_id;
+      vi.mocked(isContainerRunning).mockImplementation((sessionId) => sessionId === 'chat-1');
+      const outbound = new Database(outboundDbPath('ag-1', 'chat-1'));
+      outbound
+        .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+        .run(busyId, 'processing', now());
+      outbound.close();
+
+      const deleted = await dispatch({ id: 'del-w', command: 'tasks-delete', args: { id: waitingId } }, agentCtx());
+      expect(deleted.ok).toBe(true);
+      expect(await getSession('chat-1')).toBeDefined();
+      expect(fs.existsSync(sessionDir('ag-1', 'chat-1'))).toBe(true);
+      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId]);
+
+      const refused = await dispatch({ id: 'del-b', command: 'tasks-delete', args: { id: busyId } }, agentCtx());
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.error.message).toContain('task is running');
+      expect(conversationTaskRows().map((r) => r.series_id)).toEqual([busyId]);
+    });
+
+    it('re-arms a recurring conversation task in the same conversation after it completes', async () => {
+      const created = await createInConversation({
+        name: 'morning',
+        prompt: 'Prepare the morning for Morgan Ellery',
+        recurrence: '0 9 * * *',
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const seriesId = (created.data as { series_id: string }).series_id;
+      const inbound = new Database(inboundDbPath('ag-1', 'chat-1'));
+      inbound.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(seriesId);
+      inbound.close();
+      const chat = await getSession('chat-1');
+      if (!chat) throw new Error('chat-1 missing');
+
+      await withMailboxSession('ag-1', 'chat-1', (mailbox) => handleRecurrence(mailbox, chat));
+
+      const next = conversationTaskRows().filter((r) => r.status === 'pending');
+      expect(next).toHaveLength(1);
+      expect(next[0]).toMatchObject({ series_id: seriesId });
+      expect(JSON.parse(next[0].content).prompt).toBe('Prepare the morning for Morgan Ellery');
+      expect((await getSessionsByAgentGroup('ag-1')).map((s) => s.id)).toEqual(['chat-1']);
+    });
   });
 });
 
