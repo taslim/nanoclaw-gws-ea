@@ -176,14 +176,15 @@ export async function mintCredentialToken(
   credential: AgentGoogleCredential,
   options: CredentialTokenOptions = {},
 ): Promise<CredentialToken | undefined> {
-  const scopes = credentialScopes(credential, scopesOfGrant(grant));
+  const granted = scopesOfGrant(grant);
+  const scopes = credentialScopes(credential, granted);
   if (scopes.length === 0) return undefined;
   try {
     return await mintToken(grant, credential.host, scopes, options);
   } catch (error) {
     const first = credential.services.slice(0, 1);
     if (!(error instanceof GoogleTokenError) || !error.refused || options.fallBack === false) throw error;
-    const kept = credentialScopes({ ...credential, services: first }, scopesOfGrant(grant));
+    const kept = credentialScopes({ ...credential, services: first }, granted);
     const refused = scopes.filter((scope) => !kept.includes(scope));
     if (kept.length === 0 || refused.length === 0) throw error;
     const token = await mintToken(grant, credential.host, kept, options);

@@ -19,6 +19,7 @@ import {
   GOOGLE_SIGN_IN_CONSENTS,
   isGoogleAccountId,
   missingGoogleScopes,
+  scopesOfGrant,
   type GoogleConsent,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
@@ -360,15 +361,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
   }
   if (sub === undefined) throw signInFailed('Google did not say which account signed in');
 
-  const missing = missingGoogleScopes(granted.flatMap((consent) => consent.scopes));
-  if (missing.length > 0) {
-    throw new GwsEaError(
-      'google_scope_missing',
-      `The Google sign-in did not grant ${missing.join(', ')}; sign in again and allow every permission`,
-    );
-  }
-
-  return {
+  const grant: GoogleGrant = {
     schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
     account,
     sub,
@@ -377,4 +370,12 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
     consents: granted,
     granted_at: new Date(now()).toISOString(),
   };
+  const missing = missingGoogleScopes(scopesOfGrant(grant));
+  if (missing.length > 0) {
+    throw new GwsEaError(
+      'google_scope_missing',
+      `The Google sign-in did not grant ${missing.join(', ')}; sign in again and allow every permission`,
+    );
+  }
+  return grant;
 }
