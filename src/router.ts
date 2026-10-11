@@ -761,7 +761,9 @@ async function deliverToAgent(
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires, and a delayed one
     // until the host sweep wakes the session once it is due.
-    // Typing fires via the adapter instance that owns this chat's row.
+    // Typing fires via the adapter instance that owns this chat's row. Its
+    // anchor is the platform's id for the message the turn now works on; a
+    // reaction is no one's message, so it leaves the conversation's anchor be.
     startTypingRefresh(
       session.id,
       session.agent_group_id,
@@ -769,6 +771,7 @@ async function deliverToAgent(
       event.platformId,
       effectiveThreadId,
       mg.instance,
+      event.message.reaction === true ? undefined : event.message.id,
     );
     const freshSession = await getSession(session.id);
     if (freshSession) {

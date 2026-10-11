@@ -54,6 +54,7 @@ import {
 import { unguarded } from './guard/index.js';
 import { wakeContainer } from './container-runner.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
+import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -1130,5 +1131,110 @@ describe('outbound guard at the adapter boundary', () => {
     expect(() => registerOutboundGuard('test:duplicate', allow)).toThrow(
       'Outbound guard already registered: test:duplicate',
     );
+  });
+});
+
+describe('a send ends the working signal of every turn anchored in its conversation', () => {
+  const ANCHOR = 'telegram-message-41';
+
+  interface Ended {
+    readonly channelType: string;
+    readonly platformId: string;
+    readonly threadId: string | null;
+    readonly anchor: string;
+    readonly instance: string | undefined;
+  }
+
+  afterEach(() => {
+    guardDecides = null;
+  });
+
+  /** An adapter that marks the message a turn works on; sends whose content names `unreachable` fail. */
+  function recordEnds(): Ended[] {
+    const ended: Ended[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        if (content.includes('unreachable')) throw new Error('telegram unavailable');
+        return 'pm-1';
+      },
+      async setTyping() {},
+      async endTyping(channelType, platformId, threadId, anchor, instance) {
+        ended.push({ channelType, platformId, threadId, anchor, instance });
+      },
+    });
+    return ended;
+  }
+
+  function hostSend(platformId: string, text: string): Promise<string | undefined> {
+    return getDeliveryAdapter()!.deliver(
+      'telegram',
+      platformId,
+      null,
+      'chat-sdk',
+      JSON.stringify({ type: 'ask_question', questionId: 'appr-1', title: 'Approve?', question: text, options: [] }),
+      undefined,
+      'telegram',
+    );
+  }
+
+  it("the agent's reply ends its turn's anchor, once however many parts it has", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const ended = recordEnds();
+    startTypingRefresh(session.id, 'ag-1', 'telegram', 'telegram:123', null, 'telegram', ANCHOR);
+    try {
+      insertOutbound('ag-1', session.id, 'reply-1');
+      insertOutbound('ag-1', session.id, 'reply-2');
+
+      await deliverSessionMessages(session);
+
+      expect(ended).toEqual([
+        { channelType: 'telegram', platformId: 'telegram:123', threadId: null, anchor: ANCHOR, instance: 'telegram' },
+      ]);
+    } finally {
+      stopTypingRefresh(session.id);
+    }
+    expect(ended).toHaveLength(1);
+  });
+
+  it('an approval request the host posts into the conversation ends it too', async () => {
+    const ended = recordEnds();
+    startTypingRefresh('sess-host', 'ag-1', 'telegram', 'telegram:123', null, 'telegram', ANCHOR);
+    try {
+      await hostSend('telegram:123', 'Morgan wants to install a package. Approve?');
+
+      expect(ended.map((end) => end.anchor)).toEqual([ANCHOR]);
+    } finally {
+      stopTypingRefresh('sess-host');
+    }
+  });
+
+  it('a refused send, a failed send, or a send to another conversation ends nothing', async () => {
+    const ended = recordEnds();
+    armGuard((send) =>
+      send.content.includes('Main St')
+        ? { effect: 'refuse', reason: 'it names a private address.' }
+        : { effect: 'allow' },
+    );
+    startTypingRefresh('sess-host', 'ag-1', 'telegram', 'telegram:123', null, 'telegram', ANCHOR);
+    try {
+      await expect(hostSend('telegram:123', 'Juno lives at 1 Main St')).rejects.toBeInstanceOf(OutboundRefusedError);
+      await expect(hostSend('telegram:123', 'unreachable')).rejects.toThrow('telegram unavailable');
+      await hostSend('telegram:456', 'Approve?');
+      expect(ended).toEqual([]);
+
+      await hostSend('telegram:123', 'Approve?');
+      expect(ended.map((end) => end.anchor)).toEqual([ANCHOR]);
+    } finally {
+      stopTypingRefresh('sess-host');
+    }
+  });
+
+  it('the guarded adapter hands the typing module’s ends through to the channel', async () => {
+    const ended = recordEnds();
+
+    await getDeliveryAdapter()!.endTyping!('telegram', 'telegram:123', null, ANCHOR, 'telegram');
+
+    expect(ended.map((end) => end.anchor)).toEqual([ANCHOR]);
   });
 });

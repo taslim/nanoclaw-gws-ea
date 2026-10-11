@@ -286,12 +286,28 @@ export interface ChannelAdapter {
   deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
 
   // Optional
+  /**
+   * Show that the agent is working here; re-fired on a short interval while
+   * a turn runs (src/modules/typing). `anchor` is the platform's id for the
+   * message the turn works on in this conversation, while that work lasts
+   * (see endTyping).
+   */
   setTyping?(
     platformId: string,
     threadId: string | null,
     status?: string,
     statusKind?: 'auto' | 'agent',
+    anchor?: string,
   ): Promise<void>;
+  /**
+   * The work on the message `anchor` in this conversation ended: something
+   * was sent here, a newer message arrived, or the turn went idle, failed to
+   * wake, or its container exited. Called once for each turn that worked on
+   * it, after the pulses that carried it. An adapter that marks the message
+   * while a turn works on it (the Google Chat assistant's 👀) takes its mark
+   * off here; adapters without such a mark omit this.
+   */
+  endTyping?(platformId: string, threadId: string | null, anchor: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   /** Resolve conversation type and human-readable metadata for host UI. */
   resolveConversation?(platformId: string): Promise<ResolvedConversation | null>;

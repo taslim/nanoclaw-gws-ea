@@ -35,7 +35,7 @@ import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { requestWake } from './request-wake.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
-import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { endTypingInConversation, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
@@ -144,6 +144,16 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     status?: string,
     statusKind?: 'auto' | 'agent',
+    /** The message the turn works on in this conversation (ChannelAdapter.setTyping). */
+    anchor?: string,
+  ): Promise<void>;
+  /** The work on the message `anchor` ended (ChannelAdapter.endTyping). */
+  endTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    anchor: string,
+    instance?: string,
   ): Promise<void>;
 }
 
@@ -225,9 +235,22 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
   return {
     async deliver(channelType, platformId, threadId, kind, content, files, instance) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
-      return adapter.deliver(channelType, platformId, threadId, kind, content, files, instance);
+      const platformMessageId = await adapter.deliver(
+        channelType,
+        platformId,
+        threadId,
+        kind,
+        content,
+        files,
+        instance,
+      );
+      // Whatever reached the conversation (a reply, a reaction, a host's
+      // approval request) ends the work each turn anchored there was showing.
+      endTypingInConversation(channelType, platformId, threadId, instance);
+      return platformMessageId;
     },
     ...(adapter.setTyping && { setTyping: adapter.setTyping.bind(adapter) }),
+    ...(adapter.endTyping && { endTyping: adapter.endTyping.bind(adapter) }),
   };
 }
 

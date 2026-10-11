@@ -61,6 +61,7 @@ async function createAssistantChat(delivery: ChatDeliveryConfig): Promise<Channe
     userName: /^[^@]+/u.exec(assistant.account)?.[0] ?? assistant.account,
     auth: hostChatAuth(chatToken),
     hydrator: createChatHydrator({ chatToken, directoryToken: () => hostGoogleAccessToken('directory-host') }),
+    chatToken,
     startDelivery: (onChatEvent) => startChatDelivery({ config: delivery, onChatEvent }),
   });
   return createAssistantChatChannel(adapter);

@@ -406,3 +406,27 @@ describe('who a reaction reaches', () => {
     expect(await count('pending_sender_approvals')).toBe(0);
   });
 });
+
+describe('the message a woken turn works on (its typing anchor)', () => {
+  it('is the written message that woke it', async () => {
+    await routeInbound(written(JUNO, DM, DM_THREAD, 'spaces/AAAAjuno/messages/juno.1'));
+
+    const [session] = await sessions();
+    expect(startTypingRefresh).toHaveBeenCalledWith(
+      session!.id,
+      MAIN,
+      'gchat',
+      DM,
+      null,
+      'gchat',
+      'spaces/AAAAjuno/messages/juno.1',
+    );
+  });
+
+  it('is none for a reaction, which no one wrote', async () => {
+    await routeInbound(reaction({ by: JUNO, platformId: DM, threadId: DM_THREAD, on: 'assistant' }));
+
+    const [session] = await sessions();
+    expect(startTypingRefresh).toHaveBeenCalledWith(session!.id, MAIN, 'gchat', DM, null, 'gchat', undefined);
+  });
+});

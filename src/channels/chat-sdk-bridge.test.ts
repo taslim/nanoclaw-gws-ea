@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getEmoji, Message, parseMarkdown, type Adapter, type AdapterPostableMessage, type RawMessage } from 'chat';
 
 import type { InboundMessage } from './adapter.js';
-import { createChatSdkBridge, splitForLimit, type InboundReaction, type ReactionSource } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  splitForLimit,
+  type InboundReaction,
+  type ReactionSource,
+  type WorkingIndicator,
+} from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -113,6 +119,43 @@ describe('createChatSdkBridge', () => {
   it('keeps adapters without a transport probe available after setup', () => {
     const bridge = createChatSdkBridge({ adapter: stubAdapter({}), supportsThreads: true });
     expect(bridge.isConnected()).toBe(true);
+  });
+
+  it("gives an adapter without a working mark no endTyping, and its typing pulse stays the SDK's alone", async () => {
+    const typing: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        startTyping: async (threadId: string) => {
+          typing.push(threadId);
+        },
+      }),
+      supportsThreads: true,
+    });
+
+    await bridge.setTyping!('stub:c1', 'thread-1', undefined, undefined, 'message-1');
+
+    expect(bridge.endTyping).toBeUndefined();
+    expect(typing).toEqual(['thread-1']);
+  });
+
+  it('hands an adapter with a working mark each pulse that names a message, and each end, by thread', async () => {
+    const calls: string[] = [];
+    const adapter = stubAdapter({
+      startTyping: async (threadId: string) => {
+        calls.push(`typing ${threadId}`);
+      },
+    }) as Adapter & WorkingIndicator;
+    Object.assign(adapter, {
+      workingOn: async (threadId: string, messageId: string) => void calls.push(`working ${threadId} ${messageId}`),
+      endWorking: async (threadId: string, messageId: string) => void calls.push(`ended ${threadId} ${messageId}`),
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+
+    await bridge.setTyping!('stub:c1', null, undefined, undefined, 'message-1');
+    await bridge.setTyping!('stub:c1', null);
+    await bridge.endTyping!('stub:c1', null, 'message-1');
+
+    expect(calls).toEqual(['typing stub:c1', 'working stub:c1 message-1', 'typing stub:c1', 'ended stub:c1 message-1']);
   });
 });
 

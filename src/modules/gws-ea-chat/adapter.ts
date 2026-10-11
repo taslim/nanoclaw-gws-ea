@@ -12,6 +12,12 @@
  * The event's handler resolves only once every part is routed or found
  * gone, so the consumer acknowledges nothing before it is handled.
  *
+ * While a turn works on a message past a few seconds, the assistant shows 👀
+ * on it (R6, KTD7), placed and removed by the name Chat gives it, never by
+ * emoji: the SDK's own removal takes the first matching emoji, whoever placed
+ * it. Each 👀 placed is recorded in the bridge's state store until it is
+ * removed, so one left by a crash is removed when the channel next starts.
+ *
  * Protected SDK methods this overrides, pinned by the SDK version and named
  * in the divergence guard: `handlePubSubMessageEvent` and
  * `normalizeBotMentions`.
@@ -21,9 +27,15 @@ import { defaultEmojiResolver, type ChatInstance, type Message, type ReactionEve
 import { OAuth2Client } from 'google-auth-library';
 
 import type { ChannelAdapter, ChannelDefaults } from '../../channels/adapter.js';
-import { createChatSdkBridge, type ReactionSource, type ReplyContext } from '../../channels/chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  type ReactionSource,
+  type ReplyContext,
+  type WorkingIndicator,
+} from '../../channels/chat-sdk-bridge.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
+import { GoogleApiError, googleJson, type GoogleClientOptions } from '../gws-ea-inbox/gmail-api.js';
 import { RENEW_BEFORE_EXPIRY_MS } from '../gws-ea-google/tokens.js';
 import type { ChatDelivery } from './delivery.js';
 import {
@@ -66,6 +78,9 @@ export interface AssistantChatAdapterOptions {
   /** The assistant's OAuth client for Chat (hostChatAuth). */
   readonly auth: OAuth2Client;
   readonly hydrator: ChatHydrator;
+  /** The assistant's Chat token, for the calls the channel makes itself: its working 👀. */
+  readonly chatToken: () => Promise<string>;
+  readonly fetch?: typeof globalThis.fetch;
   /** Starts pulling Chat's events into `onChatEvent`; started when the adapter initializes, stopped when it disconnects. */
   readonly startDelivery: (onChatEvent: (event: WorkspaceEvent) => Promise<void>) => ChatDelivery;
 }
@@ -81,6 +96,25 @@ interface ReadPart {
   /** Where it falls in the event: when it was written, as Google records it. */
   readonly at: number;
   dispatch(): Promise<void>;
+}
+
+const CHAT = 'https://chat.googleapis.com/v1';
+/** How long a turn works on a message before the assistant shows 👀 on it (R6). */
+const WORKING_AFTER_MS = 3_000;
+const WORKING_EMOJI = '👀';
+/** The state-store record of each 👀 placed and not yet removed: its reaction name, by message name. */
+const WORKING_RECORD = 'gws-ea-chat:working';
+/** How many messages whose work ended are remembered, so a late pulse never shows 👀 on one again. */
+const ENDED_KEPT = 1_000;
+
+/** The assistant's 👀 on one message a turn works on. */
+interface Working {
+  /** Shows the 👀 once the turn has run WORKING_AFTER_MS; unset once it fired or the work ended. */
+  timer?: NodeJS.Timeout;
+  /** Chat placing the 👀; settles once Chat answered. */
+  placing?: Promise<void>;
+  /** The 👀 placed and not yet removed, by the name Chat gave it. */
+  name?: string;
 }
 
 /**
@@ -107,13 +141,20 @@ export function hostChatAuth(token: () => Promise<string>, fetch?: typeof global
   return client;
 }
 
-export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource {
+export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource, WorkingIndicator {
   /** Chat's events are pulled: the bridge registers no webhook route for this adapter. */
   readonly runtimeMode = 'polling';
   private readonly hydrator: ChatHydrator;
   private readonly startDelivery: AssistantChatAdapterOptions['startDelivery'];
+  private readonly chatClient: GoogleClientOptions;
   private delivery: ChatDelivery | undefined;
   private reactionHandler: ChatReactionHandler | undefined;
+  /** The 👀 of each message a turn works on, until it is off. */
+  private readonly working = new Map<string, Working>();
+  /** Messages whose work ended, oldest first. */
+  private readonly ended = new Set<string>();
+  /** The record's writes, in the order they were asked for. */
+  private recording: Promise<void> = Promise.resolve();
 
   constructor(options: AssistantChatAdapterOptions) {
     super({
@@ -125,10 +166,12 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     });
     this.hydrator = options.hydrator;
     this.startDelivery = options.startDelivery;
+    this.chatClient = { token: options.chatToken, ...(options.fetch === undefined ? {} : { fetch: options.fetch }) };
   }
 
   override async initialize(chat: ChatInstance): Promise<void> {
     await super.initialize(chat);
+    await this.removeLeftWorking();
     await this.delivery?.stop();
     this.delivery = this.startDelivery((event) => this.handleChatEvent(event));
   }
@@ -136,7 +179,47 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
   async disconnect(): Promise<void> {
     const delivery = this.delivery;
     this.delivery = undefined;
+    // A 👀 not yet shown never will be; one shown stays recorded for the next start.
+    for (const [messageId, entry] of this.working) {
+      if (entry.timer === undefined) continue;
+      clearTimeout(entry.timer);
+      this.working.delete(messageId);
+    }
     await delivery?.stop();
+  }
+
+  /**
+   * A turn is working on the message (each typing pulse that names it). Its
+   * 👀 shows once the turn has run WORKING_AFTER_MS, unless the work ended
+   * first, and never again once it has.
+   */
+  workingOn(_threadId: string, messageId: string): Promise<void> {
+    if (this.working.has(messageId) || this.ended.has(messageId)) return Promise.resolve();
+    const entry: Working = {};
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      entry.placing = this.placeWorking(messageId, entry);
+    }, WORKING_AFTER_MS);
+    entry.timer.unref();
+    this.working.set(messageId, entry);
+    return Promise.resolve();
+  }
+
+  /** The work on the message ended: its 👀 comes off, by the name Chat gave it, once Chat has placed it. */
+  async endWorking(_threadId: string, messageId: string): Promise<void> {
+    if (this.ended.has(messageId)) return;
+    this.ended.add(messageId);
+    if (this.ended.size > ENDED_KEPT) {
+      const oldest = this.ended.values().next().value;
+      if (oldest !== undefined) this.ended.delete(oldest);
+    }
+    const entry = this.working.get(messageId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    entry.timer = undefined;
+    await entry.placing;
+    if (entry.name === undefined) this.working.delete(messageId);
+    else await this.removeWorking(messageId, entry.name);
   }
 
   /** No request reaches this host from Google: Chat's events are pulled. */
@@ -219,6 +302,93 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
       text = `${text.slice(0, startIndex)}@${this.userName}${text.slice(startIndex + length)}`;
     }
     return text;
+  }
+
+  /** Place the 👀 and record its name; a 👀 Chat refuses is not tried again. */
+  private async placeWorking(messageId: string, entry: Working): Promise<void> {
+    let placed: unknown;
+    try {
+      placed = await googleJson(this.chatClient, `${CHAT}/${messageId}/reactions`, {
+        method: 'POST',
+        body: { emoji: { unicode: WORKING_EMOJI } },
+      });
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- 👀 is a courtesy: a turn never fails for it */
+    } catch (error) {
+      log.warn('Could not show 👀 on a Chat message', { messageId, err: error });
+      return;
+    }
+    const name = isRecord(placed) && typeof placed.name === 'string' ? placed.name : undefined;
+    if (name === undefined) {
+      log.warn('Chat placed 👀 without naming it', { messageId });
+      return;
+    }
+    entry.name = name;
+    await this.recordWorking();
+  }
+
+  /**
+   * Remove the 👀 by its name. One Chat no longer has, or no longer lets the
+   * assistant reach (404, 403), is gone. One that cannot be removed now stays
+   * recorded, and is removed when the channel next starts.
+   */
+  private async removeWorking(messageId: string, name: string): Promise<void> {
+    try {
+      await googleJson(this.chatClient, `${CHAT}/${name}`, { method: 'DELETE' });
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- one not removed now stays recorded for the next start */
+    } catch (error) {
+      if (!(error instanceof GoogleApiError && (error.status === 403 || error.status === 404))) {
+        log.warn('Could not remove 👀 from a Chat message; it is removed when the channel next starts', {
+          messageId,
+          name,
+          err: error,
+        });
+        return;
+      }
+    }
+    this.working.delete(messageId);
+    await this.recordWorking();
+  }
+
+  /**
+   * Record every 👀 placed and not yet removed. Writes run one at a time,
+   * each recording what is placed when it runs.
+   */
+  private recordWorking(): Promise<void> {
+    this.recording = this.recording
+      .then(async () => {
+        const placed = Object.fromEntries(
+          [...this.working].flatMap(([messageId, entry]) =>
+            entry.name === undefined ? [] : [[messageId, entry.name] as const],
+          ),
+        );
+        if (Object.keys(placed).length === 0) await this.state?.delete(WORKING_RECORD);
+        else await this.state?.set(WORKING_RECORD, placed);
+      })
+      .catch((error: unknown) => {
+        log.warn('Could not record the 👀 placed on Chat messages', { err: error });
+      });
+    return this.recording;
+  }
+
+  /** Remove each 👀 a previous run placed and left (a crash), and clear its record. */
+  private async removeLeftWorking(): Promise<void> {
+    let recorded: unknown;
+    try {
+      recorded = await this.state?.get(WORKING_RECORD);
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- Chat starts without the sweep; the record stays for the next start */
+    } catch (error) {
+      log.warn('Could not read the 👀 a previous run left on Chat messages', { err: error });
+      return;
+    }
+    if (!isRecord(recorded)) return;
+    const left = Object.entries(recorded).flatMap(([messageId, name]) =>
+      typeof name === 'string' && !this.working.has(messageId) ? [{ messageId, name }] : [],
+    );
+    for (const { messageId, name } of left) {
+      this.ended.add(messageId);
+      this.working.set(messageId, { name });
+    }
+    await Promise.all(left.map(({ messageId, name }) => this.removeWorking(messageId, name)));
   }
 
   private requireChat(): ChatInstance {

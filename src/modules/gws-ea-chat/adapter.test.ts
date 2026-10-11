@@ -2,14 +2,23 @@
  * The assistant's Chat adapter, driven as the pull consumer drives it: each
  * test hands it Workspace events and reads what reaches the host through the
  * real Chat SDK bridge and core, over the SQLite state store. Google's HTTP is
- * faked at the `fetch` boundary, for both the channel's own reads and the
- * SDK's Chat client.
+ * faked at the `fetch` boundary, for both the channel's own reads and writes
+ * and the SDK's Chat client. The working 👀 is driven as the host's typing
+ * module drives it, through the bridge's typing pulse and its end.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ChannelAdapter, InboundMessage } from '../../channels/adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage } from '../../channels/adapter.js';
+import {
+  createChannelDeliveryAdapter,
+  initChannelAdapters,
+  registerChannelAdapter,
+  teardownChannelAdapters,
+} from '../../channels/channel-registry.js';
 import { closeDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
+import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
+import { startTypingRefresh, stopTypingRefresh } from '../typing/index.js';
 import {
   AssistantChatAdapter,
   createAssistantChatChannel,
@@ -53,10 +62,13 @@ let routingFailures: number;
 /** The consumer's handler, as the adapter hands it over when it starts its delivery. */
 let deliver: ((event: WorkspaceEvent) => Promise<void>) | undefined;
 let deliveriesStopped: number;
+/** How the channel's own Chat calls reach Google. */
+let chatFetch: typeof globalThis.fetch;
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
   api = new FakeChatApi();
+  chatFetch = api.fetch;
   api.addSpace(DM, 'DIRECT_MESSAGE');
   api.addSpace(ROOM, 'SPACE');
   api.people.set('2001', 'Juno Hale');
@@ -73,7 +85,8 @@ afterEach(async () => {
   await closeDb();
 });
 
-async function start(startDelivery?: ConstructorParameters<typeof AssistantChatAdapter>[0]['startDelivery']) {
+/** The channel as the host builds it, not yet set up. */
+function build(startDelivery?: ConstructorParameters<typeof AssistantChatAdapter>[0]['startDelivery']): ChannelAdapter {
   adapter = new AssistantChatAdapter({
     botUserId: ASSISTANT,
     userName: 'morgan',
@@ -83,6 +96,8 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
       directoryToken: async () => DIRECTORY_TOKEN,
       fetch: api.fetch,
     }),
+    chatToken: async () => CHAT_TOKEN,
+    fetch: chatFetch,
     startDelivery:
       startDelivery ??
       ((onChatEvent) => {
@@ -94,9 +109,14 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
         };
       }),
   });
-  const started = createAssistantChatChannel(adapter);
-  channel = started;
-  await started.setup({
+  const built = createAssistantChatChannel(adapter);
+  channel = built;
+  return built;
+}
+
+/** The host's side of the channel: what it routes is recorded. */
+function hostSetup(): ChannelSetup {
+  return {
     async onInbound(platformId, threadId, message) {
       if (routingFailures > 0) {
         routingFailures -= 1;
@@ -107,7 +127,11 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
     onInboundEvent: () => undefined,
     onMetadata: () => undefined,
     onAction: () => undefined,
-  });
+  };
+}
+
+async function start(startDelivery?: ConstructorParameters<typeof AssistantChatAdapter>[0]['startDelivery']) {
+  await build(startDelivery).setup(hostSetup());
 }
 
 function messageEvent(name: string): WorkspaceEvent {
@@ -536,6 +560,325 @@ describe('reactions', () => {
     });
 
     await expect(deliver!(reactionEvent(`${target}/reactions/r1`))).rejects.toThrow(/database is locked/u);
+  });
+});
+
+describe('the working 👀 (R6)', () => {
+  const PLATFORM = `gchat:${DM}`;
+  const JUNO_1 = `${DM}/messages/juno.1`;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    api.addMessage(chatMessage(DM, 'juno.1', { text: 'Can you move Thursday to Friday?' }));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Let Google's fake answers and the state store's writes land. */
+  async function settle(): Promise<void> {
+    for (let turn = 0; turn < 20; turn += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  /** The typing module's pulse for a turn working on `anchor` in the DM, as the bridge receives it. */
+  async function pulse(anchor = JUNO_1): Promise<void> {
+    await channel!.setTyping!(PLATFORM, null, undefined, undefined, anchor);
+    await settle();
+  }
+
+  async function end(anchor = JUNO_1): Promise<void> {
+    await channel!.endTyping!(PLATFORM, null, anchor);
+    await settle();
+  }
+
+  async function wait(milliseconds: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(milliseconds);
+    await settle();
+  }
+
+  function eyesOn(message: string): Array<{ name: string; user: string }> {
+    return (api.reactions.get(message) ?? [])
+      .filter((reaction) => reaction.emoji.unicode === '👀')
+      .map((reaction) => ({ name: reaction.name, user: reaction.user.name }));
+  }
+
+  function requests(method: 'POST' | 'DELETE'): string[] {
+    return api.requests
+      .filter((request) => request.method === method && request.url.pathname.includes('/reactions'))
+      .map((request) => decodeURIComponent(request.url.pathname.replace(/^\/v1\//u, '')));
+  }
+
+  /** The host stops without ending the turn, and starts again. */
+  async function crashAndRestart(): Promise<void> {
+    await channel!.teardown();
+    await start();
+  }
+
+  it('shows 👀 on the message once the turn has run 3 seconds, once however often it pulses', async () => {
+    await start();
+    await pulse();
+    await wait(2_900);
+    expect(requests('POST')).toEqual([]);
+
+    await wait(200);
+    expect(eyesOn(JUNO_1)).toEqual([
+      { name: expect.stringMatching(/^spaces\/AAAAjuno\/messages\/juno\.1\/reactions\//u), user: ASSISTANT },
+    ]);
+
+    await pulse();
+    await wait(4_000);
+    await pulse();
+    await wait(4_000);
+    expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
+    expect(api.calls(`${JUNO_1}/reactions`)[0]!.authorization).toBe(`Bearer ${CHAT_TOKEN}`);
+  });
+
+  it('never shows 👀 for a turn that ends within 3 seconds', async () => {
+    await start();
+    await pulse();
+    await wait(1_000);
+    await end();
+    await wait(10_000);
+
+    expect(requests('POST')).toEqual([]);
+    expect(requests('DELETE')).toEqual([]);
+  });
+
+  it("removes exactly its own 👀 by the name Chat gave it, and leaves the principal's own 👀 in place", async () => {
+    api.addReaction({
+      name: `${JUNO_1}/reactions/juno-eyes`,
+      user: { name: 'users/2001', type: 'HUMAN' },
+      emoji: { unicode: '👀' },
+    });
+    await start();
+    await pulse();
+    await wait(3_000);
+    const [placed] = eyesOn(JUNO_1).filter((reaction) => reaction.user === ASSISTANT);
+
+    await end();
+
+    expect(requests('DELETE')).toEqual([placed!.name]);
+    expect(eyesOn(JUNO_1)).toEqual([{ name: `${JUNO_1}/reactions/juno-eyes`, user: 'users/2001' }]);
+  });
+
+  it('never shows 👀 again for a message whose work ended', async () => {
+    await start();
+    await pulse();
+    await wait(3_000);
+    await end();
+    await pulse();
+    await wait(10_000);
+
+    // Nor for one whose work ended before it ever pulsed.
+    const JUNO_2 = `${DM}/messages/juno.2`;
+    api.addMessage(chatMessage(DM, 'juno.2'));
+    await end(JUNO_2);
+    await pulse(JUNO_2);
+    await wait(10_000);
+
+    expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
+    expect(eyesOn(JUNO_1)).toEqual([]);
+    expect(eyesOn(JUNO_2)).toEqual([]);
+  });
+
+  it('removes the 👀 Chat was still placing when the work ended', async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    chatFetch = async (input, init) => {
+      if (init?.method === 'POST') await held;
+      return api.fetch(input, init);
+    };
+    await start();
+    await pulse();
+    await wait(3_000);
+    const ending = end();
+    await settle();
+    expect(requests('DELETE')).toEqual([]);
+
+    release();
+    await ending;
+    await settle();
+
+    expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
+    expect(requests('DELETE')).toHaveLength(1);
+    expect(eyesOn(JUNO_1)).toEqual([]);
+  });
+
+  it('a 👀 Chat refuses to place is not tried again, and its end has nothing to remove', async () => {
+    api.failures.set(`${JUNO_1}/reactions`, { status: 403, message: 'The caller does not have permission' });
+    await start();
+    await pulse();
+    await wait(3_000);
+    await pulse();
+    await wait(8_000);
+    await end();
+
+    expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
+    expect(requests('DELETE')).toEqual([]);
+  });
+
+  it('a 👀 left by a crash is removed when the host starts again, and its record cleared', async () => {
+    await start();
+    await pulse();
+    await wait(3_000);
+    const [placed] = eyesOn(JUNO_1);
+
+    await crashAndRestart();
+    await settle();
+    expect(requests('DELETE')).toEqual([placed!.name]);
+    expect(eyesOn(JUNO_1)).toEqual([]);
+
+    await crashAndRestart();
+    await settle();
+    expect(requests('DELETE')).toHaveLength(1);
+  });
+
+  it('a 👀 someone already removed counts as gone', async () => {
+    await start();
+    await pulse();
+    await wait(3_000);
+    api.reactions.set(JUNO_1, []);
+
+    await end();
+    expect(requests('DELETE')).toHaveLength(1);
+
+    await crashAndRestart();
+    await settle();
+    expect(requests('DELETE')).toHaveLength(1);
+  });
+
+  it('a 👀 Chat fails to remove is removed when the host next starts', async () => {
+    await start();
+    await pulse();
+    await wait(3_000);
+    const [placed] = eyesOn(JUNO_1);
+    api.failures.set(placed!.name, { status: 503, message: 'Unavailable' });
+
+    await end();
+    expect(eyesOn(JUNO_1)).toEqual([placed]);
+
+    api.failures.clear();
+    await crashAndRestart();
+    await settle();
+    expect(requests('DELETE')).toEqual([placed!.name, placed!.name]);
+    expect(eyesOn(JUNO_1)).toEqual([]);
+  });
+
+  describe('through the host: typing, delivery, and the adapter registry', () => {
+    /** The channel the host's registry started; the registry tears it down. */
+    let hosted: ChannelAdapter | undefined;
+
+    afterEach(async () => {
+      await teardownChannelAdapters();
+      if (channel === hosted) channel = undefined;
+    });
+
+    /** The principal's message, read and routed; the turn it engages starts typing as the router does. */
+    async function engage(session: string): Promise<string> {
+      registerChannelAdapter('gchat', { factory: () => (hosted = build()) });
+      await initChannelAdapters(() => hostSetup());
+      setDeliveryAdapter(createChannelDeliveryAdapter());
+      await deliver!(messageEvent(JUNO_1));
+      const anchor = routed[0]!.message.id;
+      startTypingRefresh(session, 'ag-main', 'gchat', PLATFORM, null, 'gchat', anchor);
+      await settle();
+      return anchor;
+    }
+
+    it('a full turn: 👀 after 3 seconds, removed by the reply, and nothing left recorded', async () => {
+      const anchor = await engage('sess-reply');
+      expect(anchor).toBe(JUNO_1);
+      await wait(3_000);
+      const [placed] = eyesOn(JUNO_1);
+      expect(placed?.user).toBe(ASSISTANT);
+
+      await getDeliveryAdapter()!.deliver(
+        'gchat',
+        PLATFORM,
+        null,
+        'chat',
+        JSON.stringify({ text: 'Moved to Friday.' }),
+        undefined,
+        'gchat',
+      );
+      await settle();
+      expect(requests('DELETE')).toEqual([placed!.name]);
+      expect(eyesOn(JUNO_1)).toEqual([]);
+
+      // The container exits: the end already fired.
+      stopTypingRefresh('sess-reply');
+      await settle();
+      expect(requests('DELETE')).toHaveLength(1);
+
+      await teardownChannelAdapters();
+      await start();
+      await settle();
+      expect(requests('DELETE')).toHaveLength(1);
+    });
+
+    it('a reply within 3 seconds never shows 👀', async () => {
+      await engage('sess-quick');
+      await wait(1_500);
+      await getDeliveryAdapter()!.deliver(
+        'gchat',
+        PLATFORM,
+        null,
+        'chat',
+        JSON.stringify({ text: 'Done.' }),
+        undefined,
+        'gchat',
+      );
+      await wait(10_000);
+      stopTypingRefresh('sess-quick');
+
+      expect(requests('POST')).toEqual([]);
+    });
+
+    it('a turn that sends nothing removes its 👀 when it goes idle', async () => {
+      await engage('sess-idle');
+      await wait(3_000);
+      expect(eyesOn(JUNO_1)).toHaveLength(1);
+
+      // Past the typing module's grace window with no heartbeat: the agent is idle.
+      await wait(20_000);
+      expect(eyesOn(JUNO_1)).toEqual([]);
+    });
+
+    it("an approval request the host posts into the DM removes 👀; the container's exit removes another turn's", async () => {
+      await engage('sess-approval');
+      await wait(3_000);
+      await getDeliveryAdapter()!.deliver(
+        'gchat',
+        PLATFORM,
+        null,
+        'chat-sdk',
+        JSON.stringify({
+          type: 'ask_question',
+          questionId: 'appr-1',
+          title: 'Install a package?',
+          question: 'Morgan wants jq.',
+          options: ['Approve', 'Reject'],
+        }),
+        undefined,
+        'gchat',
+      );
+      await settle();
+      expect(eyesOn(JUNO_1)).toEqual([]);
+      stopTypingRefresh('sess-approval');
+
+      const JUNO_2 = `${DM}/messages/juno.2`;
+      api.addMessage(chatMessage(DM, 'juno.2'));
+      startTypingRefresh('sess-exit', 'ag-main', 'gchat', PLATFORM, null, 'gchat', JUNO_2);
+      await wait(3_000);
+      expect(eyesOn(JUNO_2)).toHaveLength(1);
+
+      stopTypingRefresh('sess-exit');
+      await settle();
+      expect(eyesOn(JUNO_2)).toEqual([]);
+    });
   });
 });
 

@@ -87,6 +87,28 @@ function isReactionSource(adapter: Adapter): adapter is Adapter & ReactionSource
   return typeof (adapter as Partial<ReactionSource>).setReactionHandler === 'function';
 }
 
+// ---------------------------------------------------------------------------
+// A working mark on the message a turn works on
+// ---------------------------------------------------------------------------
+
+/**
+ * An adapter that marks the message a turn works on while the turn runs, as
+ * the Google Chat assistant's 👀 does. The bridge hands it each typing pulse
+ * that carries an anchor (ChannelAdapter.setTyping) and each anchor's end
+ * (ChannelAdapter.endTyping); the adapter decides when to show its mark.
+ */
+export interface WorkingIndicator {
+  /** A turn is working on the message: called on every typing pulse that names it. */
+  readonly workingOn: (threadId: string, messageId: string) => Promise<void>;
+  /** The work on the message ended; the mark comes off. */
+  readonly endWorking: (threadId: string, messageId: string) => Promise<void>;
+}
+
+function isWorkingIndicator(adapter: Adapter): adapter is Adapter & WorkingIndicator {
+  const candidate = adapter as Partial<WorkingIndicator>;
+  return typeof candidate.workingOn === 'function' && typeof candidate.endWorking === 'function';
+}
+
 /** How much of the message reacted to the agent sees with the reaction. */
 const REACTION_EXCERPT_CHARS = 200;
 
@@ -538,6 +560,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   /** Registry/routing key for this bridge — also the app-context cache
    *  namespace. Default instances key by the platform name. */
   const instanceKey = config.instance ?? adapter.name;
+  /** The adapter's working mark, when it shows one. */
+  const working = isWorkingIndicator(adapter) ? adapter : undefined;
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
@@ -1108,9 +1132,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(
+      platformId: string,
+      threadId: string | null,
+      _status?: string,
+      _statusKind?: 'auto' | 'agent',
+      anchor?: string,
+    ) {
       const tid = threadId ?? platformId;
       await adapter.startTyping(tid);
+      if (anchor !== undefined && working) await working.workingOn(tid, anchor);
     },
 
     async teardown() {
@@ -1133,6 +1164,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await state.subscribe(threadId);
     },
   };
+
+  // Only an adapter that marks the message a turn works on has an end to take.
+  if (working) {
+    bridge.endTyping = async (platformId: string, threadId: string | null, anchor: string): Promise<void> => {
+      await working.endWorking(threadId ?? platformId, anchor);
+    };
+  }
 
   // Only expose openDM when the underlying Chat SDK adapter implements it.
   // Delegate straight to adapter.openDM rather than going through chat.openDM:

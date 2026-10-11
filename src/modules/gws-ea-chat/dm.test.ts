@@ -62,6 +62,7 @@ function adapterPlatformId(space: string): string {
     userName: 'morgan.ellery',
     auth: hostChatAuth(async () => CHAT_TOKEN),
     hydrator: createChatHydrator({ chatToken: async () => CHAT_TOKEN, directoryToken: async () => DIRECTORY_TOKEN }),
+    chatToken: async () => CHAT_TOKEN,
     startDelivery: () => ({ stop: async () => undefined }),
   });
   return adapter.channelIdFromThreadId(adapter.encodeThreadId({ spaceName: space, isDM: true }));

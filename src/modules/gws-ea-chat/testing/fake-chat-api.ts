@@ -7,6 +7,8 @@
  * - A message names its sender by resource name and type only, with no
  *   display name, as do the users its mentions annotate.
  * - Reactions list in pages of `reactionPageSize`.
+ * - What the assistant writes is its own: a message it posts, and a reaction
+ *   it places, which Chat names in its answer and deletes only by that name.
  * - Chat answers only the assistant's Chat token and People only its
  *   directory token; anything else is 401.
  *
@@ -65,6 +67,16 @@ function requestUrl(input: string | URL | Request): URL {
   return new URL(typeof input === 'string' ? input : input.url);
 }
 
+/** A write's JSON body, as `fetch` was handed it. */
+async function requestBody(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+): Promise<Record<string, unknown>> {
+  const text = typeof init?.body === 'string' ? init.body : input instanceof Request ? await input.text() : '';
+  const body: unknown = text === '' ? {} : JSON.parse(text);
+  return typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
+}
+
 export class FakeChatApi {
   readonly requests: ChatRequest[] = [];
   readonly messages = new Map<string, FakeChatMessage>();
@@ -78,6 +90,8 @@ export class FakeChatApi {
   /** A resource, by its path, answers with this failure while it is set. */
   readonly failures = new Map<string, ChatFailure>();
   reactionPageSize = 200;
+  /** Numbers what the assistant writes. */
+  private written = 0;
 
   readonly fetch: typeof globalThis.fetch = async (input, init) => {
     const url = requestUrl(input);
@@ -92,6 +106,8 @@ export class FakeChatApi {
     switch (url.host) {
       case 'chat.googleapis.com':
         if (authorization !== `Bearer ${CHAT_TOKEN}`) return refusal(UNAUTHENTICATED);
+        if (method === 'POST') return this.write(path, await requestBody(input, init));
+        if (method === 'DELETE') return this.remove(path);
         return this.chat(path, url);
       case 'people.googleapis.com':
         if (authorization !== `Bearer ${DIRECTORY_TOKEN}`) return refusal(UNAUTHENTICATED);
@@ -122,6 +138,51 @@ export class FakeChatApi {
   /** The requests to one API path, such as `spaces/AAAAjuno` or `people/2001`. */
   calls(path: string): ChatRequest[] {
     return this.requests.filter((request) => decodeURIComponent(request.url.pathname) === `/v1/${path}`);
+  }
+
+  /** A message the assistant posts, or a reaction it places on a message. */
+  private write(path: string, body: Record<string, unknown>): Response {
+    this.written += 1;
+    const reactionsOf = /^(spaces\/[^/]+\/messages\/[^/]+)\/reactions$/u.exec(path)?.[1];
+    if (reactionsOf !== undefined) {
+      if (!this.messages.has(reactionsOf)) return refusal(NOT_FOUND);
+      const emoji = body.emoji as { unicode: string };
+      return json(
+        200,
+        this.addReaction({
+          name: `${reactionsOf}/reactions/assistant-${this.written}`,
+          user: { name: ASSISTANT, type: 'HUMAN' },
+          emoji,
+        }),
+      );
+    }
+    const space = /^(spaces\/[^/]+)\/messages$/u.exec(path)?.[1];
+    if (space !== undefined && this.spaces.has(space)) {
+      const thread = body.thread as { name?: string } | undefined;
+      return json(
+        200,
+        this.addMessage({
+          name: `${space}/messages/morgan.${this.written}`,
+          createTime: '2026-10-10T17:00:05.000000Z',
+          sender: { name: ASSISTANT, type: 'HUMAN' },
+          text: typeof body.text === 'string' ? body.text : '',
+          thread: { name: thread?.name ?? `${space}/threads/morgan` },
+        }),
+      );
+    }
+    return refusal(NOT_FOUND);
+  }
+
+  /** Delete a reaction, by its name. */
+  private remove(path: string): Response {
+    const message = /^(spaces\/[^/]+\/messages\/[^/]+)\/reactions\/[^/]+$/u.exec(path)?.[1];
+    const held = message === undefined ? [] : (this.reactions.get(message) ?? []);
+    if (message === undefined || !held.some((reaction) => reaction.name === path)) return refusal(NOT_FOUND);
+    this.reactions.set(
+      message,
+      held.filter((reaction) => reaction.name !== path),
+    );
+    return json(200, {});
   }
 
   private chat(path: string, url: URL): Response {
