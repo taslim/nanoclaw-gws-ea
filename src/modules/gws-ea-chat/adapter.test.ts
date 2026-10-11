@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from '../../channels/adapter.js';
+import { readPostedRequest } from '../../channels/chat-sdk-bridge.js';
 import {
   createChannelDeliveryAdapter,
   initChannelAdapters,
@@ -18,6 +19,7 @@ import {
 import { closeDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
+import { SqliteStateAdapter } from '../../state-sqlite.js';
 import { startTypingRefresh, stopTypingRefresh } from '../typing/index.js';
 import {
   AssistantChatAdapter,
@@ -879,6 +881,70 @@ describe('the working 👀 (R6)', () => {
       await settle();
       expect(eyesOn(JUNO_2)).toEqual([]);
     });
+  });
+});
+
+describe('requests', () => {
+  it("posts a request as the assistant's text, and remembers it with the time Google recorded it", async () => {
+    await start();
+
+    const name = await channel!.deliver(`gchat:${DM}`, null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-1',
+        title: 'Install a package?',
+        question: 'I would like jq to read the export.',
+        options: [
+          { label: 'Approve', value: 'approve' },
+          { label: 'Reject', value: 'reject' },
+        ],
+      },
+    });
+
+    expect(name).toBe(`${DM}/messages/morgan.1`);
+    expect(api.messages.get(name!)?.text).toBe(
+      '*Install a package?*\n\nI would like jq to read the export.\n\n' +
+        'Quote this message with yes or no, or react 👍 or 👎.',
+    );
+    const state = new SqliteStateAdapter();
+    await state.connect();
+    expect(await readPostedRequest(state, 'gchat', name!)).toEqual({
+      questionId: 'appr-1',
+      platformId: `gchat:${DM}`,
+      postedAt: '2026-10-10T17:00:05.000Z',
+    });
+  });
+
+  it("shows an answered request's outcome by editing its text alone, as a user may", async () => {
+    await start();
+    const name = await channel!.deliver(`gchat:${DM}`, null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-2',
+        title: 'Install a package?',
+        question: 'I would like jq to read the export.',
+        options: [
+          { label: 'Approve', value: 'approve' },
+          { label: 'Reject', value: 'reject' },
+        ],
+      },
+    });
+
+    await channel!.deliver(`gchat:${DM}`, null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId: 'appr-2',
+        messageId: name,
+        text: 'Install a package?\n\nI would like jq to read the export.\n\nApproved',
+      },
+    });
+
+    expect(api.messages.get(name!)?.text).toContain('Approved');
+    const edits = api.requests.filter((request) => request.method === 'PUT' || request.method === 'PATCH');
+    expect(edits.map((request) => request.url.searchParams.get('updateMask'))).toEqual(['text']);
   });
 });
 

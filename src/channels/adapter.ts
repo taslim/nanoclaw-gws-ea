@@ -21,7 +21,13 @@ export interface ChannelSetup {
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
-  /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
+  /**
+   * Called when someone answers a question or approval request: a click on a
+   * card's button, or an answer in words on a channel whose requests are
+   * text. Waits for the same readiness as onInbound, then resolves once the
+   * answer's handler has finished and rejects when it fails, so a channel
+   * that redelivers can hand the answer over again.
+   */
   onAction(
     questionId: string,
     selectedOption: string,
@@ -32,7 +38,21 @@ export interface ChannelSetup {
       platformId?: string;
       threadId?: string | null;
     },
-  ): void;
+    answer?: ActionAnswer,
+  ): void | Promise<void>;
+}
+
+/** What a channel knows about an answer beyond the option it chose. */
+export interface ActionAnswer {
+  /**
+   * The channel left the request as posted: the handler that resolves the
+   * answer edits it to its outcome once it has authorized it. Set for a
+   * request whose presentation defers resolution, and for every request on a
+   * channel whose requests are text.
+   */
+  deferResolution?: boolean;
+  /** The reason given with a rejection: in words, the text after the no. */
+  reason?: string;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */

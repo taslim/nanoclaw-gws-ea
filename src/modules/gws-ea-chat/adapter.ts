@@ -20,10 +20,20 @@
  *
  * Protected SDK methods this overrides, pinned by the SDK version and named
  * in the divergence guard: `handlePubSubMessageEvent` and
- * `normalizeBotMentions`.
+ * `normalizeBotMentions`. It also overrides `editMessage`: the SDK's text edit
+ * names `cards_v2` in its update mask, which Google lets only a Chat app
+ * update, so an edit made as the assistant updates the text alone.
  */
 import { GoogleChatAdapter, type GoogleChatMessage, type WorkspaceEventNotification } from '@chat-adapter/gchat';
-import { defaultEmojiResolver, type ChatInstance, type Message, type ReactionEvent } from 'chat';
+import {
+  convertEmojiPlaceholders,
+  defaultEmojiResolver,
+  type AdapterPostableMessage,
+  type ChatInstance,
+  type Message,
+  type RawMessage,
+  type ReactionEvent,
+} from 'chat';
 import { OAuth2Client } from 'google-auth-library';
 
 import type { ChannelAdapter, ChannelDefaults } from '../../channels/adapter.js';
@@ -220,6 +230,30 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     await entry.placing;
     if (entry.name === undefined) this.working.delete(messageId);
     else await this.removeWorking(messageId, entry.name);
+  }
+
+  /**
+   * Edit one of the assistant's messages, such as a request showing its
+   * outcome. A user may update only a message's text, never a card, so the
+   * update names the text alone; the assistant never posts a card.
+   */
+  override async editMessage(
+    threadId: string,
+    messageId: string,
+    message: AdapterPostableMessage,
+  ): Promise<RawMessage<unknown>> {
+    const text = convertEmojiPlaceholders(this.formatConverter.renderPostable(message), 'gchat');
+    try {
+      const response = await this.chatApi.spaces.messages.update({
+        name: messageId,
+        updateMask: 'text',
+        requestBody: { text },
+      });
+      return { id: response.data.name ?? messageId, threadId, raw: response.data };
+      // eslint-disable-next-line no-catch-all/no-catch-all -- handleGoogleChatError rethrows every error as the SDK's typed error
+    } catch (error) {
+      this.handleGoogleChatError(error, 'editMessage');
+    }
   }
 
   /** No request reaches this host from Google: Chat's events are pulled. */
@@ -523,10 +557,19 @@ export const GCHAT_DEFAULTS: ChannelDefaults = {
   mentions: 'platform',
 };
 
+/** When Google recorded a message the assistant posted: the `createTime` of the message it returned. */
+function chatCreateTime(raw: unknown): Date | undefined {
+  if (!isRecord(raw) || typeof raw.createTime !== 'string') return undefined;
+  const at = new Date(raw.createTime);
+  return Number.isNaN(at.getTime()) ? undefined : at;
+}
+
 /**
  * The channel: the adapter behind the Chat SDK bridge. Pub/Sub may hand an
  * event out again after it was routed, so the router drops a copy already
- * queued.
+ * queued. Google lets a user write only text, so questions and approval
+ * requests post in words (R7), each remembered with the time Google
+ * recorded it.
  */
 export function createAssistantChatChannel(adapter: AssistantChatAdapter): ChannelAdapter {
   return createChatSdkBridge({
@@ -536,5 +579,6 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Chann
     defaults: GCHAT_DEFAULTS,
     extractReplyContext: extractGchatReplyContext,
     redelivers: true,
+    textRequests: { postedAt: chatCreateTime },
   });
 }

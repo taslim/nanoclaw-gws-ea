@@ -29,7 +29,7 @@ import {
   type AccessGateResult,
 } from '../../router.js';
 import type { InboundEvent } from '../../channels/adapter.js';
-import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
+import { registerResponseHandler, showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -132,6 +132,21 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   } catch {
     return { text: raw };
   }
+}
+
+/**
+ * An answered approval edited to its outcome, when the channel left it as
+ * posted: what it asked, and the option the approver chose.
+ */
+function showApprovalOutcome(
+  answer: ResponsePayload,
+  request: { title: string; question: string; options_json: string },
+): Promise<void> {
+  return showRequestOutcome(getDeliveryAdapter(), answer, {
+    title: request.title,
+    question: request.question,
+    options: JSON.parse(request.options_json),
+  });
 }
 
 async function handleUnknownSender(
@@ -331,6 +346,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // Clear the pending row BEFORE re-routing so the gate check on the
     // second attempt doesn't see the in-flight row and short-circuit.
     await deletePendingSenderApproval(row.id);
+    await showApprovalOutcome(payload, row);
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
@@ -348,6 +364,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     approverId,
   });
   await deletePendingSenderApproval(row.id);
+  await showApprovalOutcome(payload, row);
   return true;
 }
 
@@ -374,6 +391,7 @@ async function wireApprovedChannel(
   row: PendingChannelApproval,
   agentGroupId: string,
   approverId: string,
+  answer?: ResponsePayload,
 ): Promise<boolean> {
   let event: InboundEvent;
   try {
@@ -445,6 +463,7 @@ async function wireApprovedChannel(
   }
 
   await deletePendingChannelApproval(row.messaging_group_id);
+  if (answer) await showApprovalOutcome(answer, row);
 
   try {
     await routeInbound(event);
@@ -501,6 +520,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   if (payload.value === REJECT_VALUE) {
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     await deletePendingChannelApproval(row.messaging_group_id);
+    await showApprovalOutcome(payload, row);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
@@ -525,6 +545,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const adapter = getDeliveryAdapter();
     if (!adapter) return true;
 
+    // This request is answered; the choice of an agent is asked next, under the same question id.
+    await showApprovalOutcome(payload, row);
     const agentGroups = await getAllAgentGroups();
     const options = await buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
@@ -577,6 +599,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       });
       return true;
     }
+    await showApprovalOutcome(payload, row);
     awaitingNameInput.set(row.approver_user_id, {
       channelMgId: row.messaging_group_id,
       dmChannelType: approverDm.channel_type,
@@ -635,7 +658,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   // ── Wire + replay (shared path for connect and create) ──
-  await wireApprovedChannel(row, targetAgentGroupId, approverId);
+  await wireApprovedChannel(row, targetAgentGroupId, approverId, payload);
   return true;
 }
 

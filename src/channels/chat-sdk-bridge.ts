@@ -16,17 +16,19 @@ import {
   LinkButton,
   type CardChild,
   type Adapter,
+  type AdapterPostableMessage,
   type AssistantContextChangedEvent,
   type AssistantThreadStartedEvent,
   type Author,
   type ConcurrencyStrategy,
   type EmojiValue,
   type Message as ChatMessage,
+  type StateAdapter,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
-import { normalizeOptions, type NormalizedOption } from './ask-question.js';
+import { approveRejectRequest, normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
@@ -455,6 +457,134 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * The platform shows this account no cards (Google Chat under user
+   * authentication), so requests are text. A question or approval request
+   * posts as its title, the question, and how to answer it in words, with no
+   * codes; a display card posts as text with its links. Every request is
+   * left as posted until the handler that resolves an answer edits it to its
+   * outcome: the bridge never edits one itself. Each request it posts is
+   * recorded by its message and by its question (readPostedRequest), so an
+   * answer quoting it and the handler's edit both find it. Unset, requests
+   * post as cards.
+   */
+  textRequests?: {
+    /** When the platform recorded a message the adapter posted, read from postMessage's raw response. */
+    readonly postedAt: (raw: unknown) => Date | undefined;
+  };
+}
+
+/** A request the bridge posted as text (ChatSdkBridgeConfig.textRequests). */
+export interface PostedRequest {
+  /** The question id of its pending row. */
+  readonly questionId: string;
+  /** The conversation it was posted in, as the bridge's platform id. */
+  readonly platformId: string;
+  /** When the platform recorded it, as ISO-8601; absent when the platform reported no time. */
+  readonly postedAt?: string;
+}
+
+/**
+ * How long the bridge remembers a request it posted: whether one is still
+ * open comes from its pending row, but an answer can find it only while it
+ * is remembered.
+ */
+const POSTED_REQUEST_KEPT_MS = 30 * 24 * 60 * 60 * 1000;
+
+function postedRequestKey(adapterName: string, messageId: string): string {
+  return `text-request:${adapterName}:message:${messageId}`;
+}
+
+function requestMessageKey(adapterName: string, questionId: string): string {
+  return `text-request:${adapterName}:question:${questionId}`;
+}
+
+/** The request the bridge posted as this message, while it takes answers. */
+export async function readPostedRequest(
+  state: StateAdapter,
+  adapterName: string,
+  messageId: string,
+): Promise<PostedRequest | undefined> {
+  return (await state.get<PostedRequest>(postedRequestKey(adapterName, messageId))) ?? undefined;
+}
+
+/**
+ * How a request asks for its answer in words. An approve/reject request is
+ * answered yes or no, by a quote or 👍/👎, with the reason after the no when
+ * its rejection takes one; any other request lists its options by number.
+ */
+function howToAnswer(options: readonly NormalizedOption[]): string {
+  const approval = approveRejectRequest(options);
+  if (approval) {
+    const yesOrNo = 'Quote this message with yes or no, or react 👍 or 👎.';
+    return approval.takesReason ? `${yesOrNo} To say why, quote it with no and your reason.` : yesOrNo;
+  }
+  if (options.length === 0) return '';
+  const list = options.map((option, index) => `${index + 1}. ${option.label}`).join('\n');
+  return `${list}\n\nQuote this message with the number or name of your choice.`;
+}
+
+/** A question or approval request as text: its title, the question, and how to answer it. */
+function textRequest(title: string, question: string, options: readonly NormalizedOption[]): string {
+  return [`**${title}**`, question, howToAnswer(options)].filter(Boolean).join('\n\n');
+}
+
+/** An answered request as text: what was asked, and its outcome where the answer was asked for. */
+function textOutcome({ title, question, resolution }: TerminalApprovalCard): string {
+  return [`**${title}**`, question, resolution].filter(Boolean).join('\n\n');
+}
+
+/** A display card's content (send_card), as both of its renderings read it. */
+interface DisplayCard {
+  readonly title: string;
+  /** Its description, then each text child. */
+  readonly texts: readonly string[];
+  readonly links: ReadonlyArray<{ label: string; url: string; style?: 'primary' | 'danger' | 'default' }>;
+}
+
+/**
+ * Read a display card. Non-URL actions are dropped: send_card's contract is
+ * fire-and-forget, so a callback button would have nowhere to land. The
+ * runner filters actions against LINK_ACTION_SCHEMA before writing the row;
+ * the checks here still stand because any producer can write this payload.
+ */
+function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
+  const texts: string[] = [];
+  if (typeof spec.description === 'string' && spec.description) texts.push(spec.description);
+  if (Array.isArray(spec.children)) {
+    for (const child of spec.children) {
+      if (typeof child === 'string' && child) {
+        texts.push(child);
+      } else if (child && typeof child === 'object' && typeof (child as Record<string, unknown>).text === 'string') {
+        texts.push((child as Record<string, string>).text);
+      }
+    }
+  }
+  const links = Array.isArray(spec.actions)
+    ? (spec.actions as Array<Record<string, unknown> | null | undefined>)
+        .filter(
+          (a): a is Record<string, unknown> =>
+            !!a &&
+            typeof a === 'object' &&
+            typeof a.url === 'string' &&
+            !!a.url &&
+            typeof a.label === 'string' &&
+            !!a.label,
+        )
+        .map((a) => {
+          const style = a.style;
+          const safeStyle: 'primary' | 'danger' | 'default' | undefined =
+            style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
+          return { label: a.label as string, url: a.url as string, style: safeStyle };
+        })
+    : [];
+  return { title: (spec.title as string) || '', texts, links };
+}
+
+/** A display card as text: its title, its texts, and each link by its label. */
+function textDisplayCard({ title, texts, links }: DisplayCard): string {
+  const linkLines = links.map((link) => `[${link.label}](${link.url})`).join('\n');
+  return [title ? `**${title}**` : '', ...texts, linkLines].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -507,6 +637,24 @@ function terminalApprovalMessage(spec: TerminalApprovalCard) {
     card: buildTerminalApprovalCard(spec),
     fallbackText: [spec.title, spec.question, spec.resolution].filter(Boolean).join('\n\n'),
   };
+}
+
+function isTerminalCard(card: Partial<TerminalApprovalCard> | undefined): card is TerminalApprovalCard {
+  return (
+    card !== undefined &&
+    typeof card.title === 'string' &&
+    typeof card.question === 'string' &&
+    typeof card.resolution === 'string'
+  );
+}
+
+/**
+ * Hand a click to the host without holding the platform's interaction on the
+ * answer's handler. The host logs a handler that fails, and a click is never
+ * delivered again, so nothing here waits on it.
+ */
+function handOnClick(setup: ChannelSetup, ...click: Parameters<ChannelSetup['onAction']>): void {
+  void Promise.resolve(setup.onAction(...click)).catch(() => {});
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -562,10 +710,74 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   const instanceKey = config.instance ?? adapter.name;
   /** The adapter's working mark, when it shows one. */
   const working = isWorkingIndicator(adapter) ? adapter : undefined;
+  /** Set when requests are text on this platform (ChatSdkBridgeConfig.textRequests). */
+  const textRequests = config.textRequests;
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
   let gatewayAbort: AbortController | null = null;
+
+  /** Post a request; when requests are text, remember it, so an answer and its outcome find it. */
+  async function postRequest(
+    tid: string,
+    platformId: string,
+    questionId: string,
+    message: AdapterPostableMessage,
+  ): Promise<string | undefined> {
+    const result = await adapter.postMessage(tid, message);
+    if (textRequests && result?.id) {
+      const at = textRequests.postedAt(result.raw);
+      const request: PostedRequest = {
+        questionId,
+        platformId,
+        ...(at !== undefined && !Number.isNaN(at.getTime()) ? { postedAt: at.toISOString() } : {}),
+      };
+      await state.set(postedRequestKey(adapter.name, result.id), request, POSTED_REQUEST_KEPT_MS);
+      await state.set(requestMessageKey(adapter.name, questionId), result.id, POSTED_REQUEST_KEPT_MS);
+    }
+    return result?.id;
+  }
+
+  /**
+   * The message an outcome for this question goes on: the one the handler
+   * named, when this question was posted as it, or else the question's
+   * newest posting.
+   */
+  async function requestMessage(questionId: string, named: string | undefined): Promise<string | undefined> {
+    if (named !== undefined && (await readPostedRequest(state, adapter.name, named))?.questionId === questionId) {
+      return named;
+    }
+    return (await state.get<string>(requestMessageKey(adapter.name, questionId))) ?? named;
+  }
+
+  /**
+   * Edit a request posted as text to the outcome its handler sent, addressed
+   * by its question id. Showing its outcome, the message takes no answer
+   * after this.
+   */
+  async function editRequestOutcome(tid: string, questionId: string, content: Record<string, unknown>): Promise<void> {
+    const messageId = await requestMessage(
+      questionId,
+      typeof content.messageId === 'string' ? content.messageId : undefined,
+    );
+    if (messageId === undefined) {
+      log.warn('No posted request to show its outcome on', { questionId });
+      return;
+    }
+    const terminal = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
+    const render = await resolveQuestionRender(questionId);
+    const outcome: AdapterPostableMessage =
+      render?.renderTerminal && typeof terminal?.resolution === 'string'
+        ? render.renderTerminal(terminal.resolution)
+        : isTerminalCard(terminal)
+          ? { markdown: transformText(textOutcome(terminal)) }
+          : { markdown: transformText((content.text as string) || (content.markdown as string) || '') };
+    await adapter.editMessage(tid, messageId, outcome);
+    await state.delete(postedRequestKey(adapter.name, messageId));
+    if ((await state.get<string>(requestMessageKey(adapter.name, questionId))) === messageId) {
+      await state.delete(requestMessageKey(adapter.name, questionId));
+    }
+  }
 
   async function messageToInbound(
     message: ChatMessage,
@@ -821,12 +1033,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
         const selectedOption = resolveSelectedOption(render, event.value, tail);
-        if (render?.deferResolution) {
-          setupConfig.onAction(questionId, selectedOption, userId, {
-            instance: instanceKey,
-            messageId: event.messageId,
-            platformId: adapter.channelIdFromThreadId(event.threadId),
-          });
+        const address = {
+          instance: instanceKey,
+          messageId: event.messageId,
+          platformId: adapter.channelIdFromThreadId(event.threadId),
+        };
+        // The handler that authorizes the answer shows its outcome: a
+        // presentation that defers resolution asks for that, and text
+        // requests always do.
+        if (render?.deferResolution || textRequests) {
+          await setupConfig.onAction(questionId, selectedOption, userId, address, { deferResolution: true });
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -849,11 +1065,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           log.warn('Failed to update card after action', { err });
         }
 
-        setupConfig.onAction(questionId, selectedOption, userId, {
-          instance: instanceKey,
-          messageId: event.messageId,
-          platformId: adapter.channelIdFromThreadId(event.threadId),
-        });
+        await setupConfig.onAction(questionId, selectedOption, userId, address);
       });
 
       // Reactions the adapter reads itself (ReactionSource), registered
@@ -960,6 +1172,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const tid = threadId ?? platformId;
       const content = message.content as Record<string, unknown>;
 
+      // A request's outcome, from the handler that resolved an answer to it.
+      if (textRequests && content.operation === 'edit' && typeof content.questionId === 'string') {
+        await editRequestOutcome(tid, content.questionId, content);
+        return;
+      }
+
       if (content.operation === 'edit' && content.messageId) {
         const render =
           typeof content.questionId === 'string' ? await resolveQuestionRender(content.questionId) : undefined;
@@ -969,17 +1187,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           return;
         }
         const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
-        if (
-          terminalCard &&
-          typeof terminalCard.title === 'string' &&
-          typeof terminalCard.question === 'string' &&
-          typeof terminalCard.resolution === 'string'
-        ) {
-          await adapter.editMessage(
-            tid,
-            content.messageId as string,
-            terminalApprovalMessage(terminalCard as TerminalApprovalCard),
-          );
+        if (isTerminalCard(terminalCard)) {
+          await adapter.editMessage(tid, content.messageId as string, terminalApprovalMessage(terminalCard));
         } else {
           await adapter.editMessage(tid, content.messageId as string, {
             markdown: transformText((content.text as string) || (content.markdown as string) || ''),
@@ -993,7 +1202,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return;
       }
 
-      // Ask question card — render as Card with buttons
+      // Ask question — a Card with buttons, or words when requests are text
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
         const title = content.title as string;
@@ -1004,11 +1213,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
         const render = content.requirePresentation ? await resolveQuestionRender(questionId) : undefined;
         if (render?.renderMessage) {
-          const result = await adapter.postMessage(tid, render.renderMessage(questionId));
-          return result?.id;
+          return postRequest(tid, platformId, questionId, render.renderMessage(questionId));
         }
         if (content.requirePresentation) throw new Error('Approval presentation adapter is unavailable');
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        if (textRequests) {
+          const words = textRequest(title, typeof question === 'string' ? question : '', options);
+          return postRequest(tid, platformId, questionId, { markdown: transformText(words) });
+        }
         const card = Card({
           title,
           children: [
@@ -1033,64 +1245,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       // Display card (send_card MCP tool) — returns immediately, no callback flow.
-      // Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
-      // callback button would have nowhere to land. URL actions render as link buttons.
-      // The runner filters these against LINK_ACTION_SCHEMA before writing the row;
-      // the checks below still stand because any producer can write this payload.
+      // URL actions render as link buttons, or as links when requests are text.
       if (content.type === 'card' && content.card && typeof content.card === 'object') {
         const cardSpec = content.card as Record<string, unknown>;
-        const title = (cardSpec.title as string) || '';
-        const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
-
-        const cardChildren: CardChild[] = [];
-        if (typeof cardSpec.description === 'string' && cardSpec.description) {
-          cardChildren.push(CardText(cardSpec.description));
-        }
-        if (Array.isArray(cardSpec.children)) {
-          for (const child of cardSpec.children) {
-            if (typeof child === 'string' && child) {
-              cardChildren.push(CardText(child));
-            } else if (
-              child &&
-              typeof child === 'object' &&
-              typeof (child as Record<string, unknown>).text === 'string'
-            ) {
-              cardChildren.push(CardText((child as Record<string, string>).text));
-            }
-          }
-        }
-        if (Array.isArray(cardSpec.actions)) {
-          const linkButtons = (cardSpec.actions as Array<Record<string, unknown> | null | undefined>)
-            .filter(
-              (a): a is Record<string, unknown> =>
-                !!a &&
-                typeof a === 'object' &&
-                typeof a.url === 'string' &&
-                !!a.url &&
-                typeof a.label === 'string' &&
-                !!a.label,
-            )
-            .map((a) => {
-              const style = a.style;
-              const safeStyle: 'primary' | 'danger' | 'default' | undefined =
-                style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
-              return LinkButton({
-                label: a.label as string,
-                url: a.url as string,
-                style: safeStyle,
-              });
-            });
-          if (linkButtons.length > 0) {
-            cardChildren.push(Actions(linkButtons));
-          }
-        }
-
-        if (cardChildren.length === 0 && !title) {
+        const display = readDisplayCard(cardSpec);
+        if (display.texts.length === 0 && display.links.length === 0 && !display.title) {
           log.warn('send_card payload empty, skipping delivery');
           return;
         }
+        if (textRequests) {
+          const result = await adapter.postMessage(tid, { markdown: transformText(textDisplayCard(display)) });
+          return result?.id;
+        }
 
-        const card = Card({ title, children: cardChildren });
+        const fallbackText =
+          (content.fallbackText as string) || (cardSpec.description as string) || display.title || '';
+        const cardChildren: CardChild[] = display.texts.map((child) => CardText(child));
+        if (display.links.length > 0) cardChildren.push(Actions(display.links.map((link) => LinkButton(link))));
+        const card = Card({ title: display.title, children: cardChildren });
         const result = await adapter.postMessage(tid, { card, fallbackText });
         return result?.id;
       }
@@ -1297,10 +1469,17 @@ async function handleForwardedEvent(
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 6 }),
         });
-        setupConfig.onAction(questionId, selectedOption, user?.id || '', {
-          messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
-          platformId: interaction.channel_id as string | undefined,
-        });
+        handOnClick(
+          setupConfig,
+          questionId,
+          selectedOption,
+          user?.id || '',
+          {
+            messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
+            platformId: interaction.channel_id as string | undefined,
+          },
+          { deferResolution: true },
+        );
         return;
       }
       const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
@@ -1332,7 +1511,7 @@ async function handleForwardedEvent(
 
       // Dispatch to host
       if (questionId && selectedOption) {
-        setupConfig.onAction(questionId, selectedOption, user?.id || '', {
+        handOnClick(setupConfig, questionId, selectedOption, user?.id || '', {
           messageId: (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined,
           platformId: interaction.channel_id as string | undefined,
         });

@@ -19,6 +19,14 @@ export interface QuestionRender {
   renderTerminal?: (resolution: string) => Parameters<Adapter['postMessage']>[1];
   /** The coordinator updates the card only after it authorizes and records the decision. */
   deferResolution?: boolean;
+  /**
+   * When it stops taking answers (ISO-8601 UTC): an agent's question at the
+   * deadline its asker stops waiting, an approval at its expiry. Absent when
+   * it has none.
+   */
+  expiresAt?: string;
+  /** Its status is no longer pending: an answer to it resolves nothing. */
+  resolved?: boolean;
 }
 
 export type QuestionRenderResolver = (

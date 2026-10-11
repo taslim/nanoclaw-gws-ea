@@ -9,6 +9,8 @@
  * - Reactions list in pages of `reactionPageSize`.
  * - What the assistant writes is its own: a message it posts, and a reaction
  *   it places, which Chat names in its answer and deletes only by that name.
+ * - An edit may update a message's text only: a user cannot update a card,
+ *   so a mask naming one is refused as Google refuses it.
  * - Chat answers only the assistant's Chat token and People only its
  *   directory token; anything else is 401.
  *
@@ -61,6 +63,10 @@ function refusal(failure: ChatFailure): Response {
 
 const NOT_FOUND: ChatFailure = { status: 404, message: 'Requested entity was not found.' };
 const UNAUTHENTICATED: ChatFailure = { status: 401, message: 'Request had invalid authentication credentials.' };
+const CARDS_NEED_APP: ChatFailure = {
+  status: 403,
+  message: 'This field mask requires app authentication: cards_v2 can only be updated by a Chat app.',
+};
 
 function requestUrl(input: string | URL | Request): URL {
   if (input instanceof URL) return input;
@@ -108,6 +114,7 @@ export class FakeChatApi {
         if (authorization !== `Bearer ${CHAT_TOKEN}`) return refusal(UNAUTHENTICATED);
         if (method === 'POST') return this.write(path, await requestBody(input, init));
         if (method === 'DELETE') return this.remove(path);
+        if (method === 'PUT' || method === 'PATCH') return this.update(path, url, await requestBody(input, init));
         return this.chat(path, url);
       case 'people.googleapis.com':
         if (authorization !== `Bearer ${DIRECTORY_TOKEN}`) return refusal(UNAUTHENTICATED);
@@ -171,6 +178,16 @@ export class FakeChatApi {
       );
     }
     return refusal(NOT_FOUND);
+  }
+
+  /** Edit a message the assistant posted; only its text can change. */
+  private update(path: string, url: URL, body: Record<string, unknown>): Response {
+    const message = this.messages.get(path);
+    if (!message) return refusal(NOT_FOUND);
+    const mask = (url.searchParams.get('updateMask') ?? '').split(',').map((field) => field.trim());
+    if (mask.some((field) => field.toLowerCase().startsWith('cards'))) return refusal(CARDS_NEED_APP);
+    if (!mask.includes('text') || typeof body.text !== 'string') return refusal(NOT_FOUND);
+    return json(200, this.addMessage({ ...message, text: body.text }));
   }
 
   /** Delete a reaction, by its name. */

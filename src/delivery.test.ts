@@ -57,6 +57,9 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
+import { getPendingQuestion } from './db/sessions.js';
+import { resolveQuestionRender } from './channels/question-render-registry.js';
+import type { PendingQuestion } from './types.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { log } from './log.js';
 
@@ -406,6 +409,70 @@ describe('deliverSessionMessages — instance resolution', () => {
 
     await deliverSessionMessages(session);
     expect(instances).toEqual(['telegram']);
+  });
+});
+
+describe("deliverSessionMessages — an agent's question", () => {
+  function insertQuestion(sessionId: string, content: Record<string, unknown>): void {
+    const db = new Database(outboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES ('out-question', datetime('now'), 'chat-sdk', 'telegram:123', 'telegram', ?)`,
+    ).run(JSON.stringify(content));
+    db.close();
+  }
+
+  const QUESTION = {
+    type: 'ask_question',
+    questionId: 'q-time',
+    title: 'Pick a time',
+    question: 'When should I book the review with Juno?',
+    options: ['Tuesday 3pm', 'Wednesday 10am'],
+  };
+
+  it("stores the question with its deadline, from the agent's timeout, before the channel sees it", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    let atSend: PendingQuestion | undefined;
+    setDeliveryAdapter({
+      async deliver() {
+        atSend = await getPendingQuestion('q-time');
+        return 'plat-question';
+      },
+    });
+
+    const before = Date.now();
+    await deliverSessionMessages(session);
+    const after = Date.now();
+
+    expect(atSend).toEqual(
+      expect.objectContaining({
+        question_id: 'q-time',
+        session_id: session.id,
+        title: 'Pick a time',
+        question: 'When should I book the review with Juno?',
+        options: [
+          { label: 'Tuesday 3pm', selectedLabel: 'Tuesday 3pm', value: 'Tuesday 3pm' },
+          { label: 'Wednesday 10am', selectedLabel: 'Wednesday 10am', value: 'Wednesday 10am' },
+        ],
+      }),
+    );
+    const deadline = Date.parse(atSend!.deadline!);
+    expect(deadline).toBeGreaterThanOrEqual(before + 120_000);
+    expect(deadline).toBeLessThanOrEqual(after + 120_000);
+    expect((await resolveQuestionRender('q-time'))?.expiresAt).toBe(atSend!.deadline);
+  });
+
+  it('stores no question whose timeout is missing: nothing would know when it stops waiting', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, QUESTION);
+    setDeliveryAdapter({ deliver: async () => 'plat-question' });
+
+    await deliverSessionMessages(session);
+
+    expect(await getPendingQuestion('q-time')).toBeUndefined();
   });
 });
 

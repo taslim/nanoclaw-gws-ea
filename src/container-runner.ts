@@ -44,7 +44,7 @@ import {
 } from './db/coordination.js';
 import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getSession } from './db/sessions.js';
+import { deletePendingQuestionsForSession, getSession } from './db/sessions.js';
 import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
 import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
@@ -762,6 +762,13 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
     stopTypingRefresh(sessionId);
   } catch (err) {
     log.error('Failed to stop typing refresh', { sessionId, containerName, err });
+  }
+  // Nothing waits for the session's questions once its container is gone,
+  // so none of them takes an answer any more.
+  try {
+    await deletePendingQuestionsForSession(sessionId);
+  } catch (err) {
+    log.error("Failed to drop the session's open questions", { sessionId, containerName, err });
   }
 
   if (failure && failure.kind !== 'started-then-died') {

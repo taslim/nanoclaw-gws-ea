@@ -172,7 +172,8 @@ export const askUserQuestion: McpToolDefinition = {
     const title = args.title as string;
     const question = args.question as string;
     const rawOptions = args.options as unknown[];
-    const timeout = ((args.timeout as number) || 300) * 1000;
+    const timeoutSeconds = (args.timeout as number) || 300;
+    const timeout = timeoutSeconds * 1000;
     if (!title || !question || !rawOptions?.length) {
       return err('title, question, and options are required');
     }
@@ -190,7 +191,8 @@ export const askUserQuestion: McpToolDefinition = {
     const questionId = generateId();
     const r = routing();
 
-    // Write question card to outbound.db
+    // Write question card to outbound.db. It carries how long this waits, so
+    // the host takes no answer to the question once nothing waits for it.
     await writeMessageOut({
       id: questionId,
       kind: 'chat-sdk',
@@ -203,6 +205,7 @@ export const askUserQuestion: McpToolDefinition = {
         title,
         question,
         options,
+        timeoutSeconds,
       }),
     });
 

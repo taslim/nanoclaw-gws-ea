@@ -1228,7 +1228,13 @@ describe("recorded divergence: Google Chat is the assistant's own channel, on th
     const { AssistantChatAdapter } = await import('../modules/gws-ea-chat/adapter.js');
     const sdk = GoogleChatAdapter.prototype as unknown as Record<string, unknown>;
     const own = (prototype: object, method: string) => Object.prototype.hasOwnProperty.call(prototype, method);
-    const overridden = ['initialize', 'handleWebhook', 'handlePubSubMessageEvent', 'normalizeBotMentions'];
+    const overridden = [
+      'initialize',
+      'handleWebhook',
+      'handlePubSubMessageEvent',
+      'normalizeBotMentions',
+      'editMessage',
+    ];
     const called = ['parsePubSubMessage', 'encodeThreadId', 'fetchAttachmentData'];
 
     for (const method of [...overridden, ...called]) expect(typeof sdk[method], method).toBe('function');

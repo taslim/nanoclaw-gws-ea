@@ -224,7 +224,11 @@ export interface PendingQuestion {
   channel_type: string | null;
   thread_id: string | null;
   title: string;
+  /** What the question asks; empty on a row from before it was kept. */
+  question: string;
   options: import('./channels/ask-question.js').NormalizedOption[];
+  /** When the asking agent stops waiting (ISO-8601 UTC); null on a row from before deadlines were kept. */
+  deadline: string | null;
   created_at: string;
 }
 

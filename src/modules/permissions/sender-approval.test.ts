@@ -352,3 +352,74 @@ describe('unknown-sender request_approval flow', () => {
     expect(member).toBeDefined();
   });
 });
+
+describe('unknown-sender approval answered on a channel that left it as posted', () => {
+  // Text requests: the request stays as posted until the handler that
+  // authorizes an answer edits it to its outcome, by question id.
+  async function pendingApprovalFromStranger(): Promise<string> {
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(stranger('may I join?')));
+    const { getDb } = await import('../../db/connection.js');
+    return (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!.id;
+  }
+
+  async function answer(questionId: string, value: string, userId: string): Promise<void> {
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId,
+        value,
+        userId,
+        channelType: 'telegram',
+        instance: 'telegram',
+        messageId: 'request-message',
+        platformId: 'dm-owner',
+        threadId: null,
+        deferResolution: true,
+      });
+      if (claimed) return;
+    }
+  }
+
+  function editsSinceRequest(): Array<{ platformId: unknown; instance: unknown; content: Record<string, unknown> }> {
+    return deliverMock.mock.calls
+      .slice(1)
+      .map(([, platformId, , , content, , instance]) => ({
+        platformId,
+        instance,
+        content: JSON.parse(content as string) as Record<string, unknown>,
+      }))
+      .filter((call) => call.content.operation === 'edit');
+  }
+
+  it("leaves it unedited for a bystander's answer, and edits it once its approver allows the sender", async () => {
+    const questionId = await pendingApprovalFromStranger();
+
+    await answer(questionId, 'approve', 'random-bystander');
+    expect(editsSinceRequest()).toEqual([]);
+
+    await answer(questionId, 'approve', 'owner');
+    expect(editsSinceRequest()).toEqual([
+      {
+        platformId: 'dm-owner',
+        instance: 'telegram',
+        content: expect.objectContaining({
+          operation: 'edit',
+          questionId,
+          messageId: 'request-message',
+          terminalCard: expect.objectContaining({ title: '👤 New sender', resolution: '✅ Allowed' }),
+        }),
+      },
+    ]);
+  });
+
+  it('edits it to its outcome when its approver denies the sender', async () => {
+    const questionId = await pendingApprovalFromStranger();
+
+    await answer(questionId, 'reject', 'owner');
+
+    expect(editsSinceRequest().map((edit) => (edit.content.terminalCard as { resolution: string }).resolution)).toEqual(
+      ['❌ Denied'],
+    );
+  });
+});

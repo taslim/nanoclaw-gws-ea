@@ -3,8 +3,10 @@
  *
  * Container-side `ask_user_question` writes a chat-sdk card to outbound.db +
  * polls inbound.db for a `question_response` system message. On the host side
- * this module handles the button-click response: look up the pending_questions
- * row, write the response into the session's inbound.db, wake the container.
+ * this module handles the answer (a button click, or an answer in words on a
+ * channel whose requests are text): look up the pending_questions row, write
+ * the response into the session's inbound.db, show the choice on the question
+ * when the channel left it as posted, wake the container.
  *
  * The `createPendingQuestion` call in `deliverMessage` (delivery.ts) stays
  * inline in core — it's 15 lines guarded by `hasTable('pending_questions')`,
@@ -12,8 +14,9 @@
  */
 import { getDb, hasTable } from '../../db/connection.js';
 import { deletePendingQuestion, getPendingQuestion, getSession } from '../../db/sessions.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
-import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
+import { registerResponseHandler, showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 
@@ -46,6 +49,8 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
   });
 
   await deletePendingQuestion(payload.questionId);
+  // Answered: the question shows the choice where it was asked, when the channel left it as posted.
+  await showRequestOutcome(getDeliveryAdapter(), payload, pq);
   log.info('Question response routed', {
     questionId: payload.questionId,
     selectedOption: payload.value,

@@ -173,7 +173,7 @@ CREATE INDEX idx_sessions_lookup     ON sessions(messaging_group_id, thread_id);
 
 ### 1.9 `pending_questions`
 
-The `ask_user_question` MCP tool parks an interactive question here, and the container matches incoming `system` messages back to it by `questionId`.
+The `ask_user_question` MCP tool parks an interactive question here, and the container matches incoming `system` messages back to it by `questionId`. Delivery stores the `deadline` from the tool's timeout; past it, or once the session's container exits (which deletes the session's rows), the question takes no answer.
 
 ```sql
 CREATE TABLE pending_questions (
@@ -185,7 +185,9 @@ CREATE TABLE pending_questions (
   thread_id      TEXT,
   title          TEXT NOT NULL,
   options_json   TEXT NOT NULL,
-  created_at     TEXT NOT NULL
+  created_at     TEXT NOT NULL,
+  question       TEXT NOT NULL DEFAULT '',  -- the body, kept for its outcome in place (migration 027)
+  deadline       TEXT                       -- when the asking agent stops waiting (migration 027)
 );
 ```
 

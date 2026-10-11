@@ -182,8 +182,8 @@ export async function deleteSession(id: string): Promise<void> {
  */
 export async function createPendingQuestion(pq: PendingQuestion): Promise<boolean> {
   const result = await getDb().run(
-    `INSERT INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, created_at)
-       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @created_at)
+    `INSERT INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, question, options_json, deadline, created_at)
+       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @question, @options_json, @deadline, @created_at)
        ON CONFLICT (question_id) DO NOTHING`,
     {
       question_id: pq.question_id,
@@ -193,7 +193,9 @@ export async function createPendingQuestion(pq: PendingQuestion): Promise<boolea
       channel_type: pq.channel_type,
       thread_id: pq.thread_id,
       title: pq.title,
+      question: pq.question,
       options_json: JSON.stringify(pq.options),
+      deadline: pq.deadline,
       created_at: pq.created_at,
     },
   );
@@ -212,6 +214,11 @@ export async function getPendingQuestion(questionId: string): Promise<PendingQue
 
 export async function deletePendingQuestion(questionId: string): Promise<void> {
   await getDb().run('DELETE FROM pending_questions WHERE question_id = ?', questionId);
+}
+
+/** A session's questions, once nothing in it waits for their answers. */
+export async function deletePendingQuestionsForSession(sessionId: string): Promise<void> {
+  await getDb().run('DELETE FROM pending_questions WHERE session_id = ?', sessionId);
 }
 
 // ── Pending Approvals ──
@@ -310,7 +317,8 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
  * Resolve ask_question render metadata for any card. Approval-backed rows
  * include the original question body so the bridge can retain it when the
  * card resolves; generic pending_questions intentionally keep their existing
- * title + options shape.
+ * title + options shape, with the deadline past which they take no answer.
+ * An approval whose status is no longer pending is resolved.
  */
 export async function getAskQuestionRender(id: string): Promise<
   | {
@@ -318,13 +326,22 @@ export async function getAskQuestionRender(id: string): Promise<
       question?: string;
       options: import('../channels/ask-question.js').NormalizedOption[];
       deferResolution?: boolean;
+      expiresAt?: string;
+      resolved?: boolean;
     }
   | undefined
 > {
   const q = await getPendingQuestion(id);
-  if (q) return { title: q.title, options: q.options };
-  const a = await getDb().get<{ title: string; question: string; options_json: string; action: string }>(
-    'SELECT title, question, options_json, action FROM pending_approvals WHERE approval_id = ?',
+  if (q) return { title: q.title, options: q.options, ...(q.deadline ? { expiresAt: q.deadline } : {}) };
+  const a = await getDb().get<{
+    title: string;
+    question: string;
+    options_json: string;
+    action: string;
+    status: PendingApproval['status'];
+    expires_at: string | null;
+  }>(
+    'SELECT title, question, options_json, action, status, expires_at FROM pending_approvals WHERE approval_id = ?',
     id,
   );
   if (a?.title)
@@ -333,6 +350,8 @@ export async function getAskQuestionRender(id: string): Promise<
       question: a.question,
       options: JSON.parse(a.options_json),
       ...(a.action === 'gateway_request' ? { deferResolution: true } : {}),
+      ...(a.status === 'pending' ? {} : { resolved: true }),
+      ...(a.status === 'pending' && a.expires_at ? { expiresAt: a.expires_at } : {}),
     };
 
   // Channel-registration + unknown-sender approvals persist the same render

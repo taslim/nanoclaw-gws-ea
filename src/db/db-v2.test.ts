@@ -447,14 +447,18 @@ describe('pending questions', () => {
       channel_type: 'discord',
       thread_id: null,
       title: 'Test',
+      question: 'Ship it?',
       options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+      deadline: '2026-10-10T17:05:00.000Z',
       created_at: now(),
     });
     const result = await getPendingQuestion('q-1');
     expect(result).toBeDefined();
     expect(result!.session_id).toBe('sess-1');
     expect(result!.title).toBe('Test');
+    expect(result!.question).toBe('Ship it?');
     expect(result!.options[0].value).toBe('yes');
+    expect(result!.deadline).toBe('2026-10-10T17:05:00.000Z');
   });
 
   it('should delete', async () => {
@@ -466,7 +470,9 @@ describe('pending questions', () => {
       channel_type: null,
       thread_id: null,
       title: 'Test',
+      question: 'Ship it?',
       options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+      deadline: '2026-10-10T17:05:00.000Z',
       created_at: now(),
     });
     await deletePendingQuestion('q-1');

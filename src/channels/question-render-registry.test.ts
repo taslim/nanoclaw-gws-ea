@@ -110,6 +110,27 @@ describe('question render resolver registry', () => {
     });
   });
 
+  it("tells a pending approval's expiry, and that an approval no longer pending is resolved", async () => {
+    const approval = {
+      request_id: 'request-gateway',
+      action: 'gateway_request',
+      payload: '{}',
+      created_at: new Date().toISOString(),
+      expires_at: '2026-10-10T17:02:00.000Z',
+      title: 'Credentials request',
+      options_json: JSON.stringify([{ label: 'Approve', selectedLabel: 'Approved', value: 'approve' }]),
+    };
+    await createPendingApproval({ ...approval, approval_id: 'ga-open' });
+    await createPendingApproval({ ...approval, approval_id: 'ga-decided', status: 'approved' });
+
+    expect(await resolveQuestionRender('ga-open')).toEqual(
+      expect.objectContaining({ deferResolution: true, expiresAt: '2026-10-10T17:02:00.000Z' }),
+    );
+    expect(await resolveQuestionRender('ga-open')).not.toHaveProperty('resolved');
+    expect(await resolveQuestionRender('ga-decided')).toEqual(expect.objectContaining({ resolved: true }));
+    expect(await resolveQuestionRender('ga-decided')).not.toHaveProperty('expiresAt');
+  });
+
   it('returns undefined when neither a module nor the built-in fallback owns the id', async () => {
     expect(await resolveQuestionRender('unowned-render-question')).toBeUndefined();
   });

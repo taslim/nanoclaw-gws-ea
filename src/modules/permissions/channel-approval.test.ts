@@ -824,6 +824,87 @@ describe('unknown-channel registration flow', () => {
   });
 });
 
+describe('channel registration answered on a channel that left it as posted', () => {
+  // Text requests: the request stays as posted until the handler that
+  // authorizes an answer edits it to its outcome, by question id.
+  async function pendingRegistration(platformId: string): Promise<string> {
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(groupMention(platformId)));
+    return (await getDb().get<{ messaging_group_id: string }>(
+      'SELECT messaging_group_id FROM pending_channel_approvals',
+    ))!.messaging_group_id;
+  }
+
+  async function answer(questionId: string, value: string, userId = 'owner'): Promise<void> {
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId,
+        value,
+        userId,
+        channelType: 'telegram',
+        instance: 'telegram',
+        messageId: 'request-message',
+        platformId: 'dm-owner',
+        threadId: null,
+        deferResolution: true,
+      });
+      if (claimed) return;
+    }
+  }
+
+  /** What went out after the request, in order: each outcome edit's resolution, or a new request's title. */
+  function sentSinceRequest(): string[] {
+    return deliverMock.mock.calls.slice(1).map(([, , , , content]) => {
+      const sent = JSON.parse(content as string) as Record<string, unknown>;
+      if (sent.operation === 'edit') return `edit: ${(sent.terminalCard as { resolution: string }).resolution}`;
+      return `post: ${String(sent.title ?? sent.text)}`;
+    });
+  }
+
+  it("leaves it unedited for a bystander's answer", async () => {
+    const questionId = await pendingRegistration('chat-text-bystander');
+
+    await answer(questionId, 'connect:ag-1', 'random-bystander');
+
+    expect(sentSinceRequest()).toEqual([]);
+    expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(1);
+  });
+
+  it('edits it to its outcome once its approver connects the channel', async () => {
+    const questionId = await pendingRegistration('chat-text-connect');
+
+    await answer(questionId, 'connect:ag-1');
+
+    expect(sentSinceRequest()).toEqual(['edit: ✅ Connected to Andy']);
+    const [, platformId, , , content, , instance] = deliverMock.mock.calls[1]!;
+    expect({ platformId, instance }).toEqual({ platformId: 'dm-owner', instance: 'telegram' });
+    expect(JSON.parse(content as string)).toEqual(
+      expect.objectContaining({ operation: 'edit', questionId, messageId: 'request-message' }),
+    );
+    expect(
+      await countRows('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?', questionId),
+    ).toBe(1);
+  });
+
+  it('edits it to its outcome when its approver rejects the channel', async () => {
+    const questionId = await pendingRegistration('chat-text-reject');
+
+    await answer(questionId, 'reject');
+
+    expect(sentSinceRequest()).toEqual(['edit: 🙅 Rejected']);
+  });
+
+  it('shows the choice of an agent on the first request before it asks which agent', async () => {
+    await createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
+    const questionId = await pendingRegistration('chat-text-choose');
+
+    await answer(questionId, 'choose_existing');
+
+    expect(sentSinceRequest()).toEqual(['edit: 📋 Choosing…', 'post: 📋 Choose an agent']);
+  });
+});
+
 describe('no-owner / no-agent failure modes', () => {
   it('no owner → no card, no pending row (fresh-install bootstrap path)', async () => {
     // Wipe the owner grant set up in the outer beforeEach.

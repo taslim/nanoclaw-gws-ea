@@ -35,6 +35,7 @@ const ensure = vi.fn(async (_input: GatewaySessionInput) => ({
 const reapOrphans = vi.fn(async () => {});
 import { getSessionClaim } from './db/coordination.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
+import { createPendingQuestion, getPendingQuestion } from './db/sessions.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -161,5 +162,43 @@ describe('session claim lifecycle', () => {
     await abortGatewaySessionObservers();
     expect(release).toHaveBeenCalledWith({ kind: 'host-detached', reason: 'host-shutdown' });
     expect(isContainerRunning('sess-1')).toBe(true);
+  });
+});
+
+describe('session exit', () => {
+  it("drops the session's open questions once its container exits, and leaves other sessions'", async () => {
+    await createSession({
+      id: 'sess-2',
+      agent_group_id: 'ag-1',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    const question = (questionId: string, sessionId: string) => ({
+      question_id: questionId,
+      session_id: sessionId,
+      message_out_id: `out-${questionId}`,
+      platform_id: 'gchat:spaces/AAAAjuno',
+      channel_type: 'gchat',
+      thread_id: null,
+      title: 'Pick a time',
+      question: 'When should I book the review with Juno?',
+      options: [{ label: 'Tuesday', selectedLabel: 'Tuesday', value: 'Tuesday' }],
+      deadline: new Date(Date.now() + 300_000).toISOString(),
+      created_at: now(),
+    });
+    await createPendingQuestion(question('q-1', 'sess-1'));
+    await createPendingQuestion(question('q-2', 'sess-2'));
+    snapshots.push({ handle: fakeHandle('sess-1', 'container-a'), phase: 'running' } as SupervisedSnapshot);
+    await adoptRunningSessions();
+
+    killContainer('sess-1', 'test-stop');
+
+    await vi.waitFor(async () => expect(await getPendingQuestion('q-1')).toBeUndefined());
+    expect(await getPendingQuestion('q-2')).toBeDefined();
   });
 });

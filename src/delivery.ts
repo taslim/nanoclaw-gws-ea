@@ -713,14 +713,24 @@ async function deliverMessage(
   // Guarded: without the interactive module, `pending_questions` doesn't
   // exist and we skip persistence — the card still delivers to the user,
   // but the response path has nowhere to land and will log unclaimed.
+  // The agent waits timeoutSeconds for the answer; past the deadline stored
+  // here, counted from now, the question takes no answer.
   if (content.type === 'ask_question' && content.questionId && (await hasTable(getDb(), 'pending_questions'))) {
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
-    if (!title || !Array.isArray(rawOptions)) {
-      log.error('ask_question missing required title/options — not persisting', {
+    const timeoutSeconds = content.timeoutSeconds as unknown;
+    if (
+      !title ||
+      !Array.isArray(rawOptions) ||
+      typeof timeoutSeconds !== 'number' ||
+      !Number.isFinite(timeoutSeconds) ||
+      timeoutSeconds <= 0
+    ) {
+      log.error('ask_question missing required title/options/timeoutSeconds — not persisting', {
         questionId: content.questionId,
       });
     } else {
+      const askedAt = Date.now();
       const inserted = await createPendingQuestion({
         question_id: content.questionId,
         session_id: session.id,
@@ -729,8 +739,10 @@ async function deliverMessage(
         channel_type: msg.channelType,
         thread_id: msg.threadId,
         title,
+        question: typeof content.question === 'string' ? content.question : '',
         options: normalizeOptions(rawOptions as never),
-        created_at: new Date().toISOString(),
+        deadline: new Date(askedAt + timeoutSeconds * 1000).toISOString(),
+        created_at: new Date(askedAt).toISOString(),
       });
       if (inserted) {
         log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
