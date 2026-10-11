@@ -60,7 +60,7 @@ const REQUIRED_APIS = [
   'pubsub.googleapis.com',
   'workspaceevents.googleapis.com',
 ] as const;
-const BILLING_URL = 'https://console.cloud.google.com/billing';
+const BILLING_CREATE_URL = 'https://console.cloud.google.com/billing/create';
 const BILLING_USER_ROLE = 'roles/billing.user';
 /** The member Google Chat publishes a Workspace Events subscription's events as. */
 const GCHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com';
@@ -956,7 +956,7 @@ function billingRequiredPause(gcp: GcpProjectInput, dependencies: GcloudDependen
     details: [
       `Create a billing account, or have its administrator grant ${gcp.account} Billing Account User (${BILLING_USER_ROLE}) on an open one, then resume.`,
     ],
-    actionUrl: BILLING_URL,
+    actionUrl: BILLING_CREATE_URL,
     settled: async () => {
       const open = await readOpenBillingAccounts(gcloudFor(gcp, dependencies));
       return 'value' in open && open.value.length > 0;

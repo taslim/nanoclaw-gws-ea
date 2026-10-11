@@ -1075,7 +1075,7 @@ describe('Google Cloud setup through the step engine', () => {
         code: 'gcp_billing_account_required',
         message: expect.stringMatching(new RegExp(`${setup.gcp.projectId} needs a billing account.*${ACCOUNT}`, 'u')),
         details: [expect.stringContaining('Billing Account User (roles/billing.user)')],
-        actionUrl: 'https://console.cloud.google.com/billing',
+        actionUrl: 'https://console.cloud.google.com/billing/create',
       },
     });
     expect(setup.cloud.mutations).toEqual([expect.stringMatching(/^projects create /u)]);
