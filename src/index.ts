@@ -124,6 +124,7 @@ async function main(): Promise<void> {
                 isMention: message.isMention,
                 isGroup: message.isGroup,
                 authenticatedSender: message.authenticatedSender,
+                deduplicate: message.deduplicate,
               },
             }),
           )

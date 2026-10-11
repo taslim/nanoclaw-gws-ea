@@ -640,7 +640,10 @@ async function deliverToAgent(
     });
   } catch (error) {
     if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
+    // The first copy already set off everything below: typing, the wake (or
+    // the sweep's, when that wake failed), and the fan-out to sibling sessions.
     log.info('Duplicate retry-safe inbound message already queued', { messageId, sessionId: session.id });
+    return;
   }
 
   if (wake && created) {

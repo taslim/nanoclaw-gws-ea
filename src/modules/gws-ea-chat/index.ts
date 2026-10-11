@@ -1,15 +1,77 @@
 /**
- * GWS-EA's Google Chat, as the assistant's own account (KTD2, KTD3, KTD12).
+ * GWS-EA's Google Chat, as the assistant's own account (KTD1–KTD4, KTD12).
  * Chat's events reach the host through a Workspace Events subscription the
  * host keeps (subscription.ts) and a Pub/Sub subscription it pulls
- * (pubsub-pull.ts), so the host needs no public endpoint. The Chat channel
- * starts both when it initializes (delivery.ts).
+ * (pubsub-pull.ts), so the host needs no public endpoint. The `gchat`
+ * channel registers here, as the email channel registers from its module:
+ * upstream's Chat SDK adapter signed in as the assistant (adapter.ts), which
+ * starts both when it initializes (delivery.ts) and reads each event it
+ * pulls (hydrate.ts).
  *
- * A host without Chat delivery (config.ts) runs none of it. Status reads
- * whether Chat is receiving through `gws-ea-chat health`.
+ * A host without the assistant's Google sign-in or without Chat delivery
+ * (config.ts) has no Chat channel. Status reads whether Chat is receiving
+ * through `gws-ea-chat health`.
  */
+import type { ChannelAdapter } from '../../channels/adapter.js';
+import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
+import { GCHAT_CHANNEL_TYPE } from '../../gws-ea/types.js';
+import { googleGrantFilePath } from '../gws-ea-google/grant-file.js';
+import { assistantGoogleAccount, hostGoogleAccessToken, type AssistantGoogleAccount } from '../gws-ea-google/index.js';
+import { AssistantChatAdapter, createAssistantChatChannel, GCHAT_DEFAULTS, hostChatAuth } from './adapter.js';
+import { readChatDeliveryConfig, type ChatDeliveryConfig } from './config.js';
+import { startChatDelivery } from './delivery.js';
 import { chatHealth } from './health.js';
+import { createChatHydrator } from './hydrate.js';
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The assistant's account from its grant. Chat knows the assistant by the
+ * account's Google ID, which a grant from before Chat lacks: a grant this
+ * host cannot read needs a new sign-in.
+ */
+async function signedInAssistant(): Promise<AssistantGoogleAccount> {
+  let assistant: AssistantGoogleAccount | undefined;
+  try {
+    assistant = await assistantGoogleAccount();
+  } catch (error) {
+    throw new Error(
+      `Google Chat cannot start: the assistant's Google sign-in cannot be read (${errorMessage(error)}); sign in to Google again`,
+      { cause: error },
+    );
+  }
+  if (assistant === undefined) {
+    throw new Error('Google Chat cannot start: the assistant has not signed in to Google; sign in to Google first');
+  }
+  return assistant;
+}
+
+async function createAssistantChat(delivery: ChatDeliveryConfig): Promise<ChannelAdapter> {
+  const assistant = await signedInAssistant();
+  const chatToken = () => hostGoogleAccessToken('chat');
+  const adapter = new AssistantChatAdapter({
+    botUserId: `users/${assistant.sub}`,
+    // A mention of the assistant reads to agents as its address's handle.
+    userName: /^[^@]+/u.exec(assistant.account)?.[0] ?? assistant.account,
+    auth: hostChatAuth(chatToken),
+    hydrator: createChatHydrator({ chatToken, directoryToken: () => hostGoogleAccessToken('directory-host') }),
+    startDelivery: (onChatEvent) => startChatDelivery({ config: delivery, onChatEvent }),
+  });
+  return createAssistantChatChannel(adapter);
+}
+
+registerChannelAdapter(GCHAT_CHANNEL_TYPE, {
+  // Only a host with the assistant's Google sign-in and its Chat delivery has Chat.
+  factory: () => {
+    if (googleGrantFilePath() === undefined) return null;
+    const delivery = readChatDeliveryConfig();
+    return delivery === undefined ? null : createAssistantChat(delivery);
+  },
+  defaults: GCHAT_DEFAULTS,
+});
 
 // What status reads, from the host only: whether the consumer is connected, its last pull, the
 // subscription's state and expiry, and each side's last error kind.
@@ -26,6 +88,13 @@ register({
   handler: async () => chatHealth.read(),
 });
 
+export {
+  AssistantChatAdapter,
+  extractGchatReplyContext,
+  GCHAT_DEFAULTS,
+  type ChatReactionEvent,
+  type ChatReactionHandler,
+} from './adapter.js';
 export {
   GCHAT_PROJECT_ID_ENV,
   GCHAT_SUBSCRIBER_KEY_FILE_ENV,

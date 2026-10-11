@@ -78,7 +78,12 @@ export interface InboundEvent {
      * it even when their content carries sender fields.
      */
     authenticatedSender?: AuthenticatedSender;
-    /** Retry-safe only for owner-controlled routed admin messages. */
+    /**
+     * Retry-safe: the source may deliver this message again after it was
+     * routed, so a copy already queued in a session is dropped there. Set for
+     * owner-controlled routed admin messages and for channels whose platform
+     * redelivers (InboundMessage.deduplicate).
+     */
     deduplicate?: boolean;
   };
   replyTo?: DeliveryAddress;
@@ -110,6 +115,12 @@ export interface InboundMessage {
   isGroup?: boolean;
   /** Sender identity asserted by the authenticated adapter transport. */
   authenticatedSender?: AuthenticatedSender;
+  /**
+   * The platform may deliver this message again after it was routed, as
+   * Pub/Sub's at-least-once delivery does, and its id is the same each time:
+   * the router drops a copy already queued instead of storing and waking twice.
+   */
+  deduplicate?: boolean;
 }
 
 export interface AuthenticatedSender {

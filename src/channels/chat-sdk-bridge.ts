@@ -48,6 +48,8 @@ interface ConnectionAwareAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+  /** The platform's id for the message replied to, when the platform names it. */
+  id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +347,12 @@ export interface ChatSdkBridgeConfig {
    */
   extractRawText?: RawTextExtractor;
   /**
+   * The platform may deliver a message again after the adapter handed it on,
+   * under the same message id: each inbound is marked `deduplicate`, so the
+   * router drops a copy already queued (InboundMessage.deduplicate).
+   */
+  redelivers?: boolean;
+  /**
    * Whether this platform uses threads as the primary conversation unit.
    * See `ChannelAdapter.supportsThreads`. Declared by the calling channel
    * skill, not inferred, because some platforms (Discord) can be used either
@@ -557,6 +565,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               kind: message.author.isBot === false ? 'human' : message.author.isBot === true ? 'bot' : 'unknown',
             }
           : undefined,
+      ...(config.redelivers === true ? { deduplicate: true } : {}),
     };
   }
 

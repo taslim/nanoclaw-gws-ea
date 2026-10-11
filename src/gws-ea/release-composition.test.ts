@@ -1,6 +1,7 @@
 /**
- * The product a release is: every GWS-EA host module, the Google Chat channel,
- * and the OneCLI gateway are composed into this tree. A release is the tool's
+ * The product a release is: every GWS-EA host module, the Google Chat channel
+ * among them (it registers from `gws-ea-chat`, not the channel barrel), and
+ * the OneCLI gateway are composed into this tree. A release is the tool's
  * own clean commit, so this is a property of the commit, checked here once
  * rather than at every create and update. Derived from the tree, so adding a
  * module needs no list edit. Both product templates, and the agent each
@@ -30,8 +31,9 @@ describe('release composition', () => {
     expect(imports(barrel, 'capabilities/index')).toBe(true);
   });
 
-  it('composes the Google Chat channel and the OneCLI gateway', async () => {
-    expect(imports(await read('src/channels/index.ts'), 'gchat')).toBe(true);
+  it('composes the Google Chat channel from its module, and the OneCLI gateway', async () => {
+    expect(imports(await read('src/modules/index.ts'), 'gws-ea-chat/index')).toBe(true);
+    expect(imports(await read('src/channels/index.ts'), 'gchat')).toBe(false);
     expect(imports(await read('src/gateway-providers/index.ts'), 'installed')).toBe(true);
     expect(imports(await read('src/gateway-providers/installed.ts'), 'onecli')).toBe(true);
   });
