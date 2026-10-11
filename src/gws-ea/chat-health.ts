@@ -2,9 +2,10 @@
  * Whether Google Chat is receiving (KTD12), as the assistant's own host
  * reports it through `ncl gws-ea-chat health`: its pull consumer connected to
  * Pub/Sub, and its Workspace Events subscription active. `status` shows it,
- * and a release serves only once it holds. A broken Google sign-in fails
- * both, and only a new sign-in repairs it, so it is named as one ("sign-in
- * needed") rather than as either failure.
+ * and a release serves only once it holds. A broken Google sign-in fails the
+ * subscription, and only a new sign-in repairs it, so it is named as one
+ * ("sign-in needed"). The consumer pulls with the subscriber key, not the
+ * sign-in, so a consumer that is down is its own failure even then.
  */
 import type {
   ChatErrorKind,
@@ -103,14 +104,15 @@ function failing(clause: string, error: ChatHealthError | null): string {
  */
 export function chatReceiving(health: ChatHealth, instanceId: string): ChatReceiving {
   const { consumer, subscription } = health;
-  if (health.signInNeeded) {
+  const signIn = `Sign the assistant in again with gws-ea connect-google --id ${instanceId}`;
+  if (health.signInNeeded && consumer.connected) {
     const cause =
       subscription.error?.kind === 'sign_in_needed'
         ? redact(subscription.error.message)
         : `Google suspended its Chat subscription (${subscription.suspensionReason ?? 'no reason given'})`;
     return {
       state: 'sign_in_needed',
-      reason: `Sign-in needed for Google Chat: ${cause}. Sign the assistant in again with gws-ea connect-google --id ${instanceId}`,
+      reason: `Sign-in needed for Google Chat: ${cause}. ${signIn}`,
     };
   }
   const problems: string[] = [];
@@ -122,7 +124,10 @@ export function chatReceiving(health: ChatHealth, instanceId: string): ChatRecei
   if (subscription.state !== 'active') {
     problems.push(failing(`its subscription is ${SUBSCRIPTION_STATES[subscription.state]}`, subscription.error));
   }
-  return problems.length === 0
-    ? { state: 'receiving' }
-    : { state: 'not_receiving', reason: `Google Chat is not receiving: ${problems.join('; ')}` };
+  if (problems.length === 0) return { state: 'receiving' };
+  const reason = `Google Chat is not receiving: ${problems.join('; ')}`;
+  return {
+    state: 'not_receiving',
+    reason: health.signInNeeded ? `${reason}, and its sign-in is broken. ${signIn}` : reason,
+  };
 }

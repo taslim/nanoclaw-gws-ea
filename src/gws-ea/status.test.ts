@@ -896,6 +896,31 @@ describe('status', () => {
       sign_in_needed: true,
     });
 
+    // A broken sign-in does not explain a consumer that is down: the consumer
+    // pulls with the subscriber key, so that is its own failure.
+    const both = await statusJson(
+      host,
+      state,
+      id,
+      reporting({
+        consumer: {
+          connected: false,
+          lastPullAt: null,
+          error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
+        },
+        subscription: { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' },
+        signInNeeded: true,
+      }),
+    );
+    expect(both.status.probes.chat).toMatchObject({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
+        `its subscription is suspended, and its sign-in is broken. ${signIn}`,
+      consumer_connected: false,
+      sign_in_needed: true,
+    });
+
     // Anything else is Chat not receiving, with each side's last failure.
     const down = await statusJson(
       host,
