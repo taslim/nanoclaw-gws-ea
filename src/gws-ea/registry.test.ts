@@ -76,7 +76,7 @@ function createArgs(): string[] {
     'dogfood',
     '--source-remote',
     'https://example.test/nanoclaw.git',
-    '--workspace-email',
+    '--assistant-workspace-email',
     'assistant@example.test',
   ];
 }

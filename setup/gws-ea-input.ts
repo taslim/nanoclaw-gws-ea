@@ -281,9 +281,12 @@ export async function collectGwsEaCreateInput(
   // Held in the zone's own spelling, since main's container runs in it.
   const principalTimezone = ianaTimezone(givenTimezone);
   if (principalTimezone === undefined) throw invalidFlag('principal-timezone', 'Enter a valid IANA timezone');
-  const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
-    validate: workspaceEmailProblem,
-  });
+  const assistantWorkspaceEmail = await textInput(
+    source,
+    'assistant-workspace-email',
+    'Assistant Google Workspace email',
+    { validate: workspaceEmailProblem },
+  );
   const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
   const principalChatEmail = await principalChatEmailInput(source, principalEmails);
   const provider = await chooseProvider(providers, source);
