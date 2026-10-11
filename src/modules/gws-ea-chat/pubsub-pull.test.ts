@@ -63,8 +63,18 @@ function ackIds(requests: readonly RecordedRequest[]): string[] {
   return requests.flatMap((request) => (request.body as { ackIds: string[] }).ackIds);
 }
 
+/** A message created event, about the space the message is in, as Google publishes it. */
 function chatMessage(name: string, time?: string) {
-  return { type: CHAT_MESSAGE_CREATED, data: { message: { name } }, ...(time === undefined ? {} : { time }) };
+  return {
+    type: CHAT_MESSAGE_CREATED,
+    subject: `//chat.googleapis.com/${name.split('/messages/')[0]}`,
+    data: { message: { name } },
+    ...(time === undefined ? {} : { time }),
+  };
+}
+
+function messageName(event: WorkspaceEvent): string {
+  return (event.data.message as { name: string }).name;
 }
 
 describe('acking', () => {
@@ -182,6 +192,72 @@ describe('acking', () => {
 
     await until(() => fake.acks(notJson) === 1 && fake.acks(untyped) === 1);
     expect(handled).toEqual([]);
+  });
+});
+
+describe('ordering', () => {
+  it("holds a conversation's event from a later pull until its earlier one is handled, and acks them in order", async () => {
+    const earlier = 'spaces/AAAAjuno/messages/remy.10';
+    const later = 'spaces/AAAAjuno/messages/remy.11';
+    const held = deferred();
+    const started: string[] = [];
+    start((event) => {
+      started.push(messageName(event));
+      return messageName(event) === earlier ? held.promise : Promise.resolve();
+    });
+    const earlierId = fake.publish(chatMessage(earlier));
+    await until(() => started.length === 1);
+    // The same space, though this subject names the message rather than the space.
+    const laterId = fake.publish({ ...chatMessage(later), subject: `//chat.googleapis.com/${later}` });
+    await until(() => fake.messages.get(laterId)?.ackIds.length === 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(started).toEqual([earlier]);
+    expect(fake.calls('acknowledge')).toEqual([]);
+
+    held.resolve();
+    await until(() => fake.acks(laterId) === 1);
+    expect(started).toEqual([earlier, later]);
+    expect(ackIds(fake.calls('acknowledge'))).toEqual([`${earlierId}-ack-1`, `${laterId}-ack-1`]);
+  });
+
+  it("handles another conversation's event while one conversation's handler is still pending", async () => {
+    const held = deferred();
+    let calls = 0;
+    start((event) => {
+      calls += 1;
+      return messageName(event).startsWith('spaces/AAAAjuno/') ? held.promise : Promise.resolve();
+    });
+    const juno = fake.publish(chatMessage('spaces/AAAAjuno/messages/remy.12'));
+    await until(() => calls === 1);
+    const morgan = fake.publish(chatMessage('spaces/AAAAmorgan/messages/remy.13'));
+
+    await until(() => fake.acks(morgan) === 1);
+    expect(fake.acks(juno)).toBe(0);
+
+    held.resolve();
+    await until(() => fake.acks(juno) === 1);
+  });
+
+  it('extends the lease of an event waiting for an earlier one of its conversation', async () => {
+    const held = deferred();
+    let calls = 0;
+    start(() => {
+      calls += 1;
+      return calls === 1 ? held.promise : Promise.resolve();
+    });
+    fake.publish(chatMessage('spaces/AAAAjuno/messages/remy.14'));
+    await until(() => calls === 1);
+    const waiting = fake.publish(chatMessage('spaces/AAAAjuno/messages/remy.15'));
+    await until(() => fake.messages.get(waiting)?.ackIds.length === 1);
+
+    // Past the deadline it was pulled with, its lease still runs: Pub/Sub has not handed it out again.
+    await vi.advanceTimersByTimeAsync(2 * ACK_DEADLINE_SECONDS * 1_000);
+    expect(ackIds(fake.calls('modifyAckDeadline'))).toContain(`${waiting}-ack-1`);
+    expect(fake.messages.get(waiting)?.ackIds).toEqual([`${waiting}-ack-1`]);
+    expect(calls).toBe(1);
+
+    held.resolve();
+    await until(() => fake.acks(waiting) === 1);
   });
 });
 

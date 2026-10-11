@@ -10,8 +10,9 @@
  * rejects leaves it unacknowledged, and Pub/Sub delivers it again once its
  * lease lapses, which paces the retries. REST does not extend leases the way
  * the gRPC client does, so the consumer extends every event still being
- * handled: waiting for the host to be ready, downloading an attachment, or
- * running a slow answer such as an image build.
+ * handled: waiting for the host to be ready, downloading an attachment,
+ * running a slow answer such as an image build, or waiting its turn behind an
+ * earlier event of its conversation.
  *
  * Pub/Sub may deliver an event again while its first copy is still being
  * handled. That copy is neither handled nor acknowledged: acknowledging it
@@ -113,6 +114,17 @@ function eventTime(message: ReceivedMessage, event: WorkspaceEvent | undefined):
   return Date.parse(event?.time ?? message.publishTime) || 0;
 }
 
+/**
+ * The conversation a message belongs to: the Chat space its subject names,
+ * whether the subject is the space or a message in it. A message about no
+ * space, such as a subscription's lifecycle event, belongs to its source,
+ * and those with neither all belong to one.
+ */
+function conversationOf(message: ReceivedMessage): string {
+  const subject = message.attributes['ce-subject'] ?? '';
+  return /^\/\/chat\.googleapis\.com\/(spaces\/[^/]+)/u.exec(subject)?.[1] ?? message.attributes['ce-source'] ?? '';
+}
+
 /** The subscriber's REST calls on one subscription. */
 function createPubSubApi(client: GoogleClientOptions, subscription: string) {
   const url = (method: string) => `${PUBSUB}/${subscription}:${method}`;
@@ -207,8 +219,10 @@ export interface PullConsumer {
 /**
  * Start pulling. Before its first pull, and after any failure, the consumer
  * proves Pub/Sub lets the subscriber pull, so health shows it connected
- * without waiting for an event. Each pulled batch is handled in event-time
- * order, one event after another, while the next pull is already waiting.
+ * without waiting for an event. The events of one conversation, a Chat
+ * space, are handled one after another in the order they were pulled, each
+ * batch in event-time order, while other conversations and the next pull go
+ * on without them.
  */
 export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
   const api = createPubSubApi(
@@ -216,8 +230,10 @@ export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
     options.subscription,
   );
   const stopping = new AbortController();
-  /** The ack id of each event being handled, by its Pub/Sub message id. */
+  /** The ack id of each event being handled or waiting its turn, by its Pub/Sub message id. */
   const inFlight = new Map<string, string>();
+  /** The last event queued in each conversation, which the next one waits for, until it settles. */
+  const tails = new Map<string, Promise<void>>();
 
   async function extendLeases(): Promise<void> {
     if (inFlight.size === 0) return;
@@ -264,7 +280,12 @@ export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
     }
   }
 
-  async function dispatch(received: readonly ReceivedMessage[]): Promise<void> {
+  /**
+   * Queue a pulled batch in event-time order, each event behind the earlier
+   * ones of its conversation. Each is in flight from now, so its lease is
+   * extended while it waits its turn.
+   */
+  function dispatch(received: readonly ReceivedMessage[]): void {
     const batch: { readonly message: ReceivedMessage; readonly event: WorkspaceEvent | undefined }[] = [];
     for (const message of received) {
       if (inFlight.has(message.messageId)) {
@@ -275,7 +296,14 @@ export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
       batch.push({ message, event: decodeEvent(message) });
     }
     batch.sort((a, b) => eventTime(a.message, a.event) - eventTime(b.message, b.event));
-    for (const { message, event } of batch) await settle(message, event);
+    for (const { message, event } of batch) {
+      const conversation = conversationOf(message);
+      const tail = (tails.get(conversation) ?? Promise.resolve()).then(() => settle(message, event));
+      tails.set(conversation, tail);
+      void tail.then(() => {
+        if (tails.get(conversation) === tail) tails.delete(conversation);
+      });
+    }
   }
 
   const loop = (async () => {
@@ -291,7 +319,7 @@ export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
         const received = await api.pull(stopping.signal);
         failures = 0;
         options.health.consumer({ connected: true, lastPullAt: new Date().toISOString(), error: null });
-        void dispatch(received);
+        dispatch(received);
         /* eslint-disable-next-line no-catch-all/no-catch-all -- the consumer never stops on a failure: it is recorded, and the loop waits and tries again */
       } catch (error) {
         if (stopping.signal.aborted) break;
