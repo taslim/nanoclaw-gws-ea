@@ -93,7 +93,7 @@ async function startDesk() {
     postedRequest: async (messageId) => posted.get(messageId),
     render: async (questionId) => renders.get(questionId),
     dispatch: (answer) => handle(answer),
-    selfMention: '@robin',
+    selfMention: '@noel',
   });
   let requests = 0;
   let messages = 0;
@@ -386,7 +386,7 @@ describe('createAnswers — the rule', () => {
     const desk = await startDesk();
     const request = await desk.post(ROOM, 'q-launch', question(TIMES), 0);
 
-    expect(await desk.write('@Robin 3', 30, { platformId: ROOM, quote: { messageId: request } })).toBe(true);
+    expect(await desk.write('@Noel 3', 30, { platformId: ROOM, quote: { messageId: request } })).toBe(true);
     expect(desk.answered.map((answer) => answer.value)).toEqual(['thu']);
   });
 });

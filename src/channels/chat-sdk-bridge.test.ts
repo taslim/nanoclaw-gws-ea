@@ -1495,7 +1495,7 @@ describe('createChatSdkBridge — answers in words', () => {
     const adapter = Object.assign(
       stubAdapter({
         name: 'fixture',
-        userName: 'robin',
+        userName: 'noel',
         initialize: async (instance) => {
           chat = instance;
         },
@@ -1503,7 +1503,7 @@ describe('createChatSdkBridge — answers in words', () => {
         isDM: (threadId: string) => threadId.endsWith(':dm'),
         postMessage: async (threadId) => {
           posts += 1;
-          return { id: `spaces/AAAA/messages/robin.${posts}`, threadId, raw: { createTime: postedAt } };
+          return { id: `spaces/AAAA/messages/noel.${posts}`, threadId, raw: { createTime: postedAt } };
         },
         editMessage: async (threadId, messageId) => ({ id: messageId, threadId, raw: {} }),
       }),
@@ -1515,7 +1515,7 @@ describe('createChatSdkBridge — answers in words', () => {
       redelivers: true,
       extractReplyContext: (raw) => {
         const quote = raw.quote as { name?: string; text: string } | undefined;
-        return quote ? { sender: 'Robin', text: quote.text, ...(quote.name ? { id: quote.name } : {}) } : null;
+        return quote ? { sender: 'Noel', text: quote.text, ...(quote.name ? { id: quote.name } : {}) } : null;
       },
       textRequests: { postedAt: (raw) => new Date((raw as { createTime: string }).createTime) },
     });
@@ -1585,7 +1585,7 @@ describe('createChatSdkBridge — answers in words', () => {
             text: 'Shall I?',
             formatted: parseMarkdown('Shall I?'),
             raw: {},
-            author: { userId: 'users/9', userName: 'Robin', fullName: 'Robin', isBot: false, isMe: true },
+            author: { userId: 'users/9', userName: 'Noel', fullName: 'Noel', isBot: false, isMe: true },
             metadata: { dateSent: new Date(T0), edited: false },
             attachments: [],
           }),
@@ -1758,7 +1758,7 @@ describe('createChatSdkBridge — answers in words', () => {
       expect(desk.routed).toHaveLength(1);
       expect(desk.routed[0]!.message.content).toMatchObject({
         text: 'yes',
-        replyTo: { sender: 'Robin', text: 'Shall I?', id: request },
+        replyTo: { sender: 'Noel', text: 'Shall I?', id: request },
       });
     } finally {
       await desk.bridge.teardown();
@@ -1796,7 +1796,7 @@ describe('createChatSdkBridge — answers in words', () => {
     const desk = await answeringBridge();
     try {
       const request = await desk.ask(ROOM, 'appr-launch', APPROVAL_OPTIONS, 0);
-      await desk.write('@robin yes', 30, { thread: ROOM_THREAD, quote: request });
+      await desk.write('@noel yes', 30, { thread: ROOM_THREAD, quote: request });
 
       expect(desk.actions).toEqual([
         [
@@ -1824,7 +1824,7 @@ describe('createChatSdkBridge — answers in words', () => {
       expect(desk.actions).toEqual([]);
       expect(desk.routed.map(({ message }) => message.content)).toEqual([
         expect.objectContaining({ text: 'Should we book Atlas?' }),
-        expect.objectContaining({ text: 'yes', replyTo: { sender: 'Robin', text: 'Atlas is free on Thursday.' } }),
+        expect.objectContaining({ text: 'yes', replyTo: { sender: 'Noel', text: 'Atlas is free on Thursday.' } }),
       ]);
     } finally {
       await desk.bridge.teardown();
