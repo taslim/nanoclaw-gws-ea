@@ -30,6 +30,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { approveRejectRequest, normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import { createAnswers, indexPostedRequest, POSTED_REQUEST_KEPT_MS, type Answers } from './answers.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
 
@@ -464,9 +465,11 @@ export interface ChatSdkBridgeConfig {
    * codes; a display card posts as text with its links. Every request is
    * left as posted until the handler that resolves an answer edits it to its
    * outcome: the bridge never edits one itself. Each request it posts is
-   * recorded by its message and by its question (readPostedRequest), so an
-   * answer quoting it and the handler's edit both find it. Unset, requests
-   * post as cards.
+   * recorded by its message, by its question (readPostedRequest), and in its
+   * conversation, so an answer and the handler's edit both find it. A reply
+   * or reaction that answers a request (src/channels/answers.ts) goes to its
+   * handler through onAction instead of to the agent. Unset, requests post
+   * as cards.
    */
   textRequests?: {
     /** When the platform recorded a message the adapter posted, read from postMessage's raw response. */
@@ -483,13 +486,6 @@ export interface PostedRequest {
   /** When the platform recorded it, as ISO-8601; absent when the platform reported no time. */
   readonly postedAt?: string;
 }
-
-/**
- * How long the bridge remembers a request it posted: whether one is still
- * open comes from its pending row, but an answer can find it only while it
- * is remembered.
- */
-const POSTED_REQUEST_KEPT_MS = 30 * 24 * 60 * 60 * 1000;
 
 function postedRequestKey(adapterName: string, messageId: string): string {
   return `text-request:${adapterName}:message:${messageId}`;
@@ -715,6 +711,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
+  /** Takes answers in words, when requests are text. */
+  let answers: Answers | undefined;
   let gatewayAbort: AbortController | null = null;
 
   /** Post a request; when requests are text, remember it, so an answer and its outcome find it. */
@@ -734,8 +732,29 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       };
       await state.set(postedRequestKey(adapter.name, result.id), request, POSTED_REQUEST_KEPT_MS);
       await state.set(requestMessageKey(adapter.name, questionId), result.id, POSTED_REQUEST_KEPT_MS);
+      await indexPostedRequest(state, adapter.name, platformId, result.id, request.postedAt);
     }
     return result?.id;
+  }
+
+  /**
+   * Whether a message answered a request, which then goes to the request's
+   * handler and is not routed. Only when requests are text; a handler that
+   * fails rejects, so the platform delivers the message again.
+   */
+  async function answeredBy(message: ChatMessage, threadId: string, isDM: boolean): Promise<boolean> {
+    if (!answers) return false;
+    const quote = config.extractReplyContext && message.raw ? config.extractReplyContext(message.raw) : null;
+    return answers.takeMessage({
+      id: message.id,
+      platformId: adapter.channelIdFromThreadId(threadId),
+      userId: message.author.userId,
+      isMe: message.author.isMe === true,
+      isDM,
+      at: message.metadata.dateSent,
+      text: message.text,
+      ...(quote === null ? {} : { quote: quote.id === undefined ? {} : { messageId: quote.id } }),
+    });
   }
 
   /**
@@ -910,6 +929,25 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // keyspace — prefixing the default would orphan every live install's
       // chat_sdk_subscriptions/kv/locks/lists rows.
       state = new SqliteStateAdapter(config.instance && config.instance !== adapter.name ? config.instance : undefined);
+      if (textRequests) {
+        answers = createAnswers({
+          state,
+          adapterName: adapter.name,
+          postedRequest: (messageId) => readPostedRequest(state, adapter.name, messageId),
+          render: resolveQuestionRender,
+          // The answering conversation and the request's message, so a durable gateway hold checks its own address.
+          dispatch: async (answer) => {
+            await setupConfig.onAction(
+              answer.questionId,
+              answer.value,
+              answer.userId,
+              { instance: instanceKey, messageId: answer.messageId, platformId: answer.platformId },
+              { deferResolution: true, ...(answer.reason === undefined ? {} : { reason: answer.reason }) },
+            );
+          },
+          ...(adapter.userName ? { selfMention: `@${adapter.userName}` } : {}),
+        });
+      }
 
       chat = new Chat({
         adapters: { [adapter.name]: adapter },
@@ -930,6 +968,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(
           channelId,
@@ -940,6 +979,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
       });
@@ -958,6 +998,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
+        if (await answeredBy(message, thread.id, true)) return;
         const inbound = await messageToInbound(message, true, false);
         // Agent-mode app context: DM-only by platform design.
         attachAppContext(
@@ -982,6 +1023,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+        if (await answeredBy(message, thread.id, false)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
       });
@@ -1070,13 +1112,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Reactions the adapter reads itself (ReactionSource), registered
       // before initialize starts its reading. Awaited: a reaction the router
-      // could not take rejects back to the adapter. In a DM, the thread is
-      // the reacted message's own, as a direct message's is.
+      // or an answer's handler could not take rejects back to the adapter.
+      // One that answers a request goes to its handler, not the router. In a
+      // DM, the thread is the reacted message's own, as a direct message's is.
       if (isReactionSource(adapter)) {
         adapter.setReactionHandler(async (reaction) => {
+          const platformId = adapter.channelIdFromThreadId(reaction.threadId);
+          const answered = await answers?.takeReaction({
+            id: reaction.reactionName,
+            platformId,
+            userId: reaction.user.userId,
+            isMe: reaction.user.isMe === true,
+            emoji: reaction.emoji.name,
+            messageId: reaction.message.id,
+          });
+          if (answered === true) return;
           const isDM = adapter.isDM?.(reaction.threadId);
           await setupConfig.onInbound(
-            adapter.channelIdFromThreadId(reaction.threadId),
+            platformId,
             isDM === true ? normalizeDmThreadId(reaction.threadId, reaction.message.id) : reaction.threadId,
             reactionToInbound(reaction, isDM === undefined ? undefined : !isDM),
           );

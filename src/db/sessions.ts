@@ -318,7 +318,8 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
  * include the original question body so the bridge can retain it when the
  * card resolves; generic pending_questions intentionally keep their existing
  * title + options shape, with the deadline past which they take no answer.
- * An approval whose status is no longer pending is resolved.
+ * An approval whose status is no longer pending is resolved. Each render says
+ * whether an agent asked it (a pending question) or it is an approval.
  */
 export async function getAskQuestionRender(id: string): Promise<
   | {
@@ -328,11 +329,13 @@ export async function getAskQuestionRender(id: string): Promise<
       deferResolution?: boolean;
       expiresAt?: string;
       resolved?: boolean;
+      kind: 'question' | 'approval';
     }
   | undefined
 > {
   const q = await getPendingQuestion(id);
-  if (q) return { title: q.title, options: q.options, ...(q.deadline ? { expiresAt: q.deadline } : {}) };
+  if (q)
+    return { title: q.title, kind: 'question', options: q.options, ...(q.deadline ? { expiresAt: q.deadline } : {}) };
   const a = await getDb().get<{
     title: string;
     question: string;
@@ -347,6 +350,7 @@ export async function getAskQuestionRender(id: string): Promise<
   if (a?.title)
     return {
       title: a.title,
+      kind: 'approval',
       question: a.question,
       options: JSON.parse(a.options_json),
       ...(a.action === 'gateway_request' ? { deferResolution: true } : {}),
@@ -361,7 +365,8 @@ export async function getAskQuestionRender(id: string): Promise<
       'SELECT title, question, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?',
       id,
     );
-    if (c?.title) return { title: c.title, question: c.question, options: JSON.parse(c.options_json) };
+    if (c?.title)
+      return { title: c.title, kind: 'approval', question: c.question, options: JSON.parse(c.options_json) };
   }
 
   if (await hasTable(getDb(), 'pending_sender_approvals')) {
@@ -369,7 +374,8 @@ export async function getAskQuestionRender(id: string): Promise<
       'SELECT title, question, options_json FROM pending_sender_approvals WHERE id = ?',
       id,
     );
-    if (s?.title) return { title: s.title, question: s.question, options: JSON.parse(s.options_json) };
+    if (s?.title)
+      return { title: s.title, kind: 'approval', question: s.question, options: JSON.parse(s.options_json) };
   }
 
   return undefined;

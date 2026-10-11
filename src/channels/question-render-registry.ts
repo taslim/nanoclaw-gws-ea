@@ -27,6 +27,13 @@ export interface QuestionRender {
   expiresAt?: string;
   /** Its status is no longer pending: an answer to it resolves nothing. */
   resolved?: boolean;
+  /**
+   * Who asks: an agent's own question (ask_user_question), which in a DM may
+   * take a plain answer, or an approval, which takes only a quote or a
+   * reaction (src/channels/answers.ts). A render without one is taken as an
+   * approval.
+   */
+  kind?: 'question' | 'approval';
 }
 
 export type QuestionRenderResolver = (
