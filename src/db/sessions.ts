@@ -178,7 +178,9 @@ export async function deleteSession(id: string): Promise<void> {
  * Insert a pending question row. Idempotent: when delivery fails and retries,
  * the second attempt calls this with the same question_id — without `OR
  * IGNORE` that would throw UNIQUE and prevent the retry from reaching the
- * actual send step. Returns true if a new row was inserted.
+ * actual send step. Delivery refuses a question whose id anything else
+ * already holds before it gets here, so the only conflict left is that same
+ * row's earlier attempt. Returns true if a new row was inserted.
  */
 export async function createPendingQuestion(pq: PendingQuestion): Promise<boolean> {
   const result = await getDb().run(

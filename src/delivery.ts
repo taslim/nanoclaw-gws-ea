@@ -15,6 +15,8 @@ import {
   getActiveSessions,
   getSession,
   createPendingQuestion,
+  getAskQuestionRender,
+  getPendingQuestion,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
@@ -706,6 +708,23 @@ async function deliverMessage(
       }
     }
     deliverInstance = mg.instance;
+  }
+
+  // The agent names its own question, and an answer resolves by that id
+  // alone: getAskQuestionRender reads a pending question before any approval,
+  // so a question carrying an open request's id (an approval, a channel or
+  // sender approval, another question) would let a plain "yes" to it decide
+  // that request. Refused before anything is stored or posted. The one taken
+  // id it may carry is its own — the pending question this same row stored
+  // on an earlier attempt whose send then failed.
+  if (content.type === 'ask_question' && content.questionId) {
+    const questionId = content.questionId as string;
+    if (await getAskQuestionRender(questionId)) {
+      const stored = await getPendingQuestion(questionId);
+      if (stored?.session_id !== session.id || stored.message_out_id !== msg.id) {
+        throw new Error(`question id ${questionId} already names an open request (message ${msg.id})`);
+      }
+    }
   }
 
   // Track pending questions for ask_user_question flow.

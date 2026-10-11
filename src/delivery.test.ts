@@ -57,9 +57,9 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
-import { getPendingQuestion } from './db/sessions.js';
+import { createPendingApproval, createPendingQuestion, createSession, getPendingQuestion } from './db/sessions.js';
 import { resolveQuestionRender } from './channels/question-render-registry.js';
-import type { PendingQuestion } from './types.js';
+import type { PendingQuestion, Session } from './types.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { log } from './log.js';
 
@@ -473,6 +473,123 @@ describe("deliverSessionMessages — an agent's question", () => {
     await deliverSessionMessages(session);
 
     expect(await getPendingQuestion('q-time')).toBeUndefined();
+  });
+
+  function recordSent(): string[] {
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        return 'plat-question';
+      },
+    });
+    return sent;
+  }
+
+  /** Every attempt the row gets: a refused question never goes out, however often it is tried. */
+  async function exhaustAttempts(session: Session): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) await deliverSessionMessages(session);
+  }
+
+  it("refuses a question carrying an approval's id: nothing is posted or stored, and the id still names the approval", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await createPendingApproval({
+      approval_id: 'appr-install',
+      session_id: session.id,
+      request_id: 'appr-install',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now(),
+      title: 'Install packages',
+      question: 'Install ripgrep for Morgan Ellery?',
+      options_json: JSON.stringify([
+        { label: 'Approve', selectedLabel: 'Approved', value: 'approve' },
+        { label: 'Reject', selectedLabel: 'Rejected', value: 'reject' },
+      ]),
+    });
+    insertQuestion(session.id, {
+      ...QUESTION,
+      questionId: 'appr-install',
+      options: ['approve', 'reject'],
+      timeoutSeconds: 120,
+    });
+    const sent = recordSent();
+
+    await exhaustAttempts(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('failed');
+    expect(await getPendingQuestion('appr-install')).toBeUndefined();
+    expect(await resolveQuestionRender('appr-install')).toEqual(
+      expect.objectContaining({ kind: 'approval', title: 'Install packages' }),
+    );
+  });
+
+  it.each([
+    { held: "another session's question", sessionId: 'sess-other', messageOutId: 'out-question' },
+    { held: 'an earlier message of its own session', sessionId: null, messageOutId: 'out-earlier' },
+  ])('refuses a question carrying the id of $held, which keeps its answers', async ({ sessionId, messageOutId }) => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    if (sessionId) {
+      await createSession({
+        id: sessionId,
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: 'thread-juno',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at: now(),
+      });
+    }
+    const held: PendingQuestion = {
+      question_id: 'q-time',
+      session_id: sessionId ?? session.id,
+      message_out_id: messageOutId,
+      platform_id: 'telegram:123',
+      channel_type: 'telegram',
+      thread_id: null,
+      title: 'Hold the Atlas room?',
+      question: 'Shall I hold Atlas for the review with Juno Hale?',
+      options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+      deadline: '2026-10-11T17:05:00.000Z',
+      created_at: now(),
+    };
+    await createPendingQuestion(held);
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    const sent = recordSent();
+
+    await exhaustAttempts(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('failed');
+    expect(await getPendingQuestion('q-time')).toEqual(held);
+  });
+
+  it('still posts a question whose earlier attempt stored it before the send failed', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertQuestion(session.id, { ...QUESTION, timeoutSeconds: 120 });
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        if (sent.length === 1) throw new Error('network timeout');
+        return 'plat-question';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(await getPendingQuestion('q-time')).toEqual(
+      expect.objectContaining({ session_id: session.id, message_out_id: 'out-question' }),
+    );
+    await deliverSessionMessages(session);
+
+    expect(sent).toHaveLength(2);
+    expect(deliveryStatus('ag-1', session.id, 'out-question')).toBe('delivered');
   });
 });
 
