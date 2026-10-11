@@ -663,6 +663,32 @@ async function readMemberDomainOverrides(
   return { value: overridden };
 }
 
+/** A member-domain restore Google refused: the failed read, or the override it would not delete. */
+type MemberDomainRestoreRefusal =
+  | { readonly failed: Ran }
+  | { readonly constraint: MemberDomainConstraint; readonly refused: Ran };
+
+/**
+ * Delete each member-domain policy of the dedicated project's own, so the
+ * project inherits its organization's again. Returns what Google refused, or
+ * undefined once the project has none.
+ */
+async function restoreMemberDomainPolicy(
+  coordinates: GcpProjectCoordinates,
+  dependencies: GcloudDependencies,
+): Promise<MemberDomainRestoreRefusal | undefined> {
+  const gcloud = gcloudFor(coordinates, dependencies);
+  const { projectId } = coordinates;
+  const read = await readMemberDomainOverrides(gcloud, projectId);
+  if ('failed' in read) return read;
+  for (const constraint of read.value) {
+    const deleted = await gcloud(['org-policies', 'delete', constraint, `--project=${projectId}`]);
+    // Gone since it was read: the project already inherits the organization's policy.
+    if (!succeeded(deleted) && !NO_PROJECT_POLICY.test(deleted.outcome.stderr)) return { constraint, refused: deleted };
+  }
+  return undefined;
+}
+
 /** Restore the dedicated project's key-creation policy, then clear the journal's lift. */
 async function restoreKeyCreationPolicy(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
   const pause = await changeKeyCreationPolicy(context.input.gcp, true, dependencies);
@@ -1152,7 +1178,7 @@ function publisherResource(dependencies: GcloudDependencies): StepResource<GcpSt
  * Chat may publish: each policy of the project's own on those constraints is
  * the publisher grant's override, and is deleted. Domain restricted sharing
  * is not retroactive, so the grant stays. Google holds the override, so a run
- * interrupted before deleting it finds it here.
+ * interrupted before deleting it finds it here, and so does removal.
  */
 function memberDomainPolicyResource(dependencies: GcloudDependencies): StepResource<GcpStepContext> {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
@@ -1166,21 +1192,15 @@ function memberDomainPolicyResource(dependencies: GcloudDependencies): StepResou
     },
     apply: async (context) => {
       const gcp = context.input.gcp;
-      const read = await readMemberDomainOverrides(gcloud(context), gcp.projectId);
-      if ('failed' in read) {
+      const refusal = await restoreMemberDomainPolicy(gcp, dependencies);
+      if (!refusal) return undefined;
+      if ('failed' in refusal) {
         throw gcloudFailed(
           `Google Cloud could not read the member-domain policy of project ${gcp.projectId}`,
-          read.failed,
+          refusal.failed,
         );
       }
-      for (const constraint of read.value) {
-        const deleted = await gcloud(context)(['org-policies', 'delete', constraint, `--project=${gcp.projectId}`]);
-        // Gone since it was read: the project already inherits the organization's policy.
-        if (!succeeded(deleted) && !NO_PROJECT_POLICY.test(deleted.outcome.stderr)) {
-          return refusedPolicyChange(gcp, memberDomainPolicy(constraint), 'restore', { constraint, refused: deleted });
-        }
-      }
-      return undefined;
+      return refusedPolicyChange(gcp, memberDomainPolicy(refusal.constraint), 'restore', refusal);
     },
   };
 }
@@ -1357,6 +1377,30 @@ export async function restoreKeyCreationPolicyForRemoval(
   return refusal && `${refusal.constraint}: ${evidence(refusal.refused)}`;
 }
 
+/** A member-domain restore Google refused during removal, with its answer as evidence. */
+export interface MemberDomainRemovalRefusal {
+  /** Google would not show the project's policies, or would not delete an override it showed. */
+  readonly refused: 'read' | 'delete';
+  readonly evidence: string;
+}
+
+/**
+ * Removal's restore of a member-domain policy the publisher grant relaxed,
+ * which Google holds and no journal records. Returns what Google refused as
+ * evidence, for removal to record as an unrestored relax, rather than
+ * pausing or stopping the way `provision_gcp` does.
+ */
+export async function restoreMemberDomainPolicyForRemoval(
+  coordinates: GcpProjectCoordinates,
+  dependencies: GcloudDependencies = {},
+): Promise<MemberDomainRemovalRefusal | undefined> {
+  const refusal = await restoreMemberDomainPolicy(coordinates, dependencies);
+  if (!refusal) return undefined;
+  return 'failed' in refusal
+    ? { refused: 'read', evidence: evidence(refusal.failed) }
+    : { refused: 'delete', evidence: `${refusal.constraint}: ${evidence(refusal.refused)}` };
+}
+
 export interface GcpProjectRemovalOptions {
   /** `provision_gcp` lifted the key-creation policy: restore it before deleting the project. */
   readonly restoreKeyPolicy: boolean;
@@ -1364,15 +1408,16 @@ export interface GcpProjectRemovalOptions {
 
 /** Removal's side of the reserved project: deleted (now or earlier), or unknown with evidence. */
 export type GcpProjectRemoval =
-  | { readonly status: 'deleted'; readonly keyPolicyUnrestored?: string }
+  | { readonly status: 'deleted'; readonly keyPolicyUnrestored?: string; readonly memberPolicyUnrestored?: string }
   | { readonly status: 'unknown'; readonly reason: string; readonly evidence: string };
 
 /**
  * Delete the owned project. It is deleted only once it is described
- * with this assistant's labels, after any lifted key-creation policy is
- * restored; a restore Google refuses is reported, not a reason to keep the
- * project. A project Google will not describe is unknown, with evidence:
- * whether that may be skipped or abandoned is removal's decision.
+ * with this assistant's labels, after any lifted key-creation policy and
+ * any relaxed member-domain policy are restored; a restore Google refuses is
+ * reported, not a reason to keep the project. A project Google will not
+ * describe is unknown, with evidence: whether that may be skipped or
+ * abandoned is removal's decision.
  */
 export async function deleteOwnedGcpProject(
   coordinates: GcpProjectCoordinates,
@@ -1394,6 +1439,7 @@ export async function deleteOwnedGcpProject(
   const keyPolicyUnrestored = options.restoreKeyPolicy
     ? await restoreKeyCreationPolicyForRemoval(coordinates, dependencies)
     : undefined;
+  const memberPolicyUnrestored = (await restoreMemberDomainPolicyForRemoval(coordinates, dependencies))?.evidence;
   const deleted = await gcloud(['projects', 'delete', coordinates.projectId]);
   if (!succeeded(deleted)) {
     throw gcloudFailed(`Google Cloud could not delete project ${coordinates.projectId}`, deleted);
@@ -1405,5 +1451,9 @@ export async function deleteOwnedGcpProject(
       `Google Cloud did not confirm deletion of project ${coordinates.projectId}`,
     );
   }
-  return keyPolicyUnrestored ? { status: 'deleted', keyPolicyUnrestored } : { status: 'deleted' };
+  return {
+    status: 'deleted',
+    ...(keyPolicyUnrestored ? { keyPolicyUnrestored } : {}),
+    ...(memberPolicyUnrestored ? { memberPolicyUnrestored } : {}),
+  };
 }

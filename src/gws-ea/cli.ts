@@ -1689,6 +1689,11 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
           `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
         ]
       : []),
+    ...(outcome?.memberPolicyUnrestored
+      ? [
+          `The member-domain policy relaxed on ${project} was not restored: ${outcome.memberPolicyUnrestored.split('\n')[0]}`,
+        ]
+      : []),
   ];
 }
 

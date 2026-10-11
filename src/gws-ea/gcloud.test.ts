@@ -1208,6 +1208,56 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.cloud.projectPolicies).toEqual(new Map());
   });
 
+  it('stops with evidence, deleting nothing, when the member-domain policy cannot be read in an unrecognized way', async () => {
+    const setup = await harness();
+    // The legacy constraint answers that the project has no policy of its own; the managed one cannot be read.
+    setup.cloud.ready().projectPolicies.set('iam.managed.allowedPolicyMembers', false);
+    const runCommand: GcloudCommandRunner = async (command) =>
+      command.args.slice(0, 3).join(' ') === 'org-policies describe iam.managed.allowedPolicyMembers'
+        ? failed(GCLOUD_CRASHED)
+        : setup.cloud.run(command);
+
+    const failure = await setup.run(runCommand).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: 'observation_unknown',
+      message: expect.stringContaining('the member-domain policy'),
+      details: { evidence: expect.stringContaining('gcloud crashed (TypeError)') },
+    });
+    expect(setup.sleeps).toEqual(FULL_WAIT);
+    expect(setup.cloud.mutations).toEqual([]);
+    expect(setup.cloud.projectPolicies).toEqual(new Map([['iam.managed.allowedPolicyMembers', false]]));
+  });
+
+  it('pauses, keeping the override, when Google refuses to delete it for want of permission, and stops on any other refusal', async () => {
+    const setup = await awaitingPublisher();
+    const constraint = 'iam.allowedPolicyMemberDomains';
+    setup.cloud.orgEnforced.add(constraint);
+    const { projectId } = setup.gcp;
+    let refusal = policyChangeDenied('delete', 'orgpolicy.policies.delete', projectId);
+    const runCommand: GcloudCommandRunner = async (command) =>
+      command.args.slice(0, 2).join(' ') === 'org-policies delete' ? failed(refusal) : setup.cloud.run(command);
+
+    await expect(setup.run(runCommand)).resolves.toMatchObject({
+      status: 'paused',
+      pause: {
+        code: 'gcp_policy_permission_required',
+        message: `Google Cloud refused to change the member-domain policy (constraints/${constraint}) on project ${projectId}.`,
+      },
+    });
+    const override = new Map([[constraint, false]]);
+    expect(setup.cloud.mutations).toEqual([`set-policy ${constraint} allowAll=true`, publisherGrant(projectId)]);
+    expect(setup.cloud.projectPolicies).toEqual(override);
+
+    refusal = GCLOUD_CRASHED;
+    await expect(setup.run(runCommand)).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: `Google Cloud could not restore ${constraint} on project ${projectId}`,
+      details: { stderrTail: expect.stringContaining('gcloud crashed (TypeError)') },
+    });
+    expect(setup.cloud.projectPolicies).toEqual(override);
+  });
+
   it('stops, naming the constraint and relaxing nothing, when another organization policy refuses Google Chat as the topic publisher', async () => {
     const setup = await harness();
     setup.cloud.ready().topicPolicy.clear();
@@ -1729,10 +1779,11 @@ describe('Google Cloud project removal', () => {
     expect(cloud.mutations).toEqual([]);
   });
 
-  it('restores a lifted key-creation policy before it requests deletion', async () => {
+  it('restores a lifted key-creation policy and a relaxed member-domain policy before it requests deletion', async () => {
     const { cloud, coordinates } = await removal();
     cloud.ready();
     for (const constraint of KEY_CONSTRAINTS) cloud.projectPolicies.set(constraint, false);
+    cloud.projectPolicies.set('iam.managed.allowedPolicyMembers', false);
 
     await expect(
       deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
@@ -1740,18 +1791,25 @@ describe('Google Cloud project removal', () => {
 
     expect(cloud.mutations).toEqual([
       ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
+      'delete-policy iam.managed.allowedPolicyMembers',
       `projects delete ${coordinates.projectId}`,
     ]);
   });
 
-  it('still deletes the project, reporting the lift unrestored, when Google refuses the restore', async () => {
+  it('still deletes the project, reporting each policy unrestored, when Google refuses its restore', async () => {
     const { cloud, coordinates } = await removal();
     cloud.ready().canSetPolicy = false;
+    cloud.projectPolicies.set('iam.allowedPolicyMemberDomains', false);
 
     await expect(
       deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
-    ).resolves.toEqual({ status: 'deleted', keyPolicyUnrestored: expect.stringContaining('PERMISSION_DENIED') });
+    ).resolves.toEqual({
+      status: 'deleted',
+      keyPolicyUnrestored: expect.stringContaining('PERMISSION_DENIED'),
+      memberPolicyUnrestored: expect.stringMatching(/^iam\.allowedPolicyMemberDomains: .*PERMISSION_DENIED/su),
+    });
     expect(cloud.mutations).toEqual([`projects delete ${coordinates.projectId}`]);
+    expect(cloud.projectPolicies).toEqual(new Map([['iam.allowedPolicyMemberDomains', false]]));
   });
 
   it('reports a restore Google refuses as evidence rather than a pause', async () => {
