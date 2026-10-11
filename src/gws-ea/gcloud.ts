@@ -1011,7 +1011,19 @@ function billingResource(dependencies: GcloudDependencies): StepResource<GcpStep
 
 type PubsubKind = 'topics' | 'subscriptions';
 
-/** The topic or the subscription, found by its full name in the project's conclusive list. */
+/**
+ * Google's refusal of Pub/Sub storage in a project whose organization policy
+ * it has not finished setting up, as recorded live; it asks for a retry once
+ * the policy is initialized.
+ */
+const PROJECT_POLICY_INITIALIZING = /organization policy to be properly initialized/u;
+
+/**
+ * The topic or the subscription, found by its full name in the project's
+ * conclusive list. A project created moments earlier may refuse it until
+ * Google has set up the project's organization policy, so creation is
+ * retried while Google says so.
+ */
 function pubsubResource(
   name: string,
   kind: PubsubKind,
@@ -1034,17 +1046,23 @@ function pubsubResource(
     },
     apply: async (context) => {
       const gcp = context.input.gcp;
-      const created = await gcloud(context)([
-        'pubsub',
-        kind,
-        'create',
-        id,
-        ...createFlags,
-        `--project=${gcp.projectId}`,
-      ]);
+      const create = (): Promise<Ran> =>
+        gcloud(context)(['pubsub', kind, 'create', id, ...createFlags, `--project=${gcp.projectId}`]);
+      const initializing = (attempt: Ran): boolean =>
+        !succeeded(attempt) && PROJECT_POLICY_INITIALIZING.test(attempt.outcome.stderr);
+      const created = await retryWhile(
+        create,
+        initializing,
+        ORG_POLICY_SETTLES_MS,
+        "Waiting for Google Cloud to set up the new project's organization policy; it can take up to 15 minutes…",
+        dependencies,
+      );
       // Created by an interrupted run but not yet listed: the next observation waits for it.
       if (!succeeded(created) && !alreadyExists(created)) {
-        throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}`, created);
+        const within = initializing(created)
+          ? `: ${minutes(ORG_POLICY_SETTLES_MS)} on, its organization policy still allows Pub/Sub no region to store messages in (constraints/gcp.resourceLocations)`
+          : '';
+        throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}${within}`, created);
       }
       return undefined;
     },
