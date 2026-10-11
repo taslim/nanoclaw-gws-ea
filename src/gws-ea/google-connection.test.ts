@@ -99,7 +99,7 @@ const BEFORE_WORKSPACE = [
 
 function runtime(): InstanceRuntimeConfig {
   return {
-    schema_version: 2,
+    schema_version: 3,
     instance_id: '11111111-1111-4111-8111-111111111111',
     install_id: '11111111111141118111111111111111',
     instance_root: ROOT,
@@ -107,17 +107,16 @@ function runtime(): InstanceRuntimeConfig {
     state_root: path.join(ROOT, 'state'),
     node_path: '/usr/bin/node',
     home_directory: ROOT,
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     agent_egress_network: 'gws-ea-x-agent-egress',
     onecli_project: 'gws-ea-x',
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: 'gws-ea-x-gateway-1',
     selected_provider: 'claude',
-    endpoint_url: 'https://juno.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
-      gchat_credentials: path.join(SECRETS, 'gchat-service-account.json'),
+      gchat_subscriber_key: path.join(SECRETS, 'gchat-subscriber-key.json'),
       onecli_runtime_api_key: path.join(SECRETS, 'onecli-runtime-api-key'),
       onecli_admin_api_key: path.join(SECRETS, 'onecli-admin-api-key'),
     },
@@ -129,7 +128,7 @@ const GCP: GcpProjectInput = {
   projectId: 'gws-ea-juno-test',
   account: 'operator@example.test',
   serviceAccountEmail: deriveGchatServiceAccountEmail('gws-ea-juno-test'),
-  credentialFile: path.join(SECRETS, 'gchat-service-account.json'),
+  credentialFile: path.join(SECRETS, 'gchat-subscriber-key.json'),
   cwd: ROOT,
 };
 

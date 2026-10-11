@@ -1,7 +1,7 @@
 /**
  * The assistant's Google Chat channel (KTD1, KTD4): upstream's Chat SDK
- * adapter, signed in as the assistant's own Workspace account, with ingress
- * replaced. Everything the assistant sends, edits, or reacts with still goes
+ * adapter, signed in as the assistant's own Workspace account, with only how
+ * its events arrive replaced. Everything the assistant sends, edits, or reacts with still goes
  * through upstream's adapter and its message model.
  *
  * Chat's events are pulled from Pub/Sub (delivery.ts), never pushed, so the

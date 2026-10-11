@@ -19,7 +19,6 @@ import {
   type ProvisionResult,
   type ProvisionRuntime,
   type ProvisionSteps,
-  type StepResource,
 } from './phases.js';
 import { assertReleaseCheckoutAgreement, type ResolvedRelease } from './checkout.js';
 import { loadReleasePreflightReceipt, type ReleasePreflightReceipt } from './kept-release.js';
@@ -65,7 +64,6 @@ import {
   type PrincipalBindingDependencies,
   type PrincipalBindingResult,
 } from './principal.js';
-import { verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
   centralDatabaseFile,
   instanceErrorsSince,
@@ -81,17 +79,10 @@ import {
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation, writeInstanceMarker } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
-import { findPortHolder, portInUseError } from './ports.js';
-import {
-  GwsEaError,
-  ingressEndpointUrl,
-  type IngressClaim,
-  type InstanceReservation,
-  type ProvisionStepId,
-} from './types.js';
+import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import {
   isRecord,
   normalizePrincipalEmail,
@@ -111,14 +102,6 @@ import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
 import { googleAccessResources, googleSignInResources, type GoogleConnectionInput } from './google-connection.js';
 import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
-import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
-import {
-  forgetAccountToken,
-  forgettingRefusedToken,
-  keepAccountToken,
-  usableKeptAccountToken,
-} from './cloudflare-token.js';
-import { managedTransportResources } from './cloudflare-ingress.js';
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -129,9 +112,6 @@ export interface ProductionProvisionOptions {
   readonly serviceHelpers: NanoclawServiceHelpers;
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
-  readonly managedIngress?: {
-    readonly setupSession?: ManagedAccountTokenSession;
-  };
   readonly runtime?: ProvisionRuntime;
 }
 
@@ -160,9 +140,6 @@ export interface ProductionProvisionInput {
   readonly identityDependencies?: MainIdentityDependencies;
   readonly principalDependencies?: PrincipalBindingDependencies;
   readonly hostStatus: HostStatusHelpers;
-  readonly ingress: IngressClaim;
-  readonly managedIngressSetup?: ManagedAccountTokenSession;
-  readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
   /** The assistant's Google sign-in (`sign_in_google`), and agents' access to it (`connect_google`; KTD2, KTD5). */
   readonly google: GoogleConnectionInput;
 }
@@ -199,15 +176,10 @@ export interface ProductionProvisionDependencies {
   readonly reconcileInstanceRuntime: typeof reconcileInstanceRuntime;
   /** Tells a host that is starting (its service runs a process) from one that is stopped. */
   readonly instanceServicePid: typeof instanceServicePid;
-  /** Names the process on a port when the host does not come up. */
-  readonly findPortHolder: typeof findPortHolder;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
-  readonly verifyRoute: typeof verifyExistingGchatRoute;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly bindPrincipal: typeof bindPrincipal;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
-  /** `establish_transport`'s resources in managed mode. */
-  readonly managedTransportResources: typeof managedTransportResources;
   /** `sign_in_google`'s resources. */
   readonly googleSignInResources: typeof googleSignInResources;
   /** `connect_google`'s resources. */
@@ -377,12 +349,8 @@ async function observeInstanceHost(
       evidence: `${hostReason(error, runtime)}; see ${errorLog}`,
     };
   }
-  const webhook = isRecord(status) ? status.webhook : undefined;
   const channels = isRecord(status) && Array.isArray(status.channels) ? status.channels : [];
   const pid = isRecord(status) ? status.pid : undefined;
-  if (isRecord(webhook) && webhook.port !== runtime.allocated_ports.nanoclaw_webhook) {
-    throw new GwsEaError('unsafe_runtime', 'NanoClaw is listening on an unexpected webhook port');
-  }
   const starting = (reason: string): Observation => ({
     status: 'unknown',
     reason,
@@ -397,9 +365,7 @@ async function observeInstanceHost(
 /**
  * Start the host and wait, with upstream `waitForHost`, until it answers and
  * connects Google Chat. A host that does not become ready stops the run with
- * its reason; when a process other than the host holds the webhook port, that
- * process is named instead. The port is never bound here to test it: the
- * host's own status says whose it is.
+ * its reason.
  */
 async function startInstanceHost(
   context: ProductionProvisionContext,
@@ -416,9 +382,6 @@ async function startInstanceHost(
       timeoutMs: HOST_READY_TIMEOUT_MS,
     });
   } catch (error) {
-    const port = runtime.allocated_ports.nanoclaw_webhook;
-    const holder = await dependencies.findPortHolder(port);
-    if (holder && holder.pid !== pid) throw portInUseError('webhook', port, holder, error);
     throw new GwsEaError('nanoclaw_not_ready', hostReason(error, runtime), { cause: error });
   }
 }
@@ -500,12 +463,12 @@ async function bootstrapManifestRemoved(file: string | undefined): Promise<boole
 
 /** The subscriber key the host pulls Chat's events with is this assistant's own, before the host starts. */
 async function ensureGchatCredential(context: ProductionProvisionContext): Promise<void> {
-  const target = context.input.runtime.secret_files.gchat_credentials;
+  const target = context.input.runtime.secret_files.gchat_subscriber_key;
   const contents = await readOwnerOnlyFile(target);
   const reservation = await getInstanceReservation(context.operation.paths, context.operation.instanceId);
   parseGchatServiceAccountCredential(contents, {
     projectId: reservation.exclusive_resource_claims.gcp_project_id,
-    serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
+    serviceAccountEmail: reservation.exclusive_resource_claims.gchat_subscriber_account,
   });
 }
 
@@ -522,13 +485,10 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   observeMainIdentity: defaultObserveMainIdentity,
   reconcileInstanceRuntime,
   instanceServicePid,
-  findPortHolder,
   reconcileMainIdentity,
-  verifyRoute: verifyExistingGchatRoute,
   verifyPrincipalBinding,
   bindPrincipal,
   verifyConversation: verifyTalkableConversation,
-  managedTransportResources,
   googleSignInResources,
   googleAccessResources,
   sleep: delay,
@@ -536,92 +496,6 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
 
 function humanPause(phase: ProvisionStepId, code: string, message: string): ProvisionHumanPause {
   return { kind: 'human-action', phase, code, message };
-}
-
-/** The run's Cloudflare token session: it checks a token against the account before holding it. */
-type ManagedAccountTokenSession = Pick<
-  RetainedManagedIngressSetupSession,
-  'discoverZones' | 'retainAccountToken' | 'requireAccountToken' | 'clearAccountToken'
->;
-
-function retainedAccountToken(session: ManagedAccountTokenSession | undefined, accountId: string): string | undefined {
-  try {
-    return session?.requireAccountToken(accountId);
-  } catch (error) {
-    if (!(error instanceof GwsEaError) || error.code !== 'cloudflare_token_required') throw error;
-    return undefined;
-  }
-}
-
-/** The kept token when it still reaches the account; one Cloudflare refuses is forgotten, so the operator is asked. */
-async function restoreKeptAccountToken(
-  file: string,
-  session: ManagedAccountTokenSession,
-  accountId: string,
-): Promise<string | undefined> {
-  const kept = await usableKeptAccountToken(file, accountId, (token) => session.discoverZones(token));
-  if (!kept) return undefined;
-  session.retainAccountToken(kept.token);
-  return session.requireAccountToken(accountId);
-}
-
-/**
- * The Cloudflare account token for one managed-ingress change: the one this
- * run already holds for the account, else the one this create kept, else one
- * asked for with `reason`. Whichever is used is kept until the route is set up.
- */
-async function requireManagedAccountToken(
-  context: ProductionProvisionContext,
-  accountId: string,
-  reason: string,
-): Promise<string> {
-  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
-  const session = context.input.managedIngressSetup;
-  const held =
-    retainedAccountToken(session, accountId) ??
-    (session ? await restoreKeptAccountToken(file, session, accountId) : undefined);
-  if (held !== undefined) {
-    await keepAccountToken(file, held);
-    return held;
-  }
-  if (!context.input.requestCloudflareAccountToken) {
-    throw new GwsEaError('cloudflare_token_required', `${reason}. A fresh Cloudflare API token is required.`);
-  }
-  const asked = await context.input.requestCloudflareAccountToken(accountId, reason);
-  await keepAccountToken(file, asked);
-  return asked;
-}
-
-/** A managed-ingress change Cloudflare refuses forgets the token, held and kept, so the next attempt asks again. */
-function forgettingRefusedTokenOn(
-  context: ProductionProvisionContext,
-  resource: StepResource<ProductionProvisionContext>,
-): StepResource<ProductionProvisionContext> {
-  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
-  return {
-    ...resource,
-    apply: (value) =>
-      forgettingRefusedToken(
-        file,
-        () => resource.apply(value),
-        () => context.input.managedIngressSetup?.clearAccountToken(),
-      ),
-  };
-}
-
-/** Once the route is set up, no Cloudflare account token stays on disk. */
-function keptAccountTokenForgotten(context: ProductionProvisionContext): StepResource<ProductionProvisionContext> {
-  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
-  return {
-    name: 'the Cloudflare token kept for setup',
-    absentMeansStopped: true,
-    observe: async () =>
-      (await isRegularFile(file)) ? { status: 'absent', reason: 'setup no longer needs it' } : PRESENT,
-    apply: async () => {
-      await forgetAccountToken(file);
-      return undefined;
-    },
-  };
 }
 
 /** Conversation states the assistant resolves by itself, waited on rather than handed to a person. */
@@ -774,7 +648,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
  * Production step composition over the validated provisioning primitives.
  * Each existing probe is one resource's observation. Dependencies are
  * injectable for boundary tests; omitted functions are the real checkout,
- * OneCLI, runtime, identity, principal, endpoint, and mailbox implementations.
+ * OneCLI, runtime, identity, principal, and mailbox implementations.
  */
 export function createProductionProvisionSteps(
   context: ProductionProvisionContext,
@@ -783,15 +657,8 @@ export function createProductionProvisionSteps(
 ): ProvisionSteps<ProductionProvisionContext> {
   const dependencies: ProductionProvisionDependencies = { ...defaultProductionDependencies, ...overrides };
   const { input } = context;
-  const { ingress } = input;
   if (input.runtime.instance_id !== context.operation.instanceId) {
     throw new GwsEaError('runtime_mismatch', 'Provision runtime targets a different instance');
-  }
-  if (input.runtime.endpoint_url !== validateExistingGchatEndpoint(input.runtime.endpoint_url)) {
-    throw new GwsEaError('endpoint_mismatch', 'Runtime endpoint is not canonical');
-  }
-  if (input.runtime.endpoint_url !== ingressEndpointUrl(input.ingress)) {
-    throw new GwsEaError('endpoint_mismatch', 'Runtime endpoint does not match the reserved ingress claim');
   }
   if (input.adapterInstance !== 'gchat') {
     throw new GwsEaError(
@@ -969,49 +836,6 @@ export function createProductionProvisionSteps(
         },
       ],
     },
-    establish_transport:
-      ingress.mode === 'existing'
-        ? {
-            label: 'Publishing the secure callback…',
-            resources: [
-              {
-                name: 'the published callback route',
-                observe: async () => {
-                  try {
-                    await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
-                    return PRESENT;
-                    /* eslint-disable-next-line no-catch-all/no-catch-all -- Any route-probe failure means the external postcondition is absent. */
-                  } catch {
-                    return ABSENT;
-                  }
-                },
-                apply: async () =>
-                  humanPause(
-                    'establish_transport',
-                    'existing_endpoint_required',
-                    'Publish the claimed HTTPS /webhook/gchat route without redirects, then resume.',
-                  ),
-              },
-            ],
-          }
-        : {
-            label: 'Publishing the secure callback…',
-            liveness: { label: 'Checking the secure callback…' },
-            resources: [
-              ...dependencies
-                .managedTransportResources({
-                  paths: context.operation.paths,
-                  instanceId: context.operation.instanceId,
-                  claim: ingress,
-                  platform: input.serviceDependencies.platform,
-                  webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
-                  dockerEndpoint: input.runtime.docker_endpoint,
-                  accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
-                })
-                .map((resource) => forgettingRefusedTokenOn(context, resource)),
-              keptAccountTokenForgotten(context),
-            ],
-          },
     connect_google: {
       label: "Connecting agents to the assistant's Google account…",
       resources: dependencies.googleAccessResources(),
@@ -1453,7 +1277,7 @@ export async function runProductionProvision(
   operation: InstanceOperation,
   options: ProductionProvisionOptions,
 ): Promise<ProvisionResult> {
-  const { interaction, managedIngress } = options;
+  const { interaction } = options;
   const provisionRuntime = options.runtime ?? {};
   const journal = interaction?.decisions.chatConfigured
     ? await recordChatConfigurationConfirmed(operation)
@@ -1500,8 +1324,8 @@ export async function runProductionProvision(
         instanceId: reservation.instance_id,
         projectId: reservation.exclusive_resource_claims.gcp_project_id,
         account: reservation.exclusive_resource_claims.gcp_account,
-        serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
-        credentialFile: runtime.secret_files.gchat_credentials,
+        serviceAccountEmail: reservation.exclusive_resource_claims.gchat_subscriber_account,
+        credentialFile: runtime.secret_files.gchat_subscriber_key,
         cwd: runtime.instance_root,
         ...(billingAccount ? { billingAccount } : {}),
       },
@@ -1531,14 +1355,6 @@ export async function runProductionProvision(
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,
       },
       hostStatus: options.hostStatus,
-      ingress: reservation.exclusive_resource_claims.ingress,
-      ...(managedIngress?.setupSession ? { managedIngressSetup: managedIngress.setupSession } : {}),
-      ...(interaction
-        ? {
-            requestCloudflareAccountToken: (accountId: string, reason: string) =>
-              interaction.requestCloudflareAccountToken({ accountId, reason }),
-          }
-        : {}),
       google: {
         runtime,
         assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,

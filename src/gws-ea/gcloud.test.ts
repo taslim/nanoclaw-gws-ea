@@ -11,8 +11,6 @@ import {
   assertGcloudSignedIn,
   classifyGcloudFailure,
   deleteOwnedGcpProject,
-  deriveGchatServiceAccountEmail,
-  deriveGcpProjectId,
   googleCloudResources,
   isConsumerGoogleAccount,
   parseGchatServiceAccountCredential,
@@ -26,6 +24,9 @@ import {
 import {
   deriveGchatEventsSubscription,
   deriveGchatEventsTopic,
+  deriveGchatServiceAccountEmail,
+  deriveGcpClaims,
+  deriveGcpProjectId,
   GCHAT_EVENTS_SUBSCRIPTION_ID,
   GCHAT_EVENTS_TOPIC_ID,
 } from './gcp-identity.js';
@@ -663,12 +664,10 @@ async function harness(): Promise<Harness> {
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
-    allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
+    allocated_ports: { onecli_app: 32_002, onecli_gateway: 32_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://gcloud.example.test/webhook/gchat' },
-      gcp_project_id: projectId,
+      ...deriveGcpClaims(instanceId),
       gcp_account: ACCOUNT,
-      gchat_service_account: serviceAccountEmail,
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

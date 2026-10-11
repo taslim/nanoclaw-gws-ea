@@ -66,14 +66,7 @@ import {
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
 } from './service-control.js';
-import {
-  GwsEaError,
-  ingressEndpointUrl,
-  shortCommit,
-  type IngressClaim,
-  type InstanceReservation,
-  type ReleaseCoordinates,
-} from './types.js';
+import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord, optionalString, unwrapData } from './validation.js';
 import {
   readLatestDelivery,
@@ -269,7 +262,8 @@ export type PhaseView =
 
 export interface ListedAssistant {
   readonly instance_id: string;
-  readonly hostname: string;
+  /** The assistant's own Google Workspace account. */
+  readonly account: string;
   readonly track: string;
   readonly deployed_commit: string;
   readonly phase: PhaseView;
@@ -286,9 +280,8 @@ export interface AssistantListing {
 
 /** What the registry records: the reservation, never presented as health. */
 export interface RegistryView {
-  readonly hostname: string;
-  readonly endpoint_url: string;
-  readonly ingress_mode: IngressClaim['mode'];
+  /** The assistant's own Google Workspace account. */
+  readonly account: string;
   readonly track: string;
   readonly source_remote: string;
   readonly deployed_commit: string;
@@ -507,10 +500,6 @@ function operationView(inspection: OperationInspection): OperationView {
     case 'unreadable':
       return { state: 'unreadable', code: inspection.code, message: redact(inspection.message) };
   }
-}
-
-function hostnameOf(ingress: IngressClaim): string {
-  return ingress.mode === 'managed-cloudflare' ? ingress.hostname : new URL(ingress.endpoint_url).hostname;
 }
 
 function unknownAssistant(instanceId: string): GwsEaError {
@@ -1090,15 +1079,12 @@ export async function observeAssistantStatus(
     removalInProgress(context.paths, instanceId),
     observeRelease({ context, reservation, observers }),
   ]);
-  const ingress = reservation.exclusive_resource_claims.ingress;
   const record = {
     instance_id: reservation.instance_id,
     observed_at: observedAt,
     phase,
     registry: {
-      hostname: hostnameOf(ingress),
-      endpoint_url: ingressEndpointUrl(ingress),
-      ingress_mode: ingress.mode,
+      account: reservation.exclusive_resource_claims.workspace_email,
       track: reservation.release_track,
       source_remote: reservation.source_remote,
       deployed_commit: reservation.deployed_commit,
@@ -1183,9 +1169,8 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
   const observers = resolveObservers(context.observers);
   const reservations = Object.values(registry.instances).sort(
     (left, right) =>
-      hostnameOf(left.exclusive_resource_claims.ingress).localeCompare(
-        hostnameOf(right.exclusive_resource_claims.ingress),
-      ) || left.instance_id.localeCompare(right.instance_id),
+      left.exclusive_resource_claims.workspace_email.localeCompare(right.exclusive_resource_claims.workspace_email) ||
+      left.instance_id.localeCompare(right.instance_id),
   );
   const assistants = await Promise.all(
     reservations.map(async (reservation): Promise<ListedAssistant> => {
@@ -1198,7 +1183,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
       ]);
       return {
         instance_id: reservation.instance_id,
-        hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
+        account: reservation.exclusive_resource_claims.workspace_email,
         track: reservation.release_track,
         deployed_commit: reservation.deployed_commit,
         phase,
@@ -1294,10 +1279,10 @@ function behindCell(release: ReleaseView): string {
 function renderList(listing: AssistantListing): string[] {
   if (listing.assistants.length === 0) return ['No assistants are registered on this machine.'];
   const rows = [
-    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'PHASE', 'OPERATION'],
+    ['INSTANCE ID', 'ACCOUNT', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'PHASE', 'OPERATION'],
     ...listing.assistants.map((assistant) => [
       assistant.instance_id,
-      assistant.hostname,
+      assistant.account,
       assistant.track,
       shortCommit(assistant.deployed_commit),
       behindCell(assistant.release),
@@ -1402,7 +1387,6 @@ function calendarAccessLines(views: readonly CalendarAccessView[] | null, timezo
 
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
-  const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
   const schemaLine =
     schema.central_fingerprint === null || schema.session_fingerprint === null
@@ -1410,8 +1394,7 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
       : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
   const lines = [
     `Assistant ${status.instance_id}`,
-    `  Hostname:  ${registry.hostname} (${ingress})`,
-    `  Endpoint:  ${registry.endpoint_url}`,
+    `  Account:   ${registry.account}`,
     `  Track:     ${registry.track} from ${registry.source_remote}`,
     `  Phase:     ${phaseDetail(status.phase)}`,
     `  Release:   ${releaseLine(status.instance_id, status.release)}`,
@@ -1437,7 +1420,7 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
 export const LIST_USAGE: readonly string[] = [
   'list [--json]',
   "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
-  '       release is newer. JSON: {"assistants": [...]}, each with instance_id, hostname, track,',
+  '       release is newer. JSON: {"assistants": [...]}, each with instance_id, account, track,',
   '       deployed_commit, phase (state: live with its release|fenced|unknown), release',
   '       (deployed_commit, tool_commit, behind_tool_release: true|false, or null with a reason when',
   '       unknown), service (state: running|stopped|not_installed|unmanaged|unknown, reason), operation',

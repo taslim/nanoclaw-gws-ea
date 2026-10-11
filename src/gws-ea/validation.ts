@@ -12,13 +12,8 @@ import { GwsEaError } from './types.js';
 /** An email address: a local part, `@`, and a dotted domain, with no whitespace. */
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
-/**
- * A Cloudflare tunnel ID, lowercase: an RFC 9562 UUID of any version from 1
- * to 8, so a time-ordered v7 ID passes as a v4 one does. It guards both the
- * request paths that carry the account token and the ID the registry records.
- */
-export const CLOUDFLARE_TUNNEL_ID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+/** An instance ID: a lowercase v4 UUID. */
+export const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

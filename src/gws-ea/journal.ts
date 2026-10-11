@@ -58,8 +58,9 @@ export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
  * the steps, their order, or what a completed step promises changed. Contract
  * 2 added the assistant's Google sign-in (`connect_google`) before the
  * welcome. Contract 3 signs the assistant in (`sign_in_google`) and confirms
- * the Chat configuration before the host starts, and binds the principal
- * through the DM the assistant opens with the address create named.
+ * the Chat configuration before the host starts, drops `establish_transport`
+ * because the host pulls Chat's events, and binds the principal through the
+ * DM the assistant opens with the address create named.
  */
 export const LAUNCHER_CONTRACT_VERSION = 3 as const;
 

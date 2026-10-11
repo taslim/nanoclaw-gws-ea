@@ -45,7 +45,6 @@ const fixture = vi.hoisted(() => {
     spinner,
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
-    password: vi.fn(async () => 'fresh-cloudflare-token'),
     confirm: vi.fn(async (): Promise<boolean | symbol> => true),
     /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
     cancel: Symbol('clack:cancel'),
@@ -60,7 +59,6 @@ const fixture = vi.hoisted(() => {
 vi.mock('@clack/prompts', () => ({
   log: fixture.log,
   note: fixture.note,
-  password: fixture.password,
   confirm: fixture.confirm,
   spinner: () => fixture.spinner,
   isCancel: (value: unknown) => value === fixture.cancel,
@@ -69,7 +67,6 @@ vi.mock('../src/gws-ea/cli.js', () => ({ runCli: fixture.runCli }));
 vi.mock('./gws-ea-input.js', () => ({
   collectGwsEaCreateInput: fixture.collect,
   authenticateGwsEaProvider: fixture.authenticate,
-  CLOUDFLARE_API_TOKEN_GUIDANCE: 'cloudflare-token-guidance',
 }));
 vi.mock('./gws-ea-prerequisites.js', () => ({
   ensurePrerequisites: fixture.ensurePrerequisites,
@@ -192,14 +189,6 @@ describe('GWS-EA driver', () => {
 
     await runtime.prompts!.providerCredential('claude');
     expect(fixture.authenticate).toHaveBeenCalledWith('claude', fixture.providers);
-
-    await expect(
-      runtime.prompts!.cloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'The listener drifted.' }),
-    ).resolves.toBe('fresh-cloudflare-token');
-    expect(fixture.log.warn).toHaveBeenCalledWith('The listener drifted.');
-    expect(fixture.note).toHaveBeenCalledWith('cloudflare-token-guidance', 'Cloudflare access');
-    expect(fixture.log.warn.mock.invocationCallOrder[0]).toBeLessThan(fixture.password.mock.invocationCallOrder[0]!);
-    expect(fixture.note.mock.invocationCallOrder[0]).toBeLessThan(fixture.password.mock.invocationCallOrder[0]!);
 
     await runtime.prompts!.googleCloudSignIn('reserved@example.com');
     expect(fixture.signIn).toHaveBeenCalledWith('reserved@example.com');

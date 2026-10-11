@@ -41,8 +41,6 @@ export interface ControlPlanePaths {
   registryFile: string;
   registryLock: string;
   removalRoot: string;
-  ingressRoot: string;
-  cloudflareRoot: string;
   logsRoot: string;
   preReservationLogsRoot: string;
   instanceLogsRoot(instanceId: string): string;
@@ -66,8 +64,6 @@ export interface ControlPlanePaths {
   /** The receipt of the release at `commit`, kept with it in `kept/<hex8>/` and written last. */
   releasePreflightFile(instanceId: string, commit: string): string;
   removalFile(instanceId: string): string;
-  /** The Cloudflare account token a create keeps until its route is set up. */
-  keptCloudflareTokenFile(instanceId: string): string;
 }
 
 function nearestExistingAncestor(target: string): string {
@@ -105,8 +101,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     overrides.stateRoot ?? process.env.GWS_EA_STATE_ROOT ?? path.join(defaultStateBase, 'gws-ea'),
   );
   const removalRoot = path.join(configRoot, 'removals');
-  const ingressRoot = path.join(stateRoot, 'ingress');
-  const cloudflareRoot = path.join(ingressRoot, 'cloudflare');
   const logsRoot = path.join(stateRoot, 'logs');
   const instanceRoot = (instanceId: string): string => path.join(stateRoot, instanceRootName(instanceId));
   const layout = (instanceId: string): InstanceLayout => instanceLayout(instanceRoot(instanceId));
@@ -117,8 +111,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     registryFile: path.join(configRoot, 'instances.json'),
     registryLock: path.join(configRoot, 'instances.lock'),
     removalRoot,
-    ingressRoot,
-    cloudflareRoot,
     logsRoot,
     preReservationLogsRoot: path.join(logsRoot, 'runs'),
     instanceLogsRoot: (instanceId) => path.join(logsRoot, instanceId),
@@ -134,7 +126,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
     releasePreflightFile: (instanceId, commit) => layout(instanceId).receipt(releaseName(commit)),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
-    keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),
   };
 }
 

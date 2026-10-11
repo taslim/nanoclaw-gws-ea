@@ -10,7 +10,6 @@ import {
   type CommandOptions,
   type OptionSpec,
 } from './cli-read-only.js';
-import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
   loadSecretSource,
@@ -35,8 +34,7 @@ import {
   type RunEvent,
   type StepReporter,
 } from './events.js';
-import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
-import { GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
+import { deriveGcpClaims, GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
   loadCreatedRuntime,
@@ -238,7 +236,6 @@ export interface CliRuntime {
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-  managedIngressSetup?: RetainedManagedIngressSetupSession;
   /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies. */
   upsertEnvVars?: UpsertEnvVars;
   /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
@@ -295,7 +292,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
     values: ['id', 'billing-account', 'google-client-file', ...COMMON_OPTIONS],
     switches: ['chat-configured'],
   },
-  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes'] },
+  remove: { values: ['id', 'abandon'], switches: ['yes'] },
   'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: [] },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
@@ -507,15 +504,13 @@ class Cli {
   readonly #paths: ControlPlanePaths;
   readonly #presenter: Presenter;
   readonly #runtime: CliRuntime;
-  readonly #managedIngressSetup: RetainedManagedIngressSetupSession;
   /** Set while a terminal waits on a pause: a signal then stops the wait, not the run. */
   #waiting: AbortController | undefined;
 
-  constructor(runtime: CliRuntime, presenter: Presenter, managedIngressSetup: RetainedManagedIngressSetupSession) {
+  constructor(runtime: CliRuntime, presenter: Presenter) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
     this.#presenter = presenter;
     this.#runtime = runtime;
-    this.#managedIngressSetup = managedIngressSetup;
   }
 
   /**
@@ -651,7 +646,6 @@ class Cli {
           `gws-ea remove --id ${state.instanceId}`,
           plan.options.yes ? '--yes' : undefined,
           abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
-          common,
         );
       }
       case 'start':
@@ -722,7 +716,6 @@ class Cli {
       serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
-      managedIngress: { setupSession: this.#managedIngressSetup },
     });
   }
 
@@ -765,10 +758,8 @@ class Cli {
         providedPrincipalEmails: principalEmails,
         secrets,
         prerequisites,
-        managedIngressSetup: this.#managedIngressSetup,
       }),
     );
-    run.userInput('ingress', setup.ingress.mode);
     run.userInput('provider', setup.bootstrapManifest.provider.id);
 
     const { release } = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
@@ -947,8 +938,8 @@ class Cli {
               instanceId,
               projectId: claims.gcp_project_id,
               account: claims.gcp_account,
-              serviceAccountEmail: claims.gchat_service_account,
-              credentialFile: runtime.secret_files.gchat_credentials,
+              serviceAccountEmail: claims.gchat_subscriber_account,
+              credentialFile: runtime.secret_files.gchat_subscriber_key,
               cwd: runtime.instance_root,
             },
             google: {
@@ -1325,15 +1316,12 @@ class Cli {
         command: plan.command,
         ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
         ...(plan.meta ? { meta: plan.meta } : {}),
-        secretDirectories: [
-          path.join(paths.cloudflareRoot, 'secrets'),
-          ...(plan.instanceId
-            ? [
-                path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
-                path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
-              ]
-            : []),
-        ],
+        secretDirectories: plan.instanceId
+          ? [
+              path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
+              path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
+            ]
+          : [],
       });
       const emit = (event: RunEvent): void => {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
@@ -1348,7 +1336,6 @@ class Cli {
         secrets,
         ...(this.#runtime.prompts ? { prompts: this.#runtime.prompts } : {}),
         terminal: presenter,
-        managedIngressSetup: this.#managedIngressSetup,
       });
       const outcome = await plan.work({ reporter, interaction, secrets, state });
       if (outcome.status === 'paused') {
@@ -1656,7 +1643,6 @@ function createReservation(
   },
 ): InstanceReservationInput {
   const instanceId = production.instanceId;
-  const gcpProjectId = deriveGcpProjectId(instanceId);
   const input: InstanceReservationInput = {
     instance_id: instanceId,
     release_track: track,
@@ -1664,21 +1650,8 @@ function createReservation(
     deployed_commit: production.commit,
     allocated_ports: production.ports,
     exclusive_resource_claims: {
-      ingress:
-        setup.ingress.mode === 'existing'
-          ? { mode: 'existing', endpoint_url: setup.ingress.endpointUrl }
-          : {
-              mode: 'managed-cloudflare',
-              account_id: setup.ingress.accountId,
-              zone_id: setup.ingress.zoneId,
-              zone_name: setup.ingress.zoneName,
-              hostname: setup.ingress.hostname,
-              callback_url: setup.ingress.callbackUrl,
-              dns_record_id: null,
-            },
-      gcp_project_id: gcpProjectId,
+      ...deriveGcpClaims(instanceId),
       gcp_account: production.gcpAccount,
-      gchat_service_account: deriveGchatServiceAccountEmail(gcpProjectId),
       workspace_email: setup.assistantWorkspaceEmail,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -1687,26 +1660,12 @@ function createReservation(
 }
 
 function removalPreviewLines(preview: RemovalPreview): string[] {
-  const lines = [
+  return [
     `Assistant: ${preview.instanceId}`,
     `NanoClaw: ${preview.checkout}`,
     `OneCLI: ${preview.onecliProject}`,
     `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
   ];
-  if (preview.ingress.mode === 'existing') {
-    lines.push(`External endpoint: ${preview.ingress.endpoint} (operator-managed; disconnect separately)`);
-    return lines;
-  }
-  lines.push(
-    `Managed hostname: ${preview.ingress.hostname}`,
-    `Managed callback: ${preview.ingress.callback}`,
-    `Owned DNS record: ${preview.ingress.dnsRecordId ?? 'not created'}`,
-    `Owned tunnel route: ${preview.ingress.route}`,
-    preview.ingress.sharedIngress === 'retained-for-peers'
-      ? 'Shared Cloudflare ingress: retained for other assistants'
-      : 'Shared Cloudflare ingress: retired after this final managed callback',
-  );
-  return lines;
 }
 
 /** What the operator must know after removal: the project deletion, and anything left behind. */
@@ -1716,9 +1675,6 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
     `Left behind: ${name}, which removal could not observe; delete it yourself if it still exists.`;
   const leftBehind: Readonly<Record<AbandonableResource, string>> = {
     'gcp-project': unobserved(project),
-    'cloudflare-dns': unobserved(
-      preview.ingress.mode === 'managed-cloudflare' ? `DNS record ${preview.ingress.hostname}` : 'DNS record',
-    ),
     'chat-subscription':
       "Left behind: the assistant's Google Chat subscription, which removal could not delete without a working " +
       'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
@@ -1730,7 +1686,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
     ...(outcome?.abandoned.map(({ resource }) => leftBehind[resource]) ?? []),
     ...(outcome?.keyPolicyUnrestored
       ? [
-          `The Google Chat key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
+          `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
         ]
       : []),
   ];
@@ -1746,8 +1702,6 @@ function printHelp(output: LineWriter): void {
     '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
   );
   output('         [--workspace-email <email>] [--provider <id>]');
-  output('         [--ingress existing --endpoint <https-url>]');
-  output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]');
   output(
@@ -1781,13 +1735,13 @@ function printHelp(output: LineWriter): void {
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
-  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns,chat-subscription]');
+  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,chat-subscription]');
   output('  cleanup');
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
   );
-  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>]');
-  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
+  output('  create, resume: [--secrets-file <owner-only file under the config root>]');
+  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }
 
@@ -1830,25 +1784,20 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     printHelp(errorOutput);
     return EXIT_CODES.failed;
   }
-  const managedIngressSetup = runtime.managedIngressSetup ?? createManagedIngressSetupSession();
-  const cli = new Cli(runtime, presenter, managedIngressSetup);
+  const cli = new Cli(runtime, presenter);
+  let next: () => Promise<Attempt>;
   try {
-    let next: () => Promise<Attempt>;
-    try {
-      next = cli.prepare(command, args.slice(1));
-    } catch (error) {
-      if (!(error instanceof GwsEaError)) throw error;
-      presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
-      return EXIT_CODES.failed;
-    }
-    for (;;) {
-      const attempt = await next();
-      if (attempt.status === 'done') return attempt.exitCode;
-      if (!runtime.onFailure) return EXIT_CODES.failed;
-      if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
-      next = attempt.retry;
-    }
-  } finally {
-    managedIngressSetup.clearAccountToken();
+    next = cli.prepare(command, args.slice(1));
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
+    return EXIT_CODES.failed;
+  }
+  for (;;) {
+    const attempt = await next();
+    if (attempt.status === 'done') return attempt.exitCode;
+    if (!runtime.onFailure) return EXIT_CODES.failed;
+    if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
+    next = attempt.retry;
   }
 }

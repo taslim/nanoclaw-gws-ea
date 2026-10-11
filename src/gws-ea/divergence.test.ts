@@ -12,7 +12,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -210,27 +209,6 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
   });
 });
 
-describe('recorded divergence: the webhook server honors a loopback WEBHOOK_HOST', () => {
-  it('binds 127.0.0.1 when the instance sets WEBHOOK_HOST to loopback', async () => {
-    await freshInstall();
-    const port = await freePort();
-    vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
-    vi.stubEnv('WEBHOOK_PORT', String(port));
-    const listen = vi.spyOn(net.Server.prototype, 'listen');
-    const webhooks = await import('../webhook-server.js');
-    cleanups.push(() => webhooks.stopWebhookServer());
-
-    webhooks.registerWebhookHandler('divergence-guard', (_request, response) => {
-      response.end('ok');
-    });
-
-    const server = listen.mock.contexts.find((context) => context instanceof net.Server) as net.Server | undefined;
-    expect(server).toBeDefined();
-    await vi.waitFor(() => expect(server!.listening).toBe(true));
-    expect(server!.address()).toMatchObject({ address: '127.0.0.1', port } satisfies Partial<AddressInfo>);
-  });
-});
-
 describe('recorded divergence: init-first-agent takes an optional welcome event ID', () => {
   const initFirstAgent = path.join(CONTROL_PLANE_ROOT, 'scripts', 'init-first-agent.ts');
 
@@ -327,14 +305,6 @@ describe('recorded divergence: init-first-agent takes an optional welcome event 
     expect(queued).not.toContainEqual({ id: expect.stringContaining('gws-ea-welcome') });
   });
 });
-
-async function freePort(): Promise<number> {
-  const probe = net.createServer();
-  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
-  const { port } = probe.address() as AddressInfo;
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  return port;
-}
 
 describe('recorded divergence: the Chat SDK bridge names the message a reply quotes, and marks a redelivered platform retry-safe', () => {
   it("hands the agent the reply hook's message id, and marks each inbound of a platform that redelivers", async () => {

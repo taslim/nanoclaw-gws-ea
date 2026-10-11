@@ -14,6 +14,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { deriveGcpClaims } from './gcp-identity.js';
 import { keepRelease } from './kept-release.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose, type OnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveWrapperGatewayImage, wrapperImageTag } from './onecli-gateway-image.js';
@@ -73,12 +74,10 @@ async function assistant(root: string, remote = 'https://example.test/nanoclaw.g
     release_track: 'rebuild-v2',
     source_remote: remote,
     deployed_commit: commit,
-    allocated_ports: { nanoclaw_webhook: 34_001, onecli_app: 34_002, onecli_gateway: 34_003 },
+    allocated_ports: { onecli_app: 34_002, onecli_gateway: 34_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
-      gcp_project_id: 'assistant-project',
+      ...deriveGcpClaims('22222222-2222-4222-8222-222222222222'),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'juno@example.test',
       onecli_project: 'gws-ea-22222222',
     },
@@ -322,13 +321,13 @@ describe("applying a release's kept files", () => {
   it("writes only gws-ea's keys into the state's .env, keeping another writer's", async () => {
     const subject = await keptAssistant();
     const environment = path.join(subject.layout.state, '.env');
-    await writeFile(environment, 'INSTALL_CJK_FONTS=true\nWEBHOOK_PORT=1\n');
+    await writeFile(environment, 'INSTALL_CJK_FONTS=true\nONECLI_URL=http://127.0.0.1:1\n');
 
     await subject.apply();
 
     const written = await readFile(environment, 'utf8');
     expect(written).toContain('INSTALL_CJK_FONTS=true\n');
-    expect(written).not.toContain('WEBHOOK_PORT=1\n');
+    expect(written).not.toContain('ONECLI_URL=http://127.0.0.1:1\n');
     for (const [key, value] of Object.entries(subject.kept.hostEnvironment)) {
       expect(written).toContain(`${key}=${value}\n`);
     }

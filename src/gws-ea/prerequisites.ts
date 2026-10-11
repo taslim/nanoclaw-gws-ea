@@ -61,11 +61,6 @@ export interface Prerequisites {
   readonly nodePath: string;
   /** The active Docker context's local `unix://` endpoint, answered by a running daemon. */
   readonly dockerEndpoint: string;
-  /**
-   * Docker runs rootless on Linux, so its containers cannot reach this host's
-   * loopback; undefined when the Linux daemon did not say. Always false on macOS.
-   */
-  readonly rootlessDocker: boolean | undefined;
   /** The signed-in Google Workspace account that owns the assistant's Google Cloud project. */
   readonly account: string;
 }
@@ -176,42 +171,6 @@ function pingDocker(socketPath: string): Promise<DockerDaemonState> {
       const errno = errorCode(error, 'unknown');
       resolve({ state: errno === 'EACCES' || errno === 'EPERM' ? 'no-permission' : 'stopped', evidence: errno });
     });
-    request.end();
-  });
-}
-
-/**
- * Whether the daemon behind a unix socket runs rootless, per the Engine API's
- * `GET /info`; undefined when it does not say.
- */
-function dockerRunsRootless(socketPath: string): Promise<boolean | undefined> {
-  return new Promise((resolve) => {
-    const request = httpRequest(
-      { socketPath, path: '/info', method: 'GET', agent: false, timeout: DOCKER_PING_TIMEOUT_MS },
-      (response) => {
-        let body = '';
-        response.setEncoding('utf8');
-        response.on('data', (chunk: string) => (body += chunk));
-        response.once('error', () => resolve(undefined));
-        response.once('end', () => {
-          let info: unknown;
-          try {
-            info = response.statusCode === 200 ? JSON.parse(body) : undefined;
-          } catch (error) {
-            if (!(error instanceof SyntaxError)) throw error;
-          }
-          const options: unknown = isRecord(info) ? info.SecurityOptions : undefined;
-          const listed =
-            Array.isArray(options) && options.every((option): option is string => typeof option === 'string');
-          resolve(listed ? options.some((option) => option.split(',').includes('name=rootless')) : undefined);
-        });
-      },
-    );
-    request.once('timeout', () => {
-      resolve(undefined);
-      request.destroy();
-    });
-    request.once('error', () => resolve(undefined));
     request.end();
   });
 }
@@ -379,9 +338,6 @@ export async function checkPrerequisites(
     request.command === 'resume' && request.dockerEndpoint !== undefined
       ? await probeRecordedDockerEndpoint(request.dockerEndpoint)
       : await resolveDockerEndpoint(runner);
-  const dockerSocket = unixSocketPath(dockerEndpoint);
-  const rootlessDocker =
-    platform !== 'linux' ? false : dockerSocket === undefined ? undefined : await dockerRunsRootless(dockerSocket);
   const account = await googleAccount(request, interaction, runner);
   return {
     platform,
@@ -389,7 +345,6 @@ export async function checkPrerequisites(
     runningAsRoot: process.getuid?.() === 0,
     nodePath,
     dockerEndpoint,
-    rootlessDocker,
     account,
   };
 }

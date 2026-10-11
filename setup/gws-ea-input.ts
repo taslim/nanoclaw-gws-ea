@@ -1,13 +1,10 @@
 import * as p from '@clack/prompts';
 
 import {
-  describeSecretInput,
   parsePrincipalChatEmail,
   PRINCIPAL_CHAT_EMAIL_FLAG,
   PRINCIPAL_EMAIL_FLAG,
   principalChatEmailProblem,
-  type CloudflareZoneChoice,
-  type CreateIngressAnswer,
   type CreateInputFlag,
   type CreatePromptContext,
   type CreateSetupAnswers,
@@ -17,9 +14,7 @@ import {
   principalAddressConflict,
   principalAddressesConflict,
 } from '../src/gws-ea/validation.js';
-import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
-import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
@@ -35,11 +30,6 @@ interface PromptAdapter {
     readonly placeholder?: string;
     readonly validate?: (value: string | undefined) => string | undefined;
   }): Promise<unknown>;
-  password(options: {
-    readonly message: string;
-    readonly validate?: (value: string | undefined) => string | undefined;
-  }): Promise<unknown>;
-  confirm(options: { readonly message: string; readonly initialValue: boolean }): Promise<unknown>;
   select(options: {
     readonly message: string;
     readonly options: { readonly value: string; readonly label: string; readonly hint: string }[];
@@ -59,24 +49,10 @@ export interface GwsEaCreateInputDependencies {
 const defaultPrompts: PromptAdapter = {
   note: (message, title) => p.note(message, title),
   text: (options) => p.text(options),
-  password: (options) => p.password(options),
-  confirm: (options) => p.confirm(options),
   select: (options) => brightSelect<string>(options),
   isCancel: p.isCancel,
   logInfo: (message) => p.log.info(message),
 };
-
-const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
-  'Create a scoped user or account-owned API token for the intended account and every zone used by managed assistants on this machine:',
-  'Account · Cloudflare Tunnel: Edit',
-  'Zone · Zone: Read',
-  'Zone · DNS: Edit',
-  'User tokens: https://dash.cloudflare.com/profile/api-tokens',
-  'Account-owned tokens: https://dash.cloudflare.com/?to=/:account/api-tokens',
-  '',
-  'While an assistant is being created, the token is kept in its owner-only secrets until the route is set up, then deleted; it is not stored otherwise.',
-].join('\n');
 
 function cancelled(): never {
   throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
@@ -161,15 +137,6 @@ async function askText(
   return answer.trim();
 }
 
-async function askPassword(prompts: PromptAdapter, message: string): Promise<string> {
-  const answer = await prompts.password({
-    message,
-    validate: (value) => (value?.trim() ? undefined : 'Required'),
-  });
-  if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return cancelled();
-  return answer.trim();
-}
-
 function workspaceEmailProblem(value: string): string | undefined {
   if (!EMAIL_PATTERN.test(value)) return 'Enter a valid email address';
   if (isConsumerGoogleAccount(value)) return 'Enter a Google Workspace address, not a personal Google account';
@@ -250,180 +217,6 @@ function displayName(first: string, last: string): string {
   return last ? `${first} ${last}` : first;
 }
 
-function defaultDnsLabel(assistantFirstName: string): string {
-  const normalized = assistantFirstName
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/gu, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, '-')
-    .replace(/^-+|-+$/gu, '')
-    .slice(0, 63)
-    .replace(/-+$/gu, '');
-  return normalized || 'assistant';
-}
-
-function validateDnsLabel(value: string): string | undefined {
-  return DNS_LABEL_PATTERN.test(value)
-    ? undefined
-    : 'Use 1-63 lowercase letters, numbers, or hyphens; start and end with a letter or number';
-}
-
-/** The zones arrive parsed and active from the Cloudflare seam; a choice needs at least one, each named once. */
-function validateDiscoveredZones(zones: readonly CloudflareZoneChoice[]): readonly CloudflareZoneChoice[] {
-  if (zones.length === 0) {
-    throw new GwsEaError('cloudflare_zone_required', 'The Cloudflare token has no active zones available');
-  }
-  const zoneIds = new Set<string>();
-  const zoneNames = new Set<string>();
-  for (const zone of zones) {
-    if (zoneIds.has(zone.zoneId) || zoneNames.has(zone.name)) {
-      throw new GwsEaError('invalid_cloudflare_zone', 'Cloudflare returned a duplicate zone');
-    }
-    zoneIds.add(zone.zoneId);
-    zoneNames.add(zone.name);
-  }
-  return zones;
-}
-
-async function chooseZone(zones: readonly CloudflareZoneChoice[], source: InputSource): Promise<CloudflareZoneChoice> {
-  const named = supplied(source, 'cloudflare-zone')?.toLowerCase();
-  if (named !== undefined) {
-    const zone = zones.find((candidate) => candidate.name === named);
-    if (!zone) {
-      throw invalidFlag(
-        'cloudflare-zone',
-        `${named} is not an active zone this token can use (${zones.map((candidate) => candidate.name).join(', ')})`,
-      );
-    }
-    return zone;
-  }
-  if (zones.length === 1) {
-    const zone = zones[0]!;
-    logInfo(source, `Using ${zone.name}, the active zone available to this token.`);
-    return zone;
-  }
-  if (!source.interactive) throw missingInput('cloudflare-zone');
-  const prompts = source.prompts;
-  const selected = await prompts.select({
-    message: 'Which Cloudflare zone should host the assistant?',
-    options: zones.map((zone) => ({
-      value: zone.zoneId,
-      label: zone.name,
-      hint: zone.accountName,
-    })),
-  });
-  if (prompts.isCancel(selected) || typeof selected !== 'string') return cancelled();
-  const zone = zones.find((candidate) => candidate.zoneId === selected);
-  if (!zone) throw new GwsEaError('invalid_cloudflare_zone', 'Selected Cloudflare zone is unavailable');
-  return zone;
-}
-
-async function chooseIngressMode(source: InputSource): Promise<CreateIngressAnswer['mode']> {
-  const endpoint = supplied(source, 'endpoint');
-  const mode = supplied(source, 'ingress');
-  if (mode !== undefined && mode !== 'existing' && mode !== 'managed-cloudflare') {
-    throw invalidFlag('ingress', 'use existing or managed-cloudflare');
-  }
-  if (endpoint !== undefined && mode === 'managed-cloudflare') {
-    throw invalidFlag('endpoint', 'applies only to --ingress existing');
-  }
-  if (endpoint !== undefined) return 'existing';
-  if (mode !== undefined) return mode;
-  if (!source.interactive) throw missingInput('ingress', ' (existing with --endpoint, or managed-cloudflare)');
-  const prompts = source.prompts;
-  const selected = await prompts.select({
-    message: 'How should Google Chat reach this assistant?',
-    options: [
-      {
-        value: 'managed-cloudflare',
-        label: 'Managed Cloudflare',
-        hint: 'Create and manage a stable callback automatically',
-      },
-      {
-        value: 'existing',
-        label: 'Existing HTTPS endpoint',
-        hint: 'Use infrastructure you already operate',
-      },
-    ],
-  });
-  if (prompts.isCancel(selected) || (selected !== 'existing' && selected !== 'managed-cloudflare')) return cancelled();
-  return selected;
-}
-
-function endpointProblem(value: string): string | undefined {
-  try {
-    validateExistingGchatEndpoint(value);
-    return undefined;
-  } catch (error) {
-    return error instanceof Error ? error.message : 'Enter a valid Google Chat endpoint';
-  }
-}
-
-async function cloudflareToken(source: InputSource): Promise<string> {
-  const token = source.context.secrets.get('cloudflareAccountToken');
-  if (token) return token;
-  if (!source.interactive) {
-    throw new GwsEaError(
-      'input_required',
-      `Managed Cloudflare ingress needs an API token: ${describeSecretInput('cloudflareAccountToken')}.`,
-    );
-  }
-  note(source, CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
-  const prompted = await askPassword(source.prompts, 'Cloudflare API token');
-  registerSecret(prompted);
-  return prompted;
-}
-
-async function collectIngress(source: InputSource, assistantFirstName: string): Promise<CreateIngressAnswer> {
-  const mode = await chooseIngressMode(source);
-  if (mode === 'existing') {
-    const endpointUrl = await textInput(source, 'endpoint', 'Existing Google Chat webhook endpoint', {
-      validate: endpointProblem,
-    });
-    return { mode, endpointUrl: validateExistingGchatEndpoint(endpointUrl) };
-  }
-
-  const { rootlessDocker } = source.context.prerequisites;
-  if (rootlessDocker !== false) {
-    throw new GwsEaError(
-      'managed_ingress_unsupported',
-      `Managed Cloudflare ingress needs rootful Docker on Linux: its connector reaches this assistant on 127.0.0.1, which rootless Docker cannot reach. ${
-        rootlessDocker ? 'This Docker runs rootless.' : 'Docker did not say whether it runs rootless.'
-      } Use rootful Docker, or pass --endpoint with an existing HTTPS Google Chat endpoint.`,
-    );
-  }
-  const session = source.context.managedIngressSetup;
-  if (!session) {
-    throw new GwsEaError('managed_ingress_unavailable', 'Managed Cloudflare setup is unavailable in this release');
-  }
-  const token = await cloudflareToken(source);
-  const zones = validateDiscoveredZones(await session.discoverZones(token));
-  const zone = await chooseZone(zones, source);
-  const labelWasSupplied = supplied(source, 'hostname-label') !== undefined;
-  const label = await textInput(source, 'hostname-label', 'Assistant hostname label', {
-    initialValue: defaultDnsLabel(assistantFirstName),
-    validate: validateDnsLabel,
-  });
-  const hostname = `${label}.${zone.name}`;
-  const callbackUrl = `https://${hostname}/webhook/gchat`;
-  if (!labelWasSupplied) {
-    const confirmed = await source.prompts.confirm({
-      message: `Reserve ${hostname} for this assistant?\nGoogle Chat callback: ${callbackUrl}`,
-      initialValue: true,
-    });
-    if (source.prompts.isCancel(confirmed) || confirmed !== true) return cancelled();
-  }
-  session.retainAccountToken(token);
-  return {
-    mode,
-    accountId: zone.accountId,
-    zoneId: zone.zoneId,
-    zoneName: zone.name,
-    hostname,
-    callbackUrl,
-  };
-}
-
 async function chooseProvider(
   providers: readonly SetupProviderEntry[],
   source: InputSource,
@@ -493,12 +286,10 @@ export async function collectGwsEaCreateInput(
   });
   const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
   const principalChatEmail = await principalChatEmailInput(source, principalEmails);
-  const ingress = await collectIngress(source, assistantFirst);
   const provider = await chooseProvider(providers, source);
   const metadata = provider.provisioning.credentialMetadata({ allowAmbientConfiguration: false });
 
   return {
-    ingress,
     assistantWorkspaceEmail,
     bootstrapManifest: {
       schema_version: 1,

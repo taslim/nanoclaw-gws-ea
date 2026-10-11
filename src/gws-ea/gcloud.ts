@@ -26,7 +26,6 @@ import {
   GCHAT_SERVICE_ACCOUNT_ID,
   GCP_BILLING_ACCOUNT_PATTERN,
   GCP_PROJECT_PATTERN,
-  parseGcpProjectNumber,
 } from './gcp-identity.js';
 import { readProvisionJournal, recordKeyPolicyLifted, type InstanceOperation } from './journal.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory } from './paths.js';
@@ -163,7 +162,7 @@ export function classifyGcloudFailure(outcome: SanitizedCommandOutcome): GcloudF
   return match?.[0] ?? 'anything-else';
 }
 
-/** A personal Google account, which cannot own a Google Chat app for a Workspace. */
+/** A personal Google account, not the Google Workspace one the assistant and its project's owner must each be. */
 export function isConsumerGoogleAccount(email: string): boolean {
   return CONSUMER_GOOGLE_DOMAINS.has(email.slice(email.lastIndexOf('@') + 1).toLowerCase());
 }
@@ -223,7 +222,6 @@ type Gcloud = (args: readonly string[]) => Promise<Ran>;
 
 interface Project {
   readonly projectId: string;
-  readonly projectNumber: string | undefined;
   readonly lifecycleState: string;
   readonly labels: Readonly<Record<string, unknown>>;
 }
@@ -346,13 +344,6 @@ function parseJsonList(stdout: string, label: string): unknown[] {
   return list;
 }
 
-export function deriveGcpProjectId(instanceId: string): string {
-  assertInstanceId(instanceId);
-  return `gws-ea-${instanceId.replaceAll('-', '').slice(0, 20)}`;
-}
-
-export { deriveGchatServiceAccountEmail } from './gcp-identity.js';
-
 /** gcloud is on PATH and runs. */
 export async function assertGcloudInstalled(runner: GcloudCommandRunner = runSanitizedCommandOutcome): Promise<void> {
   await runChecked(runner, ['version', '--format=json']).catch((error: unknown) =>
@@ -398,7 +389,6 @@ async function readProject(gcloud: Gcloud, projectId: string): Promise<Read<Proj
   return {
     value: {
       projectId: stringField(value, 'projectId', 'Google Cloud project', INVALID_OUTPUT),
-      projectNumber: parseGcpProjectNumber(value.projectNumber),
       lifecycleState: stringField(value, 'lifecycleState', 'Google Cloud project', INVALID_OUTPUT),
       // gcloud omits an empty label map.
       labels: isRecord(value.labels) ? value.labels : {},
@@ -430,23 +420,6 @@ function assertActiveProject(coordinates: GcpProjectCoordinates, project: Projec
     'gcp_project_unavailable',
     `Google Cloud project ${coordinates.projectId} is ${project.lifecycleState}, not ACTIVE.${recovery}`,
   );
-}
-
-/** The add-on signing identity's project number, read only from the owned, active project. */
-export async function getOwnedGcpProjectNumber(
-  coordinates: GcpProjectCoordinates,
-  dependencies: GcloudDependencies = {},
-): Promise<string> {
-  const read = await readProject(gcloudFor(coordinates, dependencies), coordinates.projectId);
-  if ('failed' in read) {
-    throw gcloudFailed(`Google Cloud could not describe project ${coordinates.projectId}`, read.failed);
-  }
-  assertOwnedProject(coordinates, read.value);
-  assertActiveProject(coordinates, read.value);
-  if (!read.value.projectNumber) {
-    throw new GwsEaError(INVALID_OUTPUT, 'Google Cloud returned an invalid project number');
-  }
-  return read.value.projectNumber;
 }
 
 function serviceAccountDescription(instanceId: string): string {

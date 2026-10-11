@@ -69,10 +69,6 @@ export const CREATE_INPUT_FLAGS = [
   'principal-timezone',
   PRINCIPAL_CHAT_EMAIL_FLAG,
   'workspace-email',
-  'ingress',
-  'endpoint',
-  'cloudflare-zone',
-  'hostname-label',
   'provider',
 ] as const;
 
@@ -83,7 +79,6 @@ export type CreateInputFlag = (typeof CREATE_INPUT_FLAGS)[number];
  * the owner-only `--secrets-file` under the config root, and is never written.
  */
 export const SECRET_INPUTS = {
-  cloudflareAccountToken: 'GWS_EA_CLOUDFLARE_API_TOKEN',
   providerCredential: 'GWS_EA_PROVIDER_CREDENTIAL',
 } as const;
 
@@ -153,20 +148,6 @@ export async function loadSecretSource(options: {
   return { get: (input) => values.get(input) };
 }
 
-export interface CloudflareZoneChoice {
-  readonly accountId: string;
-  readonly accountName: string;
-  readonly zoneId: string;
-  readonly name: string;
-  readonly status: 'active';
-}
-
-export interface ManagedIngressSetupSession {
-  discoverZones(accountToken: string): Promise<readonly CloudflareZoneChoice[]>;
-  retainAccountToken(accountToken: string): void;
-  clearAccountToken(): void;
-}
-
 export interface CreatePromptContext {
   readonly instanceId: string;
   readonly track: string;
@@ -182,22 +163,9 @@ export interface CreatePromptContext {
    */
   readonly providedPrincipalEmails: readonly string[];
   readonly secrets: SecretSource;
-  readonly managedIngressSetup?: ManagedIngressSetupSession;
 }
 
-export type CreateIngressAnswer =
-  | { readonly mode: 'existing'; readonly endpointUrl: string }
-  | {
-      readonly mode: 'managed-cloudflare';
-      readonly accountId: string;
-      readonly zoneId: string;
-      readonly zoneName: string;
-      readonly hostname: string;
-      readonly callbackUrl: string;
-    };
-
 export interface CreateSetupAnswers {
-  readonly ingress: CreateIngressAnswer;
   readonly assistantWorkspaceEmail: string;
   readonly bootstrapManifest: ProductionBootstrapManifest;
 }

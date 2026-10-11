@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
   assertInstanceCreated,
@@ -40,12 +41,10 @@ function reservation(): InstanceReservationInput {
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
-    allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
+    allocated_ports: { onecli_app: 32_002, onecli_gateway: 32_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://journal.example.test/webhook/gchat' },
-      gcp_project_id: 'journal-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@journal-project.iam.gserviceaccount.com',
       workspace_email: 'journal@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

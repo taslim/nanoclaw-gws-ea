@@ -15,6 +15,7 @@ import {
   observeLiveCheckout,
   resolveToolCommit,
 } from './checkout.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { reserveInstance } from './journal.js';
@@ -84,12 +85,10 @@ function reservation(instanceId: string, sourceRemote: string, deployedCommit: s
     release_track: 'dogfood',
     source_remote: sourceRemote,
     deployed_commit: deployedCommit,
-    allocated_ports: { nanoclaw_webhook: 33_001, onecli_app: 33_002, onecli_gateway: 33_003 },
+    allocated_ports: { onecli_app: 33_002, onecli_gateway: 33_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://checkout.example.test/webhook/gchat' },
-      gcp_project_id: 'checkout-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@checkout-project.iam.gserviceaccount.com',
       workspace_email: 'checkout@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

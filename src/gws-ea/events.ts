@@ -6,7 +6,6 @@
  */
 import type { GoogleGrant } from '../modules/gws-ea-google/grant.js';
 import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
-import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import { describeSecretInput, SECRET_INPUTS, type SecretInput, type SecretSource } from './create-input.js';
 import { signInAsAssistant, type GoogleOAuthClient } from './google-oauth.js';
 import type { ProvisionHumanPause } from './phases.js';
@@ -180,17 +179,10 @@ export interface ProviderCredentialRequest {
   readonly metadata: ProviderCredentialMetadata;
 }
 
-export interface CloudflareTokenRequest {
-  readonly accountId: string;
-  /** Why the token is needed, shown to the operator. */
-  readonly reason: string;
-}
-
 /** The engine's only way to obtain human input. */
 export interface Interaction {
   readonly decisions: HumanDecisions;
   requestProviderCredential(request: ProviderCredentialRequest): Promise<ProviderCredential>;
-  requestCloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   /** Always the browser flow (`gcloud auth login --force`); without an account, the operator picks one. */
   signInToGoogleCloud(account?: string): Promise<void>;
   /** Create: whether the signed-in `account` should own the new assistant's Google Cloud project. */
@@ -212,7 +204,6 @@ export interface Interaction {
 /** What a person at the terminal can be asked. The driver supplies this only on a TTY. */
 export interface InteractivePrompts {
   providerCredential(providerId: string): Promise<ProviderCredential>;
-  cloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   googleCloudSignIn(account?: string): Promise<void>;
   googleAccount(account: string): Promise<boolean>;
   /** Show the consent URL and open it in the operator's browser, asking them to sign in as `account`. */
@@ -225,10 +216,6 @@ export interface InteractionOptions {
   readonly secrets: SecretSource;
   readonly prompts?: InteractivePrompts;
   readonly terminal?: { suspend(): void; resume(): void };
-  readonly managedIngressSetup: Pick<
-    RetainedManagedIngressSetupSession,
-    'discoverZones' | 'retainAccountToken' | 'requireAccountToken'
-  >;
 }
 
 function secretPause(input: SecretInput, message: string): PauseRequired {
@@ -241,7 +228,7 @@ function secretPause(input: SecretInput, message: string): PauseRequired {
  * the redactor before anything else sees it.
  */
 export function createInteraction(options: InteractionOptions): Interaction {
-  const { secrets, prompts, terminal, managedIngressSetup } = options;
+  const { secrets, prompts, terminal } = options;
   const withTerminal = async <T>(work: () => Promise<T>): Promise<T> => {
     terminal?.suspend();
     try {
@@ -270,27 +257,6 @@ export function createInteraction(options: InteractionOptions): Interaction {
       const credential = await withTerminal(() => prompts.providerCredential(providerId));
       received(credential.value);
       return credential;
-    },
-    async requestCloudflareAccountToken(request) {
-      let token = secrets.get('cloudflareAccountToken');
-      if (!token) {
-        if (!prompts) {
-          throw secretPause(
-            'cloudflareAccountToken',
-            `A Cloudflare API token (${SECRET_INPUTS.cloudflareAccountToken}) is required: ${request.reason.replace(/\.$/u, '')}.`,
-          );
-        }
-        token = received(await withTerminal(() => prompts.cloudflareAccountToken(request)));
-      }
-      const zones = await managedIngressSetup.discoverZones(token);
-      if (!zones.some((zone) => zone.accountId === request.accountId)) {
-        throw new GwsEaError(
-          'cloudflare_capability_missing',
-          'The Cloudflare token cannot access an active zone in the reserved account.',
-        );
-      }
-      managedIngressSetup.retainAccountToken(token);
-      return managedIngressSetup.requireAccountToken(request.accountId);
     },
     async signInToGoogleCloud(account) {
       if (!prompts) {

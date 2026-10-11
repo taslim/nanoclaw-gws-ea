@@ -163,14 +163,14 @@ describe('GWS-EA run log', () => {
 
     await run.step('start_nanoclaw', async (step) => {
       step.write(`onecli rejected ${secret}\n`);
-      step.envFile('/instance/nanoclaw/.env', `ONECLI_URL=http://127.0.0.1:1\nGCHAT_ENDPOINT_URL=${secret}\n`);
+      step.envFile('/instance/nanoclaw/.env', `ONECLI_URL=http://127.0.0.1:1\nNANOCLAW_EGRESS_NETWORK=${secret}\n`);
       step.fact('credential', secret);
     });
 
     const raw = await readFile(path.join(run.directory, 'steps', '01-start-nanoclaw.log'), 'utf8');
     const progression = await readFile(run.progressLog, 'utf8');
     expect(raw).toContain(`onecli rejected ${REDACTED}`);
-    expect(raw).toContain('.env /instance/nanoclaw/.env: keys ONECLI_URL, GCHAT_ENDPOINT_URL');
+    expect(raw).toContain('.env /instance/nanoclaw/.env: keys ONECLI_URL, NANOCLAW_EGRESS_NETWORK');
     expect(raw).not.toContain('127.0.0.1');
     expect(`${raw}${progression}`).not.toContain(secret);
   });

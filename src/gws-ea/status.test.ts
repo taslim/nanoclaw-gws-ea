@@ -28,6 +28,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
+import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
@@ -85,7 +86,7 @@ const SENTINEL = 'sentinel-secret-value-7f3a9c';
 /** The fields `list --json` prints for each assistant, in order, as its help documents them. */
 const LIST_FIELDS = [
   'instance_id',
-  'hostname',
+  'account',
   'track',
   'deployed_commit',
   'phase',
@@ -143,7 +144,6 @@ async function nextRelease(host: Machine): Promise<string> {
 interface AssistantOptions {
   readonly label: string;
   readonly port: number;
-  readonly ingress: 'existing' | 'managed-cloudflare';
   /** The repository it was created from and the release it runs: the tool's first release unless given. */
   readonly from?: { readonly repository: string; readonly commit: string };
 }
@@ -167,33 +167,19 @@ function stateOf(reservation: InstanceReservation): string {
  */
 async function assistant(
   host: Machine,
-  { label, port, ingress, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
+  { label, port, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
 ): Promise<InstanceReservation> {
   const { paths } = host;
   const instanceId = randomUUID();
-  const callback = `https://${label}.example.test/webhook/gchat`;
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
     source_remote: from.repository,
     release_track: 'dogfood',
     deployed_commit: from.commit,
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress:
-        ingress === 'existing'
-          ? { mode: 'existing', endpoint_url: callback }
-          : {
-              mode: 'managed-cloudflare',
-              account_id: 'a'.repeat(32),
-              zone_id: 'b'.repeat(32),
-              zone_name: 'example.test',
-              hostname: `${label}.example.test`,
-              callback_url: callback,
-              dns_record_id: 'd'.repeat(31) + String(port % 10),
-            },
-      gcp_project_id: `status-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@status-${port}.iam.gserviceaccount.com`,
       workspace_email: `${label}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -575,7 +561,7 @@ interface StatusShape {
 describe('status', () => {
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     // Beside the healthy host: a removal cut short.
     await removalStarted(host.paths, reservation);
     const state = world(reservation);
@@ -618,9 +604,7 @@ describe('status', () => {
       observed_at: NOW.toISOString(),
       phase: { state: 'live', release: host.release.slice(0, 8) },
       registry: {
-        hostname: 'alpha.example.test',
-        endpoint_url: 'https://alpha.example.test/webhook/gchat',
-        ingress_mode: 'managed-cloudflare',
+        account: 'alpha@example.test',
         track: 'dogfood',
         source_remote: host.tool,
         deployed_commit: host.release,
@@ -645,7 +629,7 @@ describe('status', () => {
 
   it('reports a stopped host as a stopped service and an unreachable host, and still reports every other probe', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     state.active.clear();
     state.serving.clear();
@@ -668,7 +652,7 @@ describe('status', () => {
 
   it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const reason = `Google no longer accepts the sign-in; connect it with gws-ea connect-google --id ${reservation.instance_id}`;
 
@@ -690,7 +674,7 @@ describe('status', () => {
 
   it("reports main's identity as unknown, not degraded, when OneCLI does not answer for its agents", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const refusal = 'OneCLI refused the agent list (HTTP 503)';
 
@@ -707,7 +691,7 @@ describe('status', () => {
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const refusal = 'OneCLI gateway image gws-ea-onecli-gateway:0 provenance label does not match its build content';
 
@@ -727,7 +711,7 @@ describe('status', () => {
 
   it('reports external-email as the host reports it', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting =
@@ -767,7 +751,7 @@ describe('status', () => {
 
   it('reports the inbox as the host reports it, degraded while it fails, while calendar news is not on yet, or when its report is invalid', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const reporting = (health: unknown) => ({
@@ -855,7 +839,7 @@ describe('status', () => {
 
   it('reports Google Chat as the host reports it: receiving, a broken sign-in named as one, and anything else as not receiving', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const id = reservation.instance_id;
@@ -989,7 +973,7 @@ describe('status', () => {
 
   it("shows each principal address's calendar access in every state, and never counts it against the inbox (AE4)", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const healthy = healthyObservers(state);
     const checkedAt = '2026-09-28T14:29:00.000Z';
@@ -1039,7 +1023,7 @@ describe('status', () => {
 
   it("reports an assistant behind the tool's release with both commits", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const toolRelease = await nextRelease(host);
     const state = world(reservation);
 
@@ -1061,7 +1045,7 @@ describe('status', () => {
 
   it('reports the rollback point, whether either schema moved since its snapshot, and a fingerprint of each', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const previousCommit = 'e'.repeat(40);
     await keepRollbackPoint(host.paths, reservation, previousCommit);
     const state = world(reservation);
@@ -1107,7 +1091,7 @@ describe('status', () => {
     ['that cannot be read', 'torn', /Rollback point/u],
   ] as const)('offers no rollback for a rollback point %s', async (_label, flaw, why) => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const file = host.paths.rollbackPointFile(reservation.instance_id);
     await keepRollbackPoint(host.paths, reservation, 'e'.repeat(40));
     if (flaw === 'torn') await writeFile(file, '{torn', { mode: 0o600 });
@@ -1128,7 +1112,7 @@ describe('status', () => {
 
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     const { runtime, output } = command(host, state);
 
@@ -1152,7 +1136,7 @@ describe('status', () => {
     ['rollback', { kind: 'prune' }],
   ] as const)("names a committed %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await recordedWith(host.paths, reservation, { kind, to, followUp });
     const { runtime, output } = command(host, world(reservation));
@@ -1168,7 +1152,7 @@ describe('status', () => {
 
   it('names a host never started as such', async () => {
     const host = await machine();
-    const unstarted = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const unstarted = await assistant(host, { label: 'beta', port: 36_011 });
     // Its host never started, so it has no runtime record.
     await rm(instanceRuntimeFile(stateOf(unstarted)));
     const state = world(unstarted);
@@ -1185,7 +1169,7 @@ describe('status', () => {
 
   it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     // A switch has removed the live link; the runtime record and the databases stay in the assistant's state.
     await rm(liveOf(reservation));
     const state = world(reservation);
@@ -1239,7 +1223,7 @@ describe('status', () => {
 
   it("reports the live release's agent image as degraded when its tag is gone", async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
     state.images.clear();
 
@@ -1255,7 +1239,7 @@ describe('status', () => {
 
   it('names the fix-forward command for an update that failed and left no release to return to', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await updateFailedWithoutReturn(host.paths, reservation, target);
     const state = world(reservation);
@@ -1283,7 +1267,7 @@ describe('status', () => {
 
   it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
     await rollbackFailedReturning(host.paths, reservation, target);
     const state = world(reservation);
@@ -1316,8 +1300,8 @@ describe('status', () => {
 describe('list', () => {
   it('shows every assistant, the phase of one mid-update, and the removal another left', async () => {
     const host = await machine();
-    const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const alpha = await assistant(host, { label: 'alpha', port: 36_001 });
+    const beta = await assistant(host, { label: 'beta', port: 36_011 });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
     await updateUnfinishedAt(host.paths, beta, target);
     await removalStarted(host.paths, alpha);
@@ -1340,7 +1324,7 @@ describe('list', () => {
       expect.arrayContaining([
         {
           instance_id: alpha.instance_id,
-          hostname: 'alpha.example.test',
+          account: 'alpha@example.test',
           track: 'dogfood',
           deployed_commit: host.release,
           phase: { state: 'live', release: host.release.slice(0, 8) },
@@ -1351,7 +1335,7 @@ describe('list', () => {
         },
         {
           instance_id: beta.instance_id,
-          hostname: 'beta.example.test',
+          account: 'beta@example.test',
           track: 'dogfood',
           deployed_commit: host.release,
           phase: { state: 'live', release: host.release.slice(0, 8) },
@@ -1378,13 +1362,13 @@ describe('list', () => {
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
-        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +live +removing`,
+        `${alpha.instance_id} +alpha@example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +live +removing`,
         'u',
       ),
     );
     expect(lines).toMatch(
       new RegExp(
-        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +live +update fenced`,
+        `${beta.instance_id} +beta@example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +live +update fenced`,
         'u',
       ),
     );
@@ -1398,12 +1382,11 @@ describe('list', () => {
 
   it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {
     const host = await machine();
-    const behind = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const behind = await assistant(host, { label: 'alpha', port: 36_001 });
     const toolRelease = await nextRelease(host);
     const current = await assistant(host, {
       label: 'beta',
       port: 36_011,
-      ingress: 'existing',
       from: { repository: host.tool, commit: toolRelease },
     });
     // A release of a repository the tool's checkout never fetched, so its history cannot place it.
@@ -1415,7 +1398,6 @@ describe('list', () => {
     const unplaced = await assistant(host, {
       label: 'gamma',
       port: 36_021,
-      ingress: 'existing',
       from: { repository: elsewhere, commit: foreign },
     });
     const state = world(behind, current, unplaced);
@@ -1449,7 +1431,7 @@ describe('list', () => {
       },
     });
     const lines = text.output.stdout.join('\n');
-    expect(lines).toMatch(/^INSTANCE ID +HOSTNAME +TRACK +COMMIT +BEHIND TOOL +SERVICE +PHASE +OPERATION$/mu);
+    expect(lines).toMatch(/^INSTANCE ID +ACCOUNT +TRACK +COMMIT +BEHIND TOOL +SERVICE +PHASE +OPERATION$/mu);
     for (const [reservation, cell] of [
       [behind, 'yes'],
       [current, 'no'],
@@ -1551,8 +1533,8 @@ function verbOf({ command, args }: SanitizedCommand): string {
 describe('read-only commands', () => {
   it('write no file, load no secret, pass no secret environment variable, and ask Docker and Git only to read', async () => {
     const host = await machine();
-    const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const alpha = await assistant(host, { label: 'alpha', port: 36_001 });
+    const beta = await assistant(host, { label: 'beta', port: 36_011 });
     hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
     await sessionMailbox(stateOf(alpha));
     await keepRollbackPoint(host.paths, alpha, 'e'.repeat(40), {
@@ -1562,7 +1544,6 @@ describe('read-only commands', () => {
     const secretsFile = path.join(host.paths.configRoot, 'secrets.env');
     await writeFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${SENTINEL}\n`, { mode: 0o600 });
     vi.stubEnv('GWS_EA_PROVIDER_CREDENTIAL', SENTINEL);
-    vi.stubEnv('GWS_EA_CLOUDFLARE_API_TOKEN', SENTINEL);
     const state = world(alpha, beta);
     // Only the external boundaries are faked; every reader of the fixture is real.
     const observers: Partial<StatusObservers> = {
@@ -1635,7 +1616,7 @@ describe('help', () => {
 
   it('pins the order of the fields status prints', async () => {
     const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
     expect(Object.keys(status)).toEqual([...STATUS_FIELDS]);

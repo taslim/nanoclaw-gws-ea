@@ -26,6 +26,7 @@ import { expect } from 'vitest';
 import { AGENT_IMAGE_KEY_LABEL } from '../agent-image.js';
 import { releaseImageKey, releaseImageTag } from '../agent-image-release.js';
 import { runCli, type CliRuntime } from '../cli.js';
+import { deriveGcpClaims } from '../gcp-identity.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '../journal.js';
 import { readKeptRelease } from '../kept-release.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose, type OnecliRuntimeLayout } from '../onecli-compose.js';
@@ -352,12 +353,10 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
     source_remote: host.remote,
     release_track: 'dogfood',
     deployed_commit: host.first,
-    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    allocated_ports: { onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
-      gcp_project_id: `update-${port}`,
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: `gws-ea-chat@update-${port}.iam.gserviceaccount.com`,
       workspace_email: `a${port}@example.test`,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

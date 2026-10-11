@@ -114,10 +114,10 @@ describe('GWS-EA tool and host environments', () => {
     CLOUDSDK_CORE_ACCOUNT: 'someone@example.com',
     SSH_AUTH_SOCK: '/tmp/agent.sock',
     GOOGLE_APPLICATION_CREDENTIALS: '/tmp/key.json',
-    CLOUDFLARE_API_TOKEN: 'ambient-cloudflare',
+    GWS_EA_PROVIDER_CREDENTIAL: 'ambient-provider-credential',
     ONECLI_API_KEY: 'ambient-onecli',
     ANTHROPIC_API_KEY: 'ambient-anthropic',
-    GCHAT_CREDENTIALS: 'ambient-chat-secret',
+    GWS_EA_CHAT_SUBSCRIBER_KEY_FILE: '/tmp/stolen-key.json',
     NANOCLAW_INSTALL_ID: 'victim',
   };
 

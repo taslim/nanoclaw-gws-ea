@@ -129,8 +129,7 @@ describe('GWS-EA failure diagnosis', () => {
     const consent = prompts.notes.find(([, title]) => /leaves this machine/iu.test(title))?.[0] ?? '';
     for (const category of [
       'Google account email',
-      'project, organization, and Cloudflare zone IDs',
-      'hostnames',
+      'project and organization IDs',
       'local paths',
       'Google Chat user IDs and display names',
     ]) {

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
-import { deriveGcpProjectId } from './gcloud.js';
+import { deriveGcpClaims, deriveGcpProjectId } from './gcp-identity.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths } from './paths.js';
 import type { SanitizedCommand } from './process.js';
@@ -75,12 +75,10 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string;
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: COMMIT,
-    allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+    allocated_ports: { onecli_app: 31_002, onecli_gateway: 31_003 },
     exclusive_resource_claims: {
-      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
-      gcp_project_id: 'assistant-project',
+      ...deriveGcpClaims(instanceId),
       gcp_account: 'operator@example.test',
-      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -122,7 +120,7 @@ describe('GWS-EA instance runtime', () => {
     expect(config.state_root).toBe(path.join(config.instance_root, 'state'));
     const secretsDirectory = path.join(config.instance_root, 'secrets');
     expect(config.secret_files).toEqual({
-      gchat_credentials: path.join(secretsDirectory, 'gchat-service-account.json'),
+      gchat_subscriber_key: path.join(secretsDirectory, 'gchat-subscriber-key.json'),
       onecli_runtime_api_key: path.join(secretsDirectory, 'onecli-runtime-api-key'),
       onecli_admin_api_key: path.join(secretsDirectory, 'onecli-admin-api-key'),
     });
@@ -131,13 +129,10 @@ describe('GWS-EA instance runtime', () => {
       await expect(lstat(path.join(release, entry))).rejects.toMatchObject({ code: 'ENOENT' });
     }
     expect((await lstat(path.join(config.instance_root, 'logs'))).isDirectory()).toBe(true);
-    expect(environmentFile).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
-    expect(environmentFile).toContain('WEBHOOK_HOST=127.0.0.1');
     expect(environmentFile).toContain(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`);
     expect(Object.keys(JSON.parse(manifest) as object).sort()).toEqual([
       'allocated_ports',
       'docker_endpoint',
-      'endpoint_url',
       'home_directory',
       'instance_id',
       'instance_root',
@@ -147,7 +142,7 @@ describe('GWS-EA instance runtime', () => {
       'selected_provider',
     ]);
     expect(JSON.parse(manifest)).toMatchObject({
-      schema_version: 2,
+      schema_version: 3,
       docker_endpoint: DOCKER_ENDPOINT,
       instance_root: config.instance_root,
     });
@@ -192,7 +187,7 @@ describe('GWS-EA instance runtime', () => {
     const environmentFile = path.join(config.state_root, '.env');
     // An earlier release quoted its value; the egress network key was lost; a skill added its own.
     const earlier = (await readFile(environmentFile, 'utf8'))
-      .replace('WEBHOOK_HOST=127.0.0.1', 'WEBHOOK_HOST="127.0.0.1"')
+      .replace('NANOCLAW_GATEWAY_PROVIDER=onecli', 'NANOCLAW_GATEWAY_PROVIDER="onecli"')
       .replace(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}\n`, '');
     await writeFile(environmentFile, `${earlier}# added by /add-telegram\nTELEGRAM_BOT_TOKEN=skill-value\n`);
 
@@ -417,8 +412,6 @@ describe('GWS-EA instance runtime', () => {
         `NANOCLAW_INSTALL_ID=${config.install_id}`,
         'DEFAULT_AGENT_PROVIDER=claude',
         'NANOCLAW_GATEWAY_PROVIDER=onecli',
-        `WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`,
-        'WEBHOOK_HOST=127.0.0.1',
         'NANOCLAW_EGRESS_LOCKDOWN=true',
         `NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`,
         `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
@@ -499,7 +492,7 @@ describe('GWS-EA instance runtime', () => {
       launchInstanceHost(path.join(config.state_root, 'data', 'gws-ea', 'runtime.json'), {}, execve, release),
     ).rejects.toMatchObject({
       code: 'ENOENT',
-      path: expect.stringContaining(`${path.dirname(config.secret_files.gchat_credentials)}${path.sep}`),
+      path: expect.stringContaining(`${path.dirname(config.secret_files.gchat_subscriber_key)}${path.sep}`),
     });
     expect(execve).not.toHaveBeenCalled();
   });
@@ -507,7 +500,7 @@ describe('GWS-EA instance runtime', () => {
   it('starts no host whose Chat subscriber key is empty', async () => {
     const { config, release } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, '  \n');
+    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_subscriber_key, '  \n');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
     const execve = vi.fn((): never => {
       throw new Error('execve called');
@@ -522,7 +515,7 @@ describe('GWS-EA instance runtime', () => {
   it('starts no host from a release the live link does not name, or while no release is live', async () => {
     const { config, release } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
+    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_subscriber_key, 'chat-credential');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
     const other = path.join(config.instance_root, 'bbbbbbbb');
     await releaseFolder(other);
@@ -551,7 +544,7 @@ describe('GWS-EA instance runtime', () => {
     const { config, release } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(
-      config.secret_files.gchat_credentials,
+      config.secret_files.gchat_subscriber_key,
       '{"client_email":"subscriber@example.test","private_key":"chat-secret-canary"}',
     );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
@@ -574,10 +567,6 @@ describe('GWS-EA instance runtime', () => {
             WEBHOOK_HOST: '0.0.0.0',
             ONECLI_URL: 'https://attacker.invalid',
             ONECLI_API_KEY: 'ambient-secret',
-            GCHAT_CREDENTIALS: 'ambient-chat-secret',
-            GCHAT_ENDPOINT_URL: 'https://attacker.invalid/webhook/gchat',
-            GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL:
-              'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
             [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: '/tmp/attacker-key.json',
             [GCHAT_PROJECT_ID_ENV]: 'attacker-project',
             NODE_OPTIONS: '--import=/tmp/attacker.js',
@@ -602,20 +591,21 @@ describe('GWS-EA instance runtime', () => {
         CONTAINER_IMAGE: `nanoclaw-agent-v2-${config.install_id}:r-${RELEASE}`,
         DOCKER_HOST: DOCKER_ENDPOINT,
         NANOCLAW_INSTALL_ID: config.install_id,
-        WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
-        WEBHOOK_HOST: '127.0.0.1',
         NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
         ONECLI_URL: config.onecli_app_url,
         ONECLI_API_KEY: 'runtime-secret-canary',
-        GWS_EA_GOOGLE_GRANT_FILE: path.join(path.dirname(config.secret_files.gchat_credentials), 'google-grant.json'),
+        GWS_EA_GOOGLE_GRANT_FILE: path.join(
+          path.dirname(config.secret_files.gchat_subscriber_key),
+          'google-grant.json',
+        ),
         // Chat delivery: the subscriber key's owner-only path, never the key, and the assistant's project.
-        [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: config.secret_files.gchat_credentials,
+        [GCHAT_SUBSCRIBER_KEY_FILE_ENV]: config.secret_files.gchat_subscriber_key,
         [GCHAT_PROJECT_ID_ENV]: deriveGcpProjectId(config.instance_id),
       },
     });
-    expect(calls[0]?.env).not.toHaveProperty('NODE_OPTIONS');
-    for (const retired of ['GCHAT_CREDENTIALS', 'GCHAT_ENDPOINT_URL', 'GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL']) {
-      expect(calls[0]?.env).not.toHaveProperty(retired);
+    // The host listens on no webhook: an ambient port or address never reaches it.
+    for (const ambient of ['NODE_OPTIONS', 'WEBHOOK_PORT', 'WEBHOOK_HOST']) {
+      expect(calls[0]?.env).not.toHaveProperty(ambient);
     }
     expect(JSON.stringify(calls[0]?.env)).not.toContain('chat-secret-canary');
     expect(Object.values(calls[0]?.env ?? {})).not.toContain('admin-secret-canary');

@@ -34,26 +34,9 @@ async function tempDirectory(): Promise<string> {
 }
 
 /** A Docker Engine API stand-in on a unix socket, answering `GET /_ping` and `GET /info`. */
-async function dockerDaemon(
-  status = 200,
-  /** Its `SecurityOptions`, or how `/info` fails: an error status, a connection dropped mid-answer, or entries that are not strings. */
-  info: readonly string[] | 'refused' | 'dropped' | 'malformed' = ['name=seccomp,profile=builtin'],
-): Promise<{ readonly host: string; readonly socket: string }> {
+async function dockerDaemon(status = 200): Promise<{ readonly host: string; readonly socket: string }> {
   const socket = path.join(await tempDirectory(), 'docker.sock');
   const server = createServer((request, response) => {
-    if (request.url === '/info') {
-      if (info === 'refused') {
-        response.writeHead(500).end('{"message":"unavailable"}');
-      } else if (info === 'dropped') {
-        response.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
-        response.write('{"SecurityOptions":[');
-        setTimeout(() => response.destroy(), 10);
-      } else {
-        response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ ID: 'daemon', SecurityOptions: info === 'malformed' ? [null] : info }));
-      }
-      return;
-    }
     response.writeHead(request.url === '/_ping' ? status : 404).end('OK');
   });
   await new Promise<void>((resolve) => server.listen(socket, resolve));
@@ -193,7 +176,6 @@ describe('prerequisites', () => {
       runningAsRoot: process.getuid?.() === 0,
       nodePath: '/opt/homebrew/Cellar/node/22.20.0/bin/node',
       dockerEndpoint: daemon.host,
-      rootlessDocker: false,
       account: 'operator@example.com',
     });
     expect(person.confirmGoogleAccount).toHaveBeenCalledWith('operator@example.com');
@@ -206,22 +188,6 @@ describe('prerequisites', () => {
       'gcloud auth list --filter=status:ACTIVE --format=value(account)',
       'gcloud auth print-access-token --account=operator@example.com --quiet',
     ]);
-  });
-
-  it('reports whether Linux Docker runs rootless, whose containers cannot reach the host loopback', async () => {
-    const rootless = await dockerDaemon(200, ['name=seccomp,profile=builtin', 'name=rootless', 'name=cgroupns']);
-    const on = async (daemon: { readonly host: string }, platform: NodeJS.Platform) => {
-      const host = fakeHost(daemon.host);
-      return (await checkPrerequisites(CREATE, operator(host), dependencies(host, { platform }))).rootlessDocker;
-    };
-
-    await expect(on(rootless, 'linux')).resolves.toBe(true);
-    await expect(on(await dockerDaemon(), 'linux')).resolves.toBe(false);
-    await expect(on(rootless, 'darwin')).resolves.toBe(false);
-    // A daemon that does not say, by an error, a dropped answer, or an unreadable list, is unknown rather than rootful.
-    for (const answer of ['refused', 'dropped', 'malformed'] as const) {
-      await expect(on(await dockerDaemon(200, answer), 'linux')).resolves.toBeUndefined();
-    }
   });
 
   it('refuses a Node.js without process.execve, naming its version, before running anything', async () => {

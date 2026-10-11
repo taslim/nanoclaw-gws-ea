@@ -85,25 +85,22 @@ describe("the principal's Google Chat address", () => {
 });
 
 describe('secret inputs', () => {
-  it('reads secrets from the environment first, then an owner-only file, and registers them', async () => {
+  it('reads a secret from the environment first, then an owner-only file, and registers it', async () => {
     const root = await configRoot();
     const fileSecret = `file-provider-${Date.now()}-secret`;
-    const file = await secretsFile(
-      root,
-      `# operator secrets\nGWS_EA_PROVIDER_CREDENTIAL="${fileSecret}"\nGWS_EA_CLOUDFLARE_API_TOKEN=from-file-token\n`,
-      0o400,
-    );
+    const file = await secretsFile(root, `# operator secrets\nGWS_EA_PROVIDER_CREDENTIAL="${fileSecret}"\n`, 0o400);
 
-    const source = await loadSecretSource({
-      environment: { GWS_EA_CLOUDFLARE_API_TOKEN: 'from-environment-token' },
+    const fromFile = await loadSecretSource({ environment: {}, file, configRoot: root });
+    const fromEnvironment = await loadSecretSource({
+      environment: { GWS_EA_PROVIDER_CREDENTIAL: 'from-environment-credential' },
       file,
       configRoot: root,
     });
 
-    expect(source.get('providerCredential')).toBe(fileSecret);
-    expect(source.get('cloudflareAccountToken')).toBe('from-environment-token');
+    expect(fromFile.get('providerCredential')).toBe(fileSecret);
+    expect(fromEnvironment.get('providerCredential')).toBe('from-environment-credential');
     expect(redact(fileSecret)).toBe(REDACTED);
-    expect(redact('from-environment-token')).toBe(REDACTED);
+    expect(redact('from-environment-credential')).toBe(REDACTED);
   });
 
   it('supplies nothing when neither source has a value', async () => {

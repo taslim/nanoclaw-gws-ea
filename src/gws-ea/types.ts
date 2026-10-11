@@ -1,4 +1,4 @@
-export const REGISTRY_SCHEMA_VERSION = 2 as const;
+export const REGISTRY_SCHEMA_VERSION = 3 as const;
 export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
 
 /** NanoClaw's channel type for Google Chat: the prefix of its user IDs and the `channel_type` of its rows. */
@@ -19,7 +19,6 @@ export const PROVISION_STEPS = [
   'configure_channel',
   'sign_in_google',
   'start_nanoclaw',
-  'establish_transport',
   'connect_google',
   'bind_principal',
   'verify_conversation',
@@ -28,50 +27,22 @@ export const PROVISION_STEPS = [
 export type ProvisionStepId = (typeof PROVISION_STEPS)[number];
 
 export interface AllocatedPorts {
-  nanoclaw_webhook: number;
   onecli_app: number;
   onecli_gateway: number;
 }
 
-export interface ExistingIngressClaim {
-  mode: 'existing';
-  endpoint_url: string;
-}
-
-export interface ManagedCloudflareIngressClaim {
-  mode: 'managed-cloudflare';
-  account_id: string;
-  zone_id: string;
-  zone_name: string;
-  hostname: string;
-  callback_url: string;
-  dns_record_id: string | null;
-}
-
-export type IngressClaim = ExistingIngressClaim | ManagedCloudflareIngressClaim;
-
-export interface SharedCloudflareMetadata {
-  ownership_id: string;
-  account_id: string;
-  tunnel_name: string;
-  tunnel_id: string | null;
-  /**
-   * Set under the machine lock before the tunnel is created, and cleared once
-   * its ID is recorded or it is retired, so a crash between the two leaves a
-   * record that a tunnel may exist under `tunnel_name`.
-   */
-  tunnel_creation_started_at: string | null;
-}
-
-export interface SharedInfrastructureMetadata {
-  cloudflare: SharedCloudflareMetadata | null;
-}
-
+/**
+ * What only this assistant may hold. Everything Google Cloud names is the
+ * instance's own: the project is derived from its instance ID, and the
+ * topic Google Chat publishes to, the pull subscription the host reads, and
+ * the account that may only pull it are derived from the project.
+ */
 export interface ExclusiveResourceClaims {
-  ingress: IngressClaim;
   gcp_project_id: string;
   gcp_account: string;
-  gchat_service_account: string;
+  gchat_events_topic: string;
+  gchat_events_subscription: string;
+  gchat_subscriber_account: string;
   workspace_email: string;
   onecli_project: string;
 }
@@ -124,11 +95,6 @@ export function sameRelease(left: ReleaseCoordinates, right: ReleaseCoordinates)
 export interface InstanceRegistry {
   schema_version: typeof REGISTRY_SCHEMA_VERSION;
   instances: Record<string, InstanceReservation>;
-  shared_infrastructure_metadata: SharedInfrastructureMetadata;
-}
-
-export function ingressEndpointUrl(claim: IngressClaim): string {
-  return claim.mode === 'existing' ? claim.endpoint_url : claim.callback_url;
 }
 
 /** Names the assistant a `state/` belongs to; which release runs is the live link and its Git HEAD (KTD2). */
