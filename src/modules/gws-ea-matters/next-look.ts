@@ -69,10 +69,12 @@ function nextRun(interval: CronExpression, cron: string): number {
  * A repeating look comes back at most as often as core lets a task repeat
  * without a gate. Core lets a task with a script repeat faster because the
  * script can skip a run; a look's script wakes `main` whenever its matter
- * is open, so the limit holds for looks too. It holds on every day of the
- * year ahead, counted on the principal's calendar, so a cron that comes back
- * often only on weekdays is refused on a Saturday too, and one that comes
- * back four times a day stays allowed on the day the clocks change.
+ * is open, so the limit holds for looks too. It holds on every day of a
+ * year, counted on the principal's calendar from the first day after today
+ * that the look comes back, however far ahead: a cron that comes back often
+ * only on weekdays, or only on 29 February, is refused whenever it is set,
+ * and one that comes back four times a day stays allowed on the days the
+ * clocks change.
  */
 function repeating(value: string, timezone: string, now: Date): NextLook {
   if (value.length > CRON_MAX_LENGTH || hasControlCharacters(value)) {
@@ -92,16 +94,18 @@ function repeating(value: string, timezone: string, now: Date): NextLook {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`--look-cron ${JSON.stringify(cron)} is not a cron expression: ${reason}`, { cause: error });
   }
-  const horizon = now.getTime() + YEAR_MS;
   const dayOf = new Intl.DateTimeFormat('en-CA', {
     timeZone: timezone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
   });
+  const today = dayOf.format(now);
   const firesOn = new Map<string, number>();
+  let horizon = Number.POSITIVE_INFINITY;
   for (let run = nextRun(interval, cron); run <= horizon; run = nextRun(interval, cron)) {
     const day = dayOf.format(run);
+    if (horizon === Number.POSITIVE_INFINITY && day !== today) horizon = run + YEAR_MS;
     const fires = (firesOn.get(day) ?? 0) + 1;
     if (fires > MAX_DAILY_FIRES) {
       throw new Error(

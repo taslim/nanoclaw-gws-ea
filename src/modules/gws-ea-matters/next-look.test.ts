@@ -23,6 +23,7 @@ describe('a next look', () => {
 
   it('keeps a repeating look’s cron expression for the principal’s time zone', () => {
     expect(parseNextLook({ cron: ' 0 9 14 3 * ' }, LAGOS, NOW)).toEqual({ kind: 'repeat', cron: '0 9 14 3 *' });
+    expect(parseNextLook({ cron: '0 9 29 2 *' }, LAGOS, NOW)).toEqual({ kind: 'repeat', cron: '0 9 29 2 *' });
     expect(parseNextLook({ cron: '0 8,12,16,20 * * *' }, LAGOS, NOW)).toEqual({
       kind: 'repeat',
       cron: '0 8,12,16,20 * * *',
@@ -53,6 +54,11 @@ describe('a next look', () => {
     // NOW is a Saturday: the day after it holds no run, the Monday after holds nine.
     ['a cron expression that fires hourly on weekdays', { cron: '0 9-17 * * 1-5' }, /more than 4 times a day/],
     ['a cron expression that fires every five minutes on Mondays', { cron: '*/5 * * * 1' }, /more than 4 times a day/],
+    [
+      'a cron expression that fires every five minutes on 29 February',
+      { cron: '*/5 * 29 2 *' },
+      /more than 4 times a day/,
+    ],
     ['a cron expression on two lines', { cron: '0 9 * *\n1' }, /must be one line/],
   ])('refuses %s', (_label, input, message) => {
     expect(() => parseNextLook(input, LAGOS, NOW)).toThrow(message);
