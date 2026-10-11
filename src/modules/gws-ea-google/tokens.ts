@@ -9,13 +9,18 @@ import { isRecord } from '../../gws-ea/validation.js';
 import {
   credentialScopes,
   GOOGLE_SERVICES,
+  googleGrantIdentity,
   grantedScopes,
   type AgentGoogleCredential,
   type GoogleGrant,
   type GoogleServiceId,
+  type HostGoogleServiceId,
 } from './grant.js';
 
 export const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+
+/** Renew a token this long before Google expires it. */
+export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
 
 /** Google refused the refresh token itself: the sign-in was revoked or expired, and only a new one helps. */
 export class GoogleGrantRevokedError extends Error {
@@ -172,4 +177,63 @@ export async function mintCredentialToken(
     const token = await mintToken(grant, credential.host, kept, options);
     return { ...token, fallback: { refused, reason: error.reason } };
   }
+}
+
+export interface HostTokenSourceOptions extends TokenOptions {
+  /** The current grant, or undefined before the assistant has signed in. */
+  readonly readGrant: () => Promise<GoogleGrant | undefined>;
+}
+
+/** Tokens for the host-only services, held only in this process's memory. */
+export interface HostTokenSource {
+  /** A live token for a host-only service. */
+  accessToken(service: HostGoogleServiceId): Promise<string>;
+}
+
+/**
+ * The host's own tokens (KTD5, KTD6), minted from the grant on demand. It
+ * needs nothing but the grant, so a channel that starts before the host's
+ * modules has its token, whatever the gateway stores. A token is kept until
+ * it is close to expiry, and a new sign-in replaces every token. A revoked
+ * sign-in is not asked again until a new one is written; any other failure
+ * is asked again on the next call.
+ */
+export function createHostTokenSource(options: HostTokenSourceOptions): HostTokenSource {
+  const now = options.now ?? Date.now;
+  const tokenOptions: TokenOptions = { ...(options.fetch ? { fetch: options.fetch } : {}), now };
+  const held = new Map<HostGoogleServiceId, { identity: string; token: ServiceToken }>();
+  const minting = new Map<HostGoogleServiceId, Promise<string>>();
+  let revoked: string | undefined;
+
+  async function mint(service: HostGoogleServiceId): Promise<string> {
+    const grant = await options.readGrant();
+    if (!grant) throw new Error('The assistant is not signed in to Google yet');
+    const identity = googleGrantIdentity(grant);
+    if (revoked === identity) {
+      throw new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again");
+    }
+    const current = held.get(service);
+    if (current && current.identity === identity && current.token.expiresAt - now() > RENEW_BEFORE_EXPIRY_MS) {
+      return current.token.accessToken;
+    }
+    try {
+      const token = await mintServiceToken(grant, service, tokenOptions);
+      held.set(service, { identity, token });
+      return token.accessToken;
+    } catch (error) {
+      if (error instanceof GoogleGrantRevokedError) revoked = identity;
+      throw error;
+    }
+  }
+
+  return {
+    accessToken(service) {
+      // Callers asking at once share one mint.
+      const pending = minting.get(service);
+      if (pending) return pending;
+      const minted = mint(service).finally(() => minting.delete(service));
+      minting.set(service, minted);
+      return minted;
+    },
+  };
 }

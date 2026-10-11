@@ -27,8 +27,9 @@ const NO_ACCOUNT = 'morgan@nowhere.example';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 
 const GRANT: GoogleGrant = {
-  schema_version: 1,
+  schema_version: 2,
   account: ASSISTANT,
+  sub: '104857395723948572901',
   client_id: 'client-id',
   client_secret: 'client-secret',
   refresh_token: 'refresh-token',

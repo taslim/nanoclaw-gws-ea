@@ -60,10 +60,37 @@ const CEILING = [
   'https://www.googleapis.com/auth/presentations.readonly',
   'https://www.googleapis.com/auth/forms.body.readonly',
 ];
+/** The host's Chat token: messages and reactions, reading spaces and opening a DM, and reading members. */
+const CHAT = [
+  'https://www.googleapis.com/auth/chat.messages',
+  'https://www.googleapis.com/auth/chat.spaces.readonly',
+  'https://www.googleapis.com/auth/chat.spaces.create',
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
+];
+/** Every other Chat scope a user can grant. */
+const CHAT_CEILING = [
+  'https://www.googleapis.com/auth/chat.spaces',
+  'https://www.googleapis.com/auth/chat.delete',
+  'https://www.googleapis.com/auth/chat.memberships',
+  'https://www.googleapis.com/auth/chat.memberships.app',
+  'https://www.googleapis.com/auth/chat.messages.readonly',
+  'https://www.googleapis.com/auth/chat.messages.create',
+  'https://www.googleapis.com/auth/chat.messages.reactions',
+  'https://www.googleapis.com/auth/chat.messages.reactions.readonly',
+  'https://www.googleapis.com/auth/chat.messages.reactions.create',
+  'https://www.googleapis.com/auth/chat.users.readstate',
+  'https://www.googleapis.com/auth/chat.users.readstate.readonly',
+  'https://www.googleapis.com/auth/chat.users.spacesettings',
+  'https://www.googleapis.com/auth/chat.users.sections',
+  'https://www.googleapis.com/auth/chat.users.sections.readonly',
+  'https://www.googleapis.com/auth/chat.customemojis',
+  'https://www.googleapis.com/auth/chat.customemojis.readonly',
+];
 
 const VALID = {
-  schema_version: 1,
+  schema_version: 2,
   account: 'Juno@Example.test',
+  sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',
@@ -77,7 +104,10 @@ describe("the assistant's Google grant", () => {
   });
 
   it.each([
-    ['another schema', { ...VALID, schema_version: 2 }],
+    ['the schema from before it recorded the account ID', { ...VALID, schema_version: 1 }],
+    ['another schema', { ...VALID, schema_version: 3 }],
+    ['no account ID', { ...VALID, sub: undefined }],
+    ["an account ID that is not Google's numeric one", { ...VALID, sub: 'users/104857395723948572901' }],
     ['no refresh token', { ...VALID, refresh_token: '' }],
     ['a control character', { ...VALID, client_id: 'client\nid' }],
     ['no scopes', { ...VALID, scopes: [] }],
@@ -97,7 +127,9 @@ describe("the assistant's Google grant", () => {
       'https://www.googleapis.com/auth/directory.readonly',
       ...WORKSPACE_SCOPES,
       'https://www.googleapis.com/auth/gmail.modify',
+      ...CHAT,
       ...CEILING,
+      ...CHAT_CEILING,
     ]);
     expect(new Set(GOOGLE_SIGN_IN_SCOPES).size).toBe(GOOGLE_SIGN_IN_SCOPES.length);
   });
@@ -111,7 +143,9 @@ describe("the assistant's Google grant", () => {
       ...AGENT_GOOGLE_SERVICES.directory.scopes,
       ...HOST_GOOGLE_SERVICES.gmail.scopes,
     ];
-    expect(missingGoogleScopes(beforeThisRelease)).toEqual([...WORKSPACE_SCOPES, ...CEILING]);
+    expect(missingGoogleScopes(beforeThisRelease)).toEqual([...WORKSPACE_SCOPES, ...CHAT, ...CEILING, ...CHAT_CEILING]);
+    const beforeChat = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !scope.includes('/auth/chat.'));
+    expect(missingGoogleScopes(beforeChat)).toEqual([...CHAT, ...CHAT_CEILING]);
     expect(missingGoogleScopes(GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== 'https://mail.google.com/'))).toEqual([
       'https://mail.google.com/',
     ]);
@@ -220,7 +254,7 @@ describe('the Google services agents reach', () => {
     const hostOnly = Object.values(HOST_GOOGLE_SERVICES)
       .flatMap((service) => service.scopes)
       .filter((scope) => !EXPOSED_GOOGLE_SERVICES.some((id) => GOOGLE_SERVICES[id].scopes.includes(scope)));
-    expect(hostOnly).toEqual(['https://www.googleapis.com/auth/gmail.modify']);
+    expect(hostOnly).toEqual(['https://www.googleapis.com/auth/gmail.modify', ...CHAT]);
     for (const scope of hostOnly) expect(agentScopes.has(scope), scope).toBe(false);
     // A host-only service names no gateway credential, so nothing could publish it.
     for (const service of Object.values(HOST_GOOGLE_SERVICES)) expect(service).not.toHaveProperty('secretName');
@@ -229,5 +263,21 @@ describe('the Google services agents reach', () => {
   it("holds Drive for the host's own use with the same scope agents' Calendar credential carries", () => {
     expect(HOST_GOOGLE_SERVICES['drive-host']).toEqual({ scopes: [DRIVE] });
     expect(HOST_GOOGLE_SERVICES['calendar-host']).toEqual({ scopes: AGENT_GOOGLE_SERVICES.calendar.scopes });
+  });
+
+  it('gives Chat to the host alone, with the narrowest scopes covering what the assistant does there', () => {
+    expect(HOST_GOOGLE_SERVICES.chat).toEqual({ scopes: CHAT });
+    const agentScopes = AGENT_GOOGLE_CREDENTIALS.flatMap((credential) =>
+      credentialScopes(credential, [...GOOGLE_SIGN_IN_SCOPES]),
+    );
+    expect(agentScopes.filter((scope) => scope.includes('/auth/chat.'))).toEqual([]);
+    for (const service of Object.values(AGENT_GOOGLE_SERVICES)) {
+      expect(service.scopes.filter((scope) => scope.includes('/auth/chat.'))).toEqual([]);
+    }
+  });
+
+  it("reads people's names for the host with the directory scope the sign-in already asks for", () => {
+    expect(HOST_GOOGLE_SERVICES['directory-host']).toEqual({ scopes: AGENT_GOOGLE_SERVICES.directory.scopes });
+    expect(GOOGLE_SIGN_IN_SCOPES).toContain('https://www.googleapis.com/auth/directory.readonly');
   });
 });

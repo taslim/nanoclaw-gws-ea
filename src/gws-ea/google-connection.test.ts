@@ -32,7 +32,16 @@ const SECRETS = path.join(ROOT, 'secrets');
 const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
 const DRIVE = 'https://www.googleapis.com/auth/drive';
-/** The scopes this release adds to the sign-in, in the order it asks for them: Workspace's, then the ceiling. */
+const HOST_CHAT: readonly string[] = HOST_GOOGLE_SERVICES.chat.scopes;
+/** Chat's scopes beyond the host's Chat token, each pinned in grant.test.ts. */
+const CHAT_CEILING = GOOGLE_SIGN_IN_SCOPES.filter(
+  (scope) => scope.includes('/auth/chat.') && !HOST_CHAT.includes(scope),
+);
+/**
+ * The scopes the sign-in asks for beyond what an assistant signed in before
+ * Workspace holds, in the order it asks for them: Workspace's, Chat's, then
+ * the ceiling.
+ */
 const THIS_RELEASE_SCOPES = [
   DRIVE,
   'https://www.googleapis.com/auth/documents',
@@ -40,6 +49,7 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/presentations',
   'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.responses.readonly',
+  ...HOST_CHAT,
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.readonly',
   'https://www.googleapis.com/auth/calendar.events.readonly',
@@ -73,6 +83,7 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets.readonly',
   'https://www.googleapis.com/auth/presentations.readonly',
   'https://www.googleapis.com/auth/forms.body.readonly',
+  ...CHAT_CEILING,
 ];
 /** The scopes an assistant signed in before Drive, Docs, Sheets, Slides and Forms holds. */
 const BEFORE_WORKSPACE = [
@@ -204,8 +215,9 @@ class World {
 
 function grant(overrides: Partial<GoogleGrant> = {}): GoogleGrant {
   return {
-    schema_version: 1,
+    schema_version: 2,
     account: ACCOUNT,
+    sub: '104857395723948572901',
     ...CLIENT,
     refresh_token: '1//refresh-token',
     scopes: GOOGLE_SIGN_IN_SCOPES.map((scope) =>
