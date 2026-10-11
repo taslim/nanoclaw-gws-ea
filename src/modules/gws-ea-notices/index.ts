@@ -63,6 +63,7 @@ import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, registerDeliveryAction, registerDeliveryFailedHook } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { InboundOrigin, OutboundMessage } from '../../mailbox/index.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
@@ -175,7 +176,7 @@ function contentOf(raw: string): Readonly<Record<string, unknown>> | undefined {
     if (error instanceof SyntaxError) return undefined;
     throw error;
   }
-  return typeof content === 'object' && content !== null ? (content as Record<string, unknown>) : undefined;
+  return isRecord(content) ? content : undefined;
 }
 
 /** The inbound messages a session holds with these ids; none once the session is gone. */

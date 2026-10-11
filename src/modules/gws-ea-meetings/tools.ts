@@ -64,7 +64,7 @@ import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
-import { listOpenMatterLinks, placeInMatter } from '../gws-ea-matters/db.js';
+import { openMatterOfThread, placeInMatter } from '../gws-ea-matters/db.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import {
   getGwsEaProfile,
@@ -212,17 +212,12 @@ interface ThreadView {
 async function matterThreads(booking: ThreadBooking, joining: boolean): Promise<string[]> {
   /* eslint-disable no-catch-all/no-catch-all -- the booking already stands; its matter is best effort, never a retry that books again */
   try {
-    const links = await listOpenMatterLinks();
-    const matterId = links.find((link) => link.kind === 'thread' && link.reference === booking.threadKey)?.matter_id;
-    if (matterId === undefined) return [];
+    const matter = await openMatterOfThread(booking.threadKey);
+    if (matter === undefined) return [];
     if (joining) {
-      await placeInMatter(matterId, [{ kind: 'event', reference: `${booking.calendarId}/${booking.eventId}` }]);
+      await placeInMatter(matter.matterId, [{ kind: 'event', reference: `${booking.calendarId}/${booking.eventId}` }]);
     }
-    return links.flatMap((link) =>
-      link.matter_id === matterId && link.kind === 'thread' && link.reference !== booking.threadKey
-        ? [link.reference]
-        : [],
-    );
+    return matter.threads.filter((threadKey) => threadKey !== booking.threadKey);
   } catch (err) {
     log.error("A booking's matter could not be read or joined", { threadKey: booking.threadKey, err });
     return [];

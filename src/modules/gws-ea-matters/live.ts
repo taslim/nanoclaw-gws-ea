@@ -38,8 +38,8 @@ import {
   parseAddressList,
   parseGmailMessage,
 } from '../gws-ea-inbox/mime.js';
-import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
-import { getThread, threadAccount } from '../gws-ea-inbox/thread-map.js';
+import { assistantAddressesOf } from '../gws-ea-inbox/runtime.js';
+import { getThread, THREAD_ACCOUNT_MAX, threadAccount, type ThreadAccount } from '../gws-ea-inbox/thread-map.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import {
   createMeetingsCalendarApi,
@@ -48,7 +48,7 @@ import {
   type MeetingsCalendarApi,
 } from '../gws-ea-meetings/calendar-api.js';
 import { findPeople, getPerson, loadForgottenMatcher } from '../gws-ea-people/db.js';
-import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   createDriveApi,
   FOLDER_MIME_TYPE,
@@ -65,18 +65,11 @@ export const READ_DEADLINE_MS = 5_000;
 const UNREAD = "couldn't read just now";
 const FORGOTTEN = 'someone forgotten';
 const FRAME_LIMIT = 1_200;
-const ACCOUNT_LIMIT = 2_000;
 /** The guests an answer names before it counts the rest. */
 const GUESTS_NAMED = 8;
 /** The open comments for the assistant a file shows the words of, newest first. */
 const COMMENTS_SHOWN = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-/** What the agent working a thread last said of it (KTD9): its words, and when, ISO. */
-export interface ThreadAccount {
-  readonly text: string;
-  readonly at: string;
-}
 
 /** Where a matter's links are read from. */
 export interface LiveSources {
@@ -116,13 +109,14 @@ export interface Lens {
   readonly isForgotten: (handle: string) => boolean;
 }
 
+/** The lens for a render, the principal and the assistant both from one read of the profile. */
 export async function loadLens(timezone: string): Promise<Lens> {
   const profile = await getGwsEaProfile();
   return {
     timezone,
     principalName: profile.principal_display_name ?? 'the principal',
-    principal: await loadPrincipalRecognizer(),
-    assistant: await assistantAddresses(),
+    principal: principalRecognizer(profile.principal_emails),
+    assistant: assistantAddressesOf(profile),
     isForgotten: await loadForgottenMatcher(),
   };
 }
@@ -390,7 +384,7 @@ async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens):
   if (account.value === undefined) return [handled];
   return [
     `${handled}; its account, ${formatLocalTime(account.value.at, lens.timezone)}:`,
-    untrusted(account.value.text, ACCOUNT_LIMIT, link.handler),
+    untrusted(account.value.text, THREAD_ACCOUNT_MAX, link.handler),
   ];
 }
 

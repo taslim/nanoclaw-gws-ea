@@ -21,7 +21,7 @@ import { threadsWithMessageIds } from '../gws-ea-inbox/thread-map.js';
 import { bookingThread } from '../gws-ea-meetings/thread-calendar.js';
 import { getPerson } from '../gws-ea-people/db.js';
 import { loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
-import { getMatter, listOpenMatterLinks, type Matter, type PieceKind } from './db.js';
+import { getMatter, listOpenMatterLinks, type Matter, type OpenMatterLink, type PieceKind } from './db.js';
 
 /** Why an open matter is suggested, strongest first. */
 export const CANDIDATE_REASONS = ['reply chain', 'booking', 'same person', 'same organization'] as const;
@@ -98,12 +98,26 @@ export function verifiedSender(verdict: SenderVerdict): string | undefined {
   }
 }
 
+/** The principal's addresses, then the assistant's: their domains say nothing of how two pieces relate. */
+export async function ownAddresses(): Promise<string[]> {
+  return [...(await loadPrincipalRecognizer()).listed, ...(await assistantAddresses())];
+}
+
+/**
+ * What `candidatesFor` reads for every piece, which a caller suggesting for
+ * several pieces reads once: every link of every open matter, and the
+ * principal's and the assistant's addresses, read on first use.
+ */
+export interface CandidateReads {
+  readonly links: readonly OpenMatterLink[];
+  readonly ownAddresses: () => Promise<readonly string[]>;
+}
+
 /** The sender's organization, or undefined when their domain says nothing of one. */
-async function organizationOf(sender: string): Promise<string | undefined> {
+async function organizationOf(sender: string, own: () => Promise<readonly string[]>): Promise<string | undefined> {
   const domain = domainOf(sender);
   if (FREE_MAIL.has(domain)) return undefined;
-  const own = [...(await loadPrincipalRecognizer()).listed, ...(await assistantAddresses())];
-  return own.some((address) => domainOf(address.toLowerCase()) === domain) ? undefined : domain;
+  return (await own()).some((address) => domainOf(address.toLowerCase()) === domain) ? undefined : domain;
 }
 
 /** A person's email addresses, as their record holds them. */
@@ -126,17 +140,21 @@ async function candidate(matter: Matter, reasons: ReadonlySet<CandidateReason>):
   };
 }
 
-/** The open matters `piece` may belong to, strongest reason first, then most recently changed. */
-export async function candidatesFor(piece: NewPiece): Promise<Candidate[]> {
+/**
+ * The open matters `piece` may belong to, strongest reason first, then most
+ * recently changed. `reads` is what a caller suggesting for several pieces
+ * read once for all of them.
+ */
+export async function candidatesFor(piece: NewPiece, reads?: CandidateReads): Promise<Candidate[]> {
   const sender = piece.from === undefined ? undefined : normalizeAddress(piece.from);
   if (sender === undefined) return [];
-  const links = await listOpenMatterLinks();
+  const { links, ownAddresses: own } = reads ?? { links: await listOpenMatterLinks(), ownAddresses };
   const found = new Map<string, Set<CandidateReason>>();
   const suggest = (matterId: string, reason: CandidateReason): void => {
     found.set(matterId, (found.get(matterId) ?? new Set<CandidateReason>()).add(reason));
   };
 
-  const organization = await organizationOf(sender);
+  const organization = await organizationOf(sender, own);
   const senderKey = identityMatchKey(`email:${sender}`);
   const people = new Map<string, CandidateReason | undefined>();
   for (const link of links.filter((held) => held.kind === 'person')) {

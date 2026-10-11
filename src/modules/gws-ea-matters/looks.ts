@@ -34,11 +34,13 @@ import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.
 import {
   closeMatter,
   getMatter,
+  listOpenLookSlots,
   openMatter,
   recordLookTask,
   requireMatter,
   updateMatter,
   type CloseMatterInput,
+  type LookSlot,
   type Matter,
   type OpenMatterInput,
   type Placed,
@@ -109,6 +111,20 @@ export async function findTasks(ids: readonly string[]): Promise<Map<string, Hel
     for (const { id, task } of tasks ?? []) found.set(id, { session, task });
   }
   return found;
+}
+
+/** An open matter's look slot, with the task it records as one of main's conversations holds it. */
+export interface HeldSlot {
+  readonly slot: LookSlot;
+  /** Undefined while it records none, or none of main's conversations holds the one it records. */
+  readonly held: HeldTask | undefined;
+}
+
+/** Every open matter's look slot, oldest first, each with its task as main's conversations hold it. */
+export async function listHeldLookSlots(): Promise<HeldSlot[]> {
+  const slots = await listOpenLookSlots();
+  const tasks = await findTasks(slots.flatMap((slot) => (slot.look_task_id === null ? [] : [slot.look_task_id])));
+  return slots.map((slot) => ({ slot, held: slot.look_task_id === null ? undefined : tasks.get(slot.look_task_id) }));
 }
 
 /** Cancel a task series wherever in `main`'s conversations it is; a spent one stays as it is. */

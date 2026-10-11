@@ -229,12 +229,17 @@ export function canonicalReference(kind: LinkKind, value: string): string {
   }
 }
 
+/** A link's key in a map or a set: one for each kind and reference. */
+export function linkKey(kind: LinkKind, reference: string): string {
+  return `${kind}\u0000${reference}`;
+}
+
 /** The links in their canonical spelling, each once, in the order given. */
 function parseLinks(links: readonly LinkRef[]): LinkRef[] {
   const parsed = new Map<string, LinkRef>();
   for (const link of links) {
     const reference = canonicalReference(link.kind, link.reference);
-    parsed.set(`${link.kind}\u0000${reference}`, { kind: link.kind, reference });
+    parsed.set(linkKey(link.kind, reference), { kind: link.kind, reference });
   }
   return [...parsed.values()];
 }
@@ -369,6 +374,27 @@ export async function listOpenMatterLinks(): Promise<OpenMatterLink[]> {
   return getDb().all<OpenMatterLink>(
     'SELECT matter_id, kind, reference FROM gws_ea_matter_links WHERE matter_open = 1 ORDER BY matter_id, linked_at, rowid',
   );
+}
+
+/**
+ * The open matter a thread sits in, with that matter's threads in the order
+ * they were placed, the thread among them, looked up by the thread alone;
+ * undefined while it sits in none.
+ */
+export async function openMatterOfThread(
+  threadKey: string,
+): Promise<{ readonly matterId: string; readonly threads: readonly string[] } | undefined> {
+  const rows = await getDb().all<{ readonly matter_id: string; readonly reference: string }>(
+    `SELECT other.matter_id, other.reference
+       FROM gws_ea_matter_links mine
+       JOIN gws_ea_matter_links other
+         ON other.matter_id = mine.matter_id AND other.kind = 'thread' AND other.matter_open = 1
+      WHERE mine.kind = 'thread' AND mine.reference = ? AND mine.matter_open = 1
+      ORDER BY other.linked_at, other.rowid`,
+    threadKey,
+  );
+  const [first] = rows;
+  return first === undefined ? undefined : { matterId: first.matter_id, threads: rows.map((row) => row.reference) };
 }
 
 /** Every closed matter, most recently closed first. */
@@ -735,11 +761,6 @@ export async function setLinkHandler(link: LinkRef, handler: string): Promise<vo
 }
 
 /**
- * Record the scheduled task that is a matter's next look, or null when it
- * has none (KTD4). The task is the clock, so this is not a change to the
- * matter itself and leaves `updated_at` as it was.
- */
-/**
  * Mark that a run of the matter's look failed, or clear the mark (KTD7 step 3).
  * A matter that is gone, or closed since, is left as it is.
  */
@@ -747,6 +768,11 @@ export async function markLookFailed(id: string, at: string | null): Promise<voi
   await getDb().run('UPDATE gws_ea_matters SET look_failed_at = ? WHERE id = ? AND closed_at IS NULL', at, id);
 }
 
+/**
+ * Record the scheduled task that is a matter's next look, or null when it
+ * has none (KTD4). The task is the clock, so this is not a change to the
+ * matter itself and leaves `updated_at` as it was.
+ */
 export async function recordLookTask(id: string, taskId: string | null): Promise<void> {
   const matterId = id.trim();
   const result = await getDb().run('UPDATE gws_ea_matters SET look_task_id = ? WHERE id = ?', taskId, matterId);

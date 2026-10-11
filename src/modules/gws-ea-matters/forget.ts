@@ -24,7 +24,7 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { clearThreadAccounts, threadsWithAddresses } from '../gws-ea-inbox/thread-map.js';
 import { mayNamePerson, type ForgottenPerson, type PersonToForget } from '../gws-ea-people/db.js';
-import type { LinkRef } from './db.js';
+import { linkKey, type LinkRef } from './db.js';
 import { isEventOrFile, linksOn } from './live.js';
 import { cancelTaskSeries, oneAtATime } from './looks.js';
 
@@ -69,10 +69,6 @@ async function keptOnlyFor(personId: string): Promise<KeptOnlyFor[]> {
   return matters.filter((matter) => strands.every((strand) => strand.parent_id !== matter.id || going.has(strand.id)));
 }
 
-function linkKey(link: LinkRef): string {
-  return `${link.kind}\u0000${link.reference}`;
-}
-
 /**
  * Every matter, open or closed, that may still tell of the person once the
  * hook has run, oldest first, each as `matter <id>`, for main to rewrite.
@@ -106,9 +102,9 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
   }
   // The events and files of the matters not named yet, each read once however many matters link it.
   const unsure = links.filter((link) => !named.has(link.matter_id)).filter(isEventOrFile);
-  const pieces = new Map(unsure.map((link) => [linkKey(link), link]));
-  const on = new Set((await linksOn([...pieces.values()], isTheirs)).map(linkKey));
-  for (const link of unsure) if (on.has(linkKey(link))) named.add(link.matter_id);
+  const pieces = new Map(unsure.map((link) => [linkKey(link.kind, link.reference), link]));
+  const on = new Set((await linksOn([...pieces.values()], isTheirs)).map((link) => linkKey(link.kind, link.reference)));
+  for (const link of unsure) if (on.has(linkKey(link.kind, link.reference))) named.add(link.matter_id);
 
   return matters
     .filter((matter) => named.has(matter.id) && !going.has(matter.id))

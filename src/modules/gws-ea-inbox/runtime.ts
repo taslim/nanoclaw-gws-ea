@@ -5,7 +5,7 @@
  */
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
-import { getGwsEaProfile, loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, loadPrincipalRecognizer, type GwsEaProfile } from '../gws-ea-profile/db.js';
 import type { GmailApi } from './gmail-api.js';
 import { threadAddresses } from './thread-map.js';
 
@@ -41,11 +41,14 @@ export function activeInbox(): InboxRuntime | undefined {
 
 /** The assistant's own addresses: never a recipient, and never "someone else" on a message. */
 export async function assistantAddresses(): Promise<ReadonlySet<string>> {
+  return assistantAddressesOf((await getDb().hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined);
+}
+
+/** The assistant's own addresses, from a profile already read: the one it names, and the one Gmail reported. */
+export function assistantAddressesOf(profile: GwsEaProfile | undefined): ReadonlySet<string> {
   const addresses = new Set<string>();
-  if (await getDb().hasTable('gws_ea_profile')) {
-    const email = (await getGwsEaProfile()).assistant_workspace_email;
-    if (email) addresses.add(email.toLowerCase());
-  }
+  const email = profile?.assistant_workspace_email;
+  if (email) addresses.add(email.toLowerCase());
   const known = active?.knownGmailAddress();
   if (known) addresses.add(known.toLowerCase());
   return addresses;

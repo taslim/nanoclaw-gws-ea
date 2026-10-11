@@ -24,10 +24,9 @@ import type { Session } from '../../types.js';
 import { listUnplacedThreads, type UnplacedThread } from '../gws-ea-inbox/thread-map.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { createScheduledTask, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
-import { listOpenLookSlots } from './db.js';
 import {
   cancelTaskSeries,
-  findTasks,
+  listHeldLookSlots,
   lookSeries,
   mainConversations,
   oneAtATime,
@@ -196,10 +195,8 @@ interface DueLook {
 
 /** Every open matter's look that comes before `before`, ISO, soonest first: overdue ones included. */
 async function looksBefore(before: string): Promise<DueLook[]> {
-  const slots = await listOpenLookSlots();
-  const tasks = await findTasks(slots.flatMap((slot) => (slot.look_task_id === null ? [] : [slot.look_task_id])));
-  const due = slots.flatMap((slot): DueLook[] => {
-    const task = slot.look_task_id === null ? undefined : tasks.get(slot.look_task_id)?.task;
+  const due = (await listHeldLookSlots()).flatMap(({ slot, held }): DueLook[] => {
+    const task = held?.task;
     if (
       task?.status !== 'pending' ||
       task.processAfter === null ||

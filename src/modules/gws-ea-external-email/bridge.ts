@@ -99,6 +99,7 @@ import {
   recordThreadFile,
   releaseThread,
   setThreadAccount,
+  THREAD_ACCOUNT_MAX,
   THREAD_HANDLER,
   threadAddresses,
   threadMessages,
@@ -532,8 +533,6 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
 
 const NOTHING_TOLD = 'main was told nothing';
 const MEGABYTE = 1024 * 1024;
-/** The longest account: what a matter shows whole under its thread (`ACCOUNT_LIMIT` in gws-ea-matters/live.ts). */
-const ACCOUNT_MAX = 2_000;
 
 /** What external-email reads when its account is kept and main is left to its work. */
 const ACCOUNT_KEPT =
@@ -541,12 +540,12 @@ const ACCOUNT_KEPT =
 
 function accountOf(value: unknown): string {
   const account = writtenText(value);
-  if (account.length > ACCOUNT_MAX) {
+  if (account.length > THREAD_ACCOUNT_MAX) {
     throw invalidArgs(
-      `account is ${account.length} characters, and may be at most ${ACCOUNT_MAX}: keep to what you did, what you learned that the thread's mail doesn't say, and where it stands.`,
+      `account is ${account.length} characters, and may be at most ${THREAD_ACCOUNT_MAX}: keep to what you did, what you learned that the thread's mail doesn't say, and where it stands.`,
     );
   }
-  if (account === '') throw invalidArgs(`account must be text of 1 to ${ACCOUNT_MAX} characters`);
+  if (account === '') throw invalidArgs(`account must be text of 1 to ${THREAD_ACCOUNT_MAX} characters`);
   return account;
 }
 
@@ -663,7 +662,7 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
   const result = await writeNoteForMain({
     id: `tell-main-${session.id}-${requestId}`,
     timestamp: now.toISOString(),
-    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, ACCOUNT_MAX)}`,
+    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, THREAD_ACCOUNT_MAX)}`,
     wake: true,
     files,
     pieces: [{ kind: 'thread', reference: threadKey }],

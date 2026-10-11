@@ -21,7 +21,7 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { getMatter, type Matter, type OpenMatterSummary } from './db.js';
-import { hostSources, loadLens, readLinks, type LiveSources } from './live.js';
+import { hostSources, loadLens, readLinks, type Lens, type LiveSources } from './live.js';
 
 /** The time zone `main` lives in, which its matters are read and written in. */
 export async function principalTimezone(): Promise<string> {
@@ -87,15 +87,25 @@ function projectLines(matter: Matter, project: Matter | undefined): string[] {
   ];
 }
 
+/** Who a render may name and the zone it gives times in, as they stand now. */
+export async function principalLens(): Promise<Lens> {
+  return loadLens(await principalTimezone());
+}
+
 /**
  * The matter as it stands now, every link read fresh from its source by the
  * host's own Google clients, or by `sources` when given. A link whose source
- * fails or is late says so; the rest render all the same.
+ * fails or is late says so; the rest render all the same. `given` is the
+ * lens a caller rendering several matters read once for all of them.
  */
-export async function renderMatter(matter: Matter, sources: LiveSources = hostSources()): Promise<string> {
+export async function renderMatter(
+  matter: Matter,
+  sources: LiveSources = hostSources(),
+  given?: Lens,
+): Promise<string> {
   const readAt = new Date().toISOString();
-  const timezone = await principalTimezone();
-  const lens = await loadLens(timezone);
+  const lens = given ?? (await principalLens());
+  const { timezone } = lens;
   const [links, look, project] = await Promise.all([
     readLinks(matter.links, sources, lens),
     matter.open && matter.look_task_id !== null ? readNextLook(matter.look_task_id) : undefined,

@@ -26,19 +26,28 @@ import type { OutboundFile } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, Session } from '../../types.js';
-import { candidatesFor, renderCandidates, type NewPiece } from '../gws-ea-matters/candidates.js';
+import {
+  candidatesFor,
+  ownAddresses,
+  renderCandidates,
+  type CandidateReads,
+  type NewPiece,
+} from '../gws-ea-matters/candidates.js';
 import {
   canonicalReference,
   getMatter,
+  linkKey,
   listOpenMatterLinks,
   PIECE_KINDS,
   type PieceKind,
 } from '../gws-ea-matters/db.js';
-import { renderMatter } from '../gws-ea-matters/render.js';
+import { hostSources, type Lens } from '../gws-ea-matters/live.js';
+import { principalLens, renderMatter } from '../gws-ea-matters/render.js';
 import { getMainAgentGroupId, principalContact } from './db.js';
 
 /** A piece of work a note is about, by the id its writer holds (KTD11). */
@@ -144,15 +153,21 @@ async function bestEffort<T>(what: string, work: () => Promise<T>, fallback: T):
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** A matter rendered live, or nothing once it is gone. */
-async function matterView(id: string): Promise<string[]> {
+/** Run `read` once, on first use, however many of a note's parts ask for its result. */
+function once<T>(read: () => Promise<T>): () => Promise<T> {
+  let result: Promise<T> | undefined;
+  return () => (result ??= read());
+}
+
+/** A matter rendered live through the note's lens, or nothing once it is gone. */
+async function matterView(id: string, lens: () => Promise<Lens>): Promise<string[]> {
   const matter = await getMatter(id);
-  return matter === undefined ? [] : [await renderMatter(matter)];
+  return matter === undefined ? [] : [await renderMatter(matter, hostSources(), await lens())];
 }
 
 /** The open matters a new piece in none may belong to, with why; nothing when none is suggested. */
-async function suggestions(piece: NewPiece): Promise<string[]> {
-  const candidates = await candidatesFor(piece);
+async function suggestions(piece: NewPiece, reads: CandidateReads): Promise<string[]> {
+  const candidates = await candidatesFor(piece, reads);
   return candidates.length === 0
     ? []
     : [`${PIECE_WORDS[piece.kind]} ${piece.reference} is in no open matter.\n${renderCandidates(candidates)}`];
@@ -166,24 +181,26 @@ async function suggestions(piece: NewPiece): Promise<string[]> {
  */
 async function carried({ pieces, matters: named }: NoteNames): Promise<string[]> {
   if ((pieces.length === 0 && named.length === 0) || !(await getDb().hasTable('gws_ea_matter_links'))) return [];
-  const holders = new Map(
-    (await listOpenMatterLinks()).map((link) => [`${link.kind}\u0000${link.reference}`, link.matter_id]),
-  );
+  const links = await listOpenMatterLinks();
+  const holders = new Map(links.map((link) => [linkKey(link.kind, link.reference), link.matter_id]));
   const matterIds = new Set<string>();
   const unplaced = new Map<string, NewPiece>();
   for (const { kind, reference: given, arrival } of pieces) {
     const reference = canonicalReference(kind, given);
-    const key = `${kind}\u0000${reference}`;
+    const key = linkKey(kind, reference);
     const matterId = holders.get(key);
     if (matterId !== undefined) matterIds.add(matterId);
     else if (arrival !== undefined && !unplaced.has(key)) unplaced.set(key, { kind, reference, ...arrival });
   }
   for (const id of named) matterIds.add(id);
+  // Who a render may name, and what each suggestion reads, are read once for the whole note.
+  const lens = once(principalLens);
+  const reads: CandidateReads = { links, ownAddresses: once(ownAddresses) };
   const [matters, suggested] = await Promise.all([
-    Promise.all([...matterIds].map((id) => bestEffort(`matter ${id}`, () => matterView(id), []))),
+    Promise.all([...matterIds].map((id) => bestEffort(`matter ${id}`, () => matterView(id, lens), []))),
     Promise.all(
       [...unplaced.values()].map((piece) =>
-        bestEffort(`what ${piece.kind} ${piece.reference} may belong to`, () => suggestions(piece), []),
+        bestEffort(`what ${piece.kind} ${piece.reference} may belong to`, () => suggestions(piece, reads), []),
       ),
     ),
   ]);
@@ -199,7 +216,7 @@ export function noteNames(content: string): NoteNames {
     if (error instanceof SyntaxError) return { pieces: [], matters: [] };
     throw error;
   }
-  const recorded = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  const recorded = isRecord(parsed) ? parsed : {};
   return {
     pieces: Array.isArray(recorded.pieces) ? recorded.pieces.flatMap(notePieceOf) : [],
     matters: Array.isArray(recorded.matters)

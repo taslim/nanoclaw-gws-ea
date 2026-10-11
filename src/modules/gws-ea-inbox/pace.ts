@@ -39,17 +39,6 @@ async function isOutsideThread(session: Session): Promise<boolean> {
   return inbox !== null && session.messaging_group_id === inbox && session.thread_id !== null;
 }
 
-/**
- * Whether a row written now into `session` waits, held, for main: an
- * outside thread's mail is read only once main has placed the thread and
- * handed it over, however the thread began.
- */
-export async function heldForMain(session: Session): Promise<boolean> {
-  const threadKey = session.thread_id;
-  if (threadKey === null || !(await isOutsideThread(session))) return false;
-  return (await threadPlacement(threadKey))?.released !== true;
-}
-
 /** The deadline pace set that is still ahead in the session, if any. */
 async function waitingDeadline(session: Session): Promise<string | null> {
   const waiting = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
@@ -58,16 +47,43 @@ async function waitingDeadline(session: Session): Promise<string | null> {
   return waiting?.find((message) => message.tries === 0)?.processAfter ?? null;
 }
 
+/** When a row written now into an outside thread's session is to be read: its pending deadline, or a new one. */
+async function outsideDeadline(session: Session): Promise<string> {
+  return (
+    (await waitingDeadline(session)) ??
+    new Date(Date.now() + PACE_MIN_MS + Math.random() * (PACE_MAX_MS - PACE_MIN_MS)).toISOString()
+  );
+}
+
 /**
  * When a row written now into `session` is to be read: the outside thread's
  * pending deadline, or a new one. Null for every other session.
  */
 export async function paceDeadline(session: Session): Promise<string | null> {
-  if (!(await isOutsideThread(session))) return null;
-  return (
-    (await waitingDeadline(session)) ??
-    new Date(Date.now() + PACE_MIN_MS + Math.random() * (PACE_MAX_MS - PACE_MIN_MS)).toISOString()
-  );
+  return (await isOutsideThread(session)) ? outsideDeadline(session) : null;
+}
+
+/** How a row written now into an outside thread's session waits: held for main, or else until its deadline. */
+export interface InboundPace {
+  /** The thread's pending deadline, or a new one. */
+  readonly deadline: string;
+  /**
+   * Held for main, which wins over the deadline: an outside thread's mail is
+   * read only once main has placed the thread and handed it over, however
+   * the thread began.
+   */
+  readonly held: boolean;
+}
+
+/**
+ * How a row the router writes now into `session` waits, from one look at
+ * the inbox; undefined for every session but an outside thread's.
+ */
+export async function inboundPace(session: Session): Promise<InboundPace | undefined> {
+  const threadKey = session.thread_id;
+  if (threadKey === null || !(await isOutsideThread(session))) return undefined;
+  const deadline = await outsideDeadline(session);
+  return { deadline, held: (await threadPlacement(threadKey))?.released !== true };
 }
 
 /**

@@ -31,7 +31,7 @@ import { listUnplacedThreads, recordPlacementNote } from '../gws-ea-inbox/thread
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { listOpenLookSlots, markLookFailed, type LookSlot } from './db.js';
 import {
-  findTasks,
+  listHeldLookSlots,
   lookSeries,
   mainConversation,
   mainConversations,
@@ -39,7 +39,7 @@ import {
   seriesKey,
   setLook,
   stillToCome,
-  type HeldTask,
+  type HeldSlot,
 } from './looks.js';
 import { keepMorning, unplacedThreadLine } from './morning.js';
 import { principalTimezone } from './render.js';
@@ -48,28 +48,23 @@ import { principalTimezone } from './render.js';
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Each open matter's slot, with the task it records as main's conversations hold it. */
-interface Slot {
-  readonly slot: LookSlot;
-  readonly held: HeldTask | undefined;
-}
-
-async function readSlots(): Promise<Slot[]> {
-  const slots = await listOpenLookSlots();
-  const tasks = await findTasks(slots.flatMap((slot) => (slot.look_task_id === null ? [] : [slot.look_task_id])));
-  return slots.map((slot) => ({ slot, held: slot.look_task_id === null ? undefined : tasks.get(slot.look_task_id) }));
-}
-
 /** Step 2: a look at the next morning for every open matter whose look will not come back. */
 async function handBackMattersWithoutALook(
   conversation: Session,
   morning: string,
-  slots: readonly Slot[],
+  slots: readonly HeldSlot[],
 ): Promise<void> {
   for (const { slot, held } of slots) {
     if (stillToCome(held?.task)) continue;
     await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: morning }, true);
   }
+}
+
+/** A repeating look still to come: its slot, its series, and when its next occurrence comes, ISO. */
+interface Repeat {
+  readonly slot: LookSlot;
+  readonly key: string;
+  readonly processAfter: string;
 }
 
 /**
@@ -79,26 +74,34 @@ async function handBackMattersWithoutALook(
  * settles as done, shows in the mark the notices module sets on the matter.
  * Once it runs, the sweep arms the next occurrence from its cron again.
  */
-async function bringFailedRepeatsForward(morning: string, slots: readonly Slot[]): Promise<void> {
+async function bringFailedRepeatsForward(morning: string, slots: readonly HeldSlot[]): Promise<void> {
+  // The repeating looks still to come, by the conversation that holds each, so its mailbox opens once.
+  const conversations = new Map<string, { readonly session: Session; readonly repeats: Repeat[] }>();
   for (const { slot, held } of slots) {
     if (held === undefined) continue;
     const { session, task } = held;
     // Until the sweep arms the occurrence after a failed run, the mark waits for the next pass.
     if (task.status !== 'pending' || task.recurrence === null || task.processAfter === null) continue;
-    const key = seriesKey(task);
-    // A failed script shows in the series' runs; a failed turn, which the runner settles as done, only in the mark.
+    const conversation = conversations.get(session.id) ?? { session, repeats: [] };
+    conversation.repeats.push({ slot, key: seriesKey(task), processAfter: task.processAfter });
+    conversations.set(session.id, conversation);
+  }
+  for (const { session, repeats } of conversations.values()) {
     const failed =
-      slot.look_failed_at !== null ||
-      ((await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-        mailbox.trailingFailedRuns(key),
-      )) ?? 0) > 0;
-    if (!failed) continue;
-    if (Date.parse(task.processAfter) - Date.parse(morning) > DAY_MS) {
-      await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-        mailbox.updateTask(key, { processAfter: morning });
-      });
-    }
-    if (slot.look_failed_at !== null) await markLookFailed(slot.id, null);
+      (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        repeats.filter(({ slot, key, processAfter }) => {
+          // A failed script shows in the series' runs; a failed turn, which the runner settles as done, only in the mark.
+          const failed = slot.look_failed_at !== null || mailbox.trailingFailedRuns(key) > 0;
+          if (failed && Date.parse(processAfter) - Date.parse(morning) > DAY_MS) {
+            mailbox.updateTask(key, { processAfter: morning });
+          }
+          return failed;
+        }),
+      )) ??
+      // A conversation whose mailbox is gone has no runs to read and no look to move: only the marks count.
+      repeats.filter(({ slot }) => slot.look_failed_at !== null);
+    // Each mark is cleared once its look has come forward.
+    for (const { slot } of failed) if (slot.look_failed_at !== null) await markLookFailed(slot.id, null);
   }
 }
 
@@ -163,7 +166,7 @@ export function keepMattersOnTime(): Promise<void> {
     const idle = (await mainConversations()).every((session) => !isContainerRunning(session.id));
     if (idle) {
       // Step 2 acts on looks that will not come back, step 3 on ones still to come: one read serves both.
-      const slots = await readSlots();
+      const slots = await listHeldLookSlots();
       await handBackMattersWithoutALook(conversation, morning, slots);
       await bringFailedRepeatsForward(morning, slots);
     }

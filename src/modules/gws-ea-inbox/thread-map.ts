@@ -327,6 +327,15 @@ export async function deleteThreadAddresses(addresses: readonly string[]): Promi
 // The account of the agent working it
 // ---------------------------------------------------------------------------
 
+/** The longest account the agent working a thread may leave: what a matter shows whole under the thread. */
+export const THREAD_ACCOUNT_MAX = 2_000;
+
+/** What the agent working a thread last said of it (KTD9): its words, and when, ISO. */
+export interface ThreadAccount {
+  readonly text: string;
+  readonly at: string;
+}
+
 /** The thread's account is now `text`, left at `at`, in place of any before it. Throws for a thread that does not exist. */
 export async function setThreadAccount(threadKey: string, text: string, at: string): Promise<void> {
   const { changes } = await getDb().run(
@@ -347,9 +356,7 @@ export async function clearThreadAccounts(threadKeys: readonly string[]): Promis
 }
 
 /** The account the agent working the thread last left on it, and when, or undefined while it has left none. */
-export async function threadAccount(
-  threadKey: string,
-): Promise<{ readonly text: string; readonly at: string } | undefined> {
+export async function threadAccount(threadKey: string): Promise<ThreadAccount | undefined> {
   const row = await getDb().get<{ account: string; account_at: string }>(
     'SELECT account, account_at FROM gws_ea_threads WHERE thread_key = ? AND account IS NOT NULL',
     threadKey,
