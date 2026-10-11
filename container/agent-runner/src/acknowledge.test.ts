@@ -1,6 +1,8 @@
 /**
  * A person left waiting in a live chat is acknowledged: the runner reminds the
  * agent once, after a while, and only while nothing has gone out this turn.
+ * Where the chat itself shows the person that the agent is working (Google
+ * Chat's 👀), there is no reminder.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
@@ -13,6 +15,9 @@ import type { AgentQuery, ProviderEvent } from './providers/types.js';
 import type { MessageInRow } from './db/messages-in.js';
 
 const T0 = 1_000_000;
+
+/** The conversation each channel's rows come from, and where the agent's reply goes. */
+const PLATFORM_IDS: Record<string, string> = { gchat: 'spaces/dm', whatsapp: 'whatsapp:15550100' };
 
 afterEach(() => stopWaiting());
 
@@ -43,7 +48,7 @@ describe('the reminder', () => {
 function row(
   kind: MessageInRow['kind'],
   content: object,
-  channelType: string | null = 'gchat',
+  channelType: string | null = 'whatsapp',
   trigger = 1,
 ): MessageInRow {
   return {
@@ -57,7 +62,7 @@ function row(
     series_id: null,
     tries: 0,
     trigger,
-    platform_id: channelType === null ? null : 'spaces/dm',
+    platform_id: channelType === null ? null : (PLATFORM_IDS[channelType] ?? `${channelType}:chat`),
     channel_type: channelType,
     thread_id: null,
     content: JSON.stringify(content),
@@ -68,7 +73,7 @@ function row(
 
 describe('who is waiting', () => {
   it('is someone who wrote in a live chat, not a host note, an email, or a scheduled task', () => {
-    expect(extractRouting([row('chat-sdk', { text: 'find me an hour', senderId: 'users/7' })]).personWaiting).toBe(
+    expect(extractRouting([row('chat-sdk', { text: 'find me an hour', senderId: '15550100' })]).personWaiting).toBe(
       true,
     );
     expect(extractRouting([row('chat', { text: 'A meeting moved', senderId: 'system' }, 'agent')]).personWaiting).toBe(
@@ -83,7 +88,7 @@ describe('who is waiting', () => {
   it('is no one when the chat message only rode along as context and did not wake the turn', () => {
     const routing = extractRouting([
       row('chat', { text: 'A meeting moved', senderId: 'system' }, 'agent'),
-      row('chat-sdk', { text: 'chatting among ourselves', senderId: 'users/7' }, 'gchat', 0),
+      row('chat-sdk', { text: 'chatting among ourselves', senderId: '15550100' }, 'whatsapp', 0),
     ]);
     expect(routing.personWaiting).toBe(false);
   });
@@ -91,61 +96,92 @@ describe('who is waiting', () => {
   it('leaves a failure-notice wake as upstream defines it: no one waits, and the notice is still the whole wake', () => {
     const notice = row('chat', { text: 'Incorrect API key', failureNotice: true }, 'agent');
     expect(extractRouting([notice])).toMatchObject({ failureNoticeWake: true, personWaiting: false });
-    const asked = row('chat-sdk', { text: 'any update?', senderId: 'users/7' });
+    const asked = row('chat-sdk', { text: 'any update?', senderId: '15550100' });
     expect(extractRouting([notice, asked])).toMatchObject({
       inReplyTo: asked.id,
       failureNoticeWake: false,
       personWaiting: true,
     });
   });
+
+  it('is no one in Google Chat, whose 👀 shows the person their message is being worked on', () => {
+    expect(
+      extractRouting([row('chat-sdk', { text: 'find me an hour', senderId: 'users/7' }, 'gchat')]).personWaiting,
+    ).toBe(false);
+    const reacted = row('chat-sdk', { sender: 'Morgan Ellery', reaction: { emoji: 'thumbs_up' } }, 'gchat');
+    expect(extractRouting([reacted]).personWaiting).toBe(false);
+  });
+
+  it('is still someone when a turn also answers a chat with no such sign', () => {
+    const routing = extractRouting([
+      row('chat-sdk', { text: 'find me an hour', senderId: 'users/7' }, 'gchat'),
+      row('chat-sdk', { text: 'and lunch on Friday?', senderId: '15550100' }, 'whatsapp'),
+    ]);
+    expect(routing.personWaiting).toBe(true);
+  });
 });
 
 describe('a turn in the poll loop', () => {
+  /** Where the principal hears the agent on each channel. */
+  const DESTINATIONS: Record<string, string> = { gchat: 'principal-chat', whatsapp: 'principal-whatsapp' };
+
   beforeEach(() => {
     initTestSessionDb();
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('principal', 'principal', 'channel', 'gchat', 'spaces/dm', NULL)`,
-      )
-      .run();
+    for (const [channelType, name] of Object.entries(DESTINATIONS)) {
+      getInboundDb()
+        .prepare(
+          `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+           VALUES (?, ?, 'channel', ?, ?, NULL)`,
+        )
+        .run(name, name, channelType, PLATFORM_IDS[channelType]!);
+    }
   });
   afterEach(() => closeSessionDb());
 
-  const ROUTING = { platformId: 'spaces/dm', channelType: 'gchat', threadId: null, inReplyTo: 'm1', taskRun: false };
+  const fromWhatsApp = (): MessageInRow =>
+    row('chat-sdk', { text: 'find an hour with Remy', senderId: '15550100' }, 'whatsapp');
+  const fromChat = (): MessageInRow =>
+    row('chat-sdk', { text: 'find an hour with Remy', senderId: 'users/7' }, 'gchat');
 
-  /** Run one turn whose stream asks for the reminder after a tool batch, as the provider's hook does. */
-  async function turn(routing: typeof ROUTING & { personWaiting?: boolean }, ack: boolean): Promise<string[]> {
+  /**
+   * Run the turn a person's message starts, routed as the poll loop routes it,
+   * whose stream asks for the reminder after a tool batch that ends ten seconds
+   * in, as the provider's hook does.
+   */
+  async function turn(started: MessageInRow, ack: boolean): Promise<string[]> {
+    const to = DESTINATIONS[started.channel_type!]!;
     const asked: string[] = [];
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
-      if (ack) yield { type: 'text', text: '<message to="principal">On it: checking your week.</message>' };
-      // A tool batch ends long after the turn began.
+      if (ack) yield { type: 'text', text: `<message to="${to}">On it: checking your week.</message>` };
       const reminder = acknowledgmentReminder(Date.now() + ACKNOWLEDGE_AFTER_MS + 1_000);
       if (reminder !== undefined) asked.push(reminder);
-      yield { type: 'text', text: '<message to="principal">Thursday 10:00 is free.</message>' };
+      yield { type: 'text', text: `<message to="${to}">Thursday 10:00 is free.</message>` };
       yield { type: 'result', text: '' };
     }
     const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
-    await processQuery(query, routing, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    await processQuery(query, extractRouting([started]), [started.id], 'claude', undefined, 'prompt', undefined, true);
     return asked;
   }
 
-  it('reminds the agent when a person in a live chat has heard nothing, and not after the turn', async () => {
-    expect(await turn({ ...ROUTING, personWaiting: true }, false)).toHaveLength(1);
+  it('reminds the agent when a person in a chat with no working sign has heard nothing, and not after the turn', async () => {
+    expect(await turn(fromWhatsApp(), false)).toHaveLength(1);
     expect(acknowledgmentReminder(Date.now() + 60_000)).toBeUndefined();
   });
 
   it('stays quiet once the agent has acknowledged', async () => {
-    expect(await turn({ ...ROUTING, personWaiting: true }, true)).toEqual([]);
+    expect(await turn(fromWhatsApp(), true)).toEqual([]);
     expect(getUndeliveredMessages().map((message) => JSON.parse(message.content).text)).toEqual([
       'On it: checking your week.',
       'Thursday 10:00 is free.',
     ]);
   });
 
-  it('stays quiet for a turn no one is waiting on', async () => {
-    expect(await turn(ROUTING, false)).toEqual([]);
+  it('stays quiet in Google Chat, where the person sees 👀 on their message while the agent works', async () => {
+    expect(await turn(fromChat(), false)).toEqual([]);
+    expect(getUndeliveredMessages().map((message) => JSON.parse(message.content).text)).toEqual([
+      'Thursday 10:00 is free.',
+    ]);
   });
 
   it('forgets the wait when the turn fails, so a later turn is never reminded of it', async () => {
@@ -153,9 +189,10 @@ describe('a turn in the poll loop', () => {
       yield { type: 'init', continuation: 'c1' };
       throw new Error('the provider went away');
     }
+    const started = fromWhatsApp();
     const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: failing() };
     await expect(
-      processQuery(query, { ...ROUTING, personWaiting: true }, ['m1'], 'claude', undefined, 'prompt', undefined, true),
+      processQuery(query, extractRouting([started]), [started.id], 'claude', undefined, 'prompt', undefined, true),
     ).rejects.toThrow('the provider went away');
     expect(acknowledgmentReminder(Date.now() + 60_000)).toBeUndefined();
   });

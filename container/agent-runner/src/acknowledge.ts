@@ -14,15 +14,26 @@
  * message begins a turn and stops it when the turn ends. The provider asks
  * for the reminder after each batch of tool calls.
  *
- * Removable once the channel offers a typing indicator or a native "working"
- * signal: that tells the person their message was received without asking
- * the agent for a line, and this reminder, with its wiring in the poll loop,
- * the formatter's `personWaiting`, and the Claude provider's PostToolBatch
- * hook, should then go.
+ * A chat that itself shows the person their message is being worked on needs
+ * no reminder: the sign tells them it was received without asking the agent
+ * for a line. The formatter's `personWaiting` leaves such chats out, and a
+ * long job there gets its one-line plan from the agent's own judgment.
  */
 
 /** How long a person waits in silence before the agent is reminded to acknowledge. */
 export const ACKNOWLEDGE_AFTER_MS = 10_000;
+
+/**
+ * Channels whose host marks a person's message while a turn works on it:
+ * Google Chat, where the assistant's own account puts 👀 on the message after
+ * a few seconds and takes it off when the work ends (src/modules/gws-ea-chat).
+ */
+const WORKING_INDICATOR_CHANNELS: ReadonlySet<string> = new Set(['gchat']);
+
+/** Whether a person writing on this channel sees that the agent is working on their message. */
+export function showsWorkingIndicator(channelType: string | null): boolean {
+  return channelType !== null && WORKING_INDICATOR_CHANNELS.has(channelType);
+}
 
 interface Waiting {
   readonly since: number;

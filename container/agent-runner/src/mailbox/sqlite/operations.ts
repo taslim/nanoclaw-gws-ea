@@ -171,12 +171,23 @@ export function sqliteWriteMessageOut(message: OutboundWrite): number {
   }
 }
 
-export function sqliteGetMessageIdBySeq(sequence: number): string | null {
+/**
+ * The platform's id for message #sequence, the one a reaction or an edit names.
+ * The host stores a message it routes under the platform's id followed by
+ * `:<agentGroupId>` (src/router.ts), so the same message stays unique across
+ * the groups it reaches; that suffix comes off. A message the agent sent is
+ * known by the id the platform returned when it was posted, until then by its
+ * own.
+ */
+export function sqliteGetMessageIdBySeq(sequence: number, agentGroupId: string | null): string | null {
   const inbound = getInboundDb();
   const inboundRow = inbound.prepare('SELECT id FROM messages_in WHERE seq = ?').get(sequence) as
     | { id: string }
     | undefined;
-  if (inboundRow) return inboundRow.id;
+  if (inboundRow) {
+    const suffix = agentGroupId === null ? null : `:${agentGroupId}`;
+    return suffix !== null && inboundRow.id.endsWith(suffix) ? inboundRow.id.slice(0, -suffix.length) : inboundRow.id;
+  }
   const outboundRow = getOutboundDb().prepare('SELECT id FROM messages_out WHERE seq = ?').get(sequence) as
     | { id: string }
     | undefined;

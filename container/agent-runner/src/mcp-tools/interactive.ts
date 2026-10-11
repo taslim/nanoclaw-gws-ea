@@ -54,7 +54,7 @@ function routing() {
  */
 export const LINK_ACTION_SCHEMA = Object.freeze({
   type: 'object' as const,
-  description: 'URL link button. Callback buttons are unsupported; use ask_user_question for choices.',
+  description: 'A labelled web link. To have the user choose something, use ask_user_question.',
   properties: {
     label: { type: 'string' as const, minLength: 1 },
     // A link button has to go somewhere. A placeholder like '#' or a bare path
@@ -138,11 +138,11 @@ export const askUserQuestion: McpToolDefinition = {
   tool: {
     name: 'ask_user_question',
     description:
-      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires. Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
+      'Ask the user a multiple-choice question and wait for their answer. This is a blocking call — execution pauses until the user answers or the timeout expires. Provide a short title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (shown to the user and returned as the result) or an object { label, selectedLabel?, value? } where selectedLabel is what the question shows once that option is chosen.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        title: { type: 'string', description: 'Short card title shown above the question' },
+        title: { type: 'string', description: 'Short title shown above the question' },
         question: { type: 'string', description: 'The question to ask' },
         options: {
           type: 'array',
@@ -242,14 +242,15 @@ export const askUserQuestion: McpToolDefinition = {
 export const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
-    description: 'Send a display card with optional URL link buttons to the current conversation.',
+    description:
+      'Send formatted content to the current conversation: a title, a description, lines of text, and optional web links. It returns at once and collects no answer.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         card: {
           type: 'object',
           description:
-            'Display card with optional title, description, text children, and URL link actions. Each action requires a non-empty label and a url that is a web link (http or https); invalid actions are dropped. Callback buttons are unsupported; use ask_user_question for choices.',
+            'The content: an optional title, description, text children, and web link actions. Each action requires a non-empty label and a url that is a web link (http or https); invalid actions are dropped. To have the user choose something, use ask_user_question.',
           properties: {
             title: { type: 'string' },
             description: { type: 'string' },
@@ -276,8 +277,7 @@ export const sendCard: McpToolDefinition = {
         },
         fallbackText: {
           type: 'string',
-          description:
-            'Plain-text version of the card for channels that render cards as text. Not related to buttons: send_card never renders callback buttons anywhere.',
+          description: 'A plain-text version of the content, for channels that need one alongside it.',
         },
       },
       required: ['card'],
@@ -303,10 +303,10 @@ export const sendCard: McpToolDefinition = {
     log(`send_card: ${id}`);
     if (dropped > 0) {
       return ok(
-        `Card sent (id: ${id}). ${dropped} invalid action(s) were dropped: send_card link actions need a non-empty label and a url that is a web link (http or https), such as https://example.com. Use ask_user_question for callback buttons.`,
+        `Sent (id: ${id}). ${dropped} invalid action(s) were dropped: send_card link actions need a non-empty label and a url that is a web link (http or https), such as https://example.com. To have the user choose something, use ask_user_question.`,
       );
     }
-    return ok(`Card sent (id: ${id})`);
+    return ok(`Sent (id: ${id})`);
   },
 };
 

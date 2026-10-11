@@ -8,6 +8,17 @@ import { askUserQuestion, LINK_ACTION_SCHEMA, sendCard } from './interactive.js'
 beforeEach(() => initTestSessionDb());
 afterEach(() => closeSessionDb());
 
+describe('what the agent is told', () => {
+  // Its descriptions are checked with every other tool's (server.capabilities.test.ts).
+  it('reports a send, and the actions it dropped, without cards or buttons, which a chat may not have', async () => {
+    const result = await sendCard.handler({
+      card: { title: 'Thursday', actions: [{ label: 'Approve', value: 'approve' }] },
+    });
+
+    expect(result.content[0].text).not.toMatch(/\b(?:cards?|buttons?|click\w*|tap\w*)\b/iu);
+  });
+});
+
 describe('ask_user_question cancellation', () => {
   const args = { title: 'Fixture', question: 'Choose', options: ['yes', 'no'] };
   it('does not publish a question for an already cancelled request', async () => {
@@ -109,7 +120,7 @@ describe('send_card', () => {
         card: { title: 'Test', actions: [{ label: 'Docs', url: 'https://example.com', style }] },
       });
 
-      expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+      expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
       const content = JSON.parse(getUndeliveredMessages()[0].content);
       expect(content.card.actions).toEqual([{ label: 'Docs', url: 'https://example.com', style }]);
     },
@@ -188,7 +199,7 @@ describe('send_card', () => {
     async (url) => {
       const result = await sendCard.handler({ card: { title: 'Test', actions: [{ label: 'Open', url }] } });
 
-      expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+      expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
       const content = JSON.parse(getUndeliveredMessages()[0].content);
       expect(content.card.actions).toEqual([{ label: 'Open', url }]);
     },
@@ -205,7 +216,7 @@ describe('send_card', () => {
       },
     });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
     const content = JSON.parse(getUndeliveredMessages()[0].content);
     expect(content.card.actions).toEqual([
       { label: 'Wiki', url: 'https://de.wikipedia.org/wiki/M%C3%BCnchen' },
@@ -261,13 +272,13 @@ describe('send_card', () => {
       card: { title: 'Test', actions: [{ label: 'Docs', url: 'https://example.com' }] },
     });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
   });
 
   it('stays quiet for display-only cards', async () => {
     const result = await sendCard.handler({ card: { title: 'Test', description: 'No actions' } });
 
-    expect(result.content[0].text).toMatch(/^Card sent \(id: msg-[^)]+\)$/);
+    expect(result.content[0].text).toMatch(/^Sent \(id: msg-[^)]+\)$/);
   });
 });
 

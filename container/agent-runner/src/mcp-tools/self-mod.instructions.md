@@ -7,7 +7,7 @@ To install packages that persist, use the self-modification tools:
 Example flow:
 ```
 install_packages({ apt: ["ffmpeg"], npm: ["@xenova/transformers"], reason: "Audio transcription" })
-# → Admin gets an approval card → approves
+# → An admin is asked to approve → approves
 ```
 
 **When to use this vs workspace `pnpm install`:**

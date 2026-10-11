@@ -1,3 +1,4 @@
+import { showsWorkingIndicator } from './acknowledge.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
@@ -173,7 +174,10 @@ export interface RoutingContext {
   taskRun: boolean;
   /** Every non-echo row that woke this turn is a failure notice. */
   failureNoticeWake?: boolean;
-  /** Someone who wrote in a live chat (a Chat SDK channel) waits for the answer (acknowledge.ts); absent is no. */
+  /**
+   * Someone who wrote in a live chat (a Chat SDK channel) waits for the answer
+   * with no sign that the agent is working on it (acknowledge.ts); absent is no.
+   */
   personWaiting?: boolean;
 }
 
@@ -202,7 +206,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
     // Accumulated trigger=0 context rides along but did not wake the turn.
     failureNoticeWake: waking.length > 0 && waking.every(isFailureNotice),
-    personWaiting: waking.some((m) => m.kind === 'chat-sdk'),
+    personWaiting: waking.some((m) => m.kind === 'chat-sdk' && !showsWorkingIndicator(m.channel_type)),
   };
 }
 
