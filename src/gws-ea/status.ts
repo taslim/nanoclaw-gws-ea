@@ -3,8 +3,8 @@
  * this machine (R1, R2, KTD10). Both read only local state and what each
  * assistant's own observers report. They load no secrets, start no run log,
  * take no lock, repair nothing, and write no file: observers may read the
- * instance-held OneCLI admin key and the stored connector token they already
- * use, but never the operator's secrets file or secret environment variables.
+ * instance-held OneCLI admin key they already use, but never the operator's
+ * secrets file or secret environment variables.
  * The isolation probe stays a create and update gate.
  *
  * Every observation is live, and registry values are shown as the record,
@@ -20,17 +20,12 @@ import { createHash } from 'node:crypto';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
 import { formatLocalTime } from '../timezone.js';
 import { taggedImageId } from './agent-image.js';
 import { releaseImageTag } from './agent-image-release.js';
+import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
-import {
-  createCloudflareConnectorLayout,
-  observeCloudflareConnector,
-  type CloudflareConnectorLayout,
-  type CloudflareConnectorObservation,
-} from './cloudflare-connector.js';
-import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
 import { runInstanceNclJson } from './ncl.js';
@@ -71,7 +66,6 @@ import {
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
 } from './service-control.js';
-import { instanceServicePlatform } from './service-coordinates.js';
 import {
   GwsEaError,
   ingressEndpointUrl,
@@ -164,8 +158,18 @@ export interface InboxFacts {
   /** Each principal address's calendar access, the facts main lists: shown, never a fault. */
   readonly calendar_access: readonly CalendarAccessView[] | null;
 }
-export interface ConnectorFacts {
-  readonly drift: string | null;
+/** Google Chat as the host reports it (KTD12); each fact is null when the host did not report it. */
+export interface ChatFacts {
+  /** The pull consumer is connected to Pub/Sub. */
+  readonly consumer_connected: boolean | null;
+  /** When a pull last returned. */
+  readonly last_pull_at: string | null;
+  /** The Workspace Events subscription's state, as the host last saw it. */
+  readonly subscription_state: ChatSubscriptionState | null;
+  /** When the subscription expires unless the host renews it. */
+  readonly subscription_expire_time: string | null;
+  /** Only a new Google sign-in brings Chat back. */
+  readonly sign_in_needed: boolean | null;
 }
 export interface DeliveryFacts {
   readonly last: DeliveryView | null;
@@ -183,8 +187,10 @@ export interface AssistantProbes {
   readonly image: ProbeResult & ImageFacts;
   /** The host's service, as NanoClaw's own service helpers detect it. */
   readonly service: ProbeResult & ServiceFacts;
-  /** The host's own status over its CLI socket: webhook open, Google Chat connected. */
+  /** The host's own status over its CLI socket, answering for this assistant's checkout. */
   readonly host: ProbeResult;
+  /** Google Chat receiving: the host's pull consumer connected, and its subscription active (KTD12). */
+  readonly chat: ProbeResult & ChatFacts;
   /** The OneCLI runtime, as the instance's own Compose file names it. */
   readonly onecli: ProbeResult;
   /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
@@ -205,10 +211,6 @@ export interface AssistantProbes {
   readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
   readonly principal: ProbeResult;
-  /** The callback: the managed route from outside, or the operator's endpoint. */
-  readonly route: ProbeResult;
-  /** The machine's shared connector; managed Cloudflare ingress only. */
-  readonly connector?: ProbeResult & ConnectorFacts;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
 }
@@ -218,14 +220,13 @@ export const PROBE_NAMES = [
   'image',
   'service',
   'host',
+  'chat',
   'onecli',
   'main_identity',
   'external_email',
   'inbox',
   'workspace',
   'principal',
-  'route',
-  'connector',
   'delivery',
 ] as const satisfies readonly (keyof AssistantProbes)[];
 
@@ -332,19 +333,15 @@ export interface AssistantStatus {
 
 /** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
-  /** Runs Git (the checkout, the tool's release) and Docker (OneCLI, the connector). */
+  /** Runs Git (the checkout, the tool's release) and Docker (OneCLI, the agent image). */
   readonly runCommand: SanitizedCommandRunner;
-  /** Reaches the callback as the internet does; public DNS by default. */
+  /** Reaches Google and OneCLI for the Google connection. */
   readonly fetch?: typeof globalThis.fetch;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
   /** The assistant's OneCLI agents, as its OneCLI lists them to the instance-held admin key. */
   readonly onecliAgents: (runtime: InstanceRuntimeConfig) => Promise<readonly OnecliAgent[]>;
   readonly onecli: (layout: OnecliRuntimeLayout, pins: OnecliPins) => Promise<Observation>;
-  readonly connector: (
-    layout: CloudflareConnectorLayout,
-    dockerEndpoint: string,
-  ) => Promise<CloudflareConnectorObservation>;
   readonly principalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   /** The schema the databases under a `data`-holding root record: the physical `state/`, or a kept release. */
   readonly schema: (stateRoot: string) => SnapshotManifest;
@@ -421,9 +418,6 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
     onecliAgents: overrides.onecliAgents ?? (async (runtime) => (await instanceOnecliAdmin(runtime)).listAgents()),
     onecli:
       overrides.onecli ?? ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand })),
-    connector:
-      overrides.connector ??
-      ((layout, dockerEndpoint) => observeCloudflareConnector(layout, { runCommand, dockerEndpoint })),
     principalBinding: overrides.principalBinding ?? verifyPrincipalBinding,
     google:
       overrides.google ??
@@ -668,9 +662,8 @@ function hostFailure(error: unknown, instanceRoot: string): string {
 /** The host's own status over its CLI socket, which answers only for this checkout (upstream `queryHost`). */
 async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult> {
   if (!context.hostStatus) throw new Unobservable(`${LAUNCHER_REQUIRED}'s host status helpers.`);
-  let status: unknown;
   try {
-    status = await context.hostStatus.queryHost(context.paths.checkoutRoot(reservation.instance_id));
+    await context.hostStatus.queryHost(context.paths.checkoutRoot(reservation.instance_id));
     // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering.
   } catch (error) {
     return {
@@ -678,23 +671,28 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
       reason: `The host is unreachable: ${hostFailure(error, context.paths.instanceRoot(reservation.instance_id))}`,
     };
   }
-  const webhook = isRecord(status) ? status.webhook : undefined;
-  const channels = isRecord(status) && Array.isArray(status.channels) ? status.channels : [];
-  const port = reservation.allocated_ports.nanoclaw_webhook;
-  if (isRecord(webhook) && webhook.port !== port) {
-    return { status: 'degraded', reason: `The host listens on webhook port ${String(webhook.port)}, not its ${port}.` };
-  }
-  if (!isRecord(webhook) || !Array.isArray(webhook.paths) || !webhook.paths.includes('/webhook/gchat')) {
-    return { status: 'degraded', reason: 'The host has not opened its Google Chat webhook.' };
-  }
-  if (
-    !channels.some(
-      (channel) => isRecord(channel) && channel.instance === ADAPTER_INSTANCE && channel.connected === true,
-    )
-  ) {
-    return { status: 'degraded', reason: 'Google Chat is not connected in the running host.' };
-  }
   return OK;
+}
+
+/**
+ * Google Chat as the running host reports it (KTD12): receiving once its
+ * consumer is connected and its subscription active, beside when the
+ * subscription expires and when a pull last returned. A broken sign-in is
+ * named as one, with the command that signs the assistant in again.
+ */
+async function chatProbe({ reservation, runtime: record, observers }: Subject): Promise<ProbeResult & ChatFacts> {
+  const health = parseChatHealth(unwrapData(await observers.ncl(requireRuntime(record), CHAT_HEALTH_ARGS)));
+  const facts: ChatFacts = {
+    consumer_connected: health.consumer.connected,
+    last_pull_at: health.consumer.lastPullAt,
+    subscription_state: health.subscription.state,
+    subscription_expire_time: health.subscription.expireTime,
+    sign_in_needed: health.signInNeeded,
+  };
+  const receiving = chatReceiving(health, reservation.instance_id);
+  return receiving.state === 'receiving'
+    ? { ...OK, ...facts }
+    : { status: 'degraded', reason: sentence(receiving.reason), ...facts };
 }
 
 /**
@@ -924,35 +922,6 @@ async function principalProbe({ context, reservation, observers }: Subject): Pro
     : { status: 'degraded', reason: "The principal's direct message, its binding, or its welcome is missing." };
 }
 
-/** The managed route observed from outside, or the operator's endpoint refusing unsigned traffic. */
-async function routeProbe({ reservation, observers }: Subject): Promise<ProbeResult> {
-  const ingress = reservation.exclusive_resource_claims.ingress;
-  const dependencies = observers.fetch ? { fetch: observers.fetch } : {};
-  if (ingress.mode === 'existing') {
-    await verifyExistingGchatRoute({ endpointUrl: ingress.endpoint_url }, dependencies);
-    return OK;
-  }
-  const seen = await observeManagedGchatRoute(
-    {
-      endpointUrl: ingress.callback_url,
-      localEndpointUrl: `http://127.0.0.1:${reservation.allocated_ports.nanoclaw_webhook}/webhook/gchat`,
-    },
-    dependencies,
-  );
-  return seen.status === 'routed' ? OK : { status: 'degraded', reason: sentence(seen.observed) };
-}
-
-/** The shared connector; one on another image or token is drift, reported and never replaced (KTD11). */
-async function connectorProbe({ context, runtime: record, observers }: Subject): Promise<ProbeResult & ConnectorFacts> {
-  const runtime = requireRuntime(record);
-  const layout = createCloudflareConnectorLayout({
-    cloudflareRoot: context.paths.cloudflareRoot,
-    platform: instanceServicePlatform(context.platform),
-  });
-  const seen = await observers.connector(layout, runtime.docker_endpoint);
-  return seen.status === 'present' ? { ...OK, drift: seen.drift ?? null } : { ...fromObservation(seen), drift: null };
-}
-
 /** Main's latest delivery result, and the replies the host is still retrying. */
 async function deliveryProbe({ context, reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
   const seen = observers.delivery(context.paths.instanceLayout(reservation.instance_id).state);
@@ -1143,20 +1112,18 @@ export async function observeAssistantStatus(
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
   const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
-  const managed = ingress.mode === 'managed-cloudflare';
   const [
     checkout,
     image,
     service,
     host,
+    chat,
     onecli,
     mainIdentity,
     externalEmail,
     inbox,
     workspace,
     principal,
-    route,
-    connector,
     delivery,
     rollback,
   ] = await Promise.all([
@@ -1164,6 +1131,13 @@ export async function observeAssistantStatus(
     probe<ImageFacts>(() => imageProbe(subject), { tag: null }),
     observeService(context, runtime),
     probe(() => hostProbe(subject), {}),
+    probe<ChatFacts>(() => chatProbe(subject), {
+      consumer_connected: null,
+      last_pull_at: null,
+      subscription_state: null,
+      subscription_expire_time: null,
+      sign_in_needed: null,
+    }),
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
     probe<ExternalEmailFacts>(() => externalEmailProbe(subject), { agent_group_id: null }),
@@ -1176,8 +1150,6 @@ export async function observeAssistantStatus(
     }),
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
-    probe(() => routeProbe(subject), {}),
-    managed ? probe<ConnectorFacts>(() => connectorProbe(subject), { drift: null }) : undefined,
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
     observeRollback(subject, live),
   ]);
@@ -1190,14 +1162,13 @@ export async function observeAssistantStatus(
       image,
       service,
       host,
+      chat,
       onecli,
       main_identity: mainIdentity,
       external_email: externalEmail,
       inbox,
       workspace,
       principal,
-      route,
-      ...(connector ? { connector } : {}),
       delivery,
     },
   };
@@ -1382,8 +1353,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
     }
     case 'workspace':
       return probes.workspace.account ?? '';
-    case 'connector':
-      return probes.connector?.drift ? `${probes.connector.drift}; it is shared, so it is left as it is` : '';
+    case 'chat':
+      return chatDetail(probes.chat, timezone);
     case 'delivery': {
       const last = probes.delivery.last;
       return last ? `${last.status} ${formatLocalTime(last.at, timezone)} (${last.message_out_id})` : '';
@@ -1391,9 +1362,18 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
     case 'host':
     case 'onecli':
     case 'principal':
-    case 'route':
       return '';
   }
+}
+
+/** Receiving Chat's line: until when its subscription runs, and when a pull last returned. */
+function chatDetail(chat: ChatFacts, timezone: string): string {
+  const expires = chat.subscription_expire_time;
+  const pulled = chat.last_pull_at;
+  return [
+    ...(expires ? [`subscription active until ${formatLocalTime(expires, timezone)}`] : []),
+    ...(pulled ? [`last pulled ${formatLocalTime(pulled, timezone)}`] : []),
+  ].join('; ');
 }
 
 /** One probe's line: its status, its name, and what it saw. */
@@ -1443,7 +1423,6 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   ];
   for (const name of PROBE_NAMES) {
     const result = status.probes[name];
-    if (!result) continue;
     lines.push(probeLine(result.status, name, result.reason ?? probeDetail(name, status.probes, timezone)));
     if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
@@ -1471,12 +1450,13 @@ export const STATUS_USAGE: readonly string[] = [
   '       phase, registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, image (tag), service, host, onecli, main_identity, external_email, inbox (state,',
-  '       since, last_success_at, calendar_notifications, calendar_access: each principal address with its',
-  "       calendar's access, unchecked|bookable|readable|free-busy|none, and checked_at), workspace",
-  '       (account), principal, route, connector (managed Cloudflare only, with drift), delivery; each probe',
-  '       has status ok|degraded|unknown and a reason. list and status exit 0 once they observed, whatever',
-  '       the health; status exits 1 for an unknown ID.',
+  '       probes: checkout, image (tag), service, host, chat (consumer_connected, last_pull_at,',
+  '       subscription_state: unknown|active|suspended|expired, subscription_expire_time, sign_in_needed),',
+  '       onecli, main_identity, external_email, inbox (state, since, last_success_at, calendar_notifications,',
+  "       calendar_access: each principal address with its calendar's access,",
+  '       unchecked|bookable|readable|free-busy|none, and checked_at), workspace (account), principal,',
+  '       delivery; each probe has status ok|degraded|unknown and a reason. list and status exit 0 once they',
+  '       observed, whatever the health; status exits 1 for an unknown ID.',
 ];
 
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {

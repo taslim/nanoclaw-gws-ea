@@ -134,8 +134,12 @@ function toOperation(value: unknown): Operation {
   return { name, done, error, response: value.response };
 }
 
-/** The assistant's Workspace Events calls. Each change is a long-running operation, waited for here. */
-function createWorkspaceEventsApi(client: GoogleClientOptions) {
+/**
+ * The assistant's Workspace Events calls, which removal also makes once the
+ * host is stopped (KTD13). Each change is a long-running operation, waited
+ * for here.
+ */
+export function createWorkspaceEventsApi(client: GoogleClientOptions) {
   async function finish(started: unknown, what: string): Promise<unknown> {
     let operation = toOperation(started);
     for (let polls = 0; !operation.done; polls += 1) {
@@ -195,6 +199,8 @@ function createWorkspaceEventsApi(client: GoogleClientOptions) {
     },
   };
 }
+
+export type WorkspaceEventsApi = ReturnType<typeof createWorkspaceEventsApi>;
 
 function expired(subscription: WorkspaceSubscription): boolean {
   const expires = Date.parse(subscription.expireTime ?? '');

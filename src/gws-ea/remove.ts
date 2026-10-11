@@ -5,10 +5,14 @@
  * resource is observed. An absent resource is done; an owned one is deleted
  * and observed again; a foreign one is refused by name; one that cannot be
  * observed pauses with evidence until the operator abandons it. Everything a
- * resource needs — Docker, NanoClaw's service helpers, Google sign-in, the
- * Cloudflare token — is checked before the first change, and removal locks
- * only its own instance, so one stuck removal never blocks another assistant.
- * NanoClaw's helpers stop the host; removal then cleans up what they leave.
+ * resource needs — Docker, NanoClaw's service helpers, the operator's and the
+ * assistant's Google sign-ins, the Cloudflare token — is checked before the
+ * first change, and removal locks only its own instance, so one stuck removal
+ * never blocks another assistant. NanoClaw's helpers stop the host; removal
+ * then cleans up what they leave. The assistant's Google Chat subscription
+ * goes after the host, which would only create it again, and before the
+ * project, which takes its topic, its Pub/Sub subscription, and its
+ * subscriber account with it (KTD13).
  * An unfinished update or rollback never stops it: its releases, what is
  * kept with them, its snapshots, and its quarantined state all sit under the
  * instance root, and go with it. So does every image the assistant's
@@ -25,6 +29,16 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { createWorkspaceEventsApi, type WorkspaceEventsApi } from '../modules/gws-ea-chat/subscription.js';
+import { GOOGLE_GRANT_FILE_NAME, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
+import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
+import {
+  GoogleGrantRevokedError,
+  GoogleScopeNotGrantedError,
+  GoogleTokenError,
+  mintServiceToken,
+} from '../modules/gws-ea-google/tokens.js';
+import { GoogleApiError } from '../modules/gws-ea-inbox/gmail-api.js';
 import {
   CloudflareAmbiguousMutationError,
   createCloudflareApi,
@@ -71,6 +85,7 @@ import { readOperationRecord, type OperationRecord } from './operation.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
+import { redact } from './redact.js';
 import {
   buildToolEnvironment,
   checkedRunner,
@@ -113,16 +128,35 @@ import { forgetAccountToken, forgettingRefusedToken, usableKeptAccountToken } fr
 import type { CloudflareZoneChoice } from './create-input.js';
 
 /** Resources in teardown order; the registry entry is released after all of them. */
-export const REMOVAL_RESOURCES = ['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files'] as const;
+export const REMOVAL_RESOURCES = [
+  'managed-ingress',
+  'nanoclaw',
+  'chat-subscription',
+  'gcp-project',
+  'onecli',
+  'instance-files',
+] as const;
 export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
 /**
  * What an operator may leave behind when removal cannot observe it (`--abandon`):
- * the Google Cloud project, or the assistant's DNS record in a Cloudflare zone
- * the token can no longer see (a deleted zone takes its records with it).
+ * the Google Cloud project, the assistant's DNS record in a Cloudflare zone
+ * the token can no longer see (a deleted zone takes its records with it), or
+ * the assistant's Google Chat subscription when Google refuses its sign-in.
  */
-export const ABANDONABLE_RESOURCES = ['gcp-project', 'cloudflare-dns'] as const;
+export const ABANDONABLE_RESOURCES = ['gcp-project', 'cloudflare-dns', 'chat-subscription'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
+
+const ONLY_IF_GONE =
+  "Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.";
+
+/** What leaving each resource behind means, as a pause tells the operator. */
+const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
+  'gcp-project': ONLY_IF_GONE,
+  'cloudflare-dns': ONLY_IF_GONE,
+  'chat-subscription':
+    'Leaving it behind is safe: once the project is deleted it delivers nowhere, and Google deletes it within 7 days; removal records this evidence.',
+};
 
 function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
   return ABANDONABLE_RESOURCES.some((candidate) => candidate === resource);
@@ -137,6 +171,7 @@ const DELETE_ATTEMPTS = 3;
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
   'managed-ingress': { id: 'remove_managed_ingress', label: 'Removing the Cloudflare route…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
+  'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
   onecli: { id: 'remove_onecli', label: 'Removing OneCLI…' },
   'instance-files': { id: 'remove_instance_files', label: 'Removing local files…' },
@@ -184,6 +219,8 @@ export interface RemovalOptions {
 /** Boundary seams; each defaults to the real one. */
 export interface RemovalDependencies extends RemovalOptions {
   readonly platform?: InstanceServicePlatform;
+  /** Reaches Google as the assistant: its Chat token and its Workspace Events subscription. */
+  readonly fetch?: typeof globalThis.fetch;
   /** Runs local teardown: the service manager fallback, the stray-host kill, and Docker. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly runGcloud?: GcloudCommandRunner;
@@ -220,7 +257,7 @@ export class RemovalPause extends PauseRequired {
     super(`${resource.replaceAll('-', '_')}_unobservable`, reason, [
       'Evidence:',
       ...evidence.split('\n').map((line) => `  ${line}`),
-      `Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.`,
+      LEAVING_BEHIND[resource],
     ]);
     this.name = 'RemovalPause';
     this.resource = resource;
@@ -627,6 +664,97 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   });
 }
 
+/** The assistant's Google sign-in, where every runtime keeps it: in the instance's secrets (`googleGrantFile`). */
+function grantFileOf(paths: ControlPlanePaths, instanceId: string): string {
+  return path.join(paths.instanceRoot(instanceId), 'secrets', GOOGLE_GRANT_FILE_NAME);
+}
+
+/**
+ * Google's answer to the assistant's sign-in is final: the grant is revoked
+ * or short of Chat's scopes, or Google refuses its token or the call. Only an
+ * unreachable or overloaded Google is worth asking again.
+ */
+function googleRefuses(error: unknown): boolean {
+  if (error instanceof GoogleApiError) return !error.retryable;
+  if (error instanceof GoogleTokenError) return error.refused;
+  return error instanceof GoogleGrantRevokedError || error instanceof GoogleScopeNotGrantedError;
+}
+
+/** What Google, or reading the sign-in, answered: its message, which names no secret, redacted all the same. */
+function answerOf(error: unknown): string {
+  return redact(error instanceof Error ? error.message : String(error));
+}
+
+/** Why removal cannot see the assistant's Chat subscription. */
+interface ChatSubscriptionRefusal {
+  readonly reason: string;
+  readonly evidence: string;
+}
+
+/** How removal reaches the assistant's Chat subscription, which only the assistant's own sign-in can see. */
+type ChatSubscriptionAccess =
+  /** The assistant never signed in, so its host never subscribed. */
+  | { readonly state: 'unsigned' }
+  | { readonly state: 'signed-in'; readonly account: string; readonly api: WorkspaceEventsApi }
+  /** Google refuses the sign-in, or the sign-in cannot be read. */
+  | ({ readonly state: 'refused' } & ChatSubscriptionRefusal);
+
+function signInRefusal(account: string, error: unknown): ChatSubscriptionRefusal {
+  return {
+    reason: "Google refuses the assistant's sign-in, so removal cannot see or delete its Google Chat subscription.",
+    evidence: [`Assistant account: ${account}`, `Google answered: ${answerOf(error)}`].join('\n'),
+  };
+}
+
+/**
+ * Workspace Events as the assistant, proven by listing its Chat
+ * subscriptions, which changes nothing: from the grant the instance keeps,
+ * with a Chat token minted for each call as the host mints its own.
+ */
+async function chatSubscriptionAccess(
+  grantFile: string,
+  fetch: typeof globalThis.fetch | undefined,
+): Promise<ChatSubscriptionAccess> {
+  let grant: GoogleGrant | undefined;
+  try {
+    grant = await readGoogleGrantFile(grantFile);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A sign-in that cannot be read cannot see the subscription; removal pauses with why.
+  } catch (error) {
+    return {
+      state: 'refused',
+      reason:
+        "The assistant's Google sign-in cannot be read, so removal cannot see or delete its Google Chat subscription.",
+      evidence: [`Sign-in file: ${grantFile}`, `Reading it failed: ${answerOf(error)}`].join('\n'),
+    };
+  }
+  if (grant === undefined) return { state: 'unsigned' };
+  const signedIn = grant;
+  const options = fetch === undefined ? {} : { fetch };
+  const api = createWorkspaceEventsApi({
+    token: async () => (await mintServiceToken(signedIn, 'chat', options)).accessToken,
+    ...options,
+  });
+  try {
+    await api.list();
+  } catch (error) {
+    if (!googleRefuses(error)) throw error;
+    return { state: 'refused', ...signInRefusal(signedIn.account, error) };
+  }
+  return { state: 'signed-in', account: signedIn.account, api };
+}
+
+/** Delete every subscription the assistant holds on its Chat target, then observe that none is left. */
+async function deleteChatSubscriptions(api: WorkspaceEventsApi): Promise<void> {
+  for (const subscription of await api.list()) await api.remove(subscription.name);
+  const left = (await api.list()).filter((subscription) => subscription.state !== 'DELETED');
+  if (left.length > 0) {
+    throw new GwsEaError(
+      'chat_subscription_removal_incomplete',
+      `Google still shows the Chat subscription ${left.map((subscription) => subscription.name).join(', ')} after its deletion`,
+    );
+  }
+}
+
 /** How often, and how many times, removal checks that a stray host it stopped is gone. */
 const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
@@ -921,6 +1049,8 @@ async function removeLocked(
     // Peers write every managed route into the shared set, so it is observed whenever the machine has a tunnel.
     'managed-ingress': claim !== undefined && (started('establish_transport') || (!released && tunnelRecorded)),
     nanoclaw: started('start_nanoclaw'),
+    // The host keeps the subscription from its start, with the assistant's sign-in.
+    'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
     onecli: started('start_onecli'),
     'instance-files': true,
@@ -977,6 +1107,15 @@ async function removeLocked(
       () => interaction.signInToGoogleCloud(account),
       (refusal) => activeStep()?.write(`${refusal.message}; signing in, then trying again\n`),
     );
+  const chatSubscription = once(() => chatSubscriptionAccess(grantFileOf(paths, instanceId), dependencies.fetch));
+  /** Leave the subscription behind when the operator accepts it, else pause with why removal cannot see it. */
+  const leaveChatSubscription = (refusal: ChatSubscriptionRefusal): Evidence => {
+    if (!abandon.has('chat-subscription')) {
+      throw new RemovalPause('chat-subscription', refusal.reason, refusal.evidence);
+    }
+    activeStep()?.write(`${refusal.reason}\n${refusal.evidence}\n`);
+    return { at: new Date().toISOString(), evidence: refusal.evidence };
+  };
   const cloudflare = once(async () => {
     if (!claim) throw new GwsEaError('invalid_removal', 'Only managed ingress needs Cloudflare authorization');
     return cloudflareAuthority(
@@ -1001,6 +1140,12 @@ async function removeLocked(
       });
     }
     if (pending.has('managed-ingress')) await cloudflare();
+    if (pending.has('chat-subscription')) {
+      const access = await chatSubscription();
+      if (access.state === 'refused' && !abandon.has('chat-subscription')) {
+        throw new RemovalPause('chat-subscription', access.reason, access.evidence);
+      }
+    }
   });
 
   const file = paths.removalFile(instanceId);
@@ -1052,6 +1197,23 @@ async function removeLocked(
     nanoclaw: async () => {
       await requireUninstall()(reservation, await localRuntime());
       return undefined;
+    },
+    'chat-subscription': async () => {
+      const access = await chatSubscription();
+      switch (access.state) {
+        case 'unsigned':
+          return undefined;
+        case 'refused':
+          return leaveChatSubscription(access);
+        case 'signed-in':
+          try {
+            await deleteChatSubscriptions(access.api);
+            return undefined;
+          } catch (error) {
+            if (!googleRefuses(error)) throw error;
+            return leaveChatSubscription(signInRefusal(access.account, error));
+          }
+      }
     },
     'gcp-project': async () => {
       const coordinates: GcpProjectCoordinates = {

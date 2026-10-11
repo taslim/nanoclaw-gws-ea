@@ -886,12 +886,15 @@ async function refence(host: CutoverHost, record: OperationRecord): Promise<Oper
  * its follow-ups planned, and the registry compare-and-swap commits it. A
  * resume between the fence and the start fences again first, so a switch is
  * always followed by a start that reads the service definition it installed.
+ * Returns why the release's Google Chat waits on a new sign-in when this run
+ * verified it serving through one (KTD12), and null otherwise.
  */
-async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<void> {
+async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<string | null> {
   const { operation, layout, reporter } = host;
   const name = releaseName(start.to.deployed_commit);
   let record = RESUMED_FENCED.has(start.phase) ? await refence(host, start) : start;
   let definitionChanged = false;
+  let signInNeeded: string | null = null;
   for (;;) {
     switch (record.phase) {
       case 'staged': {
@@ -928,14 +931,17 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<voi
       case 'started': {
         const started = record;
         await reconcileMainSkills(host, started.stop?.graceful === false);
-        await runStep(reporter, { id: 'verify_release', label: 'Checking the new release serves…' }, async () =>
-          verifyServingRelease(host, {
-            view: reservationAt(host.reservation, started.to),
-            pins: await releasePins(host, started.to),
-            leaseHeld: started.stop?.graceful === false,
-            subject: 'The new release',
-          }),
-        );
+        ({ signInNeeded } = await runStep(
+          reporter,
+          { id: 'verify_release', label: 'Checking the new release serves…' },
+          async () =>
+            verifyServingRelease(host, {
+              view: reservationAt(host.reservation, started.to),
+              pins: await releasePins(host, started.to),
+              leaseHeld: started.stop?.graceful === false,
+              subject: 'The new release',
+            }),
+        ));
         record = await advanceOperation(operation, 'verified', {
           follow_ups: planFollowUps(record.follow_ups, releaseFollowUps(host.runtime)),
         });
@@ -945,9 +951,9 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<voi
         await runStep(reporter, { id: 'record_release', label: 'Recording the new release…' }, () =>
           commitOperationRelease(operation),
         );
-        return;
+        return signInNeeded;
       case 'committed':
-        return;
+        return signInNeeded;
     }
   }
 }
@@ -958,6 +964,8 @@ export interface UpdatedAssistant {
   readonly to: ReleaseCoordinates;
   /** The release it left is kept to roll back to: false for an update with no rollback target (KTD9). */
   readonly rollbackTarget: boolean;
+  /** Why its Google Chat waits on a new sign-in, which the release was served through (KTD12); null otherwise. */
+  readonly signInNeeded: string | null;
 }
 
 /**
@@ -976,9 +984,10 @@ export async function continueUpdate(
   if (!record || record.kind !== 'update' || record.closed) {
     throw new GwsEaError('operation_missing', `Assistant ${instanceId} has no update under way.`);
   }
+  let signInNeeded: string | null = null;
   if (record.phase !== 'committed') {
     try {
-      await runUpdate(await openCutoverHost(operation, dependencies), record);
+      signInNeeded = await runUpdate(await openCutoverHost(operation, dependencies), record);
       // eslint-disable-next-line no-catch-all/no-catch-all -- Every failure before the commit point goes to recovery, which reports it.
     } catch (error) {
       return recoverUpdate(
@@ -989,5 +998,5 @@ export async function continueUpdate(
     }
   }
   await finishFollowUps(operation, dependencies);
-  return { from: record.from, to: record.to, rollbackTarget: record.no_rollback_target !== true };
+  return { from: record.from, to: record.to, rollbackTarget: record.no_rollback_target !== true, signInNeeded };
 }

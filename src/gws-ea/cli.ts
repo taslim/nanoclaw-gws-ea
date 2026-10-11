@@ -1405,14 +1405,22 @@ class Cli {
   }
 }
 
+/** A release served through a broken Google sign-in says so after where it left the assistant (KTD12). */
+function signInDetails(signInNeeded: string | null): string[] {
+  return signInNeeded ? [`${signInNeeded}.`] : [];
+}
+
 /** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
     message: `Assistant ${instanceId} was updated to ${releaseLine(updated.to)}.`,
-    details: updated.rollbackTarget
-      ? [`Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`]
-      : ['It has no previous release to roll back to.'],
+    details: [
+      updated.rollbackTarget
+        ? `Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`
+        : 'It has no previous release to roll back to.',
+      ...signInDetails(updated.signInNeeded),
+    ],
   };
 }
 
@@ -1423,13 +1431,15 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
       return {
         status: 'ready',
         message: `Assistant ${instanceId} was rolled back to ${releaseLine(outcome.to)}.`,
-        details:
-          outcome.mode === 'code_only'
+        details: [
+          ...(outcome.mode === 'code_only'
             ? ['Only its code went back: every conversation, memory, and setting since the update was kept.']
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
                 `What it recorded since on ${releaseLine(outcome.from)} is kept in ${outcome.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
-              ],
+              ]),
+          ...signInDetails(outcome.signInNeeded),
+        ],
       };
     case 'update_discarded':
       return {
@@ -1702,19 +1712,22 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
 /** What the operator must know after removal: the project deletion, and anything left behind. */
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
   const project = `Google Cloud project ${preview.gcpProject}`;
-  const names: Readonly<Record<AbandonableResource, string>> = {
-    'gcp-project': project,
-    'cloudflare-dns':
+  const unobserved = (name: string): string =>
+    `Left behind: ${name}, which removal could not observe; delete it yourself if it still exists.`;
+  const leftBehind: Readonly<Record<AbandonableResource, string>> = {
+    'gcp-project': unobserved(project),
+    'cloudflare-dns': unobserved(
       preview.ingress.mode === 'managed-cloudflare' ? `DNS record ${preview.ingress.hostname}` : 'DNS record',
+    ),
+    'chat-subscription':
+      "Left behind: the assistant's Google Chat subscription, which removal could not delete without a working " +
+      'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
   };
   return [
     ...(outcome?.removed.includes('gcp-project')
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
       : []),
-    ...(outcome?.abandoned.map(
-      ({ resource }) =>
-        `Left behind: ${names[resource]}, which removal could not observe; delete it yourself if it still exists.`,
-    ) ?? []),
+    ...(outcome?.abandoned.map(({ resource }) => leftBehind[resource]) ?? []),
     ...(outcome?.keyPolicyUnrestored
       ? [
           `The Google Chat key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
@@ -1768,7 +1781,7 @@ function printHelp(output: LineWriter): void {
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
-  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
+  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns,chat-subscription]');
   output('  cleanup');
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',

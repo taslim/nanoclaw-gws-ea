@@ -13,9 +13,9 @@
  * definition, and points the live link at it. Neither moves or copies state.
  *
  * The host side lives here too: the service started and checked through
- * NanoClaw's helpers, the checks that a started release serves, main's
- * shared skills reconciled (KTD16), and the follow-ups a committed release
- * runs.
+ * NanoClaw's helpers, the checks that a started release serves (its Google
+ * Chat receiving among them, KTD12), main's shared skills reconciled
+ * (KTD16), and the follow-ups a committed release runs.
  */
 import { readdir, readFile, readlink, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -25,8 +25,8 @@ import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { removeReleaseImage, reclaimImage } from './agent-image-release.js';
 import { taggedImageId, type ImageDocker } from './agent-image.js';
+import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { observeLiveCheckout } from './checkout.js';
-import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
@@ -335,7 +335,7 @@ export interface CutoverSeams {
   readonly ambientEnv?: NodeJS.ProcessEnv;
   /** The service manager's platform and user, and the waits every poll takes. */
   readonly service?: ServiceControlOptions;
-  /** Reaches the host's listener and its callback route (public DNS for the route by default). */
+  /** Reaches OneCLI's health endpoints and its admin API. */
   readonly fetch?: typeof globalThis.fetch;
   readonly onecli?: Partial<CutoverOnecli>;
   /** `ncl <args> --json` through the assistant's own host. */
@@ -593,8 +593,8 @@ export async function serveLeftRelease(
 /** How long a started host may take to serve, and what a killed host's claim lease adds (`src/host-instance.ts`). */
 const HOST_READY_MS = 60_000;
 const HOST_LEASE_MS = 90_000;
-const PROBE_INTERVAL_MS = 1_000;
-const LISTENER_TIMEOUT_MS = 10_000;
+/** How often a started host is asked whether its Google Chat receives. */
+const CHAT_POLL_MS = 1_000;
 /** As long as the host's own `ncl` may take to answer while it starts. */
 const SKILLS_TIMEOUT_MS = 60_000;
 
@@ -603,13 +603,10 @@ function hostFailure(error: unknown, logs: string): string {
   return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(logs, 'nanoclaw.error.log')));
 }
 
-/** The listener ID of the host serving the live release, once it answers with Google Chat connected. */
-async function servingListener(host: CutoverHost, budgetMs: number, subject: string): Promise<string> {
-  const root = host.runtime.checkout_root;
-  const port = host.reservation.allocated_ports.nanoclaw_webhook;
-  let status: unknown;
+/** The host serving the live release answers for its checkout, which NanoClaw's upgrade tripwire allows only at the commit it was stamped for. */
+async function awaitServingHost(host: CutoverHost, budgetMs: number, subject: string): Promise<void> {
   try {
-    status = await host.dependencies.hostStatus.waitForHost(root, { channel: 'gchat', timeoutMs: budgetMs });
+    await host.dependencies.hostStatus.waitForHost(host.runtime.checkout_root, { timeoutMs: budgetMs });
   } catch (error) {
     // Upstream waitForHost reports every failure as a plain Error naming why the host is not ready.
     throw new GwsEaError(
@@ -618,87 +615,33 @@ async function servingListener(host: CutoverHost, budgetMs: number, subject: str
       { cause: error },
     );
   }
-  const webhook = isRecord(status) ? status.webhook : undefined;
-  if (!isRecord(webhook) || webhook.port !== port || typeof webhook.id !== 'string' || !webhook.id) {
-    throw new GwsEaError(
-      'host_not_serving',
-      `${subject}'s host answers without its Google Chat listener on port ${port}.`,
-    );
-  }
-  return webhook.id;
 }
 
-/** What the local listener answered: its status, and the listener ID it named. */
-async function askListener(fetchListener: typeof globalThis.fetch, url: string): Promise<string> {
-  try {
-    const response = await fetchListener(url, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { 'content-type': 'application/json' },
-      body: '{}',
-      signal: AbortSignal.timeout(LISTENER_TIMEOUT_MS),
-    });
-    return `HTTP ${response.status} from listener ${response.headers.get('x-nanoclaw-webhook-id') ?? 'none'}`;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Not answering is itself the answer.
-  } catch {
-    return 'no answer';
-  }
-}
-
-/** The host's listener refuses unsigned traffic with 401 and its own listener ID. */
-async function assertListenerServes(host: CutoverHost, listener: string, budgetMs: number, subject: string) {
-  const url = `http://127.0.0.1:${host.reservation.allocated_ports.nanoclaw_webhook}/webhook/gchat`;
-  const expected = `HTTP 401 from listener ${listener}`;
-  const answer = await pollUntil(
-    () => askListener(host.dependencies.fetch ?? globalThis.fetch, url),
-    (seen) => seen === expected,
-    { intervalMs: PROBE_INTERVAL_MS, limitMs: budgetMs, sleep: cutoverSleep(host) },
-  );
-  if (answer === expected) return;
-  throw new GwsEaError(
-    'listener_not_serving',
-    `${subject}'s listener at ${url} answered ${answer}, not 401 from the host's listener ${listener}.`,
-  );
-}
-
-/** The callback reaches the host's listener (managed) or refuses unsigned traffic (existing), observed read-only. */
-async function assertRouteServes(host: CutoverHost, listener: string, budgetMs: number): Promise<void> {
-  const ingress = host.reservation.exclusive_resource_claims.ingress;
-  const fetchRoute = host.dependencies.fetch ? { fetch: host.dependencies.fetch } : {};
-  const wait = { intervalMs: PROBE_INTERVAL_MS, limitMs: budgetMs, sleep: cutoverSleep(host) };
-  if (ingress.mode === 'existing') {
-    const failure = await pollUntil(
-      () =>
-        verifyExistingGchatRoute({ endpointUrl: ingress.endpoint_url }, fetchRoute).then(
-          () => undefined,
-          (error: unknown) => {
-            if (error instanceof GwsEaError) return error;
-            throw error;
-          },
-        ),
-      (seen) => seen === undefined,
-      wait,
-    );
-    if (failure) throw failure;
-    return;
-  }
+/**
+ * Wait until the started host's Google Chat receives (KTD12): its consumer
+ * connected and its subscription active, as `gws-ea-chat health` reports
+ * them. A broken Google sign-in fails both and only a new sign-in repairs
+ * it, so the release serves through it, and why is returned; anything else
+ * that keeps Chat from receiving refuses the release.
+ */
+async function awaitChatReceiving(host: CutoverHost, budgetMs: number, subject: string): Promise<string | null> {
+  const ncl = host.dependencies.ncl ?? runInstanceNclJson;
   const seen = await pollUntil(
-    () =>
-      observeManagedGchatRoute(
-        {
-          endpointUrl: ingress.callback_url,
-          localEndpointUrl: `http://127.0.0.1:${host.reservation.allocated_ports.nanoclaw_webhook}/webhook/gchat`,
-        },
-        fetchRoute,
-      ),
-    (route) => route.status === 'routed',
-    wait,
+    async () =>
+      chatReceiving(parseChatHealth(unwrapData(await ncl(host.runtime, CHAT_HEALTH_ARGS))), host.operation.instanceId),
+    (receiving) => receiving.state === 'receiving',
+    { intervalMs: CHAT_POLL_MS, limitMs: budgetMs, sleep: cutoverSleep(host) },
   );
-  if (seen.status !== 'routed') {
-    throw new GwsEaError('route_not_serving', `The assistant's callback does not reach it: ${seen.observed}.`);
-  }
-  if (seen.listenerId !== listener) {
-    throw new GwsEaError('route_not_serving', "The assistant's callback reaches another listener than the host's.");
+  switch (seen.state) {
+    case 'receiving':
+      return null;
+    case 'sign_in_needed':
+      return seen.reason;
+    case 'not_receiving':
+      throw new GwsEaError(
+        'chat_not_receiving',
+        `${subject}'s host is up, but ${seen.reason}. Check ${path.join(host.layout.logs, 'nanoclaw.error.log')}.`,
+      );
   }
 }
 
@@ -713,6 +656,15 @@ async function awaitHealthyHost(host: CutoverHost, leaseHeld: boolean, subject: 
     throw new GwsEaError('host_not_serving', `${subject}'s host service never became healthy.`);
   }
   return budget;
+}
+
+/** How a release that counts as serving serves. */
+export interface ServedRelease {
+  /**
+   * Why its Google Chat waits on a new Google sign-in, the release's only
+   * fault, which it serves through (KTD12); null while Chat receives.
+   */
+  readonly signInNeeded: string | null;
 }
 
 /** What a release must show to count as serving. */
@@ -731,26 +683,27 @@ export interface ServingRelease {
  * Check a started release serves. Its service is healthy; the live link names
  * the release, at its commit with no tracked changes, and the host answers
  * for it, which NanoClaw's upgrade tripwire allows only at the commit it was
- * stamped for; its listener answers 401 with the host's own listener ID;
- * OneCLI is healthy (a gateway the switch recreated was probed before the
- * start); and the callback route reaches it. A killed host's claim lease can
- * delay the new one, so it lengthens every wait. A host that went down since
- * it was started is started again; a running one is left as it is.
+ * stamped for; its Google Chat receives (KTD12); and OneCLI is healthy (a
+ * gateway the switch recreated was probed before the start). When a broken
+ * Google sign-in is all that keeps Chat from receiving, the release serves,
+ * and says so. A killed host's claim lease can delay the new one, so it
+ * lengthens every wait. A host that went down since it was started is
+ * started again; a running one is left as it is.
  */
-export async function verifyServingRelease(host: CutoverHost, release: ServingRelease): Promise<void> {
+export async function verifyServingRelease(host: CutoverHost, release: ServingRelease): Promise<ServedRelease> {
   const { subject } = release;
   await host.service.start();
   const budget = await awaitHealthyHost(host, release.leaseHeld, subject);
   await observeLiveCheckout(host.operation.paths, release.view, [release.view.deployed_commit], {
     runCommand: host.run,
   });
-  const listener = await servingListener(host, budget, subject);
-  await assertListenerServes(host, listener, budget, subject);
+  await awaitServingHost(host, budget, subject);
+  const signInNeeded = await awaitChatReceiving(host, budget, subject);
   const seen = await cutoverOnecli(host).observe(host.onecli, release.pins);
   if (seen.status !== 'present') {
     throw new GwsEaError('onecli_not_serving', `The credential vault is not healthy on ${subject.toLowerCase()}.`);
   }
-  await assertRouteServes(host, listener, budget);
+  return { signInNeeded };
 }
 
 /**

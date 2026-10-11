@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLockOwner } from '../community-portal/process-lock.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { ASSISTANT_TOKEN, FakeGoogleEvents } from '../modules/gws-ea-chat/testing/fake-google-events.js';
+import { GOOGLE_GRANT_FILE_NAME, GOOGLE_SIGN_IN_SCOPES } from '../modules/gws-ea-google/grant.js';
 import { runCli, type CliRuntime } from './cli.js';
 import type { CloudflareApi, CloudflareDnsRecord, CloudflareTunnel } from './cloudflare-api.js';
 import { PauseRequired, type CloudflareTokenRequest } from './events.js';
@@ -590,9 +592,55 @@ async function tunnelName(paths: ControlPlanePaths): Promise<string> {
   return metadata.tunnel_name;
 }
 
+const REFRESH_TOKEN = '1//assistant-refresh-token';
+
+/** Where the assistant's Google sign-in lives: in its instance's secrets, as every runtime keeps it. */
+function grantFile(paths: ControlPlanePaths, input: InstanceReservationInput): string {
+  return path.join(paths.instanceRoot(input.instance_id), 'secrets', GOOGLE_GRANT_FILE_NAME);
+}
+
+/** The assistant signed in to Google, as `sign_in_google` leaves it. */
+async function signIn(paths: ControlPlanePaths, input: InstanceReservationInput): Promise<void> {
+  await writePrivate(grantFile(paths, input), {
+    schema_version: 2,
+    account: input.exclusive_resource_claims.workspace_email,
+    sub: '104857395723948572901',
+    client_id: 'juno-hale-client.apps.googleusercontent.com',
+    client_secret: 'juno-hale-client-secret',
+    refresh_token: REFRESH_TOKEN,
+    scopes: GOOGLE_SIGN_IN_SCOPES,
+    granted_at: '2026-10-01T12:00:00.000Z',
+  });
+}
+
+/**
+ * Google as the assistant's sign-in reaches it: the token endpoint, which
+ * mints its refresh token exactly the scopes asked for unless it refuses, and
+ * Workspace Events, which holds the assistant's subscriptions.
+ */
+class FakeAssistantGoogle {
+  readonly events = new FakeGoogleEvents();
+  /** The OAuth error the token endpoint refuses with while set. */
+  refusal: string | undefined;
+
+  readonly fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.host !== 'oauth2.googleapis.com') return this.events.fetch(input, init);
+    const form = new URLSearchParams(String(init?.body));
+    const answer = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    if (form.get('grant_type') !== 'refresh_token' || form.get('refresh_token') !== REFRESH_TOKEN) {
+      return answer(400, { error: 'invalid_request' });
+    }
+    if (this.refusal) return answer(400, { error: this.refusal });
+    return answer(200, { access_token: ASSISTANT_TOKEN, expires_in: 3600, scope: form.get('scope') });
+  };
+}
+
 interface World {
   readonly gcloud: FakeGcloud;
   readonly cloudflare: FakeCloudflare;
+  readonly google: FakeAssistantGoogle;
   readonly order: string[];
   readonly interaction: { [K in keyof RemovalInteraction]: ReturnType<typeof vi.fn<RemovalInteraction[K]>> };
   readonly dependencies: RemovalDependencies & {
@@ -605,6 +653,7 @@ interface World {
 function world(input: InstanceReservationInput): World {
   const gcloud = new FakeGcloud(input);
   const cloudflare = new FakeCloudflare();
+  const google = new FakeAssistantGoogle();
   const order: string[] = [];
   cloudflare.onCall.push((call) => {
     if (call !== 'connections') order.push(call);
@@ -622,15 +671,22 @@ function world(input: InstanceReservationInput): World {
     if (command.args[1] === 'delete') order.push('gcp');
     return outcome;
   };
+  const fetch: typeof globalThis.fetch = async (request, init) => {
+    const response = await google.fetch(request, init);
+    if (init?.method === 'DELETE' && response.ok) order.push('chat-subscription');
+    return response;
+  };
   return {
     gcloud,
     cloudflare,
+    google,
     order,
     interaction,
     dependencies: {
       interaction,
       platform: 'linux',
       runGcloud,
+      fetch,
       resolveDocker: vi.fn(async (recorded: string | undefined) => recorded ?? DOCKER),
       createCloudflareApi: vi.fn(() => cloudflare.api()),
       uninstallNanoclaw: vi.fn(async () => void order.push('nanoclaw')),
@@ -1253,6 +1309,154 @@ describe('removal from any partial state', () => {
   });
 });
 
+describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
+  const STARTED = [
+    'materialize_checkout',
+    'provision_gcp',
+    'start_onecli',
+    'sign_in_google',
+    'start_nanoclaw',
+  ] as const;
+
+  /** `gws-ea remove --yes` for `input`, through `world`'s boundaries, recording what it prints. */
+  function removeCommand(paths: ControlPlanePaths, input: InstanceReservationInput, { dependencies }: World) {
+    const io = { out: [] as string[], err: [] as string[] };
+    const run = (args: readonly string[]): Promise<number> =>
+      runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
+        paths,
+        stdout: (line) => io.out.push(line),
+        stderr: (line) => io.err.push(line),
+        removeAssistant: (removalPaths, id, options) =>
+          removeAssistant(removalPaths, id, { ...dependencies, ...options, interaction: dependencies.interaction }),
+      });
+    return { run, io };
+  }
+
+  it('stops the host before deleting the subscription with the assistant’s sign-in, and deletes the project after', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    await signIn(paths, input);
+    const removal = world(input);
+    removal.gcloud.owned();
+    removal.google.events.seedSubscription();
+
+    const outcome = await removeAssistant(paths, input.instance_id, removal.dependencies);
+
+    expect(removal.order).toEqual(['nanoclaw', 'chat-subscription', 'gcp', 'onecli']);
+    expect(removal.google.events.subscriptions.size).toBe(0);
+    // Listed for the assistant's own target with its own Chat token before any change, which proves the sign-in, then
+    // once the host stopped: listed, deleted, and listed again to see it gone.
+    const calls = removal.google.events.requests.filter(
+      (request) => request.url.host === 'workspaceevents.googleapis.com',
+    );
+    expect(calls.map((request) => `${request.method} ${request.url.pathname}`)).toEqual([
+      'GET /v1/subscriptions',
+      'GET /v1/subscriptions',
+      expect.stringMatching(/^DELETE \/v1\/subscriptions\/chat-/u),
+      'GET /v1/subscriptions',
+    ]);
+    expect(calls[0]!.url.searchParams.get('filter')).toContain('target_resource="//chat.googleapis.com/spaces/-"');
+    expect(new Set(calls.map((request) => request.authorization))).toEqual(new Set([`Bearer ${ASSISTANT_TOKEN}`]));
+    expect(outcome).toEqual({
+      removed: ['nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'],
+      abandoned: [],
+    });
+    await expectGone(paths, input);
+  });
+
+  it('counts the subscription gone without asking Google when the assistant never signed in', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout', 'start_nanoclaw'] });
+    const removal = world(input);
+
+    const outcome = await removeAssistant(paths, input.instance_id, removal.dependencies);
+
+    expect(removal.google.events.requests).toEqual([]);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
+  });
+
+  it("pauses before any change when Google refuses the assistant's sign-in, then completes, leaving the subscription behind on request", async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    await signIn(paths, input);
+    const removal = world(input);
+    removal.gcloud.owned();
+    removal.google.refusal = 'invalid_grant';
+    const subscription = removal.google.events.seedSubscription();
+    const { run, io } = removeCommand(paths, input, removal);
+
+    expect(await run([])).toBe(10);
+    const paused = io.out.join('\n');
+    expect(paused).toContain('Paused at prerequisites');
+    expect(paused).toContain("Google no longer accepts the assistant's sign-in");
+    expect(paused).toContain('Google deletes it within 7 days');
+    expect(paused).toContain(`gws-ea remove --id ${input.instance_id} --yes --abandon chat-subscription`);
+    expect(removal.order).toEqual([]);
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+
+    io.out.length = 0;
+    expect(await run(['--abandon', 'chat-subscription'])).toBe(0);
+    expect(removal.order).toEqual(['nanoclaw', 'gcp', 'onecli']);
+    expect(removal.google.events.subscriptions.has(subscription.name)).toBe(true);
+    expect(io.out.join('\n')).toContain("Left behind: the assistant's Google Chat subscription");
+    await expectGone(paths, input);
+  });
+
+  it('pauses at the subscription when Workspace Events refuses the sign-in once the host stopped, and abandons it on request', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    await signIn(paths, input);
+    const removal = world(input);
+    removal.gcloud.owned();
+    removal.google.events.seedSubscription();
+    const uninstallNanoclaw = vi.fn<NonNullable<RemovalDependencies['uninstallNanoclaw']>>(async () => {
+      removal.order.push('nanoclaw');
+      removal.google.events.workspaceFailure = { status: 403, message: 'Workspace Events API is disabled in project' };
+    });
+    const dependencies = { ...removal.dependencies, uninstallNanoclaw };
+
+    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
+      code: 'chat_subscription_unobservable',
+      resource: 'chat-subscription',
+    });
+    expect(removal.order).toEqual(['nanoclaw']);
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      abandon: new Set(['chat-subscription']),
+    });
+
+    expect(uninstallNanoclaw).toHaveBeenCalledOnce();
+    expect(removal.order).toEqual(['nanoclaw', 'gcp', 'onecli']);
+    expect(outcome.abandoned).toEqual([
+      { resource: 'chat-subscription', evidence: expect.stringContaining('Workspace Events API is disabled') },
+    ]);
+    await expectGone(paths, input);
+  });
+
+  it('stops before any change while Google cannot be reached, with nothing to abandon, and finishes on retry', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    await signIn(paths, input);
+    const removal = world(input);
+    removal.gcloud.owned();
+    removal.google.events.seedSubscription();
+    removal.google.events.workspaceFailure = { status: 503, message: 'The service is currently unavailable.' };
+
+    await expect(
+      removeAssistant(paths, input.instance_id, { ...removal.dependencies, abandon: new Set(['chat-subscription']) }),
+    ).rejects.toThrow(/currently unavailable/u);
+    expect(removal.order).toEqual([]);
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+
+    removal.google.events.workspaceFailure = undefined;
+    await removeAssistant(paths, input.instance_id, removal.dependencies);
+
+    expect(removal.order).toEqual(['nanoclaw', 'chat-subscription', 'gcp', 'onecli']);
+    await expectGone(paths, input);
+  });
+});
+
 describe('removal after an update or rollback', () => {
   const TARGET = 'b'.repeat(40);
   const RECORDED_DOCKER = 'unix:///var/run/recorded-docker.sock';
@@ -1351,7 +1555,7 @@ describe('removal after an update or rollback', () => {
 
     const outcome = await removeAssistant(paths, input.instance_id, dependencies);
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'onecli', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'onecli', 'instance-files']);
     // The recorded Docker endpoint is found in the assistant's state, live link or none.
     expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect(dependencies.uninstallNanoclaw).toHaveBeenCalledWith(reservation, expect.anything());
@@ -1378,7 +1582,7 @@ describe('removal after an update or rollback', () => {
       serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
     });
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
     expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect([...docker.images.keys()]).toEqual([]);
     await expectGone(paths, reservation);
@@ -1586,7 +1790,7 @@ describe('removal in any phase', () => {
       serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
     });
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
     expect(processes).toEqual(new Set([peerHost]));
     await expectGone(paths, input);
     expect(await exists(paths.markerFile(peer.instance_id))).toBe(true);

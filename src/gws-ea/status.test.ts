@@ -2,8 +2,8 @@
  * `list` and `status` observe assistants built as create leaves them: a
  * registry reservation and journal, a Git checkout detached at its release
  * with its marker and runtime, the release receipt, and the OneCLI Compose
- * file. The host, service manager, Docker, OneCLI, and the callback are
- * faked at their boundaries; Git and SQLite are real.
+ * file. The host, service manager, Docker, and OneCLI are faked at their
+ * boundaries; Git and SQLite are real.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -78,7 +78,6 @@ const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.ant
 const MAIN = 'ag-main';
 const EXTERNAL_EMAIL = 'ag-external-email';
 const SESSION = 'sess-principal';
-const LISTENER = '6f1c2b1e-8d4a-4c1e-9b7a-2f3e4d5c6b7a';
 const NOW = new Date('2026-09-28T14:30:00.000Z');
 const DELIVERED_AT = '2026-09-28T14:00:00.000Z';
 const SENTINEL = 'sentinel-secret-value-7f3a9c';
@@ -112,9 +111,6 @@ const STATUS_FIELDS = [
 
 /** A schema fingerprint as `status` prints it. */
 const FINGERPRINT = /^sha256:[0-9a-f]{64}$/u;
-
-/** How the machine's shared connector differs from what this tool would run. */
-const CONNECTOR_DRIFT = 'it was started with a different connector token';
 
 interface Machine {
   readonly root: string;
@@ -377,9 +373,8 @@ interface World {
   readonly installed: ReadonlySet<string>;
   /** Installs whose service runs. */
   readonly active: Set<string>;
-  /** Checkouts whose host answers on its socket, its webhook, and `ncl`. */
+  /** Checkouts whose host answers on its socket and `ncl`. */
   readonly serving: Set<string>;
-  readonly ports: Map<string, number>;
   /** The agent image tags Docker holds. */
   readonly images: Set<string>;
   readonly commands: SanitizedCommand[];
@@ -392,9 +387,6 @@ function world(...assistants: readonly InstanceReservation[]): World {
     installed: new Set(assistants.map(installOf)),
     active: new Set(assistants.map(installOf)),
     serving: new Set(checkouts),
-    ports: new Map(
-      assistants.map((reservation) => [liveOf(reservation), reservation.allocated_ports.nanoclaw_webhook]),
-    ),
     images: new Set(assistants.map(liveImageOf)),
     commands: [],
     serviceEnvironments: [],
@@ -437,31 +429,9 @@ function hostStatus(state: World): HostStatusHelpers {
   return {
     queryHost: async (root) => {
       if (!state.serving.has(root)) throw new Error('NanoClaw is not running; see logs/nanoclaw.error.log');
-      return {
-        pid: 4242,
-        webhook: { port: state.ports.get(root), paths: ['/webhook/gchat'] },
-        channels: [{ instance: 'gchat', connected: true }],
-      };
+      return { pid: 4242, channels: [{ instance: 'gchat', connected: true }] };
     },
     waitForHost: async () => unused(),
-  };
-}
-
-/** The callback as the internet reaches it: the host's listener answers while it serves, behind a working route. */
-function callbackFetch(state: World): typeof globalThis.fetch {
-  return async (input, init) => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
-    const local = url.hostname === '127.0.0.1';
-    const serving = local
-      ? [...state.ports].some(([root, port]) => String(port) === url.port && state.serving.has(root))
-      : state.serving.size > 0;
-    if (!serving) {
-      throw new TypeError('fetch failed', {
-        cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }),
-      });
-    }
-    if (init?.method === 'GET') return new Response('not found', { status: 404 });
-    return new Response('', { status: 401, headers: { 'x-nanoclaw-webhook-id': LISTENER } });
   };
 }
 
@@ -477,6 +447,8 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { agent_group_id: EXTERNAL_EMAIL, problems: [] };
       case 'gws-ea-inbox health':
         return HEALTHY_INBOX;
+      case 'gws-ea-chat health':
+        return RECEIVING_CHAT;
       case `groups get --id ${MAIN}`:
         return { id: MAIN, name: 'main' };
       case `groups config get --id ${MAIN}`:
@@ -496,6 +468,19 @@ const HEALTHY_INBOX = {
   consecutiveFailures: 0,
   calendarNotifications: { state: 'ok', reason: null },
   calendarAccess: [{ address: 'morgan@example.test', access: 'bookable', checkedAt: '2026-09-28T14:29:00.000Z' }],
+} as const;
+
+/** Google Chat as the host's `gws-ea-chat health` reports it receiving. */
+const RECEIVING_CHAT = {
+  consumer: { connected: true, lastPullAt: '2026-09-28T14:29:30.000Z', error: null },
+  subscription: {
+    state: 'active',
+    name: 'subscriptions/chat-juno-hale',
+    expireTime: '2026-10-04T14:00:00.000Z',
+    suspensionReason: null,
+    error: null,
+  },
+  signInNeeded: false,
 } as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
@@ -534,11 +519,9 @@ function recordingRunner(state: World): StatusObservers['runCommand'] {
 function healthyObservers(state: World): StatusObservers {
   return {
     runCommand: recordingRunner(state),
-    fetch: callbackFetch(state),
     ncl: ncl(state),
     onecliAgents,
     onecli: async () => PRESENT,
-    connector: async () => ({ status: 'present' }),
     principalBinding: () => ({
       status: 'matched',
       agentGroupId: MAIN,
@@ -593,14 +576,11 @@ describe('status', () => {
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
-    // Beside the healthy host: a removal cut short, and a drifted shared connector.
+    // Beside the healthy host: a removal cut short.
     await removalStarted(host.paths, reservation);
     const state = world(reservation);
 
-    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
-      ...healthyObservers(state),
-      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
-    });
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id);
 
     expect(exitCode).toBe(0);
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
@@ -620,8 +600,15 @@ describe('status', () => {
         { address: 'morgan@example.test', access: 'bookable', checked_at: HEALTHY_INBOX.lastSuccessAt },
       ],
     });
-    // A shared connector's drift is reported, never counted against this assistant (KTD11).
-    expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
+    expect(status.probes.chat).toEqual({
+      status: 'ok',
+      reason: null,
+      consumer_connected: true,
+      last_pull_at: RECEIVING_CHAT.consumer.lastPullAt,
+      subscription_state: 'active',
+      subscription_expire_time: RECEIVING_CHAT.subscription.expireTime,
+      sign_in_needed: false,
+    });
     expect(status.probes.delivery).toMatchObject({
       last: { status: 'delivered', message_out_id: 'out-welcome', at: DELIVERED_AT },
       retrying: 0,
@@ -672,8 +659,9 @@ describe('status', () => {
       reason: `The host is unreachable: NanoClaw is not running; see ${host.paths.instanceRoot(reservation.instance_id)}/logs/nanoclaw.error.log`,
     });
     expect(status.probes.main_identity).toMatchObject({ status: 'unknown', agent_group_id: null });
-    expect(status.probes.route).toMatchObject({ status: 'degraded', reason: expect.stringMatching(/local listener/u) });
-    for (const name of ['checkout', 'onecli', 'principal', 'connector', 'delivery']) {
+    // Whether Chat receives is the host's to say, so a host that does not answer leaves it unknown.
+    expect(status.probes.chat).toMatchObject({ status: 'unknown', consumer_connected: null, sign_in_needed: null });
+    for (const name of ['checkout', 'onecli', 'principal', 'delivery']) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
   });
@@ -732,8 +720,6 @@ describe('status', () => {
 
     expect(exitCode).toBe(0);
     expect(status.probes.onecli).toEqual({ status: 'degraded', reason: refusal });
-    // An operator-managed endpoint has no connector to observe.
-    expect(Object.keys(status.probes)).toEqual(PROBE_NAMES.filter((name) => name !== 'connector'));
     for (const name of Object.keys(status.probes).filter((probe) => probe !== 'onecli')) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
@@ -863,6 +849,140 @@ describe('status', () => {
         last_success_at: null,
         calendar_notifications: null,
         calendar_access: null,
+      });
+    }
+  });
+
+  it('reports Google Chat as the host reports it: receiving, a broken sign-in named as one, and anything else as not receiving', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const id = reservation.instance_id;
+    const reporting = (health: unknown): Partial<StatusObservers> => ({
+      ...healthy,
+      ncl: (async (runtime, args) =>
+        args.join(' ') === 'gws-ea-chat health' ? health : healthy.ncl(runtime, args)) satisfies StatusObservers['ncl'],
+    });
+    const at = '2026-09-28T14:20:00.000Z';
+    const signIn = `Sign the assistant in again with gws-ea connect-google --id ${id}.`;
+
+    // Google suspended the subscription for the assistant's authorization.
+    const suspended = await statusJson(
+      host,
+      state,
+      id,
+      reporting({
+        ...RECEIVING_CHAT,
+        subscription: { ...RECEIVING_CHAT.subscription, state: 'suspended', suspensionReason: 'USER_SCOPE_REVOKED' },
+        signInNeeded: true,
+      }),
+    );
+    expect(suspended.status.probes.chat).toEqual({
+      status: 'degraded',
+      reason: `Sign-in needed for Google Chat: Google suspended its Chat subscription (USER_SCOPE_REVOKED). ${signIn}`,
+      consumer_connected: true,
+      last_pull_at: RECEIVING_CHAT.consumer.lastPullAt,
+      subscription_state: 'suspended',
+      subscription_expire_time: RECEIVING_CHAT.subscription.expireTime,
+      sign_in_needed: true,
+    });
+
+    // Google refused the assistant's grant, so the host never confirmed a subscription.
+    const refused = await statusJson(
+      host,
+      state,
+      id,
+      reporting({
+        ...RECEIVING_CHAT,
+        subscription: {
+          state: 'unknown',
+          name: null,
+          expireTime: null,
+          suspensionReason: null,
+          error: { kind: 'sign_in_needed', message: 'Google refused a chat token (invalid_scope)', at },
+        },
+        signInNeeded: true,
+      }),
+    );
+    expect(refused.status.probes.chat).toMatchObject({
+      status: 'degraded',
+      reason: `Sign-in needed for Google Chat: Google refused a chat token (invalid_scope). ${signIn}`,
+      subscription_state: 'unknown',
+      sign_in_needed: true,
+    });
+
+    // Anything else is Chat not receiving, with each side's last failure.
+    const down = await statusJson(
+      host,
+      state,
+      id,
+      reporting({
+        consumer: {
+          connected: false,
+          lastPullAt: null,
+          error: { kind: 'subscriber_credential', message: 'Pub/Sub refused the subscriber (HTTP 403)', at },
+        },
+        subscription: {
+          state: 'expired',
+          name: 'subscriptions/chat-juno-hale',
+          expireTime: '2026-09-28T13:00:00.000Z',
+          suspensionReason: null,
+          error: { kind: 'unreachable', message: 'Google could not be reached (/v1/subscriptions)', at },
+        },
+        signInNeeded: false,
+      }),
+    );
+    expect(down.status.probes.chat).toEqual({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer is not connected (Pub/Sub refused the subscriber (HTTP 403)); ' +
+        'its subscription is expired (Google could not be reached (/v1/subscriptions)).',
+      consumer_connected: false,
+      last_pull_at: null,
+      subscription_state: 'expired',
+      subscription_expire_time: '2026-09-28T13:00:00.000Z',
+      sign_in_needed: false,
+    });
+    for (const name of Object.keys(down.status.probes).filter((probe) => probe !== 'chat')) {
+      expect(down.status.probes[name], name).toMatchObject({ status: 'ok' });
+    }
+
+    // A host only just started has neither yet.
+    const starting = await statusJson(
+      host,
+      state,
+      id,
+      reporting({
+        consumer: { connected: false, lastPullAt: null, error: null },
+        subscription: { state: 'unknown', name: null, expireTime: null, suspensionReason: null, error: null },
+        signInNeeded: false,
+      }),
+    );
+    expect(starting.status.probes.chat).toMatchObject({
+      status: 'degraded',
+      reason:
+        'Google Chat is not receiving: its consumer has not connected yet; its subscription is not confirmed yet.',
+    });
+
+    for (const report of [
+      { ...RECEIVING_CHAT, signInNeeded: 'no' },
+      { ...RECEIVING_CHAT, consumer: { ...RECEIVING_CHAT.consumer, connected: 1 } },
+      { ...RECEIVING_CHAT, subscription: { ...RECEIVING_CHAT.subscription, state: 'ACTIVE' } },
+      {
+        ...RECEIVING_CHAT,
+        subscription: { ...RECEIVING_CHAT.subscription, error: { kind: 'revoked', message: 'x', at } },
+      },
+    ]) {
+      const invalid = await statusJson(host, state, id, reporting(report));
+      expect(invalid.status.probes.chat).toEqual({
+        status: 'degraded',
+        reason: 'ncl returned an invalid Chat report',
+        consumer_connected: null,
+        last_pull_at: null,
+        subscription_state: null,
+        subscription_expire_time: null,
+        sign_in_needed: null,
       });
     }
   });
@@ -1010,10 +1130,7 @@ describe('status', () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const state = world(reservation);
-    const { runtime, output } = command(host, state, {
-      ...healthyObservers(state),
-      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
-    });
+    const { runtime, output } = command(host, state);
 
     expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
 
@@ -1022,8 +1139,10 @@ describe('status', () => {
     expect(text).toContain('Observed: Sep 28, 2026, 10:30 AM');
     expect(text).toContain('Sep 28, 2026, 10:00 AM');
     for (const name of PROBE_NAMES) expect(text).toMatch(new RegExp(`^ {2}ok +${name}\\b`, 'mu'));
-    expect(text).toMatch(
-      new RegExp(`^ {2}ok +connector +${CONNECTOR_DRIFT}; it is shared, so it is left as it is$`, 'mu'),
+    const tz = 'America/New_York';
+    expect(output.stdout).toContain(
+      `  ok        chat            subscription active until ${formatLocalTime(RECEIVING_CHAT.subscription.expireTime, tz)}; ` +
+        `last pulled ${formatLocalTime(RECEIVING_CHAT.consumer.lastPullAt, tz)}`,
     );
     expect(output.stderr).toEqual([]);
   });
@@ -1448,7 +1567,6 @@ describe('read-only commands', () => {
     // Only the external boundaries are faked; every reader of the fixture is real.
     const observers: Partial<StatusObservers> = {
       runCommand: recordingRunner(state),
-      fetch: callbackFetch(state),
       ncl: ncl(state),
       onecliAgents,
     };
@@ -1502,10 +1620,14 @@ describe('help', () => {
       'behind_tool_release',
       'previous_commit',
       'schema_moved',
-      'drift',
       'last_success_at',
       'calendar_notifications',
       'calendar_access',
+      'consumer_connected',
+      'last_pull_at',
+      'subscription_state',
+      'subscription_expire_time',
+      'sign_in_needed',
     ]) {
       expect(help, field).toContain(field);
     }

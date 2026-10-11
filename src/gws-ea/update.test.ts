@@ -6,7 +6,7 @@
  * committed, its state never moved. Git, tar, SQLite, and the files are
  * real; the service manager, Docker and OneCLI, `ps`, `lsof`, the release's
  * install, build, migration, and tripwire scripts, the host's status and
- * listener, and `ncl` are faked at their boundaries.
+ * its Google Chat health, and `ncl` are faked at their boundaries.
  */
 import { readlinkSync } from 'node:fs';
 import { mkdir, readdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
@@ -866,8 +866,8 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
 
   /**
    * After `returnCutShort`, a login ran the release the update left, which recorded `m-after` after the update's
-   * snapshot. Continuing the update, the new release migrates the database as it starts and its callback route
-   * never reaches it.
+   * snapshot. Continuing the update, the new release migrates the database as it starts and its Google Chat
+   * never receives.
    */
   async function leftReleaseRanAgain() {
     const cut = await returnCutShort();
@@ -876,8 +876,8 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
     expect(state.running).toBe(true);
     await converse(runtime, 'm-after');
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(next.commit);
-      if (state.routeDown) applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
+      state.chatDown = readlinkSync(root) === releaseName(next.commit);
+      if (state.chatDown) applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
     };
     return cut;
   }
@@ -940,10 +940,10 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     await converse(runtime, 'm1');
     const next = await nextRelease(host);
     const state = world(runtime);
-    // The new release's callback route never reaches it, and its host serves one message before it is rolled back.
+    // The new release's Google Chat never receives, and its host serves one message before it is rolled back.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(next.commit);
-      if (state.routeDown) void converse(runtime, 'm2');
+      state.chatDown = readlinkSync(root) === releaseName(next.commit);
+      if (state.chatDown) void converse(runtime, 'm2');
     };
     const inode = await centralInode(runtime);
     const { run, err } = cli(host, state, next, runtime);
@@ -970,10 +970,10 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     const point = await readRollbackPoint(host.paths, runtime.instance_id);
     await converse(runtime, 'm2');
     const next = await nextRelease(host);
-    // The new release migrates the live database as its host starts, serves one message, and is never reached.
+    // The new release migrates the live database as its host starts, serves one message, and never receives Chat.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(next.commit);
-      if (!state.routeDown) return;
+      state.chatDown = readlinkSync(root) === releaseName(next.commit);
+      if (!state.chatDown) return;
       applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
       void converse(runtime, 'm3');
     };
@@ -1026,7 +1026,7 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const state = world(runtime);
     // Nothing serves: neither the new release nor the one it left.
-    state.routeDown = true;
+    state.chatDown = true;
     const id = runtime.instance_id;
     const { run, err } = cli(host, state, next, runtime);
 
@@ -1055,7 +1055,7 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(err.join('\n')).toContain('failed and left no release to return to (started)');
     expect(err.join('\n')).toContain(`Fix it forward: update it to a newer release with gws-ea update --id ${id}`);
     const newer = await nextRelease(host);
-    delete state.routeDown;
+    delete state.chatDown;
 
     expect(await cli(host, state, newer, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
 
@@ -1110,9 +1110,9 @@ describe('an update killed once switched, its release then run by a login', GIT_
 
   it('continued and failing its checks, restores the snapshot taken before its release ran, never one taken since', async () => {
     const { host, runtime, next, state, run } = await switchedAndRun(true);
-    // The new release's callback route never reaches it.
+    // The new release's Google Chat never receives.
     state.onStart = (root) => {
-      state.routeDown = readlinkSync(root) === releaseName(next.commit);
+      state.chatDown = readlinkSync(root) === releaseName(next.commit);
     };
 
     expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
