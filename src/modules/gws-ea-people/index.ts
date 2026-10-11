@@ -5,7 +5,8 @@
  * and reads it live through a pointer section; what it knows of a person
  * lives in its own memory. The only people fact the host passes on is a
  * level for an identity (`getPersonLevel`). Other modules purge their own
- * data for a forgotten person through `registerPersonForgetHook`.
+ * data for a forgotten person through `registerPersonForgetHook`, and put to
+ * main what only it can rewrite through `registerPersonForgetReview`.
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -270,7 +271,7 @@ registerResource({
       access: 'open',
       description:
         'Forget a person, when the principal tells you to: their record, their identities, and the work on their email threads are deleted. Only a one-way fingerprint of each identity remains, so they are unknown from then on and only the principal can add them back.\n\n' +
-        'Answers with their name and identities: clear them from your memory, their file and every other mention.',
+        'Answers with their name and identities: clear them from your memory, their file and every other mention. `rewrite` lists, by kind and id, what else you wrote that may name them: rewrite each so none does.',
       args: [ID_ARG],
       examples: ['ncl people forget p-1a2b3c4d5e6f'],
       handler: async (args, ctx) => asMain(ctx, async () => forgetPerson({ id: requiredString(args, 'id') })),
@@ -307,7 +308,10 @@ export {
   getPersonLevel,
   PERSON_LEVELS,
   registerPersonForgetHook,
+  registerPersonForgetReview,
   type ForgottenPerson,
   type PersonForgetHook,
+  type PersonForgetReview,
   type PersonLevel,
+  type PersonToForget,
 } from './db.js';

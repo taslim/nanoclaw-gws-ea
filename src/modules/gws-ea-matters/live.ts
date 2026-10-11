@@ -11,6 +11,9 @@
  *   assigned to the assistant or mentioning it.
  * - A person by name, and a memory file as its path for `main` to read.
  *
+ * A forget reads the same sources for who is on an event or a file
+ * (`linksOn`), which only Google knows.
+ *
  * Every link is read at once with the others, under its own five-second
  * deadline, as the link check's Drive reads are. One that fails or is late
  * renders "couldn't read just now", and the rest render all the same.
@@ -53,8 +56,9 @@ import {
   type DriveApi,
   type DriveComment,
   type DriveFile,
+  type DrivePermission,
 } from '../gws-ea-workspace/drive-api.js';
-import type { MatterLink } from './db.js';
+import type { LinkRef, MatterLink } from './db.js';
 
 /** How long one read may take before its link renders as unread. */
 export const READ_DEADLINE_MS = 5_000;
@@ -78,7 +82,7 @@ export interface ThreadAccount {
 export interface LiveSources {
   readonly gmail: Pick<GmailApi, 'getThread'>;
   readonly calendar: Pick<MeetingsCalendarApi, 'getEvent'>;
-  readonly drive: Pick<DriveApi, 'getFile' | 'listComments'>;
+  readonly drive: Pick<DriveApi, 'getFile' | 'listComments' | 'listPermissions'>;
   /**
    * The account the agent working a thread last left on it, or undefined
    * while it has left none. Without this reader, no account is shown.
@@ -406,4 +410,73 @@ export async function readLinks(links: readonly MatterLink[], sources: LiveSourc
       ].join('\n');
     }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Who is on an event or a file, for a forget (R26)
+// ---------------------------------------------------------------------------
+
+/** An event or a file: the links whose people only Google knows. */
+export type EventOrFile = LinkRef & { readonly kind: 'event' | 'file' };
+
+export function isEventOrFile<T extends LinkRef>(link: T): link is T & EventOrFile {
+  return link.kind === 'event' || link.kind === 'file';
+}
+
+function present(address: string | undefined): address is string {
+  return address !== undefined;
+}
+
+/** Everyone an event shows: its organizer and its guests. */
+async function eventAddresses(reference: string, calendar: LiveSources['calendar']): Promise<string[]> {
+  const slash = reference.indexOf('/');
+  const event = await calendar.getEvent(reference.slice(0, slash), reference.slice(slash + 1));
+  if (event === undefined) return [];
+  return [event.organizer?.email, ...(event.attendees ?? []).map((attendee) => attendee.email)].filter(present);
+}
+
+/** A file's access list, or none when Drive's final word is that the assistant may not read it, as on a file it cannot share. */
+async function accessTo(fileId: string, drive: LiveSources['drive']): Promise<DrivePermission[]> {
+  try {
+    return await drive.listPermissions(fileId);
+  } catch (error) {
+    if (error instanceof GoogleApiError && !error.retryable && !isDriveRateLimit(error)) return [];
+    throw error;
+  }
+}
+
+/** Everyone a file shows: its owners, whoever shared it or last changed it, and those it is shared with. */
+async function fileAddresses(fileId: string, drive: LiveSources['drive']): Promise<string[]> {
+  const [file, access] = await Promise.all([drive.getFile(fileId), accessTo(fileId, drive)]);
+  if (file === undefined) return [];
+  return [
+    ...(file.owners ?? []).map((owner) => owner.emailAddress),
+    file.sharingUser?.emailAddress,
+    file.lastModifyingUser?.emailAddress,
+    ...access.map((permission) => permission.emailAddress),
+  ].filter(present);
+}
+
+/**
+ * The events and files among `links` that someone is on, by `isTheirs` over
+ * the addresses their sources show now, each read under its own deadline at
+ * once with the others. One whose source fails or is late counts as theirs:
+ * only a read could say it is not.
+ */
+export async function linksOn(
+  links: readonly EventOrFile[],
+  isTheirs: (address: string) => boolean,
+  sources: Pick<LiveSources, 'calendar' | 'drive'> = hostSources(),
+): Promise<EventOrFile[]> {
+  const on = await Promise.all(
+    links.map(async (link) => {
+      const addresses = await within(`${link.kind} ${link.reference}`, () =>
+        link.kind === 'event'
+          ? eventAddresses(link.reference, sources.calendar)
+          : fileAddresses(link.reference, sources.drive),
+      );
+      return !addresses.ok || addresses.value.some(isTheirs);
+    }),
+  );
+  return links.filter((_link, index) => on[index]);
 }

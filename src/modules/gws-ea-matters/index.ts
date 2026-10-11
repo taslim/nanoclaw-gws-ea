@@ -10,13 +10,15 @@
  * A matter's next look is one scheduled task in main's conversation
  * (KTD4, `looks.ts`), the morning brings main back once a day
  * (KTD6, `morning.ts`), and the host keeps both on time without the model
- * (KTD7, `loop.ts`).
+ * (KTD7, `loop.ts`). Forgetting a person takes them off every matter
+ * (R26, `forget.ts`).
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
 import { onHostStart } from '../../host-lifecycle.js';
+import { registerPersonForgetHook, registerPersonForgetReview } from '../gws-ea-people/index.js';
 import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
   getMatter,
@@ -27,6 +29,7 @@ import {
   placeNowhere,
   type LinkRef,
 } from './db.js';
+import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
 import { gwsEaMattersMigration } from './migration.js';
@@ -40,6 +43,10 @@ onHostStart(({ signal }) => {
   // Started, not awaited: host startup never waits on a pass.
   void runMattersLoop(signal);
 });
+
+// A forgotten person leaves every matter, and main is asked to rewrite each one whose words may still tell of them.
+registerPersonForgetReview('gws-ea-matters:forget', mattersToRewrite);
+registerPersonForgetHook('gws-ea-matters:forget', forgetFromMatters);
 
 // ---------------------------------------------------------------------------
 // `ncl matters …` — main's read and write path.

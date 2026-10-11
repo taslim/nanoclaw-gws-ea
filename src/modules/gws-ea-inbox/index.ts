@@ -69,7 +69,13 @@ import { heldForMain, paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 import { emailWords, sendKey } from './send.js';
-import { deleteSends, deleteThreadAddresses, threadsWithAddresses, type SendScope } from './thread-map.js';
+import {
+  clearThreadAccounts,
+  deleteSends,
+  deleteThreadAddresses,
+  threadsWithAddresses,
+  type SendScope,
+} from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
 // The inbox's own state, its thread map, then what was added since (migration.ts).
@@ -188,7 +194,8 @@ async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void>
 }
 
 // A forgotten person leaves nothing of theirs on the threads they were on, in this order: those threads'
-// external-email sessions, then the person's addresses on every thread, and their hourly counts.
+// external-email sessions, then together the accounts on those threads, which may tell of them, the person's
+// addresses on every thread, by which those threads are known, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_threads'))) return;
@@ -200,6 +207,7 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const { threadKeys, addresses } = await threadsWithAddresses(isForgotten);
   await purgeThreadSessions(threadKeys);
   await db.transaction(async () => {
+    await clearThreadAccounts(threadKeys);
     await deleteThreadAddresses(addresses);
     for (const row of await db.all<{ sender: string }>('SELECT DISTINCT sender FROM gws_ea_inbox_sender_counts')) {
       if (isForgotten(row.sender)) await db.run('DELETE FROM gws_ea_inbox_sender_counts WHERE sender = ?', row.sender);

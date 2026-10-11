@@ -20,7 +20,9 @@
  *   thread (`deleteThreadAddresses`).
  * - A thread holds the account the agent working it last left, each one in
  *   place of the one before, which `main` reads under the thread wherever a
- *   matter shows it (`setThreadAccount`, `threadAccount`).
+ *   matter shows it (`setThreadAccount`, `threadAccount`). Forgetting a
+ *   person clears it from every thread that may tell of them
+ *   (`clearThreadAccounts`).
  * - A thread is where `main` placed it: not yet, in an open matter, or
  *   nowhere, and handed over to `external-email` or not; until main hands it
  *   over, its mail waits, held (Slice 5 KTD8). Mail starts a thread unplaced,
@@ -334,6 +336,14 @@ export async function setThreadAccount(threadKey: string, text: string, at: stri
     threadKey,
   );
   if (changes === 0) throw new Error(`No email thread ${threadKey} exists`);
+}
+
+/** These threads hold no account, until the agent working each leaves its next one. */
+export async function clearThreadAccounts(threadKeys: readonly string[]): Promise<void> {
+  const db = getDb();
+  for (const threadKey of new Set(threadKeys)) {
+    await db.run('UPDATE gws_ea_threads SET account = NULL, account_at = NULL WHERE thread_key = ?', threadKey);
+  }
 }
 
 /** The account the agent working the thread last left on it, and when, or undefined while it has left none. */
