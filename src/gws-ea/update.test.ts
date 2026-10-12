@@ -773,7 +773,11 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
 
     expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
 
-    expect(err.join('\n')).toContain(`sqlite3 (PID 777) holds ${database}`);
+    // Asking Docker's VM to let go changes nothing for a process on the Mac itself.
+    expect(err.join('\n')).toContain(
+      `sqlite3 (PID 777) holds ${database}, still held after Docker's VM was asked to drop its file cache. To go on, close any process named here`,
+    );
+    expect(state.cacheDrops).toEqual([releaseTag(runtime, host.first)]);
     expect(err.join('\n')).toContain(`runs dogfood ${host.first.slice(0, 12)} again`);
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
     expect(state.running).toBe(true);
@@ -785,6 +789,23 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
 
     await expectUpdated(host, runtime, next, state);
     expect(state.setups).toHaveLength(2);
+  });
+
+  it("updates past the files Docker's VM kept from the assistant's exited containers, dropping its cache once", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const database = path.join(runtime.state_root, 'data', 'v2.db');
+    state.vmRetained = `p5677\nccom.apple.Virtualization.Virtua\nf9\nn${database}\nn${runtime.state_root}\n`;
+    const { run } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectUpdated(host, runtime, next, state);
+    // Run from the release the assistant was serving, and never taken for a gateway's isolation probe.
+    expect(state.cacheDrops).toEqual([releaseTag(runtime, host.first)]);
+    expect(state.probes).not.toContain('unknown');
   });
 
   it('probes a gateway the switch recreated before the start, and a failed probe serves the release it left again', async () => {

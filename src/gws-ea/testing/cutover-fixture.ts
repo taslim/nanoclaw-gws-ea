@@ -530,6 +530,10 @@ export interface World {
   /** What `ps` lists, and what `lsof` finds open under the instance's state. */
   processes: string;
   openFiles: string;
+  /** What `lsof` also finds open under the state, held by Docker's VM, until a cache drop lets it go. */
+  vmRetained?: string;
+  /** The image each cache drop ran from. */
+  readonly cacheDrops: string[];
   /** The containers `docker ps --all` lists, by the install label it filters on. */
   readonly containers: Map<string, readonly string[]>;
   /** The running host's Google Chat consumer never connects: Pub/Sub refuses its subscriber. */
@@ -591,6 +595,7 @@ export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id' | 'insta
     migrate,
     processes: '',
     openFiles: '',
+    cacheDrops: [],
     containers: new Map(),
   };
 }
@@ -717,6 +722,14 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
     const project = flagValues(spec.args, '--filter')[0]!.replace('label=com.docker.compose.project=', '');
     return { stdout: projectContainers(state, project), stderr: '' };
   }
+  if (first === 'run' && spec.args.includes('systempaths=unconfined')) {
+    // The cache drop: it runs from an image already here, and Docker's VM lets go of what it kept.
+    const image = spec.args[spec.args.indexOf('-c') - 1]!;
+    if (!state.tags.has(image)) throw dockerFailure(`Unable to find image '${image}' locally`);
+    state.cacheDrops.push(image);
+    delete state.vmRetained;
+    return { stdout: '', stderr: '' };
+  }
   if (first === 'run') {
     const project = [...state.gateways].find(([name]) =>
       (flagValues(spec.args, '--network')[0] ?? '').startsWith(name),
@@ -818,7 +831,9 @@ export function runner(state: World): SanitizedCommandRunner {
       return { stdout: '', stderr: '' };
     }
     if (spec.command === 'ps') return { stdout: state.processes, stderr: '' };
-    if (spec.command === 'sh' && spec.args[2] === 'lsof') return { stdout: state.openFiles, stderr: '' };
+    if (spec.command === 'sh' && spec.args[2] === 'lsof') {
+      return { stdout: `${state.openFiles}${state.vmRetained ?? ''}`, stderr: '' };
+    }
     if (spec.command === 'systemctl') return { stdout: '', stderr: '' };
     if (spec.command === 'docker') return docker(state, spec);
     throw new Error(`unexpected command: ${spec.command} ${joined}`);
