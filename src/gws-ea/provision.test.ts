@@ -1506,11 +1506,13 @@ describe('production provision step composition', () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
     const project = reserved.exclusive_resource_claims.gcp_project_id;
+    const account = reserved.exclusive_resource_claims.gcp_account;
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
       const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
 
+      // The Chat link first; each link alone on its line, then one field to a line.
       await expect(phase.observe(context)).resolves.toEqual({
         status: 'pause',
         pause: {
@@ -1518,19 +1520,28 @@ describe('production provision step composition', () => {
           phase: 'configure_channel',
           code: 'chat_configuration_required',
           message:
-            "In this assistant's Google Cloud project, configure the Google Chat API and create the assistant's " +
-            "Google sign-in client, then confirm the one and continue with the other's file.",
+            "Do two things in this assistant's Google Cloud project, then confirm the first and give the second's file.",
           details: [
-            'Google Chat API, on the page below:',
-            '  App name: Aya',
-            '  Avatar URL: a public HTTPS image of the assistant',
-            '  Description: a short line, such as "Executive assistant to Principal"',
-            '  Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
-            `Sign-in client, at https://console.cloud.google.com/auth/overview?project=${project}:`,
-            '  Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
-            '  Under Clients, create a client of type Desktop app, and download its JSON.',
+            '1. Configure the Google Chat API:',
+            `   https://console.developers.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${project}`,
+            '   App name: Aya',
+            '   Avatar URL: a public HTTPS image of the assistant',
+            '   Description: a short line, such as "Executive assistant to Principal"',
+            '   Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+            '   Save',
+            "2. Create the assistant's Google sign-in client:",
+            `   https://console.cloud.google.com/auth/overview?project=${project}`,
+            '   Get started:',
+            '     App name: Aya',
+            `     User support email: ${account}`,
+            '     Audience: Internal',
+            `     Contact email: ${account}`,
+            '     Agree to the Google API Services: User Data Policy, then Create',
+            '   Clients, then Create client:',
+            '     Application type: Desktop app',
+            '     Name: leave the default',
+            '     Create, then Download JSON',
           ],
-          actionUrl: expect.stringContaining(`project=${project}`),
           resumeFlag: '--chat-configured --google-client-file <file>',
         },
       });
@@ -1594,12 +1605,13 @@ describe('production provision step composition', () => {
             code: 'chat_configuration_required',
             message: "Configure the Google Chat API for this assistant's project, then confirm it.",
             details: [
+              `https://console.developers.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${reserved.exclusive_resource_claims.gcp_project_id}`,
               'App name: Aya',
               'Avatar URL: a public HTTPS image of the assistant',
               'Description: a short line, such as "Executive assistant to Principal"',
-              'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+              'Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+              'Save',
             ],
-            actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
             resumeFlag: '--chat-configured',
           },
         });

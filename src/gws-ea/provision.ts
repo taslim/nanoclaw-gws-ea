@@ -102,10 +102,9 @@ import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
 import {
   GOOGLE_CLIENT_FILE_FLAG,
-  GOOGLE_CLIENT_STEPS,
   googleAccessResources,
-  googleClientConsoleUrl,
   googleClientNeeded,
+  googleClientSteps,
   googleSignInResources,
   type GoogleConnectionInput,
 } from './google-connection.js';
@@ -594,15 +593,18 @@ async function principalResult(
  * assistant's sign-in still needs its client, which has no API either, the
  * same visit to the project's console creates it, and the pause takes its
  * file with the confirmation, so the operator returns to the terminal once.
+ * Each task's link comes first and alone on its line, so it is the first
+ * thing to click and nothing after it joins the link.
  */
 async function chatConfigurationPause(input: ProductionProvisionInput): Promise<ProvisionHumanPause> {
   const chat = [
+    googleChatConfigurationUrl(input.gcp.projectId),
     `App name: ${input.identity.assistantDisplayName}`,
     'Avatar URL: a public HTTPS image of the assistant',
     `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
-    'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+    'Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+    'Save',
   ];
-  const actionUrl = googleChatConfigurationUrl(input.gcp.projectId);
   if (!(await googleClientNeeded(input.google))) {
     return {
       ...humanPause(
@@ -611,24 +613,22 @@ async function chatConfigurationPause(input: ProductionProvisionInput): Promise<
         "Configure the Google Chat API for this assistant's project, then confirm it.",
       ),
       details: chat,
-      actionUrl,
       resumeFlag: '--chat-configured',
     };
   }
+  const indented = (lines: readonly string[]): string[] => lines.map((line) => `   ${line}`);
   return {
     ...humanPause(
       'configure_channel',
       'chat_configuration_required',
-      "In this assistant's Google Cloud project, configure the Google Chat API and create the assistant's Google " +
-        "sign-in client, then confirm the one and continue with the other's file.",
+      "Do two things in this assistant's Google Cloud project, then confirm the first and give the second's file.",
     ),
     details: [
-      'Google Chat API, on the page below:',
-      ...chat.map((line) => `  ${line}`),
-      `Sign-in client, at ${googleClientConsoleUrl(input.gcp.projectId)}:`,
-      ...GOOGLE_CLIENT_STEPS.map((line) => `  ${line}`),
+      '1. Configure the Google Chat API:',
+      ...indented(chat),
+      "2. Create the assistant's Google sign-in client:",
+      ...indented(googleClientSteps(input.gcp, input.identity.assistantDisplayName)),
     ],
-    actionUrl,
     resumeFlag: `--chat-configured ${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }
@@ -1384,6 +1384,7 @@ export async function runProductionProvision(
       google: {
         runtime,
         assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,
+        assistantName: source.identity.assistantDisplayName,
         ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
         signIn: (request) => {
           if (interaction) return interaction.signInAssistantToGoogle(request);
