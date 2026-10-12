@@ -2,7 +2,7 @@
  * Failure notices in main's own conversations (R38, Slice 5 R25): the
  * principal hears of a failure only when what failed was their own message,
  * one plain sentence in their direct message; anything else in main's
- * conversations (a note from the host, a look, the morning, another agent's
+ * conversations (a note from the host, a look, the daily sync, another agent's
  * message) reaches main as a fact that wakes nothing. A failure in
  * external-email's conversations goes to main instead (external-email.test.ts).
  *
@@ -694,20 +694,20 @@ describe('a failed turn the runner reports', () => {
     expect(sent).toEqual([]);
   });
 
-  it('of the morning, tells Morgan nothing, and the look it was serving comes back at the next morning (AE12)', async () => {
+  it('of the daily sync, tells Morgan nothing, and the look it was serving comes back at the next sync (AE12)', async () => {
     const { matter } = await openMatterWithLook(
       { title: 'Acme renewal', openLoop: 'Morgan wants it signed this quarter.', links: [] },
       { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },
     );
     await keepMattersOnTime();
     const rows = liveTaskRows(main);
-    const morning = rows.find((row) => row.series_id.startsWith('gws-ea-morning-'));
+    const sync = rows.find((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
     const look = rows.find((row) => row.series_id === matter.look_task_id);
-    if (morning === undefined || look === undefined) throw new Error('No morning or no look');
+    if (sync === undefined || look === undefined) throw new Error('No sync or no look');
     // The runner answered both in one turn, which failed.
-    await runOccurrence(main, morning.id, 'completed');
+    await runOccurrence(main, sync.id, 'completed');
     await runOccurrence(main, look.id, 'completed');
-    turnFailed(main, { batch: [morning.id, look.id], error: 'API Error: 529 overloaded' });
+    turnFailed(main, { batch: [sync.id, look.id], error: 'API Error: 529 overloaded' });
 
     await drain(main, 1);
     await keepMattersOnTime();
@@ -715,12 +715,13 @@ describe('a failed turn the runner reports', () => {
     expect(sent).toEqual([]);
     const handedBack = (await getMatter(matter.id))?.look_task_id ?? '';
     expect(lookSeries(handedBack)).toEqual({ matterId: matter.id, handedBack: true });
-    const nextMorning = liveTaskRows(main).find((row) => row.series_id === morning.series_id)?.process_after;
-    expect(liveTaskRows(main).find((row) => row.series_id === handedBack)?.process_after).toBe(nextMorning);
+    const nextSync = liveTaskRows(main).find((row) => row.series_id === sync.series_id)?.process_after;
+    expect(nextSync).toBeDefined();
+    expect(liveTaskRows(main).find((row) => row.series_id === handedBack)?.process_after).toBe(nextSync);
     expect(onlyFact().text).toBe('Your turn failed before it finished, so what it was handling may be left undone.');
   });
 
-  it("of a repeating look, brings it back at the next morning and keeps next year's date", async () => {
+  it("of a repeating look, brings it back at the next sync and keeps next year's date", async () => {
     const yearly = '0 9 14 3 *';
     const { matter } = await openMatterWithLook(
       { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
@@ -736,18 +737,19 @@ describe('a failed turn the runner reports', () => {
     await drain(main, 1);
     await keepMattersOnTime();
 
-    const morning = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-morning-'))?.process_after;
+    const sync = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-daily-sync-'))?.process_after;
+    expect(sync).toBeDefined();
     const retry = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
-    expect(retry).toMatchObject({ recurrence: yearly, process_after: morning });
+    expect(retry).toMatchObject({ recurrence: yearly, process_after: sync });
     expect(sent).toEqual([]);
 
     // Once taken, it is back on its yearly date, and a later pass leaves it there.
     await runOccurrence(main, retry?.id ?? '', 'completed');
     await keepMattersOnTime();
-    expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)?.process_after).not.toBe(morning);
+    expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)?.process_after).not.toBe(sync);
   });
 
-  it("of a repeating look, brings it back at the next morning even when main's fact cannot be written", async () => {
+  it("of a repeating look, brings it back at the next sync even when main's fact cannot be written", async () => {
     const yearly = '0 9 14 3 *';
     const { matter } = await openMatterWithLook(
       { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
@@ -770,10 +772,11 @@ describe('a failed turn the runner reports', () => {
     await keepMattersOnTime();
 
     expect(facts()).toEqual([]);
-    const morning = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-morning-'))?.process_after;
+    const sync = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-daily-sync-'))?.process_after;
+    expect(sync).toBeDefined();
     expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)).toMatchObject({
       recurrence: yearly,
-      process_after: morning,
+      process_after: sync,
     });
   });
 

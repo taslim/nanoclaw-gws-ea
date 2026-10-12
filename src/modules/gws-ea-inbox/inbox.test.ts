@@ -118,7 +118,7 @@ import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { morningBrief } from '../gws-ea-matters/morning.js';
+import { syncVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
 import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';
@@ -1525,7 +1525,8 @@ describe('notes that carry their matter (Slice 5 KTD11)', () => {
         'Read each event from the calendar before you act on it.\n\n' +
         `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
         'Open matters it may belong to:\n' +
-        `- ${matter.id}: Acme renewal (same person)`,
+        `- ${matter.id}: Acme renewal (same person)\n` +
+        'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
     );
   });
 });
@@ -1933,7 +1934,7 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
 
     await ncl('matters-close', { id: matter.id, outcome: 'Call booked for Thursday at 10.' });
     // Closing asks main nothing: the thread waits to be placed only once mail comes.
-    expect((await morningBrief()).data).toContain('Threads waiting to be placed: none.');
+    expect((await todayVerdict()).data).toContain('Threads waiting to be placed: none.');
     vi.mocked(requestWake).mockClear();
 
     gmail.receive({
@@ -2006,7 +2007,7 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     expect(placements[1].text).toContain('can we move it to Friday?');
   });
 
-  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and in the morning brief (AE11)", async () => {
+  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and at the daily sync (AE11)", async () => {
     gmail.receive({ threadId: 'g-renewal', from: `Remy Vance <${REMY}>`, subject: 'The renewal call', body: 'Hi.' });
     await inbox.tick();
     const threadKey = await onlyThread();
@@ -2029,9 +2030,10 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     // While that note is still to be read, the host writes no other.
     await keepMattersOnTime();
     expect(notes(UNPLACED)).toHaveLength(1);
-    const brief = (await morningBrief()).data ?? [];
-    expect(brief).toContain('Threads waiting to be placed:');
-    expect(brief.some((entry) => line.test(entry))).toBe(true);
+    const sync = await syncVerdict();
+    expect(sync.wakeAgent).toBe(true);
+    expect(sync.data).toContain('Threads waiting to be placed:');
+    expect(sync.data?.some((entry) => line.test(entry))).toBe(true);
 
     // external-email has not acted: its mail is still held, and the sweep wakes nothing for it.
     const session = await requireThreadSession(threadKey);
@@ -2095,7 +2097,7 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     await read(again.row.id);
     await keepMattersOnTime();
     expect(notes(UNPLACED)).toHaveLength(2);
-    expect((await morningBrief()).data).toContain('Threads waiting to be placed: none.');
+    expect((await todayVerdict()).data).toContain('Threads waiting to be placed: none.');
   });
 
   it('never asks main to place a thread only the principal and the assistant are on: main reads their words as they come', async () => {
@@ -2106,7 +2108,7 @@ describe('placement before action (Slice 5 R9, R10, R27, KTD8)', () => {
     await keepMattersOnTime();
 
     expect(notes()).toEqual([]);
-    expect((await morningBrief()).data).toContain('Threads waiting to be placed: none.');
+    expect((await todayVerdict()).data).toContain('Threads waiting to be placed: none.');
   });
 
   it("takes the reply to a thread main started straight to external-email, at the thread's pace, and asks main nothing", async () => {

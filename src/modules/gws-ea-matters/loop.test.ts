@@ -1,8 +1,8 @@
 /**
  * The host's guarantees for matters (KTD7, R13, R14, R16, R24, AE3): every
  * open matter has exactly one look still to come, a closed one none, the
- * morning always exists, and a failed repeating look comes back the next
- * morning. Driven through `ncl` and the real sweep against main's real
+ * daily sync always exists, and a failed repeating look comes back at the
+ * next sync. Driven through `ncl` and the real sweep against main's real
  * session mailbox, on the real clock, as SQLite's `now` decides what is due.
  */
 import { CronExpressionParser } from 'cron-parser';
@@ -101,14 +101,14 @@ async function looksByMatter(): Promise<Map<string, string[]>> {
   return looks;
 }
 
-async function mornings(): Promise<TaskRow[]> {
-  return liveTaskRows(await mainSession()).filter((row) => row.series_id.startsWith('gws-ea-morning-'));
+async function syncs(): Promise<TaskRow[]> {
+  return liveTaskRows(await mainSession()).filter((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
 }
 
-/** When the morning next comes, as its series holds it. */
-async function nextMorning(): Promise<string> {
-  const [morning] = await mornings();
-  return morning.process_after;
+/** When the daily sync next comes, as its series holds it. */
+async function nextSync(): Promise<string> {
+  const [sync] = await syncs();
+  return sync.process_after;
 }
 
 beforeEach(async () => {
@@ -125,7 +125,7 @@ afterEach(async () => {
 });
 
 describe("the host's guarantees for matters", () => {
-  it("gives a matter whose look ran with no new one a look at the next morning, once main's container is idle (AE3)", async () => {
+  it("gives a matter whose look ran with no new one a look at the next sync, once main's container is idle (AE3)", async () => {
     const acme = await open('Acme renewal', { look: inDays(3) });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(acme.look_task_id)).id, 'completed');
@@ -140,7 +140,7 @@ describe("the host's guarantees for matters", () => {
     const handedBack = (await fresh(acme)).look_task_id;
     expect(await looksByMatter()).toEqual(new Map([[acme.id, [handedBack]]]));
     expect(lookSeries(handedBack ?? '')).toEqual({ matterId: acme.id, handedBack: true });
-    expect(Date.parse((await liveRow(handedBack)).process_after)).toBe(Date.parse(await nextMorning()));
+    expect(Date.parse((await liveRow(handedBack)).process_after)).toBe(Date.parse(await nextSync()));
   });
 
   it('replaces a look cancelled or paused through ncl tasks, cancelling the paused one', async () => {
@@ -173,25 +173,25 @@ describe("the host's guarantees for matters", () => {
     expect(next.process_after).toBe(CronExpressionParser.parse(YEARLY, { tz: ZONE }).next().toISOString());
   });
 
-  it('keeps the morning and a yearly look as they are through a pass between their run and the sweep arming the next', async () => {
+  it('keeps the daily sync and a yearly look as they are through a pass between their run and the sweep arming the next', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     await keepMattersOnTime();
-    const [morning] = await mornings();
+    const [sync] = await syncs();
     const main = await mainSession();
 
     // The sweep has read the runner's answers, and waits on waking main for other mail before it arms what repeats.
     await answerOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');
-    await answerOccurrence(main, morning.id, 'completed');
+    await answerOccurrence(main, sync.id, 'completed');
     await keepMattersOnTime();
     await reconcileSession(main.id);
     await keepMattersOnTime();
 
     expect(await looksByMatter()).toEqual(new Map([[birthday.id, [birthday.look_task_id]]]));
     expect(await fresh(birthday)).toMatchObject({ look_task_id: birthday.look_task_id });
-    expect((await mornings()).map((row) => row.series_id)).toEqual([morning.series_id]);
+    expect((await syncs()).map((row) => row.series_id)).toEqual([sync.series_id]);
   });
 
-  it('brings a failed yearly look back at the next morning, and its date for next year stays', async () => {
+  it('brings a failed yearly look back at the next sync, and its date for next year stays', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'script-skip:error');
@@ -207,7 +207,7 @@ describe("the host's guarantees for matters", () => {
     await keepMattersOnTime();
     const retry = await liveRow(birthday.look_task_id);
     expect(retry).toMatchObject({ recurrence: YEARLY });
-    expect(Date.parse(retry.process_after)).toBe(Date.parse(await nextMorning()));
+    expect(Date.parse(retry.process_after)).toBe(Date.parse(await nextSync()));
     // One extra run: another pass leaves it as it is.
     await keepMattersOnTime();
     expect(liveTaskRows(main).filter((row) => row.series_id === birthday.look_task_id)).toEqual([retry]);
@@ -224,7 +224,7 @@ describe("the host's guarantees for matters", () => {
     // The one-off look's turn fails: the runner settles its row as done, and the notices module marks the matter.
     await runOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');
     await markLookFailed(birthday.id, new Date().toISOString());
-    // The morning hands the matter back, and main then makes its look yearly.
+    // The sync hands the matter back, and main then makes its look yearly.
     await keepMattersOnTime();
     expect(lookSeries((await fresh(birthday)).look_task_id ?? '')).toEqual({ matterId: birthday.id, handedBack: true });
     await data(run('matters-update', { id: birthday.id, 'look-cron': YEARLY }));
@@ -287,34 +287,33 @@ describe("the host's guarantees for matters", () => {
     expect([...looks.keys()].sort()).toEqual([acme.id, birthday.id, lunch.id].sort());
   });
 
-  it('creates the morning when the host starts, again after it is cancelled, and at the time main moved it to after the sweep pauses it', async () => {
+  it('creates the daily sync when the host starts, and again at its time after it is cancelled or the sweep pauses it', async () => {
     const controller = new AbortController();
     const loop = runMattersLoop(controller.signal);
-    await vi.waitFor(async () => expect(await mornings()).toHaveLength(1));
+    await vi.waitFor(async () => expect(await syncs()).toHaveLength(1));
     controller.abort();
     await loop;
-    const [first] = await mornings();
+    const [first] = await syncs();
     expect(first).toMatchObject({ recurrence: '30 7 * * *' });
 
     await data(run('tasks-cancel', { id: first.series_id }));
     await keepMattersOnTime();
-    const [second] = await mornings();
-    expect(await mornings()).toHaveLength(1);
+    const [second] = await syncs();
+    expect(await syncs()).toHaveLength(1);
+    expect(second).toMatchObject({ recurrence: '30 7 * * *' });
     expect(second.series_id).not.toBe(first.series_id);
 
-    // main moves it while the principal travels; then eight failed runs in a row, and the sweep pauses the series.
-    await data(run('matters-morning', { at: '06:45' }));
-    const [moved] = await mornings();
+    // Eight failed runs in a row, and the sweep pauses the series.
     const main = await mainSession();
     for (let failures = 0; failures < 8; failures++) {
-      await runOccurrence(main, (await liveRow(moved.series_id)).id, 'script-skip:error');
+      await runOccurrence(main, (await liveRow(second.series_id)).id, 'script-skip:error');
     }
-    expect(await liveRow(moved.series_id)).toMatchObject({ status: 'paused' });
+    expect(await liveRow(second.series_id)).toMatchObject({ status: 'paused' });
 
     await keepMattersOnTime();
-    const [third] = (await mornings()).filter((row) => row.status === 'pending');
-    expect(await mornings()).toEqual([third]);
-    expect(third).toMatchObject({ recurrence: '45 6 * * *' });
-    expect(third.series_id).not.toBe(moved.series_id);
+    const [third] = (await syncs()).filter((row) => row.status === 'pending');
+    expect(await syncs()).toEqual([third]);
+    expect(third).toMatchObject({ recurrence: '30 7 * * *' });
+    expect(third.series_id).not.toBe(second.series_id);
   });
 });

@@ -5,13 +5,16 @@
  * the piece's reply chain answers; or, for an invitation, the thread that
  * booked it. Each comes with why.
  *
- * Only a sender Google verified counts: the sender of mail Gmail
- * authenticated (`verifiedSender`), or the account Calendar or Drive names
- * for an invitation, a share or a comment. A piece from anyone else gets no
- * suggestions at all, so mail cannot claim a matter any more than it can
- * claim a level. An organization is its domain, never a free-mail domain or
- * the principal's or the assistant's own, which say nothing of how two
- * pieces relate.
+ * Only a sender Google names counts: the sender of mail Gmail
+ * authenticated (`verifiedSender`), the account Drive names for a share or a
+ * comment, or the organizer Calendar shows for an invitation. A piece from
+ * anyone else gets no suggestions at all, so mail cannot claim a matter any
+ * more than it can claim a level. An invitation's organizer is whoever the
+ * invitation names, which one sent as a file in an email chooses freely, so a
+ * note says so beside what it suggests from one (`main-note.ts`).
+ *
+ * An organization is its domain, never a free-mail domain or the principal's
+ * or the assistant's own, which say nothing of how two pieces relate.
  */
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import type { SenderVerdict } from '../gws-ea-inbox/authentication.js';
@@ -32,10 +35,10 @@ export interface NewPiece {
   readonly kind: PieceKind;
   readonly reference: string;
   /**
-   * The address Google verified it came from: for mail, `verifiedSender` of
-   * Gmail's verdict; for an invitation, a share or a comment, the account
-   * Calendar or Drive names. Undefined when none was verified, and then
-   * nothing is suggested.
+   * The address Google names it came from: for mail, `verifiedSender` of
+   * Gmail's verdict; for a share or a comment, the account Drive names; for
+   * an invitation, the organizer Calendar shows. Undefined when there is
+   * none, and then nothing is suggested.
    */
   readonly from: string | undefined;
   /** The Message-IDs mail answers: its In-Reply-To and References. */

@@ -8,8 +8,8 @@
  * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (KTD4, `looks.ts`), the morning brings main back once a day
- * (KTD6, `morning.ts`), and the host keeps both on time without the model
+ * (KTD4, `looks.ts`), the daily sync brings main back to whatever waited for
+ * it (KTD6, `sync.ts`), and the host keeps both on time without the model
  * (KTD7, `loop.ts`). Forgetting a person takes them off every matter
  * (R26, `forget.ts`).
  */
@@ -33,9 +33,9 @@ import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
 import { gwsEaMattersMigration } from './migration.js';
-import { currentMorning, formatMorningAnswer, morningBrief, moveMorning } from './morning.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
+import { syncVerdict, todayVerdict } from './sync.js';
 
 registerMigration(gwsEaMattersMigration);
 
@@ -342,31 +342,27 @@ registerResource({
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (args, ctx) => asMain(ctx, () => lookVerdict(requiredString(args, 'id'))),
     },
-    morning: {
+    sync: {
       access: 'open',
       description:
-        "The morning: once a day, before the principal's day starts, you come back with today's brief. With no flags, its time in the principal's time zone; --at moves it, as you do while the principal travels.",
-      args: [
-        {
-          name: 'at',
-          type: 'string',
-          description: "The morning's new time: 24-hour HH:MM in the principal's time zone.",
-        },
-        {
-          name: 'brief',
-          type: 'boolean',
-          description: "The morning's pre-task script, which runs on its own each morning: today's brief.",
-        },
+        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you only when something has waited for you, a note you have not read or a thread to place. The host keeps the sync and its time; you never set it.",
+      args: [],
+      examples: ['ncl matters sync'],
+      // The runner reads the last line of a script's output as its verdict: one line of JSON.
+      formatHuman: (verdict) => JSON.stringify(verdict),
+      handler: async (_args, ctx) => asMain(ctx, syncVerdict),
+    },
+    today: {
+      access: 'open',
+      description:
+        "Today as matters hold it: today's looks, the matters handed back without one, and the threads waiting to be placed. It is the script of a morning rundown the principal asks for: an --in-conversation task, theirs to move or drop.",
+      args: [],
+      examples: [
+        'ncl matters today',
+        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * 1-5" --script "ncl matters today" --prompt "Their morning rundown"',
       ],
-      examples: ['ncl matters morning', 'ncl matters morning --at 06:45'],
-      formatHuman: formatMorningAnswer,
-      handler: async (args, ctx) =>
-        asMain(ctx, async () => {
-          const at = optionalString(args.at);
-          if (args.brief !== true) return at === undefined ? currentMorning() : moveMorning(at);
-          if (at !== undefined) throw new Error('--brief prints the brief and --at moves the morning: give one');
-          return morningBrief();
-        }),
+      formatHuman: (verdict) => JSON.stringify(verdict),
+      handler: async (_args, ctx) => asMain(ctx, todayVerdict),
     },
     list: {
       access: 'open',

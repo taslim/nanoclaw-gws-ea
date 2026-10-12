@@ -44,7 +44,7 @@ import { getMatter, listOpenMatters, type Matter, type Placed } from './db.js';
 import './index.js';
 import { seedMain } from './testing/main-conversation.js';
 
-const VERBS = ['open', 'place', 'update', 'close', 'get', 'look', 'morning', 'list'] as const;
+const VERBS = ['open', 'place', 'update', 'close', 'get', 'look', 'sync', 'today', 'list'] as const;
 const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-matters-index';
 
 const NOW = '2026-10-10T12:00:00.000Z';
@@ -412,7 +412,8 @@ describe('GWS-EA matters ncl resource', () => {
       ['close', { id, outcome: 'Done.' }],
       ['get', { id }],
       ['look', { id }],
-      ['morning', {}],
+      ['sync', {}],
+      ['today', {}],
       ['list', {}],
     ];
     expect(attempts.map(([verb]) => verb)).toEqual([...VERBS]);

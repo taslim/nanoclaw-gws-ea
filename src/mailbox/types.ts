@@ -123,6 +123,11 @@ export interface InboundMailbox {
   insertMessage(message: InboundMessage): Promise<void>;
   countDueMessages(): number;
   /**
+   * How many due messages wait, waking nothing, as context for the next
+   * turn: pending non-trigger rows, other than those on `exceptChannelType`.
+   */
+  countUnreadContext(exceptChannelType: string): number;
+  /**
    * Release every held message: each becomes a pending trigger, due at
    * `processAfter` (null: due now). Returns how many it released.
    */

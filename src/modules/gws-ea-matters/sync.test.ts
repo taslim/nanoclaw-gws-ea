@@ -1,0 +1,279 @@
+/**
+ * The daily sync (KTD6): one recurring task in main's conversation, before
+ * the principal's day starts, whose pre-task script wakes main only for what
+ * has waited for it; and `ncl matters today`, the script of a morning rundown
+ * the principal asks for. Driven through `ncl matters` and the host's pass
+ * against main's real session mailbox, on a fixed Monday in New York; Google
+ * is in memory and must never be read.
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: '/tmp/nanoclaw-test-gws-ea-matters-sync',
+  GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-matters-sync/groups',
+}));
+
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
+  isContainerRunning: vi.fn(() => false),
+}));
+
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
+
+const google = vi.hoisted(() => ({ gmail: undefined as unknown }));
+vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../gws-ea-inbox/gmail-api.js')>()),
+  createGmailApi: () => ({
+    getThread: (id: string) =>
+      (google.gmail as import('../gws-ea-inbox/testing/fake-gmail-threads.js').FakeGmailThreads).getThread(id),
+  }),
+}));
+
+import { dispatch } from '../../cli/dispatch.js';
+import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import '../gws-ea-inbox/index.js';
+import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
+import { createThread, recordThreadAddresses, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
+import '../gws-ea-people/index.js';
+import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
+import '../gws-ea-preferences/index.js';
+import '../gws-ea-profile/index.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import type { Matter, Placed } from './db.js';
+import './index.js';
+import { keepMattersOnTime } from './loop.js';
+import {
+  answerOccurrence,
+  liveTaskRows,
+  MAIN,
+  mainSession,
+  printed,
+  runnerReads,
+  runOccurrence,
+  seedMain,
+  taskContent,
+  taskRows,
+  type TaskRow,
+} from './testing/main-conversation.js';
+
+const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-matters-sync';
+const ZONE = 'America/New_York';
+/** Monday 12 October 2026, 6:00 AM in New York. */
+const MONDAY_6AM = '2026-10-12T10:00:00.000Z';
+const THREAD = 'mail-8d1f2c34-5b6a-4e7f-9a01-23456789abcd';
+const MAIN_CALLER: CallerContext = {
+  caller: 'agent',
+  sessionId: 'sess-main',
+  agentGroupId: MAIN,
+  messagingGroupId: 'mg-dm',
+};
+
+function run(command: string, args: Record<string, unknown>): Promise<ResponseFrame> {
+  return dispatch({ id: command, command, args }, MAIN_CALLER);
+}
+
+async function data<T>(response: Promise<ResponseFrame>): Promise<T> {
+  const settled = await response;
+  if (!settled.ok) throw new Error(`Command failed: ${JSON.stringify(settled.error)}`);
+  return settled.data as T;
+}
+
+async function open(title: string, look: Record<string, string>, links: Record<string, string> = {}): Promise<Matter> {
+  return (await data<Placed>(run('matters-open', { title, 'open-loop': 'What happens next.', ...look, ...links })))
+    .matter;
+}
+
+/** The live occurrences of the sync series. */
+async function syncs(): Promise<TaskRow[]> {
+  return liveTaskRows(await mainSession()).filter((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
+}
+
+function localClock(iso: string): string {
+  return new Date(iso).toLocaleTimeString('en-US', { timeZone: ZONE, hour: 'numeric', minute: '2-digit' });
+}
+
+/** A note for main that wakes nothing, as the host writes one. */
+async function note(id: string, text: string): Promise<void> {
+  expect(await writeNoteForMain({ id, timestamp: new Date().toISOString(), text, wake: false })).toBe('written');
+}
+
+let gmail: FakeGmailThreads;
+let scratch: string;
+
+beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(MONDAY_6AM));
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-ea-matters-sync-'));
+  gmail = new FakeGmailThreads();
+  google.gmail = gmail;
+  await runMigrations(await initTestDb());
+  await seedMain(ZONE);
+  await createThread('gmail-thread-a', MONDAY_6AM, THREAD);
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  await closeDb();
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(scratch, { recursive: true, force: true });
+});
+
+describe('the daily sync', () => {
+  it("comes at 07:30 in main's time zone while the principal has no working hours, its gate as its script", async () => {
+    await keepMattersOnTime();
+
+    const [sync] = await syncs();
+    expect(await syncs()).toHaveLength(1);
+    expect(sync).toMatchObject({ status: 'pending', recurrence: '30 7 * * *' });
+    expect(localClock(sync.process_after)).toBe('7:30 AM');
+    expect(taskContent(sync).script).toBe('ncl matters sync');
+    // The next pass keeps the same series.
+    await keepMattersOnTime();
+    expect(await syncs()).toEqual([sync]);
+  });
+
+  it('comes 30 minutes before the earliest working-hours start, and follows the working hours when they change', async () => {
+    const basis = 'Said so.';
+    const workingHours = (weekday: 'mon' | 'tue', start: string) =>
+      setSchedulingPreference({
+        kind: 'working-hours',
+        weekday,
+        hours: { start, end: '17:00' },
+        source: 'principal',
+        basis,
+      });
+    await workingHours('mon', '09:00');
+    await workingHours('tue', '08:15');
+    await setSchedulingPreference({ kind: 'working-hours', weekday: 'sat', hours: 'off', source: 'principal', basis });
+
+    await keepMattersOnTime();
+    const [before] = await syncs();
+    expect(before).toMatchObject({ recurrence: '45 7 * * *' });
+    expect(localClock(before.process_after)).toBe('7:45 AM');
+
+    await workingHours('tue', '06:30');
+    await keepMattersOnTime();
+    const [after] = await syncs();
+    expect(await syncs()).toHaveLength(1);
+    expect(after).toMatchObject({ recurrence: '0 6 * * *' });
+    expect(after.series_id).not.toBe(before.series_id);
+    expect(taskRows(await mainSession()).find((row) => row.id === before.id)?.status).toBe('cancelled');
+  });
+
+  it('wakes nothing on a quiet day', async () => {
+    const quiet = await run('matters-sync', {});
+    expect(quiet).toMatchObject({ ok: true, data: { wakeAgent: false } });
+    expect(await runnerReads(printed(quiet), scratch)).toEqual({ wakeAgent: false });
+  });
+
+  it('wakes main for the notes it has not read, and not once it has read them', async () => {
+    await note('note-calendar', 'Calendar access to the work calendar dropped to free/busy only.');
+    expect(await data(run('matters-sync', {}))).toEqual({
+      wakeAgent: true,
+      data: ['A note you have not read comes with this.'],
+    });
+    await note('note-unsigned', 'Gmail could not confirm an email in their name came from them.');
+    const waking = await run('matters-sync', {});
+    expect(waking).toMatchObject({
+      ok: true,
+      data: { wakeAgent: true, data: ['2 notes you have not read come with this.'] },
+    });
+    expect(await runnerReads(printed(waking), scratch)).toEqual({
+      wakeAgent: true,
+      data: ['2 notes you have not read come with this.'],
+    });
+
+    // main's next turn reads both.
+    const main = await mainSession();
+    await answerOccurrence(main, 'note-calendar', 'completed');
+    await answerOccurrence(main, 'note-unsigned', 'completed');
+    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: false });
+  });
+
+  it('wakes main for each thread waiting to be placed: who its mail carried, when the latest came, and its Gmail thread (R27)', async () => {
+    await recordThreadMessage(
+      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-1' },
+      '2026-10-12T08:15:00.000Z',
+    );
+    await recordThreadMessage(
+      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-2' },
+      '2026-10-12T09:30:00.000Z',
+    );
+    await recordThreadAddresses(THREAD, ['remy@acme.example', 'noel@acme.example'], 'message', MONDAY_6AM);
+    await recordThreadAddresses(THREAD, ['jane@partner.example'], 'written', MONDAY_6AM);
+    // A thread only the principal and the assistant are on waits for no placement.
+    await createThread('gmail-thread-b', MONDAY_6AM, 'mail-principal-only');
+    await recordThreadMessage(
+      { threadKey: 'mail-principal-only', side: 'principal', gmailMessageId: 'p-1' },
+      MONDAY_6AM,
+    );
+
+    expect(await data(run('matters-sync', {}))).toEqual({
+      wakeAgent: true,
+      data: [
+        'Threads waiting to be placed:',
+        `- ${THREAD}: noel@acme.example, remy@acme.example; latest mail Oct 12, 2026, 5:30 AM; Gmail thread gmail-thread-a`,
+      ],
+    });
+    expect(gmail.reads).toEqual([]);
+  });
+});
+
+describe('today, for a morning rundown the principal asks for', () => {
+  it("lists today's looks and the matters handed back without one, reading nothing live", async () => {
+    gmail.put('gmail-thread-a', { id: 'a1', from: 'Juno Hale <juno@acme.example>', at: MONDAY_6AM, subject: 'Hi' });
+    // Opened before the look that comes earlier, so the list's order is by when each comes.
+    const standup = await open('Weekly step back on the office move', { 'look-cron': '0 16 * * 1' });
+    vi.setSystemTime(new Date(Date.parse(MONDAY_6AM) + 60_000));
+    const acme = await open('Acme renewal', { look: '2026-10-12T14:00' }, { thread: THREAD });
+    await open('Lunch with Noel Archer', { look: '2026-10-13T12:00' });
+    // A look that ran with no new one set: the host hands it back at the sync.
+    const lease = await open('Lease', { look: '2026-10-12T06:10' });
+    await runOccurrence(
+      await mainSession(),
+      liveTaskRows(await mainSession()).find((row) => row.series_id === lease.look_task_id)!.id,
+      'completed',
+    );
+    await keepMattersOnTime();
+
+    const today = await run('matters-today', {});
+    expect(today).toMatchObject({
+      ok: true,
+      data: {
+        wakeAgent: true,
+        data: [
+          'Looks today:',
+          `- ${acme.id}, Oct 12, 2026, 2:00 PM: Acme renewal`,
+          `- ${standup.id}, Oct 12, 2026, 4:00 PM: Weekly step back on the office move`,
+          'Handed back without a next look:',
+          `- ${lease.id}: Lease`,
+          'Threads waiting to be placed: none.',
+        ],
+      },
+    });
+    expect(gmail.reads).toEqual([]);
+    expect(await runnerReads(printed(today), scratch)).toEqual({
+      wakeAgent: true,
+      data: expect.arrayContaining(['Looks today:', `- ${lease.id}: Lease`]),
+    });
+  });
+
+  it('still wakes main on a quiet day, with each section empty', async () => {
+    const today = await run('matters-today', {});
+    const quiet = [
+      'Looks today: none.',
+      'Handed back without a next look: none.',
+      'Threads waiting to be placed: none.',
+    ];
+    expect(today).toMatchObject({ ok: true, data: { wakeAgent: true, data: quiet } });
+    expect(await runnerReads(printed(today), scratch)).toEqual({ wakeAgent: true, data: quiet });
+  });
+});

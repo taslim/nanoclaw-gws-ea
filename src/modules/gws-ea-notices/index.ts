@@ -30,12 +30,12 @@
  *     cannot turn one notice into a stream of them. Why it failed goes to the
  *     host log only.
  *   - one of main's own, for everything else it concerned (a note from the
- *     host, a look, the morning, another agent's message): main, since the
+ *     host, a look, the daily sync, another agent's message): main, since the
  *     principal sent none of it and has nothing to send again. It gets one
  *     fact in its conversation, what failed and the pieces it concerned, with
  *     their matters; a reply that did not go out also brings the matter of
  *     the look it came from. The fact wakes nothing and rides on main's next
- *     turn, at the latest the morning: waking main to try again over a
+ *     turn, at the latest the daily sync: waking main to try again over a
  *     channel that just failed would only repeat the failure. A look lost
  *     with a failed turn comes back through the matters loop instead.
  *   - an outside email thread, a session of `external-email`: main, which

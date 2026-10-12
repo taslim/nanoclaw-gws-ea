@@ -6,6 +6,7 @@ import { sessionMailboxDir, sessionMailboxPath } from './paths.js';
 export { inboundDbPath, outboundDbPath, sessionMailboxDir, sessionMailboxPath } from './paths.js';
 import {
   countDueMessages,
+  countUnreadContext,
   deleteOrphanProcessingClaims,
   ensureSchema,
   getContainerState,
@@ -203,6 +204,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
       ),
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
+    countUnreadContext: (exceptChannelType) => countUnreadContext(db, exceptChannelType),
     releaseHeldMessages: (processAfter) => releaseHeldMessages(db, processAfter),
     settleHeldMessages: () => settleHeldMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),

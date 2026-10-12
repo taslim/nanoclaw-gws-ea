@@ -11,6 +11,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 
 import {
   countDueMessages,
+  countUnreadContext,
   ensureSchema,
   getInboundSourceSessionId,
   insertMessage,
@@ -248,6 +249,44 @@ describe('held messages', () => {
     expect(releaseHeldMessages(db, null)).toBe(0);
     expect(settleHeldMessages(db)).toBe(0);
     expect(countDueMessages(db)).toBe(1);
+    db.close();
+  });
+});
+
+describe('unread context', () => {
+  it('counts the due rows that wake nothing, leaving out triggers, rows read or not yet due, and the channel named', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    const db = new Database(DB_PATH);
+    const write = (
+      id: string,
+      options: { trigger: boolean; channelType?: string; processAfter?: string; status?: 'held' },
+    ): void =>
+      insertMessage(db, {
+        id,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: 'chat:dm-morgan',
+        channelType: options.channelType ?? 'chat',
+        threadId: null,
+        content: JSON.stringify({ sender: 'system', text: 'Calendar access to the work calendar dropped.' }),
+        processAfter: options.processAfter ?? null,
+        recurrence: null,
+        trigger: options.trigger,
+        ...(options.status ? { status: options.status } : {}),
+      });
+
+    write('note-due', { trigger: false });
+    write('note-past', { trigger: false, processAfter: new Date(Date.now() - 60_000).toISOString() });
+    write('note-ahead', { trigger: false, processAfter: new Date(Date.now() + 3_600_000).toISOString() });
+    write('note-read', { trigger: false });
+    write('echo', { trigger: false, channelType: 'session-echo' });
+    write('message', { trigger: true });
+    write('held', { trigger: false, status: 'held' });
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'note-read'").run();
+
+    expect(countUnreadContext(db, 'session-echo')).toBe(2);
     db.close();
   });
 });

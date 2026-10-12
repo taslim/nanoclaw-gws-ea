@@ -15,7 +15,7 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   failed turn's rows as done, so a repeating look's next occurrence is
  *   armed on its next date as if it had run; the host marks the matter when
  *   it hears of the failure, and its loop brings that occurrence to the next
- *   morning, then clears the mark. It is the host's bookkeeping for one
+ *   daily sync, then clears the mark. It is the host's bookkeeping for one
  *   guarantee, never shown to `main` or anyone, and no status of the matter;
  * - a link is a reference by id: a thread key, `<calendar id>/<event id>`, a
  *   Drive file id, a person id, or a memory path. `handler` names the agent

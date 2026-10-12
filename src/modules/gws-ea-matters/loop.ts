@@ -2,11 +2,11 @@
  * The host's guarantees for matters (KTD7, R13, R14, R16, R24): a pass every
  * minute, without the model, that keeps time for main.
  *
- * 1. The morning series exists (`morning.ts`).
+ * 1. The daily sync exists, at its time (`sync.ts`).
  * 2. Every open matter has a look still to come. One left without, because
  *    its look ran and no new one was set, or was cancelled, paused or lost,
- *    gets one at the next morning, named as handed back (R14).
- * 3. A repeating look whose latest run failed comes back at the next morning
+ *    gets one at the next sync, named as handed back (R14).
+ * 3. A repeating look whose latest run failed comes back at the next sync
  *    instead of at its next date, which its cron keeps: a failed birthday
  *    look comes back the next day, not next year. Its next occurrence is
  *    brought forward, so the series still has one occurrence to come, which
@@ -41,22 +41,22 @@ import {
   stillToCome,
   type HeldSlot,
 } from './looks.js';
-import { keepMorning, unplacedThreadLine } from './morning.js';
+import { keepSync, unplacedThreadLine } from './sync.js';
 import { principalTimezone } from './render.js';
 
 /** How often the host makes its pass. */
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Step 2: a look at the next morning for every open matter whose look will not come back. */
+/** Step 2: a look at the next sync for every open matter whose look will not come back. */
 async function handBackMattersWithoutALook(
   conversation: Session,
-  morning: string,
+  sync: string,
   slots: readonly HeldSlot[],
 ): Promise<void> {
   for (const { slot, held } of slots) {
     if (stillToCome(held?.task)) continue;
-    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: morning }, true);
+    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: sync }, true);
   }
 }
 
@@ -69,12 +69,12 @@ interface Repeat {
 
 /**
  * Step 3: a repeating look whose latest run failed, and whose next
- * occurrence is more than a day after the next morning, comes at the morning.
+ * occurrence is more than a day after the next sync, comes at the sync.
  * A failed script shows in the series' runs; a failed turn, which the runner
  * settles as done, shows in the mark the notices module sets on the matter.
  * Once it runs, the sweep arms the next occurrence from its cron again.
  */
-async function bringFailedRepeatsForward(morning: string, slots: readonly HeldSlot[]): Promise<void> {
+async function bringFailedRepeatsForward(sync: string, slots: readonly HeldSlot[]): Promise<void> {
   // The repeating looks still to come, by the conversation that holds each, so its mailbox opens once.
   const conversations = new Map<string, { readonly session: Session; readonly repeats: Repeat[] }>();
   for (const { slot, held } of slots) {
@@ -92,8 +92,8 @@ async function bringFailedRepeatsForward(morning: string, slots: readonly HeldSl
         repeats.filter(({ slot, key, processAfter }) => {
           // A failed script shows in the series' runs; a failed turn, which the runner settles as done, only in the mark.
           const failed = slot.look_failed_at !== null || mailbox.trailingFailedRuns(key) > 0;
-          if (failed && Date.parse(processAfter) - Date.parse(morning) > DAY_MS) {
-            mailbox.updateTask(key, { processAfter: morning });
+          if (failed && Date.parse(processAfter) - Date.parse(sync) > DAY_MS) {
+            mailbox.updateTask(key, { processAfter: sync });
           }
           return failed;
         }),
@@ -162,13 +162,13 @@ export function keepMattersOnTime(): Promise<void> {
   return oneAtATime(async () => {
     const conversation = await mainConversation();
     if (conversation === undefined) return;
-    const { next: morning } = await keepMorning(conversation);
+    const sync = await keepSync(conversation);
     const idle = (await mainConversations()).every((session) => !isContainerRunning(session.id));
     if (idle) {
       // Step 2 acts on looks that will not come back, step 3 on ones still to come: one read serves both.
       const slots = await listHeldLookSlots();
-      await handBackMattersWithoutALook(conversation, morning, slots);
-      await bringFailedRepeatsForward(morning, slots);
+      await handBackMattersWithoutALook(conversation, sync, slots);
+      await bringFailedRepeatsForward(sync, slots);
     }
     await cancelStrayLooks();
     await remindOfUnplacedThreads(conversation);

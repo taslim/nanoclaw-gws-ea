@@ -18,7 +18,7 @@
  *   by a one-off, which would silently end a yearly date (R24): a one-off
  *   follow-up is a matter of its own.
  * - A look the host sets for a matter left without one (R14) is named apart,
- *   so the morning brief can say which matters came back that way.
+ *   so today's list can say which matters came back that way.
  *
  * Every change to a slot, and each pass of the host's loop, runs one at a
  * time, so a pass never reads a slot halfway through a change.
@@ -63,7 +63,7 @@ export function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
 
 /**
  * `main`'s one shared conversation (`resolveMainConversation`), where every
- * note lands and every look and the morning come back: undefined until the
+ * note lands and every look and the daily sync come back: undefined until the
  * profile names main and the principal has a direct message.
  */
 export async function mainConversation(): Promise<Session | undefined> {
@@ -163,7 +163,7 @@ const LOOK_SERIES = /^(look|back)-(m-[0-9a-f]{12})-[0-9a-f]{4}$/u;
 
 export interface LookSeries {
   readonly matterId: string;
-  /** The host set it, at the morning, for a matter left without a look (R14). */
+  /** The host set it, at the daily sync, for a matter left without a look (R14). */
   readonly handedBack: boolean;
 }
 

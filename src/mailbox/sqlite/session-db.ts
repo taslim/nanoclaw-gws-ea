@@ -120,6 +120,25 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
+ * How many due messages wait, waking nothing, as context for the session's
+ * next turn: pending rows that are not triggers, other than those on
+ * `exceptChannelType`.
+ */
+export function countUnreadContext(db: Database.Database, exceptChannelType: string): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) as count FROM messages_in
+       WHERE status = 'pending'
+         AND trigger = 0
+         AND (channel_type IS NULL OR channel_type <> ?)
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+      )
+      .get(exceptChannelType) as { count: number }
+  ).count;
+}
+
+/**
  * Release every held message: each becomes a pending trigger, due at
  * `processAfter` (null: due now), so the sweep wakes the session for it once
  * it is due. Returns how many it released.

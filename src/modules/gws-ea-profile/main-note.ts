@@ -98,7 +98,7 @@ export interface MainConversation {
 
 /**
  * main's one shared conversation with the principal, where every note is
- * written and every look and the morning come back; its session is created
+ * written and every look and the daily sync come back; its session is created
  * the first time. Until the profile names main and the principal has a
  * direct message, which of the two is missing.
  */
@@ -165,12 +165,25 @@ async function matterView(id: string, lens: () => Promise<Lens>): Promise<string
   return matter === undefined ? [] : [await renderMatter(matter, hostSources(), await lens())];
 }
 
+/**
+ * What an invitation's person and organization rest on. Calendar shows the
+ * organizer the invitation names, and an invitation sent as a file in an
+ * email names whoever its sender chose.
+ */
+const NAMED_ORGANIZER =
+  'The person and organization rest on the organizer the invitation names, which whoever sent it chose.';
+
 /** The open matters a new piece in none may belong to, with why; nothing when none is suggested. */
 async function suggestions(piece: NewPiece, reads: CandidateReads): Promise<string[]> {
   const candidates = await candidatesFor(piece, reads);
-  return candidates.length === 0
-    ? []
-    : [`${PIECE_WORDS[piece.kind]} ${piece.reference} is in no open matter.\n${renderCandidates(candidates)}`];
+  if (candidates.length === 0) return [];
+  const named =
+    piece.kind === 'event' &&
+    candidates.some(({ reasons }) => reasons.includes('same person') || reasons.includes('same organization'));
+  return [
+    `${PIECE_WORDS[piece.kind]} ${piece.reference} is in no open matter.\n${renderCandidates(candidates)}` +
+      (named ? `\n${NAMED_ORGANIZER}` : ''),
+  ];
 }
 
 /**

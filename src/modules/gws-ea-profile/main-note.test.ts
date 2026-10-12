@@ -310,7 +310,8 @@ describe('a note about pieces in no open matter', () => {
       `Google Calendar reports a change:\n- A new event (event ${INVITATION} on calendar ${MORGAN})\n${CALENDAR_CLOSING}\n\n` +
         `Event ${MORGAN}/${INVITATION} is in no open matter.\n` +
         'Open matters it may belong to:\n' +
-        `- ${acme.id}: Acme renewal (same person)`,
+        `- ${acme.id}: Acme renewal (same person)\n` +
+        'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
     );
   });
 
