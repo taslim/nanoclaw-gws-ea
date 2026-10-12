@@ -127,20 +127,20 @@ afterEach(async () => {
 });
 
 describe('the daily sync', () => {
-  it("comes at 07:30 in main's time zone while the principal has no working hours, its gate as its script", async () => {
+  it("comes at 07:00 in main's time zone while the principal has no working hours, its gate as its script", async () => {
     await keepMattersOnTime();
 
     const [sync] = await syncs();
     expect(await syncs()).toHaveLength(1);
-    expect(sync).toMatchObject({ status: 'pending', recurrence: '30 7 * * *' });
-    expect(localClock(sync.process_after)).toBe('7:30 AM');
+    expect(sync).toMatchObject({ status: 'pending', recurrence: '0 7 * * *' });
+    expect(localClock(sync.process_after)).toBe('7:00 AM');
     expect(taskContent(sync).script).toBe('ncl matters sync');
     // The next pass keeps the same series.
     await keepMattersOnTime();
     expect(await syncs()).toEqual([sync]);
   });
 
-  it('comes 30 minutes before the earliest working-hours start, and follows the working hours when they change', async () => {
+  it('comes an hour before the earliest working-hours start, and follows the working hours when they change', async () => {
     const basis = 'Said so.';
     const workingHours = (weekday: 'mon' | 'tue', start: string) =>
       setSchedulingPreference({
@@ -156,14 +156,14 @@ describe('the daily sync', () => {
 
     await keepMattersOnTime();
     const [before] = await syncs();
-    expect(before).toMatchObject({ recurrence: '45 7 * * *' });
-    expect(localClock(before.process_after)).toBe('7:45 AM');
+    expect(before).toMatchObject({ recurrence: '15 7 * * *' });
+    expect(localClock(before.process_after)).toBe('7:15 AM');
 
     await workingHours('tue', '06:30');
     await keepMattersOnTime();
     const [after] = await syncs();
     expect(await syncs()).toHaveLength(1);
-    expect(after).toMatchObject({ recurrence: '0 6 * * *' });
+    expect(after).toMatchObject({ recurrence: '30 5 * * *' });
     expect(after.series_id).not.toBe(before.series_id);
     expect(taskRows(await mainSession()).find((row) => row.id === before.id)?.status).toBe('cancelled');
   });

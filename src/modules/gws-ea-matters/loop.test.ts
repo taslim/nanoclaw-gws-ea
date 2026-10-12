@@ -294,13 +294,13 @@ describe("the host's guarantees for matters", () => {
     controller.abort();
     await loop;
     const [first] = await syncs();
-    expect(first).toMatchObject({ recurrence: '30 7 * * *' });
+    expect(first).toMatchObject({ recurrence: '0 7 * * *' });
 
     await data(run('tasks-cancel', { id: first.series_id }));
     await keepMattersOnTime();
     const [second] = await syncs();
     expect(await syncs()).toHaveLength(1);
-    expect(second).toMatchObject({ recurrence: '30 7 * * *' });
+    expect(second).toMatchObject({ recurrence: '0 7 * * *' });
     expect(second.series_id).not.toBe(first.series_id);
 
     // Eight failed runs in a row, and the sweep pauses the series.
@@ -313,7 +313,7 @@ describe("the host's guarantees for matters", () => {
     await keepMattersOnTime();
     const [third] = (await syncs()).filter((row) => row.status === 'pending');
     expect(await syncs()).toEqual([third]);
-    expect(third).toMatchObject({ recurrence: '30 7 * * *' });
+    expect(third).toMatchObject({ recurrence: '0 7 * * *' });
     expect(third.series_id).not.toBe(second.series_id);
   });
 });

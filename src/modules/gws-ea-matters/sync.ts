@@ -5,8 +5,8 @@
  * principal: whether they hear about their day, and when, is main's
  * judgment, and a standing morning rundown is a task they ask for.
  *
- * - Its time is 30 minutes before the earliest working-hours start in the
- *   principal's preferences, or 07:30 while they have none, in main's time
+ * - Its time is an hour before the earliest working-hours start in the
+ *   principal's preferences, or 07:00 while they have none, in main's time
  *   zone, and it follows their working hours when those change. Nothing else
  *   sets it.
  * - Its pre-task script, `ncl matters sync`, wakes main only when something
@@ -43,8 +43,8 @@ import { principalTimezone } from './render.js';
 
 const SYNC_TASK_NAME = 'gws-ea daily sync';
 const SYNC_SLUG = taskNameSlug(SYNC_TASK_NAME);
-const DEFAULT_SYNC_MINUTE = 7 * 60 + 30;
-const BEFORE_WORK_MINUTES = 30;
+const DEFAULT_SYNC_MINUTE = 7 * 60;
+const BEFORE_WORK_MINUTES = 60;
 
 function minuteOfDay(time: string): number {
   const [hours, minutes] = time.split(':').map(Number);
@@ -59,7 +59,7 @@ function nextRun(recurrence: string, timezone: string): string {
   return CronExpressionParser.parse(recurrence, { tz: timezone }).next().toDate().toISOString();
 }
 
-/** The sync's cron: 30 minutes before the earliest working-hours start the principal has, or 07:30 while they have none. */
+/** The sync's cron: an hour before the earliest working-hours start the principal has, or 07:00 while they have none. */
 async function syncRecurrence(): Promise<string> {
   const starts = (await getSchedulingPreferenceValues()).working_hours.flatMap((day) =>
     day.off ? [] : [minuteOfDay(day.start)],
