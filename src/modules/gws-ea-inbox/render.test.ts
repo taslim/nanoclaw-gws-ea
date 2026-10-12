@@ -222,6 +222,12 @@ describe('the signature', () => {
     );
   });
 
+  it('stays directly under the closing when a link definition follows it', () => {
+    const email = renderEmail({ markdown: 'See the [agenda][a].\n\nBest,\n\n[a]: https://example.com/a', signature });
+    expect(email.text).toContain('Best,\nJuno Hale | EA to Morgan Ellery');
+    expect(email.html).toContain('<p>Best,<br />\nJuno Hale | EA to Morgan Ellery</p>\n</div>');
+  });
+
   it('is a paragraph of its own after an email that ends in anything but a paragraph', () => {
     const email = renderEmail({
       markdown: 'Would either work?\n\n- Tuesday at 10:00\n- Wednesday at 14:00',

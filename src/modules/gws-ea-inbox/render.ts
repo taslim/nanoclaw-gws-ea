@@ -261,7 +261,8 @@ export function quotedBy(quote: QuotedMessage): string {
 /** The email's text and HTML: the body, the signature, and a reply's quote. */
 export function renderEmail(content: EmailContent): RenderedEmail {
   const markdown = content.markdown.replace(/\r\n?/gu, '\n').trim();
-  const body = markdownHtml(markdown);
+  // micromark leaves a line ending after a trailing link definition, which writes nothing.
+  const body = markdownHtml(markdown).trimEnd();
   // Raw HTML is escaped, so a closing `</p>` is micromark's: the email ends in a paragraph.
   const closed = body.endsWith('</p>');
   const signature = escapeHtml(content.signature);
