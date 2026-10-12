@@ -1499,12 +1499,51 @@ describe('production provision step composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
-  it("pauses for the Chat API configuration: the assistant's name, avatar, and description, with interactive features off", async () => {
+  it('asks for the Chat API configuration and the sign-in client in one console visit while the client is still needed', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+    const project = reserved.exclusive_resource_claims.gcp_project_id;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+
+      await expect(phase.observe(context)).resolves.toEqual({
+        status: 'pause',
+        pause: {
+          kind: 'human-action',
+          phase: 'configure_channel',
+          code: 'chat_configuration_required',
+          message:
+            "In this assistant's Google Cloud project, configure the Google Chat API and create the assistant's " +
+            "Google sign-in client, then confirm the one and continue with the other's file.",
+          details: [
+            'Google Chat API, on the page below:',
+            '  App name: Aya',
+            '  Avatar URL: a public HTTPS image of the assistant',
+            '  Description: a short line, such as "Executive assistant to Principal"',
+            '  Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+            `Sign-in client, at https://console.cloud.google.com/auth/overview?project=${project}:`,
+            '  Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
+            '  Under Clients, create a client of type Desktop app, and download its JSON.',
+          ],
+          actionUrl: expect.stringContaining(`project=${project}`),
+          resumeFlag: '--chat-configured --google-client-file <file>',
+        },
+      });
+    });
+  });
+
+  it("pauses for the Chat API configuration alone once the sign-in has its client: the assistant's name, avatar, and description, with interactive features off", async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const context = productionContext(operation, reserved);
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, google: { ...base.input.google, clientFile: '/downloads/client.json' } },
+      };
       const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
 
       const observed = await phase.observe(context);

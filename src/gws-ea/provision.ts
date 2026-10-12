@@ -100,7 +100,15 @@ import {
 } from '../provider-credential.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
-import { googleAccessResources, googleSignInResources, type GoogleConnectionInput } from './google-connection.js';
+import {
+  GOOGLE_CLIENT_FILE_FLAG,
+  GOOGLE_CLIENT_STEPS,
+  googleAccessResources,
+  googleClientConsoleUrl,
+  googleClientNeeded,
+  googleSignInResources,
+  type GoogleConnectionInput,
+} from './google-connection.js';
 import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
 
 export interface ProductionProvisionOptions {
@@ -582,23 +590,46 @@ async function principalResult(
 /**
  * Google Chat API configuration has no API (chat-configuration.ts): the
  * assistant's name, an avatar, and a description, with interactive features
- * off, since the assistant talks in Chat as its own account.
+ * off, since the assistant talks in Chat as its own account. When the
+ * assistant's sign-in still needs its client, which has no API either, the
+ * same visit to the project's console creates it, and the pause takes its
+ * file with the confirmation, so the operator returns to the terminal once.
  */
-function chatConfigurationPause(input: ProductionProvisionInput): ProvisionHumanPause {
+async function chatConfigurationPause(input: ProductionProvisionInput): Promise<ProvisionHumanPause> {
+  const chat = [
+    `App name: ${input.identity.assistantDisplayName}`,
+    'Avatar URL: a public HTTPS image of the assistant',
+    `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
+    'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+  ];
+  const actionUrl = googleChatConfigurationUrl(input.gcp.projectId);
+  if (!(await googleClientNeeded(input.google))) {
+    return {
+      ...humanPause(
+        'configure_channel',
+        'chat_configuration_required',
+        "Configure the Google Chat API for this assistant's project, then confirm it.",
+      ),
+      details: chat,
+      actionUrl,
+      resumeFlag: '--chat-configured',
+    };
+  }
   return {
     ...humanPause(
       'configure_channel',
       'chat_configuration_required',
-      "Configure the Google Chat API for this assistant's project, then confirm it.",
+      "In this assistant's Google Cloud project, configure the Google Chat API and create the assistant's Google " +
+        "sign-in client, then confirm the one and continue with the other's file.",
     ),
     details: [
-      `App name: ${input.identity.assistantDisplayName}`,
-      'Avatar URL: a public HTTPS image of the assistant',
-      `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
-      'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+      'Google Chat API, on the page below:',
+      ...chat.map((line) => `  ${line}`),
+      `Sign-in client, at ${googleClientConsoleUrl(input.gcp.projectId)}:`,
+      ...GOOGLE_CLIENT_STEPS.map((line) => `  ${line}`),
     ],
-    actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
-    resumeFlag: '--chat-configured',
+    actionUrl,
+    resumeFlag: `--chat-configured ${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }
 
@@ -786,7 +817,9 @@ export function createProductionProvisionSteps(
         {
           name: 'the Google Chat API configuration',
           observe: async (value) =>
-            value.input.chatConfigured ? PRESENT : { status: 'pause', pause: chatConfigurationPause(value.input) },
+            value.input.chatConfigured
+              ? PRESENT
+              : { status: 'pause', pause: await chatConfigurationPause(value.input) },
           apply: async (value) => (value.input.chatConfigured ? undefined : chatConfigurationPause(value.input)),
         },
       ],

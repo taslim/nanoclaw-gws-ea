@@ -12,6 +12,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { decisionForChoice, type PauseResponse } from '../src/gws-ea/events.js';
+import { GOOGLE_CLIENT_FILE_FLAG } from '../src/gws-ea/google-connection.js';
 import type { ProvisionHumanPause } from '../src/gws-ea/phases.js';
 import { pollUntil } from '../src/gws-ea/poll.js';
 
@@ -61,6 +62,17 @@ function typedPath(value: string): string {
   return path.resolve(value === '~' || value.startsWith('~/') ? path.join(os.homedir(), value.slice(1)) : value);
 }
 
+/** Where the operator saved the assistant's downloaded client, or undefined when they gave no answer. */
+async function askClientFile(prompts: PausePrompts, signal: AbortSignal): Promise<string | undefined> {
+  const answer = await prompts.text({
+    message: 'Where is the downloaded client JSON?',
+    placeholder: '~/Downloads/client_secret.json',
+    signal,
+  });
+  if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return undefined;
+  return typedPath(answer.trim());
+}
+
 async function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
   await delay(milliseconds, undefined, { signal }).catch((error: unknown) => {
     if (!signal?.aborted) throw error;
@@ -96,25 +108,28 @@ export async function attendPause(
     return decisions ? { kind: 'continue', decisions } : STOP;
   }
 
-  if (pause.resumeFlag === '--chat-configured') {
-    prompts.note(shown, 'Google Chat API');
+  if (pause.code === 'chat_configuration_required') {
+    // The same console visit may also create the assistant's sign-in client, when the pause asks for its file.
+    const withClient = pause.resumeFlag?.includes(GOOGLE_CLIENT_FILE_FLAG) === true;
+    prompts.note(shown, withClient ? 'Google Cloud console' : 'Google Chat API');
     const answer = await prompts.confirm({
-      message: 'Have you saved this configuration?',
+      message: 'Have you saved the Google Chat configuration?',
       initialValue: true,
       signal,
     });
-    return answer === true ? { kind: 'continue', decisions: { chatConfigured: true } } : STOP;
+    if (answer !== true) return STOP;
+    // Without the file, the run goes on and the sign-in asks for it again.
+    const clientFile = withClient ? await askClientFile(prompts, signal) : undefined;
+    return {
+      kind: 'continue',
+      decisions: { chatConfigured: true, ...(clientFile ? { googleClientFile: clientFile } : {}) },
+    };
   }
 
   if (pause.code === 'google_client_required') {
     prompts.note(shown, "The assistant's Google sign-in client");
-    const answer = await prompts.text({
-      message: 'Where is the downloaded client JSON?',
-      placeholder: '~/Downloads/client_secret.json',
-      signal,
-    });
-    if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return STOP;
-    return { kind: 'continue', decisions: { googleClientFile: typedPath(answer.trim()) } };
+    const clientFile = await askClientFile(prompts, signal);
+    return clientFile ? { kind: 'continue', decisions: { googleClientFile: clientFile } } : STOP;
   }
 
   const { settled } = pause;

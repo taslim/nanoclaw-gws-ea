@@ -37,10 +37,10 @@ function clackPrompts() {
 function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPause {
   return {
     kind: 'human-action',
-    phase: 'bind_principal',
-    code: 'principal_chat_request_pending',
-    message: "Morgan Ellery must accept the assistant's chat request in Google Chat, then resume.",
-    details: ['Principal: Morgan Ellery (morgan.ellery@example.test)'],
+    phase: 'verify_conversation',
+    code: 'later_principal_message_missing',
+    message: "Ask the principal to reply to the assistant's welcome in Google Chat.",
+    details: ['Bound principal: Morgan Ellery (gchat:users/2001)'],
     ...overrides,
   };
 }
@@ -115,6 +115,26 @@ describe('attending a pause at the terminal', () => {
     await expect(
       attendPause(CHAT_CONFIGURATION, new AbortController().signal, { prompts: prompts(false) }),
     ).resolves.toEqual({ kind: 'stop' });
+  });
+
+  it('takes the Chat confirmation and the sign-in client file in one console visit when the pause asks for both', async () => {
+    const both = { ...CHAT_CONFIGURATION, resumeFlag: '--chat-configured --google-client-file <file>' };
+    const terminal = prompts(true);
+    terminal.text.mockResolvedValueOnce('~/Downloads/client.json');
+
+    await expect(attendPause(both, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { chatConfigured: true, googleClientFile: path.join(os.homedir(), 'Downloads', 'client.json') },
+    });
+    expect(terminal.note).toHaveBeenCalledWith(expect.stringContaining('App name: Juno'), 'Google Cloud console');
+
+    // Without the file, the Chat configuration still counts, and the sign-in asks for the file again.
+    const unanswered = prompts(true);
+    unanswered.text.mockResolvedValueOnce(CANCEL);
+    await expect(attendPause(both, new AbortController().signal, { prompts: unanswered })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { chatConfigured: true },
+    });
   });
 
   it('lets the person make the choice a pause offers, as the decision its resume flag records, or stop', async () => {

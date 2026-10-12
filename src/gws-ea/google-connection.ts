@@ -90,10 +90,28 @@ const PUBLISH_ATTEMPTS = 36;
 /** Gmail's API host, which any secret able to carry `gmail.modify` must be injected on. */
 const GMAIL_HOST = 'gmail.googleapis.com';
 
-function consoleUrl(projectId: string): string {
+/** Where, in the assistant's project, the operator creates its sign-in client. */
+export function googleClientConsoleUrl(projectId: string): string {
   const url = new URL('https://console.cloud.google.com/auth/overview');
   url.searchParams.set('project', projectId);
   return url.href;
+}
+
+/** What the operator does on that page; Google has no API for it. */
+export const GOOGLE_CLIENT_STEPS: readonly string[] = [
+  'Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
+  'Under Clients, create a client of type Desktop app, and download its JSON.',
+];
+
+/**
+ * Whether the assistant's sign-in still needs the client the operator
+ * downloads: no sign-in yet, no client kept from an earlier run, and none
+ * given on this one.
+ */
+export async function googleClientNeeded(google: GoogleConnectionInput): Promise<boolean> {
+  if (google.clientFile) return false;
+  if (await readGoogleGrantFile(googleGrantFile(google.runtime))) return false;
+  return (await readStoredGoogleOAuthClient(googleOAuthClientFile(google.runtime))) === undefined;
 }
 
 function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
@@ -102,11 +120,8 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
     phase: 'sign_in_google',
     code: 'google_client_required',
     message: "Create the assistant's Google sign-in client, then continue with its file.",
-    details: [
-      'Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
-      'Under Clients, create a client of type Desktop app, and download its JSON.',
-    ],
-    actionUrl: consoleUrl(context.input.gcp.projectId),
+    details: GOOGLE_CLIENT_STEPS,
+    actionUrl: googleClientConsoleUrl(context.input.gcp.projectId),
     resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }
