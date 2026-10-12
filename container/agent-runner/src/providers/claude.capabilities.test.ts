@@ -235,7 +235,7 @@ describe('the pinned SDK offers only granted built-in tools', () => {
   // settings file, skill or hook that Claude Code would load.
   it("offers external-email's list only tools that read, plus its own", async () => {
     const offered = await wireTools(
-      await optionsFor(['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external']),
+      await optionsFor(['files-read', 'time', 'request-status', 'gws-ea-email-external']),
     );
 
     expect(offered.filter((tool) => !tool.startsWith('mcp__'))).toEqual(

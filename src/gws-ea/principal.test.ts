@@ -234,10 +234,8 @@ describe('binding the principal through the DM the assistant opens', () => {
     );
   });
 
-  it.each([
-    ['a request the principal must accept', { status: 'awaiting_acceptance', space: 'spaces/dm-2001' }],
-    ['Google unavailable', { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' }],
-  ] as const)('reports %s, binding nothing', async (_label, answer) => {
+  it('reports Google unavailable, binding nothing', async () => {
+    const answer = { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' } as const;
     const h = harness(answer);
 
     await expect(bindPrincipal(runtimeConfig(), INPUT, h.dependencies)).resolves.toEqual(answer);
@@ -612,24 +610,5 @@ describe('binding the principal on a real instance', () => {
     });
     expect(instance.rows('SELECT sender_scope FROM messaging_group_agents')).toEqual([{ sender_scope: 'all' }]);
     expect(instance.mainInbound()).toEqual([]);
-  }, 60_000);
-
-  it('pauses without binding while a principal outside the organization has not accepted the DM', async () => {
-    const instance = await runningInstance();
-    instance.chat.people.set(CHAT_EMAIL, { id: PRINCIPAL_ID, external: true });
-    await instance.publishMain();
-
-    await expect(instance.bind()).resolves.toEqual({
-      status: 'awaiting_acceptance',
-      space: `spaces/dm-${PRINCIPAL_ID}`,
-    });
-    expect(instance.rows('SELECT user_id FROM gws_ea_principal_users')).toEqual([]);
-    expect(instance.rows('SELECT id FROM messaging_group_agents')).toEqual([]);
-
-    instance.chat.accepted.add(PRINCIPAL_ID);
-    const bound = await instance.bind();
-    await instance.settled(1);
-    expect(bound).toMatchObject({ status: 'bound', principal: { userId: USER } });
-    expect(instance.mainInbound()).toEqual([`${(bound as { eventId: string }).eventId}:ag-main`]);
   }, 60_000);
 });

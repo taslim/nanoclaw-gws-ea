@@ -206,7 +206,7 @@ export interface InteractivePrompts {
   providerCredential(providerId: string): Promise<ProviderCredential>;
   googleCloudSignIn(account?: string): Promise<void>;
   googleAccount(account: string): Promise<boolean>;
-  /** Show the consent URL and open it in the operator's browser, asking them to sign in as `account`. */
+  /** Show the sign-in link and open it in the operator's browser, asking them to sign in as `account`. */
   googleWorkspaceSignIn(url: string, account: string): Promise<void>;
   attendPause(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
 }

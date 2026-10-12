@@ -368,6 +368,7 @@ async function startInbox(): Promise<void> {
       subscribe: async () => undefined,
       unsubscribe: async () => undefined,
     },
+    events: { getEvent: async () => undefined },
     drive,
     sleep: async () => undefined,
   });
@@ -637,7 +638,7 @@ describe("external-email's reply", () => {
     await inbox.tick();
     expect(await threadMessages(key, 'principal')).toHaveLength(1);
 
-    const id = await reply(session, key, 'Thursday at **10** works for Pat.\n\nBest,\nJuno');
+    const id = await reply(session, key, 'Thursday at **10** works for Pat.\n\nBest,');
     expect(deliveryStatus(session, id)).toBe('delivered');
     const [sent] = gmail.sent;
     expect(sent.to).toEqual([JANE, SAM]);
@@ -650,9 +651,11 @@ describe("external-email's reply", () => {
     expect(header(sent.headers, 'References')).toBe('<s1@acme.example> <j1@partner.example>');
     expect(sent.text).toMatch(/Jane <jane@partner\.example> wrote:\n\n> Adding our sales lead\./u);
     // The plain part reads as typed; only the HTML part is formatted.
-    expect(sent.text.slice(0, sent.text.indexOf('\n\n-- \n'))).toBe('Thursday at 10 works for Pat.\n\nBest,\nJuno');
+    expect(sent.text.slice(0, sent.text.indexOf('\n\nOn '))).toBe(
+      'Thursday at 10 works for Pat.\n\nBest,\nJuno | EA to Pat',
+    );
     expect(sent.html).toContain('<strong>10</strong>');
-    expect(sent.text.match(/-- \nJuno\nAssistant to Pat/gu)).toHaveLength(1);
+    expect(sent.text.match(/Juno \| EA to Pat/gu)).toHaveLength(1);
     for (const part of [sent.text, sent.html, ...sent.headers.map((h) => h.value)]) {
       expect(part).not.toMatch(/keep it short|p1@principal/u);
     }

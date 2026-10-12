@@ -170,6 +170,25 @@ describe('canonical mailbox model', () => {
     ).toThrow('expected boolean');
   });
 
+  it('writes an inbound message pending, or held until released, and in no other status', () => {
+    const write = {
+      id: 'in-1',
+      kind: 'chat',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{}',
+      processAfter: null,
+      recurrence: null,
+    } as const;
+
+    expect(createInboundRecord(write, 2).status).toBe('pending');
+    expect(createInboundRecord({ ...write, status: 'held' }, 2).status).toBe('held');
+    expect(parseInboundRecord(createInboundRecord({ ...write, status: 'held' }, 2)).status).toBe('held');
+    expect(() => parseInboundWrite({ ...write, status: 'processing' })).toThrow('unexpected value');
+  });
+
   it('enforces each destination variant at its parser boundary', () => {
     expect(
       parseDestinationRecord({

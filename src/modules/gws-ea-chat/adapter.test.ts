@@ -561,6 +561,17 @@ describe('the working 👀 (R6)', () => {
     expect(requests('POST')).toEqual([`${JUNO_1}/reactions`]);
   });
 
+  it('never asks Chat for 👀 on a message the host made itself, such as the welcome to the principal', async () => {
+    const welcome = 'gws-ea-welcome:9fab48387b4277a8f29886a43bcd65ec23d9844fc38e3d604abeda5b5573c827';
+    await start();
+    await pulse(welcome);
+    await wait(10_000);
+    await end(welcome);
+
+    expect(requests('POST')).toEqual([]);
+    expect(requests('DELETE')).toEqual([]);
+  });
+
   it('never shows 👀 for a turn that ends within 3 seconds', async () => {
     await start();
     await pulse();

@@ -40,7 +40,7 @@ const { MEMORY_SESSION_HOOK, SEALED_MEMORY_SESSION_HOOK } = await import('../mem
 /** What a group on `all` holds, conversation-context among it. */
 const ALL = ['reply', 'files-read', 'files-write', 'shell', 'conversation-context'];
 /** external-email's list: no conversation-context, so its sessions are sealed. */
-const SEALED = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
+const SEALED = ['files-read', 'time', 'request-status', 'gws-ea-email-external'];
 
 let tmp: string;
 const saved: Record<string, string | undefined> = {};
@@ -69,7 +69,9 @@ afterEach(() => {
 async function hooksFor(keys: readonly string[]): Promise<Record<string, unknown>> {
   grants = new Set(keys);
   const provider = createProvider('claude', { env: { PATH: process.env.PATH } });
-  provider.registerMemorySessionHook(keys.includes('conversation-context') ? MEMORY_SESSION_HOOK : SEALED_MEMORY_SESSION_HOOK);
+  provider.registerMemorySessionHook(
+    keys.includes('conversation-context') ? MEMORY_SESSION_HOOK : SEALED_MEMORY_SESSION_HOOK,
+  );
   for await (const _event of provider.query({ prompt: 'go', cwd: tmp }).events) {
     // Drain the stub stream so the provider has called the SDK.
   }

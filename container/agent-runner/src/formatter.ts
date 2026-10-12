@@ -34,6 +34,22 @@ export function isFailureNotice(msg: MessageInRow): boolean {
 }
 
 /**
+ * Content flag the host sets on a task created to come back as a turn of its
+ * conversation (`ncl tasks create --in-conversation`). Any other task is an
+ * isolated run wherever its row sits, a v1-ported one in a conversation's
+ * session included.
+ */
+const IN_CONVERSATION_FIELD = 'inConversation';
+
+function isConversationTask(msg: MessageInRow): boolean {
+  try {
+    return JSON.parse(msg.content)?.[IN_CONVERSATION_FIELD] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Command categories for messages starting with '/'.
  * - admin: sender must be in NANOCLAW_ADMIN_USER_IDS
  * - filtered: silently drop (mark completed without processing)
@@ -168,10 +184,18 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
-  /** Batch is a task run. One-door delivery: only an explicitly addressed tool
-   *  delivers from a task session; final-text `<message to>` blocks are inert
-   *  and the final text auto-appends to the series run log. */
+  /** Batch is a task run: every row is a scheduled task, unless each was
+   *  created to come back in its conversation. One-door delivery: only an
+   *  explicitly addressed tool delivers from a task run; final-text
+   *  `<message to>` blocks are inert and the final text auto-appends to the
+   *  series run log. */
   taskRun: boolean;
+  /** Every row in the batch is a scheduled task (echo rows aside). A task run,
+   *  unless each task was created to come back in its conversation: then it
+   *  is a turn like any other, except that its prose outside a block is
+   *  scratchpad, never nudged, so a task with nothing to say stays quiet;
+   *  absent is no. */
+  tasksOnly?: boolean;
   /** Every non-echo row that woke this turn is a failure notice. */
   failureNoticeWake?: boolean;
   /**
@@ -179,6 +203,17 @@ export interface RoutingContext {
    * with no sign that the agent is working on it (acknowledge.ts); absent is no.
    */
   personWaiting?: boolean;
+  /**
+   * The ids of the messages the turn answers, context that rode along
+   * included. Its failure report and each message it writes to a person name
+   * them, so the host can tell whose they were; absent is none.
+   */
+  batch?: readonly string[];
+}
+
+/** The messages a turn over `messages` answers: all but other conversations' echoes. */
+export function batchOf(messages: readonly MessageInRow[]): string[] {
+  return messages.filter((m) => !isSessionEcho(m)).map((m) => m.id);
 }
 
 /**
@@ -196,17 +231,23 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const waking = nonEcho.filter((m) => m.trigger !== 0);
   const preferred = nonEcho[0] && isFailureNotice(nonEcho[0]) ? waking.find((m) => !isFailureNotice(m)) : undefined;
   const first = preferred ?? nonEcho[0] ?? messages[0];
+  // Echo rows riding along with a task must not disable one-door delivery:
+  // at least one task row and no non-task/non-echo row.
+  const tasksOnly =
+    messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m));
   return {
     platformId: first?.platform_id ?? null,
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
-    // Echo rows riding along with a task must not disable one-door delivery:
-    // taskRun as long as at least one task row and no non-task/non-echo row.
-    taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
+    // A task comes back as a turn only when it was created to, wherever its
+    // row sits; a batch mixing such tasks with others stays a run.
+    taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),
+    tasksOnly,
     // Accumulated trigger=0 context rides along but did not wake the turn.
     failureNoticeWake: waking.length > 0 && waking.every(isFailureNotice),
     personWaiting: waking.some((m) => m.kind === 'chat-sdk' && !showsWorkingIndicator(m.channel_type)),
+    batch: batchOf(messages),
   };
 }
 
@@ -365,7 +406,9 @@ function formatTaskMessage(msg: MessageInRow): string {
   });
   const parts: string[] = [];
   if (content.scriptOutput) {
-    parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');
+    // A script's data can carry outside text, which must never close the
+    // <task> block, so it is escaped like any other inbound text.
+    parts.push('Script output:', escapeXml(JSON.stringify(content.scriptOutput, null, 2)), '');
   }
   parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
   return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;

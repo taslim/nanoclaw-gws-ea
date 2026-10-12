@@ -19,10 +19,9 @@ await loadToolModule('agents', () => import('./agents.js'));
 await loadToolModule('self-mod', () => import('./self-mod.js'));
 await loadToolModule('time', () => import('./time.js'));
 // The email tools name their own two keys, one for each agent, and
-// request_status, the reminders and main's calendar tools their own: their
-// tests load them ahead of this barrel.
+// request_status and main's calendar tools their own: their tests load them
+// ahead of this barrel.
 await import('./gws-ea-email.js');
-await import('./reminders.js');
 await import('./calendar-write.js');
 await import('./request-status.js');
 // Module barrel — loads registration modules, including the singular mailbox

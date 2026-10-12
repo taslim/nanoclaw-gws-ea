@@ -8,11 +8,13 @@ import {
   EXPOSED_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SKILLS,
   GOOGLE_SERVICES,
+  GOOGLE_SIGN_IN_CONSENTS,
   GOOGLE_SIGN_IN_SCOPES,
   googleCredentialFor,
   HOST_GOOGLE_SERVICES,
   missingGoogleScopes,
   parseGoogleGrant,
+  scopesOfGrant,
 } from './grant.js';
 
 const DRIVE = 'https://www.googleapis.com/auth/drive';
@@ -24,15 +26,18 @@ const WORKSPACE_SCOPES = [
   'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.responses.readonly',
 ];
-/** What the sign-in asks for beyond its services' scopes: every other scope of each product an agent could be handed. */
-const CEILING = [
+/** The first consent: every scope of Calendar, Gmail and Drive an agent or the host could be handed. */
+const CALENDAR_GMAIL_DRIVE = [
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/calendar.events.readonly',
   'https://www.googleapis.com/auth/calendar.events.owned',
   'https://www.googleapis.com/auth/calendar.events.owned.readonly',
   'https://www.googleapis.com/auth/calendar.events.freebusy',
   'https://www.googleapis.com/auth/calendar.events.public.readonly',
+  'https://www.googleapis.com/auth/calendar.freebusy',
+  'https://www.googleapis.com/auth/calendar.calendarlist',
   'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
   'https://www.googleapis.com/auth/calendar.calendars',
   'https://www.googleapis.com/auth/calendar.calendars.readonly',
@@ -40,6 +45,8 @@ const CEILING = [
   'https://www.googleapis.com/auth/calendar.acls.readonly',
   'https://www.googleapis.com/auth/calendar.settings.readonly',
   'https://mail.google.com/',
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.metadata',
   'https://www.googleapis.com/auth/gmail.compose',
   'https://www.googleapis.com/auth/gmail.send',
@@ -47,6 +54,7 @@ const CEILING = [
   'https://www.googleapis.com/auth/gmail.labels',
   'https://www.googleapis.com/auth/gmail.settings.basic',
   'https://www.googleapis.com/auth/gmail.settings.sharing',
+  DRIVE,
   'https://www.googleapis.com/auth/drive.readonly',
   'https://www.googleapis.com/auth/drive.metadata',
   'https://www.googleapis.com/auth/drive.metadata.readonly',
@@ -55,24 +63,17 @@ const CEILING = [
   'https://www.googleapis.com/auth/drive.labels',
   'https://www.googleapis.com/auth/drive.labels.readonly',
   'https://www.googleapis.com/auth/drive.meet.readonly',
-  'https://www.googleapis.com/auth/documents.readonly',
-  'https://www.googleapis.com/auth/spreadsheets.readonly',
-  'https://www.googleapis.com/auth/presentations.readonly',
-  'https://www.googleapis.com/auth/forms.body.readonly',
 ];
-/** The host's Chat token: messages and reactions, reading spaces and opening a DM, and reading members. */
-const CHAT = [
-  'https://www.googleapis.com/auth/chat.messages',
+/** Every Chat scope a user can grant. */
+const ALL_CHAT = [
+  'https://www.googleapis.com/auth/chat.spaces',
   'https://www.googleapis.com/auth/chat.spaces.readonly',
   'https://www.googleapis.com/auth/chat.spaces.create',
-  'https://www.googleapis.com/auth/chat.memberships.readonly',
-];
-/** Every other Chat scope a user can grant. */
-const CHAT_CEILING = [
-  'https://www.googleapis.com/auth/chat.spaces',
   'https://www.googleapis.com/auth/chat.delete',
   'https://www.googleapis.com/auth/chat.memberships',
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
   'https://www.googleapis.com/auth/chat.memberships.app',
+  'https://www.googleapis.com/auth/chat.messages',
   'https://www.googleapis.com/auth/chat.messages.readonly',
   'https://www.googleapis.com/auth/chat.messages.create',
   'https://www.googleapis.com/auth/chat.messages.reactions',
@@ -86,15 +87,38 @@ const CHAT_CEILING = [
   'https://www.googleapis.com/auth/chat.customemojis',
   'https://www.googleapis.com/auth/chat.customemojis.readonly',
 ];
+/** The second consent: every scope of Docs, Sheets, Slides, Forms, the directory and Chat. */
+const DOCS_TO_CHAT = [
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations',
+  'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body',
+  'https://www.googleapis.com/auth/forms.body.readonly',
+  'https://www.googleapis.com/auth/forms.responses.readonly',
+  'https://www.googleapis.com/auth/directory.readonly',
+  ...ALL_CHAT,
+];
+/** The host's Chat token: messages and reactions, reading spaces and opening a DM, and reading members. */
+const CHAT = [
+  'https://www.googleapis.com/auth/chat.messages',
+  'https://www.googleapis.com/auth/chat.spaces.readonly',
+  'https://www.googleapis.com/auth/chat.spaces.create',
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
+];
 
 const VALID = {
-  schema_version: 2,
+  schema_version: 3,
   account: 'Juno@Example.test',
   sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
-  refresh_token: '1//refresh-token',
-  scopes: ['openid', 'https://www.googleapis.com/auth/userinfo.email'],
+  consents: [
+    { refresh_token: '1//refresh-token-1', scopes: ['openid', 'https://www.googleapis.com/auth/userinfo.email'] },
+    { refresh_token: '1//refresh-token-2', scopes: ['openid', 'https://www.googleapis.com/auth/chat.messages'] },
+  ],
   granted_at: '2026-09-30T10:00:00.000Z',
 };
 
@@ -103,38 +127,55 @@ describe("the assistant's Google grant", () => {
     expect(parseGoogleGrant(VALID)).toEqual({ ...VALID, account: 'juno@example.test' });
   });
 
+  it('holds every scope its consents granted, each once', () => {
+    expect(scopesOfGrant(parseGoogleGrant(VALID))).toEqual([
+      'openid',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/chat.messages',
+    ]);
+  });
+
   it.each([
     ['the schema from before it recorded the account ID', { ...VALID, schema_version: 1 }],
-    ['another schema', { ...VALID, schema_version: 3 }],
+    ['the schema from before each consent kept its own refresh token', { ...VALID, schema_version: 2 }],
+    ['another schema', { ...VALID, schema_version: 4 }],
     ['no account ID', { ...VALID, sub: undefined }],
     ["an account ID that is not Google's numeric one", { ...VALID, sub: 'users/104857395723948572901' }],
-    ['no refresh token', { ...VALID, refresh_token: '' }],
+    ['no consents', { ...VALID, consents: [] }],
+    ['a consent without a refresh token', { ...VALID, consents: [{ refresh_token: '', scopes: ['openid'] }] }],
+    ['a consent without scopes', { ...VALID, consents: [{ refresh_token: '1//refresh-token', scopes: [] }] }],
     ['a control character', { ...VALID, client_id: 'client\nid' }],
-    ['no scopes', { ...VALID, scopes: [] }],
     ['a time that is not canonical', { ...VALID, granted_at: '2026-09-30 10:00' }],
   ])('refuses a grant with %s', (_label, value) => {
     expect(() => parseGoogleGrant(value)).toThrow(/Google grant/);
   });
 
-  it('asks in one sign-in for identity, every service, and the ceiling beyond them, each scope once', () => {
-    expect(GOOGLE_SIGN_IN_SCOPES).toEqual([
-      'openid',
-      'email',
-      'https://www.googleapis.com/auth/calendar.events',
-      'https://www.googleapis.com/auth/calendar.calendarlist',
-      'https://www.googleapis.com/auth/calendar.freebusy',
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/directory.readonly',
-      ...WORKSPACE_SCOPES,
-      'https://www.googleapis.com/auth/gmail.modify',
-      ...CHAT,
-      ...CEILING,
-      ...CHAT_CEILING,
+  it("asks in consents of the account's identity and their products' scopes, each scope once", () => {
+    expect(GOOGLE_SIGN_IN_CONSENTS).toEqual([
+      ['openid', 'email', ...CALENDAR_GMAIL_DRIVE],
+      ['openid', 'email', ...DOCS_TO_CHAT],
     ]);
+    expect(GOOGLE_SIGN_IN_SCOPES).toEqual(['openid', 'email', ...CALENDAR_GMAIL_DRIVE, ...DOCS_TO_CHAT]);
     expect(new Set(GOOGLE_SIGN_IN_SCOPES).size).toBe(GOOGLE_SIGN_IN_SCOPES.length);
   });
 
-  it("names each required scope a grant lacks, the ceiling's too, accepting Google's long form of email", () => {
+  it('keeps each consent well under the size at which Google stops finishing it', () => {
+    // Checked live on 2026-10-11: a consent of 49 scopes came back, and 57 hung after Allow.
+    for (const consent of GOOGLE_SIGN_IN_CONSENTS) expect(consent.length).toBeLessThanOrEqual(40);
+  });
+
+  it('asks in one consent for every scope a token is minted with, since each consent mints only its own', () => {
+    const tokens = [
+      ...Object.values(GOOGLE_SERVICES).map((service) => service.scopes),
+      ...AGENT_GOOGLE_CREDENTIALS.map((credential) => credentialScopes(credential, [...GOOGLE_SIGN_IN_SCOPES])),
+    ];
+    for (const scopes of tokens) {
+      const granting = GOOGLE_SIGN_IN_CONSENTS.filter((consent) => scopes.every((scope) => consent.includes(scope)));
+      expect(granting, scopes.join(' ')).not.toEqual([]);
+    }
+  });
+
+  it("names each required scope a grant lacks, accepting Google's long form of email", () => {
     const beforeThisRelease = [
       'openid',
       'https://www.googleapis.com/auth/userinfo.email',
@@ -143,9 +184,11 @@ describe("the assistant's Google grant", () => {
       ...AGENT_GOOGLE_SERVICES.directory.scopes,
       ...HOST_GOOGLE_SERVICES.gmail.scopes,
     ];
-    expect(missingGoogleScopes(beforeThisRelease)).toEqual([...WORKSPACE_SCOPES, ...CHAT, ...CEILING, ...CHAT_CEILING]);
+    expect(missingGoogleScopes(beforeThisRelease)).toEqual(
+      [...CALENDAR_GMAIL_DRIVE, ...DOCS_TO_CHAT].filter((scope) => !beforeThisRelease.includes(scope)),
+    );
     const beforeChat = GOOGLE_SIGN_IN_SCOPES.filter((scope) => !scope.includes('/auth/chat.'));
-    expect(missingGoogleScopes(beforeChat)).toEqual([...CHAT, ...CHAT_CEILING]);
+    expect(missingGoogleScopes(beforeChat)).toEqual(ALL_CHAT);
     expect(missingGoogleScopes(GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== 'https://mail.google.com/'))).toEqual([
       'https://mail.google.com/',
     ]);

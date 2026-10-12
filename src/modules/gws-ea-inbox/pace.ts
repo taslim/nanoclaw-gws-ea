@@ -13,16 +13,20 @@
  * pending deadline when there is one, so it is worked with the mail already
  * waiting, and is otherwise due as written (`pendingDeadline`).
  *
- * A deadline is pending only while it is ahead and pace set it: a reminder
- * keeps its own time, and a retried message waits out its backoff, so
- * neither holds new mail. Once the agent has a batch, the next row starts a
- * new wait. No other session is delayed: the principal's own email and every
+ * A deadline is pending only while it is ahead and pace set it: a retried
+ * message waits out its backoff, which holds no new mail. Once the agent
+ * has a batch, the next row starts a new wait. No other session is delayed: the principal's own email and every
  * note to `main` are worked as they come.
+ *
+ * Pace starts once `main` has handed the thread over (Slice 5 KTD8). Until
+ * then every row the router writes into the thread's session is held: no
+ * turn reads it and nothing waits on it or wakes for it. The handoff releases
+ * what is held to the thread's pending deadline, with main's words.
  */
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { isReminderId } from '../gws-ea-reminders/index.js';
 import { emailMessagingGroupIds } from './db.js';
+import { threadPlacement } from './thread-map.js';
 
 /** The shortest wait for an outside thread's first unanswered message. */
 const PACE_MIN_MS = 3 * 60_000;
@@ -40,7 +44,15 @@ async function waitingDeadline(session: Session): Promise<string | null> {
   const waiting = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getWaitingMessages(),
   );
-  return waiting?.find((message) => message.tries === 0 && !isReminderId(message.id))?.processAfter ?? null;
+  return waiting?.find((message) => message.tries === 0)?.processAfter ?? null;
+}
+
+/** When a row written now into an outside thread's session is to be read: its pending deadline, or a new one. */
+async function outsideDeadline(session: Session): Promise<string> {
+  return (
+    (await waitingDeadline(session)) ??
+    new Date(Date.now() + PACE_MIN_MS + Math.random() * (PACE_MAX_MS - PACE_MIN_MS)).toISOString()
+  );
 }
 
 /**
@@ -48,11 +60,30 @@ async function waitingDeadline(session: Session): Promise<string | null> {
  * pending deadline, or a new one. Null for every other session.
  */
 export async function paceDeadline(session: Session): Promise<string | null> {
-  if (!(await isOutsideThread(session))) return null;
-  return (
-    (await waitingDeadline(session)) ??
-    new Date(Date.now() + PACE_MIN_MS + Math.random() * (PACE_MAX_MS - PACE_MIN_MS)).toISOString()
-  );
+  return (await isOutsideThread(session)) ? outsideDeadline(session) : null;
+}
+
+/** How a row written now into an outside thread's session waits: held for main, or else until its deadline. */
+export interface InboundPace {
+  /** The thread's pending deadline, or a new one. */
+  readonly deadline: string;
+  /**
+   * Held for main, which wins over the deadline: an outside thread's mail is
+   * read only once main has placed the thread and handed it over, however
+   * the thread began.
+   */
+  readonly held: boolean;
+}
+
+/**
+ * How a row the router writes now into `session` waits, from one look at
+ * the inbox; undefined for every session but an outside thread's.
+ */
+export async function inboundPace(session: Session): Promise<InboundPace | undefined> {
+  const threadKey = session.thread_id;
+  if (threadKey === null || !(await isOutsideThread(session))) return undefined;
+  const deadline = await outsideDeadline(session);
+  return { deadline, held: (await threadPlacement(threadKey))?.released !== true };
 }
 
 /**

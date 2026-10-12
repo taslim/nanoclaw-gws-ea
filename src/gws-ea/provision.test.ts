@@ -37,6 +37,7 @@ import { keepRelease, keptReleaseFiles } from './kept-release.js';
 import { createOnecliAdmin } from './onecli-admin.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
+import { storeGoogleOAuthClient, writeGoogleGrant } from './google-oauth.js';
 import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
@@ -47,6 +48,8 @@ import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
+  googleGrantFile,
+  googleOAuthClientFile,
   instanceHostConfiguration,
   instanceServiceDefinitionFile,
   loadInstanceRuntimeConfig,
@@ -165,8 +168,9 @@ afterEach(async () => {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_chat_request_pending',
-  message: "Juno Hale must accept the assistant's chat request in Google Chat, then resume.",
+  code: 'google_chat_unavailable',
+  message:
+    'Google Chat did not answer while the assistant opened its direct message with Juno Hale. Resume to try again.',
 };
 
 /** An in-memory world of named resources for exercising the step engine. */
@@ -301,6 +305,11 @@ async function engineFixture() {
 
 function startedSteps(events: readonly RunEvent[]): string[] {
   return events.flatMap((event) => (event.type === 'step-started' ? [event.step] : []));
+}
+
+/** The steps a terminal shows: those started with a label. */
+function labeledSteps(events: readonly RunEvent[]): string[] {
+  return events.flatMap((event) => (event.type === 'step-started' && event.label ? [event.step] : []));
 }
 
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
@@ -576,15 +585,42 @@ describe('step engine', () => {
     engine.events.length = 0;
     await expect(engine.run()).resolves.toEqual({ status: 'ready' });
 
-    expect(startedSteps(engine.events).slice(0, 2)).toEqual(['start_onecli', 'start_nanoclaw']);
-    expect(engine.events[0]).toEqual({ type: 'step-started', step: 'start_onecli', label: 'Checking start_onecli…' });
+    // A first look at each, logged but not shown; only the runtime still starting gets the shown check.
+    expect(engine.events.slice(0, 3)).toEqual([
+      { type: 'step-started', step: 'start_onecli' },
+      { type: 'step-completed', step: 'start_onecli' },
+      { type: 'step-started', step: 'start_onecli', label: 'Checking start_onecli…' },
+    ]);
+    expect(labeledSteps(engine.events)).not.toContain('start_nanoclaw');
+    expect(startedSteps(engine.events).slice(0, 4)).toEqual([
+      'start_onecli',
+      'start_onecli',
+      'start_nanoclaw',
+      'connect_google',
+    ]);
     expect(engine.world.observed.filter((name) => name === 'start_onecli')).toHaveLength(3);
     expect(engine.world.observed.filter((name) => name === 'start_nanoclaw')).toHaveLength(1);
     expect(engine.world.observed).not.toContain('materialize_checkout');
     expect(engine.world.observed).not.toContain('provision_gcp');
     expect(engine.world.observed).not.toContain('configure_provider');
-    expect(engine.sleeps).toEqual([1_000, 2_000]);
+    expect(engine.sleeps).toEqual([1_000]);
     expect(engine.world.applied.filter((name) => name === 'start_onecli')).toHaveLength(1);
+  });
+
+  it('shows no check of a runtime that is running, and shows the check that repairs a stopped one', async () => {
+    const engine = await engineFixture();
+    engine.world.pauseOnApply.set('connect_google', { ...DM_PAUSE, phase: 'connect_google' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+
+    engine.events.length = 0;
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+    expect(labeledSteps(engine.events)).toEqual(['connect_google']);
+
+    engine.world.present.delete('start_nanoclaw');
+    engine.events.length = 0;
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+    expect(labeledSteps(engine.events)).toEqual(['start_nanoclaw', 'connect_google']);
+    expect(engine.world.applied.filter((name) => name === 'start_nanoclaw')).toHaveLength(2);
   });
 
   it('repairs a stopped runtime locally only after the bounded wait', async () => {
@@ -1236,7 +1272,7 @@ describe('production provision step composition', () => {
     expect(progress).toEqual([{ type: 'step-waiting', step: 'provision_gcp', reason }]);
   });
 
-  it('observes Google Cloud as its own resources, restoring a lifted key policy only after the key', async () => {
+  it('observes Google Cloud as its own resources, restoring a relaxed member-domain policy after the publisher grant and a lifted key policy only after the key', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
 
@@ -1250,6 +1286,7 @@ describe('production provision step composition', () => {
         ['the Google Chat events topic', 'wait'],
         ['the Google Chat events subscription', 'wait'],
         ['the publisher grant on the topic', 'wait'],
+        ['the member-domain policy', 'wait'],
         ['the Chat subscriber account', 'wait'],
         ["the subscriber's grant on the subscription", 'wait'],
         ['the Chat subscriber key', 'wait'],
@@ -1497,38 +1534,126 @@ describe('production provision step composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
-  it("pauses for the Chat API configuration: the assistant's name, avatar, and description, with interactive features off", async () => {
+  it('asks for the Chat API configuration and the sign-in client in one console visit while the client is still needed', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
+    const project = reserved.exclusive_resource_claims.gcp_project_id;
+    const account = reserved.exclusive_resource_claims.gcp_account;
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
       const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
 
-      const observed = await phase.observe(context);
-      expect(observed).toEqual({
+      // The Chat link first; each link alone on its line, then one field to a line.
+      await expect(phase.observe(context)).resolves.toEqual({
         status: 'pause',
         pause: {
           kind: 'human-action',
           phase: 'configure_channel',
           code: 'chat_configuration_required',
-          message: "Configure the Google Chat API for this assistant's project, then confirm it.",
+          message:
+            "Do two things in this assistant's Google Cloud project, then confirm the first and give the second's file.",
           details: [
-            'App name: Aya',
-            'Avatar URL: a public HTTPS image of the assistant',
-            'Description: a short line, such as "Executive assistant to Principal"',
-            'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+            '1. Configure the Google Chat API:',
+            `   https://console.developers.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${project}`,
+            '   App name: Aya',
+            '   Avatar URL: a public HTTPS image of the assistant',
+            '   Description: a short line, such as "Executive assistant to Principal"',
+            '   Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+            '   Save',
+            "2. Create the assistant's Google sign-in client:",
+            `   https://console.cloud.google.com/auth/overview?project=${project}`,
+            '   Get started:',
+            '     App name: Aya',
+            `     User support email: ${account}`,
+            '     Audience: Internal',
+            `     Contact email: ${account}`,
+            '     Agree to the Google API Services: User Data Policy, then Create',
+            '   Clients, then Create client:',
+            '     Application type: Desktop app',
+            '     Name: leave the default',
+            '     Create, then Download JSON',
           ],
-          actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
-          resumeFlag: '--chat-configured',
+          resumeFlag: '--chat-configured --google-client-file <file>',
         },
       });
-      // No endpoint, callback, or add-on: Chat's events are pulled.
-      const shown = JSON.stringify(observed);
-      expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
-      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
     });
   });
+
+  /** The ways the assistant's sign-in can already have its client, so the Chat pause need not ask for it. */
+  const SIGN_IN_CLIENT_READY: ReadonlyArray<
+    readonly [string, (context: ProductionProvisionContext) => Promise<ProductionProvisionContext>]
+  > = [
+    [
+      'is given on this run',
+      async (context) => ({
+        ...context,
+        input: { ...context.input, google: { ...context.input.google, clientFile: '/downloads/client.json' } },
+      }),
+    ],
+    [
+      'was kept from an earlier run',
+      async (context) => {
+        await storeGoogleOAuthClient(googleOAuthClientFile(context.input.runtime), {
+          client_id: '123-abc.apps.googleusercontent.com',
+          client_secret: 'GOCSPX-desktop-secret',
+        });
+        return context;
+      },
+    ],
+    [
+      'already signed the assistant in',
+      async (context) => {
+        await writeGoogleGrant(googleGrantFile(context.input.runtime), {
+          schema_version: 3,
+          account: context.input.google.assistantWorkspaceEmail,
+          sub: '104857395723948572901',
+          client_id: '123-abc.apps.googleusercontent.com',
+          client_secret: 'GOCSPX-desktop-secret',
+          consents: [{ refresh_token: '1//refresh-token', scopes: ['openid'] }],
+          granted_at: '2026-10-12T00:00:00.000Z',
+        });
+        return context;
+      },
+    ],
+  ];
+
+  it.each(SIGN_IN_CLIENT_READY)(
+    "pauses for the Chat API configuration alone once the sign-in's client %s: the assistant's name, avatar, and description, with interactive features off",
+    async (_label, ready) => {
+      const paths = await testPaths();
+      const reserved = await reserveInstance(paths, reservation());
+
+      await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const context = await ready(productionContext(operation, reserved));
+        const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+
+        const observed = await phase.observe(context);
+        expect(observed).toEqual({
+          status: 'pause',
+          pause: {
+            kind: 'human-action',
+            phase: 'configure_channel',
+            code: 'chat_configuration_required',
+            message: "Configure the Google Chat API for this assistant's project, then confirm it.",
+            details: [
+              `https://console.developers.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${reserved.exclusive_resource_claims.gcp_project_id}`,
+              'App name: Aya',
+              'Avatar URL: a public HTTPS image of the assistant',
+              'Description: a short line, such as "Executive assistant to Principal"',
+              'Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+              'Save',
+            ],
+            resumeFlag: '--chat-configured',
+          },
+        });
+        // No endpoint, callback, or add-on: Chat's events are pulled.
+        const shown = JSON.stringify(observed);
+        expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
+        await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
+      });
+    },
+  );
 
   it("takes the operator's confirmation as the Chat configuration", async () => {
     const paths = await testPaths();
@@ -1743,7 +1868,13 @@ describe('production provision step composition', () => {
 
       host = 2;
       await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
-      expect(sleeps).toEqual([1_000, 2_000]);
+      // The first look, logged but not shown, finds the host starting; the shown check waits for it.
+      expect(sleeps).toEqual([1_000]);
+      expect(events).toContainEqual({
+        type: 'step-started',
+        step: 'start_nanoclaw',
+        label: 'Checking the assistant…',
+      });
       expect(events).toContainEqual({
         type: 'step-waiting',
         step: 'start_nanoclaw',
@@ -2004,8 +2135,8 @@ interface ProductionHarness {
   readonly sleeps: number[];
   providerCredential: boolean;
   chatConfigured: boolean;
-  /** What opening the principal's DM finds: they have not accepted it yet, Google does not answer, or it opens. */
-  principal: 'awaiting_acceptance' | 'unavailable' | 'bound';
+  /** What opening the principal's DM finds: Google does not answer, or it opens. */
+  principal: 'unavailable' | 'bound';
   /** The address each bind opened the DM with, and the moment it bound them at. */
   readonly binds: Array<{ readonly chatEmail: string; readonly verifiedAt: string }>;
   conversationReady: boolean;
@@ -2074,7 +2205,7 @@ async function productionHarness(): Promise<ProductionHarness> {
     crashAfterBinding: false,
     providerCredential: true,
     chatConfigured: true,
-    principal: 'awaiting_acceptance',
+    principal: 'unavailable',
     binds: [],
     conversationReady: true,
     conversationReasons: [],
@@ -2189,9 +2320,6 @@ async function productionHarness(): Promise<ProductionHarness> {
           bindPrincipal: async (_runtime, input) => {
             harness.effects.push(`bindPrincipal:${harness.principal}`);
             harness.binds.push({ chatEmail: input.chatEmail, verifiedAt: input.verifiedAt });
-            if (harness.principal === 'awaiting_acceptance') {
-              return { status: 'awaiting_acceptance', space: 'spaces/dm-2001' };
-            }
             if (harness.principal === 'unavailable') {
               return { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' };
             }
@@ -2259,16 +2387,10 @@ describe('production step order and pause outcomes', () => {
   it("signs in before the host starts, connects agents' access after it, then binds the principal through the DM the assistant opens", async () => {
     const harness = await productionHarness();
 
-    // A principal outside the assistant's organization must accept its DM first.
+    // Google Chat does not answer the first time the assistant opens the principal's DM.
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: {
-        phase: 'bind_principal',
-        code: 'principal_chat_request_pending',
-        message:
-          "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
-          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
-      },
+      pause: { phase: 'bind_principal', code: 'google_chat_unavailable' },
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
@@ -2280,7 +2402,7 @@ describe('production step order and pause outcomes', () => {
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
-      'bindPrincipal:awaiting_acceptance',
+      'bindPrincipal:unavailable',
     ]);
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
@@ -2326,7 +2448,7 @@ describe('production step order and pause outcomes', () => {
     harness.chatConfigured = true;
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
+      pause: { phase: 'bind_principal', code: 'google_chat_unavailable' },
     });
   });
 
@@ -2383,7 +2505,7 @@ describe('production step order and pause outcomes', () => {
       status: 'paused',
       pause: {
         phase: 'bind_principal',
-        code: 'principal_chat_request_pending',
+        code: 'google_chat_unavailable',
         details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
       },
     });
@@ -2451,7 +2573,7 @@ describe('production step order and pause outcomes', () => {
     ]);
   });
 
-  it('waits while the assistant delivers its welcome, then pauses for a reply it can watch for', async () => {
+  it('waits while the assistant delivers its welcome, then watches one pause through the reply and the answer', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
     harness.conversationReady = false;
@@ -2461,14 +2583,41 @@ describe('production step order and pause outcomes', () => {
     expect(paused.pause).toMatchObject({
       phase: 'verify_conversation',
       code: 'later_principal_message_missing',
-      message: "Ask the principal to reply to the assistant's welcome in Google Chat.",
+      message:
+        "Ask the principal to reply to the assistant's welcome in Google Chat, if they have not yet; setup finishes " +
+        "once the assistant answers them. If they are outside the assistant's Google Workspace organization, the " +
+        'welcome reaches them as a message request to accept first.',
     });
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
 
-    // The pause watches for the reply without changing anything.
+    // The pause watches without changing anything, and a reply the assistant has not answered yet keeps it watching.
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+    harness.conversationReasons = ['reply_not_delivered'];
     await expect(paused.pause.settled?.()).resolves.toBe(false);
     harness.conversationReady = true;
     await expect(paused.pause.settled?.()).resolves.toBe(true);
+  });
+
+  it('watches for the answer to a reply already there, without a delivery wait first', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+    harness.conversationReasons = Array.from({ length: 40 }, () => 'reply_not_delivered' as const);
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'verify_conversation',
+      code: 'reply_not_delivered',
+      message:
+        'The principal has replied; setup finishes once the assistant answers them. If it does not, check the errors below.',
+    });
+    expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toEqual([]);
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+
+    harness.conversationReasons = [];
+    harness.conversationReady = true;
+    await expect(paused.pause.settled?.()).resolves.toBe(true);
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
   });
 
   it('stops waiting on a delivery after a minute, and names it without a watch', async () => {

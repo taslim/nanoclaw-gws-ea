@@ -91,8 +91,8 @@ A form runs from building to close, and you own all of it.
 
    For named people, use `"type":"user"` with their `"emailAddress"`, one call each. Google emails each of them about it unless you add `"sendNotificationEmail":false` to `--params`.
 3. Share the responder link, the `responderUri` from `gog forms get <formId>`.
-4. Google doesn't email you responses, and you can't turn that on. While the form is open, set yourself reminders with `remind_me` to read `gog forms responses list <formId>` at sensible points, more often near the deadline, and keep any sheet of responses current.
-5. Close it on a reminder when the job calls for it: `gog forms publish <formId> --accepting-responses=false`. Then read the responses one last time and bring the sheet up to date.
+4. Google doesn't email you responses, and you can't turn that on. While the form is open, keep it in the matter it serves (`ncl matters place <id> --file <formId>`), with the matter's next look set for when responses are worth reading, more often near the deadline. At each look, read `gog forms responses list <formId>` and keep any sheet of responses current.
+5. Close it at a look when the job calls for it: `gog forms publish <formId> --accepting-responses=false`. Then read the responses one last time, bring the sheet up to date, and close the matter if nothing else is left in it.
 
 ## Share
 

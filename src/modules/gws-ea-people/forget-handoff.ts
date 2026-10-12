@@ -38,6 +38,8 @@ export interface PeopleForgetHandoff {
   readonly fingerprints: readonly ForgottenFingerprint[];
   /** The host's own: the names it is forgetting again, kept until main has been told. */
   readonly pending_note?: readonly string[];
+  /** The host's own: what those forgets put to main to rewrite, kept as each is known until main has been told. */
+  readonly pending_rewrite?: readonly string[];
 }
 
 function invalid(what: string): GwsEaError {
@@ -55,17 +57,25 @@ function parseFingerprint(value: unknown, index: number): ForgottenFingerprint {
   return { fingerprint, forgotten_at: forgottenAt };
 }
 
+/** One of the host's own lists, each entry a line. */
+function parseLines(value: unknown, field: string, what: string): string[] {
+  if (!Array.isArray(value)) throw invalid(`${field} must be an array of ${what}`);
+  return value.map((entry, index) => requireString(entry, `${LABEL} ${field}[${index}]`, INVALID));
+}
+
 /** The handoff in `value`, every row checked: a file with one bad row is refused whole. */
 function parseHandoff(value: unknown): PeopleForgetHandoff {
   if (!isRecord(value)) throw invalid('it must be an object');
   if (!Array.isArray(value.fingerprints)) throw invalid('fingerprints must be an array');
-  const fingerprints = value.fingerprints.map(parseFingerprint);
-  if (value.pending_note === undefined) return { fingerprints };
-  if (!Array.isArray(value.pending_note)) throw invalid('pending_note must be an array of names');
-  const pendingNote = value.pending_note.map((name, index) =>
-    requireString(name, `${LABEL} pending_note[${index}]`, INVALID),
-  );
-  return { fingerprints, pending_note: pendingNote };
+  return {
+    fingerprints: value.fingerprints.map(parseFingerprint),
+    ...(value.pending_note === undefined
+      ? {}
+      : { pending_note: parseLines(value.pending_note, 'pending_note', 'names') }),
+    ...(value.pending_rewrite === undefined
+      ? {}
+      : { pending_rewrite: parseLines(value.pending_rewrite, 'pending_rewrite', 'entries') }),
+  };
 }
 
 /** The handoff, or undefined when there is none. An unsafe or malformed file is refused. */

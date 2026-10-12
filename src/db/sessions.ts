@@ -59,15 +59,34 @@ export async function findSessionForAgent(
   );
 }
 
+/** Excludes the host's system sessions (a `system:%` thread with no messaging group), such as task sessions. */
+const NOT_SYSTEM_SESSION = "NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')";
+
 /** Find an active session scoped to an agent group (ignoring messaging group). */
 export async function findSessionByAgentGroup(agentGroupId: string): Promise<Session | undefined> {
   return getDb().get<Session>(
     `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND status = 'active'
-         AND NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')
+         AND ${NOT_SYSTEM_SESSION}
        ORDER BY created_at DESC
        LIMIT 1`,
+    agentGroupId,
+  );
+}
+
+/**
+ * A group's active conversation sessions, newest first: every active session
+ * that is not a system one. A task that comes back as a turn of a
+ * conversation lives in that conversation's mailbox.
+ */
+export async function findConversationSessions(agentGroupId: string): Promise<Session[]> {
+  return getDb().all<Session>(
+    `SELECT * FROM sessions
+       WHERE agent_group_id = ?
+         AND status = 'active'
+         AND ${NOT_SYSTEM_SESSION}
+       ORDER BY created_at DESC`,
     agentGroupId,
   );
 }

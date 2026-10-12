@@ -44,12 +44,13 @@ import { getInboxHealth } from './health.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
+import { createMeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { createDriveApi } from '../gws-ea-workspace/drive-api.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
-import { registerInboundDelay } from '../../router.js';
+import { HOLD_UNTIL_RELEASED, registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
@@ -59,14 +60,22 @@ import {
   gwsEaInboxEmailChannelMigration,
   gwsEaInboxMigration,
   gwsEaInboxRelativeFilePathsMigration,
+  gwsEaInboxThreadAccountsMigration,
+  gwsEaInboxThreadPlacementMigration,
   gwsEaInboxUnsignedNoticesMigration,
 } from './migration.js';
 import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
-import { paceDeadline } from './pace.js';
+import { inboundPace } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 import { emailWords, sendKey } from './send.js';
-import { deleteSends, deleteThreadAddresses, threadsWithAddresses, type SendScope } from './thread-map.js';
+import {
+  clearThreadAccounts,
+  deleteSends,
+  deleteThreadAddresses,
+  threadsWithAddresses,
+  type SendScope,
+} from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
 // The inbox's own state, its thread map, then what was added since (migration.ts).
@@ -76,6 +85,8 @@ registerMigration(gwsEaInboxDropThreadHoldsMigration);
 registerMigration(gwsEaInboxRelativeFilePathsMigration);
 registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
+registerMigration(gwsEaInboxThreadAccountsMigration);
+registerMigration(gwsEaInboxThreadPlacementMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;
@@ -93,6 +104,7 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
     live = createInbox({
       gmail: createGmailApi({ token: () => hostGoogleAccessToken('gmail') }),
       calendar: createCalendarListApi({ token: () => hostGoogleAccessToken('calendar-host') }),
+      events: createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }),
       drive: createDriveApi({ token: () => hostGoogleAccessToken('drive-host') }),
     });
     return live.adapter;
@@ -117,7 +129,13 @@ registerRoleGrantPolicy('gws-ea-inbox:no-email-privilege', (grant) =>
 );
 
 // An outside thread is worked at a human pace: what reaches its session waits for the thread's next turn (KTD3).
-registerInboundDelay((_event, session) => paceDeadline(session));
+// Before that, its mail waits, held, until main places the thread and hands it over (Slice 5 KTD8): a hold
+// wins over a time, as the router resolves them.
+registerInboundDelay(async (_event, session) => {
+  const pace = await inboundPace(session);
+  if (pace === undefined) return null;
+  return pace.held ? HOLD_UNTIL_RELEASED : pace.deadline;
+});
 
 /** The send record of a row the channel sent: an agent's email on one side of its thread. */
 function emailSend(msg: OutboundMessage): { readonly scope: SendScope; readonly key: string } | undefined {
@@ -180,7 +198,8 @@ async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void>
 }
 
 // A forgotten person leaves nothing of theirs on the threads they were on, in this order: those threads'
-// external-email sessions, then the person's addresses on every thread, and their hourly counts.
+// external-email sessions, then together the accounts on those threads, which may tell of them, the person's
+// addresses on every thread, by which those threads are known, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_threads'))) return;
@@ -192,6 +211,7 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const { threadKeys, addresses } = await threadsWithAddresses(isForgotten);
   await purgeThreadSessions(threadKeys);
   await db.transaction(async () => {
+    await clearThreadAccounts(threadKeys);
     await deleteThreadAddresses(addresses);
     for (const row of await db.all<{ sender: string }>('SELECT DISTINCT sender FROM gws_ea_inbox_sender_counts')) {
       if (isForgotten(row.sender)) await db.run('DELETE FROM gws_ea_inbox_sender_counts WHERE sender = ?', row.sender);

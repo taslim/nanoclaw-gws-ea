@@ -6,8 +6,10 @@ import {
   AGENT_GOOGLE_CREDENTIALS,
   AGENT_GOOGLE_SERVICES,
   credentialScopes,
+  GOOGLE_SIGN_IN_CONSENTS,
   GOOGLE_SIGN_IN_SCOPES,
   HOST_GOOGLE_SERVICES,
+  scopesOfGrant,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
 import { GOOGLE_TOKEN_ENDPOINT } from '../modules/gws-ea-google/tokens.js';
@@ -34,24 +36,13 @@ const SECRETS = path.join(ROOT, 'secrets');
 const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
 const DRIVE = 'https://www.googleapis.com/auth/drive';
-const HOST_CHAT: readonly string[] = HOST_GOOGLE_SERVICES.chat.scopes;
-/** Chat's scopes beyond the host's Chat token, each pinned in grant.test.ts. */
-const CHAT_CEILING = GOOGLE_SIGN_IN_SCOPES.filter(
-  (scope) => scope.includes('/auth/chat.') && !HOST_CHAT.includes(scope),
-);
+/** Chat's scopes, each pinned in grant.test.ts. */
+const CHAT = GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope.includes('/auth/chat.'));
 /**
  * The scopes the sign-in asks for beyond what an assistant signed in before
- * Workspace holds, in the order it asks for them: Workspace's, Chat's, then
- * the ceiling.
+ * Workspace holds, in the order its consents ask for them.
  */
 const THIS_RELEASE_SCOPES = [
-  DRIVE,
-  'https://www.googleapis.com/auth/documents',
-  'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/presentations',
-  'https://www.googleapis.com/auth/forms.body',
-  'https://www.googleapis.com/auth/forms.responses.readonly',
-  ...HOST_CHAT,
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.readonly',
   'https://www.googleapis.com/auth/calendar.events.readonly',
@@ -73,6 +64,7 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.labels',
   'https://www.googleapis.com/auth/gmail.settings.basic',
   'https://www.googleapis.com/auth/gmail.settings.sharing',
+  DRIVE,
   'https://www.googleapis.com/auth/drive.readonly',
   'https://www.googleapis.com/auth/drive.metadata',
   'https://www.googleapis.com/auth/drive.metadata.readonly',
@@ -81,11 +73,16 @@ const THIS_RELEASE_SCOPES = [
   'https://www.googleapis.com/auth/drive.labels',
   'https://www.googleapis.com/auth/drive.labels.readonly',
   'https://www.googleapis.com/auth/drive.meet.readonly',
+  'https://www.googleapis.com/auth/documents',
   'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations',
   'https://www.googleapis.com/auth/presentations.readonly',
+  'https://www.googleapis.com/auth/forms.body',
   'https://www.googleapis.com/auth/forms.body.readonly',
-  ...CHAT_CEILING,
+  'https://www.googleapis.com/auth/forms.responses.readonly',
+  ...CHAT,
 ];
 /** The scopes an assistant signed in before Drive, Docs, Sheets, Slides and Forms holds. */
 const BEFORE_WORKSPACE = [
@@ -216,17 +213,22 @@ class World {
 
 function grant(overrides: Partial<GoogleGrant> = {}): GoogleGrant {
   return {
-    schema_version: 2,
+    schema_version: 3,
     account: ACCOUNT,
     sub: '104857395723948572901',
     ...CLIENT,
-    refresh_token: '1//refresh-token',
-    scopes: GOOGLE_SIGN_IN_SCOPES.map((scope) =>
-      scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope,
-    ),
+    consents: GOOGLE_SIGN_IN_CONSENTS.map((scopes, index) => ({
+      refresh_token: `1//refresh-token-${index + 1}`,
+      scopes: scopes.map((scope) => (scope === 'email' ? 'https://www.googleapis.com/auth/userinfo.email' : scope)),
+    })),
     granted_at: '2026-09-30T12:00:00.000Z',
     ...overrides,
   };
+}
+
+/** A sign-in from before Drive, Docs, Sheets, Slides and Forms joined it. */
+function grantBeforeWorkspace(): GoogleGrant {
+  return grant({ consents: [{ refresh_token: '1//refresh-token', scopes: BEFORE_WORKSPACE }] });
 }
 
 function context(
@@ -314,14 +316,26 @@ describe("connecting the assistant's Google account", () => {
       'forms.googleapis.com',
     ]);
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
+    // The link first and alone on its line, then each field the console asks for.
     expect(pause).toMatchObject({
       phase: 'sign_in_google',
       code: 'google_client_required',
       resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
-      actionUrl: `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
+      details: [
+        `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
+        'Get started:',
+        "  App name: the assistant's name",
+        `  User support email: ${GCP.account}`,
+        '  Audience: Internal',
+        `  Contact email: ${GCP.account}`,
+        '  Agree to the Google API Services: User Data Policy, then Create',
+        'Clients, then Create client:',
+        '  Application type: Desktop app',
+        '  Name: leave the default',
+        '  Create, then Download JSON',
+      ],
     });
-    expect(pause?.details?.join('\n')).toMatch(/Get started.*Internal.*\n.*Clients.*Desktop app.*download/su);
-    expect(pause?.details?.join('\n')).not.toContain('chmod');
+    expect(pause).not.toHaveProperty('actionUrl');
     expect(signIn).not.toHaveBeenCalled();
   });
 
@@ -485,7 +499,7 @@ describe("connecting the assistant's Google account", () => {
   it("signs in again when the grant on disk lacks this release's scopes", async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant({ granted_at: '2026-10-09T18:00:00.000Z' }));
-    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grantBeforeWorkspace()), {
       mode: 0o600,
     });
     const resources = resourcesFor(world);
@@ -497,9 +511,8 @@ describe("connecting the assistant's Google account", () => {
     await expect(connect(resources, context(signIn))).resolves.toBeUndefined();
 
     expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT, account: ACCOUNT }));
-    expect(JSON.parse(fs.readFileSync(path.join(SECRETS, 'google-grant.json'), 'utf8'))).toMatchObject({
-      scopes: expect.arrayContaining(THIS_RELEASE_SCOPES) as unknown,
-    });
+    const written = JSON.parse(fs.readFileSync(path.join(SECRETS, 'google-grant.json'), 'utf8')) as GoogleGrant;
+    expect(scopesOfGrant(written)).toEqual(expect.arrayContaining(THIS_RELEASE_SCOPES));
   });
 
   it('takes the download as the browser saved it, and keeps only a private copy', async () => {
@@ -615,7 +628,7 @@ describe('observing the Google connection for status', () => {
   it("names this release's missing scopes and the connect-google repair for an assistant signed in before them", async () => {
     const world = new World();
     world.publish(BEFORE_WORKSPACE);
-    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grantBeforeWorkspace()), {
       mode: 0o600,
     });
 
@@ -629,7 +642,7 @@ describe('observing the Google connection for status', () => {
   it('reports a revoked sign-in as revoked, not as missing scopes, even from before the Workspace scopes', async () => {
     const world = new World();
     world.revoked = true;
-    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant({ scopes: BEFORE_WORKSPACE })), {
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grantBeforeWorkspace()), {
       mode: 0o600,
     });
 

@@ -54,9 +54,9 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('Lovelace')
       .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('America/Los_Angeles')
       .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test')
-      .mockResolvedValueOnce(' T@Other.test');
+      .mockResolvedValueOnce(' T@Other.test')
+      .mockResolvedValueOnce('America/Los_Angeles');
     const select = vi.fn();
 
     const result = await collectGwsEaCreateInput(
@@ -67,7 +67,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: { 'workspace-email': 'ada@example.test' },
+        provided: { 'assistant-workspace-email': 'ada@example.test' },
       },
       {
         providers: [claude],
@@ -83,21 +83,29 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(select).not.toHaveBeenCalled();
-    expect(text).toHaveBeenCalledTimes(7);
-    expect(text).toHaveBeenNthCalledWith(
-      5,
-      expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
-    );
-    expect(text).toHaveBeenNthCalledWith(6, expect.objectContaining({ message: 'Principal email addresses' }));
-    // Which of them the principal uses for Google Chat, prefilled with the first; it must be one of theirs.
+    // Asked about one person at a time: the assistant, then the principal.
+    expect(text.mock.calls.map(([options]) => (options as { message: string }).message)).toEqual([
+      'Assistant first name',
+      'Assistant last name',
+      'Principal first name',
+      'Principal last name',
+      'Principal email addresses',
+      'Principal Google Chat address',
+      'Principal timezone',
+    ]);
     expect(text).toHaveBeenNthCalledWith(
       7,
+      expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
+    );
+    // Which of them the principal uses for Google Chat, prefilled with the first; it must be one of theirs.
+    expect(text).toHaveBeenNthCalledWith(
+      6,
       expect.objectContaining({
         message: 'Principal Google Chat address',
         initialValue: 'morgan@example.test',
       }),
     );
-    const [{ validate }] = text.mock.calls[6] as [{ validate: (value: string) => string | undefined }];
+    const [{ validate }] = text.mock.calls[5] as [{ validate: (value: string) => string | undefined }];
     expect(validate('remy.vance@example.test')).toBe(
       "Use one of the principal's addresses: morgan@example.test, t@other.test",
     );
@@ -140,8 +148,8 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('UTC')
-      .mockResolvedValueOnce('morganellery@gmail.com');
+      .mockResolvedValueOnce('morganellery@gmail.com')
+      .mockResolvedValueOnce('UTC');
 
     await collectGwsEaCreateInput(
       {
@@ -151,7 +159,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
-        provided: { 'workspace-email': 'ada@example.test' },
+        provided: { 'assistant-workspace-email': 'ada@example.test' },
       },
       {
         providers: [provider('claude', 'Claude')],
@@ -166,7 +174,7 @@ describe('GWS-EA interactive create input', () => {
       },
     );
 
-    const [{ validate }] = text.mock.calls[5] as [{ validate: (value: string) => string | undefined }];
+    const [{ validate }] = text.mock.calls[4] as [{ validate: (value: string) => string | undefined }];
     expect(validate('morgan@example.test, Ada+x@Example.test')).toBe(
       "ada+x@example.test is the assistant's own address, not one of the principal's",
     );
@@ -196,7 +204,7 @@ describe('GWS-EA interactive create input', () => {
         providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
-        provided: { 'workspace-email': 'aya@example.test' },
+        provided: { 'assistant-workspace-email': 'aya@example.test' },
       },
       {
         providers: [claude, codex],
@@ -224,7 +232,7 @@ describe('GWS-EA interactive create input', () => {
 
   it('attaches focused validation to prompted timezone and email fields', async () => {
     const validators = new Map<string, (value: string | undefined) => string | undefined>();
-    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya@example.test'];
+    const answers = ['Aya', '', 'aya@example.test', 'Morgan', '', 'UTC'];
     const prompts = {
       note: vi.fn(),
       text: vi.fn(
@@ -255,6 +263,14 @@ describe('GWS-EA interactive create input', () => {
       },
     );
 
+    expect(prompts.text.mock.calls.map(([options]) => options.message)).toEqual([
+      'Assistant first name',
+      'Assistant last name',
+      'Assistant Google Workspace email',
+      'Principal first name',
+      'Principal last name',
+      'Principal timezone',
+    ]);
     expect(validators.get('Principal timezone')?.('Not/A_Timezone')).toMatch(/valid IANA timezone/u);
     // Main's container runs in it, and a container's TZ reads an offset with its sign flipped.
     expect(validators.get('Principal timezone')?.('+05:30')).toMatch(/valid IANA timezone/u);
@@ -296,7 +312,7 @@ describe('GWS-EA unattended create input', () => {
     'principal-first-name': 'Morgan',
     'principal-last-name': 'Ellery',
     'principal-timezone': 'America/Los_Angeles',
-    'workspace-email': 'aya@example.test',
+    'assistant-workspace-email': 'aya@example.test',
   } as const;
 
   function unattended(
@@ -400,7 +416,7 @@ describe('GWS-EA unattended create input', () => {
     });
   });
 
-  it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'workspace-email'] as const)(
+  it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'assistant-workspace-email'] as const)(
     'names --%s when it is missing',
     async (flag) => {
       const { [flag]: _omitted, ...provided } = FLAGS;
@@ -416,12 +432,12 @@ describe('GWS-EA unattended create input', () => {
       code: 'invalid_arguments',
       message: expect.stringContaining('--principal-timezone'),
     });
-    await expect(unattended({ ...FLAGS, 'workspace-email': 'not-an-email' })).rejects.toMatchObject({
-      message: expect.stringContaining('--workspace-email'),
+    await expect(unattended({ ...FLAGS, 'assistant-workspace-email': 'not-an-email' })).rejects.toMatchObject({
+      message: expect.stringContaining('--assistant-workspace-email'),
     });
-    await expect(unattended({ ...FLAGS, 'workspace-email': 'aya@gmail.com' })).rejects.toMatchObject({
+    await expect(unattended({ ...FLAGS, 'assistant-workspace-email': 'aya@gmail.com' })).rejects.toMatchObject({
       code: 'invalid_arguments',
-      message: expect.stringMatching(/--workspace-email.*Google Workspace/su),
+      message: expect.stringMatching(/--assistant-workspace-email.*Google Workspace/su),
     });
   });
 

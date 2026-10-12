@@ -28,6 +28,7 @@ export type {
   DirectOutboundMessage,
   InboundMessage,
   InboundMailbox,
+  InboundOrigin,
   MailboxSessionKey,
   MailboxSession,
   MessageRetry,

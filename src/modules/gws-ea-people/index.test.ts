@@ -128,6 +128,7 @@ describe('GWS-EA people ncl resource', () => {
       forgotten: added.id,
       name: 'Patricia Doe',
       identities: ['email:pat@example.test', 'email:pat@work.example.test'],
+      rewrite: [],
     });
     expect(await getPersonLevel('email:pat@example.test')).toBe('unknown');
     expect(await run('people-get', { id: added.id })).toMatchObject({

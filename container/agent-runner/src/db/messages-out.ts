@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { OutboundMessage } from '../mailbox/types.js';
+import { getCurrentReplyRoute } from './session-state.js';
 
 export interface MessageOutRow {
   id: string;
@@ -30,6 +31,12 @@ export interface WriteMessageOut {
   channel_type?: string | null;
   thread_id?: string | null;
   content: string;
+  /**
+   * The inbound messages this row answers. A message to a person names them,
+   * by default the batch of the turn being answered (the reply stamp), so the
+   * host can tell whether a send that fails was the principal's to hear of.
+   */
+  batch?: readonly string[];
 }
 
 /**
@@ -41,8 +48,8 @@ export interface WriteMessageOut {
  *
  * Scope is deliberately narrow: only `kind: 'system'` messages whose
  * content parses to a JSON object are decorated, and entries never
- * overwrite keys the handler wrote itself. Everything else passes through
- * byte-identical. With no active context (the default), this is a no-op.
+ * overwrite keys the handler wrote itself. No other row receives them.
+ * With no active context (the default), this is a no-op.
  */
 const outboundPassthrough = new AsyncLocalStorage<Record<string, unknown>>();
 
@@ -51,18 +58,15 @@ export function withOutboundPassthrough<T>(entries: Record<string, unknown>, fn:
   return outboundPassthrough.run(entries, fn);
 }
 
-/** Apply any active passthrough entries to a system-action JSON payload. */
-function decorateContent(msg: WriteMessageOut): string {
-  const entries = outboundPassthrough.getStore();
-  if (!entries || msg.kind !== 'system') return msg.content;
-
+/** `content` with `entries` merged in when it is a JSON object, never overwriting a key it has. */
+function mergeEntries(content: string, entries: Record<string, unknown>): string {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(msg.content);
+    parsed = JSON.parse(content);
   } catch {
-    return msg.content;
+    return content;
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return msg.content;
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return content;
 
   const payload = parsed as Record<string, unknown>;
   let changed = false;
@@ -72,7 +76,24 @@ function decorateContent(msg: WriteMessageOut): string {
       changed = true;
     }
   }
-  return changed ? JSON.stringify(payload) : msg.content;
+  return changed ? JSON.stringify(payload) : content;
+}
+
+/**
+ * Apply any active passthrough entries to a system-action JSON payload, and
+ * name the batch a message to a person answers. A message to another agent
+ * reaches it as written, so it names none.
+ */
+function decorateContent(msg: WriteMessageOut): string {
+  if (msg.kind === 'system') {
+    const entries = outboundPassthrough.getStore();
+    return entries ? mergeEntries(msg.content, entries) : msg.content;
+  }
+  if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && msg.channel_type !== 'agent') {
+    const batch = msg.batch ?? getCurrentReplyRoute()?.batch ?? [];
+    return batch.length > 0 ? mergeEntries(msg.content, { batch }) : msg.content;
+  }
+  return msg.content;
 }
 
 function messageRow(message: OutboundMessage): MessageOutRow {

@@ -1,28 +1,31 @@
 /**
- * One-door delivery in task sessions.
+ * One-door delivery in task sessions, and a task that comes back as a turn of
+ * a conversation.
  *
  * Every outbound tool call names its destination. In a task run, final output
- * is inert delivery-wise and becomes the automatic run summary instead.
+ * is inert delivery-wise and becomes the automatic run summary instead. A task
+ * created to come back to its conversation is a turn of it: its blocks deliver
+ * and nothing is logged.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
+import { getPendingMessages } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { sendFile, sendMessage } from './mcp-tools/core.js';
-import { autoAppendTaskLog, buildTaskBlockNudge, dispatchResultText, shouldNudgeTaskBlocks } from './poll-loop.js';
-import type { RoutingContext } from './formatter.js';
-
-function seedSessionRouting(channelType: string | null, platformId: string | null, threadId: string | null): void {
-  const db = getInboundDb();
-  db.exec(`CREATE TABLE IF NOT EXISTS session_routing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    channel_type TEXT, platform_id TEXT, thread_id TEXT
-  )`);
-  db.prepare(
-    'INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)',
-  ).run(channelType, platformId, threadId);
-}
+import {
+  autoAppendTaskLog,
+  buildTaskBlockNudge,
+  dispatchResultText,
+  processQuery,
+  runPollLoop,
+  shouldNudgeTaskBlocks,
+} from './poll-loop.js';
+import { extractRouting, type RoutingContext } from './formatter.js';
+import { MockProvider } from './providers/mock.js';
+import type { AgentQuery, ProviderEvent } from './providers/types.js';
+import { seedSessionRouting } from './test-utils/session-routing.js';
 
 function seedDestination(name = 'family', channelType = 'telegram', platformId = 'telegram:99'): void {
   getInboundDb()
@@ -233,5 +236,225 @@ describe('automatic task run summary', () => {
     await autoAppendTaskLog('final summary');
 
     expect(getOutboundDb().prepare("SELECT 1 FROM messages_out WHERE kind = 'task_log'").all()).toHaveLength(1);
+  });
+});
+
+describe('a scheduled task in a conversation', () => {
+  const LOOK = '<message to="principal">Juno Hale confirmed the venue for Thursday.</message>';
+  /** A task's content as the host writes it for `ncl tasks create --in-conversation`. */
+  const COMES_BACK = { prompt: 'Check whether the venue confirmed', inConversation: true };
+
+  /** The conversation the agent has with the principal, as the host binds it on a wake. */
+  function seedConversation(): void {
+    seedSessionRouting('gchat', 'gchat:spaces/dm', null);
+    seedDestination('principal', 'gchat', 'gchat:spaces/dm');
+  }
+
+  /** A task row as the host writes it: no route of its own, unless v1 migration ported it with its chat's. */
+  function insertTask(
+    id: string,
+    content: object | string,
+    row: { seq?: number; channelType?: string; platformId?: string } = {},
+  ): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, series_id, platform_id, channel_type, content)
+         VALUES (?, ?, 'task', ?, 'pending', ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        row.seq ?? 2,
+        new Date().toISOString(),
+        id,
+        row.platformId ?? null,
+        row.channelType ?? null,
+        typeof content === 'string' ? content : JSON.stringify(content),
+      );
+  }
+
+  function taskLogRows(): Array<{ text: string }> {
+    return (
+      getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as Array<{
+        content: string;
+      }>
+    ).map((row) => JSON.parse(row.content) as { text: string });
+  }
+
+  function ackStatus(id: string): string | undefined {
+    return (
+      getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+        | { status: string }
+        | undefined
+    )?.status;
+  }
+
+  /** Run the real poll loop until `done` holds, then stop it. */
+  async function runLoopUntil(provider: MockProvider, done: () => boolean): Promise<void> {
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', signal: controller.signal }).catch(
+      () => {},
+    );
+    const deadline = Date.now() + 5000;
+    while (!done() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await loop;
+  }
+
+  function resultQuery(result: ProviderEvent): AgentQuery {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'look-session' };
+      yield result;
+    }
+    return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+  }
+
+  it('is a turn only when every task in the batch was created to come back to the conversation', () => {
+    seedConversation();
+    insertTask('look-a1b2', COMES_BACK);
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: false, tasksOnly: true });
+
+    insertTask('digest-c3d4', { prompt: 'Send the daily digest' }, { seq: 4 });
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: true, tasksOnly: true });
+  });
+
+  it('runs a task whose content predates the JSON envelope in isolation', () => {
+    seedConversation();
+    insertTask('digest-c3d4', 'Send the daily digest');
+
+    expect(extractRouting(getPendingMessages())).toMatchObject({ taskRun: true, tasksOnly: true });
+  });
+
+  it("delivers its <message> blocks to the conversation's route and writes no task_log", async () => {
+    seedConversation();
+    insertTask('look-a1b2', COMES_BACK);
+
+    await runLoopUntil(new MockProvider({}, () => LOOK), () => getUndeliveredMessages().length > 0);
+
+    const out = getUndeliveredMessages();
+    expect(out.map((row) => [row.kind, row.channel_type, row.platform_id, JSON.parse(row.content).text])).toEqual([
+      ['chat', 'gchat', 'gchat:spaces/dm', 'Juno Hale confirmed the venue for Thursday.'],
+    ]);
+    expect(out[0].in_reply_to).toBe('look-a1b2');
+    expect(taskLogRows()).toEqual([]);
+  });
+
+  it('reports a failed turn for the host to place, and logs nothing', async () => {
+    seedConversation();
+    insertTask('look-a1b2', COMES_BACK);
+    const rows = getPendingMessages();
+
+    await processQuery(
+      resultQuery({ type: 'result', text: '', isError: true, error: 'Incorrect API key' }),
+      extractRouting(rows),
+      rows.map((row) => row.id),
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+    );
+
+    expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+      [
+        'system',
+        {
+          action: 'turn_failed',
+          channelType: null,
+          platformId: null,
+          threadId: null,
+          error: 'Incorrect API key',
+          batch: ['look-a1b2'],
+        },
+      ],
+    ]);
+    expect(taskLogRows()).toEqual([]);
+  });
+
+  it('in a task session of its own a task is still an isolated run: one-door delivery and a task_log', async () => {
+    seedSessionRouting(null, null, 'system:tasks:look-a1b2');
+    seedDestination('principal', 'gchat', 'gchat:spaces/dm');
+    insertTask('look-a1b2', { prompt: 'Check whether the venue confirmed' });
+
+    await runLoopUntil(new MockProvider({}, () => LOOK), () => taskLogRows().length > 0);
+
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toEqual([]);
+    expect(taskLogRows()).toEqual([{ text: '[undelivered → principal] Juno Hale confirmed the venue for Thursday.' }]);
+  });
+
+  it('completes without a turn when its pre-task script answers wakeAgent false', async () => {
+    seedConversation();
+    insertTask('look-a1b2', { ...COMES_BACK, script: `echo '{"wakeAgent": false}'` });
+    const prompts: string[] = [];
+
+    await runLoopUntil(
+      new MockProvider({}, (prompt) => {
+        prompts.push(prompt);
+        return LOOK;
+      }),
+      () => ackStatus('look-a1b2') === 'completed',
+    );
+
+    expect(ackStatus('look-a1b2')).toBe('completed');
+    expect(prompts).toEqual([]);
+    expect(getUndeliveredMessages()).toEqual([]);
+  });
+
+  /**
+   * v1 migration ports each task into its chat's shared session (no thread),
+   * with the chat's route on the row. It never asked to come back as a turn,
+   * so it runs in isolation there, as every task did before.
+   */
+  describe("in the chat's shared session a v1 task was ported to", () => {
+    const DIGEST = '<message to="team">Three new posts today.</message>';
+    const TEAM = { channelType: 'discord', platformId: 'discord:chan-1' };
+    const PORTED = {
+      prompt: 'Post the daily digest',
+      script: null,
+      migrated_from_v1: { original_id: 'digest', context_mode: 'group' },
+    };
+
+    beforeEach(() => {
+      seedSessionRouting(TEAM.channelType, TEAM.platformId, null);
+      seedDestination('team', TEAM.channelType, TEAM.platformId);
+    });
+
+    it('a ported task is still an isolated run: its blocks stay inert and its final text is logged', async () => {
+      insertTask('digest', PORTED, TEAM);
+
+      await runLoopUntil(new MockProvider({}, () => DIGEST), () => taskLogRows().length > 0);
+
+      expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+        ['task_log', { text: '[undelivered → team] Three new posts today.' }],
+      ]);
+    });
+
+    it('a ported task that fails logs the failure and reports no failed turn', async () => {
+      insertTask('digest', PORTED, TEAM);
+      const rows = getPendingMessages();
+
+      await processQuery(
+        resultQuery({ type: 'result', text: 'The feed did not load.', isError: true, error: 'Incorrect API key' }),
+        extractRouting(rows),
+        rows.map((row) => row.id),
+        'mock',
+        undefined,
+        'prompt',
+        undefined,
+      );
+
+      expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+        ['task_log', { text: 'The feed did not load. Incorrect API key' }],
+      ]);
+    });
+
+    it('a task created to come back there is a turn: its blocks deliver and nothing is logged', async () => {
+      insertTask('digest', { prompt: PORTED.prompt, script: null, inConversation: true });
+
+      await runLoopUntil(new MockProvider({}, () => DIGEST), () => getUndeliveredMessages().length > 0);
+
+      expect(getUndeliveredMessages().map((row) => [row.kind, row.platform_id, JSON.parse(row.content).text])).toEqual([
+        ['chat', TEAM.platformId, 'Three new posts today.'],
+      ]);
+      expect(taskLogRows()).toEqual([]);
+    });
   });
 });

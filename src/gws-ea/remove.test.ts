@@ -71,6 +71,8 @@ afterEach(async () => {
 const ACCOUNT = 'operator@example.test';
 const DOCKER = 'unix:///var/run/docker.sock';
 const KEY_CONSTRAINTS = ['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation'];
+/** Domain restricted sharing: the legacy list constraint, then the managed one. */
+const MEMBER_CONSTRAINTS = ['iam.allowedPolicyMemberDomains', 'iam.managed.allowedPolicyMembers'];
 
 async function testPaths(): Promise<ControlPlanePaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-remove-'));
@@ -154,6 +156,12 @@ type FakeNanoclawService = ReturnType<typeof nanoclawService>;
 class FakeGcloud {
   project: { labels: Record<string, string>; lifecycleState: string } | undefined;
   signedIn = true;
+  /** The member-domain constraints the project has a policy of its own for. */
+  readonly memberPolicies = new Set<string>();
+  /** The reserved account may delete the project's own policies. */
+  canDeletePolicy = true;
+  /** Google will not describe the project, though its policies still answer. */
+  projectHidden = false;
   readonly calls: string[] = [];
   readonly mutations: string[] = [];
 
@@ -180,7 +188,7 @@ class FakeGcloud {
             `ERROR: (gcloud.auth.print-access-token) There was a problem refreshing auth tokens for account ${ACCOUNT}: invalid_grant\n\nto obtain new credentials.`,
           );
     }
-    if (!this.project) {
+    if (!this.project || (this.projectHidden && line === `projects describe ${projectId} --format=json`)) {
       return failed(
         `ERROR: (gcloud.${words.slice(0, 2).join('.')}) [${ACCOUNT}] does not have permission to access projects instance [${projectId}] (or it may not exist): The caller does not have permission.`,
       );
@@ -207,6 +215,30 @@ class FakeGcloud {
       };
       this.mutations.push(`set-policy ${policy.name.split('/').at(-1)} enforce=${policy.spec.rules[0]!.enforce}`);
       return ok();
+    }
+    for (const constraint of MEMBER_CONSTRAINTS) {
+      const name = `projects/441811502258/policies/${constraint}`;
+      if (line === `org-policies describe ${constraint} --project=${projectId} --format=json`) {
+        if (this.memberPolicies.has(constraint)) return ok(JSON.stringify({ name }));
+        return failed(
+          [
+            `ERROR: (gcloud.org-policies.describe) NOT_FOUND: A Policy of constraint constraints/${constraint} on resource projects/441811502258 does not exist.`,
+            "- '@type': type.googleapis.com/google.rpc.ErrorInfo",
+            '  domain: orgpolicy.googleapis.com',
+            '  reason: POLICY_NOT_FOUND',
+          ].join('\n'),
+        );
+      }
+      if (line === `org-policies delete ${constraint} --project=${projectId}` && this.memberPolicies.has(constraint)) {
+        if (!this.canDeletePolicy) {
+          return failed(
+            `ERROR: (gcloud.org-policies.delete) PERMISSION_DENIED: Permission 'orgpolicy.policies.delete' denied on resource '//cloudresourcemanager.googleapis.com/projects/${projectId}' (or it may not exist).`,
+          );
+        }
+        this.memberPolicies.delete(constraint);
+        this.mutations.push(`delete-policy ${constraint}`);
+        return ok('{}\n', `Deleted policy [${name}].\n`);
+      }
     }
     throw new Error(`Unexpected gcloud command: ${line}`);
   };
@@ -486,13 +518,12 @@ function grantFile(paths: ControlPlanePaths, input: InstanceReservationInput): s
 /** The assistant signed in to Google, as `sign_in_google` leaves it. */
 async function signIn(paths: ControlPlanePaths, input: InstanceReservationInput): Promise<void> {
   await writePrivate(grantFile(paths, input), {
-    schema_version: 2,
+    schema_version: 3,
     account: input.exclusive_resource_claims.workspace_email,
     sub: '104857395723948572901',
     client_id: 'juno-hale-client.apps.googleusercontent.com',
     client_secret: 'juno-hale-client-secret',
-    refresh_token: REFRESH_TOKEN,
-    scopes: GOOGLE_SIGN_IN_SCOPES,
+    consents: [{ refresh_token: REFRESH_TOKEN, scopes: GOOGLE_SIGN_IN_SCOPES }],
     granted_at: '2026-10-01T12:00:00.000Z',
   });
 }
@@ -543,7 +574,7 @@ function world(input: InstanceReservationInput): World {
   };
   const runGcloud: GcloudCommandRunner = async (command) => {
     const outcome = await gcloud.run(command);
-    if (command.args[1] === 'delete') order.push('gcp');
+    if (command.args.slice(0, 2).join(' ') === 'projects delete') order.push('gcp');
     return outcome;
   };
   const fetch: typeof globalThis.fetch = async (request, init) => {
@@ -625,13 +656,17 @@ describe('removal from any partial state', () => {
 
     const outcome = await removeAssistant(paths, input.instance_id, dependencies);
 
+    const projectId = input.exclusive_resource_claims.gcp_project_id;
     expect(order).toEqual(['gcp']);
     expect(gcloud.calls).toEqual([
       'version --format=json',
       'auth print-access-token',
-      `projects describe ${input.exclusive_resource_claims.gcp_project_id} --format=json`,
-      `projects delete ${input.exclusive_resource_claims.gcp_project_id}`,
-      `projects describe ${input.exclusive_resource_claims.gcp_project_id} --format=json`,
+      `projects describe ${projectId} --format=json`,
+      ...MEMBER_CONSTRAINTS.map(
+        (constraint) => `org-policies describe ${constraint} --project=${projectId} --format=json`,
+      ),
+      `projects delete ${projectId}`,
+      `projects describe ${projectId} --format=json`,
     ]);
     expect(dependencies.resolveDocker).not.toHaveBeenCalled();
     expect(outcome.removed).toEqual(['gcp-project', 'instance-files']);
@@ -657,7 +692,8 @@ describe('removal from any partial state', () => {
     expect(gcloud.mutations).toEqual([]);
     expect((await readRegistry(paths)).instances[input.instance_id]).toBeDefined();
 
-    // Abandoning records the evidence and the policy lift it could not restore, and continues.
+    // Abandoning records the evidence and the policy lift it could not restore, and continues. Policies Google
+    // will not show belong to the project left behind: no member-domain relax is claimed.
     const removeOnecli = vi
       .fn<NonNullable<RemovalDependencies['removeOnecli']>>()
       .mockRejectedValueOnce(new GwsEaError('docker_stopped', 'Docker is not running'))
@@ -676,6 +712,7 @@ describe('removal from any partial state', () => {
       },
       key_policy_unrestored: { at: expect.any(String), evidence: expect.stringContaining('may not exist') },
     });
+    expect(receipt).not.toHaveProperty('member_policy_unrestored');
 
     io.out.length = 0;
     expect(await cli(['--abandon', 'gcp-project'])).toBe(0);
@@ -683,6 +720,28 @@ describe('removal from any partial state', () => {
       `Left behind: Google Cloud project ${input.exclusive_resource_claims.gcp_project_id}`,
     );
     expect(io.out.join('\n')).toContain('key-creation policy');
+    expect(io.out.join('\n')).not.toContain('member-domain policy');
+    expect(gcloud.mutations).toEqual([]);
+    await expectGone(paths, input);
+  });
+
+  it('records a member-domain override Google shows but refuses to delete on a project it will not show', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout', 'provision_gcp'] });
+    const { dependencies, gcloud } = world(input);
+    gcloud.owned().memberPolicies.add('iam.allowedPolicyMemberDomains');
+    gcloud.projectHidden = true;
+    gcloud.canDeletePolicy = false;
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      abandon: new Set(['gcp-project']),
+    });
+
+    expect(outcome).toMatchObject({
+      abandoned: [{ resource: 'gcp-project', evidence: expect.stringContaining('(or it may not exist)') }],
+      memberPolicyUnrestored: expect.stringMatching(/^iam\.allowedPolicyMemberDomains: .*PERMISSION_DENIED/su),
+    });
     expect(gcloud.mutations).toEqual([]);
     await expectGone(paths, input);
   });
@@ -702,6 +761,24 @@ describe('removal from any partial state', () => {
       ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
       'projects delete',
     ]);
+  });
+
+  it('still deletes the project, and says so, when Google refuses to restore a relaxed member-domain policy', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout', 'provision_gcp'] });
+    const removal = world(input);
+    removal.gcloud.owned().memberPolicies.add('iam.allowedPolicyMemberDomains');
+    removal.gcloud.canDeletePolicy = false;
+    const { run: cli, io } = removeCommand(paths, input, removal);
+    const projectId = input.exclusive_resource_claims.gcp_project_id;
+
+    expect(await cli([])).toBe(0);
+
+    expect(removal.gcloud.mutations).toEqual(['projects delete']);
+    expect(io.out.join('\n')).toContain(
+      `The member-domain policy relaxed on Google Cloud project ${projectId} was not restored: iam.allowedPolicyMemberDomains: `,
+    );
+    await expectGone(paths, input);
   });
 
   it("does not let one assistant's stuck removal block creating, resuming, or removing another", async () => {

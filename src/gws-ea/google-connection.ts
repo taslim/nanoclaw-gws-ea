@@ -24,6 +24,7 @@ import {
   AGENT_GOOGLE_CREDENTIALS,
   googleCredentialFor,
   missingGoogleScopes,
+  scopesOfGrant,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
@@ -62,6 +63,8 @@ export interface GoogleConnectionInput {
   readonly runtime: InstanceRuntimeConfig;
   /** The declared Workspace address the sign-in must be. */
   readonly assistantWorkspaceEmail: string;
+  /** The assistant's name, which its sign-in client's app is named after, when this run knows it. */
+  readonly assistantName?: string;
   /** `--google-client-file`, when the operator supplied it on this run. */
   readonly clientFile?: string;
   /** The assistant's sign-in through the operator's browser; pauses when no one is at a terminal. */
@@ -89,10 +92,43 @@ const PUBLISH_ATTEMPTS = 36;
 /** Gmail's API host, which any secret able to carry `gmail.modify` must be injected on. */
 const GMAIL_HOST = 'gmail.googleapis.com';
 
-function consoleUrl(projectId: string): string {
+/** Where, in the assistant's project, the operator creates its sign-in client. */
+export function googleClientConsoleUrl(projectId: string): string {
   const url = new URL('https://console.cloud.google.com/auth/overview');
   url.searchParams.set('project', projectId);
   return url.href;
+}
+
+/**
+ * What the operator does on that page, its link first and one field to a
+ * line, as Google has no API for it. The app is named after the assistant,
+ * so the consent page names the operator's own assistant, not a vendor.
+ */
+export function googleClientSteps(gcp: { projectId: string; account: string }, assistantName?: string): string[] {
+  return [
+    googleClientConsoleUrl(gcp.projectId),
+    'Get started:',
+    `  App name: ${assistantName ?? "the assistant's name"}`,
+    `  User support email: ${gcp.account}`,
+    '  Audience: Internal',
+    `  Contact email: ${gcp.account}`,
+    '  Agree to the Google API Services: User Data Policy, then Create',
+    'Clients, then Create client:',
+    '  Application type: Desktop app',
+    '  Name: leave the default',
+    '  Create, then Download JSON',
+  ];
+}
+
+/**
+ * Whether the assistant's sign-in still needs the client the operator
+ * downloads: no sign-in yet, no client kept from an earlier run, and none
+ * given on this one.
+ */
+export async function googleClientNeeded(google: GoogleConnectionInput): Promise<boolean> {
+  if (google.clientFile) return false;
+  if (await readGoogleGrantFile(googleGrantFile(google.runtime))) return false;
+  return (await readStoredGoogleOAuthClient(googleOAuthClientFile(google.runtime))) === undefined;
 }
 
 function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
@@ -101,11 +137,7 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
     phase: 'sign_in_google',
     code: 'google_client_required',
     message: "Create the assistant's Google sign-in client, then continue with its file.",
-    details: [
-      'Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
-      'Under Clients, create a client of type Desktop app, and download its JSON.',
-    ],
-    actionUrl: consoleUrl(context.input.gcp.projectId),
+    details: googleClientSteps(context.input.gcp, context.input.google.assistantName),
     resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }
@@ -150,7 +182,7 @@ function signInProblem(grant: GoogleGrant | undefined, account: string): string 
 
 /** Which scopes this release asks for that `grant` lacks, as a reason, or undefined when it holds them all. */
 function scopeProblem(grant: GoogleGrant): string | undefined {
-  const missing = missingGoogleScopes(grant.scopes);
+  const missing = missingGoogleScopes(scopesOfGrant(grant));
   return missing.length > 0 ? `the sign-in lacks ${missing.join(', ')}` : undefined;
 }
 

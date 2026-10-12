@@ -1,7 +1,7 @@
 /**
  * The Drive calls the host makes with its own Drive token (KTD1, KTD3): a
- * file and its access list, the permission id Drive gives an address, and a
- * file's pending access requests. No client library: each call is one
+ * file and its access list, the permission id Drive gives an address, a
+ * file's pending access requests, and its comments. No client library: each call is one
  * `fetch` with the token in its header, so the token never reaches a
  * container or an argument list. A share names one person, never a group,
  * and never asks Google to email them.
@@ -37,6 +37,28 @@ export interface DriveFile {
   readonly sharedWithMeTime?: string;
   /** Whether the assistant can change who has access; only then can it read the full access list. */
   readonly canShare?: boolean;
+  /** When anyone last changed it. */
+  readonly modifiedTime?: string;
+  /** Who last changed it. */
+  readonly lastModifyingUser?: DriveUser;
+}
+
+/**
+ * A comment on a file, as the host reads it. Drive never says who wrote a
+ * comment by address, so the host never names them.
+ */
+export interface DriveComment {
+  readonly id: string;
+  /** Its words: someone else's text. */
+  readonly content?: string;
+  /** Resolved by one of its replies. */
+  readonly resolved?: boolean;
+  /** When it or any of its replies last changed. */
+  readonly modifiedTime?: string;
+  /** Who it is assigned to, as an action item. */
+  readonly assigneeEmailAddress?: string;
+  /** Everyone it mentions. */
+  readonly mentionedEmailAddresses?: readonly string[];
 }
 
 /** Where one person's access to a file comes from: the file itself, or a folder above it. */
@@ -107,6 +129,8 @@ export interface DriveApi {
   permissionId(emailAddress: string): Promise<string | undefined>;
   /** A file's pending requests for access; only someone who can share the file sees them. */
   listAccessProposals(fileId: string): Promise<DriveAccessProposal[]>;
+  /** A file's comments, resolved or not, oldest first; never deleted ones. */
+  listComments(fileId: string): Promise<DriveComment[]>;
 }
 
 /** Drive's 403 reasons that only ask the caller to slow down. */
@@ -162,6 +186,7 @@ function toFile(value: unknown): DriveFile {
     ? value.parents.filter((parent): parent is string => typeof parent === 'string')
     : undefined;
   const sharingUser = toUser(value.sharingUser)[0];
+  const lastModifyingUser = toUser(value.lastModifyingUser)[0];
   const canShare = isRecord(value.capabilities) ? booleanField(value.capabilities, 'canShare') : {};
   return {
     id: value.id,
@@ -173,6 +198,8 @@ function toFile(value: unknown): DriveFile {
     ...(sharingUser === undefined ? {} : { sharingUser }),
     ...textField(value, 'sharedWithMeTime'),
     ...canShare,
+    ...textField(value, 'modifiedTime'),
+    ...(lastModifyingUser === undefined ? {} : { lastModifyingUser }),
   };
 }
 
@@ -231,6 +258,23 @@ function toProposal(value: unknown): DriveAccessProposal[] {
   ];
 }
 
+function toComment(value: unknown): DriveComment[] {
+  if (!isRecord(value) || typeof value.id !== 'string') return [];
+  const mentioned = Array.isArray(value.mentionedEmailAddresses)
+    ? value.mentionedEmailAddresses.filter((address): address is string => typeof address === 'string')
+    : undefined;
+  return [
+    {
+      id: value.id,
+      ...textField(value, 'content'),
+      ...booleanField(value, 'resolved'),
+      ...textField(value, 'modifiedTime'),
+      ...textField(value, 'assigneeEmailAddress'),
+      ...(mentioned === undefined ? {} : { mentionedEmailAddresses: mentioned }),
+    },
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // The client
 // ---------------------------------------------------------------------------
@@ -238,7 +282,8 @@ function toProposal(value: unknown): DriveAccessProposal[] {
 const DRIVE = 'https://www.googleapis.com/drive/v3';
 const DRIVE_V2 = 'https://www.googleapis.com/drive/v2';
 const FILE_FIELDS =
-  'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)';
+  'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare),modifiedTime,lastModifyingUser(emailAddress,permissionId)';
+const COMMENT_FIELDS = 'id,content,resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses';
 const PERMISSION_FIELDS =
   'id,type,role,emailAddress,domain,deleted,expirationTime,view,permissionDetails(permissionType,role,inherited,inheritedFrom)';
 /** Pages read before a list is refused as too long: an access list and its requests are short. */
@@ -364,6 +409,21 @@ export function createDriveApi(options: GoogleClientOptions): DriveApi {
         'accessProposals',
         toProposal,
         'list of access requests',
+      );
+    },
+
+    async listComments(fileId) {
+      return listPages(
+        options,
+        (pageToken) =>
+          fileUrl(fileId, '/comments', {
+            fields: `nextPageToken,comments(${COMMENT_FIELDS})`,
+            pageSize: '100',
+            ...(pageToken === undefined ? {} : { pageToken }),
+          }),
+        'comments',
+        toComment,
+        'list of comments',
       );
     },
   };

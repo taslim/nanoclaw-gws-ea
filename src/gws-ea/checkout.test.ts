@@ -13,6 +13,7 @@ import {
   locateOnTrack,
   materializeReleaseCheckout,
   observeLiveCheckout,
+  prepareReleaseCommandEnvironments,
   resolveToolCommit,
 } from './checkout.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -126,11 +127,19 @@ function expectSanitizedEnvironment(
   expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
   expect(environment?.GIT_TERMINAL_PROMPT).toBe('0');
   for (const key of Object.keys(environment ?? {})) {
-    expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', ...additions]).toContain(
-      key,
-    );
+    expect([
+      ...TOOL_ENVIRONMENT_KEYS,
+      'HOME',
+      'GIT_CONFIG_NOSYSTEM',
+      'GIT_TERMINAL_PROMPT',
+      ...GIT_SETTINGS,
+      ...additions,
+    ]).toContain(key);
   }
 }
+
+/** The settings release Git commands carry in their environment. */
+const GIT_SETTINGS = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
 
 async function reserved(paths: ControlPlanePaths, sourceRemote: string, deployedCommit: string) {
   const instanceId = randomUUID();
@@ -138,6 +147,21 @@ async function reserved(paths: ControlPlanePaths, sourceRemote: string, deployed
 }
 
 describe('release track history', () => {
+  it('runs Git with no automatic maintenance, which would go on writing into a scratch repository being removed', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-release-git-'));
+    roots.push(root);
+    const { git: environment } = await prepareReleaseCommandEnvironments(root);
+
+    const answer = await runSanitizedCommand({
+      command: 'git',
+      args: ['config', '--get', 'maintenance.auto'],
+      cwd: root,
+      env: environment,
+    });
+
+    expect(answer.stdout.trim()).toBe('false');
+  });
+
   it('rejects a ref that peels to a non-commit object', async () => {
     const source = await sourceFixture();
     const blob = git(source.source, 'hash-object', '-w', '--stdin');

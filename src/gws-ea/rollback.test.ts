@@ -794,6 +794,27 @@ describe('what a snapshot restore discards', () => {
     });
   });
 
+  it('counts a message held in the snapshot and handled since as one that runs again', async () => {
+    const root = await temporaryRoot('gws-ea-discard-');
+    const [snapshotRoot, currentRoot] = [path.join(root, 'snapshot'), path.join(root, 'current')];
+    for (const state of [snapshotRoot, currentRoot]) {
+      mkdirSync(path.join(state, SESSION), { recursive: true });
+      mkdirSync(path.join(state, 'groups', 'main'), { recursive: true });
+      const central = new Database(path.join(state, 'data', 'v2.db'));
+      central.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL)');
+      central.close();
+      const inbound = new Database(path.join(state, SESSION, 'inbound.db'));
+      inbound.exec('CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT NOT NULL, status TEXT)');
+      const insert = inbound.prepare('INSERT INTO messages_in VALUES (?, ?, ?, ?)');
+      insert.run('handled', 2, 'chat', state === snapshotRoot ? 'held' : 'completed');
+      insert.run('released', 4, 'chat', state === snapshotRoot ? 'held' : 'pending');
+      insert.run('still-held', 6, 'chat', 'held');
+      inbound.close();
+    }
+
+    expect((await summarizeDiscard(currentRoot, snapshotRoot)).rerun).toEqual({ count: 1, ids: ['handled'] });
+  });
+
   it('shows the files an agent named with their control characters escaped, the summary keeping each name exactly', async () => {
     const root = await temporaryRoot('gws-ea-discard-');
     const [snapshotRoot, currentRoot] = [path.join(root, 'snapshot'), path.join(root, 'current')];

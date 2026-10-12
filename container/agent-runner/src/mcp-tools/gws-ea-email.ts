@@ -9,11 +9,11 @@
  *   `external-email` with `email_handoff`, and writes to the principal in one
  *   of their threads with `email_principal`.
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
- *   thread with `email_send`, tells main what main should know with
- *   `tell_main`, passing on files that came in the thread, and schedules on
- *   the principal's calendar with `free_time`, `book`, `change_booking` and
- *   `cancel_booking`, each bound by the host to the thread whose session
- *   calls it.
+ *   thread with `email_send`, leaves main its account of the thread with
+ *   `tell_main`, waking main and passing on files that came in the thread
+ *   only when main must act now, and schedules on the principal's calendar
+ *   with `free_time`, `book`, `change_booking` and `cancel_booking`, each
+ *   bound by the host to the thread whose session calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -110,7 +110,7 @@ export const emailHandoff = requestTool({
   ...common,
   name: 'email_handoff',
   description:
-    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message, decides who each email goes to and who is copied, and writes the emails. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
+    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message and the thread's mail waiting for you, decides who each email goes to and who is copied, and writes the emails. A thread you have not placed is refused until you place it, or name its matter here. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
   properties: {
     thread_key: { type: 'string', description: 'The mail-… key of an existing thread, as a message about it gave it.' },
     people: {
@@ -128,6 +128,11 @@ export const emailHandoff = requestTool({
       type: 'string',
       description:
         "Which of the principal's calendars this thread's bookings go on, by its ID. Until one is set, external-email can offer times but books nothing.",
+    },
+    matter: {
+      type: 'string',
+      description:
+        'The id of the open matter the thread belongs to, such as m-1a2b3c4d5e6f: the thread joins it, placing it there if you had not placed it. A new thread without one is placed nowhere.',
     },
   },
   required: ['message'],
@@ -178,15 +183,23 @@ export const tellMain = requestTool({
   ...common,
   name: 'tell_main',
   description:
-    'Tell main something from this thread: what happened, what someone asks of the principal, or what you need, with any files from the thread main should have. main reads it as information from this thread, and any answer comes here as a new message. Answers once main has it.',
+    'Leave main your account of this thread, in place of your last one. main reads it whenever it looks at this thread. With wake, main also gets it now and takes a turn on it, with any files from the thread it should have, and any answer comes here as a new message. Answers once the account is kept.',
   properties: {
-    message: { type: 'string', description: 'What main should know, in plain language.' },
+    account: {
+      type: 'string',
+      description:
+        "In plain language: what you did, what you learned that the thread's mail doesn't say, and where the thread stands, including anything you wait on main for. Up to 2,000 characters.",
+    },
+    wake: {
+      type: 'boolean',
+      description: 'true only when main must act now, such as when you need its answer before you go on.',
+    },
     files: {
       ...FILES,
-      description: `Paths of files that came in this thread, under ${INBOX}/, for main to have, such as an invoice someone sent. Up to 10.`,
+      description: `Paths of files that came in this thread, under ${INBOX}/, for main to have, such as an invoice someone sent. Up to 10, only with wake.`,
     },
   },
-  required: ['message'],
+  required: ['account'],
   repeatable: false,
   prepare: (fields, requestId) => stageFiles(fields, requestId, true),
 });

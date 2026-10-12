@@ -20,11 +20,14 @@ import {
   getPerson,
   getPersonLevel,
   listPeople,
+  mayNamePerson,
   registerPersonForgetHook,
+  registerPersonForgetReview,
   setPersonLevel,
   updatePerson,
   type AddPersonInput,
   type ForgottenPerson,
+  type PersonToForget,
 } from './db.js';
 import { FINGERPRINT_KEY_FILE_NAME, identityFingerprint } from './fingerprint.js';
 import './index.js';
@@ -46,6 +49,12 @@ registerPersonForgetHook('test-sessions:purge', async (person) => {
   const failure = sessionsHookFailure;
   sessionsHookFailure = undefined;
   if (failure) throw failure;
+});
+/** Who the registered review read, with how many hooks had run by then. */
+const reviewCalls: Array<readonly [person: PersonToForget, hooksRun: number]> = [];
+registerPersonForgetReview('test-notes:review', async (person) => {
+  reviewCalls.push([person, hookCalls.length]);
+  return ['note n-1', 'note n-2', 'note n-1'];
 });
 
 let secretsDir: string;
@@ -100,6 +109,7 @@ beforeEach(async () => {
   fs.chmodSync(secretsDir, 0o700);
   vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secretsDir, 'google-grant.json'));
   hookCalls.length = 0;
+  reviewCalls.length = 0;
   await runMigrations(await initTestDb());
   await setUpInstance();
 });
@@ -555,13 +565,14 @@ describe('forgetting a person', () => {
     return id;
   }
 
-  it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints (AE9), and answers with the name and identities to clear from memory', async () => {
+  it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints (AE9), and answers with the name and identities to clear from memory and what else to rewrite', async () => {
     const id = await seedPat();
 
     expect(await forgetPerson({ id })).toEqual({
       forgotten: id,
       name: 'Pat Doe',
       identities: ['email:pat@example.test', 'gchat:users/pat'],
+      rewrite: ['note n-1', 'note n-2'],
     });
 
     for (const table of ['gws_ea_people', 'gws_ea_people_identities']) {
@@ -590,6 +601,8 @@ describe('forgetting a person', () => {
       ['meetings', { id, handles }],
       ['sessions', { id, handles }],
     ]);
+    // The review read the person whole, by name too, before any hook purged a thing.
+    expect(reviewCalls).toEqual([[{ id, name: 'Pat Doe', handles }, 0]]);
 
     const fingerprints = await getDb().all<{ fingerprint: string; forgotten_at: string }>(
       'SELECT fingerprint, forgotten_at FROM gws_ea_people_fingerprints ORDER BY fingerprint',
@@ -611,6 +624,7 @@ describe('forgetting a person', () => {
     await expect(forgetPerson({ id: 'p-000000000000' })).rejects.toThrow(/no person/i);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(hookCalls).toEqual([]);
+    expect(reviewCalls).toEqual([]);
   });
 
   it('keeps the record when a hook fails, so forgetting again finishes the job', async () => {
@@ -640,6 +654,7 @@ describe('forgetting a person', () => {
     await expect(forgetPerson({ id })).rejects.toThrow(/email:pat@example.test.*access/i);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(hookCalls).toEqual([]);
+    expect(reviewCalls).toEqual([]);
   });
 
   it('refuses a learned add of a forgotten identity in any spelling; the principal adding it back clears the fingerprint', async () => {
@@ -775,6 +790,17 @@ describe('forgetting a person', () => {
       fs.rmSync(instanceDir, { recursive: true, force: true });
       await initTestDb();
     }
+  });
+});
+
+describe('whether words may name a person', () => {
+  it('finds a word of their name as names are compared, or one of their addresses, and never a lone initial', () => {
+    const juno = { name: 'Juno A. Hálé', handles: ['email:jh@studio.example', 'gchat:users/juno'] };
+
+    expect(mayNamePerson(juno, "Juno's birthday")).toBe(true);
+    expect(mayNamePerson(juno, 'Lunch with the HALES? No: with HALE')).toBe(true);
+    expect(mayNamePerson(juno, 'Send the deck to JH@Studio.example by Friday')).toBe(true);
+    expect(mayNamePerson(juno, 'A junior role at a studio')).toBe(false);
   });
 });
 

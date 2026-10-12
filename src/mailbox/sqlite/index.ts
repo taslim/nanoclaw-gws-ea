@@ -6,6 +6,7 @@ import { sessionMailboxDir, sessionMailboxPath } from './paths.js';
 export { inboundDbPath, outboundDbPath, sessionMailboxDir, sessionMailboxPath } from './paths.js';
 import {
   countDueMessages,
+  countUnreadContext,
   deleteOrphanProcessingClaims,
   ensureSchema,
   getContainerState,
@@ -24,8 +25,10 @@ import {
   openInboundDb,
   openOutboundDb,
   openOutboundDbRw,
+  releaseHeldMessages,
   replaceDestinations,
   retryWithBackoff,
+  settleHeldMessages,
   upsertSessionRouting,
 } from './session-db.js';
 import {
@@ -53,6 +56,7 @@ import {
 import type {
   AgentMailbox,
   InboundMailbox,
+  InboundOrigin,
   MailboxHistoryMessage,
   MailboxSession,
   MailboxSessionKey,
@@ -200,6 +204,9 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
       ),
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
+    countUnreadContext: (exceptChannelType) => countUnreadContext(db, exceptChannelType),
+    releaseHeldMessages: (processAfter) => releaseHeldMessages(db, processAfter),
+    settleHeldMessages: () => settleHeldMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
     getMessageForRetry: (messageId, status) => {
@@ -222,6 +229,16 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .all() as WaitingMessage[]
       ).map((row) => ({ ...row, processAfter: sqliteTimestamp(row.processAfter) })),
     hasMessage: (messageId) => db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined,
+    getInboundMessages: (messageIds) =>
+      messageIds.length === 0
+        ? []
+        : (db
+            .prepare(
+              `SELECT id, kind, series_id AS seriesId, channel_type AS channelType, platform_id AS platformId,
+                      thread_id AS threadId, content
+                 FROM messages_in WHERE id IN (${messageIds.map(() => '?').join(', ')}) ORDER BY seq`,
+            )
+            .all(...messageIds) as InboundOrigin[]),
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
     getDeliveredIds: () => getDeliveredIds(db),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),
@@ -287,10 +304,12 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .all(limit) as MailboxHistoryMessage[]
       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
     getConversationRoot: () => {
+      // A held message is no opener until it is released: backfill would copy it into other sessions.
       const row = db
         .prepare(
           "SELECT timestamp, content FROM messages_in WHERE kind IN ('chat','chat-sdk') " +
-            "AND trigger = 1 AND (channel_type IS NULL OR channel_type NOT IN ('session-echo', 'agent')) " +
+            "AND trigger = 1 AND status IS NOT 'held' " +
+            "AND (channel_type IS NULL OR channel_type NOT IN ('session-echo', 'agent')) " +
             'ORDER BY seq ASC LIMIT 1',
         )
         .get() as MailboxTimelineMessage | undefined;

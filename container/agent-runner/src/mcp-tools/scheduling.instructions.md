@@ -1,6 +1,6 @@
 ## Task scheduling (`ncl tasks`)
 
-Use `ncl tasks` for one-shot and recurring tasks. Each task runs in its own isolated session. Its runtime prompt supplies the task-only delivery and run-log contract.
+Use `ncl tasks` for one-shot and recurring tasks. A task runs in its own isolated session, whose runtime prompt supplies the task-only delivery and run-log contract. With `--in-conversation` it comes back instead as a turn of the conversation you set it from, as a `<task>` you answer like any message there; it is listed and managed like any other task.
 
 Pass `--name "<short label>"` on create to get a readable task id (e.g. `--name "sales briefing"` → `sales-briefing-a25c`); without it ids are `t-<hex>`.
 

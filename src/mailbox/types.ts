@@ -52,6 +52,20 @@ export interface MessageRetry {
   threadId: string | null;
 }
 
+/**
+ * An inbound message as it arrived: its kind, the series a task belongs to,
+ * its conversation, and its content, which names its sender.
+ */
+export interface InboundOrigin {
+  id: string;
+  kind: string;
+  seriesId: string | null;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  content: string;
+}
+
 /** A pending inbound message that waits for its `process_after`. */
 export interface WaitingMessage {
   id: string;
@@ -108,6 +122,21 @@ export interface InboundMailbox {
   replaceDestinations(entries: Destination[]): void;
   insertMessage(message: InboundMessage): Promise<void>;
   countDueMessages(): number;
+  /**
+   * How many due messages wait, waking nothing, as context for the next
+   * turn: pending non-trigger rows, other than those on `exceptChannelType`.
+   */
+  countUnreadContext(exceptChannelType: string): number;
+  /**
+   * Release every held message: each becomes a pending trigger, due at
+   * `processAfter` (null: due now). Returns how many it released.
+   */
+  releaseHeldMessages(processAfter: string | null): number;
+  /**
+   * Settle every held message: each is completed unread, so no turn ever
+   * reads it and no later release brings it back. Returns how many it settled.
+   */
+  settleHeldMessages(): number;
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;
@@ -115,6 +144,8 @@ export interface InboundMailbox {
   getWaitingMessages(): WaitingMessage[];
   /** Whether the mailbox holds a message with this id, whatever its status. */
   hasMessage(messageId: string): boolean;
+  /** The messages with these ids, whatever their status, in the order they arrived; an id it lacks is left out. */
+  getInboundMessages(messageIds: readonly string[]): InboundOrigin[];
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;

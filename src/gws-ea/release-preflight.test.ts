@@ -152,8 +152,12 @@ describe('release preflight', () => {
       expect(environment?.HOME).toBe(path.join(path.dirname(root), '.release-home'));
       expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(environment?.GIT_TERMINAL_PROMPT).toBe('0');
+      // Git's own settings: no automatic maintenance in the release's repositories.
+      const settings = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
       for (const key of Object.keys(environment ?? {})) {
-        expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(key);
+        expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', ...settings]).toContain(
+          key,
+        );
       }
     }
     for (const command of setupCommands) expectCommonEnvironment(command.env, root);

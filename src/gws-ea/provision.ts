@@ -100,7 +100,14 @@ import {
 } from '../provider-credential.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
-import { googleAccessResources, googleSignInResources, type GoogleConnectionInput } from './google-connection.js';
+import {
+  GOOGLE_CLIENT_FILE_FLAG,
+  googleAccessResources,
+  googleClientNeeded,
+  googleClientSteps,
+  googleSignInResources,
+  type GoogleConnectionInput,
+} from './google-connection.js';
 import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
 
 export interface ProductionProvisionOptions {
@@ -498,15 +505,27 @@ function humanPause(phase: ProvisionStepId, code: string, message: string): Prov
   return { kind: 'human-action', phase, code, message };
 }
 
-/** Conversation states the assistant resolves by itself, waited on rather than handed to a person. */
+/**
+ * Conversation states the assistant resolves by itself before anyone else
+ * is involved, waited on briefly rather than handed to a person.
+ */
 const DELIVERY_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
   'binding_not_ready',
   'session_not_ready',
   'welcome_not_delivered',
-  'reply_not_delivered',
 ]);
 const DELIVERY_WAIT_MS = 60_000;
 const DELIVERY_POLL_MS = 2_000;
+
+/**
+ * The exchange after the welcome: the principal's reply, then the
+ * assistant's answer, which can take minutes of work. One watched pause
+ * covers both, so the run finishes once the answer is there.
+ */
+const EXCHANGE_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
+  'later_principal_message_missing',
+  'reply_not_delivered',
+]);
 
 /** What a person is told when the conversation is still not ready. */
 const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> = {
@@ -514,8 +533,13 @@ const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> 
   session_not_ready:
     "The assistant has not opened the principal's conversation yet; check the errors below, then resume.",
   welcome_not_delivered: 'The assistant has not delivered its welcome; check the errors below, then resume.',
-  later_principal_message_missing: "Ask the principal to reply to the assistant's welcome in Google Chat.",
-  reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
+  // A watch that stops reports this pause as it was given, so it stays true once the principal has replied.
+  later_principal_message_missing:
+    "Ask the principal to reply to the assistant's welcome in Google Chat, if they have not yet; setup finishes " +
+    "once the assistant answers them. If they are outside the assistant's Google Workspace organization, the " +
+    'welcome reaches them as a message request to accept first.',
+  reply_not_delivered:
+    'The principal has replied; setup finishes once the assistant answers them. If it does not, check the errors below.',
 };
 
 /**
@@ -556,15 +580,6 @@ async function principalResult(
 ): Promise<ProvisionHumanPause | undefined> {
   const name = context.input.principalDisplayName;
   switch (result.status) {
-    case 'awaiting_acceptance':
-      return principalPause(
-        context,
-        'bind_principal',
-        'principal_chat_request_pending',
-        `${name} is outside the assistant's Google Workspace organization, so Google Chat shows them its ` +
-          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
-        unboundPrincipal(context.input),
-      );
     case 'unavailable':
       return principalPause(
         context,
@@ -589,23 +604,47 @@ async function principalResult(
 /**
  * Google Chat API configuration has no API (chat-configuration.ts): the
  * assistant's name, an avatar, and a description, with interactive features
- * off, since the assistant talks in Chat as its own account.
+ * off, since the assistant talks in Chat as its own account. When the
+ * assistant's sign-in still needs its client, which has no API either, the
+ * same visit to the project's console creates it, and the pause takes its
+ * file with the confirmation, so the operator returns to the terminal once.
+ * Each task's link comes first and alone on its line, so it is the first
+ * thing to click and nothing after it joins the link.
  */
-function chatConfigurationPause(input: ProductionProvisionInput): ProvisionHumanPause {
+async function chatConfigurationPause(input: ProductionProvisionInput): Promise<ProvisionHumanPause> {
+  const chat = [
+    googleChatConfigurationUrl(input.gcp.projectId),
+    `App name: ${input.identity.assistantDisplayName}`,
+    'Avatar URL: a public HTTPS image of the assistant',
+    `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
+    'Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
+    'Save',
+  ];
+  if (!(await googleClientNeeded(input.google))) {
+    return {
+      ...humanPause(
+        'configure_channel',
+        'chat_configuration_required',
+        "Configure the Google Chat API for this assistant's project, then confirm it.",
+      ),
+      details: chat,
+      resumeFlag: '--chat-configured',
+    };
+  }
+  const indented = (lines: readonly string[]): string[] => lines.map((line) => `   ${line}`);
   return {
     ...humanPause(
       'configure_channel',
       'chat_configuration_required',
-      "Configure the Google Chat API for this assistant's project, then confirm it.",
+      "Do two things in this assistant's Google Cloud project, then confirm the first and give the second's file.",
     ),
     details: [
-      `App name: ${input.identity.assistantDisplayName}`,
-      'Avatar URL: a public HTTPS image of the assistant',
-      `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
-      'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+      '1. Configure the Google Chat API:',
+      ...indented(chat),
+      "2. Create the assistant's Google sign-in client:",
+      ...indented(googleClientSteps(input.gcp, input.identity.assistantDisplayName)),
     ],
-    actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
-    resumeFlag: '--chat-configured',
+    resumeFlag: `--chat-configured ${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }
 
@@ -793,7 +832,9 @@ export function createProductionProvisionSteps(
         {
           name: 'the Google Chat API configuration',
           observe: async (value) =>
-            value.input.chatConfigured ? PRESENT : { status: 'pause', pause: chatConfigurationPause(value.input) },
+            value.input.chatConfigured
+              ? PRESENT
+              : { status: 'pause', pause: await chatConfigurationPause(value.input) },
           apply: async (value) => (value.input.chatConfigured ? undefined : chatConfigurationPause(value.input)),
         },
       ],
@@ -884,12 +925,12 @@ export function createProductionProvisionSteps(
               CONVERSATION_PAUSES[result.reason],
               `Bound principal: ${value.input.principalDisplayName} (${principal.userId})`,
             );
-            if (result.reason !== 'later_principal_message_missing') return pause;
+            if (!EXCHANGE_REASONS.has(result.reason)) return pause;
             return {
               ...pause,
               settled: async () => {
                 const now = await verifyConversation(value);
-                return !now || now.ready || now.reason !== 'later_principal_message_missing';
+                return !now || now.ready || !EXCHANGE_REASONS.has(now.reason);
               },
             };
           },
@@ -1358,6 +1399,7 @@ export async function runProductionProvision(
       google: {
         runtime,
         assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,
+        assistantName: source.identity.assistantDisplayName,
         ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
         signIn: (request) => {
           if (interaction) return interaction.signInAssistantToGoogle(request);

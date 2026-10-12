@@ -848,7 +848,7 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
     });
     expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
     // The signature reads the profile at each send.
-    expect(emailSignature(await getGwsEaProfile())).toEqual(['Aya', 'Assistant to Juno Hale']);
+    expect(emailSignature(await getGwsEaProfile())).toBe('Aya | EA to Juno Hale');
     // main's identity text is composed at its next start, from the profile.
     const [section] = await getRequiredProjectDocSections(main);
     expect(section?.body).toContain('Juno Hale is the principal.');
