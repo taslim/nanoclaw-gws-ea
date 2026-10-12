@@ -7,8 +7,12 @@
  * opening it when there is none. Google must answer with a direct message
  * between the assistant and exactly one person, who is then known by the
  * numeric ID Chat names them with (`gchat:users/{id}`): the address alias
- * never becomes a user ID. A person outside the assistant's organization
- * sees the DM as a request, and is reported as awaiting it until they accept.
+ * never becomes a user ID. Google lists that person as invited until the DM
+ * holds a message, as observed live on 2026-10-12 for a person in the
+ * assistant's own organization, and someone outside it stays invited until
+ * they accept the DM as a message request. Neither can happen before the
+ * assistant writes, so an invited person is the principal like a joined one:
+ * the assistant's welcome is what makes the DM appear to them.
  *
  * The DM's conversation is the one the adapter routes that person's
  * messages to (adapter.ts): `gchat:{space}`, on the `gchat` instance. It is
@@ -41,8 +45,6 @@ export type PrincipalDmResult =
       readonly platform_id: string;
       readonly messaging_group_id: string;
     }
-  /** The address is outside the assistant's organization, and the person has not yet accepted the DM. */
-  | { readonly status: 'awaiting_acceptance'; readonly space: string }
   /** Google stayed unavailable through every attempt. */
   | { readonly status: 'unavailable'; readonly reason: string };
 
@@ -60,7 +62,6 @@ export interface OpenPrincipalDmOptions {
 interface DirectMessage {
   readonly space: string;
   readonly userId: string;
-  readonly joined: boolean;
 }
 
 /** The conversation the adapter routes a DM in `space` to: `channelIdFromThreadId` of its DM thread. */
@@ -93,7 +94,7 @@ async function readDirectMessage(email: string, options: OpenPrincipalDmOptions)
   }
   const name = space.name;
   if (space.spaceType !== DIRECT_MESSAGE || space.singleUserBotDm === true) throw notOneToOne(email, name);
-  // Invited members are listed only when asked for: a person outside the organization is one until they accept.
+  // Invited members are listed only when asked for, and the person is one until the DM holds a message.
   const listed = await googleJson(client, `${CHAT}/${name}/members?showInvited=true&pageSize=100`, {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
@@ -116,7 +117,7 @@ async function readDirectMessage(email: string, options: OpenPrincipalDmOptions)
   ) {
     throw notOneToOne(email, name);
   }
-  return { space: name, userId: `${GCHAT_CHANNEL_TYPE}:${other.name}`, joined: other.state === 'JOINED' };
+  return { space: name, userId: `${GCHAT_CHANNEL_TYPE}:${other.name}` };
 }
 
 /**
@@ -160,7 +161,6 @@ export async function openPrincipalDm(email: string, options: OpenPrincipalDmOpt
       await sleep(wait);
     }
   }
-  if (!dm.joined) return { status: 'awaiting_acceptance', space: dm.space };
   return {
     status: 'opened',
     user_id: dm.userId,

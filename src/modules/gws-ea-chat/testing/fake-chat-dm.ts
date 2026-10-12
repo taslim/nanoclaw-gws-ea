@@ -2,9 +2,10 @@
  * Google Chat's direct-message setup, faked at the `fetch` boundary as it
  * answers the assistant under user authentication: `spaces.setup` opens (or
  * returns the existing) DM with the person an address names, and
- * `spaces.members.list` lists who is in it by numeric user ID only. A person
- * outside the assistant's organization stays invited until they accept the
- * request.
+ * `spaces.members.list` lists who is in it by numeric user ID only. As Google
+ * does, it lists the person as invited until they join the DM, which needs a
+ * message in it (and, for someone outside the organization, their accepting
+ * it as a request).
  *
  * Every request is recorded. A test makes the next requests fail with
  * `failures`, answered in order.
@@ -24,8 +25,6 @@ import {
 export interface FakeChatPerson {
   /** Their numeric Google ID: Chat names them `users/{id}`. */
   readonly id: string;
-  /** Outside the assistant's organization: the DM reaches them as a request they must accept. */
-  readonly external?: boolean;
   /** How Chat lists them; a person unless a test says otherwise. */
   readonly type?: 'HUMAN' | 'BOT';
 }
@@ -48,8 +47,8 @@ export class FakeChatDirectMessages {
   readonly people = new Map<string, FakeChatPerson>();
   /** Answers the next requests get instead, in order. */
   readonly failures: ChatFailure[] = [];
-  /** External people who have accepted the assistant's request, by numeric ID. */
-  readonly accepted = new Set<string>();
+  /** People who have joined their DM with the assistant, by numeric ID; everyone else is listed as invited. */
+  readonly joined = new Set<string>();
   /** What `spaces.setup` reports the space as; a real DM unless a test says otherwise. */
   space: { readonly spaceType: string; readonly singleUserBotDm?: boolean } = { spaceType: 'DIRECT_MESSAGE' };
   /** Members the space lists beyond the assistant and the person. */
@@ -108,7 +107,7 @@ export class FakeChatDirectMessages {
     const id = /^spaces\/dm-(\d+)$/u.exec(space)?.[1];
     const person = [...this.people.values()].find((candidate) => candidate.id === id);
     if (!person) return refusal(NOT_FOUND);
-    const invited = person.external === true && !this.accepted.has(person.id);
+    const invited = !this.joined.has(person.id);
     const memberships: FakeMembership[] = [
       { name: `${space}/members/assistant`, state: 'JOINED', member: { name: ASSISTANT, type: 'HUMAN' } },
       {

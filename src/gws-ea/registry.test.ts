@@ -663,9 +663,9 @@ describe('create recovery contract', () => {
         status: 'paused' as const,
         pause: {
           kind: 'human-action' as const,
-          phase: 'bind_principal' as const,
-          code: 'principal_chat_request_pending',
-          message: 'Accept the chat request.',
+          phase: 'verify_conversation' as const,
+          code: 'later_principal_message_missing',
+          message: "Ask the principal to reply to the assistant's welcome.",
         },
       };
     };
@@ -699,7 +699,7 @@ describe('create recovery contract', () => {
       'Reserving the assistant…',
       'Configuring Google Cloud…',
       'Waiting for the service account…',
-      'Paused at bind_principal: Accept the chat request.',
+      "Paused at verify_conversation: Ask the principal to reply to the assistant's welcome.",
     ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
@@ -941,9 +941,9 @@ describe('create recovery contract', () => {
             status: 'paused',
             pause: {
               kind: 'human-action',
-              phase: 'bind_principal',
-              code: 'principal_chat_request_pending',
-              message: 'Accept the chat request.',
+              phase: 'verify_conversation',
+              code: 'later_principal_message_missing',
+              message: "Ask the principal to reply to the assistant's welcome.",
             },
           };
         },

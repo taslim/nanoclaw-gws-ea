@@ -138,14 +138,13 @@ describe("opening the principal's DM", () => {
     expect(sleeps).toEqual([]);
   });
 
-  it('reports a person outside the organization as a request they must accept, and binds them once they do', async () => {
-    chat.people.set(JUNO, { id: JUNO_ID, external: true });
+  it('opens the DM with the person whether Google lists them as invited, as before the DM holds a message, or joined', async () => {
+    const invited = await open();
+    chat.joined.add(JUNO_ID);
+    const joined = await open();
 
-    await expect(open()).resolves.toEqual({ status: 'awaiting_acceptance', space: `spaces/dm-${JUNO_ID}` });
-    expect(await getMessagingGroupByPlatform('gchat', `gchat:spaces/dm-${JUNO_ID}`, 'gchat')).toBeUndefined();
-
-    chat.accepted.add(JUNO_ID);
-    await expect(open()).resolves.toMatchObject({ status: 'opened', user_id: `gchat:users/${JUNO_ID}` });
+    expect(invited).toMatchObject({ status: 'opened', user_id: `gchat:users/${JUNO_ID}` });
+    expect(joined).toEqual(invited);
   });
 
   it.each([

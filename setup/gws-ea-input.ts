@@ -269,11 +269,19 @@ export async function collectGwsEaCreateInput(
     optional: true,
     placeholder: 'Optional',
   });
+  const assistantWorkspaceEmail = await textInput(
+    source,
+    'assistant-workspace-email',
+    'Assistant Google Workspace email',
+    { validate: workspaceEmailProblem },
+  );
   const principalFirst = await textInput(source, 'principal-first-name', 'Principal first name');
   const principalLast = await textInput(source, 'principal-last-name', 'Principal last name', {
     optional: true,
     placeholder: 'Optional',
   });
+  const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
+  const principalChatEmail = await principalChatEmailInput(source, principalEmails);
   const givenTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
     initialValue: detectedTimezone,
     validate: (value) => (ianaTimezone(value) === undefined ? 'Enter a valid IANA timezone' : undefined),
@@ -281,14 +289,6 @@ export async function collectGwsEaCreateInput(
   // Held in the zone's own spelling, since main's container runs in it.
   const principalTimezone = ianaTimezone(givenTimezone);
   if (principalTimezone === undefined) throw invalidFlag('principal-timezone', 'Enter a valid IANA timezone');
-  const assistantWorkspaceEmail = await textInput(
-    source,
-    'assistant-workspace-email',
-    'Assistant Google Workspace email',
-    { validate: workspaceEmailProblem },
-  );
-  const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
-  const principalChatEmail = await principalChatEmailInput(source, principalEmails);
   const provider = await chooseProvider(providers, source);
   const metadata = provider.provisioning.credentialMetadata({ allowAmbientConfiguration: false });
 

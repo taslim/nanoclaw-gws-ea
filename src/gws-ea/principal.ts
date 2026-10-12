@@ -40,8 +40,6 @@ export type PrincipalBindingResult =
       readonly agentGroupId: string;
       readonly eventId: string;
     }
-  /** The principal is outside the assistant's organization and has not accepted its DM yet. */
-  | { readonly status: 'awaiting_acceptance'; readonly space: string }
   /** Google stayed unavailable while the host opened the DM. */
   | { readonly status: 'unavailable'; readonly reason: string };
 
@@ -67,7 +65,7 @@ type OpenedDm =
       readonly platformId: string;
       readonly messagingGroupId: string;
     }
-  | Extract<PrincipalBindingResult, { status: 'awaiting_acceptance' | 'unavailable' }>;
+  | Extract<PrincipalBindingResult, { status: 'unavailable' }>;
 
 /**
  * How long the host may take to open the DM: it retries Google while Google
@@ -109,9 +107,6 @@ function invalidDm(problem: string): GwsEaError {
 function parseOpenedDm(value: unknown): OpenedDm {
   const dm = unwrapData(value);
   if (!isRecord(dm)) throw invalidDm('is not an answer');
-  if (dm.status === 'awaiting_acceptance' && typeof dm.space === 'string') {
-    return { status: 'awaiting_acceptance', space: dm.space };
-  }
   if (dm.status === 'unavailable' && typeof dm.reason === 'string') return { status: 'unavailable', reason: dm.reason };
   if (dm.status !== 'opened') throw invalidDm('has an unknown state');
   const userId = safeIdentifier(dm.user_id);

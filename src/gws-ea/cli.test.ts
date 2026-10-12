@@ -155,10 +155,10 @@ function createRuntime(): Partial<CliRuntime> {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_chat_request_pending',
+  code: 'google_chat_unavailable',
   message:
-    "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
-    'direct message as a request. Ask them to accept it in Google Chat, then resume.',
+    'Google Chat did not answer while the assistant opened its direct message with Principal ' +
+    '(Google refused /v1/spaces:setup: Backend error). Resume to try again.',
 };
 
 const CHAT_PAUSE: ProvisionHumanPause = {
@@ -240,9 +240,10 @@ describe('gws-ea usage', () => {
     ).toEqual([
       '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
       '         [--assistant-first-name <name> --assistant-last-name <name> --assistant-workspace-email <email>]',
-      '         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]',
+      '         [--principal-first-name <name> --principal-last-name <name>]',
       '         [--principal-email <email>]...  (once per address the principal uses)',
       '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
+      '         [--principal-timezone <iana>]',
       '         [--provider <id>]',
       "         Deploys this gws-ea's own release, which must be committed, clean, and on the track.",
     ]);
