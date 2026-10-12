@@ -136,6 +136,15 @@ describe('buildSystemPromptAddendum — reading messages', () => {
     expect(prompt.indexOf('## Sending messages')).toBeLessThan(prompt.indexOf('## Reading messages'));
   });
 
+  it('names a scheduled task that comes back to the conversation, and lets one with nothing to say stay quiet', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group-1@g.us');
+
+    const reading = buildSystemPromptAddendum('Casa').split('## Reading messages')[1] ?? '';
+
+    expect(reading).toContain('`<task>`');
+    expect(reading).toContain('end the turn without a block');
+  });
+
   it('omits the reading section in task mode, which never receives echoes', () => {
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
 

@@ -59,7 +59,7 @@ describe('the Drive client', () => {
     expect(request.url.origin).toBe('https://www.googleapis.com');
     expect(request.url.pathname).toBe('/drive/v3/files/folder-1');
     expect(request.url.searchParams.get('fields')).toBe(
-      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)',
+      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare),modifiedTime,lastModifyingUser(emailAddress,permissionId)',
     );
     expect(request.url.searchParams.get('supportsAllDrives')).toBe('true');
     expect(request.headers.authorization).toBe('Bearer host-drive-token');
@@ -87,6 +87,24 @@ describe('the Drive client', () => {
     });
   });
 
+  it('reads when a file last changed and who changed it', async () => {
+    const { api } = stubGoogle(() => ({
+      status: 200,
+      body: {
+        id: 'budget-1',
+        name: 'Q4 budget',
+        modifiedTime: '2026-10-09T15:00:00.000Z',
+        lastModifyingUser: { emailAddress: 'juno@acme.example', permissionId: '0903', displayName: 'Juno Hale' },
+      },
+    }));
+    expect(await api.getFile('budget-1')).toEqual({
+      id: 'budget-1',
+      name: 'Q4 budget',
+      modifiedTime: '2026-10-09T15:00:00.000Z',
+      lastModifyingUser: { emailAddress: 'juno@acme.example', permissionId: '0903' },
+    });
+  });
+
   it('creates a file with its name, type and parents, and reads back what it made', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { ...FOLDER, id: 'folder-2' } }));
     expect(await api.createFile({ name: 'Morgan Ellery · Juno', mimeType: FOLDER_MIME_TYPE })).toMatchObject({
@@ -102,7 +120,7 @@ describe('the Drive client', () => {
     expect(folder.method).toBe('POST');
     expect(folder.url.pathname).toBe('/drive/v3/files');
     expect(folder.url.searchParams.get('fields')).toBe(
-      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare)',
+      'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare),modifiedTime,lastModifyingUser(emailAddress,permissionId)',
     );
     expect(folder.body).toEqual({ name: 'Morgan Ellery · Juno', mimeType: FOLDER_MIME_TYPE });
     expect(document.body).toEqual({
@@ -211,6 +229,42 @@ describe('the Drive client', () => {
       '/drive/v3/files/doc-1/accessproposals',
       '/drive/v3/files/doc-1/accessproposals',
     ]);
+  });
+
+  it("lists a file's comments across pages, with whom each is for and never who wrote it", async () => {
+    const assigned = {
+      id: 'c-1',
+      content: '+juno@northwind.example please update the totals',
+      resolved: false,
+      modifiedTime: '2026-10-10T08:00:00.000Z',
+      assigneeEmailAddress: 'juno@northwind.example',
+      mentionedEmailAddresses: ['juno@northwind.example'],
+    };
+    const { api, requests } = stubGoogle((request) =>
+      request.url.searchParams.get('pageToken') === null
+        ? {
+            status: 200,
+            body: {
+              comments: [
+                { ...assigned, author: { displayName: 'Remy Vance', me: false } },
+                { id: 'c-2', content: 'Looks good', resolved: true },
+                { content: 'no id' },
+              ],
+              nextPageToken: 'p2',
+            },
+          }
+        : { status: 200, body: {} },
+    );
+    expect(await api.listComments('doc-1')).toEqual([assigned, { id: 'c-2', content: 'Looks good', resolved: true }]);
+    expect(requests.map((request) => request.url.pathname)).toEqual([
+      '/drive/v3/files/doc-1/comments',
+      '/drive/v3/files/doc-1/comments',
+    ]);
+    expect(requests[0].url.searchParams.get('fields')).toBe(
+      'nextPageToken,comments(id,content,resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses)',
+    );
+    expect(requests[0].url.searchParams.get('includeDeleted')).toBeNull();
+    expect(requests[1].url.searchParams.get('pageToken')).toBe('p2');
   });
 
   it('refuses an unreadable answer rather than guessing', async () => {

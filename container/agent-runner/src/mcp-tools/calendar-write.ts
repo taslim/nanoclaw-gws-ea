@@ -26,6 +26,10 @@ const CALENDAR = {
 } as const;
 const ADDRESSES = { type: 'array', items: { type: 'string' } } as const;
 const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it, such as 2026-10-12T09:00:00-07:00';
+const MATTER = {
+  type: 'string',
+  description: 'The id of the open matter the event belongs to, such as m-1a2b3c4d5e6f: the event joins it.',
+} as const;
 
 export const createEvent = requestTool({
   name: 'create_event',
@@ -48,6 +52,7 @@ export const createEvent = requestTool({
       description: 'How it repeats, as RRULE lines, such as RRULE:FREQ=WEEKLY;BYDAY=MO.',
     },
     video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
+    matter: MATTER,
   },
   required: ['calendar', 'title', 'start', 'end'],
   repeatable: false,
@@ -66,6 +71,7 @@ export const changeGuests = requestTool({
     },
     add: { ...ADDRESSES, description: 'Email addresses to invite.' },
     remove: { ...ADDRESSES, description: 'Email addresses to take off it.' },
+    matter: MATTER,
   },
   required: ['calendar', 'event'],
   repeatable: true,

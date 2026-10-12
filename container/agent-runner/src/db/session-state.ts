@@ -83,13 +83,19 @@ export interface ReplyRoute {
   threadId: string | null;
 }
 
+/** The reply stamp as published: the turn's route, and the ids of the batch it answers. */
+export interface ReplyStamp extends ReplyRoute {
+  batch: readonly string[];
+}
+
 /**
  * The reply stamp: the route of the first inbound message in the batch the
- * agent is currently processing. The poll loop publishes it at batch start;
- * MCP tools (`send_message`, `send_file`) read it to thread a reply into the
- * conversation being answered and to stamp `in_reply_to` onto outbound rows so
- * the host's a2a return-path routing can correlate replies back to the
- * originating session.
+ * agent is currently processing, and the ids of every message in it. The poll
+ * loop publishes it at batch start; MCP tools (`send_message`, `send_file`)
+ * read it to thread a reply into the conversation being answered and to stamp
+ * `in_reply_to` onto outbound rows so the host's a2a return-path routing can
+ * correlate replies back to the originating session. Each message a tool
+ * writes to a person names the batch (`writeMessageOut`).
  *
  * This lives in mailbox state because the MCP server runs as a separate stdio
  * subprocess; module state set by the poll loop is invisible to it.
@@ -101,30 +107,36 @@ export interface ReplyRoute {
  */
 const REPLY_ROUTE_KEY = 'current_reply_route';
 
-export function setCurrentReplyRoute(route: ReplyRoute | null): void {
-  if (route === null) {
+export function setCurrentReplyRoute(stamp: ReplyStamp | null): void {
+  if (stamp === null) {
     clearCurrentReplyRoute();
     return;
   }
-  const { inReplyTo, channelType, platformId, threadId } = route;
-  setValue(REPLY_ROUTE_KEY, JSON.stringify({ inReplyTo, channelType, platformId, threadId }));
+  const { inReplyTo, channelType, platformId, threadId, batch } = stamp;
+  setValue(REPLY_ROUTE_KEY, JSON.stringify({ inReplyTo, channelType, platformId, threadId, batch }));
 }
 
 export function clearCurrentReplyRoute(): void {
   deleteValue(REPLY_ROUTE_KEY);
 }
 
-export function getCurrentReplyRoute(): ReplyRoute | null {
+/** The ids a stamp names; a stamp that names none as strings names an empty batch. */
+function stampedBatch(value: unknown): string[] {
+  return Array.isArray(value) && value.every((id: unknown): id is string => typeof id === 'string') ? value : [];
+}
+
+export function getCurrentReplyRoute(): ReplyStamp | null {
   const row = getAgentMailbox().operations.getState(REPLY_ROUTE_KEY);
   if (!row) return null;
   try {
-    const parsed = JSON.parse(row.value) as Partial<ReplyRoute>;
+    const parsed = JSON.parse(row.value) as Partial<ReplyRoute> & { batch?: unknown };
     if (typeof parsed.inReplyTo !== 'string') return null;
     return {
       inReplyTo: parsed.inReplyTo,
       channelType: parsed.channelType ?? null,
       platformId: parsed.platformId ?? null,
       threadId: parsed.threadId ?? null,
+      batch: stampedBatch(parsed.batch),
     };
   } catch {
     return null;

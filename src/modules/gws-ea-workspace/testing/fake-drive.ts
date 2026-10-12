@@ -15,15 +15,19 @@
  * - a file someone else owns and shares with the assistant shows its owner
  *   and who shared it; only when the assistant can share it may it read
  *   its full access list, as Drive allows owners and writers only.
+ * - a file shows when it last changed and who changed it once someone has,
+ *   and lists its comments, never who wrote one.
  *
  * Every call is recorded, reads included. A test makes the changes people
  * make in Drive itself (`trash`, `deleteForever`, `share`, `removeAccess`,
- * `shareWithAssistant`) and makes a call fail once (`failNext`).
+ * `shareWithAssistant`, `edit`, `comment`) and makes a call fail once
+ * (`failNext`).
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
   DriveAccessProposal,
   DriveApi,
+  DriveComment,
   DriveFile,
   DrivePermission,
   DrivePermissionDetail,
@@ -58,6 +62,9 @@ interface StoredFile {
   /** Set for a file someone else shared with the assistant. */
   readonly sharingUser?: DriveUser;
   readonly sharedWithMeTime?: string;
+  /** Set once someone changes it. */
+  lastChange?: { readonly at: string; readonly by: DriveUser };
+  readonly comments: DriveComment[];
 }
 
 interface Account {
@@ -128,6 +135,17 @@ export class FakeDrive implements DriveApi {
     permissions.splice(index, 1);
   }
 
+  /** `by`, an account, changes the file at `at`. */
+  edit(fileId: string, by: string, at: string): void {
+    const account = this.account(by);
+    this.live(fileId).lastChange = { at, by: { emailAddress: account.email, permissionId: account.permissionId } };
+  }
+
+  /** Someone comments on the file. */
+  comment(fileId: string, comment: DriveComment): void {
+    this.live(fileId).comments.push(comment);
+  }
+
   /** Someone asks for access to the file. */
   addProposal(fileId: string, proposal: DriveAccessProposal): void {
     this.live(fileId).proposals.push(proposal);
@@ -163,6 +181,7 @@ export class FakeDrive implements DriveApi {
         ...(input.access ?? []),
       ],
       proposals: [],
+      comments: [],
       owner: { emailAddress: owner.email, permissionId: owner.permissionId },
       sharingUser: { emailAddress: sharer.email, permissionId: sharer.permissionId },
       ...(input.sharedAt === undefined ? {} : { sharedWithMeTime: input.sharedAt }),
@@ -198,6 +217,7 @@ export class FakeDrive implements DriveApi {
       deleted: false,
       permissions: [{ id: owner.permissionId, type: 'user', role: 'owner', emailAddress: owner.email }],
       proposals: [],
+      comments: [],
       owner: { emailAddress: owner.email, permissionId: owner.permissionId },
     };
     this.files.set(file.id, file);
@@ -302,6 +322,11 @@ export class FakeDrive implements DriveApi {
     return [...this.live(fileId).proposals];
   }
 
+  async listComments(fileId: string): Promise<DriveComment[]> {
+    this.begin('listComments', fileId);
+    return [...this.live(fileId).comments];
+  }
+
   // -------------------------------------------------------------------------
 
   private begin(op: DriveOp, fileId?: string, input?: unknown): void {
@@ -362,6 +387,9 @@ export class FakeDrive implements DriveApi {
       ...(file.sharingUser === undefined ? {} : { sharingUser: file.sharingUser }),
       ...(file.sharedWithMeTime === undefined ? {} : { sharedWithMeTime: file.sharedWithMeTime }),
       canShare: this.canShare(file),
+      ...(file.lastChange === undefined
+        ? {}
+        : { modifiedTime: file.lastChange.at, lastModifyingUser: file.lastChange.by }),
     };
   }
 }
@@ -381,5 +409,6 @@ export function delegatingDriveApi(current: () => DriveApi): DriveApi {
     deletePermission: (fileId, permissionId) => current().deletePermission(fileId, permissionId),
     permissionId: (emailAddress) => current().permissionId(emailAddress),
     listAccessProposals: (fileId) => current().listAccessProposals(fileId),
+    listComments: (fileId) => current().listComments(fileId),
   };
 }

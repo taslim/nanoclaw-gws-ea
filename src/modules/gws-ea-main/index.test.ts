@@ -4,7 +4,7 @@ import { defaultEmojiResolver } from 'chat';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { dispatch } from '../../cli/dispatch.js';
-import { lookup } from '../../cli/registry.js';
+import { listCommands, lookup } from '../../cli/registry.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
@@ -15,11 +15,13 @@ import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-profile/index.js';
-// They register the email channel's and the reminders' keys, whose instructions main is taught.
+// It registers the email channel's keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
-import '../gws-ea-reminders/index.js';
-// It registers the `ncl people` verbs the guidance names.
+// They register the `ncl` resources and verbs the guidance names.
 import '../gws-ea-people/index.js';
+import '../gws-ea-preferences/index.js';
+import '../gws-ea-privacy/index.js';
+import '../gws-ea-matters/index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-test';
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
@@ -69,10 +71,13 @@ async function skillsOf(agentGroupId: string): Promise<unknown> {
   return row === undefined ? undefined : JSON.parse(row.skills);
 }
 
+/** Stops what the host started, such as the matters loop, before the next test's database. */
+let hostStopped = new AbortController();
+
 async function startHost(): Promise<void> {
-  const signal = new AbortController().signal;
   const deliveryAdapter = { deliver: async () => undefined };
-  for (const start of getHostStartCallbacks()) await start({ db: getDb(), deliveryAdapter, signal });
+  for (const start of getHostStartCallbacks())
+    await start({ db: getDb(), deliveryAdapter, signal: hostStopped.signal });
 }
 
 beforeEach(async () => {
@@ -82,6 +87,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  hostStopped.abort();
+  hostStopped = new AbortController();
   await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
@@ -154,6 +161,18 @@ describe("GWS-EA's guidance for main", () => {
     }
   });
 
+  it('names only `ncl` resources that exist, matters among them, where it names one without a verb', () => {
+    const resources = [...GUIDANCE.matchAll(/`ncl ([a-z-]+)`/gu)].map(([, resource]) => resource);
+    expect(resources).toContain('matters');
+    const names = listCommands().map((command) => command.name);
+    for (const resource of resources) {
+      expect(
+        names.some((command) => command.startsWith(`${resource}-`)),
+        resource,
+      ).toBe(true);
+    }
+  });
+
   it('names no tool the agent does not have, and none only external-email holds', () => {
     expect(unknownToolNames(GUIDANCE, NOT_TOOLS)).toEqual([]);
     for (const tool of EXTERNAL_ONLY_TOOLS) expect(GUIDANCE).not.toContain(`\`${tool}\``);
@@ -163,11 +182,11 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/\b(?:AI|artificial intelligence|language model|chatbot|bot)\b/iu);
   });
 
-  it('stays within 2,250 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_250);
+  it('stays within 2,400 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_400);
   });
 
-  it("teaches main its email and reminder tools, and none of external-email's", async () => {
+  it("teaches main its email tools, and none of external-email's", async () => {
     const main = group('ag-main');
     await createGroup(main);
     await publishMain(main);
@@ -177,7 +196,6 @@ describe("GWS-EA's guidance for main", () => {
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
 
     expect(document).toContain('# NanoClaw Module: gws-ea-email\n');
-    expect(document).toContain('# NanoClaw Module: reminders\n');
     expect(document).not.toContain('# NanoClaw Module: gws-ea-email-external');
   });
 

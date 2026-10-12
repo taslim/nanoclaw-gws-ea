@@ -436,6 +436,48 @@ describe('recorded divergence: delivery consults outbound guards, and the runner
     // external-email is the counterpart's email thread (#3908, #3994).
     expect(pollLoop).not.toContain('deliverErrorResult');
     expect(pollLoop).not.toContain('FAILURE_NOTICE_FIELD');
+    // GWS-EA: the report, and each message the turn writes to a person, name the batch it answered (Slice 5 KTD12).
+    expect(pollLoop).toContain('...(routing.batch === undefined ? {} : { batch: routing.batch })');
+    const messagesOut = await readFile(path.join(originalCwd, 'container/agent-runner/src/db/messages-out.ts'), 'utf8');
+    expect(messagesOut).toContain('mergeEntries(msg.content, { batch })');
+  });
+});
+
+describe('recorded divergence: a module can read the inbound messages a failure names', () => {
+  it('reads each named message, whatever its status, with its kind, series, route and content', async () => {
+    const { INBOUND_SCHEMA } = await import('../mailbox/sqlite/schema.js');
+    const { wrapSqliteInbound } = await import('../mailbox/sqlite/index.js');
+    const db = new Database(':memory:');
+    cleanups.push(async () => {
+      db.close();
+    });
+    db.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(db);
+    const content = '{"senderId":"users/morgan","text":"Is Thursday still on?"}';
+    await inbound.insertMessage({
+      id: 'in-1',
+      kind: 'chat-sdk',
+      timestamp: '2026-10-10T09:00:00.000Z',
+      platformId: 'gchat:spaces/dm',
+      channelType: 'gchat',
+      threadId: null,
+      content,
+      processAfter: null,
+      recurrence: null,
+    });
+    inbound.markMessageFailed('in-1');
+
+    expect(inbound.getInboundMessages(['in-1', 'in-gone'])).toEqual([
+      {
+        id: 'in-1',
+        kind: 'chat-sdk',
+        seriesId: 'in-1',
+        channelType: 'gchat',
+        platformId: 'gchat:spaces/dm',
+        threadId: null,
+        content,
+      },
+    ]);
   });
 });
 
@@ -512,13 +554,195 @@ describe('recorded divergence: a module can hold an inbound message until a time
   });
 });
 
+describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
+  it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named, or settles it unread', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const createdAt = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await db.createMessagingGroupAgent({
+      id: 'mga-1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: createdAt,
+    });
+    await import('../mailbox/compose.js');
+    const router = await import('../router.js');
+    const { findSessionForAgent } = await import('../db/sessions.js');
+    const { withExistingMailboxSession } = await import('../session-manager.js');
+    const later = new Date(Date.now() + 4 * 60_000).toISOString();
+    router.registerInboundDelay((event) => (event.message.id.startsWith('held') ? router.HOLD_UNTIL_RELEASED : null));
+    router.registerInboundDelay((event) => (event.message.id.startsWith('held') ? later : null));
+    external.requestWake.mockClear();
+
+    await router.routeInbound({
+      channelType: 'gchat',
+      platformId: 'gchat:spaces/dm',
+      threadId: null,
+      message: {
+        id: 'held',
+        kind: 'chat',
+        content: '{"text":"hello"}',
+        timestamp: createdAt,
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    expect(external.requestWake).not.toHaveBeenCalled();
+
+    const sessionId = (await findSessionForAgent('ag-1', 'mg-1', null))?.id ?? '';
+    expect(
+      await withExistingMailboxSession('ag-1', sessionId, (mailbox) => [
+        mailbox.countDueMessages(),
+        mailbox.getWaitingMessages(),
+      ]),
+    ).toEqual([0, []]);
+    expect(await withExistingMailboxSession('ag-1', sessionId, (mailbox) => mailbox.releaseHeldMessages(later))).toBe(
+      1,
+    );
+    expect(await withExistingMailboxSession('ag-1', sessionId, (mailbox) => mailbox.getWaitingMessages())).toEqual([
+      { id: 'held:ag-1', tries: 0, processAfter: later },
+    ]);
+
+    await router.routeInbound({
+      channelType: 'gchat',
+      platformId: 'gchat:spaces/dm',
+      threadId: null,
+      message: {
+        id: 'held-again',
+        kind: 'chat',
+        content: '{"text":"hello again"}',
+        timestamp: createdAt,
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    expect(await withExistingMailboxSession('ag-1', sessionId, (mailbox) => mailbox.settleHeldMessages())).toBe(1);
+    expect(
+      await withExistingMailboxSession('ag-1', sessionId, (mailbox) => [
+        mailbox.releaseHeldMessages(null),
+        mailbox.countDueMessages(),
+      ]),
+    ).toEqual([0, 0]);
+  });
+
+  it("keeps held rows out of the runner's pending read", async () => {
+    const operations = await readFile(
+      path.join(originalCwd, 'container/agent-runner/src/mailbox/sqlite/operations.ts'),
+      'utf8',
+    );
+    // The runner's other reads of pending rows (question and CLI answers) must not stand in for its batch read.
+    const pendingRead = /export function sqliteGetPendingMessages\([\s\S]*?\n\}\n/u.exec(operations)?.[0] ?? '';
+    expect(pendingRead).toMatch(/SELECT \* FROM messages_in\s+WHERE status = 'pending'\s/u);
+  });
+});
+
+describe('recorded divergence: a scheduled task can come back as a turn of the conversation that created it', () => {
+  it('lands an --in-conversation task in the calling session marked to come back, lists it, and refuses one from a task session', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const now = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Main', folder: 'main', agent_provider: null, created_at: now });
+    const { createSession } = await import('../db/sessions.js');
+    await createSession({
+      id: 'chat-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now,
+    });
+    await import('../mailbox/compose.js');
+    const { initSessionFolder, withExistingMailboxSession } = await import('../session-manager.js');
+    initSessionFolder('ag-1', 'chat-1');
+    await import('../cli/resources/tasks.js');
+    const { dispatch } = await import('../cli/dispatch.js');
+    const ctx = { caller: 'agent', agentGroupId: 'ag-1', sessionId: 'chat-1', messagingGroupId: 'mg-1' } as const;
+    const args = { prompt: 'Check whether the venue confirmed', process_after: '2999-01-01T09:00:00Z' };
+    const storedContent = async (created: Awaited<ReturnType<typeof dispatch>>): Promise<unknown> => {
+      if (!created.ok) throw new Error(created.error.message);
+      const { session_id, series_id } = created.data as { session_id: string; series_id: string };
+      const task = await withExistingMailboxSession('ag-1', session_id, (mailbox) => mailbox.getTask(series_id));
+      return JSON.parse(task?.content ?? 'null');
+    };
+
+    const conversation = await dispatch(
+      { id: 'c', command: 'tasks-create', args: { ...args, in_conversation: true } },
+      ctx,
+    );
+    expect(conversation).toMatchObject({ ok: true, data: { session_id: 'chat-1' } });
+    const listed = await dispatch({ id: 'l', command: 'tasks-list', args: {} }, ctx);
+    expect(listed.ok && (listed.data as Array<{ session_id: string }>).map((row) => row.session_id)).toEqual([
+      'chat-1',
+    ]);
+
+    const isolated = await dispatch({ id: 'i', command: 'tasks-create', args }, ctx);
+    // The runner answers a task as a turn by this marker, never by the session it sits in.
+    expect(await storedContent(conversation)).toMatchObject({ inConversation: true });
+    expect(await storedContent(isolated)).not.toHaveProperty('inConversation');
+    const taskSession = isolated.ok ? (isolated.data as { session_id: string }).session_id : '';
+    const refused = await dispatch(
+      { id: 'r', command: 'tasks-create', args: { ...args, in_conversation: true } },
+      { ...ctx, sessionId: taskSession },
+    );
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error.message).toContain('no conversation to come back to');
+  });
+
+  it("runs a task as a turn only when it is marked to come back, keeps a quiet task's prose unsent, and escapes script output", async () => {
+    const runner = path.join(originalCwd, 'container/agent-runner/src');
+    const formatter = await readFile(path.join(runner, 'formatter.ts'), 'utf8');
+    const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
+    const destinations = await readFile(path.join(runner, 'destinations.ts'), 'utf8');
+
+    // A v1-ported task shares a conversation's session unmarked, so the marker, not the session, decides.
+    expect(formatter).toContain("const IN_CONVERSATION_FIELD = 'inConversation';");
+    expect(formatter).toContain(
+      "taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),",
+    );
+    expect(formatter).toContain('escapeXml(JSON.stringify(content.scriptOutput, null, 2))');
+    expect(pollLoop).toContain('routing.tasksOnly === true ? blockUndelivered : !!scratchpad');
+    expect(destinations).toContain('- `<task>` — a scheduled task you set to come back to this conversation');
+  });
+});
+
 describe("recorded divergence: the runner's tool barrel loads GWS-EA's tools", () => {
-  it("loads the runner's email, reminder and request-status tools, which name their own capability keys", async () => {
+  it("loads the runner's email and request-status tools, which name their own capability keys, and no reminder tools", async () => {
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
-    for (const module of ['gws-ea-email', 'reminders', 'request-status']) {
+    for (const module of ['gws-ea-email', 'request-status']) {
       expect(tools).toContain(`await import('./${module}.js');`);
     }
     expect(tools).not.toContain('gws-ea-meetings');
+    // Slice 5 R15: no tool times a conversation's own follow-through; a matter's look in main's conversation does.
+    expect(tools).not.toContain("'./reminders.js'");
   });
 });
 

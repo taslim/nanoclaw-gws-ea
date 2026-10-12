@@ -18,6 +18,17 @@
  * - A thread's addresses are those its messages carried and those `main`
  *   named (`recordThreadAddresses`). A forgotten person's go from every
  *   thread (`deleteThreadAddresses`).
+ * - A thread holds the account the agent working it last left, each one in
+ *   place of the one before, which `main` reads under the thread wherever a
+ *   matter shows it (`setThreadAccount`, `threadAccount`). Forgetting a
+ *   person clears it from every thread that may tell of them
+ *   (`clearThreadAccounts`).
+ * - A thread is where `main` placed it: not yet, in an open matter, or
+ *   nowhere, and handed over to `external-email` or not; until main hands it
+ *   over, its mail waits, held (Slice 5 KTD8). Mail starts a thread unplaced,
+ *   the matters store keeps a thread's placement in step with its matters,
+ *   and the bridge hands it over (`threadPlacement`, `placeThread`,
+ *   `releaseThread`, `holdThread`, `unplaceThread`, `listUnplacedThreads`).
  * - A file goes out in a thread only when `main` handed it over for it, by
  *   its SHA-256 (`recordThreadFile`, `findThreadFile`).
  * - A send never happens twice. Before Gmail is called, a pending record
@@ -202,6 +213,18 @@ export async function recordThreadMessage(message: NewThreadMessage, at: string)
   );
 }
 
+/** The threads that recorded a message under any of these Message-IDs, each once. */
+export async function threadsWithMessageIds(rfcMessageIds: readonly string[]): Promise<string[]> {
+  const ids = [...new Set(rfcMessageIds)].slice(0, MAX_ANSWERED_IDS);
+  if (ids.length === 0) return [];
+  const rows = await getDb().all<{ thread_key: string }>(
+    `SELECT DISTINCT thread_key FROM gws_ea_thread_messages
+      WHERE rfc_message_id IN (${ids.map(() => '?').join(', ')}) ORDER BY thread_key`,
+    ...ids,
+  );
+  return rows.map((row) => row.thread_key);
+}
+
 /** A side's messages in the thread, oldest first. */
 export async function threadMessages(threadKey: string, side: ThreadSide): Promise<ThreadMessage[]> {
   const rows = await getDb().all<MessageRow>(
@@ -298,6 +321,176 @@ export async function threadsWithAddresses(
 export async function deleteThreadAddresses(addresses: readonly string[]): Promise<void> {
   const db = getDb();
   for (const address of addresses) await db.run('DELETE FROM gws_ea_thread_addresses WHERE address = ?', address);
+}
+
+// ---------------------------------------------------------------------------
+// The account of the agent working it
+// ---------------------------------------------------------------------------
+
+/** The longest account the agent working a thread may leave: what a matter shows whole under the thread. */
+export const THREAD_ACCOUNT_MAX = 2_000;
+
+/** What the agent working a thread last said of it (KTD9): its words, and when, ISO. */
+export interface ThreadAccount {
+  readonly text: string;
+  readonly at: string;
+}
+
+/** The thread's account is now `text`, left at `at`, in place of any before it. Throws for a thread that does not exist. */
+export async function setThreadAccount(threadKey: string, text: string, at: string): Promise<void> {
+  const { changes } = await getDb().run(
+    'UPDATE gws_ea_threads SET account = ?, account_at = ? WHERE thread_key = ?',
+    text,
+    at,
+    threadKey,
+  );
+  if (changes === 0) throw new Error(`No email thread ${threadKey} exists`);
+}
+
+/** These threads hold no account, until the agent working each leaves its next one. */
+export async function clearThreadAccounts(threadKeys: readonly string[]): Promise<void> {
+  const db = getDb();
+  for (const threadKey of new Set(threadKeys)) {
+    await db.run('UPDATE gws_ea_threads SET account = NULL, account_at = NULL WHERE thread_key = ?', threadKey);
+  }
+}
+
+/** The account the agent working the thread last left on it, and when, or undefined while it has left none. */
+export async function threadAccount(threadKey: string): Promise<ThreadAccount | undefined> {
+  const row = await getDb().get<{ account: string; account_at: string }>(
+    'SELECT account, account_at FROM gws_ea_threads WHERE thread_key = ? AND account IS NOT NULL',
+    threadKey,
+  );
+  return row ? { text: row.account, at: row.account_at } : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Placement
+// ---------------------------------------------------------------------------
+
+/** Where `main` placed the thread: not yet, in an open matter, or nowhere, as also once its matter closed. */
+export type Placement = 'unplaced' | 'matter' | 'nowhere';
+
+export interface ThreadPlacement {
+  readonly placement: Placement;
+  /** main handed it over: external-email reads its mail as it comes. Until then the mail waits, held. */
+  readonly released: boolean;
+}
+
+/** The agent that works a thread main hands over, as the matter it sits in names it (Slice 5 R7). */
+export const THREAD_HANDLER = 'external-email';
+
+/** Where main placed the thread and whether it handed it over, or undefined for a thread that does not exist. */
+export async function threadPlacement(threadKey: string): Promise<ThreadPlacement | undefined> {
+  const row = await getDb().get<{ placement: Placement; released: number }>(
+    'SELECT placement, released FROM gws_ea_threads WHERE thread_key = ?',
+    threadKey,
+  );
+  return row ? { placement: row.placement, released: row.released === 1 } : undefined;
+}
+
+/** main placed the thread in an open matter, or nowhere. */
+export async function placeThread(threadKey: string, placement: Exclude<Placement, 'unplaced'>): Promise<void> {
+  await getDb().run('UPDATE gws_ea_threads SET placement = ? WHERE thread_key = ?', placement, threadKey);
+}
+
+/** main handed the thread over: its mail is external-email's from now on. Throws unless main has placed it. */
+export async function releaseThread(threadKey: string): Promise<void> {
+  const { changes } = await getDb().run(
+    "UPDATE gws_ea_threads SET released = 1 WHERE thread_key = ? AND placement <> 'unplaced'",
+    threadKey,
+  );
+  if (changes === 0) throw new Error(`Email thread ${threadKey} does not exist or is not placed yet`);
+}
+
+/** The thread's matter closed: it sits in no matter, and its new mail waits, held, to be placed again. */
+export async function holdThread(threadKey: string): Promise<void> {
+  await getDb().run("UPDATE gws_ea_threads SET placement = 'nowhere', released = 0 WHERE thread_key = ?", threadKey);
+}
+
+/**
+ * New mail on a thread in no matter that main has not handed over since: it
+ * waits to be placed again, and no note has asked yet. False when it is not
+ * such a thread, such as one main handed over meanwhile.
+ */
+export async function unplaceThread(threadKey: string): Promise<boolean> {
+  const { changes } = await getDb().run(
+    `UPDATE gws_ea_threads SET placement = 'unplaced', placement_note = NULL
+      WHERE thread_key = ? AND placement = 'nowhere' AND released = 0`,
+    threadKey,
+  );
+  return changes > 0;
+}
+
+/** Whether a note has asked main to place the thread since it last became unplaced. */
+export async function placementAsked(threadKey: string): Promise<boolean> {
+  const row = await getDb().get<{ placement_note: string | null }>(
+    'SELECT placement_note FROM gws_ea_threads WHERE thread_key = ?',
+    threadKey,
+  );
+  return (row?.placement_note ?? null) !== null;
+}
+
+/** `noteId` asked main to place these threads; one placed meanwhile keeps nothing of it. */
+export async function recordPlacementNote(threadKeys: readonly string[], noteId: string): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    for (const threadKey of threadKeys) {
+      await db.run(
+        "UPDATE gws_ea_threads SET placement_note = ? WHERE thread_key = ? AND placement = 'unplaced'",
+        noteId,
+        threadKey,
+      );
+    }
+  });
+}
+
+/** A thread waiting for main to place it (Slice 5 R27). */
+export interface UnplacedThread {
+  readonly threadKey: string;
+  readonly gmailThreadId: string | null;
+  /** The addresses its mail carried. */
+  readonly people: readonly string[];
+  /** When its latest mail came in. */
+  readonly latestAt: string;
+  /** The note that last asked main to place it, or null while none has. */
+  readonly placementNote: string | null;
+}
+
+/**
+ * Every thread waiting for main to place it, the one whose latest mail is
+ * oldest first: unplaced, with mail from outside. A thread only the
+ * principal and the assistant are on waits for no placement.
+ */
+export async function listUnplacedThreads(): Promise<UnplacedThread[]> {
+  const rows = await getDb().all<{
+    thread_key: string;
+    gmail_thread_id: string | null;
+    placement_note: string | null;
+    latest_at: string;
+  }>(
+    `SELECT t.thread_key, t.gmail_thread_id, t.placement_note, MAX(m.recorded_at) AS latest_at
+       FROM gws_ea_threads t
+       JOIN gws_ea_thread_messages m ON m.thread_key = t.thread_key AND m.side = 'outside'
+      WHERE t.placement = 'unplaced'
+      GROUP BY t.thread_key, t.gmail_thread_id, t.placement_note
+      ORDER BY latest_at, t.thread_key`,
+  );
+  return Promise.all(
+    rows.map(async (row) => ({
+      threadKey: row.thread_key,
+      gmailThreadId: row.gmail_thread_id,
+      people: [
+        ...new Set(
+          (await threadAddresses(row.thread_key))
+            .filter((entry) => entry.source === 'message')
+            .map((entry) => entry.address),
+        ),
+      ],
+      latestAt: row.latest_at,
+      placementNote: row.placement_note,
+    })),
+  );
 }
 
 // ---------------------------------------------------------------------------

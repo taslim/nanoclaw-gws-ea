@@ -40,7 +40,14 @@ import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-prof
 import '../gws-ea-profile/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
-import { addPerson, getPerson, registerPersonForgetHook, updatePerson, type ForgottenPerson } from './db.js';
+import {
+  addPerson,
+  getPerson,
+  registerPersonForgetHook,
+  registerPersonForgetReview,
+  updatePerson,
+  type ForgottenPerson,
+} from './db.js';
 import { createFingerprintKey, FINGERPRINT_KEY_FILE_NAME, identityFingerprint } from './fingerprint.js';
 import {
   peopleForgetHandoffFile,
@@ -70,6 +77,9 @@ registerPersonForgetHook('test-purge:forget-again', async (person) => {
   handoffsAtForget.push(await readPeopleForgetHandoff(HANDOFF));
   if (holdForget) await holdForget;
 });
+/** What the review puts to main to rewrite for each person, by name. */
+const rewrites = new Map<string, readonly string[]>();
+registerPersonForgetReview('test-purge:rewrite', async (person) => rewrites.get(person.name) ?? []);
 
 let key: Buffer;
 
@@ -86,6 +96,17 @@ async function keep(name: string, identities: readonly [string, ...string[]]): P
 /** The rows the replaced state's forget of `handles` wrote. */
 function forgottenIn(handles: readonly string[]): ForgottenFingerprint[] {
   return handles.map((handle) => ({ fingerprint: identityFingerprint(key, handle), forgotten_at: FORGOTTEN_AT }));
+}
+
+/** Fingerprints as a sweep that stopped part-way left them recorded. */
+async function recordForgotten(rows: readonly ForgottenFingerprint[]): Promise<void> {
+  for (const row of rows) {
+    await getDb().run(
+      'INSERT INTO gws_ea_people_fingerprints (fingerprint, forgotten_at) VALUES (?, ?)',
+      row.fingerprint,
+      row.forgotten_at,
+    );
+  }
 }
 
 async function recordedFingerprints(): Promise<ForgottenFingerprint[]> {
@@ -137,6 +158,7 @@ beforeEach(async () => {
   vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(SECRETS_DIR, 'google-grant.json'));
   forgotten.length = 0;
   handoffsAtForget.length = 0;
+  rewrites.clear();
   holdForget = undefined;
   vi.mocked(requestWake).mockClear();
 
@@ -290,6 +312,59 @@ describe('forgetting again after a snapshot restore', () => {
     expect(notes[0].text).toContain('Juno Hale');
   });
 
+  it('asks main to rewrite again what each forget put to it, keeping each as it goes and leaving out whom it kept', async () => {
+    const noel = await keep('Noel Archer', ['email:noel@example.test']);
+    const lena = await keep('Lena Ford', ['email:lena@example.test']);
+    const remy = await keep('Remy Vance', ['email:remy@example.test']);
+    await getDb().run(
+      'INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at) VALUES (?, ?, NULL, ?)',
+      'email:remy@example.test',
+      'ag-main',
+      NOW,
+    );
+    rewrites.set('Lena Ford', ['matter m-0000000000a1']);
+    rewrites.set('Noel Archer', ['matter m-0000000000b2', 'matter m-0000000000a1']);
+    rewrites.set('Remy Vance', ['matter m-0000000000c3']);
+    const fingerprints = forgottenIn(['email:noel@example.test', 'email:lena@example.test', 'email:remy@example.test']);
+    await writePeopleForgetHandoff(HANDOFF, { fingerprints });
+
+    await sweepForgetHandoff(HANDOFF);
+
+    expect(await getPerson(noel)).toBeUndefined();
+    expect(await getPerson(lena)).toBeUndefined();
+    expect(await getPerson(remy)).toBeDefined();
+    // By name: Lena first. Her list was kept before Noel's forget began, so a host stopped then still tells main.
+    expect(handoffsAtForget[1]).toEqual({
+      fingerprints,
+      pending_note: ['Lena Ford', 'Noel Archer', 'Remy Vance'],
+      pending_rewrite: ['matter m-0000000000a1'],
+    });
+    const notes = await notesForMain();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].text).toContain(
+      'Rewrite these as well, so none names them: matter m-0000000000a1 and matter m-0000000000b2.',
+    );
+    expect(notes[0].text).not.toContain('m-0000000000c3');
+  });
+
+  it('still asks main to rewrite what it kept when the host stopped after forgetting and before the note', async () => {
+    const fingerprints = forgottenIn(['email:noel@example.test']);
+    await recordForgotten(fingerprints);
+    await writePeopleForgetHandoff(HANDOFF, {
+      fingerprints,
+      pending_note: ['Noel Archer'],
+      pending_rewrite: ['matter m-0000000000b2'],
+    });
+
+    await sweepForgetHandoff(HANDOFF);
+
+    const notes = await notesForMain();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].text).toContain('Noel Archer');
+    expect(notes[0].text).toContain('matter m-0000000000b2');
+    expect(fs.existsSync(HANDOFF)).toBe(false);
+  });
+
   it('does nothing without a handoff, or with one that hands over nothing', async () => {
     const noel = await keep('Noel Archer', ['email:noel@example.test']);
     const before = await getPerson(noel);
@@ -307,13 +382,7 @@ describe('forgetting again after a snapshot restore', () => {
   it('tells main on restart when the host stopped after forgetting and before the note, and only once when it stopped after the note', async () => {
     // The host stopped after recording the fingerprints and forgetting Noel Archer, before telling main.
     const fingerprints = forgottenIn(['email:noel@example.test']);
-    for (const row of fingerprints) {
-      await getDb().run(
-        'INSERT INTO gws_ea_people_fingerprints (fingerprint, forgotten_at) VALUES (?, ?)',
-        row.fingerprint,
-        row.forgotten_at,
-      );
-    }
+    await recordForgotten(fingerprints);
     const stopped = { fingerprints, pending_note: ['Noel Archer'] };
     await writePeopleForgetHandoff(HANDOFF, stopped);
 
@@ -352,6 +421,14 @@ describe('forgetting again after a snapshot restore', () => {
       ['a local timestamp', JSON.stringify({ fingerprints: [{ ...row, forgotten_at: '2026-10-08 14:30:00' }] })],
       ['a note that is not a list', JSON.stringify({ fingerprints: [row], pending_note: 'Noel Archer' })],
       ['a blank name', JSON.stringify({ fingerprints: [row], pending_note: [''] })],
+      [
+        'a rewrite list that is not a list',
+        JSON.stringify({ fingerprints: [row], pending_note: ['Noel Archer'], pending_rewrite: 'matter m-1' }),
+      ],
+      [
+        'a blank rewrite',
+        JSON.stringify({ fingerprints: [row], pending_note: ['Noel Archer'], pending_rewrite: [''] }),
+      ],
       ['readable by others', JSON.stringify({ fingerprints: [row] }), 0o644],
     ];
 

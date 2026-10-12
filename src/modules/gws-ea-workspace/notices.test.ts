@@ -13,6 +13,7 @@ import {
   MAX_NOTE_ITEMS,
   parseWorkspaceNotification,
   SHARE_WINDOW_MS,
+  workspaceNotePieces,
   workspaceNoteText,
   type NoticeContext,
   type WorkspaceNotice,
@@ -683,5 +684,55 @@ describe('a poll of many notices', () => {
     expect(hostText(text).split('\n')[1]).toBe(
       `- A comment for you on file ${FILE} (comment AAABkQ3x0Yc). Drive doesn't show you this file now.`,
     );
+  });
+});
+
+describe('the files a note is about (Slice 5 KTD11)', () => {
+  it('brings a file shared or commented on new, from whom Google names as having acted, and any other as it is', () => {
+    const w = world();
+    const pieces = workspaceNotePieces(
+      [
+        notice(commentMail({ actor: `Remy Vance <${REMY}>` }), COMMENTS),
+        notice(shareMail({ fileId: OTHER_FILE, sharer: REMY })),
+        notice(accessRequestMail(FILE)),
+      ],
+      w.context,
+    );
+
+    expect(pieces).toEqual([
+      { kind: 'file', reference: FILE, arrival: { from: REMY } },
+      { kind: 'file', reference: OTHER_FILE, arrival: { from: REMY } },
+      { kind: 'file', reference: FILE },
+    ]);
+  });
+
+  it('names no one a notice without a Reply-To came from', () => {
+    const w = world();
+    const share = notice(shareMail());
+    const { actor: _actor, ...unnamed } = share;
+
+    expect(workspaceNotePieces([unnamed], w.context)).toEqual([
+      { kind: 'file', reference: FILE, arrival: { from: undefined } },
+    ]);
+  });
+
+  it('is about the files the note lists: each once, the principal’s first, as many as it reads', () => {
+    const w = world();
+    const strangers = Array.from({ length: MAX_NOTE_ITEMS }, (_, index) =>
+      notice(
+        shareMail({
+          fileId: `1Stranger${String(index).padStart(3, '0')}abcdefghijklmnopq`,
+          sharer: `s${index}@spam.example`,
+        }),
+      ),
+    );
+    const pieces = workspaceNotePieces(
+      [...strangers, notice(commentMail(), COMMENTS), notice(commentMail(), COMMENTS)],
+      w.context,
+    );
+
+    expect(pieces).toHaveLength(MAX_NOTE_ITEMS);
+    expect(pieces[0]).toEqual({ kind: 'file', reference: FILE, arrival: { from: MORGAN } });
+    expect(pieces.at(-1)?.reference).toBe(strangers.at(-2)?.fileId);
   });
 });

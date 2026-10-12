@@ -23,6 +23,7 @@ const route = (id: string, taskRun = false): RoutingContext => ({
   threadId: `thread-${id}`,
   inReplyTo: `m-${id}`,
   taskRun,
+  batch: [`m-${id}`],
 });
 function insert(id: string, kind = 'chat') {
   getInboundDb()
@@ -81,11 +82,13 @@ it('routes B then the retry of A in provider FIFO order, with matching exchange 
     ['answer A', 'thread-A', 'm-A'],
   ]);
   expect(stamps).toEqual(
+    // A retry answers the same messages as the turn it retries.
     ['B', 'A'].map((id) => ({
       inReplyTo: `m-${id}`,
       channelType: 'slack',
       platformId: 'C123',
       threadId: `thread-${id}`,
+      batch: [`m-${id}`],
     })),
   );
   expect(exchanges.map((e) => (e.prompt.includes('question B') ? 'B' : 'A'))).toEqual(['A', 'B', 'A']);

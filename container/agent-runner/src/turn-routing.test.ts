@@ -68,6 +68,7 @@ describe('turn routing — a later turn from another thread on the same open que
       channelType: 'slack',
       platformId: 'C123',
       threadId: 'thread-B',
+      batch: ['m-b'],
     });
     controller.abort();
     await loop.catch(() => {});

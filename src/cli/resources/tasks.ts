@@ -5,6 +5,7 @@ import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   deleteSession,
+  findConversationSessions,
   findTaskSessions,
   getActiveSessions,
   getSession,
@@ -12,7 +13,7 @@ import {
   taskThreadId,
   TASKS_SYSTEM_THREAD_ID,
 } from '../../db/sessions.js';
-import type { TaskUpdate } from '../../mailbox/index.js';
+import type { MailboxSession, TaskUpdate } from '../../mailbox/index.js';
 import { parseTaskContent } from '../../modules/scheduling/task-content.js';
 import {
   createScheduledTask,
@@ -31,6 +32,7 @@ import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 import type { InboundMailbox } from '../../mailbox/index.js';
 import { isContainerRunning } from '../../container-runner.js';
+import type { Session } from '../../types.js';
 
 type TaskStatus = 'pending' | 'paused';
 
@@ -39,6 +41,11 @@ type TaskRow = ScheduledTaskRow;
 interface ScopedSession {
   id: string;
   agent_group_id: string;
+  thread_id: string | null;
+}
+
+function scoped(session: Session): ScopedSession {
+  return { id: session.id, agent_group_id: session.agent_group_id, thread_id: session.thread_id };
 }
 
 function str(value: unknown): string | undefined {
@@ -78,7 +85,7 @@ async function ownSession(sessionId: string, ctx: CallerContext): Promise<Scoped
   if (ctx.caller === 'agent' && session.agent_group_id !== ctx.agentGroupId) {
     throw new Error(`session not found: ${sessionId}`);
   }
-  return { id: session.id, agent_group_id: session.agent_group_id };
+  return scoped(session);
 }
 
 async function selectedSessions(
@@ -91,22 +98,20 @@ async function selectedSessions(
 
   const group = groupArg(args, ctx);
   if (group) {
-    // One session per live task series — the loops below already fan out across them.
-    return (await findTaskSessions(group, includeClosed)).map((s) => ({
-      id: s.id,
-      agent_group_id: s.agent_group_id,
-    }));
+    // One session per live task series, then the conversations that hold tasks
+    // coming back to them — the loops below already fan out across them.
+    return [...(await findTaskSessions(group, includeClosed)), ...(await findConversationSessions(group))].map(scoped);
   }
 
   if (ctx.caller === 'agent') return [];
-  return (await getActiveSessions()).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
+  return (await getActiveSessions()).map(scoped);
 }
 
 function withInbound<T>(session: ScopedSession, fn: (mailbox: InboundMailbox) => T): Promise<T | undefined> {
   return withExistingMailboxSession(session.agent_group_id, session.id, fn);
 }
 
-function toOutput(session: ScopedSession, row: TaskRow) {
+function toOutput(session: Pick<ScopedSession, 'id' | 'agent_group_id'>, row: TaskRow) {
   const content = parseTaskContent(row.content);
   return {
     agent_group_id: session.agent_group_id,
@@ -138,9 +143,25 @@ function taskId(args: Record<string, unknown>): string {
   return id;
 }
 
+/**
+ * The conversation an `--in-conversation` task comes back to: the session the
+ * request was delivered from, never one an argument names.
+ */
+async function requestingConversation(ctx: CallerContext): Promise<Session> {
+  if (ctx.caller !== 'agent') {
+    throw new Error(
+      '--in-conversation brings the task back to the conversation that asked for it; only an agent in a conversation can use --in-conversation',
+    );
+  }
+  const session = await getSession(ctx.sessionId);
+  if (!session) throw new Error(`session not found: ${ctx.sessionId}`);
+  return session;
+}
+
 async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const group = groupArg(args, ctx);
   if (!group) throw new Error('--group is required');
+  const conversation = bool(args.in_conversation) ? await requestingConversation(ctx) : undefined;
   const prompt = str(args.prompt);
   if (!prompt) throw new Error('--prompt is required');
   const recurrence = normalizeNullableString(args.recurrence) ?? null;
@@ -156,6 +177,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   });
   const { session, row } = await createScheduledTask(group, prepared, {
     originSessionId: ctx.caller === 'agent' ? ctx.sessionId : null,
+    session: conversation,
   });
   return toOutput(session, row);
 }
@@ -288,19 +310,32 @@ async function mutateTask(
   return { series_id: id, touched };
 }
 
+/** Whether the running container has claimed one of the series' rows: the task is mid-turn. */
+function seriesProcessing(mailbox: MailboxSession, seriesKey: string): boolean {
+  return mailbox.getProcessingClaims().some((claim) => {
+    const row = mailbox.getTask(claim.messageId);
+    return row !== undefined && (row.seriesId ?? row.id) === seriesKey;
+  });
+}
+
 async function deleteTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   let touched = 0;
   for (const session of await selectedSessions(args, ctx, true)) {
-    const found = await withInbound(session, (mailbox) => mailbox.getTask(id));
+    const found = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      const row = mailbox.getTask(id);
+      return row && { processing: seriesProcessing(mailbox, row.seriesId ?? row.id) };
+    });
     if (!found) continue;
-    if (isContainerRunning(session.id))
+    // A task session's container runs only its tasks. A conversation's stays
+    // warm between turns, so only a task it is processing holds the delete back.
+    if (isContainerRunning(session.id) && (isTaskThread(session.thread_id) || found.processing))
       throw new Error(`task is running; wait for it to finish before deleting: ${id}`);
 
     // Current tasks own an isolated session, so hard-delete the whole mailbox:
     // inbound history, outbound acknowledgements/messages, attachments, and heartbeat.
     // Clean up mailbox state before deleting the task so failures can be retried.
-    if ((await getSession(session.id))?.thread_id === taskThreadId(id)) {
+    if (session.thread_id === taskThreadId(id)) {
       await destroySessionMailbox(session.agent_group_id, session.id);
       fs.rmSync(sessionDir(session.agent_group_id, session.id), { recursive: true, force: true });
       await deleteSession(session.id);
@@ -309,7 +344,8 @@ async function deleteTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       continue;
     }
 
-    // Legacy shared task sessions may contain other series and keep their mailbox.
+    // A legacy shared task session or a conversation holds other rows too, so
+    // it keeps its mailbox and loses only this series.
     const deleted = (await withInbound(session, (mailbox) => mailbox.deleteTask(id))) ?? 0;
     if (deleted === 0) continue;
     touched += deleted;
@@ -419,13 +455,17 @@ registerResource({
   plural: 'tasks',
   table: 'messages_in',
   description:
-    'Scheduled task — prompt plus run time. Tasks run from the agent group system session and the agent chooses delivery destination at fire time.',
+    'Scheduled task — prompt plus run time. A task runs in an isolated session of its own, where the agent chooses a delivery destination at fire time, or with --in-conversation comes back as a turn of the conversation that created it.',
   idColumn: 'series_id',
   scopeField: 'agent_group_id',
   columns: [
     { name: 'series_id', type: 'string', description: 'Stable task handle.', generated: true },
     { name: 'agent_group_id', type: 'string', description: 'Agent group that owns the task.' },
-    { name: 'session_id', type: 'string', description: 'System session that runs the task.' },
+    {
+      name: 'session_id',
+      type: 'string',
+      description: 'Session that runs the task: its own, or the conversation it comes back to.',
+    },
     { name: 'status', type: 'string', description: 'Live state.', enum: ['pending', 'paused'] },
     {
       name: 'process_after',
@@ -453,7 +493,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
         {
           name: 'all',
           type: 'boolean',
@@ -476,14 +516,14 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => getTask(args, ctx),
     },
     create: {
       access: 'open',
       description:
-        `Create a scheduled task (recurring or one-shot) in the agent group system session.\n\n` +
+        `Create a scheduled task (recurring or one-shot). It runs in an isolated session of its own; with --in-conversation it comes back instead as a turn of the conversation you are in, where you answer it as you would any message.\n\n` +
         `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive local). Always pass --name for a readable id.\n\n` +
         `--script contract (pre-task gate, runs BEFORE the agent wakes):\n` +
         `  bash, 30s timeout, 1MB output cap. Its LAST stdout line must be JSON:\n` +
@@ -530,6 +570,12 @@ registerResource({
           description: 'Pre-task gate script (bash) — see the --script contract above.',
         },
         {
+          name: 'in_conversation',
+          type: 'boolean',
+          description:
+            'Come back as a turn of this conversation instead of running in an isolated session. Refused inside a task run, which has no conversation.',
+        },
+        {
           name: 'group',
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
@@ -538,6 +584,7 @@ registerResource({
       examples: [
         `# Recurring — --recurrence alone is enough; the first run comes off the cron grid:\nncl tasks create --name "sales briefing" --prompt "Send the weekday sales briefing" --recurrence "0 9 * * 1-5"`,
         `# One-shot — --process-after required (UTC, offset, or naive-local in the instance TZ):\nncl tasks create --name "ping" --prompt "Remind me to call Dana" --process-after "tomorrow 18:00"`,
+        `# Come back to this conversation — the task arrives here as a turn:\nncl tasks create --in-conversation --name "venue check" --prompt "Ask whether the venue confirmed for Thursday" --process-after "2026-10-14T09:00:00"`,
         `# Monitor — script gates the run; the agent wakes only when something matters:\nncl tasks create --name "alert watch" --recurrence "*/15 * * * *" \\\n  --prompt "Investigate the alerts in the script data and notify me if serious" \\\n  --script 'c=$(curl -sf https://example.com/api/alerts | jq length) || exit 0\necho "{\\"wakeAgent\\": $([ "$c" -gt 0 ] && echo true || echo false), \\"data\\": {\\"alerts\\": $c}}"'`,
       ],
       handler: async (args, ctx) => createTask(args, ctx),
@@ -590,7 +637,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => updateTaskCommand(args, ctx),
     },
@@ -605,7 +652,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => cancelTaskCommand(args, ctx),
     },
@@ -620,7 +667,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => runTaskCommand(args, ctx),
     },
@@ -634,7 +681,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => mutateTask(args, ctx, (mailbox, id) => mailbox.pauseTask(id)),
     },
@@ -648,7 +695,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => mutateTask(args, ctx, (mailbox, id) => mailbox.resumeTask(id)),
     },
@@ -662,7 +709,7 @@ registerResource({
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
-        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        { name: 'session', type: 'string', description: 'Limit to one session id.' },
       ],
       handler: async (args, ctx) => deleteTaskCommand(args, ctx),
     },

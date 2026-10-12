@@ -34,6 +34,16 @@ export async function getThreadBooking(threadKey: string, eventId: string): Prom
     : undefined;
 }
 
+/** The thread that booked this event, its calendar in any case, or undefined when no thread did. */
+export async function bookingThread(calendarId: string, eventId: string): Promise<string | undefined> {
+  const row = await getDb().get<{ thread_key: string }>(
+    'SELECT thread_key FROM gws_ea_thread_bookings WHERE lower(calendar_id) = ? AND event_id = ?',
+    calendarId.toLowerCase(),
+    eventId,
+  );
+  return row?.thread_key;
+}
+
 /** Record an event the thread booked; recording it again changes nothing. */
 export async function recordThreadBooking(booking: ThreadBooking): Promise<void> {
   await getDb().run(

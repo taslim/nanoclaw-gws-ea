@@ -4,9 +4,9 @@
  * organize), nor with the private-details check on its invitations:
  *
  *   create_event   { calendar, title, start, end, all_day?, timezone?, notes?, location?,
- *                    guests?, free?, private?, recurrence?, video_call? }
+ *                    guests?, free?, private?, recurrence?, video_call?, matter? }
  *                                        → { calendar, event, start, end, message }
- *   change_guests  { calendar, event, add?, remove? }
+ *   change_guests  { calendar, event, add?, remove?, matter? }
  *                                        → { calendar, event, guests, message }
  *
  * - Each writes only to a calendar Google lets the assistant change that is
@@ -38,6 +38,8 @@
  *   change, so Google's notification of it makes no note; one on the
  *   assistant's own calendar is not, so a guest's answer to it reaches main
  *   (KTD12).
+ * - With `matter`, one of main's open matters, the event either writes on
+ *   joins it (Slice 5 KTD11), checked before anything is written.
  *
  * Each request is answered once. A replayed `create_event` finds the event
  * it made, whose id derives from the request, and writes nothing more: its
@@ -49,6 +51,7 @@ import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-ac
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
+import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
 import {
@@ -345,7 +348,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     return { entry, owner, principal };
   }
 
-  const createEvent: ActionAnswer = async (content, _session, requestId) => {
+  const createEvent: ActionAnswer = async (content, session, requestId) => {
     const calendarId = calendarIdOf(content.calendar);
     const title = lineOf(content.title, 'title', TITLE_MAX);
     if (title === undefined) throw invalidArgs(`title must be text of 1 to ${TITLE_MAX} characters`);
@@ -381,6 +384,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       // An event that ends on a later day names both days, not only the one it starts on.
       when = spanLabel({ start: from, end: to }, timezone);
     }
+    const matterId = await requestedMatter(content.matter, session);
 
     const { entry, owner, principal } = await writableCalendarOf(calendarId);
     // The calendar's owner is its organizer; on the assistant's own, the principal is on it only when named.
@@ -439,6 +443,10 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     }
     recordOwnChange(owner, entry.id, eventId);
     const conference = videoCall ? await readConference(calendar(), entry.id, eventId) : undefined;
+    const joined =
+      matterId === undefined
+        ? []
+        : [await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })];
     return {
       calendar: entry.id,
       event: eventId,
@@ -454,11 +462,12 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
             ]),
         ...(recurrence === undefined ? [] : ['It repeats.']),
         `Change who it invites with change_guests, event ${eventId}; anything else with gog calendar update.`,
+        ...joined,
       ].join(' '),
     };
   };
 
-  const changeGuests: ActionAnswer = async (content) => {
+  const changeGuests: ActionAnswer = async (content, session) => {
     const calendarId = calendarIdOf(content.calendar);
     const eventId = eventIdOf(content.event);
     const add = addressesOf(content.add, 'add', MAX_GUESTS) ?? [];
@@ -466,10 +475,21 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     if (add.length === 0 && remove.length === 0) {
       throw invalidArgs('Give add, remove, or both: the people to invite or to take off.');
     }
+    const matterId = await requestedMatter(content.matter, session);
     const { entry, owner, principal } = await writableCalendarOf(calendarId);
     const words = OWNER_WORDS[owner];
     const organizer = entry.id.toLowerCase();
     if (remove.some((address) => isOwnerAddress(entry.id, address))) throw forbidden(words.stays);
+    /** The answer for the event as it now stands, which joins the matter the request named. */
+    const answered = async (guests: readonly string[], message: string) => ({
+      calendar: entry.id,
+      event: eventId,
+      guests,
+      message:
+        matterId === undefined
+          ? message
+          : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })}`,
+    });
 
     // The list is written back only over the version of the event it was
     // read from, so a guest's answer, or anyone's change, that lands in
@@ -492,16 +512,14 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         remove,
       );
       if (next === undefined) {
-        return {
-          calendar: entry.id,
-          event: eventId,
-          guests: invited,
-          message: `Nothing changed: ${[
+        return answered(
+          invited,
+          `Nothing changed: ${[
             ...(absent.length === 0 ? [] : [`${are(absent)} not invited`]),
             ...(already.length === 0 ? [] : [`${are(already)} already invited`]),
             words.alreadyOn,
           ].join('; ')}.`,
-        };
+        );
       }
       if (added.length > 0) {
         // Whoever it invites reads what the event already says, and everyone else on it sees who joins.
@@ -530,12 +548,10 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       const sendUpdates = tellsGuests ? 'all' : 'none';
       if ((await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag)) === 'set') {
         recordOwnChange(owner, entry.id, eventId);
-        return {
-          calendar: entry.id,
-          event: eventId,
-          guests: invited,
-          message: `Its guests now: ${words.guestsNow(invited, answer)}. ${tellsGuests ? 'Google sent the guests the update.' : 'Google emailed no one.'}`,
-        };
+        return answered(
+          invited,
+          `Its guests now: ${words.guestsNow(invited, answer)}. ${tellsGuests ? 'Google sent the guests the update.' : 'Google emailed no one.'}`,
+        );
       }
     }
     throw forbidden("The event's guests kept changing while this ran: try again in a moment.");

@@ -107,6 +107,28 @@ export interface ForgottenPerson {
 
 export type PersonForgetHook = (person: ForgottenPerson) => Promise<void>;
 
+/** What a forget review reads of the person, while their record still stands: their name too. */
+export interface PersonToForget extends ForgottenPerson {
+  readonly name: string;
+}
+
+/**
+ * What a module puts to main for a person being forgotten: each record of
+ * its own whose words main wrote and that may name them, by kind and id
+ * (`matter m-…`), for main to rewrite, since only main can.
+ */
+export type PersonForgetReview = (person: PersonToForget) => Promise<readonly string[]>;
+
+/** What forgetting a person answers main. */
+export interface ForgetAnswer {
+  readonly forgotten: string;
+  readonly name: string;
+  /** Every identity forgotten, for main to clear from its memory with the name. */
+  readonly identities: readonly string[];
+  /** What the reviews put to main to rewrite, each once. */
+  readonly rewrite: readonly string[];
+}
+
 const NAME_MAX_LENGTH = 120;
 const BASIS_MAX_LENGTH = 280;
 const QUERY_MAX_LENGTH = 320;
@@ -115,10 +137,18 @@ const CHANNEL_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
 const HOOK_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
 // ---------------------------------------------------------------------------
-// Forget hooks: other modules purge their own data for a forgotten person.
+// Forget hooks and reviews: other modules purge their own data for a
+// forgotten person, and put to main what only it can rewrite.
 // ---------------------------------------------------------------------------
 
 const forgetHooks = new Map<string, PersonForgetHook>();
+const forgetReviews = new Map<string, PersonForgetReview>();
+
+function registerOnce<T>(registry: Map<string, T>, what: string, id: string, entry: T): void {
+  if (!HOOK_ID_PATTERN.test(id)) throw new Error(`${what} "${id}" must use "<module-id>:<hook-id>"`);
+  if (registry.has(id)) throw new Error(`${what} "${id}" is already registered`);
+  registry.set(id, entry);
+}
 
 /**
  * Register a module's purge of its own data for a forgotten person, such as
@@ -128,9 +158,16 @@ const forgetHooks = new Map<string, PersonForgetHook>();
  * idempotent.
  */
 export function registerPersonForgetHook(id: string, hook: PersonForgetHook): void {
-  if (!HOOK_ID_PATTERN.test(id)) throw new Error(`Person forget hook "${id}" must use "<module-id>:<hook-id>"`);
-  if (forgetHooks.has(id)) throw new Error(`Person forget hook "${id}" is already registered`);
-  forgetHooks.set(id, hook);
+  registerOnce(forgetHooks, 'Person forget hook', id, hook);
+}
+
+/**
+ * Register what a module puts to main to rewrite for a forgotten person, such
+ * as the matters whose words may name them. Reviews only read, and run before
+ * any hook, so no module's purge hides from another what led to the person.
+ */
+export function registerPersonForgetReview(id: string, review: PersonForgetReview): void {
+  registerOnce(forgetReviews, 'Person forget review', id, review);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +193,21 @@ function nameKey(value: string): string {
 
 function nameTokens(key: string): string[] {
   return key.split(/[^\p{L}\p{N}]+/u).filter((token) => token !== '');
+}
+
+/**
+ * Whether `text` may name the person: a word of their name, compared as names
+ * are and a lone initial aside, or one of their email addresses. Generous on
+ * purpose: it picks out what main should reread, never what is deleted.
+ */
+export function mayNamePerson(person: Pick<PersonToForget, 'name' | 'handles'>, text: string): boolean {
+  const words = new Set(nameTokens(nameKey(person.name)).filter((word) => word.length > 1));
+  if (nameTokens(nameKey(text)).some((word) => words.has(word))) return true;
+  const lowered = text.toLowerCase();
+  return person.handles.some(
+    (handle) =>
+      handle.toLowerCase().startsWith('email:') && lowered.includes(handle.slice('email:'.length).toLowerCase()),
+  );
 }
 
 /**
@@ -651,17 +703,16 @@ async function assertNoGrantedAccess(userIds: readonly string[]): Promise<void> 
 }
 
 /**
- * Forget a person on the principal's word (R16): every registered hook purges
- * its module's data, then the record and its identities are deleted with the
- * core `users` and dropped-message rows of its `email:` identities. Only a
- * keyed fingerprint of each identity is kept, so learning cannot bring the
- * person back (KTD8). What `main` knows of them is in its memory, which the
- * host never reads: the answer names them and their identities so `main`
- * can clear it.
+ * Forget a person on the principal's word (R16): every registered review
+ * reads what main must rewrite, every registered hook purges its module's
+ * data, then the record and its identities are deleted with the core `users`
+ * and dropped-message rows of its `email:` identities. Only a keyed
+ * fingerprint of each identity is kept, so learning cannot bring the person
+ * back (KTD8). What `main` knows of them is in its memory, which the host
+ * never reads: the answer names them and their identities so `main` can
+ * clear it, with what else it wrote that may name them.
  */
-export async function forgetPerson(
-  input: ForgetPersonInput,
-): Promise<{ readonly forgotten: string; readonly name: string; readonly identities: readonly string[] }> {
+export async function forgetPerson(input: ForgetPersonInput): Promise<ForgetAnswer> {
   const id = input.id.trim();
   await loadFingerprintKey();
   const person = await requirePerson(id);
@@ -669,6 +720,10 @@ export async function forgetPerson(
   await assertNoGrantedAccess(handles.filter((handle) => handle.startsWith('email:')));
   const key = await forgetKey();
 
+  const rewrite = new Set<string>();
+  for (const review of forgetReviews.values()) {
+    for (const entry of await review({ id, name: person.name, handles })) rewrite.add(entry);
+  }
   for (const hook of forgetHooks.values()) await hook({ id, handles });
 
   const db = getDb();
@@ -695,7 +750,7 @@ export async function forgetPerson(
       await db.run('DELETE FROM unregistered_senders WHERE user_id = ?', userId);
       await db.run('DELETE FROM users WHERE id = ?', userId);
     }
-    return { forgotten: id, name: record.name, identities: forgotten };
+    return { forgotten: id, name: record.name, identities: forgotten, rewrite: [...rewrite] };
   });
 }
 
@@ -723,20 +778,30 @@ export async function recordForgottenFingerprints(rows: readonly ForgottenFinger
 }
 
 /**
+ * Whether an identity, such as `email:sam@example.com`, was forgotten at the
+ * principal's request (KTD8), in any spelling that reaches the same mailbox:
+ * a test against the fingerprints recorded now, for a reader that must never
+ * show a forgotten person. Without a key the store holds no fingerprints.
+ */
+export async function loadForgottenMatcher(): Promise<(handle: string) => boolean> {
+  const key = await loadFingerprintKey();
+  if (key === undefined) return () => false;
+  const recorded = new Set(
+    (await getDb().all<{ readonly fingerprint: string }>('SELECT fingerprint FROM gws_ea_people_fingerprints')).map(
+      (row) => row.fingerprint,
+    ),
+  );
+  return (handle) => recorded.size > 0 && recorded.has(identityFingerprint(key, handle));
+}
+
+/**
  * Everyone holding an identity whose fingerprint is recorded, by name. A
  * principal adding an identity back clears its fingerprint, so only a
  * snapshot restore leaves anyone here.
  */
 export async function listForgottenPeople(): Promise<Array<{ readonly id: string; readonly name: string }>> {
-  const key = await loadFingerprintKey();
-  if (key === undefined) return [];
-  const db = getDb();
-  const recorded = new Set(
-    (await db.all<{ readonly fingerprint: string }>('SELECT fingerprint FROM gws_ea_people_fingerprints')).map(
-      (row) => row.fingerprint,
-    ),
-  );
-  const identities = await db.all<{ readonly id: string; readonly name: string; readonly handle: string }>(
+  const isForgotten = await loadForgottenMatcher();
+  const identities = await getDb().all<{ readonly id: string; readonly name: string; readonly handle: string }>(
     `SELECT p.id, p.name, i.handle
        FROM gws_ea_people_identities i
        JOIN gws_ea_people p ON p.id = i.person_id
@@ -744,7 +809,7 @@ export async function listForgottenPeople(): Promise<Array<{ readonly id: string
   );
   const people = new Map<string, string>();
   for (const { id, name, handle } of identities) {
-    if (recorded.has(identityFingerprint(key, handle))) people.set(id, name);
+    if (isForgotten(handle)) people.set(id, name);
   }
   return [...people].map(([id, name]) => ({ id, name }));
 }

@@ -46,6 +46,8 @@ export interface GmailMessage {
   readonly labelIds?: readonly string[];
   /** Epoch milliseconds, as a string. */
   readonly internalDate?: string;
+  /** Gmail's excerpt of the message's text, HTML-escaped: someone else's words. */
+  readonly snippet?: string;
   readonly payload?: GmailMessagePart;
 }
 
@@ -85,7 +87,11 @@ export interface GmailApi {
     readonly labelIds?: readonly string[];
     readonly maxResults: number;
   }): Promise<GmailMessageRef[]>;
-  /** The thread's messages with their reconciliation headers; undefined when it no longer exists. */
+  /**
+   * The thread's messages, oldest first, with Gmail's excerpt of each and only
+   * their reconciliation headers and From, Date and Subject; undefined when
+   * the thread no longer exists.
+   */
   getThread(id: string): Promise<GmailMessage[] | undefined>;
   /** One file a message carries, base64url, as Gmail stores it; undefined when it no longer exists. */
   getAttachment(messageId: string, attachmentId: string): Promise<string | undefined>;
@@ -216,9 +222,11 @@ function toMessage(value: unknown): GmailMessage {
   const ref = toRef(value);
   const record = value as Record<string, unknown>;
   const internalDate = text(record.internalDate);
+  const snippet = text(record.snippet);
   return {
     ...ref,
     ...(internalDate === undefined ? {} : { internalDate }),
+    ...(snippet === undefined ? {} : { snippet }),
     ...(record.payload === undefined ? {} : { payload: toPart(record.payload) }),
   };
 }
@@ -258,6 +266,11 @@ function query(params: Record<string, string | readonly string[] | number | unde
 }
 
 const METADATA = { format: 'metadata', metadataHeaders: [...RECONCILIATION_HEADERS] } as const;
+/** A thread's messages: the headers a send is found by, and who wrote each, when, and about what (KTD5). */
+const THREAD_METADATA = {
+  format: 'metadata',
+  metadataHeaders: [...RECONCILIATION_HEADERS, 'From', 'Date', 'Subject'],
+} as const;
 
 /** The real client, over Gmail's REST API. */
 export function createGmailApi(options: GoogleClientOptions): GmailApi {
@@ -308,7 +321,7 @@ export function createGmailApi(options: GoogleClientOptions): GmailApi {
     },
 
     async getThread(id) {
-      const payload = await googleJson(options, `${GMAIL}/threads/${encodeURIComponent(id)}${query(METADATA)}`, {
+      const payload = await googleJson(options, `${GMAIL}/threads/${encodeURIComponent(id)}${query(THREAD_METADATA)}`, {
         allowNotFound: true,
       });
       if (payload === undefined) return undefined;

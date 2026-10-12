@@ -2,10 +2,12 @@
  * Router inbound-delay hook: a registered module names the time before which
  * a session must not read a routed message, and the router writes it as the
  * row's `process_after`. A delayed message does not wake the container; the
- * host sweep wakes the session once it is due.
+ * host sweep wakes the session once it is due. A module may instead hold the
+ * message until it releases it: the row is written `held`, and nothing reads,
+ * counts, copies or wakes for it until the release makes it due.
  *
  * Exercised through the REAL routeInbound path (adapter registry + seeded
- * wiring) and the real session mailbox.
+ * wiring), the real session mailbox and the real sweep.
  */
 import fs from 'fs';
 import Database from 'better-sqlite3';
@@ -22,7 +24,10 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channels/channel-registry.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
-import { registerInboundDelay, routeInbound } from './router.js';
+import { settleEchoFans } from './modules/cross-session-context/index.js';
+import { reconcileSession } from './reconcile-session.js';
+import { HOLD_UNTIL_RELEASED, registerInboundDelay, routeInbound, type InboundDelay } from './router.js';
+import { withExistingMailboxSession } from './session-manager.js';
 import type { ChannelAdapter, ChannelDefaults, InboundEvent } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -43,7 +48,7 @@ vi.mock('./config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-inbound-delay';
 
 /** What each of the two registered delays answers for a message, by its id; null when absent. */
-const answers = new Map<string, readonly [string | null, string | null]>();
+const answers = new Map<string, readonly [InboundDelay, InboundDelay]>();
 const asked: Array<{ messageId: string; session: Session }> = [];
 
 registerInboundDelay((event, session) => {
@@ -133,7 +138,7 @@ afterEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
-async function inbound(id: string, threadId = 'testchat:C1:1'): Promise<void> {
+async function inbound(id: string, threadId = 'testchat:C1:1', text = 'hello'): Promise<void> {
   const event: InboundEvent = {
     channelType: 'testchat',
     platformId: 'testchat:C1',
@@ -141,7 +146,7 @@ async function inbound(id: string, threadId = 'testchat:C1:1'): Promise<void> {
     message: {
       id,
       kind: 'chat',
-      content: JSON.stringify({ sender: 'Alex', text: 'hello' }),
+      content: JSON.stringify({ sender: 'Alex', text }),
       timestamp: now(),
       isMention: true,
       isGroup: true,
@@ -150,20 +155,55 @@ async function inbound(id: string, threadId = 'testchat:C1:1'): Promise<void> {
   await routeInbound(event);
 }
 
-/** The time the routed message's row waits for, as the session's inbound mailbox holds it. */
-async function processAfterOf(id: string, threadId = 'testchat:C1:1'): Promise<string | null> {
+async function sessionOf(threadId = 'testchat:C1:1'): Promise<Session> {
   const session = await findSessionForAgent('ag-1', 'mg-1', threadId);
   if (!session) throw new Error('No session for the thread');
+  return session;
+}
+
+/** What the session's inbound mailbox holds, read as the runner and the sweep would see it. */
+function readInbound<T>(session: Session, read: (db: Database.Database) => T): T {
   const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
   try {
-    const row = db.prepare('SELECT process_after FROM messages_in WHERE id = ?').get(`${id}:ag-1`) as
-      | { process_after: string | null }
-      | undefined;
-    if (!row) throw new Error(`${id} was not written`);
-    return row.process_after;
+    return read(db);
   } finally {
     db.close();
   }
+}
+
+/** The routed message's row: its status, the time it waits for, and whether it is a trigger. */
+async function rowOf(
+  id: string,
+  threadId = 'testchat:C1:1',
+): Promise<{ status: string; process_after: string | null; trigger: number }> {
+  const row = readInbound(await sessionOf(threadId), (db) =>
+    db.prepare('SELECT status, process_after, trigger FROM messages_in WHERE id = ?').get(`${id}:ag-1`),
+  ) as { status: string; process_after: string | null; trigger: number } | undefined;
+  if (!row) throw new Error(`${id} was not written`);
+  return row;
+}
+
+/** The time the routed message's row waits for, as the session's inbound mailbox holds it. */
+async function processAfterOf(id: string, threadId = 'testchat:C1:1'): Promise<string | null> {
+  return (await rowOf(id, threadId)).process_after;
+}
+
+/** The text of every message copied into the thread's session from the conversation's other sessions. */
+async function copiedTexts(threadId: string): Promise<string[]> {
+  const rows = readInbound(await sessionOf(threadId), (db) =>
+    db.prepare("SELECT content FROM messages_in WHERE channel_type = 'session-echo' ORDER BY seq").all(),
+  ) as Array<{ content: string }>;
+  return rows.map((row) => (JSON.parse(row.content) as { text: string }).text);
+}
+
+async function dueCount(session: Session): Promise<number | undefined> {
+  return withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.countDueMessages());
+}
+
+async function release(session: Session, processAfter: string | null): Promise<number | undefined> {
+  return withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.releaseHeldMessages(processAfter),
+  );
 }
 
 describe('registerInboundDelay', () => {
@@ -210,5 +250,99 @@ describe('registerInboundDelay', () => {
     expect(asked).toEqual([
       { messageId: 'm1', session: expect.objectContaining({ id: session?.id, thread_id: 'testchat:C1:7' }) },
     ]);
+  });
+});
+
+describe('holding a message until a module releases it', () => {
+  it('stores a held message that nothing counts as due and nothing wakes for, the sweep included', async () => {
+    answers.set('held', [HOLD_UNTIL_RELEASED, null]);
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await inbound('held');
+    const session = await sessionOf();
+    await reconcileSession(session.id);
+
+    expect(await rowOf('held')).toEqual({ status: 'held', process_after: null, trigger: 1 });
+    expect(await dueCount(session)).toBe(0);
+    expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+  });
+
+  it('holds a message whatever time another delay names', async () => {
+    answers.set('hold-first', [HOLD_UNTIL_RELEASED, inMinutes(4)]);
+    answers.set('hold-second', [inMinutes(4), HOLD_UNTIL_RELEASED]);
+
+    await inbound('hold-first');
+    await inbound('hold-second', 'testchat:C1:2');
+
+    expect(await rowOf('hold-first')).toMatchObject({ status: 'held', process_after: null });
+    expect(await rowOf('hold-second', 'testchat:C1:2')).toMatchObject({ status: 'held', process_after: null });
+  });
+
+  it('leaves a held message unread when a later message comes due in the same session and wakes it', async () => {
+    answers.set('held', [HOLD_UNTIL_RELEASED, null]);
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await inbound('held');
+    await inbound('due');
+
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+    expect((await rowOf('held')).status).toBe('held');
+    expect((await rowOf('due')).status).toBe('pending');
+    expect(await dueCount(await sessionOf())).toBe(1);
+  });
+
+  it("copies a held message into none of the conversation's other sessions", async () => {
+    answers.set('held', [HOLD_UNTIL_RELEASED, null]);
+
+    await inbound('opener', 'testchat:C1:1', 'Morgan Ellery opened the conversation');
+    await inbound('held', 'testchat:C1:2', 'Juno Hale asked for the contract terms');
+    await inbound('seen', 'testchat:C1:3', 'Remy Vance confirmed Thursday');
+    await settleEchoFans();
+
+    // The live copy reaches the conversation's other sessions; the held message reaches none.
+    expect(await copiedTexts('testchat:C1:1')).toEqual(['Remy Vance confirmed Thursday']);
+    // A session born later is seeded with the conversation's openers, not with the held one.
+    expect(await copiedTexts('testchat:C1:3')).toEqual(['Morgan Ellery opened the conversation']);
+  });
+
+  it('releases every message held in the session, each a trigger due at the time the release names', async () => {
+    answers.set('held', [HOLD_UNTIL_RELEASED, null]);
+    answers.set('also-held', [HOLD_UNTIL_RELEASED, null]);
+    answers.set('held-elsewhere', [HOLD_UNTIL_RELEASED, null]);
+    const { wakeContainer } = await import('./container-runner.js');
+    await inbound('held');
+    await inbound('also-held');
+    await inbound('held-elsewhere', 'testchat:C1:2');
+    const session = await sessionOf();
+    const later = inMinutes(4);
+
+    expect(await release(session, later)).toBe(2);
+    await reconcileSession(session.id);
+
+    expect(await rowOf('held')).toEqual({ status: 'pending', process_after: later, trigger: 1 });
+    expect(await rowOf('also-held')).toEqual({ status: 'pending', process_after: later, trigger: 1 });
+    expect((await rowOf('held-elsewhere', 'testchat:C1:2')).status).toBe('held');
+    expect(
+      await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.getWaitingMessages()),
+    ).toEqual([
+      { id: 'held:ag-1', tries: 0, processAfter: later },
+      { id: 'also-held:ag-1', tries: 0, processAfter: later },
+    ]);
+    expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+    expect(await release(session, null)).toBe(0);
+  });
+
+  it('wakes the session on the sweep once a released message is due', async () => {
+    answers.set('held', [HOLD_UNTIL_RELEASED, null]);
+    const { wakeContainer } = await import('./container-runner.js');
+    await inbound('held');
+    const session = await sessionOf();
+
+    expect(await release(session, null)).toBe(1);
+    await reconcileSession(session.id);
+
+    expect(await rowOf('held')).toEqual({ status: 'pending', process_after: null, trigger: 1 });
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalledWith(expect.objectContaining({ id: session.id }));
   });
 });

@@ -7,7 +7,7 @@
  */
 import Database from 'better-sqlite3';
 
-import { createInboundRecord } from '../model.js';
+import { createInboundRecord, parseIsoTimestamp } from '../model.js';
 import type { InboundWrite } from '../model.js';
 import type { MessageRetry } from '../types.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
@@ -117,6 +117,45 @@ export function countDueMessages(db: Database.Database): number {
       )
       .get() as { count: number }
   ).count;
+}
+
+/**
+ * How many due messages wait, waking nothing, as context for the session's
+ * next turn: pending rows that are not triggers, other than those on
+ * `exceptChannelType`.
+ */
+export function countUnreadContext(db: Database.Database, exceptChannelType: string): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) as count FROM messages_in
+       WHERE status = 'pending'
+         AND trigger = 0
+         AND (channel_type IS NULL OR channel_type <> ?)
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+      )
+      .get(exceptChannelType) as { count: number }
+  ).count;
+}
+
+/**
+ * Release every held message: each becomes a pending trigger, due at
+ * `processAfter` (null: due now), so the sweep wakes the session for it once
+ * it is due. Returns how many it released.
+ */
+export function releaseHeldMessages(db: Database.Database, processAfter: string | null): number {
+  const due = processAfter === null ? null : parseIsoTimestamp(processAfter);
+  return db
+    .prepare("UPDATE messages_in SET status = 'pending', trigger = 1, process_after = ? WHERE status = 'held'")
+    .run(due).changes;
+}
+
+/**
+ * Settle every held message: each is completed unread, so no turn ever reads
+ * it and no later release brings it back. Returns how many it settled.
+ */
+export function settleHeldMessages(db: Database.Database): number {
+  return db.prepare("UPDATE messages_in SET status = 'completed' WHERE status = 'held'").run().changes;
 }
 
 export function markMessageFailed(db: Database.Database, messageId: string): void {

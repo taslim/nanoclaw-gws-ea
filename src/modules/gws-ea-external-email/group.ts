@@ -23,7 +23,6 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { getExternalEmailAgentGroupId, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
-import { REMINDERS_CAPABILITY } from '../gws-ea-reminders/index.js';
 
 /**
  * The email channel's tool keys, one for each part (KTD4), registered
@@ -55,11 +54,12 @@ export const EXTERNAL_EMAIL_PLUGIN = 'gws-ea-external-email';
 export const EXTERNAL_EMAIL_NAME = 'external-email';
 
 /**
- * Exactly what the group holds: its thread's tools, its reminders,
- * `request_status` for a request the host was slow to answer, the `time_*`
- * calculators, which compute over the container's clock and reveal nothing,
- * and `files-read`, for the files that reached its thread (KTD9). No write
- * tools, shell, web, subagents, MCP servers, messages to destinations, or
+ * Exactly what the group holds: its thread's tools, `request_status` for a
+ * request the host was slow to answer, the `time_*` calculators, which
+ * compute over the container's clock and reveal nothing, and `files-read`,
+ * for the files that reached its thread (KTD9). No timers: main nudges a
+ * thread when its matter comes due (Slice 5 R15). No write tools, shell,
+ * web, subagents, MCP servers, messages to destinations, or
  * `conversation-context`: each of its sessions is sealed from every other,
  * and nothing of one thread lands in the folder its sessions share.
  */
@@ -67,7 +67,6 @@ export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
   'files-read',
   'time',
   'request-status',
-  REMINDERS_CAPABILITY,
   EXTERNAL_EMAIL_TOOLS_CAPABILITY,
 ];
 

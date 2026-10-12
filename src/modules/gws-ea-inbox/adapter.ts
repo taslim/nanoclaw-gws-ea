@@ -21,13 +21,15 @@
  *
  * Each poll also keeps the assistant's calendar list first: each principal
  * address's calendar in it, its access recorded, and notifications on for
- * the principal's calendars (calendar-notifications.ts). Calendar's
- * notifications, and Docs' and Drive's, each become one note for `main`
- * after the poll's messages are routed; Drive failing as that note is
- * written costs the note detail, never the poll.
+ * the principal's calendars (calendar-notifications.ts). The mail that waits
+ * for main to place its thread or hand it over, Calendar's notifications,
+ * and Docs' and Drive's each become one note for `main` after the poll's
+ * messages are routed; Drive failing as that note is written costs the note
+ * detail, never the poll.
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
+import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import type { DriveApi } from '../gws-ea-workspace/drive-api.js';
 import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import { syncCalendarList, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
@@ -48,7 +50,14 @@ import { parseGmailMessage, type ParsedMail } from './mime.js';
 import { noticeSetAside } from './notices.js';
 import { sendToOutside } from './outbound.js';
 import { sendToPrincipal } from './principal-reply.js';
-import { loadRoutingContext, routeMail, writeCalendarNote, type RoutingContext } from './route-mail.js';
+import {
+  loadRoutingContext,
+  routeMail,
+  writeCalendarNote,
+  writeHeldNote,
+  type HeldMail,
+  type RoutingContext,
+} from './route-mail.js';
 import {
   activeInbox,
   assistantAddresses,
@@ -87,6 +96,8 @@ export const EMAIL_CHANNEL_DEFAULTS: ChannelDefaults = { dm: EMAIL_CONTEXT, grou
 export interface InboxDeps {
   readonly gmail: GmailApi;
   readonly calendar: CalendarListApi;
+  /** The principal's events as the host's own Calendar token reads them, for who organized a new one. */
+  readonly events: Pick<MeetingsCalendarApi, 'getEvent'>;
   /** Drive as the host's own Drive token reaches it, for the details of Docs and Drive activity. */
   readonly drive: DriveApi;
   readonly now?: () => Date;
@@ -141,6 +152,7 @@ export function createInbox(deps: InboxDeps): Inbox {
    */
   async function routeBatch(ids: readonly string[], context: RoutingContext, limited: boolean): Promise<boolean> {
     const at = context.at.toISOString();
+    const held: { gmailMessageId: string; held: HeldMail }[] = [];
     const calendar: { gmailMessageId: string; notice: CalendarNotice }[] = [];
     const workspace: { gmailMessageId: string; notice: WorkspaceNotice }[] = [];
     let complete = true;
@@ -177,7 +189,8 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       try {
         const routed = await routeMail(mail, runtime, context, { limited });
-        if (routed.kind === 'calendar') calendar.push({ gmailMessageId: id, notice: routed.notice });
+        if (routed.kind === 'held') held.push({ gmailMessageId: id, held: routed.held });
+        else if (routed.kind === 'calendar') calendar.push({ gmailMessageId: id, notice: routed.notice });
         else if (routed.kind === 'workspace') workspace.push({ gmailMessageId: id, notice: routed.notice });
         else await settleMessage(id, routed.outcome, at);
       } catch (error) {
@@ -207,7 +220,8 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       /* eslint-enable no-catch-all/no-catch-all */
     };
-    await writeBatch(calendar, () => writeCalendarNote(calendar, context.at), 'calendar-note');
+    await writeBatch(held, () => writeHeldNote(held, context.at), 'outside');
+    await writeBatch(calendar, () => writeCalendarNote(calendar, deps.events, context.at), 'calendar-note');
     await writeBatch(workspace, () => writeWorkspaceNote(workspace, deps.drive, context.at), 'workspace-note');
     if (setAside.length > 0) await noticeSetAside(setAside);
     return complete;

@@ -227,8 +227,9 @@ interface InboundRow {
   readonly status: string | null;
 }
 
-const WAITING = new Set(['pending', 'processing']);
-const UNFINISHED = new Set(['pending', 'processing', 'paused']);
+// A held message waits for a module to release it, and runs once released.
+const WAITING = new Set(['pending', 'processing', 'held']);
+const UNFINISHED = new Set(['pending', 'processing', 'paused', 'held']);
 
 function columnsOf(database: Database.Database, table: string): Set<string> {
   return new Set(

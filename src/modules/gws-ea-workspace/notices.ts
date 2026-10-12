@@ -15,7 +15,8 @@
  *   details, never the poll, and once Drive is unavailable the rest of the
  *   note goes without it. What the principal's addresses did comes first,
  *   and notices past the cap are only counted, so a flood costs a bounded
- *   number of Drive reads and one bounded note.
+ *   number of Drive reads and one bounded note. The open matter of each file
+ *   it lists comes with it (KTD11).
  * - A share carries the principal's words only when Drive confirms it: the
  *   email is to the assistant and its links name one file; Google's Reply-To
  *   is the account Drive says shared that file; that account is one the home
@@ -25,7 +26,8 @@
  *   listed. Titles, whom Google says acted, and anyone else's words reach
  *   `main` framed untrusted.
  *
- * A leaf (KTD4): it loads no module's entry point.
+ * A leaf (KTD4): it loads no module's entry point but the shared Google
+ * helpers', through the note writer.
  */
 import { createHash } from 'node:crypto';
 
@@ -36,7 +38,7 @@ import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { headerValues, oneLine, parseAddressList, type Mailbox, type ParsedMail } from '../gws-ea-inbox/mime.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
-import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { writeNoteForMain, type NotePiece } from '../gws-ea-profile/main-note.js';
 import { listFolderGrants } from './db.js';
 import type { DriveAccessProposal, DriveApi, DriveFile } from './drive-api.js';
 
@@ -478,6 +480,48 @@ function describe(notice: WorkspaceNotice, reader: NoteReader, context: NoticeCo
 }
 
 /**
+ * The notices one note lists: each once, what the principal's addresses did
+ * first, at most `MAX_NOTE_ITEMS`; and how many it leaves out.
+ */
+function noteNotices(
+  notices: readonly WorkspaceNotice[],
+  context: NoticeContext,
+): { readonly listed: readonly WorkspaceNotice[]; readonly rest: number } {
+  const unique = [
+    ...new Map(
+      notices.map((notice) => [`${notice.activity}\u0000${notice.fileId}\u0000${notice.commentId ?? ''}`, notice]),
+    ).values(),
+  ];
+  const byPrincipal = (notice: WorkspaceNotice): boolean => context.principalAddresses.has(notice.actor?.address);
+  const ordered = [...unique.filter(byPrincipal), ...unique.filter((notice) => !byPrincipal(notice))];
+  return { listed: ordered.slice(0, MAX_NOTE_ITEMS), rest: Math.max(0, ordered.length - MAX_NOTE_ITEMS) };
+}
+
+/**
+ * The files a note lists notices of, for their open matters to come with it
+ * (KTD11). A share or a comment brings its file new: in no open matter, the
+ * note suggests the open matters it may belong to (KTD10) from whom Google
+ * names as having acted, its Reply-To in mail Gmail verified Google sent.
+ * Drive itself names no comment's author by address.
+ */
+export function workspaceNotePieces(notices: readonly WorkspaceNotice[], context: NoticeContext): NotePiece[] {
+  return noteNotices(notices, context).listed.map((notice): NotePiece => {
+    switch (notice.activity) {
+      case 'share':
+      case 'comment':
+        return { kind: 'file', reference: notice.fileId, arrival: { from: notice.actor?.address } };
+      case 'access-request':
+      case 'other':
+        return { kind: 'file', reference: notice.fileId };
+      default: {
+        const unreachable: never = notice.activity;
+        throw new Error(`Unknown Docs or Drive activity: ${String(unreachable)}`);
+      }
+    }
+  });
+}
+
+/**
  * One poll's notices as the note `main` reads: each once, what the
  * principal's addresses did first, at most `MAX_NOTE_ITEMS` of them read from
  * Drive and the rest counted.
@@ -487,18 +531,10 @@ export async function workspaceNoteText(
   drive: DriveApi,
   context: NoticeContext,
 ): Promise<string> {
-  const unique = [
-    ...new Map(
-      notices.map((notice) => [`${notice.activity}\u0000${notice.fileId}\u0000${notice.commentId ?? ''}`, notice]),
-    ).values(),
-  ];
-  const byPrincipal = (notice: WorkspaceNotice): boolean => context.principalAddresses.has(notice.actor?.address);
-  const ordered = [...unique.filter(byPrincipal), ...unique.filter((notice) => !byPrincipal(notice))];
-  const listed = ordered.slice(0, MAX_NOTE_ITEMS);
+  const { listed, rest } = noteNotices(notices, context);
   const reader = noteReader(drive);
   const items: string[] = [];
   for (const notice of listed) items.push(await describe(notice, reader, context));
-  const rest = ordered.length - listed.length;
   return [
     'Google Docs and Drive report activity on files you can see:',
     ...items,
@@ -511,17 +547,19 @@ export async function workspaceNoteText(
   ].join('\n');
 }
 
-/** One note for every Docs and Drive notification of a poll, waking `main`. Throws only when it cannot be written. */
+/**
+ * One note for every Docs and Drive notification of a poll, waking `main`,
+ * with the open matters of the files it lists. Throws only when it cannot be
+ * written.
+ */
 export async function writeWorkspaceNote(
   entries: readonly { readonly gmailMessageId: string; readonly notice: WorkspaceNotice }[],
   drive: DriveApi,
   at: Date,
 ): Promise<void> {
-  const text = await workspaceNoteText(
-    entries.map((entry) => entry.notice),
-    drive,
-    await loadNoticeContext(),
-  );
+  const notices = entries.map((entry) => entry.notice);
+  const context = await loadNoticeContext();
+  const text = await workspaceNoteText(notices, drive, context);
   const batch = createHash('sha256')
     .update(
       entries
@@ -536,6 +574,7 @@ export async function writeWorkspaceNote(
     timestamp: at.toISOString(),
     text,
     wake: true,
+    pieces: workspaceNotePieces(notices, context),
   });
   if (result === 'no-main' || result === 'no-principal') {
     throw new Error('The inbox has no main agent or no principal direct message to report to');

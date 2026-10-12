@@ -9,7 +9,17 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { ensureSchema, getInboundSourceSessionId, migrateMessagesInTable, syncProcessingAcks } from './session-db.js';
+import {
+  countDueMessages,
+  countUnreadContext,
+  ensureSchema,
+  getInboundSourceSessionId,
+  insertMessage,
+  migrateMessagesInTable,
+  releaseHeldMessages,
+  settleHeldMessages,
+  syncProcessingAcks,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -152,5 +162,131 @@ describe('syncProcessingAcks — script-skip counter', () => {
     syncProcessingAcks(inDb, outDb);
 
     expect(status(inDb, 't1')).toBe('completed');
+  });
+});
+
+describe('held messages', () => {
+  function freshInbound(): InstanceType<typeof Database> {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    return new Database(DB_PATH);
+  }
+
+  function write(
+    db: InstanceType<typeof Database>,
+    id: string,
+    options: { status?: 'pending' | 'held'; trigger?: boolean } = {},
+  ): void {
+    insertMessage(db, {
+      id,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: 'email:inbox',
+      channelType: 'email',
+      threadId: 'thread-noel-archer',
+      content: JSON.stringify({ sender: 'Noel Archer', text: 'Following up on the proposal' }),
+      processAfter: null,
+      recurrence: null,
+      trigger: options.trigger ?? true,
+      ...(options.status ? { status: options.status } : {}),
+    });
+  }
+
+  const row = (db: InstanceType<typeof Database>, id: string) =>
+    db.prepare('SELECT status, trigger, process_after FROM messages_in WHERE id = ?').get(id) as {
+      status: string;
+      trigger: number;
+      process_after: string | null;
+    };
+
+  it('stores a held message that is never due', () => {
+    const db = freshInbound();
+    write(db, 'held-1', { status: 'held' });
+
+    expect(row(db, 'held-1')).toEqual({ status: 'held', trigger: 1, process_after: null });
+    expect(countDueMessages(db)).toBe(0);
+    db.close();
+  });
+
+  it('releases every held message as a trigger due at the time given, and says how many', () => {
+    const db = freshInbound();
+    write(db, 'held-1', { status: 'held' });
+    write(db, 'held-2', { status: 'held', trigger: false });
+    write(db, 'ambient', { trigger: false });
+    const due = new Date(Date.now() - 1000).toISOString();
+
+    expect(releaseHeldMessages(db, due)).toBe(2);
+
+    expect(row(db, 'held-1')).toEqual({ status: 'pending', trigger: 1, process_after: due });
+    expect(row(db, 'held-2')).toEqual({ status: 'pending', trigger: 1, process_after: due });
+    expect(row(db, 'ambient')).toEqual({ status: 'pending', trigger: 0, process_after: null });
+    expect(countDueMessages(db)).toBe(2);
+    expect(releaseHeldMessages(db, null)).toBe(0);
+    db.close();
+  });
+
+  it('refuses a release time that is not an ISO-8601 UTC timestamp, releasing nothing', () => {
+    const db = freshInbound();
+    write(db, 'held-1', { status: 'held' });
+
+    expect(() => releaseHeldMessages(db, '2026-10-12 09:00:00')).toThrow('invalid ISO-8601 UTC timestamp');
+    expect(row(db, 'held-1').status).toBe('held');
+    db.close();
+  });
+
+  it('settles every held message unread, so no release brings it back, and says how many', () => {
+    const db = freshInbound();
+    write(db, 'held-1', { status: 'held' });
+    write(db, 'held-2', { status: 'held', trigger: false });
+    write(db, 'waiting');
+
+    expect(settleHeldMessages(db)).toBe(2);
+
+    expect(row(db, 'held-1')).toEqual({ status: 'completed', trigger: 1, process_after: null });
+    expect(row(db, 'held-2')).toEqual({ status: 'completed', trigger: 0, process_after: null });
+    expect(row(db, 'waiting')).toEqual({ status: 'pending', trigger: 1, process_after: null });
+    expect(releaseHeldMessages(db, null)).toBe(0);
+    expect(settleHeldMessages(db)).toBe(0);
+    expect(countDueMessages(db)).toBe(1);
+    db.close();
+  });
+});
+
+describe('unread context', () => {
+  it('counts the due rows that wake nothing, leaving out triggers, rows read or not yet due, and the channel named', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    const db = new Database(DB_PATH);
+    const write = (
+      id: string,
+      options: { trigger: boolean; channelType?: string; processAfter?: string; status?: 'held' },
+    ): void =>
+      insertMessage(db, {
+        id,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: 'chat:dm-morgan',
+        channelType: options.channelType ?? 'chat',
+        threadId: null,
+        content: JSON.stringify({ sender: 'system', text: 'Calendar access to the work calendar dropped.' }),
+        processAfter: options.processAfter ?? null,
+        recurrence: null,
+        trigger: options.trigger,
+        ...(options.status ? { status: options.status } : {}),
+      });
+
+    write('note-due', { trigger: false });
+    write('note-past', { trigger: false, processAfter: new Date(Date.now() - 60_000).toISOString() });
+    write('note-ahead', { trigger: false, processAfter: new Date(Date.now() + 3_600_000).toISOString() });
+    write('note-read', { trigger: false });
+    write('echo', { trigger: false, channelType: 'session-echo' });
+    write('message', { trigger: true });
+    write('held', { trigger: false, status: 'held' });
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'note-read'").run();
+
+    expect(countUnreadContext(db, 'session-echo')).toBe(2);
+    db.close();
   });
 });

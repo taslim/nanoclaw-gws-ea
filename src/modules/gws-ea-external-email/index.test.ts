@@ -50,16 +50,7 @@ import '../gws-ea-preferences/index.js';
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 /** The tools external-email holds: the only ones its guidance may name. */
-const ITS_TOOLS = [
-  'free_time',
-  'book',
-  'change_booking',
-  'cancel_booking',
-  'email_send',
-  'tell_main',
-  'remind_me',
-  'clear_reminder',
-];
+const ITS_TOOLS = ['free_time', 'book', 'change_booking', 'cancel_booking', 'email_send', 'tell_main'];
 
 const GUIDANCE_TEXT = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8');
 
@@ -134,7 +125,7 @@ describe('the contract other units build on', () => {
     expect(resolveCapabilities('all', 'any')).toContain(MAIN_EMAIL_CAPABILITY);
     expect(resolveCapabilities('all', 'any')).not.toContain(EXTERNAL_EMAIL_TOOLS_CAPABILITY);
     expect([...EXTERNAL_EMAIL_CAPABILITIES].sort()).toEqual(
-      ['files-read', 'gws-ea-email-external', 'gws-ea-reminders', 'request-status', 'time'].sort(),
+      ['files-read', 'gws-ea-email-external', 'request-status', 'time'].sort(),
     );
     for (const key of EXTERNAL_EMAIL_CAPABILITIES) expect(listCapabilityKeys()).toContain(key);
   });
@@ -236,7 +227,6 @@ describe("external-email's project document", () => {
       '# External Email',
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: gws-ea-email-external',
-      '# NanoClaw Module: reminders',
       '# NanoClaw Module: time',
     ]);
     expect(composed.get('# Assistant Identity')).toBe(
@@ -306,6 +296,10 @@ describe("external-email's project document", () => {
       (span, index) => index % 2 === 1 && /^[a-z]+(?:_[a-z]+)*$/u.test(span),
     );
     for (const name of named) expect(ITS_TOOLS, name).toContain(name);
+  });
+
+  it('teaches it to leave main an account of its thread with `tell_main`, since it keeps no timers', () => {
+    expect(GUIDANCE_TEXT).toMatch(/`tell_main`[^.]*\baccount\b/u);
   });
 });
 

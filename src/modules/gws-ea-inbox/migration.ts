@@ -254,3 +254,49 @@ export const gwsEaInboxCalendarAccessMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * The account the agent working a thread last left on it (Slice 5 R7, KTD9):
+ * what it did, what it learned that no source records, and where the thread
+ * stands, in its words, with when it left it. Each account replaces the one
+ * before, and a thread has none until its agent leaves one.
+ */
+export const gwsEaInboxThreadAccountsMigration: ModuleMigration = {
+  version: 7,
+  name: 'module:gws-ea-inbox:thread-accounts',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_threads ADD COLUMN account TEXT CHECK (account <> '');
+      ALTER TABLE gws_ea_threads ADD COLUMN account_at TEXT CHECK ((account IS NULL) = (account_at IS NULL));
+    `);
+  },
+};
+
+/**
+ * Where `main` placed each thread (Slice 5 R9, R27, KTD8), and whether it
+ * handed the thread over to `external-email`, which reads the thread's mail
+ * only once it has; until then each email waits, held.
+ *
+ * - `placement`: `unplaced` until main places it, in an open matter
+ *   (`matter`), or `nowhere`, which is also where a thread is left once its
+ *   matter closes. A thread is never handed over before main places it.
+ * - `released`: main handed it over. A thread main starts is placed and
+ *   handed over as it begins, and every thread an earlier release had was
+ *   already external-email's.
+ * - `placement_note`: the note that last asked main to place it, so the host
+ *   asks again only once main has read that one.
+ */
+export const gwsEaInboxThreadPlacementMigration: ModuleMigration = {
+  version: 8,
+  name: 'module:gws-ea-inbox:thread-placement',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_threads ADD COLUMN placement TEXT NOT NULL DEFAULT 'unplaced'
+        CHECK (placement IN ('unplaced', 'matter', 'nowhere'));
+      ALTER TABLE gws_ea_threads ADD COLUMN released INTEGER NOT NULL DEFAULT 0
+        CHECK (released IN (0, 1) AND (released = 0 OR placement <> 'unplaced'));
+      ALTER TABLE gws_ea_threads ADD COLUMN placement_note TEXT CHECK (placement_note <> '');
+      UPDATE gws_ea_threads SET placement = 'nowhere', released = 1;
+    `);
+  },
+};

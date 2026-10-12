@@ -906,8 +906,8 @@ MCP tools write to the container's own `outbound.db`. Anything that needs a chan
 
 **Scheduling**: scheduled-task management is not an MCP surface — it lives on
 `ncl tasks` (create/list/get/update/cancel/pause/resume/run/append-log). Due
-task rows live in the agent group's system session and are woken by the host
-sweep.
+task rows live in their own task session, or with `--in-conversation` in the
+conversation that created them, and are woken by the host sweep.
 
 **Central-DB / self-modification** (`kind: 'system'` actions; host authorizes, often via admin approval):
 

@@ -1,8 +1,9 @@
 # Scheduled Tasks
 
 Scheduled tasks run an agent prompt at a future time or on a recurring cron
-schedule. Each task belongs to an agent group and runs in its own system
-session, separate from normal chat sessions.
+schedule. Each task belongs to an agent group. By default it runs in its own
+system session, separate from normal chat sessions; an agent can instead ask
+for a task that comes back as a turn of the conversation it is in.
 
 Run `ncl tasks create --help` for the complete and current CLI reference.
 
@@ -39,14 +40,35 @@ ncl tasks create \
 `--process-after` accepts an ISO 8601 timestamp or a local time interpreted in
 the installation timezone.
 
+## Come back to a conversation
+
+Inside an agent container, `--in-conversation` puts the task in the
+conversation the agent is in instead of a session of its own:
+
+```bash
+ncl tasks create \
+  --in-conversation \
+  --name "venue check" \
+  --process-after "2026-07-14T09:00:00+03:00" \
+  --prompt "Ask whether the venue confirmed for Thursday"
+```
+
+When it fires, the agent reads it as a `<task>` in that conversation and
+answers it like any other message there: its `<message>` blocks are delivered,
+a failed turn is reported as for any message, and prose outside a block stays
+private, so a task with nothing to say sends nothing. It can repeat, and it is
+listed and managed like any other task. NanoClaw takes the conversation from
+the request itself, never from an argument, and refuses the flag inside a task
+run, which has no conversation, and from the host.
+
 ## Delivery and run logs
 
-A scheduled task has no chat attached to it. If its result should reach a
-user, the prompt must tell the agent where to send it. Use a destination name
-available to that agent, such as `telegram` or `team-slack`.
+A task in its own session has no chat attached to it. If its result should
+reach a user, the prompt must tell the agent where to send it. Use a
+destination name available to that agent, such as `telegram` or `team-slack`.
 
-NanoClaw also asks the agent to append a short work-log entry after each agent
-run. View run counts, failures, and recent log entries with:
+For a task in its own session, NanoClaw also keeps a short work-log entry from
+each agent run. View run counts, failures, and recent log entries with:
 
 ```bash
 ncl tasks get <task-id> --group <agent-group-id>
@@ -64,7 +86,9 @@ ncl tasks delete <task-id> --group <agent-group-id>
 ```
 
 `cancel` stops the live task but keeps its history. `delete` permanently removes
-the whole task series and its history.
+the whole task series and its history. A task in its own session can't be
+deleted while that session's container is running; a task in a conversation
+can't be deleted only while it is being processed.
 
 To test a task immediately without changing its schedule:
 
