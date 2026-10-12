@@ -37,6 +37,7 @@ import { keepRelease, keptReleaseFiles } from './kept-release.js';
 import { createOnecliAdmin } from './onecli-admin.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
+import { storeGoogleOAuthClient, writeGoogleGrant } from './google-oauth.js';
 import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
@@ -47,6 +48,8 @@ import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
+  googleGrantFile,
+  googleOAuthClientFile,
   instanceHostConfiguration,
   instanceServiceDefinitionFile,
   loadInstanceRuntimeConfig,
@@ -1534,42 +1537,79 @@ describe('production provision step composition', () => {
     });
   });
 
-  it("pauses for the Chat API configuration alone once the sign-in has its client: the assistant's name, avatar, and description, with interactive features off", async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation());
+  /** The ways the assistant's sign-in can already have its client, so the Chat pause need not ask for it. */
+  const SIGN_IN_CLIENT_READY: ReadonlyArray<
+    readonly [string, (context: ProductionProvisionContext) => Promise<ProductionProvisionContext>]
+  > = [
+    [
+      'is given on this run',
+      async (context) => ({
+        ...context,
+        input: { ...context.input, google: { ...context.input.google, clientFile: '/downloads/client.json' } },
+      }),
+    ],
+    [
+      'was kept from an earlier run',
+      async (context) => {
+        await storeGoogleOAuthClient(googleOAuthClientFile(context.input.runtime), {
+          client_id: '123-abc.apps.googleusercontent.com',
+          client_secret: 'GOCSPX-desktop-secret',
+        });
+        return context;
+      },
+    ],
+    [
+      'already signed the assistant in',
+      async (context) => {
+        await writeGoogleGrant(googleGrantFile(context.input.runtime), {
+          schema_version: 3,
+          account: context.input.google.assistantWorkspaceEmail,
+          sub: '104857395723948572901',
+          client_id: '123-abc.apps.googleusercontent.com',
+          client_secret: 'GOCSPX-desktop-secret',
+          consents: [{ refresh_token: '1//refresh-token', scopes: ['openid'] }],
+          granted_at: '2026-10-12T00:00:00.000Z',
+        });
+        return context;
+      },
+    ],
+  ];
 
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: { ...base.input, google: { ...base.input.google, clientFile: '/downloads/client.json' } },
-      };
-      const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+  it.each(SIGN_IN_CLIENT_READY)(
+    "pauses for the Chat API configuration alone once the sign-in's client %s: the assistant's name, avatar, and description, with interactive features off",
+    async (_label, ready) => {
+      const paths = await testPaths();
+      const reserved = await reserveInstance(paths, reservation());
 
-      const observed = await phase.observe(context);
-      expect(observed).toEqual({
-        status: 'pause',
-        pause: {
-          kind: 'human-action',
-          phase: 'configure_channel',
-          code: 'chat_configuration_required',
-          message: "Configure the Google Chat API for this assistant's project, then confirm it.",
-          details: [
-            'App name: Aya',
-            'Avatar URL: a public HTTPS image of the assistant',
-            'Description: a short line, such as "Executive assistant to Principal"',
-            'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
-          ],
-          actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
-          resumeFlag: '--chat-configured',
-        },
+      await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const context = await ready(productionContext(operation, reserved));
+        const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
+
+        const observed = await phase.observe(context);
+        expect(observed).toEqual({
+          status: 'pause',
+          pause: {
+            kind: 'human-action',
+            phase: 'configure_channel',
+            code: 'chat_configuration_required',
+            message: "Configure the Google Chat API for this assistant's project, then confirm it.",
+            details: [
+              'App name: Aya',
+              'Avatar URL: a public HTTPS image of the assistant',
+              'Description: a short line, such as "Executive assistant to Principal"',
+              'Turn interactive features off: the assistant talks in Chat as its own account, not as a Chat app.',
+            ],
+            actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
+            resumeFlag: '--chat-configured',
+          },
+        });
+        // No endpoint, callback, or add-on: Chat's events are pulled.
+        const shown = JSON.stringify(observed);
+        expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
+        await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
       });
-      // No endpoint, callback, or add-on: Chat's events are pulled.
-      const shown = JSON.stringify(observed);
-      expect(shown).not.toMatch(/endpoint|webhook|https:\/\/assistant|add-on|visibility/iu);
-      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'chat_configuration_required' });
-    });
-  });
+    },
+  );
 
   it("takes the operator's confirmation as the Chat configuration", async () => {
     const paths = await testPaths();
