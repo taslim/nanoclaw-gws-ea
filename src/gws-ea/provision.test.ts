@@ -165,8 +165,9 @@ afterEach(async () => {
 const DM_PAUSE: ProvisionHumanPause = {
   kind: 'human-action',
   phase: 'bind_principal',
-  code: 'principal_chat_request_pending',
-  message: "Juno Hale must accept the assistant's chat request in Google Chat, then resume.",
+  code: 'google_chat_unavailable',
+  message:
+    'Google Chat did not answer while the assistant opened its direct message with Juno Hale. Resume to try again.',
 };
 
 /** An in-memory world of named resources for exercising the step engine. */
@@ -2005,8 +2006,8 @@ interface ProductionHarness {
   readonly sleeps: number[];
   providerCredential: boolean;
   chatConfigured: boolean;
-  /** What opening the principal's DM finds: they have not accepted it yet, Google does not answer, or it opens. */
-  principal: 'awaiting_acceptance' | 'unavailable' | 'bound';
+  /** What opening the principal's DM finds: Google does not answer, or it opens. */
+  principal: 'unavailable' | 'bound';
   /** The address each bind opened the DM with, and the moment it bound them at. */
   readonly binds: Array<{ readonly chatEmail: string; readonly verifiedAt: string }>;
   conversationReady: boolean;
@@ -2075,7 +2076,7 @@ async function productionHarness(): Promise<ProductionHarness> {
     crashAfterBinding: false,
     providerCredential: true,
     chatConfigured: true,
-    principal: 'awaiting_acceptance',
+    principal: 'unavailable',
     binds: [],
     conversationReady: true,
     conversationReasons: [],
@@ -2190,9 +2191,6 @@ async function productionHarness(): Promise<ProductionHarness> {
           bindPrincipal: async (_runtime, input) => {
             harness.effects.push(`bindPrincipal:${harness.principal}`);
             harness.binds.push({ chatEmail: input.chatEmail, verifiedAt: input.verifiedAt });
-            if (harness.principal === 'awaiting_acceptance') {
-              return { status: 'awaiting_acceptance', space: 'spaces/dm-2001' };
-            }
             if (harness.principal === 'unavailable') {
               return { status: 'unavailable', reason: 'Google refused /v1/spaces:setup: Backend error' };
             }
@@ -2260,16 +2258,10 @@ describe('production step order and pause outcomes', () => {
   it("signs in before the host starts, connects agents' access after it, then binds the principal through the DM the assistant opens", async () => {
     const harness = await productionHarness();
 
-    // A principal outside the assistant's organization must accept its DM first.
+    // Google Chat does not answer the first time the assistant opens the principal's DM.
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: {
-        phase: 'bind_principal',
-        code: 'principal_chat_request_pending',
-        message:
-          "Principal is outside the assistant's Google Workspace organization, so Google Chat shows them its " +
-          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
-      },
+      pause: { phase: 'bind_principal', code: 'google_chat_unavailable' },
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
@@ -2281,7 +2273,7 @@ describe('production step order and pause outcomes', () => {
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'connectGoogle',
-      'bindPrincipal:awaiting_acceptance',
+      'bindPrincipal:unavailable',
     ]);
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
@@ -2327,7 +2319,7 @@ describe('production step order and pause outcomes', () => {
     harness.chatConfigured = true;
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { phase: 'bind_principal', code: 'principal_chat_request_pending' },
+      pause: { phase: 'bind_principal', code: 'google_chat_unavailable' },
     });
   });
 
@@ -2384,7 +2376,7 @@ describe('production step order and pause outcomes', () => {
       status: 'paused',
       pause: {
         phase: 'bind_principal',
-        code: 'principal_chat_request_pending',
+        code: 'google_chat_unavailable',
         details: ['Principal: Principal (principal@example.test)', `No errors logged since ${began} in ${errorLog}`],
       },
     });
@@ -2462,7 +2454,9 @@ describe('production step order and pause outcomes', () => {
     expect(paused.pause).toMatchObject({
       phase: 'verify_conversation',
       code: 'later_principal_message_missing',
-      message: "Ask the principal to reply to the assistant's welcome in Google Chat.",
+      message:
+        "Ask the principal to reply to the assistant's welcome in Google Chat. If they are outside the " +
+        "assistant's Google Workspace organization, it reaches them as a message request to accept first.",
     });
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
 

@@ -514,7 +514,9 @@ const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> 
   session_not_ready:
     "The assistant has not opened the principal's conversation yet; check the errors below, then resume.",
   welcome_not_delivered: 'The assistant has not delivered its welcome; check the errors below, then resume.',
-  later_principal_message_missing: "Ask the principal to reply to the assistant's welcome in Google Chat.",
+  later_principal_message_missing:
+    "Ask the principal to reply to the assistant's welcome in Google Chat. If they are outside the assistant's " +
+    'Google Workspace organization, it reaches them as a message request to accept first.',
   reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
 };
 
@@ -556,15 +558,6 @@ async function principalResult(
 ): Promise<ProvisionHumanPause | undefined> {
   const name = context.input.principalDisplayName;
   switch (result.status) {
-    case 'awaiting_acceptance':
-      return principalPause(
-        context,
-        'bind_principal',
-        'principal_chat_request_pending',
-        `${name} is outside the assistant's Google Workspace organization, so Google Chat shows them its ` +
-          'direct message as a request. Ask them to accept it in Google Chat, then resume.',
-        unboundPrincipal(context.input),
-      );
     case 'unavailable':
       return principalPause(
         context,
