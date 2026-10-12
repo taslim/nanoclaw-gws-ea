@@ -291,9 +291,9 @@ function abbreviated(args: string): string {
 function summarizeHolders(holders: readonly OpenFileHolder[]): string {
   const processes = new Map<number, { command: string; files: Set<string> }>();
   for (const holder of holders) {
-    const process = processes.get(holder.pid) ?? { command: holder.command, files: new Set<string>() };
-    process.files.add(holder.file);
-    processes.set(holder.pid, process);
+    const held = processes.get(holder.pid) ?? { command: holder.command, files: new Set<string>() };
+    held.files.add(holder.file);
+    processes.set(holder.pid, held);
   }
   return [...processes]
     .map(([pid, { command, files }]) => {
