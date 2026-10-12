@@ -149,7 +149,7 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
     async googleWorkspaceSignIn(url, account) {
       p.note(
         [
-          `Next, sign in to Google as ${account}, the assistant's own account, and allow every permission.`,
+          `Next, sign in to Google as ${account}, the assistant's own account, and allow every permission on each screen Google shows.`,
           'Use a browser window where you can sign in as the assistant, such as a private window or a browser profile for it.',
           formatNoteLink(url),
         ]

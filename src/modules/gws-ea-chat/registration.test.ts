@@ -47,13 +47,12 @@ afterEach(() => {
 function writeGrant(fields: Record<string, unknown> = {}): string {
   const file = path.join(root, 'google-grant.json');
   const grant = {
-    schema_version: 2,
+    schema_version: 3,
     account: 'morgan.ellery@northwind.example',
     sub: ASSISTANT_SUB,
     client_id: 'client.apps.googleusercontent.com',
     client_secret: 'GOCSPX-client-secret',
-    refresh_token: '1//refresh-token',
-    scopes: [...GOOGLE_SIGN_IN_SCOPES],
+    consents: [{ refresh_token: '1//refresh-token', scopes: [...GOOGLE_SIGN_IN_SCOPES] }],
     granted_at: '2026-10-10T09:00:00.000Z',
     ...fields,
   };

@@ -27,20 +27,21 @@ const NO_ACCOUNT = 'morgan@nowhere.example';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 
 const GRANT: GoogleGrant = {
-  schema_version: 2,
+  schema_version: 3,
   account: ASSISTANT,
   sub: '104857395723948572901',
   client_id: 'client-id',
   client_secret: 'client-secret',
-  refresh_token: 'refresh-token',
-  scopes: [...GOOGLE_SIGN_IN_SCOPES],
+  consents: [{ refresh_token: 'refresh-token', scopes: [...GOOGLE_SIGN_IN_SCOPES] }],
   granted_at: AT,
 };
 
 /** A sign-in from before Workspace: every scope but Drive's. */
 const OLD_GRANT: GoogleGrant = {
   ...GRANT,
-  scopes: GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== DRIVE_SCOPE),
+  consents: [
+    { refresh_token: 'refresh-token', scopes: GOOGLE_SIGN_IN_SCOPES.filter((scope) => scope !== DRIVE_SCOPE) },
+  ],
   granted_at: '2026-10-01T09:00:00.000Z',
 };
 

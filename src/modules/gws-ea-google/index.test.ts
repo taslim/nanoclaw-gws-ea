@@ -139,13 +139,12 @@ function gogSettingsAtSpawn(capabilities: readonly string[], agentGroupId = 'ag-
 function writeGrantFile(): void {
   fs.mkdirSync(path.dirname(GRANT_FILE), { recursive: true, mode: 0o700 });
   const grant = {
-    schema_version: 2,
+    schema_version: 3,
     account: 'juno@northwind.example',
     sub: ASSISTANT_SUB,
     client_id: 'client.apps.googleusercontent.com',
     client_secret: 'GOCSPX-client-secret',
-    refresh_token: '1//refresh-token',
-    scopes: [...GOOGLE_SIGN_IN_SCOPES],
+    consents: [{ refresh_token: '1//refresh-token', scopes: [...GOOGLE_SIGN_IN_SCOPES] }],
     granted_at: '2026-10-10T09:00:00.000Z',
   };
   fs.writeFileSync(GRANT_FILE, JSON.stringify(grant), { mode: 0o600 });

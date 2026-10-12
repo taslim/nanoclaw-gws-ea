@@ -16,9 +16,11 @@ import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import {
   GOOGLE_GRANT_SCHEMA_VERSION,
-  GOOGLE_SIGN_IN_SCOPES,
+  GOOGLE_SIGN_IN_CONSENTS,
   isGoogleAccountId,
   missingGoogleScopes,
+  scopesOfGrant,
+  type GoogleConsent,
   type GoogleGrant,
 } from '../modules/gws-ea-google/grant.js';
 import { GOOGLE_TOKEN_ENDPOINT } from '../modules/gws-ea-google/tokens.js';
@@ -120,7 +122,7 @@ export async function readStoredGoogleOAuthClient(file: string): Promise<GoogleO
 /** Write the grant owner-only and atomically, registering its secrets first. */
 export async function writeGoogleGrant(file: string, grant: GoogleGrant): Promise<void> {
   registerSecret(grant.client_secret);
-  registerSecret(grant.refresh_token);
+  for (const consent of grant.consents) registerSecret(consent.refresh_token);
   await writePrivate(file, grant);
 }
 
@@ -128,7 +130,7 @@ export interface AssistantSignInInput {
   readonly client: GoogleOAuthClient;
   /** The declared Workspace address; any other account is refused. */
   readonly account: string;
-  /** Show the operator the consent URL and open it once they are ready; the time limit starts after. */
+  /** Show the operator the sign-in link and open it once they are ready; the time limit starts after. */
   readonly present: (url: string) => Promise<void>;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
@@ -142,47 +144,108 @@ function signInFailed(message: string): GwsEaError {
 const CALLBACK_PAGE = (heading: string): string =>
   `<!doctype html><meta charset="utf-8"><title>${heading}</title><p>${heading} You can close this tab.</p>`;
 
+/** One consent's request to Google: its PKCE verifier, its state, and the consent URL. */
+interface ConsentRequest {
+  readonly verifier: string;
+  readonly state: string;
+  readonly url: string;
+}
+
+function consentRequest(
+  client: GoogleOAuthClient,
+  redirectUri: string,
+  account: string,
+  scopes: readonly string[],
+): ConsentRequest {
+  const verifier = randomBytes(48).toString('base64url');
+  const state = randomBytes(24).toString('base64url');
+  const authorization = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
+  authorization.search = new URLSearchParams({
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: scopes.join(' '),
+    code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+    code_challenge_method: 'S256',
+    state,
+    access_type: 'offline',
+    prompt: 'consent',
+    login_hint: account,
+  }).toString();
+  return { verifier, state, url: authorization.href };
+}
+
 /**
- * Google's redirect to the loopback server, resolving with its query. It
- * listens at once, so no redirect is missed, but the time limit starts only
- * at `arm`, once the operator is ready to sign in; `cancel` stops the wait.
- * Only a redirect carrying this sign-in's `state` ends the wait: any other
- * request to the port is refused, so another local process cannot cut the
+ * Google's redirects to the loopback server, one per consent, each resolving
+ * with its query. The sign-in link the operator opens, on a path only this
+ * sign-in knows, sends the browser to the first consent; each consent's
+ * redirect but the last sends it on to the next, and the last shows how the
+ * sign-in went. It listens at once, so no redirect is missed, but the time
+ * limit, for the whole sign-in, starts only at `arm`, once the operator is
+ * ready to sign in; `cancel` stops the wait. Only a redirect carrying a
+ * consent's `state` counts: any other request to the port is refused, so
+ * another local process can neither learn a consent's `state` nor cut the
  * operator's sign-in short.
  */
-function awaitRedirect(
+function awaitRedirects(
   server: Server,
-  state: string,
+  consents: readonly ConsentRequest[],
   timeoutMs: number,
-): { readonly done: Promise<URLSearchParams>; arm(): void; cancel(): void } {
+): {
+  readonly signInPath: string;
+  readonly redirects: readonly Promise<URLSearchParams>[];
+  arm(): void;
+  cancel(): void;
+} {
+  const signInPath = `/sign-in/${randomBytes(24).toString('base64url')}`;
   let timer: NodeJS.Timeout | undefined;
-  let expire: (() => void) | undefined;
-  const done = new Promise<URLSearchParams>((resolve, reject) => {
-    expire = () =>
-      reject(new GwsEaError('google_sign_in_timeout', 'Google sign-in was not finished in time; run it again'));
-    server.on('request', (request, response) => {
-      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-      if (url.pathname !== '/' || (!url.searchParams.has('code') && !url.searchParams.has('error'))) {
-        response.writeHead(404).end();
-        return;
-      }
-      if (url.searchParams.get('state') !== state) {
-        response
-          .writeHead(400, { 'content-type': 'text/html; charset=utf-8' })
-          .end(CALLBACK_PAGE('This is not the sign-in gws-ea is waiting for.'));
-        return;
-      }
+  const waits = consents.map(() => {
+    let arrive: (query: URLSearchParams) => void = () => undefined;
+    let expire: (error: GwsEaError) => void = () => undefined;
+    const redirect = new Promise<URLSearchParams>((resolve, reject) => {
+      arrive = resolve;
+      expire = reject;
+    });
+    // A consent never reached, once an earlier one fails, leaves no unhandled rejection.
+    redirect.catch(() => undefined);
+    return { redirect, arrive, expire };
+  });
+  server.on('request', (request, response) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    const first = consents.at(0);
+    if (url.pathname === signInPath && first) {
+      response.writeHead(302, { location: first.url }).end();
+      return;
+    }
+    if (url.pathname !== '/' || (!url.searchParams.has('code') && !url.searchParams.has('error'))) {
+      response.writeHead(404).end();
+      return;
+    }
+    const index = consents.findIndex((consent) => consent.state === url.searchParams.get('state'));
+    if (index < 0) {
+      response
+        .writeHead(400, { 'content-type': 'text/html; charset=utf-8' })
+        .end(CALLBACK_PAGE('This is not the sign-in gws-ea is waiting for.'));
+      return;
+    }
+    const next = url.searchParams.has('code') ? consents.at(index + 1) : undefined;
+    if (next) {
+      response.writeHead(302, { location: next.url }).end();
+    } else {
       response
         .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         .end(CALLBACK_PAGE(url.searchParams.has('code') ? 'Signed in.' : 'Sign-in stopped.'));
-      clearTimeout(timer);
-      resolve(url.searchParams);
-    });
+    }
+    waits[index]?.arrive(url.searchParams);
   });
   return {
-    done,
+    signInPath,
+    redirects: waits.map((wait) => wait.redirect),
     arm: () => {
-      timer = setTimeout(() => expire?.(), timeoutMs);
+      timer = setTimeout(() => {
+        const late = new GwsEaError('google_sign_in_timeout', 'Google sign-in was not finished in time; run it again');
+        for (const wait of waits) wait.expire(late);
+      }, timeoutMs);
     },
     cancel: () => clearTimeout(timer),
   };
@@ -207,42 +270,18 @@ export async function readJson(response: Response): Promise<unknown> {
 }
 
 /**
- * Sign the assistant in to Google: PKCE on a loopback redirect, offline
- * access, the release's scopes, and a forced consent so Google returns a
- * refresh token. Returns the grant for the caller to keep.
+ * Turn one consent's redirect into its refresh token: exchange the code, and
+ * accept it only from the declared account, which every consent proves by
+ * asking for the account's identity.
  */
-export async function signInAsAssistant(input: AssistantSignInInput): Promise<GoogleGrant> {
+async function completeConsent(
+  input: AssistantSignInInput,
+  account: string,
+  redirectUri: string,
+  consent: ConsentRequest,
+  query: URLSearchParams,
+): Promise<{ readonly consent: GoogleConsent; readonly sub: string }> {
   const fetchImpl = input.fetch ?? globalThis.fetch;
-  const now = input.now ?? Date.now;
-  const account = input.account.trim().toLowerCase();
-  const verifier = randomBytes(48).toString('base64url');
-  const state = randomBytes(24).toString('base64url');
-  const { server, redirectUri } = await listenOnLoopback();
-  let query: URLSearchParams;
-  let redirect: ReturnType<typeof awaitRedirect> | undefined;
-  try {
-    redirect = awaitRedirect(server, state, input.timeoutMs ?? SIGN_IN_TIMEOUT_MS);
-    const authorization = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
-    authorization.search = new URLSearchParams({
-      client_id: input.client.client_id,
-      redirect_uri: redirectUri,
-      response_type: 'code',
-      scope: GOOGLE_SIGN_IN_SCOPES.join(' '),
-      code_challenge: createHash('sha256').update(verifier).digest('base64url'),
-      code_challenge_method: 'S256',
-      state,
-      access_type: 'offline',
-      prompt: 'consent',
-      login_hint: account,
-    }).toString();
-    await input.present(authorization.href);
-    redirect.arm();
-    query = await redirect.done;
-  } finally {
-    redirect?.cancel();
-    server.close();
-  }
-
   const refusal = query.get('error');
   if (refusal !== null) {
     throw signInFailed(
@@ -258,7 +297,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
     body: new URLSearchParams({
       grant_type: 'authorization_code',
       code,
-      code_verifier: verifier,
+      code_verifier: consent.verifier,
       client_id: input.client.client_id,
       client_secret: input.client.client_secret,
       redirect_uri: redirectUri,
@@ -296,23 +335,53 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
       `Google signed in ${signedIn}, not the assistant's account ${account}; sign in as ${account}`,
     );
   }
+  return { consent: { refresh_token: tokens.refresh_token, scopes }, sub };
+}
 
-  const missing = missingGoogleScopes(scopes);
+/**
+ * Sign the assistant in to Google: PKCE on a loopback redirect, offline
+ * access, and a forced consent so Google returns a refresh token, for each of
+ * the sign-in's consents in turn, from one short link. Returns the grant for
+ * the caller to keep.
+ */
+export async function signInAsAssistant(input: AssistantSignInInput): Promise<GoogleGrant> {
+  const now = input.now ?? Date.now;
+  const account = input.account.trim().toLowerCase();
+  const { server, redirectUri } = await listenOnLoopback();
+  const consents = GOOGLE_SIGN_IN_CONSENTS.map((scopes) => consentRequest(input.client, redirectUri, account, scopes));
+  const granted: GoogleConsent[] = [];
+  let sub: string | undefined;
+  let waiting: ReturnType<typeof awaitRedirects> | undefined;
+  try {
+    waiting = awaitRedirects(server, consents, input.timeoutMs ?? SIGN_IN_TIMEOUT_MS);
+    await input.present(`${redirectUri}${waiting.signInPath}`);
+    waiting.arm();
+    for (const [index, consent] of consents.entries()) {
+      const completed = await completeConsent(input, account, redirectUri, consent, await waiting.redirects[index]);
+      granted.push(completed.consent);
+      sub ??= completed.sub;
+    }
+  } finally {
+    waiting?.cancel();
+    server.close();
+  }
+  if (sub === undefined) throw signInFailed('Google did not say which account signed in');
+
+  const grant: GoogleGrant = {
+    schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
+    account,
+    sub,
+    client_id: input.client.client_id,
+    client_secret: input.client.client_secret,
+    consents: granted,
+    granted_at: new Date(now()).toISOString(),
+  };
+  const missing = missingGoogleScopes(scopesOfGrant(grant));
   if (missing.length > 0) {
     throw new GwsEaError(
       'google_scope_missing',
       `The Google sign-in did not grant ${missing.join(', ')}; sign in again and allow every permission`,
     );
   }
-
-  return {
-    schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
-    account,
-    sub,
-    client_id: input.client.client_id,
-    client_secret: input.client.client_secret,
-    refresh_token: tokens.refresh_token,
-    scopes,
-    granted_at: new Date(now()).toISOString(),
-  };
+  return grant;
 }

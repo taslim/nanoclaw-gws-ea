@@ -60,7 +60,7 @@ const REQUIRED_APIS = [
   'pubsub.googleapis.com',
   'workspaceevents.googleapis.com',
 ] as const;
-const BILLING_URL = 'https://console.cloud.google.com/billing';
+const BILLING_CREATE_URL = 'https://console.cloud.google.com/billing/create';
 const BILLING_USER_ROLE = 'roles/billing.user';
 /** The member Google Chat publishes a Workspace Events subscription's events as. */
 const GCHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com';
@@ -956,7 +956,7 @@ function billingRequiredPause(gcp: GcpProjectInput, dependencies: GcloudDependen
     details: [
       `Create a billing account, or have its administrator grant ${gcp.account} Billing Account User (${BILLING_USER_ROLE}) on an open one, then resume.`,
     ],
-    actionUrl: BILLING_URL,
+    actionUrl: BILLING_CREATE_URL,
     settled: async () => {
       const open = await readOpenBillingAccounts(gcloudFor(gcp, dependencies));
       return 'value' in open && open.value.length > 0;
@@ -1011,7 +1011,19 @@ function billingResource(dependencies: GcloudDependencies): StepResource<GcpStep
 
 type PubsubKind = 'topics' | 'subscriptions';
 
-/** The topic or the subscription, found by its full name in the project's conclusive list. */
+/**
+ * Google's refusal of Pub/Sub storage in a project whose organization policy
+ * it has not finished setting up, as recorded live; it asks for a retry once
+ * the policy is initialized.
+ */
+const PROJECT_POLICY_INITIALIZING = /organization policy to be properly initialized/u;
+
+/**
+ * The topic or the subscription, found by its full name in the project's
+ * conclusive list. A project created moments earlier may refuse it until
+ * Google has set up the project's organization policy, so creation is
+ * retried while Google says so.
+ */
 function pubsubResource(
   name: string,
   kind: PubsubKind,
@@ -1034,17 +1046,23 @@ function pubsubResource(
     },
     apply: async (context) => {
       const gcp = context.input.gcp;
-      const created = await gcloud(context)([
-        'pubsub',
-        kind,
-        'create',
-        id,
-        ...createFlags,
-        `--project=${gcp.projectId}`,
-      ]);
+      const create = (): Promise<Ran> =>
+        gcloud(context)(['pubsub', kind, 'create', id, ...createFlags, `--project=${gcp.projectId}`]);
+      const initializing = (attempt: Ran): boolean =>
+        !succeeded(attempt) && PROJECT_POLICY_INITIALIZING.test(attempt.outcome.stderr);
+      const created = await retryWhile(
+        create,
+        initializing,
+        ORG_POLICY_SETTLES_MS,
+        "Waiting for Google Cloud to set up the new project's organization policy; it can take up to 15 minutes…",
+        dependencies,
+      );
       // Created by an interrupted run but not yet listed: the next observation waits for it.
       if (!succeeded(created) && !alreadyExists(created)) {
-        throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}`, created);
+        const within = initializing(created)
+          ? ` after ${minutes(ORG_POLICY_SETTLES_MS)}: the project's organization policy (constraints/gcp.resourceLocations) allows Pub/Sub no region to store messages in`
+          : '';
+        throw gcloudFailed(`Google Cloud could not create ${fullName(gcp.projectId)}${within}`, created);
       }
       return undefined;
     },

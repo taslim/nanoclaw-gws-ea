@@ -239,6 +239,8 @@ class FakeGoogleCloud {
   topic = false;
   /** Lists that still omit the topic after it was created. */
   unlistedTopicReads = 0;
+  /** Topic creations Google refuses while it sets up a new project's organization policy. */
+  initializingPolicyCreates = 0;
   /** The pull subscription, as the flags it was created with set it. */
   subscription: Record<string, string | boolean> | undefined;
   readonly topicPolicy = new Map<string, Set<string>>();
@@ -447,6 +449,16 @@ class FakeGoogleCloud {
 
   #createTopic(line: string): SanitizedCommandOutcome {
     const name = deriveGchatEventsTopic(this.gcp.projectId);
+    if (this.initializingPolicyCreates > 0) {
+      this.initializingPolicyCreates -= 1;
+      // Google's answer for a project created moments earlier, recorded live.
+      return failed(
+        [
+          `ERROR: Failed to create topic [${name}]: The topic ${name} cannot be created or updated due to an organization policy specified at the project or organization level. The organization policy does not allow message storage in any GCP region where Cloud Pub/Sub is present. The organization policy may be updated by your project or organization administrator. See https://console.cloud.google.com/iam-admin/orgpolicies/gcp-resourceLocations?project=${this.gcp.projectId}. If the topic's project was recently created, you may need to wait a few minutes for the project's organization policy to be properly initialized, and then retry this operation.`,
+          `ERROR: (gcloud.pubsub.topics.create) Failed to create the following: [${GCHAT_EVENTS_TOPIC_ID}].`,
+        ].join('\n'),
+      );
+    }
     if (this.topic) {
       return failed(
         [
@@ -1063,7 +1075,7 @@ describe('Google Cloud setup through the step engine', () => {
         code: 'gcp_billing_account_required',
         message: expect.stringMatching(new RegExp(`${setup.gcp.projectId} needs a billing account.*${ACCOUNT}`, 'u')),
         details: [expect.stringContaining('Billing Account User (roles/billing.user)')],
-        actionUrl: 'https://console.cloud.google.com/billing',
+        actionUrl: 'https://console.cloud.google.com/billing/create',
       },
     });
     expect(setup.cloud.mutations).toEqual([expect.stringMatching(/^projects create /u)]);
@@ -1296,6 +1308,34 @@ describe('Google Cloud setup through the step engine', () => {
 
     expect(setup.cloud.commands).toContain(`pubsub topics create gws-ea-chat-events --project=${setup.gcp.projectId}`);
     expect(setup.cloud.mutations).toEqual([]);
+  });
+
+  it('waits for Google to set up a new project’s organization policy before creating the topic', async () => {
+    const setup = await harness();
+    setup.cloud.initializingPolicyCreates = 2;
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.topic).toBe(true);
+    expect(setup.sleeps).toEqual([1_000, 2_000]);
+    expect(setup.events).toContainEqual({
+      type: 'step-waiting',
+      step: 'provision_gcp',
+      reason: "Waiting for Google Cloud to set up the new project's organization policy; it can take up to 15 minutes…",
+    });
+  });
+
+  it('stops naming the location policy when the project still refuses the topic after 15 minutes', async () => {
+    const setup = await harness();
+    setup.cloud.initializingPolicyCreates = 999;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringContaining('constraints/gcp.resourceLocations'),
+      details: { stderrTail: expect.stringContaining('organization policy to be properly initialized') },
+    });
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(15 * 60_000);
+    expect(setup.cloud.topic).toBe(false);
   });
 
   it('waits for Google to know a subscriber account it just created before granting it the subscription', async () => {

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AGENT_GOOGLE_CREDENTIALS,
   AGENT_GOOGLE_SERVICES,
-  GOOGLE_SIGN_IN_SCOPES,
+  GOOGLE_SIGN_IN_CONSENTS,
   googleCredentialFor,
   type GoogleGrant,
 } from './grant.js';
@@ -18,16 +18,24 @@ import {
   RENEW_BEFORE_EXPIRY_MS,
 } from './tokens.js';
 
+/** A sign-in through every consent, each with its own refresh token. */
 const GRANT: GoogleGrant = {
-  schema_version: 2,
+  schema_version: 3,
   account: 'juno@example.test',
   sub: '104857395723948572901',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
-  refresh_token: '1//refresh-token',
-  scopes: [...GOOGLE_SIGN_IN_SCOPES],
+  consents: GOOGLE_SIGN_IN_CONSENTS.map((scopes, index) => ({
+    refresh_token: `1//refresh-token-${index + 1}`,
+    scopes: [...scopes],
+  })),
   granted_at: '2026-09-30T10:00:00.000Z',
 };
+
+/** `grant` with only the scopes `keep` accepts. */
+function keeping(grant: GoogleGrant, keep: (scope: string) => boolean): GoogleGrant {
+  return { ...grant, consents: grant.consents.map((consent) => ({ ...consent, scopes: consent.scopes.filter(keep) })) };
+}
 
 const READONLY = 'https://www.googleapis.com/auth/gmail.readonly';
 const MODIFY = 'https://www.googleapis.com/auth/gmail.modify';
@@ -41,10 +49,7 @@ const CHAT = [
 ];
 
 /** A grant from before Drive, Docs, Sheets, Slides and Forms joined the sign-in. */
-const OLD_GRANT: GoogleGrant = {
-  ...GRANT,
-  scopes: GRANT.scopes.filter((scope) => !/\/(drive|documents|spreadsheets|presentations|forms\.)/u.test(scope)),
-};
+const OLD_GRANT = keeping(GRANT, (scope) => !/\/(drive|documents|spreadsheets|presentations|forms\.)/u.test(scope));
 
 /** How Google's token endpoint answers one request: an error with its status, or the scopes it granted. */
 interface Answer {
@@ -56,10 +61,13 @@ interface Answer {
 /** Google's token endpoint, answering whatever is asked with `answer(asked)`: by default exactly what was asked. */
 function google(answer: (asked: string) => Answer = () => ({})) {
   const asked: string[] = [];
+  const refreshTokens: string[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     expect(String(input)).toBe(GOOGLE_TOKEN_ENDPOINT);
-    const scope = new URLSearchParams(String(init?.body)).get('scope') ?? '';
+    const form = new URLSearchParams(String(init?.body));
+    const scope = form.get('scope') ?? '';
     asked.push(scope);
+    refreshTokens.push(form.get('refresh_token') ?? '');
     const reply = answer(scope);
     if (reply.status !== undefined && reply.status >= 400) {
       return new Response(JSON.stringify(reply.error ? { error: reply.error } : {}), { status: reply.status });
@@ -71,7 +79,7 @@ function google(answer: (asked: string) => Answer = () => ({})) {
       },
     );
   }) as unknown as typeof globalThis.fetch;
-  return { fetch, asked };
+  return { fetch, asked, refreshTokens };
 }
 
 /** Google refusing any request that asks for Drive with `refusal`, and granting everything else as asked. */
@@ -128,7 +136,7 @@ describe("minting a service's token from the grant", () => {
     const world = google(() => ({ status: 400, error: 'invalid_grant' }));
     const error = await mintServiceToken(GRANT, 'directory', { fetch: world.fetch }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(GoogleGrantRevokedError);
-    expect(String(error)).not.toContain(GRANT.refresh_token);
+    for (const consent of GRANT.consents) expect(String(error)).not.toContain(consent.refresh_token);
   });
 
   it.each([
@@ -142,6 +150,35 @@ describe("minting a service's token from the grant", () => {
     const error = await mintServiceToken(GRANT, 'directory', { fetch: world.fetch }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(GoogleTokenError);
     expect(error).toMatchObject({ refused });
+  });
+});
+
+describe('choosing the consent a token is minted from', () => {
+  it('mints each token with the refresh token of the consent that granted its scopes', async () => {
+    const world = google();
+    await mintServiceToken(GRANT, 'chat', { fetch: world.fetch });
+    await mintCredentialToken(GRANT, googleCredentialFor('calendar'), { fetch: world.fetch });
+
+    expect(world.asked).toEqual([CHAT.join(' '), `${CALENDAR} ${DRIVE}`]);
+    expect(world.refreshTokens).toEqual(['1//refresh-token-2', '1//refresh-token-1']);
+  });
+
+  it('refuses, as final and without asking Google, a token whose scopes no one consent granted', async () => {
+    const world = google();
+    const [first, ...rest] = AGENT_GOOGLE_SERVICES.calendar.scopes;
+    const split: GoogleGrant = {
+      ...GRANT,
+      consents: [
+        { refresh_token: '1//refresh-token-1', scopes: [first] },
+        { refresh_token: '1//refresh-token-2', scopes: rest },
+      ],
+    };
+
+    const error = await mintServiceToken(split, 'calendar', { fetch: world.fetch }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GoogleTokenError);
+    expect(error).toMatchObject({ refused: true });
+    expect(world.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -160,64 +197,11 @@ describe("minting an agent credential's token", () => {
     expect(token).not.toHaveProperty('fallback');
   });
 
-  it("asks for exactly each credential's own scopes on a grant holding the whole ceiling, never a broader one", async () => {
-    const grant: GoogleGrant = {
-      ...GRANT,
-      scopes: [
-        'openid',
-        'https://www.googleapis.com/auth/userinfo.email',
-        'https://www.googleapis.com/auth/calendar.events',
-        'https://www.googleapis.com/auth/calendar.calendarlist',
-        'https://www.googleapis.com/auth/calendar.freebusy',
-        READONLY,
-        'https://www.googleapis.com/auth/directory.readonly',
-        DRIVE,
-        'https://www.googleapis.com/auth/documents',
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/presentations',
-        'https://www.googleapis.com/auth/forms.body',
-        'https://www.googleapis.com/auth/forms.responses.readonly',
-        MODIFY,
-        // The rest of the ceiling: every other scope of each product an agent could be handed.
-        'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/calendar.readonly',
-        'https://www.googleapis.com/auth/calendar.events.readonly',
-        'https://www.googleapis.com/auth/calendar.events.owned',
-        'https://www.googleapis.com/auth/calendar.events.owned.readonly',
-        'https://www.googleapis.com/auth/calendar.events.freebusy',
-        'https://www.googleapis.com/auth/calendar.events.public.readonly',
-        'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
-        'https://www.googleapis.com/auth/calendar.calendars',
-        'https://www.googleapis.com/auth/calendar.calendars.readonly',
-        'https://www.googleapis.com/auth/calendar.acls',
-        'https://www.googleapis.com/auth/calendar.acls.readonly',
-        'https://www.googleapis.com/auth/calendar.settings.readonly',
-        'https://mail.google.com/',
-        'https://www.googleapis.com/auth/gmail.metadata',
-        'https://www.googleapis.com/auth/gmail.compose',
-        'https://www.googleapis.com/auth/gmail.send',
-        'https://www.googleapis.com/auth/gmail.insert',
-        'https://www.googleapis.com/auth/gmail.labels',
-        'https://www.googleapis.com/auth/gmail.settings.basic',
-        'https://www.googleapis.com/auth/gmail.settings.sharing',
-        'https://www.googleapis.com/auth/drive.readonly',
-        'https://www.googleapis.com/auth/drive.metadata',
-        'https://www.googleapis.com/auth/drive.metadata.readonly',
-        'https://www.googleapis.com/auth/drive.activity',
-        'https://www.googleapis.com/auth/drive.activity.readonly',
-        'https://www.googleapis.com/auth/drive.labels',
-        'https://www.googleapis.com/auth/drive.labels.readonly',
-        'https://www.googleapis.com/auth/drive.meet.readonly',
-        'https://www.googleapis.com/auth/documents.readonly',
-        'https://www.googleapis.com/auth/spreadsheets.readonly',
-        'https://www.googleapis.com/auth/presentations.readonly',
-        'https://www.googleapis.com/auth/forms.body.readonly',
-      ],
-    };
+  it("asks for exactly each credential's own scopes on the full sign-in, never a broader one", async () => {
     const asked: Record<string, string[]> = {};
     for (const credential of AGENT_GOOGLE_CREDENTIALS) {
       const world = google();
-      await mintCredentialToken(grant, credential, { fetch: world.fetch });
+      await mintCredentialToken(GRANT, credential, { fetch: world.fetch });
       asked[credential.host] = world.asked;
     }
 
@@ -366,7 +350,7 @@ describe("the host's token source", () => {
     const tokens = source(world, () => grant);
     const first = await tokens.accessToken('chat');
 
-    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-10-10T18:00:00.000Z' };
+    grant = { ...GRANT, granted_at: '2026-10-10T18:00:00.000Z' };
 
     expect(await tokens.accessToken('chat')).not.toBe(first);
     expect(world.asked).toHaveLength(2);
@@ -385,9 +369,7 @@ describe("the host's token source", () => {
 
     await expect(tokens.accessToken('drive-host')).rejects.toBeInstanceOf(GoogleScopeNotGrantedError);
     await expect(
-      source(world, () => ({ ...GRANT, scopes: GRANT.scopes.filter((scope) => !CHAT.includes(scope)) })).accessToken(
-        'chat',
-      ),
+      source(world, () => keeping(GRANT, (scope) => !CHAT.includes(scope))).accessToken('chat'),
     ).rejects.toMatchObject({ code: 'google_scope_not_granted', service: 'chat' });
     expect(world.fetch).not.toHaveBeenCalled();
 
@@ -405,7 +387,7 @@ describe("the host's token source", () => {
     await expect(tokens.accessToken('gmail')).rejects.toThrow(/no longer accepts/);
     expect(world.asked).toHaveLength(1);
 
-    grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-10-10T18:00:00.000Z' };
+    grant = { ...GRANT, granted_at: '2026-10-10T18:00:00.000Z' };
     await expect(tokens.accessToken('chat')).rejects.toBeInstanceOf(GoogleGrantRevokedError);
     expect(world.asked).toHaveLength(2);
   });

@@ -27,6 +27,7 @@ import {
   googleGrantIdentity as grantIdentity,
   grantedScopes,
   HOST_GOOGLE_SERVICES,
+  scopesOfGrant,
   type GoogleGrant,
 } from '../gws-ea-google/grant.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError } from '../gws-ea-google/tokens.js';
@@ -243,7 +244,7 @@ export function createHomeFolder(options: HomeFolderOptions): HomeFolder {
       try {
         grant = await options.readGrant();
         if (grant === undefined) return;
-        if (grantedScopes(DRIVE_SCOPES, grant.scopes).length === 0) {
+        if (grantedScopes(DRIVE_SCOPES, scopesOfGrant(grant)).length === 0) {
           waitFor(grant, "The home folder waits until the assistant's Google sign-in includes Drive");
           return;
         }
