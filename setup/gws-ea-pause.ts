@@ -62,15 +62,18 @@ function typedPath(value: string): string {
   return path.resolve(value === '~' || value.startsWith('~/') ? path.join(os.homedir(), value.slice(1)) : value);
 }
 
-/** Where the operator saved the assistant's downloaded client, or undefined when they gave no answer. */
+/**
+ * Where the operator saved the assistant's downloaded client: its path, an
+ * empty string when they left it blank, or undefined when they cancelled.
+ */
 async function askClientFile(prompts: PausePrompts, signal: AbortSignal): Promise<string | undefined> {
   const answer = await prompts.text({
     message: 'Where is the downloaded client JSON?',
     placeholder: '~/Downloads/client_secret.json',
     signal,
   });
-  if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return undefined;
-  return typedPath(answer.trim());
+  if (prompts.isCancel(answer) || typeof answer !== 'string') return undefined;
+  return answer.trim() ? typedPath(answer.trim()) : '';
 }
 
 async function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -118,8 +121,9 @@ export async function attendPause(
       signal,
     });
     if (answer !== true) return STOP;
-    // Without the file, the run goes on and the sign-in asks for it again.
-    const clientFile = withClient ? await askClientFile(prompts, signal) : undefined;
+    // Left blank, the run goes on and the sign-in asks for the file again; cancelled, the run stops.
+    const clientFile = withClient ? await askClientFile(prompts, signal) : '';
+    if (clientFile === undefined) return STOP;
     return {
       kind: 'continue',
       decisions: { chatConfigured: true, ...(clientFile ? { googleClientFile: clientFile } : {}) },

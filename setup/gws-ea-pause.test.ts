@@ -128,12 +128,19 @@ describe('attending a pause at the terminal', () => {
     });
     expect(terminal.note).toHaveBeenCalledWith(expect.stringContaining('App name: Juno'), 'Google Cloud console');
 
-    // Without the file, the Chat configuration still counts, and the sign-in asks for the file again.
-    const unanswered = prompts(true);
-    unanswered.text.mockResolvedValueOnce(CANCEL);
-    await expect(attendPause(both, new AbortController().signal, { prompts: unanswered })).resolves.toEqual({
+    // Left blank, the Chat configuration still counts, and the sign-in asks for the file again.
+    const blank = prompts(true);
+    blank.text.mockResolvedValueOnce('   ');
+    await expect(attendPause(both, new AbortController().signal, { prompts: blank })).resolves.toEqual({
       kind: 'continue',
       decisions: { chatConfigured: true },
+    });
+
+    // Cancelled, as Ctrl-C does, the run stops.
+    const cancelled = prompts(true);
+    cancelled.text.mockResolvedValueOnce(CANCEL);
+    await expect(attendPause(both, new AbortController().signal, { prompts: cancelled })).resolves.toEqual({
+      kind: 'stop',
     });
   });
 
