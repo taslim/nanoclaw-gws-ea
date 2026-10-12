@@ -505,15 +505,27 @@ function humanPause(phase: ProvisionStepId, code: string, message: string): Prov
   return { kind: 'human-action', phase, code, message };
 }
 
-/** Conversation states the assistant resolves by itself, waited on rather than handed to a person. */
+/**
+ * Conversation states the assistant resolves by itself before anyone else
+ * is involved, waited on briefly rather than handed to a person.
+ */
 const DELIVERY_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
   'binding_not_ready',
   'session_not_ready',
   'welcome_not_delivered',
-  'reply_not_delivered',
 ]);
 const DELIVERY_WAIT_MS = 60_000;
 const DELIVERY_POLL_MS = 2_000;
+
+/**
+ * The exchange after the welcome: the principal's reply, then the
+ * assistant's answer, which can take minutes of work. One watched pause
+ * covers both, so the run finishes once the answer is there.
+ */
+const EXCHANGE_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
+  'later_principal_message_missing',
+  'reply_not_delivered',
+]);
 
 /** What a person is told when the conversation is still not ready. */
 const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> = {
@@ -521,10 +533,13 @@ const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> 
   session_not_ready:
     "The assistant has not opened the principal's conversation yet; check the errors below, then resume.",
   welcome_not_delivered: 'The assistant has not delivered its welcome; check the errors below, then resume.',
+  // A watch that stops reports this pause as it was given, so it stays true once the principal has replied.
   later_principal_message_missing:
-    "Ask the principal to reply to the assistant's welcome in Google Chat. If they are outside the assistant's " +
-    'Google Workspace organization, it reaches them as a message request to accept first.',
-  reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
+    "Ask the principal to reply to the assistant's welcome in Google Chat, if they have not yet; setup finishes " +
+    "once the assistant answers them. If they are outside the assistant's Google Workspace organization, the " +
+    'welcome reaches them as a message request to accept first.',
+  reply_not_delivered:
+    'The principal has replied; setup finishes once the assistant answers them. If it does not, check the errors below.',
 };
 
 /**
@@ -910,12 +925,12 @@ export function createProductionProvisionSteps(
               CONVERSATION_PAUSES[result.reason],
               `Bound principal: ${value.input.principalDisplayName} (${principal.userId})`,
             );
-            if (result.reason !== 'later_principal_message_missing') return pause;
+            if (!EXCHANGE_REASONS.has(result.reason)) return pause;
             return {
               ...pause,
               settled: async () => {
                 const now = await verifyConversation(value);
-                return !now || now.ready || now.reason !== 'later_principal_message_missing';
+                return !now || now.ready || !EXCHANGE_REASONS.has(now.reason);
               },
             };
           },

@@ -73,7 +73,8 @@ export interface ProvisionStep<Context> {
   readonly resources: readonly StepResource<Context>[];
   /**
    * A runtime step: once complete, every run re-checks it first and repairs
-   * it locally. The label names that check.
+   * it locally. The label names that check, shown only when the runtime is
+   * not found running at once.
    */
   readonly liveness?: { readonly label: string };
   /** Completed runtime steps this step's pause needs; re-checked before pausing. */
@@ -246,9 +247,29 @@ export async function runProvisionSteps<Context>(
   const ensureAll = (id: ProvisionStepId, waitOnAbsent: boolean): Promise<Pause> =>
     runner.ensureAll(id, steps[id].resources, waitOnAbsent);
 
-  /** Liveness: the same observation, waited on before any local repair. */
-  const checkRuntime = (id: ProvisionStepId): Promise<Pause> =>
-    stepRun(id, steps[id].liveness?.label ?? steps[id].label, () => ensureAll(id, true));
+  /**
+   * Whether a runtime step's resources all observe present at once, with no
+   * wait and no change. The look is logged but not rendered, so a runtime
+   * that is running adds nothing to the operator's screen.
+   */
+  const runningNow = (id: ProvisionStepId): Promise<boolean> =>
+    runStep(runtime, { id }, async () => {
+      for (const resource of steps[id].resources) {
+        // An observation that fails is the full check's to report: it observes again.
+        const seen = await resource.observe(context).catch(() => undefined);
+        if (seen?.status !== 'present') return false;
+      }
+      return true;
+    });
+
+  /**
+   * Liveness: nothing shown while the runtime runs. Otherwise the shown
+   * check observes again, waited on before any local repair.
+   */
+  const checkRuntime = async (id: ProvisionStepId): Promise<Pause> =>
+    (await runningNow(id))
+      ? undefined
+      : stepRun(id, steps[id].liveness?.label ?? steps[id].label, () => ensureAll(id, true));
 
   const advance = (id: ProvisionStepId): Promise<Pause> =>
     stepRun(id, steps[id].label, async () => {

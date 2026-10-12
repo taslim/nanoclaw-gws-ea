@@ -307,6 +307,11 @@ function startedSteps(events: readonly RunEvent[]): string[] {
   return events.flatMap((event) => (event.type === 'step-started' ? [event.step] : []));
 }
 
+/** The steps a terminal shows: those started with a label. */
+function labeledSteps(events: readonly RunEvent[]): string[] {
+  return events.flatMap((event) => (event.type === 'step-started' && event.label ? [event.step] : []));
+}
+
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 
 /** These provisions stop before the host starts, so NanoClaw's service helpers are never reached. */
@@ -580,15 +585,42 @@ describe('step engine', () => {
     engine.events.length = 0;
     await expect(engine.run()).resolves.toEqual({ status: 'ready' });
 
-    expect(startedSteps(engine.events).slice(0, 2)).toEqual(['start_onecli', 'start_nanoclaw']);
-    expect(engine.events[0]).toEqual({ type: 'step-started', step: 'start_onecli', label: 'Checking start_onecli…' });
+    // A first look at each, logged but not shown; only the runtime still starting gets the shown check.
+    expect(engine.events.slice(0, 3)).toEqual([
+      { type: 'step-started', step: 'start_onecli' },
+      { type: 'step-completed', step: 'start_onecli' },
+      { type: 'step-started', step: 'start_onecli', label: 'Checking start_onecli…' },
+    ]);
+    expect(labeledSteps(engine.events)).not.toContain('start_nanoclaw');
+    expect(startedSteps(engine.events).slice(0, 4)).toEqual([
+      'start_onecli',
+      'start_onecli',
+      'start_nanoclaw',
+      'connect_google',
+    ]);
     expect(engine.world.observed.filter((name) => name === 'start_onecli')).toHaveLength(3);
     expect(engine.world.observed.filter((name) => name === 'start_nanoclaw')).toHaveLength(1);
     expect(engine.world.observed).not.toContain('materialize_checkout');
     expect(engine.world.observed).not.toContain('provision_gcp');
     expect(engine.world.observed).not.toContain('configure_provider');
-    expect(engine.sleeps).toEqual([1_000, 2_000]);
+    expect(engine.sleeps).toEqual([1_000]);
     expect(engine.world.applied.filter((name) => name === 'start_onecli')).toHaveLength(1);
+  });
+
+  it('shows no check of a runtime that is running, and shows the check that repairs a stopped one', async () => {
+    const engine = await engineFixture();
+    engine.world.pauseOnApply.set('connect_google', { ...DM_PAUSE, phase: 'connect_google' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+
+    engine.events.length = 0;
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+    expect(labeledSteps(engine.events)).toEqual(['connect_google']);
+
+    engine.world.present.delete('start_nanoclaw');
+    engine.events.length = 0;
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+    expect(labeledSteps(engine.events)).toEqual(['start_nanoclaw', 'connect_google']);
+    expect(engine.world.applied.filter((name) => name === 'start_nanoclaw')).toHaveLength(2);
   });
 
   it('repairs a stopped runtime locally only after the bounded wait', async () => {
@@ -1836,7 +1868,13 @@ describe('production provision step composition', () => {
 
       host = 2;
       await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
-      expect(sleeps).toEqual([1_000, 2_000]);
+      // The first look, logged but not shown, finds the host starting; the shown check waits for it.
+      expect(sleeps).toEqual([1_000]);
+      expect(events).toContainEqual({
+        type: 'step-started',
+        step: 'start_nanoclaw',
+        label: 'Checking the assistant…',
+      });
       expect(events).toContainEqual({
         type: 'step-waiting',
         step: 'start_nanoclaw',
@@ -2535,7 +2573,7 @@ describe('production step order and pause outcomes', () => {
     ]);
   });
 
-  it('waits while the assistant delivers its welcome, then pauses for a reply it can watch for', async () => {
+  it('waits while the assistant delivers its welcome, then watches one pause through the reply and the answer', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
     harness.conversationReady = false;
@@ -2546,15 +2584,40 @@ describe('production step order and pause outcomes', () => {
       phase: 'verify_conversation',
       code: 'later_principal_message_missing',
       message:
-        "Ask the principal to reply to the assistant's welcome in Google Chat. If they are outside the " +
-        "assistant's Google Workspace organization, it reaches them as a message request to accept first.",
+        "Ask the principal to reply to the assistant's welcome in Google Chat, if they have not yet; setup finishes " +
+        "once the assistant answers them. If they are outside the assistant's Google Workspace organization, the " +
+        'welcome reaches them as a message request to accept first.',
     });
     expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
 
-    // The pause watches for the reply without changing anything.
+    // The pause watches without changing anything, and a reply the assistant has not answered yet keeps it watching.
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+    harness.conversationReasons = ['reply_not_delivered'];
     await expect(paused.pause.settled?.()).resolves.toBe(false);
     harness.conversationReady = true;
     await expect(paused.pause.settled?.()).resolves.toBe(true);
+  });
+
+  it('watches for the answer to a reply already there, without a delivery wait first', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+    harness.conversationReasons = Array.from({ length: 40 }, () => 'reply_not_delivered' as const);
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'verify_conversation',
+      code: 'reply_not_delivered',
+      message:
+        'The principal has replied; setup finishes once the assistant answers them. If it does not, check the errors below.',
+    });
+    expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toEqual([]);
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+
+    harness.conversationReasons = [];
+    harness.conversationReady = true;
+    await expect(paused.pause.settled?.()).resolves.toBe(true);
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
   });
 
   it('stops waiting on a delivery after a minute, and names it without a watch', async () => {
