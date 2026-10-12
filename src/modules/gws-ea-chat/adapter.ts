@@ -201,9 +201,12 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
   /**
    * A turn is working on the message (each typing pulse that names it). Its
    * 👀 shows once the turn has run WORKING_AFTER_MS, unless the work ended
-   * first, and never again once it has.
+   * first, and never again once it has. Only a Chat message can carry it:
+   * one the host made itself, such as main's welcome to the principal, has
+   * nothing in Chat to react to.
    */
   workingOn(_threadId: string, messageId: string): Promise<void> {
+    if (spaceOfMessage(messageId) === undefined) return Promise.resolve();
     if (this.working.has(messageId) || this.ended.has(messageId)) return Promise.resolve();
     const entry: Working = {};
     entry.timer = setTimeout(() => {
