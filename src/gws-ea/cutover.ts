@@ -23,7 +23,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import { removeReleaseImage, reclaimImage } from './agent-image-release.js';
+import { releaseImageTag, removeReleaseImage, reclaimImage } from './agent-image-release.js';
 import { taggedImageId, type ImageDocker } from './agent-image.js';
 import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { observeLiveCheckout } from './checkout.js';
@@ -82,6 +82,13 @@ import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 const CONTAINER_POLL_MS = 1_000;
 const CONTAINER_LIMIT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
+/** How long Docker's VM may take to close the files it dropped: it lets go of them after the drop returns. */
+const CACHE_DROP_POLL_MS = 1_000;
+const CACHE_DROP_LIMIT_MS = 10_000;
+
+/** What a refusal after the cache drop tells the operator, whoever still holds the state. */
+const CACHE_DROP_REMEDY =
+  "To go on, close any process named here; if Docker's VM (com.apple.Virtualization) is named, restarting Docker Desktop releases it but stops every container on this Mac; then try again";
 
 /** The instance a fence proves quiet, with what Docker needs to look for its containers. */
 export interface QuietInstance {
@@ -92,6 +99,8 @@ export interface QuietInstance {
   readonly installId: string;
   readonly homeDirectory: string;
   readonly dockerEndpoint: string;
+  /** The image the host runs, which the cache drop runs from: always present, and it has `sh`. */
+  readonly releaseImage: string;
 }
 
 /** Boundary seams; each defaults to this process's. */
@@ -299,12 +308,61 @@ function summarizeHolders(holders: readonly OpenFileHolder[]): string {
 }
 
 /**
+ * Ask Docker's VM to drop its file cache, so it lets go of the files exited
+ * containers left it holding: on macOS, Docker Desktop keeps a host file open
+ * for every file its Linux VM still caches, long after the container that
+ * read it is gone. Root in a throwaway container writes the VM-wide setting,
+ * from the release image, with no network, no capabilities, and no pull;
+ * Docker's read-only `/proc/sys` is all `systempaths=unconfined` lifts.
+ * Returns why it could not run, or nothing when it ran.
+ */
+async function dropVmFileCache(instance: QuietInstance, seams: QuiescenceSeams): Promise<string | undefined> {
+  try {
+    await (seams.runCommand ?? runSanitizedCommand)({
+      command: 'docker',
+      args: [
+        'run',
+        '--rm',
+        '--pull',
+        'never',
+        '--network',
+        'none',
+        '--user',
+        '0',
+        '--cap-drop',
+        'ALL',
+        '--security-opt',
+        'no-new-privileges',
+        '--security-opt',
+        'systempaths=unconfined',
+        '--entrypoint',
+        'sh',
+        instance.releaseImage,
+        '-c',
+        'sync; echo 3 > /proc/sys/vm/drop_caches',
+      ],
+      cwd: instance.homeDirectory,
+      env: toolEnvironment(seams, { HOME: instance.homeDirectory, DOCKER_HOST: instance.dockerEndpoint }),
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    return undefined;
+  } catch (error) {
+    // Docker refusing, failing, or timing out is the answer; anything else is a fault here.
+    if (!(error instanceof GwsEaError)) throw error;
+    const stderr = error.details?.stderrTail;
+    return typeof stderr === 'string' && stderr ? stderr.split('\n').at(-1) : safeErrorMessage(error);
+  }
+}
+
+/**
  * Prove a stopped assistant quiet (KTD1): no process runs from its instance
  * root, no container carries its install's label in any state (those the
  * drain stopped get a moment to be removed), and no process holds anything
  * under its `state/` open, a database's `-wal`, `-shm`, and `-journal` side
- * files included. Refuses, naming what it found, before anything is copied
- * or moved.
+ * files included. On macOS, when something does, Docker's VM is first asked
+ * once to drop its file cache, and the state is looked at again for a few
+ * seconds; a holder is never excused, whoever it is. Refuses, naming what it
+ * found, before anything is copied or moved.
  */
 export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
   const root = instance.instanceRoot;
@@ -315,22 +373,36 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
       `${running.map(({ pid, args }) => `PID ${pid} (${abbreviated(args)})`).join('; ')} still run${running.length === 1 ? 's' : ''} from it`,
     );
   }
+  const sleep = seams.sleep ?? ((milliseconds: number) => delay(milliseconds));
   const containers = await pollUntil(
     () => labeledContainers(instance, seams),
     (ids) => ids.length === 0,
-    {
-      intervalMs: CONTAINER_POLL_MS,
-      limitMs: CONTAINER_LIMIT_MS,
-      sleep: seams.sleep ?? ((milliseconds) => delay(milliseconds)),
-    },
+    { intervalMs: CONTAINER_POLL_MS, limitMs: CONTAINER_LIMIT_MS, sleep },
   );
   if (containers.length > 0) {
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
   // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
   const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];
-  if (holders.length > 0) {
-    throw notQuiet(root, summarizeHolders(holders));
+  if (holders.length === 0) return;
+  if ((seams.platform ?? process.platform) !== 'darwin') throw notQuiet(root, summarizeHolders(holders));
+  const failure = await dropVmFileCache(instance, seams);
+  if (failure !== undefined) {
+    throw notQuiet(
+      root,
+      `${summarizeHolders(holders)}, and Docker's VM could not be asked to drop its file cache (${failure}). ${CACHE_DROP_REMEDY}`,
+    );
+  }
+  const still = await pollUntil(
+    () => openFileHolders(instance.state, seams),
+    (found) => found.length === 0,
+    { intervalMs: CACHE_DROP_POLL_MS, limitMs: CACHE_DROP_LIMIT_MS, sleep },
+  );
+  if (still.length > 0) {
+    throw notQuiet(
+      root,
+      `${summarizeHolders(still)}, still held after Docker's VM was asked to drop its file cache. ${CACHE_DROP_REMEDY}`,
+    );
   }
 }
 
@@ -438,6 +510,10 @@ function quietInstanceOf(host: CutoverHost): QuietInstance {
     installId: host.runtime.install_id,
     homeDirectory: host.runtime.home_directory,
     dockerEndpoint: host.runtime.docker_endpoint,
+    releaseImage: releaseImageTag(
+      getInstallScopedNames(host.runtime.install_id).containerImageBase,
+      releaseName(host.reservation.deployed_commit),
+    ),
   };
 }
 

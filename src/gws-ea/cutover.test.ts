@@ -22,7 +22,12 @@ import {
   type ServedRelease,
 } from './cutover.js';
 import { withInstanceOperation } from './journal.js';
-import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import {
+  commandExitError,
+  runSanitizedCommand,
+  type SanitizedCommand,
+  type SanitizedCommandRunner,
+} from './process.js';
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
 import type { InstanceRuntimeConfig } from './service.js';
@@ -48,22 +53,45 @@ interface Observed {
   processes: string;
   containers: string[][];
   openFiles: string;
+  /** What each lsof reports once Docker's VM was asked to drop its file cache, the last one standing. */
+  afterDrop?: string[];
+  /** What the cache drop's container wrote on stderr when it exited non-zero. */
+  dropError?: string;
   /** What lsof reports on stderr: an error it met. */
   lsofError?: string;
   readonly commands: SanitizedCommand[];
+}
+
+function cacheDrops(state: Observed): SanitizedCommand[] {
+  return state.commands.filter((command) => command.command === 'docker' && command.args[0] === 'run');
 }
 
 function observing(state: Observed): SanitizedCommandRunner {
   return async (command) => {
     state.commands.push(command);
     if (command.command === 'ps') return { stdout: state.processes, stderr: '' };
+    if (command.command === 'docker' && command.args[0] === 'run') {
+      if (state.dropError === undefined) return { stdout: '', stderr: '' };
+      throw commandExitError(command, { exitCode: 2, stdout: '', stderr: state.dropError });
+    }
     if (command.command === 'docker') return { stdout: (state.containers.shift() ?? []).join('\n'), stderr: '' };
     if (command.command === 'sh' && command.args[2] === 'lsof') {
-      return { stdout: state.openFiles, stderr: state.lsofError ?? '' };
+      const dropped = cacheDrops(state).length > 0 && state.dropError === undefined;
+      const openFiles =
+        dropped && state.afterDrop
+          ? state.afterDrop.length > 1
+            ? state.afterDrop.shift()!
+            : state.afterDrop[0]!
+          : state.openFiles;
+      return { stdout: openFiles, stderr: state.lsofError ?? '' };
     }
     throw new Error(`unexpected command: ${command.command} ${command.args.join(' ')}`);
   };
 }
+
+/** What every refusal after the cache drop tells the operator to do, whoever holds the state. */
+const REMEDY =
+  "To go on, close any process named here; if Docker's VM (com.apple.Virtualization) is named, restarting Docker Desktop releases it but stops every container on this Mac; then try again";
 
 async function quietTarget(): Promise<QuietInstance> {
   const root = await temporaryRoot('gws-ea-quiet-');
@@ -76,6 +104,7 @@ async function quietTarget(): Promise<QuietInstance> {
     installId: 'abc123',
     homeDirectory: root,
     dockerEndpoint: 'unix:///var/run/docker.sock',
+    releaseImage: 'nanoclaw-agent-v2-abc123:r-0123abcd',
   };
 }
 
@@ -107,6 +136,8 @@ describe('proving a stopped assistant quiet', () => {
     expect(docker.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
     const lsof = state.commands.find((command) => command.command === 'sh')!;
     expect(lsof.args.slice(2)).toEqual(['lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', target.state]);
+    // Nothing held, so nothing asks Docker's VM to drop its file cache.
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'sh']);
   });
 
   it('refuses a process running from any release of the instance, naming it', async () => {
@@ -122,6 +153,7 @@ describe('proving a stopped assistant quiet', () => {
       code: 'instance_not_quiet',
       message: expect.stringContaining('PID 4242'),
     });
+    expect(cacheDrops(state)).toEqual([]);
   });
 
   it('waits for stopped containers to go, and refuses one that stays in any state', async () => {
@@ -144,10 +176,11 @@ describe('proving a stopped assistant quiet', () => {
       code: 'instance_not_quiet',
       message: expect.stringContaining('c-created'),
     });
+    expect(cacheDrops(staying)).toEqual([]);
   });
 
   it.each(['sqlite3', 'com.apple.Virtualization.Virtua'])(
-    'refuses any %s process holding state open, even after containers are gone',
+    'refuses any %s process still holding state open after the cache drop, naming it and the way on',
     async (command) => {
       const target = await quietTarget();
       const wal = path.join(target.state, 'data', 'v2.db-wal');
@@ -160,11 +193,154 @@ describe('proving a stopped assistant quiet', () => {
 
       await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
         code: 'instance_not_quiet',
-        message: expect.stringContaining(`${command} (PID 777) holds ${wal}`),
+        message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: ${command} (PID 777) holds ${wal}, still held after Docker's VM was asked to drop its file cache. ${REMEDY}.`,
       });
-      expect(state.commands.map((entry) => entry.command)).toEqual(['ps', 'docker', 'sh']);
+      expect(cacheDrops(state)).toHaveLength(1);
     },
   );
+});
+
+describe("asking Docker's VM to let go of an exited container's files (macOS)", () => {
+  const vmHolds = (files: readonly string[]) =>
+    `p5677\nccom.apple.Virtualization.Virtua\n${files.map((file) => `n${file}`).join('\n')}\n`;
+
+  it('drops the VM kernel file cache once from the release image, with nothing more than writing that setting needs, then passes', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([path.join(target.state, 'data', 'v2.db'), path.join(target.state, 'groups')]),
+      afterDrop: [''],
+      commands: [],
+    };
+
+    await assertInstanceQuiet(target, {
+      runCommand: observing(state),
+      platform: 'darwin',
+      ambientEnv: {},
+      sleep: async () => undefined,
+    });
+
+    const [drop, ...more] = cacheDrops(state);
+    expect(more).toEqual([]);
+    expect(drop!.args).toEqual([
+      'run',
+      '--rm',
+      '--pull',
+      'never',
+      '--network',
+      'none',
+      '--user',
+      '0',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '--security-opt',
+      'systempaths=unconfined',
+      '--entrypoint',
+      'sh',
+      'nanoclaw-agent-v2-abc123:r-0123abcd',
+      '-c',
+      'sync; echo 3 > /proc/sys/vm/drop_caches',
+    ]);
+    expect(drop!.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'sh', 'docker', 'sh']);
+  });
+
+  it('gives the VM a few seconds to close the files, since it lets go of them after the drop returns', async () => {
+    const target = await quietTarget();
+    const held = vmHolds([path.join(target.state, 'data', 'v2.db')]);
+    const state: Observed = { processes: '', containers: [[]], openFiles: held, afterDrop: [held, ''], commands: [] };
+    const sleeps: number[] = [];
+
+    await assertInstanceQuiet(target, {
+      runCommand: observing(state),
+      platform: 'darwin',
+      ambientEnv: {},
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      },
+    });
+
+    expect(cacheDrops(state)).toHaveLength(1);
+    expect(sleeps).toEqual([1_000]);
+  });
+
+  it('refuses when the VM still holds the files ten seconds after the drop', async () => {
+    const target = await quietTarget();
+    const files = Array.from({ length: 5 }, (_, index) => path.join(target.state, 'data', `file-${index}`));
+    const state: Observed = { processes: '', containers: [[]], openFiles: vmHolds(files), commands: [] };
+    const sleeps: number[] = [];
+
+    await expect(
+      assertInstanceQuiet(target, {
+        runCommand: observing(state),
+        platform: 'darwin',
+        ambientEnv: {},
+        sleep: async (milliseconds) => {
+          sleeps.push(milliseconds);
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(
+        `com.apple.Virtualization.Virtua (PID 5677) holds 5 paths (${files.slice(0, 3).join(', ')}, ...), still held after Docker's VM was asked to drop its file cache. ${REMEDY}.`,
+      ),
+    });
+    expect(cacheDrops(state)).toHaveLength(1);
+    expect(sleeps.reduce((total, milliseconds) => total + milliseconds, 0)).toBe(10_000);
+  });
+
+  it('refuses with the reason when the VM cannot be asked to drop its file cache, pulling nothing', async () => {
+    const target = await quietTarget();
+    const wal = path.join(target.state, 'data', 'v2.db-wal');
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([wal]),
+      dropError: 'sh: 1: cannot create /proc/sys/vm/drop_caches: Read-only file system',
+      commands: [],
+    };
+
+    await expect(
+      assertInstanceQuiet(target, {
+        runCommand: observing(state),
+        platform: 'darwin',
+        ambientEnv: {},
+        sleep: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: com.apple.Virtualization.Virtua (PID 5677) holds ${wal}, and Docker's VM could not be asked to drop its file cache (sh: 1: cannot create /proc/sys/vm/drop_caches: Read-only file system). ${REMEDY}.`,
+    });
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'sh', 'docker']);
+  });
+
+  it("leaves Linux's refusal as it was: no VM to ask, and no cache drop", async () => {
+    const target = await quietTarget();
+    const proc = path.join(path.dirname(target.instanceRoot), 'proc');
+    const shm = path.join(target.state, 'data', 'v2.db-shm');
+    await mkdir(path.join(proc, '11', 'fd'), { recursive: true });
+    await writeFile(path.join(proc, '11', 'comm'), 'sqlite3\n');
+    await symlink('/', path.join(proc, '11', 'cwd'));
+    await symlink(shm, path.join(proc, '11', 'fd', '7'));
+    const state: Observed = { processes: '', containers: [[]], openFiles: '', commands: [] };
+
+    await expect(
+      assertInstanceQuiet(target, {
+        runCommand: observing(state),
+        platform: 'linux',
+        procRoot: proc,
+        ambientEnv: {},
+        sleep: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: sqlite3 (PID 11) holds ${shm}.`,
+    });
+    expect(cacheDrops(state)).toEqual([]);
+  });
 });
 
 describe('what lsof reports', () => {
