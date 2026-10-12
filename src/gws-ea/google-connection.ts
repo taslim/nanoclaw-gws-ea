@@ -63,6 +63,8 @@ export interface GoogleConnectionInput {
   readonly runtime: InstanceRuntimeConfig;
   /** The declared Workspace address the sign-in must be. */
   readonly assistantWorkspaceEmail: string;
+  /** The assistant's name, which its sign-in client's app is named after, when this run knows it. */
+  readonly assistantName?: string;
   /** `--google-client-file`, when the operator supplied it on this run. */
   readonly clientFile?: string;
   /** The assistant's sign-in through the operator's browser; pauses when no one is at a terminal. */
@@ -97,11 +99,26 @@ export function googleClientConsoleUrl(projectId: string): string {
   return url.href;
 }
 
-/** What the operator does on that page; Google has no API for it. */
-export const GOOGLE_CLIENT_STEPS: readonly string[] = [
-  'Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
-  'Under Clients, create a client of type Desktop app, and download its JSON.',
-];
+/**
+ * What the operator does on that page, its link first and one field to a
+ * line, as Google has no API for it. The app is named after the assistant,
+ * so the consent page names the operator's own assistant, not a vendor.
+ */
+export function googleClientSteps(gcp: { projectId: string; account: string }, assistantName?: string): string[] {
+  return [
+    googleClientConsoleUrl(gcp.projectId),
+    'Get started:',
+    `  App name: ${assistantName ?? "the assistant's name"}`,
+    `  User support email: ${gcp.account}`,
+    '  Audience: Internal',
+    `  Contact email: ${gcp.account}`,
+    '  Agree to the Google API Services: User Data Policy, then Create',
+    'Clients, then Create client:',
+    '  Application type: Desktop app',
+    '  Name: leave the default',
+    '  Create, then Download JSON',
+  ];
+}
 
 /**
  * Whether the assistant's sign-in still needs the client the operator
@@ -120,8 +137,7 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
     phase: 'sign_in_google',
     code: 'google_client_required',
     message: "Create the assistant's Google sign-in client, then continue with its file.",
-    details: GOOGLE_CLIENT_STEPS,
-    actionUrl: googleClientConsoleUrl(context.input.gcp.projectId),
+    details: googleClientSteps(context.input.gcp, context.input.google.assistantName),
     resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
 }

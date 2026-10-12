@@ -316,14 +316,26 @@ describe("connecting the assistant's Google account", () => {
       'forms.googleapis.com',
     ]);
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
+    // The link first and alone on its line, then each field the console asks for.
     expect(pause).toMatchObject({
       phase: 'sign_in_google',
       code: 'google_client_required',
       resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
-      actionUrl: `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
+      details: [
+        `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
+        'Get started:',
+        "  App name: the assistant's name",
+        `  User support email: ${GCP.account}`,
+        '  Audience: Internal',
+        `  Contact email: ${GCP.account}`,
+        '  Agree to the Google API Services: User Data Policy, then Create',
+        'Clients, then Create client:',
+        '  Application type: Desktop app',
+        '  Name: leave the default',
+        '  Create, then Download JSON',
+      ],
     });
-    expect(pause?.details?.join('\n')).toMatch(/Get started.*Internal.*\n.*Clients.*Desktop app.*download/su);
-    expect(pause?.details?.join('\n')).not.toContain('chmod');
+    expect(pause).not.toHaveProperty('actionUrl');
     expect(signIn).not.toHaveBeenCalled();
   });
 
