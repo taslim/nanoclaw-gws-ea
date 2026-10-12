@@ -40,6 +40,19 @@ export interface ReleaseCommandEnvironments {
   git: Readonly<Record<string, string>>;
 }
 
+/**
+ * Git's own settings for the release commands, given in the environment so
+ * no operator configuration is read: no automatic maintenance. After a fetch
+ * Git otherwise starts it detached, and it goes on writing into a scratch
+ * repository while the release removes it (`ENOTEMPTY`, seen live with Git
+ * 2.54 on 2026-10-12).
+ */
+const RELEASE_GIT_SETTINGS = {
+  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_KEY_0: 'maintenance.auto',
+  GIT_CONFIG_VALUE_0: 'false',
+} as const;
+
 /** Build the tool environment rooted in storage owned by this release operation. */
 export async function prepareReleaseCommandEnvironments(ownerRoot: string): Promise<ReleaseCommandEnvironments> {
   const home = path.join(ownerRoot, '.release-home');
@@ -47,7 +60,7 @@ export async function prepareReleaseCommandEnvironments(ownerRoot: string): Prom
   const common = buildToolEnvironment(process.env, { HOME: home });
   return {
     common,
-    git: { ...common, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+    git: { ...common, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', ...RELEASE_GIT_SETTINGS },
   };
 }
 
