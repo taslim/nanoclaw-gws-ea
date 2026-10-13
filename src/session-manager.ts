@@ -409,21 +409,52 @@ function extractAttachmentFiles(
     if (!inboxDir) break;
 
     const filePath = path.join(inboxDir, filename);
+    const bytes = Buffer.from(att.data as string, 'base64');
     try {
       // wx = exclusive create. Refuses to follow a pre existing symlink or
       // overwrite any existing file. The host expects to be the sole writer
       // of these attachments.
-      fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'), { flag: 'wx' });
+      fs.writeFileSync(filePath, bytes, { flag: 'wx', mode: 0o600 });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException;
       if (e.code === 'EEXIST') {
-        log.warn('Inbox attachment target already exists, refusing to overwrite', {
-          messageId,
-          filename,
-        });
-        continue;
+        // A source retry may find the original bytes already staged. Open
+        // without following a link and reuse only this user's matching file.
+        let existing: number | undefined;
+        try {
+          const target = fs.lstatSync(filePath);
+          if (!target.isFile() || target.isSymbolicLink() || target.nlink !== 1) {
+            log.warn('Inbox attachment target is not a regular owned source file; refusing reuse', {
+              messageId,
+              filename,
+            });
+            continue;
+          }
+          existing = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+          const info = fs.fstatSync(existing);
+          if (
+            !info.isFile() ||
+            info.nlink !== 1 ||
+            info.dev !== target.dev ||
+            info.ino !== target.ino ||
+            info.size !== bytes.length ||
+            (typeof process.getuid === 'function' && info.uid !== process.getuid()) ||
+            !fs.readFileSync(existing).equals(bytes)
+          ) {
+            log.warn('Inbox attachment target differs from original source; refusing reuse', { messageId, filename });
+            continue;
+          }
+        } catch (error) {
+          if (!(error instanceof Error && 'code' in error && (error.code === 'ELOOP' || error.code === 'ENOENT')))
+            throw error;
+          log.warn('Inbox attachment target is unsafe; refusing reuse', { messageId, filename });
+          continue;
+        } finally {
+          if (existing !== undefined) fs.closeSync(existing);
+        }
+      } else {
+        throw err;
       }
-      throw err;
     }
 
     att.name = filename;

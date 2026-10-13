@@ -157,4 +157,44 @@ describe('extractAttachmentFiles — a platform message ID that is not a file na
     const inbox = path.join(sessionDir(AG, SESS), 'inbox');
     expect(fs.existsSync(inbox) ? fs.readdirSync(inbox) : []).toEqual([]);
   });
+
+  it('reuses only the same owned regular audio file when a delivery is retried', async () => {
+    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const inbox = path.join(sessionDir(AG, SESS), 'inbox', folder);
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.writeFileSync(path.join(inbox, 'note.ogg'), 'original audio');
+    const content = JSON.stringify({
+      text: 'caption',
+      attachments: [{ type: 'audio', name: 'note.ogg', data: Buffer.from('original audio').toString('base64') }],
+    });
+    await writeSessionMessage(AG, SESS, {
+      id: GCHAT_ID,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      content,
+    });
+    expect(storedContent(GCHAT_ID).attachments).toEqual([
+      { type: 'audio', name: 'note.ogg', localPath: `inbox/${folder}/note.ogg` },
+    ]);
+  });
+
+  it.each(['different bytes', 'symlink'] as const)('refuses to reuse an existing attachment with %s', async (kind) => {
+    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const inbox = path.join(sessionDir(AG, SESS), 'inbox', folder);
+    fs.mkdirSync(inbox, { recursive: true });
+    const target = path.join(inbox, 'note.ogg');
+    const outside = path.join(TEST_DIR, 'canary.ogg');
+    fs.writeFileSync(outside, 'original audio');
+    if (kind === 'symlink') fs.symlinkSync(outside, target);
+    else fs.writeFileSync(target, 'different recording');
+    const attachment = { type: 'audio', name: 'note.ogg', data: Buffer.from('original audio').toString('base64') };
+    await writeSessionMessage(AG, SESS, {
+      id: GCHAT_ID,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      content: JSON.stringify({ attachments: [attachment] }),
+    });
+    expect(storedContent(GCHAT_ID).attachments).toEqual([attachment]);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('original audio');
+  });
 });
