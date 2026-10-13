@@ -74,6 +74,38 @@ afterEach(async () => {
 });
 
 describe('sessionHistory', () => {
+  it.each([
+    ['plain legacy text', 'plain legacy text', ''],
+    ['[]', '', ''],
+    ['42', '', ''],
+    ['"plain JSON text"', '', ''],
+    ['{"action":"restart","sender":"Alex"}', '[restart]', 'Alex'],
+    ['{"text":"caption","action":"restart","sender":"Alex"}', 'caption', 'Alex'],
+  ])('retains historical content fallback for %s', async (content, text, sender) => {
+    await writeSessionMessage(AG, SESS, {
+      id: 'legacy',
+      kind: 'chat',
+      timestamp: '2026-08-01T10:00:00.000Z',
+      platformId: 'D1',
+      channelType: 'slack',
+      threadId: null,
+      content,
+    });
+    expect((await sessionHistory({ id: SESS }, HOST))[0]).toMatchObject({ text, sender });
+  });
+
+  it('retains null content already stored in outbound history', async () => {
+    await writeOutboundDirect(AG, SESS, {
+      id: 'legacy-null',
+      kind: 'chat',
+      platformId: 'D1',
+      channelType: 'slack',
+      threadId: null,
+      content: 'null',
+    });
+    expect((await sessionHistory({ id: SESS }, HOST))[0]).toMatchObject({ text: 'null', sender: 'Pixel' });
+  });
+
   it('keeps a forwarded recording as source information beside its caption in full history', async () => {
     await writeSessionMessage(AG, SESS, {
       id: 'forwarded-voice',

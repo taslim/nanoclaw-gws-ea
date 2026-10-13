@@ -15,17 +15,6 @@ export type SpeechResult = (
   model?: string;
 };
 
-export interface InboundAudioAttachment {
-  type: 'audio';
-  audioSource?: AudioSource;
-  speech?: SpeechResult;
-  mimeType?: string;
-  filename?: string;
-  data?: string;
-  path?: string;
-  duration?: number;
-}
-
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -48,13 +37,21 @@ export function parseInboundContent(raw: string): {
   sender: string | null;
   senderId: string | null;
 } {
-  let parsed: Record<string, unknown> | undefined;
   try {
-    parsed = record(JSON.parse(raw) as unknown);
+    return extractInboundContent(JSON.parse(raw) as unknown);
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     return { text: raw, sender: null, senderId: null };
   }
+}
+
+/** Read already parsed content without parsing retained media a second time. */
+export function extractInboundContent(value: unknown): {
+  text: string;
+  sender: string | null;
+  senderId: string | null;
+} {
+  const parsed = record(value);
   if (!parsed) return { text: '', sender: null, senderId: null };
 
   const parts = [typeof parsed.text === 'string' ? parsed.text : ''];

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SpeechResult } from '../../../channels/inbound-content.js';
+import { isRecord } from '../../../gws-ea/validation.js';
 import { isPathInside } from '../../../inbox-safety.js';
 import {
   verifyVoiceInstallation,
@@ -66,9 +67,8 @@ export interface ComparisonReport {
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value))
-    throw new Error('Expected a comparison object');
-  return value as Record<string, unknown>;
+  if (!isRecord(value)) throw new Error('Expected a comparison object');
+  return value;
 }
 
 function text(value: unknown, field: string): string {

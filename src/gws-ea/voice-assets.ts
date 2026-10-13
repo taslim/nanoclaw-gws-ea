@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { isRecord } from './validation.js';
 
 export const VOICE_POLICY_SCHEMA_VERSION = 1;
 export const VOICE_RECIPE_ID = 'whisper.cpp-1.9.5-ffmpeg-8.1-vad-6.2.0';
@@ -91,10 +92,10 @@ export class VoiceAssetsError extends Error {
 }
 
 function object(value: unknown): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw new VoiceAssetsError('invalid-assets', 'Voice configuration must be an object');
   }
-  return value as Record<string, unknown>;
+  return value;
 }
 
 export function parseVoiceHostPolicy(value: unknown): VoiceHostPolicy {

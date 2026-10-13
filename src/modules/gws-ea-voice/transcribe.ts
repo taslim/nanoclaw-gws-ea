@@ -2,6 +2,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { SpeechResult } from '../../channels/inbound-content.js';
 import type { VerifiedVoiceInstallation } from '../../gws-ea/voice-assets.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { runVoiceProcess } from './process.js';
 import { withVoiceTemp } from './staging.js';
 
@@ -21,8 +22,8 @@ export class VoiceRecognitionError extends Error {
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new VoiceRecognitionError('invalid-output');
-  return value as Record<string, unknown>;
+  if (!isRecord(value)) throw new VoiceRecognitionError('invalid-output');
+  return value;
 }
 
 /** Validate whisper.cpp's complete JSON, including its actual language/mode. */

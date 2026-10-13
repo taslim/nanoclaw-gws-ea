@@ -6,6 +6,7 @@ import type { SpeechResult } from '../../channels/inbound-content.js';
 import { register } from '../../cli/registry.js';
 import { DATA_DIR } from '../../config.js';
 import { VOICE_RECIPE_ID } from '../../gws-ea/voice-assets.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
 import { registerInboundPreparer, type InboundPreparationRequest } from '../../inbound-preparation.js';
 import { readVoiceReadiness } from './config.js';
@@ -23,9 +24,7 @@ let lastOutcome: { status: SpeechResult['status']; at: string } | null = null;
 let lastFailure: { reason: string; at: string } | null = null;
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
+  return isRecord(value) ? value : undefined;
 }
 
 function failureReason(error: unknown): string {
