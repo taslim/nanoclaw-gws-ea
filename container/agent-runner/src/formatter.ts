@@ -498,18 +498,67 @@ function formatLinks(links: any[] | undefined, text: string): string {
   return urls.length === 0 ? '' : `\n${urls.map((url) => `[link: ${escapeXml(url)}]`).join('\n')}`;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatAttachments(attachments: any[] | undefined): string {
-  if (!Array.isArray(attachments) || attachments.length === 0) return '';
-  const parts = attachments.map((a) => {
-    const name = a.name || a.filename || 'attachment';
-    const type = a.type || 'file';
-    const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
-    const url = a.url || '';
-    if (localPath) {
-      return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
+function attachmentRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function attachmentText(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/** Speech remains nested source material; engine/model diagnostics stay in storage. */
+function formatSpeech(attachment: Record<string, unknown>): string {
+  const speech = attachmentRecord(attachment.speech);
+  if (!speech) return '';
+  const source = attachmentRecord(attachment.audioSource);
+  const sourceAttrs =
+    ` source="${source?.kind === 'voice-note' ? 'voice-note' : 'audio'}"` +
+    (source?.forwarded === true ? ' forwarded="true"' : '') +
+    (source?.quoted === true ? ' quoted="true"' : '');
+  const text = attachmentText(speech.text);
+  if (speech.status === 'recognized' && text.trim()) {
+    const language = attachmentText(speech.language);
+    const languageAttr = language ? ` language="${escapeXml(language)}"` : '';
+    return `\n<speech status="recognized"${sourceAttrs}${languageAttr}>${escapeXml(text)}</speech>`;
+  }
+  const status = speech.status === 'unavailable' || speech.status === 'no-speech' ? speech.status : 'failed';
+  let consequence = 'The recording could not be understood in full.';
+  if (status === 'no-speech') consequence = 'No usable speech was detected in the recording.';
+  else if (status === 'unavailable') {
+    switch (speech.reason) {
+      case 'operator-setup-required':
+      case 'operator-enablement-required':
+        consequence = 'Voice notes need operator enablement.';
+        break;
+      case 'operator-update-required':
+        consequence = 'Voice notes need an operator update.';
+        break;
+      default:
+        consequence = 'Voice notes are currently unavailable.';
     }
-    return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
+  } else if (speech.reason === 'media-download-failed') consequence = 'The recording could not be obtained.';
+  return `\n<speech status="${status}"${sourceAttrs}>${consequence}</speech>`;
+}
+
+function formatAttachments(attachments: unknown): string {
+  if (!Array.isArray(attachments) || attachments.length === 0) return '';
+  const parts = attachments.map((value: unknown) => {
+    const a = attachmentRecord(value) ?? {};
+    const name = attachmentText(a.name) || attachmentText(a.filename) || 'attachment';
+    const type = attachmentText(a.type) || 'file';
+    const local = attachmentText(a.localPath);
+    const localPath = local ? `/workspace/${local}` : '';
+    const url = attachmentText(a.url);
+    const speech = formatSpeech(a);
+    if (localPath) {
+      return `[${escapeXml(type)}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]${speech}`;
+    }
+    const description = url
+      ? `[${escapeXml(type)}: ${escapeXml(name)} (${escapeXml(url)})]`
+      : `[${escapeXml(type)}: ${escapeXml(name)}]`;
+    return description + speech;
   });
   return '\n' + parts.join('\n');
 }

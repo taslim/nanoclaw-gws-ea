@@ -12,6 +12,7 @@ import { readVoiceReadiness } from './config.js';
 import { VoiceProcessError } from './process.js';
 import { readOriginalAudio, VoiceMediaError } from './staging.js';
 import { transcribeAudio, VoiceRecognitionError } from './transcribe.js';
+import './guidance.js';
 
 const MAX_PENDING_NOTES = 8;
 const stop = new AbortController();
