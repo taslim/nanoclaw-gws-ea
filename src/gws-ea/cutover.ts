@@ -4,9 +4,9 @@
  *
  * The fence stops the assistant's service job and drains its agents, proves
  * the instance quiet (no process runs from its instance root, no container
- * carries its install's label, nothing holds anything under its `state/`
- * open, Docker Desktop's own VM aside once no running container mounts the
- * state), and removes the live link, so nothing can start a host until a
+ * carries its install's label or mounts its `state/`, nothing holds anything
+ * under it open, Docker Desktop's own VM aside), and removes the live link,
+ * so nothing can start a host until a
  * switch points the link again, not even the service manager after a reboot.
  * The switch, run only fenced, stamps the target release's upgrade tripwire
  * with its own script, resets the circuit breaker, applies the files kept
@@ -329,13 +329,15 @@ async function dockerDesktopVm(
   // Containers on another runtime are not ones this assistant's Docker can list.
   if (system.trim() !== 'Docker Desktop') return undefined;
   for (const pid of vms) {
-    const { stdout } = await (seams.runCommand ?? runSanitizedCommand)({
+    const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
       command: 'sh',
       args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'n', '-p', String(pid)],
       cwd: instance.homeDirectory,
       env: toolEnvironment(seams),
       timeoutMs: PROBE_TIMEOUT_MS,
     });
+    // An lsof that met an error has not shown what the process holds.
+    if (stderr.trim()) continue;
     const files = stdout.split('\n').filter((line) => line.startsWith('n'));
     if (files.some((line) => path.basename(line.slice(1)) === DOCKER_DESKTOP_DISK)) return pid;
   }
@@ -343,10 +345,10 @@ async function dockerDesktopVm(
 }
 
 /**
- * Every running container with a bind mount inside `state/`, its source's
- * links resolved: an agent container mounts the state through its release's
- * folder. With Docker Desktop's VM aside, these are the containers that could
- * still be using the state.
+ * Every running container with a bind mount that reaches `state/`: the state,
+ * a folder inside it, or a folder that holds it, its source's links resolved,
+ * since an agent container mounts the state through its release's folder.
+ * Whoever started it, such a container can write the state.
  */
 async function containersMountingState(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
   const { stdout: listed } = await quietDocker(instance, seams, ['ps', '--quiet', '--no-trunc']);
@@ -374,7 +376,8 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
       const mount = requireRecord(value, 'Container mount', INVALID_DOCKER_OUTPUT);
       if (mount.Type !== 'bind') continue;
       const source = requireString(mount.Source, 'Mount source', INVALID_DOCKER_OUTPUT);
-      if (isInside(canonicalPath(source), state)) {
+      const reached = canonicalPath(source);
+      if (isInside(reached, state) || isInside(state, reached)) {
         found.push(name);
         break;
       }
@@ -384,14 +387,14 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
 }
 
 /**
- * Prove a stopped assistant quiet (KTD1): no process runs from its instance
- * root, no container carries its install's label in any state (those the
- * drain stopped get a moment to be removed), and no process holds anything
- * under its `state/` open, a database's `-wal`, `-shm`, and `-journal` side
- * files included. On macOS, Docker Desktop's own VM is not a holder of its
- * own: it is how containers reach the Mac's files, so in its place no running
- * container may mount anything inside the state. Refuses, naming what it
- * found, before anything is copied or moved.
+ * Prove a stopped assistant quiet (KTD1), each writer where it runs: no
+ * process runs from its instance root, no container carries its install's
+ * label in any state (those the drain stopped get a moment to be removed), no
+ * running container mounts its `state/`, and no process holds anything under
+ * it open, a database's `-wal`, `-shm`, and `-journal` side files included.
+ * Docker Desktop's own VM is not a holder of its own: it is how containers
+ * reach the Mac's files, and they are already accounted for. Refuses, naming
+ * what it found, before anything is copied or moved.
  */
 export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
   const root = instance.instanceRoot;
@@ -414,16 +417,14 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
   if (containers.length > 0) {
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
+  const mounting = await containersMountingState(instance, seams);
+  if (mounting.length > 0) {
+    throw notQuiet(root, `running containers ${mounting.join(', ')} mount its state`);
+  }
   // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
   const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];
   if (holders.length === 0) return;
   const vm = await dockerDesktopVm(instance, holders, seams);
-  if (vm !== undefined) {
-    const mounting = await containersMountingState(instance, seams);
-    if (mounting.length > 0) {
-      throw notQuiet(root, `running containers ${mounting.join(', ')} mount its state`);
-    }
-  }
   const others = holders.filter(({ pid }) => pid !== vm);
   if (others.length > 0) throw notQuiet(root, summarizeHolders(others));
 }

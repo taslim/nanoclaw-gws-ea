@@ -534,6 +534,8 @@ export interface World {
   openFiles: string;
   /** What `lsof` also finds open under the state, held by Docker Desktop's VM long after its containers left. */
   vmRetained?: string;
+  /** A container running on the machine that is not the assistant's, and the host folder it bind-mounts. */
+  strayMount?: { readonly name: string; readonly source: string };
   /** The containers `docker ps --all` lists, by the install label it filters on. */
   readonly containers: Map<string, readonly string[]>;
   /** The running host's Google Chat consumer never connects: Pub/Sub refuses its subscriber. */
@@ -742,8 +744,16 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
     }
     return { stdout: '', stderr: '' };
   }
-  // The fixture's machine runs no container that mounts an assistant's state.
-  if (first === 'ps' && !spec.args.includes('--filter')) return { stdout: '', stderr: '' };
+  // The running containers: none of the assistant's once drained, and any stray one.
+  if (first === 'ps' && !spec.args.includes('--filter'))
+    return { stdout: state.strayMount ? 'c-stray\n' : '', stderr: '' };
+  if (first === 'container' && second === 'inspect' && state.strayMount) {
+    const { name, source } = state.strayMount;
+    return {
+      stdout: `${JSON.stringify({ name: `/${name}`, mounts: [{ Type: 'bind', Source: source }] })}\n`,
+      stderr: '',
+    };
+  }
   if (first === 'ps') {
     const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
     return { stdout: (state.containers.get(label) ?? []).map((id) => `${id}\n`).join(''), stderr: '' };

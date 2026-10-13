@@ -787,6 +787,22 @@ describe('an update refused before its release starts', GIT_HEAVY, () => {
     expect(state.setups).toHaveLength(2);
   });
 
+  it('refuses while a container someone started by hand mounts the state, serving the release it left', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.strayMount = { name: 'debug-shell', source: path.join(runtime.state_root, 'data') };
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain('running containers debug-shell mount its state');
+    expect(err.join('\n')).toContain(`runs dogfood ${host.first.slice(0, 12)} again`);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+  });
+
   it("updates past the files Docker Desktop's VM kept from the assistant's exited containers", async () => {
     const host = await machine();
     const runtime = await assistant(host);
