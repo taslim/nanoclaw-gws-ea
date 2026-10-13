@@ -37,6 +37,7 @@ import {
 import { OAuth2Client } from 'google-auth-library';
 
 import type { ChannelAdapter, ChannelDefaults } from '../../channels/adapter.js';
+import type { AudioSource } from '../../channels/inbound-content.js';
 import {
   createChatSdkBridge,
   type ReactionSource,
@@ -116,6 +117,9 @@ const WORKING_EMOJI = '👀';
 const WORKING_RECORD = 'gws-ea-chat:working';
 /** How many messages whose work ended are remembered, so a late pulse never shows 👀 on one again. */
 const ENDED_KEPT = 1_000;
+/** chat@4.40.0's default dedupe lifetime, retained for a completed audio dispatch. */
+const SDK_DEDUPE_TTL_MS = 10 * 60_000;
+const AUDIO_DISPATCH_COMPLETE = { gwsEaAudioCompleted: true } as const;
 
 /** The assistant's 👀 on one message a turn works on. */
 interface Working {
@@ -308,11 +312,26 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     if (!message || !space) throw new Error('A Chat message notification lacks its message or space');
     const chat = this.requireChat();
     const threadId = this.threadIdOf(message, space);
+    const key = sdkDedupeKey(this.name, message.name);
+    const hasAudio = message.attachment?.some((attachment) => attachment.contentType?.startsWith('audio/')) === true;
+    const claim = hasAudio ? await this.state?.get<unknown>(key) : undefined;
+    const audioCompleted = isRecord(claim) && claim.gwsEaAudioCompleted === true;
+    // The SDK claims a source before media preparation. Its opaque KV value
+    // can also record completion, so only unfinished audio dispatch is retried
+    // after a host death. Completed captions (including consumed replies and
+    // command denials) keep native SDK dedupe; ordinary text is unchanged.
+    // The pull owner serializes each space until this awaited dispatch ends.
+    if (hasAudio && !audioCompleted) await this.state?.delete(key);
     try {
       await chat.processMessage(this, threadId, () => this.parsePubSubMessage(notification, threadId));
+      if (hasAudio && !audioCompleted) await this.state?.set(key, AUDIO_DISPATCH_COMPLETE, SDK_DEDUPE_TTL_MS);
+      // Mailbox source IDs cover a death before this completion write. A death
+      // after a non-mailbox interceptor effect can repeat that effect, as the
+      // SDK claim and module effects do not share an atomic transaction.
     } catch (error) {
-      // The SDK skips a copy of this message for ten minutes; it was not routed, so its copy must be.
-      await this.state?.delete(sdkDedupeKey(this.name, message.name)).catch((cause: unknown) => {
+      // A failed dispatch must retry, including a failed completion write after
+      // mailbox insertion; durable source IDs protect an already inserted copy.
+      await this.state?.delete(key).catch((cause: unknown) => {
         log.error('Could not clear a failed Chat message from the SDK dedupe', { name: message.name, err: cause });
       });
       throw error;
@@ -549,6 +568,13 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   return { sender, text, ...(id === undefined ? {} : { id }) };
 }
 
+/** A native forward contains source audio; replying to a message does not forward a new recording. */
+function gchatAudioSource(raw: Record<string, unknown>): AudioSource {
+  const message = isRecord(raw.message) ? raw.message : undefined;
+  const quote = isRecord(message?.quotedMessageMetadata) ? message.quotedMessageMetadata : undefined;
+  return { kind: 'audio', ...(quote?.quoteType === 'FORWARD' ? { forwarded: true } : {}) };
+}
+
 /**
  * Google Chat's wiring defaults. Every DM engages; a group conversation
  * engages on a mention, which an operator can widen per wiring. Unknown
@@ -581,6 +607,7 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Chann
     supportsThreads: true,
     defaults: GCHAT_DEFAULTS,
     extractReplyContext: extractGchatReplyContext,
+    extractAudioSource: gchatAudioSource,
     redelivers: true,
     textRequests: { postedAt: chatCreateTime },
   });

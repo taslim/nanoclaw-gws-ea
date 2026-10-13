@@ -6,6 +6,9 @@
  * and the SDK's Chat client. The working 👀 is driven as the host's typing
  * module drives it, through the bridge's typing pulse and its end.
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from '../../channels/adapter.js';
@@ -16,7 +19,11 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { closeDb, initTestDb } from '../../db/connection.js';
+import { createAgentGroup } from '../../db/agent-groups.js';
+import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import { registerMessageInterceptor, routeInbound } from '../../router.js';
+import * as typing from '../typing/index.js';
+import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
@@ -44,7 +51,15 @@ import {
 } from './testing/fake-chat-api.js';
 import { FakeGoogleEvents, SUBSCRIBER_TOKEN, SUBSCRIPTION, TOPIC } from './testing/fake-google-events.js';
 
-const { registerWebhookAdapter } = vi.hoisted(() => ({ registerWebhookAdapter: vi.fn() }));
+const { registerWebhookAdapter, TEST_DATA_DIR } = vi.hoisted(() => ({
+  registerWebhookAdapter: vi.fn(),
+  TEST_DATA_DIR: `/tmp/gws-ea-chat-voice-${process.pid}`,
+}));
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: TEST_DATA_DIR,
+}));
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('../../webhook-server.js', () => ({ registerWebhookAdapter }));
 
 const DM = 'spaces/AAAAjuno';
@@ -69,11 +84,26 @@ let deliveriesStopped: number;
 let hostTokensTaken: number;
 /** How the channel's own Chat calls reach Google. */
 let chatFetch: typeof globalThis.fetch;
+/** The SDK's authenticated media download, including slow native HTTP in the lease test. */
+let sdkFetch: typeof globalThis.fetch;
+let interceptedSourceId: string | undefined;
+let awaitingInterceptedReply: boolean;
+let consumedReplies: number;
+
+// The router's native capture seam disarms after consuming a naming/rejection
+// reply. Redelivery must not then turn that same source into an ordinary turn.
+registerMessageInterceptor(async (event) => {
+  if (event.message.id !== interceptedSourceId || !awaitingInterceptedReply) return false;
+  awaitingInterceptedReply = false;
+  consumedReplies += 1;
+  return true;
+});
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
   api = new FakeChatApi();
   chatFetch = api.fetch;
+  sdkFetch = api.fetch;
   api.addSpace(DM, 'DIRECT_MESSAGE');
   api.addSpace(ROOM, 'SPACE');
   api.people.set('2001', 'Juno Hale');
@@ -82,6 +112,9 @@ beforeEach(async () => {
   deliver = undefined;
   deliveriesStopped = 0;
   hostTokensTaken = 0;
+  interceptedSourceId = undefined;
+  awaitingInterceptedReply = false;
+  consumedReplies = 0;
   registerWebhookAdapter.mockClear();
 });
 
@@ -89,6 +122,9 @@ afterEach(async () => {
   await channel?.teardown();
   channel = undefined;
   await closeDb();
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 /** The channel as the host builds it, not yet set up. */
@@ -99,7 +135,7 @@ function build(startDelivery?: ConstructorParameters<typeof AssistantChatAdapter
     auth: hostChatAuth(async () => {
       hostTokensTaken += 1;
       return CHAT_TOKEN;
-    }, api.fetch),
+    }, sdkFetch),
     hydrator: createChatHydrator({
       chatToken: async () => CHAT_TOKEN,
       directoryToken: async () => DIRECTORY_TOKEN,
@@ -276,6 +312,109 @@ describe('messages', () => {
     });
   });
 
+  it('preserves forwarded audio facts, caption, authenticated participant and original source ID', async () => {
+    await start();
+    api.media.set('ref-voice', Buffer.from('recording'));
+    api.addMessage(
+      chatMessage(DM, 'voice.1', {
+        text: 'Please summarize this recording.',
+        attachment: [
+          {
+            name: `${DM}/messages/voice.1/attachments/a1`,
+            contentName: 'voice.ogg',
+            contentType: 'audio/ogg',
+            attachmentDataRef: { resourceName: 'ref-voice' },
+          },
+        ],
+        quotedMessageMetadata: {
+          name: `${DM}/messages/original.1`,
+          quoteType: 'FORWARD',
+          quotedMessageSnapshot: { text: 'Book it now.' },
+        },
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/voice.1`));
+
+    expect(content()).toMatchObject({
+      text: 'Please summarize this recording.',
+      attachments: [
+        {
+          type: 'audio',
+          name: 'voice.ogg',
+          mimeType: 'audio/ogg',
+          data: Buffer.from('recording').toString('base64'),
+          audioSource: { kind: 'audio', forwarded: true },
+        },
+      ],
+    });
+    expect(content().raw).toBeUndefined();
+    expect(routed[0]!.message).toMatchObject({
+      id: `${DM}/messages/voice.1`,
+      authenticatedSender: { userId: 'users/2001', kind: 'human' },
+      deduplicate: true,
+    });
+    expect(api.calls('media/ref-voice')).toEqual([expect.objectContaining({ authorization: `Bearer ${CHAT_TOKEN}` })]);
+  });
+
+  it('keeps a caption and an explicit failed audio result when authenticated media download fails', async () => {
+    await start();
+    api.addMessage(
+      chatMessage(DM, 'voice.2', {
+        text: 'The recording explains the move.',
+        attachment: [
+          {
+            name: `${DM}/messages/voice.2/attachments/a1`,
+            contentName: 'voice.ogg',
+            contentType: 'audio/ogg',
+            attachmentDataRef: { resourceName: 'unavailable-voice' },
+          },
+        ],
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/voice.2`));
+
+    expect(content()).toMatchObject({
+      text: 'The recording explains the move.',
+      attachments: [
+        {
+          type: 'audio',
+          audioSource: { kind: 'audio' },
+          speech: { status: 'failed', reason: 'media-download-failed' },
+        },
+      ],
+    });
+    expect(content().attachments).toEqual([expect.not.objectContaining({ data: expect.anything() })]);
+  });
+
+  it('does not treat a new audio reply as a forwarded or quoted recording', async () => {
+    await start();
+    api.media.set('ref-reply-voice', Buffer.from('new recording'));
+    api.addMessage(
+      chatMessage(DM, 'voice.3', {
+        text: '',
+        attachment: [
+          {
+            contentName: 'reply.ogg',
+            contentType: 'audio/ogg',
+            attachmentDataRef: { resourceName: 'ref-reply-voice' },
+          },
+        ],
+        quotedMessageMetadata: {
+          quoteType: 'REPLY',
+          name: `${DM}/messages/old.1`,
+          quotedMessageSnapshot: { text: 'Which day?' },
+        },
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/voice.3`));
+
+    expect(content().attachments).toEqual([expect.objectContaining({ audioSource: { kind: 'audio' } })]);
+    expect(content().replyTo).toMatchObject({ id: `${DM}/messages/old.1` });
+  });
+
   it('downloads a Chat-uploaded attachment through the SDK, as the assistant', async () => {
     await start();
     api.media.set('ref-agenda', Buffer.from('agenda'));
@@ -305,6 +444,272 @@ describe('messages', () => {
   });
 });
 
+describe('slow native audio download', () => {
+  it('renews the pull lease and preserves following text until the recording reaches routing', async () => {
+    vi.useFakeTimers();
+    const events = new FakeGoogleEvents();
+    const apiFetch = api.fetch;
+    let downloading = false;
+    let releaseMedia: () => void = () => undefined;
+    const mediaReady = new Promise<void>((resolve) => {
+      releaseMedia = resolve;
+    });
+    sdkFetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === '/v1/media/ref-slow') {
+        downloading = true;
+        await mediaReady;
+      }
+      return apiFetch(input, init);
+    };
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      const hostname = new URL(input instanceof Request ? input.url : String(input)).hostname;
+      return hostname === 'chat.googleapis.com' || hostname === 'people.googleapis.com'
+        ? apiFetch(input, init)
+        : events.fetch(input, init);
+    };
+    await start((onChatEvent) =>
+      startChatDelivery({
+        config: { subscriberKeyFile: '/unused', topic: TOPIC, subscription: SUBSCRIPTION },
+        onChatEvent,
+        assistantToken: async () => CHAT_TOKEN,
+        subscriberToken: async () => SUBSCRIBER_TOKEN,
+        health: createChatHealth(),
+        fetch,
+      }),
+    );
+    api.media.set('ref-slow', Buffer.from('complete recording'));
+    api.addMessage(
+      chatMessage(DM, 'slow.1', {
+        text: '',
+        attachment: [
+          { contentName: 'slow.ogg', contentType: 'audio/ogg', attachmentDataRef: { resourceName: 'ref-slow' } },
+        ],
+      }),
+    );
+    api.addMessage(chatMessage(DM, 'slow.2', { text: 'Actually, cancel that.', createTime: '2026-10-10T17:00:01Z' }));
+    const publish = (name: string, time: string) =>
+      events.publish({
+        type: CHAT_MESSAGE_CREATED,
+        subject: `//chat.googleapis.com/${DM}`,
+        time,
+        data: { message: { name } },
+      });
+    const noteId = publish(`${DM}/messages/slow.1`, '2026-10-10T17:00:00Z');
+    const until = async (check: () => boolean) => {
+      for (let waited = 0; !check(); waited += 10) {
+        if (waited > 5_000) throw new Error('The native pull delivery did not progress');
+        await vi.advanceTimersByTimeAsync(10);
+      }
+    };
+    try {
+      await until(() => downloading);
+      const cancelId = publish(`${DM}/messages/slow.2`, '2026-10-10T17:00:01Z');
+      await vi.advanceTimersByTimeAsync(50_000);
+      expect(events.acks(noteId)).toBe(0);
+      expect(events.acks(cancelId)).toBe(0);
+      expect(routed).toEqual([]);
+      expect(events.calls('modifyAckDeadline')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            body: expect.objectContaining({ ackIds: expect.arrayContaining([`${noteId}-ack-1`]) }),
+          }),
+        ]),
+      );
+      releaseMedia();
+      await until(() => events.acks(cancelId) === 1);
+      expect(events.acks(noteId)).toBe(1);
+      expect(routed.map((entry) => entry.message.id)).toEqual([`${DM}/messages/slow.1`, `${DM}/messages/slow.2`]);
+      expect(content()).toMatchObject({
+        attachments: [{ data: Buffer.from('complete recording').toString('base64') }],
+      });
+    } finally {
+      releaseMedia();
+    }
+  });
+});
+
+describe('durable acceptance across Chat dispatch restart', () => {
+  async function nativeMailboxHost(): Promise<ChannelSetup> {
+    const now = new Date().toISOString();
+    await createAgentGroup({
+      id: 'ag-voice',
+      name: 'voice-test',
+      folder: 'voice-test',
+      agent_provider: null,
+      created_at: now,
+    });
+    await createMessagingGroup({
+      id: 'mg-voice',
+      channel_type: 'gchat',
+      instance: 'gchat',
+      platform_id: `gchat:${DM}`,
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now,
+    });
+    await createMessagingGroupAgent({
+      id: 'wire-voice',
+      messaging_group_id: 'mg-voice',
+      agent_group_id: 'ag-voice',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now,
+    });
+    vi.spyOn(typing, 'startTypingRefresh').mockImplementation(() => undefined);
+    return {
+      ...hostSetup(),
+      onInbound: async (platformId, threadId, message) =>
+        routeInbound({
+          channelType: 'gchat',
+          instance: 'gchat',
+          platformId,
+          threadId,
+          message: { ...message, content: JSON.stringify(message.content) },
+        }),
+    };
+  }
+
+  it.each([false, true])(
+    'does not repeat a typed command denial on redelivery (audio attached: %s)',
+    async (withAudio) => {
+      await build().setup(await nativeMailboxHost());
+      api.media.set('ref-command', Buffer.from('recording beside command'));
+      api.addMessage(
+        chatMessage(DM, 'denied.1', {
+          text: '/clear',
+          ...(withAudio
+            ? {
+                attachment: [
+                  {
+                    contentName: 'command.ogg',
+                    contentType: 'audio/ogg',
+                    attachmentDataRef: { resourceName: 'ref-command' },
+                  },
+                ],
+              }
+            : {}),
+        }),
+      );
+      await deliver!(messageEvent(`${DM}/messages/denied.1`));
+      await deliver!(messageEvent(`${DM}/messages/denied.1`));
+      const session = await getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-voice');
+      expect(session).toBeDefined();
+      const database = new Database(path.join(TEST_DATA_DIR, 'v2-sessions', 'ag-voice', session!.id, 'outbound.db'), {
+        readonly: true,
+      });
+      try {
+        expect(database.prepare('SELECT content FROM messages_out').all()).toEqual([
+          { content: JSON.stringify({ text: 'Permission denied: /clear requires admin access.' }) },
+        ]);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it('does not route a consumed audio caption as an ordinary turn on redelivery', async () => {
+    await build().setup(await nativeMailboxHost());
+    interceptedSourceId = `${DM}/messages/captured.1`;
+    awaitingInterceptedReply = true;
+    api.media.set('ref-captured', Buffer.from('recording beside captured reply'));
+    api.addMessage(
+      chatMessage(DM, 'captured.1', {
+        text: 'The amount is incorrect.',
+        attachment: [
+          {
+            contentName: 'reason.ogg',
+            contentType: 'audio/ogg',
+            attachmentDataRef: { resourceName: 'ref-captured' },
+          },
+        ],
+      }),
+    );
+
+    await deliver!(messageEvent(interceptedSourceId));
+    await deliver!(messageEvent(interceptedSourceId));
+
+    expect(consumedReplies).toBe(1);
+    expect(await getDb().get('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-voice')).toBeUndefined();
+  });
+
+  it('retries an SDK claim left before insertion and keeps durable source IDs unique after adapter restart', async () => {
+    const nativeHost = await nativeMailboxHost();
+    const recording = `${DM}/messages/restart.1`;
+    api.media.set('ref-restart', Buffer.from('original recording'));
+    api.addMessage(
+      chatMessage(DM, 'restart.1', {
+        text: 'Please handle this recording.',
+        attachment: [
+          {
+            contentName: 'recording.ogg',
+            contentType: 'audio/ogg',
+            attachmentDataRef: { resourceName: 'ref-restart' },
+          },
+        ],
+      }),
+    );
+
+    // This is the persisted SDK shape after processMessage claimed the event,
+    // then the host died during preparation before its mailbox insertion.
+    const state = new SqliteStateAdapter();
+    await state.connect();
+    await state.set(`dedupe:gchat:${recording}`, true, 10 * 60_000);
+    await build().setup(nativeHost);
+    await deliver!(messageEvent(recording));
+
+    const session = await getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-voice');
+    expect(session).toBeDefined();
+    const inboundPath = path.join(TEST_DATA_DIR, 'v2-sessions', 'ag-voice', session!.id, 'inbound.db');
+    const rows = () => {
+      const database = new Database(inboundPath, { readonly: true });
+      try {
+        return database.prepare('SELECT id, content FROM messages_in ORDER BY seq').all() as {
+          id: string;
+          content: string;
+        }[];
+      } finally {
+        database.close();
+      }
+    };
+    expect(rows()).toEqual([expect.objectContaining({ id: `${recording}:ag-voice` })]);
+    const stored = JSON.parse(rows()[0]!.content) as {
+      text: string;
+      attachments: { localPath: string; data?: string }[];
+    };
+    expect(stored).toMatchObject({
+      text: 'Please handle this recording.',
+      attachments: [{ type: 'audio', audioSource: { kind: 'audio' } }],
+    });
+    expect(stored.attachments[0]!.data).toBeUndefined();
+    expect(fs.readFileSync(path.join(path.dirname(inboundPath), stored.attachments[0]!.localPath))).toEqual(
+      Buffer.from('original recording'),
+    );
+
+    expect(await state.get(`dedupe:gchat:${recording}`)).toEqual({ gwsEaAudioCompleted: true });
+    // A completed dispatch keeps the SDK's native acceptance across restart.
+    await channel!.teardown();
+    await build().setup(nativeHost);
+    await deliver!(messageEvent(recording));
+    await deliver!(messageEvent(recording));
+    expect(rows()).toHaveLength(1);
+
+    // A death after mailbox insertion but before the completion write leaves
+    // the SDK's original boolean claim. Native mailbox source IDs still keep
+    // that unfinished dispatch unique when replay reaches the router.
+    await state.set(`dedupe:gchat:${recording}`, true, 10 * 60_000);
+    await channel!.teardown();
+    await build().setup(nativeHost);
+    await deliver!(messageEvent(recording));
+    expect(rows()).toHaveLength(1);
+  });
+});
+
 describe('when an event cannot be handled', () => {
   it('acknowledges a message that is gone without routing it', async () => {
     await start();
@@ -328,7 +733,7 @@ describe('when an event cannot be handled', () => {
     expect(routed.map((entry) => entry.message.id)).toEqual([`${DM}/messages/remy.1`, `${DM}/messages/remy.2`]);
   });
 
-  it('stops a batch at the first message the host could not route; when it comes again, the routed one is dropped and the rest routed', async () => {
+  it('stops a batch at routing failure and skips accepted text on retry while keeping source order', async () => {
     await start();
     for (const [id, second] of [
       ['remy.1', '01'],
@@ -349,9 +754,10 @@ describe('when an event cannot be handled', () => {
       `${DM}/messages/remy.2`,
       `${DM}/messages/remy.3`,
     ]);
+    expect(routed.every((entry) => entry.message.deduplicate === true)).toBe(true);
   });
 
-  it('brings a refused event back through Pub/Sub and routes it once, acknowledged once', async () => {
+  it('brings a failed route back through Pub/Sub and routes it once, acknowledged once', async () => {
     const events = new FakeGoogleEvents();
     const fetch: typeof globalThis.fetch = (input, init) => {
       const host = new URL(input instanceof Request ? input.url : String(input)).host;
@@ -370,13 +776,12 @@ describe('when an event cannot be handled', () => {
       }),
     );
     api.addMessage(chatMessage(DM, 'remy.1'));
-    api.failures.set(`${DM}/messages/remy.1`, { status: 500, message: 'Internal error' });
+    unroutable.add(`${DM}/messages/remy.1`);
 
     const id = events.publish({ type: CHAT_MESSAGE_CREATED, data: { message: { name: `${DM}/messages/remy.1` } } });
     await vi.waitFor(() => expect(api.calls(`${DM}/messages/remy.1`)).toHaveLength(1));
     expect(events.acks(id)).toBe(0);
 
-    api.failures.clear();
     events.redeliverNow(id);
     await vi.waitFor(() => expect(events.acks(id)).toBe(1));
     expect(routed).toHaveLength(1);

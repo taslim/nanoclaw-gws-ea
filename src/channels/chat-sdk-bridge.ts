@@ -32,6 +32,7 @@ import { approveRejectRequest, normalizeOptions, type NormalizedOption } from '.
 import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { createAnswers, indexPostedRequest, POSTED_REQUEST_KEPT_MS, type Answers } from './answers.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
+import type { AudioSource } from './inbound-content.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
@@ -418,6 +419,8 @@ export interface ChatSdkBridgeConfig {
   botToken?: string;
   /** Platform-specific reply context extraction. */
   extractReplyContext?: ReplyContextExtractor;
+  /** Native recording provenance, recovered before the SDK raw payload is dropped. */
+  extractAudioSource?: (raw: Record<string, unknown>) => AudioSource;
   /**
    * Recover readable content the platform adapter left only in `message.raw`.
    * The returned text is appended to the message body and persisted; the raw
@@ -803,21 +806,22 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     isMention: boolean,
     isGroup?: boolean,
   ): Promise<InboundMessage> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const serialized = message.toJSON() as Record<string, any>;
+    const serialized = message.toJSON() as unknown as Record<string, unknown>;
+    const raw = message.raw as Record<string, unknown> | undefined;
+    const audioSource = raw && config.extractAudioSource ? config.extractAudioSource(raw) : { kind: 'audio' as const };
 
     // Download attachment data before serialization loses fetchData()
     if (message.attachments && message.attachments.length > 0) {
-      const enriched = [];
+      const enriched: Record<string, unknown>[] = [];
       for (const att of message.attachments) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const entry: Record<string, any> = {
+        const entry: Record<string, unknown> = {
           type: att.type,
           name: att.name,
           mimeType: att.mimeType,
           size: att.size,
           width: (att as unknown as Record<string, unknown>).width,
           height: (att as unknown as Record<string, unknown>).height,
+          ...(att.type === 'audio' ? { audioSource } : {}),
         };
         if (att.fetchData) {
           try {
@@ -825,7 +829,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             entry.data = buffer.toString('base64');
           } catch (err) {
             log.warn('Failed to download attachment', { type: att.type, err });
+            if (att.type === 'audio') entry.speech = { status: 'failed', reason: 'media-download-failed' };
           }
+        }
+        if (att.type === 'audio' && !att.fetchData) {
+          entry.speech = { status: 'failed', reason: 'media-download-failed' };
         }
         enriched.push(entry);
       }
@@ -839,8 +847,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     // Extract reply context via platform-specific hook
     if (config.extractReplyContext && message.raw) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const replyTo = config.extractReplyContext(message.raw as Record<string, any>);
+      const replyTo = config.extractReplyContext(message.raw as Record<string, unknown>);
       if (replyTo) serialized.replyTo = replyTo;
     }
 
