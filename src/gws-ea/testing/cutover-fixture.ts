@@ -94,6 +94,8 @@ const PINS = { gateway: LAUNCHER_PINS.onecliGateway };
 export const NEW_IMAGE = { 'container/Dockerfile': 'FROM scratch\nRUN true\n' } as const;
 /** A gateway an earlier release built, which an assistant may still run. */
 export const DEPLOYED_GATEWAY = wrapperImageTag('0'.repeat(16));
+/** The disk Docker Desktop's VM runs from. */
+const DOCKER_DESKTOP_DISK = '/Users/morgan/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw';
 /** The gateway every release this machine stages names. */
 export const RELEASE_GATEWAY = (await resolveWrapperGatewayImage(PINS)).image;
 export const LIVE_MIGRATIONS = ['initial-v2-schema', 'host-coordination'] as const;
@@ -530,6 +532,10 @@ export interface World {
   /** What `ps` lists, and what `lsof` finds open under the instance's state. */
   processes: string;
   openFiles: string;
+  /** What `lsof` also finds open under the state, held by Docker Desktop's VM long after its containers left. */
+  vmRetained?: string;
+  /** A container running on the machine that is not the assistant's, and the host folder it bind-mounts. */
+  strayMount?: { readonly name: string; readonly source: string };
   /** The containers `docker ps --all` lists, by the install label it filters on. */
   readonly containers: Map<string, readonly string[]>;
   /** The running host's Google Chat consumer never connects: Pub/Sub refuses its subscriber. */
@@ -717,6 +723,7 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
     const project = flagValues(spec.args, '--filter')[0]!.replace('label=com.docker.compose.project=', '');
     return { stdout: projectContainers(state, project), stderr: '' };
   }
+  if (first === 'info') return { stdout: 'Docker Desktop\n', stderr: '' };
   if (first === 'run') {
     const project = [...state.gateways].find(([name]) =>
       (flagValues(spec.args, '--network')[0] ?? '').startsWith(name),
@@ -736,6 +743,16 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
       });
     }
     return { stdout: '', stderr: '' };
+  }
+  // The running containers: none of the assistant's once drained, and any stray one.
+  if (first === 'ps' && !spec.args.includes('--filter'))
+    return { stdout: state.strayMount ? 'c-stray\n' : '', stderr: '' };
+  if (first === 'container' && second === 'inspect' && state.strayMount) {
+    const { name, source } = state.strayMount;
+    return {
+      stdout: `${JSON.stringify({ name: `/${name}`, mounts: [{ Type: 'bind', Source: source }] })}\n`,
+      stderr: '',
+    };
   }
   if (first === 'ps') {
     const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
@@ -818,7 +835,13 @@ export function runner(state: World): SanitizedCommandRunner {
       return { stdout: '', stderr: '' };
     }
     if (spec.command === 'ps') return { stdout: state.processes, stderr: '' };
-    if (spec.command === 'sh' && spec.args[2] === 'lsof') return { stdout: state.openFiles, stderr: '' };
+    if (spec.command === 'sh' && spec.args[2] === 'lsof' && spec.args.includes('-p')) {
+      // Every process lsof is asked about is Docker Desktop's VM, which runs its disk.
+      return { stdout: `p${spec.args.at(-1)}\nn${DOCKER_DESKTOP_DISK}\n`, stderr: '' };
+    }
+    if (spec.command === 'sh' && spec.args[2] === 'lsof') {
+      return { stdout: `${state.openFiles}${state.vmRetained ?? ''}`, stderr: '' };
+    }
     if (spec.command === 'systemctl') return { stdout: '', stderr: '' };
     if (spec.command === 'docker') return docker(state, spec);
     throw new Error(`unexpected command: ${spec.command} ${joined}`);

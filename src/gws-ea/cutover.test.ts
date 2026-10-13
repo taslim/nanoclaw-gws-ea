@@ -39,9 +39,21 @@ import {
   type Machine,
   type World,
 } from './testing/cutover-fixture.js';
-import { releaseOf } from './types.js';
+import { GwsEaError, releaseOf } from './types.js';
 
 afterEach(removeTemporaryRoots);
+
+/** A running container as `docker container inspect` describes it. */
+interface RunningContainer {
+  readonly id: string;
+  readonly name: string;
+  readonly mounts: ReadonlyArray<{
+    readonly Type: string;
+    readonly Source: string;
+    readonly Name?: string;
+    readonly Driver?: string;
+  }>;
+}
 
 /** An assistant whose host is stopped, and what `ps`, Docker, and `lsof` report about it. */
 interface Observed {
@@ -50,20 +62,74 @@ interface Observed {
   openFiles: string;
   /** What lsof reports on stderr: an error it met. */
   lsofError?: string;
+  /** What runs the assistant's Docker, as `docker info` says; Docker Desktop unless set. */
+  system?: string;
+  /** Docker fails to answer `docker info`. */
+  infoFails?: boolean;
+  /** The files each process holds open, as `lsof -p` lists them. */
+  processFiles?: Readonly<Record<number, readonly string[]>>;
+  /** What `lsof -p` reports on stderr: an error it met. */
+  processError?: string;
+  /** The containers running on the assistant's Docker. */
+  running?: readonly RunningContainer[];
+  /** Each named volume's driver options, as `docker volume inspect` shows them. */
+  volumes?: Readonly<Record<string, Readonly<Record<string, string>> | null>>;
   readonly commands: SanitizedCommand[];
 }
 
 function observing(state: Observed): SanitizedCommandRunner {
   return async (command) => {
     state.commands.push(command);
+    const [first] = command.args;
     if (command.command === 'ps') return { stdout: state.processes, stderr: '' };
-    if (command.command === 'docker') return { stdout: (state.containers.shift() ?? []).join('\n'), stderr: '' };
+    if (command.command === 'docker' && first === 'info') {
+      if (state.infoFails) throw new GwsEaError('command_failed', 'Command failed (exit code 1): docker info');
+      return { stdout: `${state.system ?? 'Docker Desktop'}\n`, stderr: '' };
+    }
+    if (command.command === 'docker' && first === 'volume') {
+      return {
+        stdout: command.args
+          .slice(4)
+          .map((name) => `${JSON.stringify({ name, options: state.volumes?.[name] ?? null })}\n`)
+          .join(''),
+        stderr: '',
+      };
+    }
+    if (command.command === 'docker' && first === 'container') {
+      const asked = command.args.slice(4);
+      const inspected = (state.running ?? []).filter(({ id }) => asked.includes(id));
+      return {
+        stdout: inspected.map(({ name, mounts }) => `${JSON.stringify({ name: `/${name}`, mounts })}\n`).join(''),
+        stderr: '',
+      };
+    }
+    if (command.command === 'docker' && command.args.includes('--all')) {
+      return { stdout: (state.containers.shift() ?? []).join('\n'), stderr: '' };
+    }
+    if (command.command === 'docker' && first === 'ps') {
+      return { stdout: (state.running ?? []).map(({ id }) => `${id}\n`).join(''), stderr: '' };
+    }
+    if (command.command === 'sh' && command.args[2] === 'lsof' && command.args.includes('-p')) {
+      const pid = Number(command.args.at(-1));
+      return {
+        stdout: `p${pid}\n${(state.processFiles?.[pid] ?? []).map((file) => `n${file}\n`).join('')}`,
+        stderr: state.processError ?? '',
+      };
+    }
     if (command.command === 'sh' && command.args[2] === 'lsof') {
       return { stdout: state.openFiles, stderr: state.lsofError ?? '' };
     }
     throw new Error(`unexpected command: ${command.command} ${command.args.join(' ')}`);
   };
 }
+
+/** Docker Desktop's VM, as lsof names it, holding `files`. */
+function vmHolds(files: readonly string[], pid = 5677): string {
+  return `p${pid}\nccom.apple.Virtualization.Virtua\n${files.map((file) => `n${file}`).join('\n')}\n`;
+}
+
+/** What Docker Desktop's VM process holds besides the state: the disk it runs from. */
+const DESKTOP_DISK = { 5677: ['/Users/morgan/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw'] };
 
 async function quietTarget(): Promise<QuietInstance> {
   const root = await temporaryRoot('gws-ea-quiet-');
@@ -107,6 +173,8 @@ describe('proving a stopped assistant quiet', () => {
     expect(docker.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
     const lsof = state.commands.find((command) => command.command === 'sh')!;
     expect(lsof.args.slice(2)).toEqual(['lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', target.state]);
+    // No container runs, and nothing is held, so Docker is asked nothing more.
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'docker', 'sh']);
   });
 
   it('refuses a process running from any release of the instance, naming it', async () => {
@@ -146,24 +214,356 @@ describe('proving a stopped assistant quiet', () => {
     });
   });
 
-  it('refuses any process holding a file under its state open, even idle, naming the file', async () => {
+  it.each(['sqlite3', 'com.apple.Virtualization.Virtua'])(
+    'refuses any %s process holding state open, even after containers are gone',
+    async (command) => {
+      const target = await quietTarget();
+      const wal = path.join(target.state, 'data', 'v2.db-wal');
+      const state: Observed = {
+        processes: '',
+        containers: [[]],
+        openFiles: `p777\nc${command}\nf3\nn${wal}\n`,
+        commands: [],
+      };
+
+      await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+        code: 'instance_not_quiet',
+        message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: ${command} (PID 777) holds ${wal}.`,
+      });
+    },
+  );
+});
+
+describe("Docker Desktop's own VM, the way containers reach the Mac's files (macOS)", () => {
+  const seams = (state: Observed) => ({
+    runCommand: observing(state),
+    platform: 'darwin' as const,
+    ambientEnv: {},
+    sleep: async () => undefined,
+  });
+
+  it("passes when only Docker Desktop's VM holds the state and no running container mounts it", async () => {
     const target = await quietTarget();
-    const wal = path.join(target.state, 'data', 'v2.db-wal');
     const state: Observed = {
       processes: '',
       containers: [[]],
-      openFiles: `p777\ncsqlite3\nf3\nn${wal}\n`,
+      openFiles: vmHolds([path.join(target.state, 'data', 'v2.db'), target.state]),
+      processFiles: DESKTOP_DISK,
+      running: [{ id: 'c-gateway', name: 'gws-ea-abc123-gateway-1', mounts: [] }],
+      commands: [],
+    };
+
+    await assertInstanceQuiet(target, seams(state));
+
+    const [ps, labeled, listed, inspected, scan, info, vm, ...more] = state.commands;
+    expect([ps, labeled, scan].map((command) => command!.command)).toEqual(['ps', 'docker', 'sh']);
+    expect(listed!.args).toEqual(['ps', '--quiet', '--no-trunc']);
+    expect(listed!.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
+    expect(inspected!.args.slice(0, 2)).toEqual(['container', 'inspect']);
+    expect(inspected!.args.slice(4)).toEqual(['c-gateway']);
+    expect(info!.args).toEqual(['info', '--format', '{{.OperatingSystem}}']);
+    expect(vm!.args.slice(2)).toEqual(['lsof', '-n', '-P', '-w', '-F', 'n', '-p', '5677']);
+    expect(more).toEqual([]);
+  });
+
+  it('still refuses every other holder, naming only them', async () => {
+    const target = await quietTarget();
+    const database = path.join(target.state, 'data', 'v2.db');
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: `${vmHolds([database])}p777\ncsqlite3\nn${database}\n`,
+      processFiles: DESKTOP_DISK,
       commands: [],
     };
 
     await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
       code: 'instance_not_quiet',
-      message: expect.stringContaining(`sqlite3 (PID 777) holds ${wal}`),
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: sqlite3 (PID 777) holds ${database}.`,
+    });
+  });
+
+  it("counts the VM when the assistant's Docker is not Docker Desktop, whose containers it could not list", async () => {
+    const target = await quietTarget();
+    const database = path.join(target.state, 'data', 'v2.db');
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([database]),
+      system: 'OrbStack',
+      processFiles: DESKTOP_DISK,
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(`com.apple.Virtualization.Virtua (PID 5677) holds ${database}`),
+    });
+    expect(state.commands.map((command) => command.args[0])).not.toContain('container');
+  });
+
+  it("counts a VM that does not run Docker Desktop's disk", async () => {
+    const target = await quietTarget();
+    const database = path.join(target.state, 'data', 'v2.db');
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([database], 4242),
+      processFiles: { 4242: ['/Users/morgan/.colima/_lima/colima/diffdisk'] },
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(`com.apple.Virtualization.Virtua (PID 4242) holds ${database}`),
+    });
+  });
+
+  it('refuses a running container that mounts something inside the state, whoever started it', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([path.join(target.state, 'data')]),
+      processFiles: DESKTOP_DISK,
+      running: [
+        {
+          id: 'c-1',
+          name: 'unrelated',
+          mounts: [{ Type: 'volume', Name: 'x', Driver: 'local', Source: '/var/lib/docker/volumes/x/_data' }],
+        },
+        { id: 'c-2', name: 'debug-shell', mounts: [{ Type: 'bind', Source: path.join(target.state, 'data') }] },
+      ],
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: running containers debug-shell mount its state.`,
+    });
+  });
+
+  it("finds a container mounting the state through a release folder's link into it", async () => {
+    const target = await quietTarget();
+    await mkdir(path.join(target.state, 'groups', 'main'), { recursive: true });
+    const release = path.join(target.instanceRoot, 'c9ba5ab6');
+    await mkdir(release, { recursive: true });
+    await symlink(path.join(target.state, 'groups'), path.join(release, 'groups'));
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([path.join(target.state, 'groups', 'main')]),
+      processFiles: DESKTOP_DISK,
+      running: [
+        { id: 'c-1', name: 'leftover-agent', mounts: [{ Type: 'bind', Source: path.join(release, 'groups', 'main') }] },
+      ],
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining('running containers leftover-agent mount its state'),
+    });
+  });
+
+  it('passes a running container whose mounts are all outside the state, a release folder and secrets included', async () => {
+    const target = await quietTarget();
+    const release = path.join(target.instanceRoot, 'c9ba5ab6', 'container', 'agent-runner');
+    await mkdir(release, { recursive: true });
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([target.state]),
+      processFiles: DESKTOP_DISK,
+      running: [
+        {
+          id: 'c-1',
+          name: 'gws-ea-abc123-gateway-1',
+          mounts: [
+            { Type: 'bind', Source: release },
+            { Type: 'bind', Source: path.join(target.instanceRoot, 'onecli', 'secrets', 'encryption-key') },
+            { Type: 'bind', Source: `${target.state}-other` },
+          ],
+        },
+      ],
+      commands: [],
+    };
+
+    await assertInstanceQuiet(target, seams(state));
+  });
+
+  it('fails the check when Docker cannot say what runs it, rather than passing', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([target.state]),
+      processFiles: DESKTOP_DISK,
+      infoFails: true,
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({ code: 'command_failed' });
+  });
+
+  it('asks Linux nothing about Docker Desktop: its containers are processes the scan sees', async () => {
+    const target = await quietTarget();
+    const proc = path.join(path.dirname(target.instanceRoot), 'proc');
+    const shm = path.join(target.state, 'data', 'v2.db-shm');
+    await mkdir(path.join(proc, '11', 'fd'), { recursive: true });
+    await writeFile(path.join(proc, '11', 'comm'), 'com.apple.Virtualization.Virtua\n');
+    await symlink('/', path.join(proc, '11', 'cwd'));
+    await symlink(shm, path.join(proc, '11', 'fd', '7'));
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      processFiles: DESKTOP_DISK,
+      commands: [],
+    };
+
+    await expect(
+      assertInstanceQuiet(target, { ...seams(state), platform: 'linux', procRoot: proc }),
+    ).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: com.apple.Virtualization.Virtua (PID 11) holds ${shm}.`,
+    });
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'docker']);
+    expect(state.commands.map((command) => command.args[0])).not.toContain('info');
+  });
+
+  it.each(['darwin', 'linux'] as const)(
+    'refuses on %s a running container that mounts the state even with nothing held open',
+    async (platform) => {
+      const target = await quietTarget();
+      const state: Observed = {
+        processes: '',
+        containers: [[]],
+        openFiles: '',
+        running: [{ id: 'c-1', name: 'idle-shell', mounts: [{ Type: 'bind', Source: target.state }] }],
+        commands: [],
+      };
+
+      await expect(
+        assertInstanceQuiet(target, { ...seams(state), platform, procRoot: target.state }),
+      ).rejects.toMatchObject({
+        code: 'instance_not_quiet',
+        message: expect.stringContaining('running containers idle-shell mount its state'),
+      });
+    },
+  );
+
+  it('refuses a running container whose local volume is bound to the state, and passes plain volumes', async () => {
+    const target = await quietTarget();
+    const volume = (name: string) => ({
+      Type: 'volume',
+      Name: name,
+      Driver: 'local',
+      Source: `/var/lib/docker/volumes/${name}/_data`,
+    });
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      running: [
+        { id: 'c-1', name: 'postgres', mounts: [volume('pgdata')] },
+        { id: 'c-2', name: 'bound', mounts: [volume('state-alias')] },
+      ],
+      volumes: { pgdata: null, 'state-alias': { type: 'none', o: 'bind', device: target.state } },
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: running containers bound mount its state.`,
+    });
+    const inspected = state.commands.find((command) => command.args[0] === 'volume')!;
+    expect(inspected.args.slice(4).sort()).toEqual(['pgdata', 'state-alias']);
+  });
+
+  it('refuses a running container with a volume of another driver, whose source gws-ea cannot see', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      running: [
+        {
+          id: 'c-1',
+          name: 'synced',
+          mounts: [{ Type: 'volume', Name: 'remote', Driver: 'sshfs', Source: '/var/lib/docker/plugins/x/remote' }],
+        },
+      ],
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(
+        'running containers synced (its volume remote is not local, so where it points is unknown) mount its state',
+      ),
+    });
+  });
+
+  it('refuses a running container that mounts a folder holding the state', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      running: [{ id: 'c-1', name: 'home-dev', mounts: [{ Type: 'bind', Source: path.dirname(target.instanceRoot) }] }],
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining('running containers home-dev mount its state'),
+    });
+  });
+
+  it('counts the VM when lsof could not say what it holds', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: vmHolds([target.state]),
+      processFiles: DESKTOP_DISK,
+      processError: 'lsof: no pwd entry for UID 0',
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining('com.apple.Virtualization.Virtua (PID 5677)'),
     });
   });
 });
 
 describe('what lsof reports', () => {
+  it('groups repeated paths by PID and limits examples without hiding another holder', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: `p5677\nccom.apple.Virtualization.Virtua\n${Array.from({ length: 12 }, (_, index) => `n${target.state}/data/file-${index}`).join('\n')}\nn${target.state}/data/file-0\np777\ncsqlite3\nn${target.state}/data/v2.db\n`,
+      commands: [],
+    };
+
+    const proof = assertInstanceQuiet(target, {
+      runCommand: observing(state),
+      platform: 'darwin',
+      ambientEnv: {},
+      sleep: async () => undefined,
+    });
+    await expect(proof).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(
+        `com.apple.Virtualization.Virtua (PID 5677) holds 12 paths (${target.state}/data/file-0, ${target.state}/data/file-1, ${target.state}/data/file-2, ...); sqlite3 (PID 777) holds ${target.state}/data/v2.db`,
+      ),
+    });
+    await expect(proof).rejects.not.toThrow('file-11');
+  });
+
   it('fails the check on an error it met, rather than reading what it printed as all that is open', async () => {
     const target = await quietTarget();
     const state: Observed = {
@@ -193,7 +593,7 @@ describe('proving quiet an assistant whose restore was cut short', () => {
       sleep: async () => undefined,
     });
 
-    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker']);
+    expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'docker']);
   });
 });
 

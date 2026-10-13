@@ -4,8 +4,9 @@
  *
  * The fence stops the assistant's service job and drains its agents, proves
  * the instance quiet (no process runs from its instance root, no container
- * carries its install's label, nothing holds anything under its `state/`
- * open), and removes the live link, so nothing can start a host until a
+ * carries its install's label or mounts its `state/`, nothing holds anything
+ * under it open, Docker Desktop's own VM aside), and removes the live link,
+ * so nothing can start a host until a
  * switch points the link again, not even the service manager after a reboot.
  * The switch, run only fenced, stamps the target release's upgrade tripwire
  * with its own script, resets the circuit breaker, applies the files kept
@@ -40,7 +41,7 @@ import {
   type OperationFollowUp,
   type OperationStop,
 } from './operation.js';
-import { isWithinDirectory, type ControlPlanePaths } from './paths.js';
+import { canonicalPath, isWithinDirectory, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
@@ -75,13 +76,18 @@ import {
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { GwsEaError, releaseLine, type InstanceReservation, type ReleaseCoordinates } from './types.js';
-import { isRecord, unwrapData } from './validation.js';
+import { isRecord, parseJson, requireRecord, requireString, unwrapData } from './validation.js';
 import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 
 /** How long containers the drain stopped may take to be removed (`--rm` removes them after they exit). */
 const CONTAINER_POLL_MS = 1_000;
 const CONTAINER_LIMIT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
+/** The process a Linux VM runs as on macOS, as lsof names it (shortened). */
+const APPLE_VM = /^com\.apple\.Virtualization/u;
+/** The disk Docker Desktop's VM runs from, by name. */
+const DOCKER_DESKTOP_DISK = 'Docker.raw';
+const INVALID_DOCKER_OUTPUT = 'invalid_docker_output';
 
 /** The instance a fence proves quiet, with what Docker needs to look for its containers. */
 export interface QuietInstance {
@@ -152,16 +158,21 @@ async function processesRunningFrom(
   return found;
 }
 
-/** Every container carrying the install's label, in any state. */
-async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
-  const label = getInstallScopedNames(instance.installId).containerInstallLabel;
-  const { stdout } = await (seams.runCommand ?? runSanitizedCommand)({
+/** Docker, as the assistant reaches it. */
+function quietDocker(instance: QuietInstance, seams: QuiescenceSeams, args: readonly string[]) {
+  return (seams.runCommand ?? runSanitizedCommand)({
     command: 'docker',
-    args: ['ps', '--all', '--quiet', '--filter', `label=${label}`],
+    args: [...args],
     cwd: instance.homeDirectory,
     env: toolEnvironment(seams, { HOME: instance.homeDirectory, DOCKER_HOST: instance.dockerEndpoint }),
     timeoutMs: PROBE_TIMEOUT_MS,
   });
+}
+
+/** Every container carrying the install's label, in any state. */
+async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
+  const label = getInstallScopedNames(instance.installId).containerInstallLabel;
+  const { stdout } = await quietDocker(instance, seams, ['ps', '--all', '--quiet', '--filter', `label=${label}`]);
   return stdout
     .split(/\r?\n/u)
     .map((id) => id.trim())
@@ -279,13 +290,178 @@ function abbreviated(args: string): string {
   return args.length > 160 ? `${args.slice(0, 157)}...` : args;
 }
 
+function summarizeHolders(holders: readonly OpenFileHolder[]): string {
+  const processes = new Map<number, { command: string; files: Set<string> }>();
+  for (const holder of holders) {
+    const held = processes.get(holder.pid) ?? { command: holder.command, files: new Set<string>() };
+    held.files.add(holder.file);
+    processes.set(holder.pid, held);
+  }
+  return [...processes]
+    .map(([pid, { command, files }]) => {
+      const paths = [...files];
+      const detail =
+        paths.length === 1
+          ? paths[0]
+          : `${paths.length} paths (${paths.slice(0, 3).join(', ')}${paths.length > 3 ? ', ...' : ''})`;
+      return `${command} (PID ${pid}) holds ${detail}`;
+    })
+    .join('; ');
+}
+
 /**
- * Prove a stopped assistant quiet (KTD1): no process runs from its instance
- * root, no container carries its install's label in any state (those the
- * drain stopped get a moment to be removed), and no process holds anything
- * under its `state/` open, a database's `-wal`, `-shm`, and `-journal` side
- * files included. Refuses, naming what it found, before anything is copied
- * or moved.
+ * The holder that is Docker Desktop's own VM, when the assistant's Docker is
+ * Docker Desktop: a Linux VM process holding Docker Desktop's disk open. On
+ * macOS every container reaches the Mac's files through it, and it keeps a
+ * file open for whatever its guest still caches, or leaked, long after the
+ * container that read it has gone; it writes nothing of its own. Undefined
+ * when no holder is that VM, so every holder still counts.
+ */
+async function dockerDesktopVm(
+  instance: QuietInstance,
+  holders: readonly OpenFileHolder[],
+  seams: QuiescenceSeams,
+): Promise<number | undefined> {
+  if ((seams.platform ?? process.platform) !== 'darwin') return undefined;
+  const vms = [...new Set(holders.filter(({ command }) => APPLE_VM.test(command)).map(({ pid }) => pid))];
+  if (vms.length === 0) return undefined;
+  const { stdout: system } = await quietDocker(instance, seams, ['info', '--format', '{{.OperatingSystem}}']);
+  // Containers on another runtime are not ones this assistant's Docker can list.
+  if (system.trim() !== 'Docker Desktop') return undefined;
+  for (const pid of vms) {
+    const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
+      command: 'sh',
+      args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'n', '-p', String(pid)],
+      cwd: instance.homeDirectory,
+      env: toolEnvironment(seams),
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    // An lsof that met an error has not shown what the process holds.
+    if (stderr.trim()) continue;
+    const files = stdout.split('\n').filter((line) => line.startsWith('n'));
+    if (files.some((line) => path.basename(line.slice(1)) === DOCKER_DESKTOP_DISK)) return pid;
+  }
+  return undefined;
+}
+
+/** Whether a host folder is the state, inside it, or holds it, its links resolved. */
+function reachesState(source: string, state: string): boolean {
+  const folder = canonicalPath(source);
+  return isInside(folder, state) || isInside(state, folder);
+}
+
+/**
+ * The host folder each named local volume binds, by name: a volume created
+ * with `o=bind` and a `device` is a bind mount by another name. One with no
+ * device keeps its data inside Docker, apart from the state.
+ */
+async function localVolumeDevices(
+  instance: QuietInstance,
+  seams: QuiescenceSeams,
+  names: readonly string[],
+): Promise<ReadonlyMap<string, string | undefined>> {
+  const devices = new Map<string, string | undefined>();
+  if (names.length === 0) return devices;
+  const { stdout } = await quietDocker(instance, seams, [
+    'volume',
+    'inspect',
+    '--format',
+    '{"name":{{json .Name}},"options":{{json .Options}}}',
+    ...names,
+  ]);
+  for (const line of stdout.split('\n').filter((entry) => entry.trim())) {
+    const volume = requireRecord(
+      parseJson(line, 'Docker volume', INVALID_DOCKER_OUTPUT),
+      'Volume',
+      INVALID_DOCKER_OUTPUT,
+    );
+    const name = requireString(volume.name, 'Volume name', INVALID_DOCKER_OUTPUT);
+    const device = isRecord(volume.options) ? volume.options.device : undefined;
+    devices.set(name, typeof device === 'string' && path.isAbsolute(device) ? device : undefined);
+  }
+  return devices;
+}
+
+/**
+ * Every running container with a mount that can reach `state/`, whoever
+ * started it, each with what reaches it. A bind mount, or a local volume
+ * bound to a host folder, reaches it when its folder is the state, inside
+ * it, or holds it, links resolved, since an agent container mounts the state
+ * through its release's folder. A volume of any other driver could point
+ * anywhere, so it counts too.
+ */
+async function containersReachingState(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
+  const { stdout: listed } = await quietDocker(instance, seams, ['ps', '--quiet', '--no-trunc']);
+  const ids = listed.split(/\s+/u).filter(Boolean);
+  if (ids.length === 0) return [];
+  const { stdout } = await quietDocker(instance, seams, [
+    'container',
+    'inspect',
+    '--format',
+    '{"name":{{json .Name}},"mounts":{{json .Mounts}}}',
+    ...ids,
+  ]);
+  const containers = stdout
+    .split('\n')
+    .filter((entry) => entry.trim())
+    .map((line) => {
+      const container = requireRecord(
+        parseJson(line, 'Docker inspection', INVALID_DOCKER_OUTPUT),
+        'Container',
+        INVALID_DOCKER_OUTPUT,
+      );
+      const name = requireString(container.name, 'Container name', INVALID_DOCKER_OUTPUT).replace(/^\//u, '');
+      if (!Array.isArray(container.mounts))
+        throw new GwsEaError(INVALID_DOCKER_OUTPUT, `Docker did not list ${name}'s mounts`);
+      return {
+        name,
+        mounts: container.mounts.map((mount) => requireRecord(mount, 'Container mount', INVALID_DOCKER_OUTPUT)),
+      };
+    });
+  const localVolumes = new Set<string>();
+  for (const { mounts } of containers) {
+    for (const mount of mounts) {
+      if (mount.Type === 'volume' && mount.Driver === 'local') {
+        localVolumes.add(requireString(mount.Name, 'Volume name', INVALID_DOCKER_OUTPUT));
+      }
+    }
+  }
+  const devices = await localVolumeDevices(instance, seams, [...localVolumes]);
+  const state = canonicalPath(instance.state);
+  const found: string[] = [];
+  for (const { name, mounts } of containers) {
+    for (const mount of mounts) {
+      if (mount.Type === 'bind') {
+        if (reachesState(requireString(mount.Source, 'Mount source', INVALID_DOCKER_OUTPUT), state)) {
+          found.push(name);
+          break;
+        }
+      } else if (mount.Type === 'volume') {
+        const volume = requireString(mount.Name, 'Volume name', INVALID_DOCKER_OUTPUT);
+        if (mount.Driver !== 'local') {
+          found.push(`${name} (its volume ${volume} is not local, so where it points is unknown)`);
+          break;
+        }
+        const device = devices.get(volume);
+        if (device !== undefined && reachesState(device, state)) {
+          found.push(name);
+          break;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Prove a stopped assistant quiet (KTD1), each writer where it runs: no
+ * process runs from its instance root, no container carries its install's
+ * label in any state (those the drain stopped get a moment to be removed), no
+ * running container can reach its `state/` through a mount, and no process holds anything under
+ * it open, a database's `-wal`, `-shm`, and `-journal` side files included.
+ * Docker Desktop's own VM is not a holder of its own: it is how containers
+ * reach the Mac's files, and they are already accounted for. Refuses, naming
+ * what it found, before anything is copied or moved.
  */
 export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
   const root = instance.instanceRoot;
@@ -308,11 +484,16 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
   if (containers.length > 0) {
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
+  const reaching = await containersReachingState(instance, seams);
+  if (reaching.length > 0) {
+    throw notQuiet(root, `running containers ${reaching.join(', ')} mount its state`);
+  }
   // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
   const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];
-  if (holders.length > 0) {
-    throw notQuiet(root, holders.map(({ pid, command, file }) => `${command} (PID ${pid}) holds ${file}`).join('; '));
-  }
+  if (holders.length === 0) return;
+  const vm = await dockerDesktopVm(instance, holders, seams);
+  const others = holders.filter(({ pid }) => pid !== vm);
+  if (others.length > 0) throw notQuiet(root, summarizeHolders(others));
 }
 
 /** OneCLI as a switch's host checks it; each step defaults to the real one. */
