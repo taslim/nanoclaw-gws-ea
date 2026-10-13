@@ -2,14 +2,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { formatLocalTime } from '../timezone.js';
-import {
-  READ_ONLY_COMMANDS,
-  requireOption,
-  targetInstance,
-  type CommandEnd,
-  type CommandOptions,
-  type OptionSpec,
-} from './cli-read-only.js';
+import { READ_ONLY_COMMANDS, requireOption, targetInstance, type CommandEnd } from './cli-read-only.js';
+import type { AttemptCommand as Command } from './command-definitions.js';
+import { completionScript, helpLines, schemaDocument, toolVersion } from './command-discovery.js';
+import { discoveryTarget, parseInvocation, type CommandOptions, type ParsedInvocation } from './command-parser.js';
 import {
   CREATE_INPUT_FLAGS,
   loadSecretSource,
@@ -143,30 +139,12 @@ const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
 /** Signals that end a run, recorded in its log first. */
 const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
-/** `0` ready, `10` paused for a person, `1` failed, `75` busy. */
-export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
+/** Managed exits; native ncl and logs retain the delegated tool's exit contract. */
+export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, usage: 2, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-/** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
-const COMMANDS = [
-  'create',
-  'resume',
-  'remove',
-  'start',
-  'stop',
-  'restart',
-  'update',
-  'rollback',
-  'cleanup',
-  'connect-google',
-] as const;
-type Command = (typeof COMMANDS)[number];
 /** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
-
-function isCommand(value: string | undefined): value is Command {
-  return COMMANDS.some((command) => command === value);
-}
 
 /** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
 export interface StopReport {
@@ -268,74 +246,6 @@ type UpdateLauncher = Required<
   Pick<CliRuntime, 'serviceHelpers' | 'toolProviderSetup' | 'upsertEnvVars' | 'hostStatus'>
 >;
 
-const COMMON_OPTIONS = ['secrets-file'] as const;
-/** The host service commands name the assistant and nothing else: they read no secrets. */
-const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
-
-/** A command's flags, with the options it takes once per value. */
-interface CommandOptionSpec extends OptionSpec {
-  /** Options given once per value, such as create's `--principal-email`; their values keep the order given. */
-  readonly repeatable?: readonly string[];
-}
-
-interface ParsedOptions {
-  /** Each option given once, and `'true'` for each switch. */
-  readonly options: CommandOptions;
-  /** Each repeatable option's values, in the order given. */
-  readonly repeated: Readonly<Record<string, readonly string[]>>;
-}
-
-const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
-  create: {
-    values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
-    switches: [],
-    repeatable: [PRINCIPAL_EMAIL_FLAG],
-  },
-  resume: {
-    values: ['id', 'billing-account', 'google-client-file', ...COMMON_OPTIONS],
-    switches: ['chat-configured'],
-  },
-  remove: { values: ['id', 'abandon'], switches: ['yes'] },
-  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: [] },
-  start: SERVICE_OPTIONS,
-  stop: SERVICE_OPTIONS,
-  restart: SERVICE_OPTIONS,
-  update: { values: ['id', 'track', 'source-remote'], switches: ['yes', 'all'] },
-  rollback: { values: ['id'], switches: ['snapshot', 'yes'] },
-  cleanup: { values: [], switches: [] },
-};
-
-function parseOptions(
-  args: readonly string[],
-  { values, switches, repeatable = [] }: CommandOptionSpec,
-): ParsedOptions {
-  const options: Record<string, string> = {};
-  const repeated: Record<string, string[]> = {};
-  for (let index = 0; index < args.length; ) {
-    const flag = args[index];
-    if (!flag?.startsWith('--')) throw new GwsEaError('invalid_arguments', 'Expected an option flag');
-    const name = flag.slice(2);
-    const repeats = repeatable.includes(name);
-    if (!repeats && !values.includes(name) && !switches.includes(name)) {
-      throw new GwsEaError('invalid_arguments', `Unknown option --${name}`);
-    }
-    if (options[name] !== undefined) throw new GwsEaError('invalid_arguments', `Option --${name} was provided twice`);
-    if (switches.includes(name)) {
-      options[name] = 'true';
-      index += 1;
-      continue;
-    }
-    const value = args[index + 1];
-    if (value === undefined || value.startsWith('--')) {
-      throw new GwsEaError('invalid_arguments', `Option --${name} requires a value`);
-    }
-    if (repeats) (repeated[name] ??= []).push(value);
-    else options[name] = value;
-    index += 2;
-  }
-  return { options, repeated };
-}
-
 /**
  * `update --all` moves every assistant on its own track and repository, so it
  * names no assistant, and moving one elsewhere stays a decision made for it
@@ -416,6 +326,15 @@ function isStateRefusal(error: unknown): boolean {
 
 function busy(): GwsEaError {
   return new GwsEaError('instance_busy', 'Instance operation is already in progress; no action was taken.');
+}
+
+/** Domain input validation runs in prepare, before an attempt can load prerequisites or make changes. */
+function initialInvocationExit(error: GwsEaError): number {
+  return error.code === 'invalid_arguments' ||
+    error.code === 'invalid_release_track' ||
+    error.code === 'release_source_required'
+    ? EXIT_CODES.usage
+    : EXIT_CODES.failed;
 }
 
 function createLinePresenter(output: LineWriter, errorOutput: LineWriter): Presenter {
@@ -521,8 +440,8 @@ class Cli {
    * failure itself. Each command has its own branch, so none falls through
    * to another command's work.
    */
-  prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
-    const { options, repeated } = parseOptions(args, COMMAND_OPTIONS[command]);
+  prepare(command: Command, invocation: ParsedInvocation): () => Promise<Attempt> {
+    const { options, repeated, commandArgs: args } = invocation;
     switch (command) {
       case 'create': {
         const track = requireOption(options, 'track');
@@ -693,14 +612,14 @@ class Cli {
   /** Retrying a reserved create resumes it; every other attempt reruns as given. */
   #retry(plan: AttemptPlan, state: AttemptState): () => Promise<Attempt> {
     if (plan.command !== 'create' || !state.reserved || !state.instanceId) {
-      return () => this.prepare(plan.command, plan.args)();
+      return () => this.prepare(plan.command, parseInvocation([plan.command, ...plan.args]))();
     }
     const resumeArgs = [
       '--id',
       state.instanceId,
       ...(plan.options['secrets-file'] ? ['--secrets-file', plan.options['secrets-file']] : []),
     ];
-    return () => this.prepare('resume', resumeArgs)();
+    return () => this.prepare('resume', parseInvocation(['resume', ...resumeArgs]))();
   }
 
   #checkPrerequisites(request: PrerequisiteRequest, interaction: Interaction): Promise<Prerequisites> {
@@ -1508,19 +1427,6 @@ async function verifyServing(
   });
 }
 
-/** A command's own arguments, before any `--`, and everything after it, untouched. */
-function splitPassThrough(args: readonly string[]): {
-  readonly own: readonly string[];
-  readonly passThrough: readonly string[];
-} {
-  const separator = args.indexOf('--');
-  return separator === -1
-    ? { own: args, passThrough: [] }
-    : { own: args.slice(0, separator), passThrough: args.slice(separator + 1) };
-}
-
-const NCL_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
-
 /**
  * `ncl`: hand the process to the assistant's own `bin/ncl` with everything
  * after `--` untouched (KTD13), in the environment `buildInstanceCliCommand`
@@ -1530,11 +1436,11 @@ const NCL_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
  */
 async function prepareNcl(
   paths: ControlPlanePaths,
-  args: readonly string[],
+  invocation: ParsedInvocation,
   environment: NodeJS.ProcessEnv,
 ): Promise<CommandEnd> {
-  const { own, passThrough } = splitPassThrough(args);
-  const instanceId = targetInstance(parseOptions(own, NCL_OPTIONS).options);
+  const { options, passThrough } = invocation;
+  const instanceId = targetInstance(options);
   const operation = await acquireInstanceOperation(paths, instanceId, { command: 'ncl' });
   if (!operation) throw busy();
   try {
@@ -1554,7 +1460,7 @@ function reportStop(presenter: Presenter, error: unknown): number {
   const usage =
     error instanceof GwsEaError && error.code === 'invalid_arguments' ? ['Run gws-ea --help for usage.'] : [];
   presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: usage });
-  return EXIT_CODES.failed;
+  return usage.length ? EXIT_CODES.usage : EXIT_CODES.failed;
 }
 
 /**
@@ -1700,174 +1606,137 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
   ];
 }
 
-function printHelp(output: LineWriter): void {
-  output('Usage: gws-ea <command> [options]');
-  output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
-  output('         [--assistant-first-name <name> --assistant-last-name <name> --assistant-workspace-email <email>]');
-  output('         [--principal-first-name <name> --principal-last-name <name>]');
-  output('         [--principal-email <email>]...  (once per address the principal uses)');
-  output(
-    '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
-  );
-  output('         [--principal-timezone <iana>]');
-  output('         [--provider <id>]');
-  output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
-  output('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]');
-  output(
-    "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
-  );
-  output('  connect-google --id <instance_id> [--google-client-file <file>]');
-  output('         Signs the assistant in to Google as its own account, or repairs that sign-in; safe to rerun.');
-  output('  start --id <instance_id>');
-  output('  stop --id <instance_id>');
-  output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');
-  output('  restart --id <instance_id>');
-  output('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
-  output(
-    "         Stages this gws-ea's release beside the running assistant and shows what changes before anything does,",
-  );
-  output(
-    '         then switches to it during a brief stop, verifies it, and keeps the previous release to roll back to.',
-  );
-  output('         --track and --source-remote move it to another track or repository that holds the release.');
-  output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
-  output('  update --all [--yes]');
-  output(
-    '         Shows the plan, asks once, then updates every assistant that can take this release, one at a time; --yes skips the question.',
-  );
-  output('  rollback --id <instance_id> [--snapshot] [--yes]');
-  output(
-    '         Returns to the kept previous release, keeping every message since the update unless it changed a schema;',
-  );
-  output('         then, or with --snapshot, it restores the pre-update snapshot after showing what that discards.');
-  output('         Rerun it to continue a rollback that was cut short, or to revert an update that is unfinished.');
-  for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
-  output('  ncl --id <instance_id> -- <ncl arguments>');
-  output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
-  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,chat-subscription]');
-  output('  cleanup');
-  output(
-    '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
-  );
-  output('  install-voice [--model base|small|large-v3-turbo-q5_0] [--cmake /absolute/path]');
-  output(
-    `         Explicitly builds and selects shared local voice assets, disabled; initial model candidate: ${DEFAULT_VOICE_MODEL}.`,
-  );
-  output('  enable-voice');
-  output(
-    '         Enables every compatible current and future assistant on this host; installation must already exist.',
-  );
-  output('  disable-voice');
-  output('         Stops new recognition host-wide; text service and shared assets remain available.');
-  output('  uninstall-voice');
-  output('         Removes recipe-owned assets only after disablement and proof that all consumers have drained.');
-  output('  create, resume: [--secrets-file <owner-only file under the config root>]');
-  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
-  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
-}
-
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
-  // gws-ea's own help is asked for only before `--`; what follows belongs to the tool it runs.
-  const { own } = splitPassThrough(args);
-  if (own.length === 0 || own[0] === 'help' || own.includes('--help') || own.includes('-h')) {
-    printHelp(output);
-    return EXIT_CODES.ready;
-  }
-  const command = args[0];
-  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
-  const environment = runtime.environment ?? process.env;
-  if (
-    command === 'install-voice' ||
-    command === 'enable-voice' ||
-    command === 'disable-voice' ||
-    command === 'uninstall-voice'
-  ) {
-    return runOutsideAttempts(presenter, runtime.execve, async () => {
-      const { options } = parseOptions(args.slice(1), {
-        values: command === 'install-voice' ? ['model', 'cmake'] : [],
-        switches: [],
-      });
-      const paths = runtime.paths ?? resolveControlPlanePaths();
-      const dependencies = {
-        environment,
-        upsertEnvVars: runtime.upsertEnvVars,
-        serviceHelpers: runtime.serviceHelpers,
-        progress: (line: string) => presenter.line(line),
-      };
-      switch (command) {
-        case 'install-voice': {
-          const model = options.model ?? DEFAULT_VOICE_MODEL;
-          if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
-            throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
-          const installed = await installLocalVoice(
-            paths,
-            { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
-            dependencies,
-          );
-          presenter.line(
-            `Voice assets installed at ${installed.installationDir}; voice remains disabled. Run gws-ea enable-voice.`,
+  let invocation: ParsedInvocation;
+  try {
+    invocation = parseInvocation(args);
+    const { definition, options } = invocation;
+    if (invocation.help) {
+      const target =
+        definition.handler.kind === 'discovery' && definition.handler.command === 'help'
+          ? discoveryTarget(invocation.arguments)
+          : definition;
+      for (const line of helpLines(target)) output(line);
+      return EXIT_CODES.ready;
+    }
+    if (definition.handler.kind === 'discovery') {
+      switch (definition.handler.command) {
+        case 'help':
+          for (const line of helpLines(discoveryTarget(invocation.arguments))) output(line);
+          break;
+        case 'schema':
+          output(JSON.stringify(schemaDocument(discoveryTarget(invocation.arguments)), null, 2));
+          break;
+        case 'completion':
+          output(completionScript(invocation.arguments[0]));
+          break;
+        case 'version': {
+          const version = await toolVersion();
+          output(
+            options.json === 'true'
+              ? JSON.stringify(version)
+              : `gws-ea ${version.version}${version.revision ? ` (${version.revision})` : ''}`,
           );
           break;
         }
-        case 'enable-voice':
-          await enableLocalVoice(paths, dependencies);
-          presenter.line('Voice enabled host-wide for every compatible current and future assistant.');
-          break;
-        case 'disable-voice':
-          await disableLocalVoice(paths);
-          presenter.line('Voice disabled host-wide; shared assets retained and text service available.');
-          break;
-        case 'uninstall-voice':
-          await uninstallLocalVoice(paths, dependencies);
-          presenter.line('Recipe-owned voice assets removed; text service remains available.');
-          break;
       }
-      return { exitCode: EXIT_CODES.ready };
-    });
-  }
-  const readOnly = READ_ONLY_COMMANDS.get(command);
-  if (readOnly) {
-    return runOutsideAttempts(presenter, runtime.execve, async () =>
-      readOnly.run(
-        {
-          paths: runtime.paths ?? resolveControlPlanePaths(),
-          output,
-          errorOutput,
-          environment,
-          serviceHelpers: runtime.serviceHelpers,
-          hostStatus: runtime.hostStatus,
-          toolCheckout: runtime.toolCheckout,
-        },
-        parseOptions(args.slice(1), readOnly.options).options,
-      ),
-    );
-  }
-  if (command === 'ncl') {
-    return runOutsideAttempts(presenter, runtime.execve, async () =>
-      prepareNcl(runtime.paths ?? resolveControlPlanePaths(), args.slice(1), environment),
-    );
-  }
-  if (!isCommand(command)) {
-    errorOutput('Unknown command.');
-    printHelp(errorOutput);
-    return EXIT_CODES.failed;
-  }
-  const cli = new Cli(runtime, presenter);
-  let next: () => Promise<Attempt>;
-  try {
-    next = cli.prepare(command, args.slice(1));
+      return EXIT_CODES.ready;
+    }
   } catch (error) {
     if (!(error instanceof GwsEaError)) throw error;
-    presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
-    return EXIT_CODES.failed;
+    errorOutput(error.message);
+    errorOutput('Run gws-ea --help for usage.');
+    return error.code === 'invalid_arguments' ? EXIT_CODES.usage : EXIT_CODES.failed;
   }
-  for (;;) {
-    const attempt = await next();
-    if (attempt.status === 'done') return attempt.exitCode;
-    if (!runtime.onFailure) return EXIT_CODES.failed;
-    if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
-    next = attempt.retry;
+  const { handler } = invocation.definition;
+  const { options } = invocation;
+  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const environment = runtime.environment ?? process.env;
+  switch (handler.kind) {
+    case 'voice': {
+      const command = handler.command;
+      return runOutsideAttempts(presenter, runtime.execve, async () => {
+        const paths = runtime.paths ?? resolveControlPlanePaths();
+        const dependencies = {
+          environment,
+          upsertEnvVars: runtime.upsertEnvVars,
+          serviceHelpers: runtime.serviceHelpers,
+          progress: (line: string) => presenter.line(line),
+        };
+        switch (command) {
+          case 'install-voice': {
+            const model = options.model ?? DEFAULT_VOICE_MODEL;
+            if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
+              throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
+            const installed = await installLocalVoice(
+              paths,
+              { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
+              dependencies,
+            );
+            presenter.line(
+              `Voice assets installed at ${installed.installationDir}; voice remains disabled. Run gws-ea enable-voice.`,
+            );
+            break;
+          }
+          case 'enable-voice':
+            await enableLocalVoice(paths, dependencies);
+            presenter.line('Voice enabled host-wide for every compatible current and future assistant.');
+            break;
+          case 'disable-voice':
+            await disableLocalVoice(paths);
+            presenter.line('Voice disabled host-wide; shared assets retained and text service available.');
+            break;
+          case 'uninstall-voice':
+            await uninstallLocalVoice(paths, dependencies);
+            presenter.line('Recipe-owned voice assets removed; text service remains available.');
+            break;
+        }
+        return { exitCode: EXIT_CODES.ready };
+      });
+    }
+    case 'observation': {
+      const readOnly = READ_ONLY_COMMANDS.get(handler.command);
+      if (!readOnly) throw new Error(`Missing observation handler for ${handler.command}`);
+      return runOutsideAttempts(presenter, runtime.execve, () =>
+        readOnly.run(
+          {
+            paths: runtime.paths ?? resolveControlPlanePaths(),
+            output,
+            errorOutput,
+            environment,
+            serviceHelpers: runtime.serviceHelpers,
+            hostStatus: runtime.hostStatus,
+            toolCheckout: runtime.toolCheckout,
+          },
+          options,
+        ),
+      );
+    }
+    case 'native':
+      return runOutsideAttempts(presenter, runtime.execve, () =>
+        prepareNcl(runtime.paths ?? resolveControlPlanePaths(), invocation, environment),
+      );
+    case 'discovery':
+      throw new Error('Discovery must finish before runtime dispatch.');
+    case 'attempt': {
+      const cli = new Cli(runtime, presenter);
+      let next: () => Promise<Attempt>;
+      try {
+        next = cli.prepare(handler.command, invocation);
+      } catch (error) {
+        if (!(error instanceof GwsEaError)) throw error;
+        presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
+        return initialInvocationExit(error);
+      }
+      for (;;) {
+        const attempt = await next();
+        if (attempt.status === 'done') return attempt.exitCode;
+        if (!runtime.onFailure) return EXIT_CODES.failed;
+        if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
+        next = attempt.retry;
+      }
+    }
   }
 }

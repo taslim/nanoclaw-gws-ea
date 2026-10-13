@@ -87,7 +87,7 @@ describe('host-wide optional voice commands', () => {
         stdout: () => undefined,
         stderr: (line) => stderr.push(line),
       }),
-    ).toBe(1);
+    ).toBe(2);
     expect(stderr.join('\n')).toContain('Unknown option --id');
   });
 });
@@ -250,6 +250,18 @@ function lines(): { readonly out: string[]; readonly err: string[]; readonly run
 }
 
 describe('gws-ea usage', () => {
+  it.each([
+    ['--json', 'list'],
+    ['list', '--json'],
+    ['--quiet', '--no-input', 'list', '--json'],
+  ])('resolves common options in %j through the actual list handler', async (...args) => {
+    const paths = await testPaths();
+    const io = lines();
+    expect(await runCli(args, { paths, ...io.runtime })).toBe(0);
+    expect(JSON.parse(io.out.join('\n'))).toEqual({ assistants: [] });
+    expect(io.err).toEqual([]);
+  });
+
   it.each(['help', '--help', '-h'])('prints the usage for gws-ea %s and exits 0', async (argument) => {
     const io = lines();
 
@@ -258,60 +270,55 @@ describe('gws-ea usage', () => {
     expect(io.err).toEqual([]);
   });
 
-  it('prints the usage for --help given before --, and only then', async () => {
+  it('prints scoped native help for --help given before --', async () => {
     const io = lines();
 
     expect(await runCli(['ncl', '--help', '--id', 'x'], io.runtime)).toBe(0);
-    expect(io.out[0]).toBe('Usage: gws-ea <command> [options]');
-    expect(io.out.join('\n')).toContain('ncl --id <instance_id> -- <ncl arguments>');
-    expect(io.out.join('\n')).toContain('logs --id <instance_id> [--errors] [--follow]');
+    expect(io.out[0]).toContain('Usage: gws-ea ncl --id <instance_id> --');
+    expect(io.out.join('\n')).toContain('passed through unchanged');
+    expect(io.out.join('\n')).not.toContain('Usage: gws-ea logs');
   });
 
-  it('names create and each of its options, and the one secret create and resume take', async () => {
+  it('names create inputs, repeatability, and its secret source in command help', async () => {
     const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    const usage = io.out.indexOf(
-      '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
-    );
-    expect(
-      io.out.slice(usage, io.out.indexOf('  resume --id <instance_id> [--chat-configured] [--billing-account <id>]')),
-    ).toEqual([
-      '  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]',
-      '         [--assistant-first-name <name> --assistant-last-name <name> --assistant-workspace-email <email>]',
-      '         [--principal-first-name <name> --principal-last-name <name>]',
-      '         [--principal-email <email>]...  (once per address the principal uses)',
-      '         [--principal-chat-email <email>]  (which of them they use for Google Chat; needed when there are several)',
-      '         [--principal-timezone <iana>]',
-      '         [--provider <id>]',
-      "         Deploys this gws-ea's own release, which must be committed, clean, and on the track.",
-    ]);
-    expect(io.out).toContain('  create, resume: [--secrets-file <owner-only file under the config root>]');
-    expect(io.out).toContain('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
+    expect(await runCli(['help', 'create'], io.runtime)).toBe(0);
+    const text = io.out.join('\n');
+    for (const flag of [
+      'track',
+      'source-remote',
+      'google-account',
+      'assistant-first-name',
+      'assistant-last-name',
+      'assistant-workspace-email',
+      'principal-first-name',
+      'principal-last-name',
+      'principal-chat-email',
+      'principal-timezone',
+      'provider',
+      'secrets-file',
+    ])
+      expect(text).toContain(`--${flag} <`);
+    expect(text).toContain('--principal-email <email>...');
+    expect(text).toContain('GWS_EA_PROVIDER_CREDENTIAL');
+    expect(text).toContain("this tool's own committed, clean release");
   });
 
-  it('names update and each of its options', async () => {
+  it('names update flags and explains single and all-assistant preparation effects', async () => {
     const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    expect(io.out).toContain('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
+    expect(await runCli(['update', '--help'], io.runtime)).toBe(0);
+    const text = io.out.join('\n');
+    for (const flag of ['id', 'track', 'source-remote', 'yes', 'all']) expect(text).toContain(`--${flag}`);
+    expect(text).toContain('stages a release before confirmation');
+    expect(text).toContain('shows the plan before staging, asks once');
+    expect(text).toContain('sequential rollout');
   });
 
-  it('names update --all and its option, and says it asks once, about its plan, unless --yes is given', async () => {
+  it('names rollback options and snapshot data effects', async () => {
     const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    const usage = io.out.indexOf('  update --all [--yes]');
-    expect(io.out.slice(usage + 1, io.out.indexOf('  rollback --id <instance_id> [--snapshot] [--yes]'))).toEqual([
-      '         Shows the plan, asks once, then updates every assistant that can take this release, one at a time; --yes skips the question.',
-    ]);
-  });
-
-  it('names rollback and each of its options', async () => {
-    const io = lines();
-
-    expect(await runCli(['--help'], io.runtime)).toBe(0);
-    expect(io.out).toContain('  rollback --id <instance_id> [--snapshot] [--yes]');
+    expect(await runCli(['help', 'rollback'], io.runtime)).toBe(0);
+    const text = io.out.join('\n');
+    expect(text).toContain('rollback --id <instance_id> [--snapshot] [--yes]');
+    expect(text).toContain('discard post-snapshot data');
   });
 
   it('refuses a rollback option it does not take, or one without --id, before anything runs', async () => {
@@ -319,8 +326,8 @@ describe('gws-ea usage', () => {
     const before = await everythingUnder(paths);
     const io = lines();
 
-    expect(await runCli(['rollback', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(1);
-    expect(await runCli(['rollback', '--yes'], { paths, ...io.runtime })).toBe(1);
+    expect(await runCli(['rollback', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(2);
+    expect(await runCli(['rollback', '--yes'], { paths, ...io.runtime })).toBe(2);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual([
       'Unknown option --to',
@@ -335,7 +342,7 @@ describe('gws-ea usage', () => {
     const before = await everythingUnder(paths);
     const io = lines();
 
-    expect(await runCli(['update', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(1);
+    expect(await runCli(['update', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(2);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual(['Unknown option --to', 'Run gws-ea --help for usage.']);
   });
@@ -350,7 +357,7 @@ describe('gws-ea usage', () => {
     const before = await everythingUnder(paths);
     const io = lines();
 
-    expect(await runCli([...args, '--capture-fixtures'], { paths, ...io.runtime })).toBe(1);
+    expect(await runCli([...args, '--capture-fixtures'], { paths, ...io.runtime })).toBe(2);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual(['Unknown option --capture-fixtures', 'Run gws-ea --help for usage.']);
   });
@@ -381,18 +388,18 @@ describe('gws-ea usage', () => {
         serviceHelpers: services.helpers,
         toolProviderSetup: vi.fn(),
       }),
-    ).toBe(1);
+    ).toBe(2);
     expect(io.err).toEqual([refusal, 'Run gws-ea --help for usage.']);
     expect(io.out).toEqual([]);
     expect(services.calls).toEqual([]);
     expect(await everythingUnder(paths)).toEqual(before);
   });
 
-  it('names an unknown command before the usage and exits 1', async () => {
+  it('names an unknown command before the usage and exits 2', async () => {
     const io = lines();
 
-    expect(await runCli(['helpme'], io.runtime)).toBe(1);
-    expect(io.err.slice(0, 2)).toEqual(['Unknown command.', 'Usage: gws-ea <command> [options]']);
+    expect(await runCli(['helpme'], io.runtime)).toBe(2);
+    expect(io.err).toEqual(['Unknown command "helpme".', 'Run gws-ea --help for usage.']);
     expect(io.out).toEqual([]);
   });
 });
@@ -1181,7 +1188,7 @@ describe('gws-ea release sources', () => {
     const paths = await testPaths();
     const io = lines();
 
-    expect(await runCli(['create', '--track', 'canary'], { paths, ...io.runtime, ...createRuntime() })).toBe(1);
+    expect(await runCli(['create', '--track', 'canary'], { paths, ...io.runtime, ...createRuntime() })).toBe(2);
     expect(io.err.join('\n')).toContain('--source-remote');
     expect(io.out).toEqual([]);
   });
@@ -1206,20 +1213,21 @@ describe("gws-ea create and the principal's email addresses", () => {
     return contexts;
   }
 
-  it('hands create inputs every --principal-email, lowercased and each once', async () => {
-    const contexts = await contextsOf([
-      '--principal-email',
-      'Morgan@Example.test',
-      '--principal-email',
-      'morgan@work.example.test',
-      '--principal-email',
-      'MORGAN@example.test',
-    ]);
+  it.each(['space', 'equals'])(
+    'hands create inputs every repeatable email with %s syntax, lowercased and each once',
+    async (syntax) => {
+      const emails = ['Morgan@Example.test', 'morgan@work.example.test', 'MORGAN@example.test'];
+      const contexts = await contextsOf(
+        emails.flatMap((email) =>
+          syntax === 'equals' ? [`--principal-email=${email}`] : ['--principal-email', email],
+        ),
+      );
 
-    expect(contexts.map((context) => context.providedPrincipalEmails)).toEqual([
-      ['morgan@example.test', 'morgan@work.example.test'],
-    ]);
-  });
+      expect(contexts.map((context) => context.providedPrincipalEmails)).toEqual([
+        ['morgan@example.test', 'morgan@work.example.test'],
+      ]);
+    },
+  );
 
   it('hands create inputs no address when none is passed, so a person is asked', async () => {
     const contexts = await contextsOf([]);
@@ -1243,7 +1251,7 @@ describe("gws-ea create and the principal's email addresses", () => {
         ...createRuntime(),
         collectCreateInputs,
       }),
-    ).toBe(1);
+    ).toBe(2);
     expect(io.err).toEqual([message, 'Run gws-ea --help for usage.']);
     expect(collectCreateInputs).not.toHaveBeenCalled();
     expect(await everythingUnder(paths)).toEqual(before);
@@ -2430,7 +2438,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     const w = await toolCheckoutWorld();
     const io = lines();
 
-    expect(await runCli(['cleanup', '--yes'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(1);
+    expect(await runCli(['cleanup', '--yes'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(2);
     expect(io.err.join('\n')).toContain('Unknown option --yes');
     expect(await runCli(['cleanup'], { paths, ...io.runtime })).toBe(1);
     expect(io.err.join('\n')).toContain('Run this command through the gws-ea launcher');
@@ -2442,7 +2450,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
 
     expect(await runCli(['--help'], io.runtime)).toBe(0);
 
-    expect(io.out).toContain('  cleanup');
+    expect(io.out.join('\n')).toContain('cleanup  Remove a stray NanoClaw install');
   });
 
   it('notes a stray install beside list and status on stderr, leaving their output and exit codes alone', async () => {
