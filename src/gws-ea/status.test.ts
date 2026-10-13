@@ -570,7 +570,12 @@ describe('status', () => {
 
     expect(exitCode).toBe(0);
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
-    for (const name of PROBE_NAMES) expect(status.probes[name], name).toMatchObject({ status: 'ok', reason: null });
+    for (const name of PROBE_NAMES.filter((name) => name !== 'voice'))
+      expect(status.probes[name], name).toMatchObject({ status: 'ok', reason: null });
+    expect(status.probes).toHaveProperty(
+      'voice',
+      expect.objectContaining({ status: 'ok', enabled: false, assets: 'absent', readiness: 'unavailable' }),
+    );
     expect(status.probes.checkout).toMatchObject({ commit: host.release });
     expect(status.probes.image).toEqual({ status: 'ok', reason: null, tag: liveImageOf(reservation) });
     expect(status.probes.service).toMatchObject({ state: 'running' });
@@ -1153,6 +1158,11 @@ describe('status', () => {
 
     expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
     expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false })).toBe(0);
+    const voice = text.output.stdout.find((line) => /\bvoice\b/u.test(line));
+    expect(voice).toContain('host enablement unknown');
+    expect(voice).not.toContain('disabled host-wide');
   });
 
   it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {

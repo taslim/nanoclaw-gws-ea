@@ -164,6 +164,8 @@ export interface InstanceServiceStart {
 
 export interface InstanceRuntimeDependencies extends InstanceServiceDependencies {
   readonly upsertEnvVars: UpsertEnvVars;
+  /** The shared operator policy locator, supplied by create's control-plane roots. */
+  readonly voicePolicyFile?: string;
 }
 
 function assertPort(value: unknown, label: string): number {
@@ -352,12 +354,14 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   upsertEnvVars: UpsertEnvVars,
+  voicePolicyFile?: string,
 ): Promise<void> {
   const config = validateRuntimeConfig(configInput);
   await preparePrivateDirectory(path.dirname(instanceRuntimeFile(config.state_root)));
   await preparePrivateDirectory(path.dirname(config.secret_files.gchat_subscriber_key));
   await preparePrivateDirectory(instanceLayout(config.instance_root).logs);
   await persistRuntimeFile(config);
+  if (voicePolicyFile) await bindInstanceVoicePolicy(config, voicePolicyFile, upsertEnvVars);
   const owned = instanceHostConfiguration(config);
   const present = readInstanceHostEnvironment(config.state_root);
   const missing = Object.entries(owned).filter(([key]) => present[key] === undefined);
@@ -367,6 +371,18 @@ export async function persistInstanceRuntime(
     path.join(config.state_root, '.env'),
     missing.map(([key, value]) => `${key}=${value}\n`).join(''),
   );
+}
+
+/** Bind a locator in native host configuration; it conveys no per-assistant consent. */
+export async function bindInstanceVoicePolicy(
+  config: InstanceRuntimeConfig,
+  policyFile: string,
+  upsertEnvVars: UpsertEnvVars,
+): Promise<void> {
+  if (!path.isAbsolute(policyFile)) throw new GwsEaError('invalid_arguments', 'Voice policy locator must be absolute');
+  const key = 'GWS_EA_VOICE_POLICY_FILE';
+  if (readEnvFile([key], config.state_root)[key] !== policyFile)
+    upsertEnvVars({ [key]: policyFile }, config.state_root);
 }
 
 /** gws-ea's `.env` keys as the `.env` in `root` holds them, as NanoClaw reads it; other writers' keys are not read. */
@@ -852,7 +868,7 @@ export async function reconcileInstanceRuntime(
 ): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   const release = instanceLayout(config.instance_root).release(releaseName(commit));
-  await persistInstanceRuntime(config, dependencies.upsertEnvVars);
+  await persistInstanceRuntime(config, dependencies.upsertEnvVars, dependencies.voicePolicyFile);
   // The script runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
   const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
     HOME: config.home_directory,

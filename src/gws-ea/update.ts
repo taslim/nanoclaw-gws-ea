@@ -96,7 +96,7 @@ import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget 
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
 import { readOwnerOnlyJson } from './secrets.js';
-import type { InstanceRuntimeConfig } from './service.js';
+import { bindInstanceVoicePolicy, type InstanceRuntimeConfig } from './service.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import type { ServiceState } from './status.js';
@@ -925,6 +925,11 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         if ((await readCurrent(layout)) !== name) {
           definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         }
+        await bindInstanceVoicePolicy(
+          host.runtime,
+          path.join(host.operation.paths.configRoot, 'voice.json'),
+          host.dependencies.upsertEnvVars,
+        );
         await startRelease(host, definitionChanged, 'Starting the new release…');
         record = await advanceOperation(operation, 'started');
         break;

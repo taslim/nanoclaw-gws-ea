@@ -28,6 +28,7 @@ import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
 import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
+import { observeLocalVoice, type VoiceObservation } from './local-voice.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
 import type { OnecliAgent } from './onecli-admin.js';
@@ -174,6 +175,8 @@ export interface WorkspaceFacts {
 }
 
 export interface AssistantProbes {
+  /** Optional host-wide voice, with release compatibility and actual recognition observations. */
+  readonly voice: VoiceObservation;
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
   /** The live release's own agent image, which its host runs agents on (KTD6). */
@@ -221,6 +224,7 @@ export const PROBE_NAMES = [
   'workspace',
   'principal',
   'delivery',
+  'voice',
 ] as const satisfies readonly (keyof AssistantProbes)[];
 
 interface OperationRecordFacts {
@@ -1111,6 +1115,7 @@ export async function observeAssistantStatus(
     workspace,
     principal,
     delivery,
+    voice,
     rollback,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
@@ -1137,6 +1142,19 @@ export async function observeAssistantStatus(
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
+    probe<Omit<VoiceObservation, 'status' | 'reason'>>(
+      () => observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl),
+      {
+        enabled: null,
+        assets: 'unknown' as const,
+        compatibility: 'unknown' as const,
+        readiness: 'unknown' as const,
+        queued: null,
+        inflight: null,
+        last_outcome: null,
+        last_failure: null,
+      },
+    ),
     observeRollback(subject, live),
   ]);
   return {
@@ -1156,6 +1174,7 @@ export async function observeAssistantStatus(
       workspace,
       principal,
       delivery,
+      voice,
     },
   };
 }
@@ -1344,6 +1363,25 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       const last = probes.delivery.last;
       return last ? `${last.status} ${formatLocalTime(last.at, timezone)} (${last.message_out_id})` : '';
     }
+    case 'voice': {
+      const voice = probes.voice;
+      const enabled =
+        voice.enabled === null ? 'host enablement unknown' : voice.enabled ? 'enabled host-wide' : 'disabled host-wide';
+      return [
+        enabled,
+        `assets ${voice.assets}`,
+        `release ${voice.compatibility}`,
+        `readiness ${voice.readiness}`,
+        ...(voice.queued === null ? [] : [`queued ${voice.queued}`]),
+        ...(voice.inflight === null ? [] : [`active ${voice.inflight}`]),
+        ...(voice.last_outcome
+          ? [`last ${voice.last_outcome.status} ${formatLocalTime(voice.last_outcome.at, timezone)}`]
+          : []),
+        ...(voice.last_failure
+          ? [`last failure ${voice.last_failure.reason} ${formatLocalTime(voice.last_failure.at, timezone)}`]
+          : []),
+      ].join('; ');
+    }
     case 'host':
     case 'onecli':
     case 'principal':
@@ -1406,7 +1444,11 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   ];
   for (const name of PROBE_NAMES) {
     const result = status.probes[name];
-    lines.push(probeLine(result.status, name, result.reason ?? probeDetail(name, status.probes, timezone)));
+    const detail =
+      name === 'voice'
+        ? [probeDetail(name, status.probes, timezone), ...(result.reason ? [result.reason] : [])].join('; ')
+        : (result.reason ?? probeDetail(name, status.probes, timezone));
+    lines.push(probeLine(result.status, name, detail));
     if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
@@ -1438,7 +1480,8 @@ export const STATUS_USAGE: readonly string[] = [
   '       onecli, main_identity, external_email, inbox (state, since, last_success_at, calendar_notifications,',
   "       calendar_access: each principal address with its calendar's access,",
   '       unchecked|bookable|readable|free-busy|none, and checked_at), workspace (account), principal,',
-  '       delivery; each probe has status ok|degraded|unknown and a reason. list and status exit 0 once they',
+  '       delivery, voice (enabled host-wide, assets, compatibility, readiness, queued, inflight, last_outcome, last_failure);',
+  '       each probe has status ok|degraded|unknown and a reason. list and status exit 0 once they',
   '       observed, whatever the health; status exits 1 for an unknown ID.',
 ];
 

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+import path from 'node:path';
 
 import {
   readProvisionJournal,
@@ -1389,6 +1390,7 @@ export async function runProductionProvision(
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
+        voicePolicyFile: path.join(operation.paths.configRoot, 'voice.json'),
         restartService: (config) =>
           createServiceControl(options.serviceHelpers, runtimeServiceTarget(config)).restart(),
         platform: manifest?.platform ?? instanceServicePlatform(),
