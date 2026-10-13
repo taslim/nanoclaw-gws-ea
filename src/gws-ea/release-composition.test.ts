@@ -37,4 +37,15 @@ describe('release composition', () => {
     expect(imports(await read('src/gateway-providers/index.ts'), 'installed')).toBe(true);
     expect(imports(await read('src/gateway-providers/installed.ts'), 'onecli')).toBe(true);
   });
+
+  it('keeps optional voice installation out of package, image, create, and ordinary update', async () => {
+    const packageJson: unknown = JSON.parse(await read('package.json'));
+    expect(JSON.stringify(packageJson)).not.toMatch(/whisper\.cpp|ffmpeg|ggml-(base|small|large)/u);
+    expect(await read('container/Dockerfile')).not.toMatch(/whisper|ggml-|install-voice/u);
+    for (const file of ['src/gws-ea/provision.ts', 'src/gws-ea/update.ts', 'src/gws-ea/rollback.ts']) {
+      expect(await read(file), file).not.toMatch(
+        /installVoiceAssets|installLocalVoice|voiceModelUrl|install-voice\.js/u,
+      );
+    }
+  });
 });

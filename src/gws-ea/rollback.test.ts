@@ -10,7 +10,7 @@
  * `testing/cutover-fixture.ts`).
  */
 import { mkdirSync, readlinkSync, writeFileSync } from 'node:fs';
-import { readdir, readFile, readlink, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -192,6 +192,12 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     const { host, runtime, next, state } = await updatedAssistant({
       [MAIN_SKILLS]: `${JSON.stringify(['agent-browser', 'gmail'])}\n`,
     });
+    const voicePolicy = path.join(host.paths.configRoot, 'voice.json');
+    const modelFile = path.join(host.paths.stateRoot, 'voice', 'shared-model.bin');
+    const voiceRecord = JSON.stringify({ schemaVersion: 1, enabled: true, installationDir: path.dirname(modelFile) });
+    await mkdir(path.dirname(modelFile), { recursive: true, mode: 0o700 });
+    await writeFile(modelFile, 'shared immutable model');
+    await writeFile(voicePolicy, voiceRecord, { mode: 0o600 });
     await converse(runtime, 'm2');
     expect(mainSkills(runtime)).toEqual(['agent-browser', 'gmail']);
     const inode = await centralInode(runtime);
@@ -200,6 +206,11 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state);
+    expect(await readFile(voicePolicy, 'utf8')).toBe(voiceRecord);
+    expect(await readFile(modelFile, 'utf8')).toBe('shared immutable model');
+    expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
+      `GWS_EA_VOICE_POLICY_FILE=${voicePolicy}`,
+    );
     expect(await centralInode(runtime)).toBe(inode);
     expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
     expect(await readFile(path.join(runtime.checkout_root, MEMORY), 'utf8')).toContain('mornings');

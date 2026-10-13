@@ -38,6 +38,7 @@
  * provisioning, no last_active bump, no reconcile enqueue). Never throws.
  */
 import { CONVERSATION_CONTEXT_CAPABILITY, getGroupCapabilities } from '../../capabilities.js';
+import { parseInboundContent } from '../../channels/inbound-content.js';
 import {
   getMessagingGroup,
   getMessagingGroupByPlatform,
@@ -191,19 +192,6 @@ export async function loadHotCandidates(
   return topLevel ? [...recent, topLevel] : recent;
 }
 
-function parseContent(raw: string): { text: string; sender: string | null; senderId: string | null } {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      text: typeof parsed.text === 'string' ? parsed.text : '',
-      sender: typeof parsed.sender === 'string' ? parsed.sender : null,
-      senderId: typeof parsed.senderId === 'string' ? parsed.senderId : null,
-    };
-  } catch {
-    return { text: raw, sender: null, senderId: null };
-  }
-}
-
 interface EchoFanInput {
   agentGroupId: string;
   sourceSessionId: string;
@@ -330,7 +318,7 @@ async function fanInbound(args: Parameters<typeof fanInboundMessage>[0]): Promis
     if (args.channelType === 'agent' || args.channelType === ECHO_CHANNEL_TYPE) return 0;
     // Task sessions are never a SOURCE (their traffic is series-internal).
     if (isTaskThread(session.thread_id)) return 0;
-    const parsed = parseContent(args.content);
+    const parsed = parseInboundContent(args.content);
     if (!parsed.text) return 0;
     // Targets are always sibling threads of the conversation the message
     // arrived on, so every echo is sibling-flavored.
@@ -397,7 +385,7 @@ async function fanOutbound(
           (await getMessagingGroupByPlatform(msg.channel_type, msg.platform_id)));
     if (!mg) return 0;
 
-    const parsed = parseContent(msg.content);
+    const parsed = parseInboundContent(msg.content);
     if (!parsed.text) return 0;
     // Targets are the sessions of the conversation the message was DELIVERED
     // to. An origin-conversation reply reads as a sibling-thread echo;

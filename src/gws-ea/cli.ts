@@ -43,6 +43,9 @@ import {
   type InstanceOperation,
 } from './journal.js';
 import { readOperationRecord } from './operation.js';
+import { disableLocalVoice, enableLocalVoice, installLocalVoice, uninstallLocalVoice } from './local-voice.js';
+import { DEFAULT_VOICE_MODEL } from './install-voice.js';
+import type { VoiceModelId } from './voice-assets.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { googleConnectionResources } from './google-connection.js';
 import {
@@ -381,7 +384,7 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 }
 
 function isBusy(error: unknown): boolean {
-  return error instanceof GwsEaError && error.code === 'instance_busy';
+  return error instanceof GwsEaError && (error.code === 'instance_busy' || error.code === 'voice_busy');
 }
 
 /**
@@ -1746,6 +1749,18 @@ function printHelp(output: LineWriter): void {
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
   );
+  output('  install-voice [--model base|small|large-v3-turbo-q5_0] [--cmake /absolute/path]');
+  output(
+    `         Explicitly builds and selects shared local voice assets, disabled; initial model candidate: ${DEFAULT_VOICE_MODEL}.`,
+  );
+  output('  enable-voice');
+  output(
+    '         Enables every compatible current and future assistant on this host; installation must already exist.',
+  );
+  output('  disable-voice');
+  output('         Stops new recognition host-wide; text service and shared assets remain available.');
+  output('  uninstall-voice');
+  output('         Removes recipe-owned assets only after disablement and proof that all consumers have drained.');
   output('  create, resume: [--secrets-file <owner-only file under the config root>]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
@@ -1763,6 +1778,55 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   const command = args[0];
   const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
   const environment = runtime.environment ?? process.env;
+  if (
+    command === 'install-voice' ||
+    command === 'enable-voice' ||
+    command === 'disable-voice' ||
+    command === 'uninstall-voice'
+  ) {
+    return runOutsideAttempts(presenter, runtime.execve, async () => {
+      const { options } = parseOptions(args.slice(1), {
+        values: command === 'install-voice' ? ['model', 'cmake'] : [],
+        switches: [],
+      });
+      const paths = runtime.paths ?? resolveControlPlanePaths();
+      const dependencies = {
+        environment,
+        upsertEnvVars: runtime.upsertEnvVars,
+        serviceHelpers: runtime.serviceHelpers,
+        progress: (line: string) => presenter.line(line),
+      };
+      switch (command) {
+        case 'install-voice': {
+          const model = options.model ?? DEFAULT_VOICE_MODEL;
+          if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
+            throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
+          const installed = await installLocalVoice(
+            paths,
+            { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
+            dependencies,
+          );
+          presenter.line(
+            `Voice assets installed at ${installed.installationDir}; voice remains disabled. Run gws-ea enable-voice.`,
+          );
+          break;
+        }
+        case 'enable-voice':
+          await enableLocalVoice(paths, dependencies);
+          presenter.line('Voice enabled host-wide for every compatible current and future assistant.');
+          break;
+        case 'disable-voice':
+          await disableLocalVoice(paths);
+          presenter.line('Voice disabled host-wide; shared assets retained and text service available.');
+          break;
+        case 'uninstall-voice':
+          await uninstallLocalVoice(paths, dependencies);
+          presenter.line('Recipe-owned voice assets removed; text service remains available.');
+          break;
+      }
+      return { exitCode: EXIT_CODES.ready };
+    });
+  }
   const readOnly = READ_ONLY_COMMANDS.get(command);
   if (readOnly) {
     return runOutsideAttempts(presenter, runtime.execve, async () =>

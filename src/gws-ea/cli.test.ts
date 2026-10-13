@@ -53,6 +53,45 @@ vi.mock('./google-connection.js', async (importOriginal) => {
 const roots: string[] = [];
 const servers: Server[] = [];
 
+describe('host-wide optional voice commands', () => {
+  it('names explicit installation when enabling absent voice assets, without an instance or a download', async () => {
+    const paths = await testPaths();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const fetch = vi.spyOn(globalThis, 'fetch');
+    try {
+      expect(
+        await runCli(['enable-voice'], {
+          paths,
+          stdout: (line) => stdout.push(line),
+          stderr: (line) => stderr.push(line),
+        }),
+      ).toBe(1);
+      expect(stderr.join('\n')).toContain('gws-ea install-voice');
+      expect(stderr.join('\n')).not.toContain('Unknown command');
+      expect(fetch).not.toHaveBeenCalled();
+      await expect(readFile(path.join(paths.configRoot, 'voice.json'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it('rejects per-assistant voice configuration', async () => {
+    const paths = await testPaths();
+    const stderr: string[] = [];
+    expect(
+      await runCli(['enable-voice', '--id', randomUUID()], {
+        paths,
+        stdout: () => undefined,
+        stderr: (line) => stderr.push(line),
+      }),
+    ).toBe(1);
+    expect(stderr.join('\n')).toContain('Unknown option --id');
+  });
+});
+
 function neverCalled(): never {
   throw new Error('process.execve is only called by the service launcher');
 }

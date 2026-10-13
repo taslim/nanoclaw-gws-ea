@@ -23,6 +23,7 @@
  * Only a group holding `conversation-context` is backfilled.
  */
 import { CONVERSATION_CONTEXT_CAPABILITY, getGroupCapabilities } from '../../capabilities.js';
+import { parseInboundContent } from '../../channels/inbound-content.js';
 import { isTaskThread } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -46,14 +47,6 @@ interface BackfillRow {
   text: string;
   /** Row authored by the agent itself — rendered as "you" in the prelude. */
   self: boolean;
-}
-
-function parseContent(raw: string): { text?: string; sender?: string; senderId?: string; echo?: unknown } {
-  try {
-    return JSON.parse(raw) as { text?: string; sender?: string; senderId?: string; echo?: unknown };
-  } catch {
-    return {};
-  }
 }
 
 /**
@@ -80,7 +73,7 @@ async function collectSiblingTopLevel(
 
   if (timeline.root) {
     const r = timeline.root;
-    const c = parseContent(r.content);
+    const c = parseInboundContent(r.content);
     if (c.text && c.senderId !== 'system' && c.sender !== 'system' && !c.text.startsWith('System instruction:')) {
       // Host-injected triggers (the welcome hand-off) are attributed to the
       // OWNER for sender-gating, so filter them by shape too — internal
@@ -97,7 +90,7 @@ async function collectSiblingTopLevel(
   }
 
   for (const r of timeline.outbound) {
-    const c = parseContent(r.content);
+    const c = parseInboundContent(r.content);
     if (!c.text) continue;
     rows.push({
       timestamp: r.timestamp,

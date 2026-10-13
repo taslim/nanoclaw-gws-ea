@@ -87,6 +87,7 @@ import {
   snapshotTakenAt,
 } from './release-layout.js';
 import { activeStep } from './run-log.js';
+import { bindInstanceVoicePolicy } from './service.js';
 import { GwsEaError, releaseLine, releaseOf, type ReleaseCoordinates } from './types.js';
 import { backupCentralDatabase, printableName, readForgottenFingerprints, readSchemaManifest } from './verify.js';
 
@@ -829,6 +830,11 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
           if ((await readCurrent(layout)) !== releaseName(record.to.deployed_commit)) {
             definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
           }
+          await bindInstanceVoicePolicy(
+            rollback.runtime,
+            path.join(rollback.operation.paths.configRoot, 'voice.json'),
+            rollback.dependencies.upsertEnvVars,
+          );
           await startRelease(rollback, definitionChanged, 'Starting the previous release…');
           record = await advanceOperation(operation, 'started');
           break;
