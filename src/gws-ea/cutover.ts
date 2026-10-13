@@ -344,13 +344,53 @@ async function dockerDesktopVm(
   return undefined;
 }
 
+/** Whether a host folder is the state, inside it, or holds it, its links resolved. */
+function reachesState(source: string, state: string): boolean {
+  const folder = canonicalPath(source);
+  return isInside(folder, state) || isInside(state, folder);
+}
+
 /**
- * Every running container with a bind mount that reaches `state/`: the state,
- * a folder inside it, or a folder that holds it, its source's links resolved,
- * since an agent container mounts the state through its release's folder.
- * Whoever started it, such a container can write the state.
+ * The host folder each named local volume binds, by name: a volume created
+ * with `o=bind` and a `device` is a bind mount by another name. One with no
+ * device keeps its data inside Docker, apart from the state.
  */
-async function containersMountingState(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
+async function localVolumeDevices(
+  instance: QuietInstance,
+  seams: QuiescenceSeams,
+  names: readonly string[],
+): Promise<ReadonlyMap<string, string | undefined>> {
+  const devices = new Map<string, string | undefined>();
+  if (names.length === 0) return devices;
+  const { stdout } = await quietDocker(instance, seams, [
+    'volume',
+    'inspect',
+    '--format',
+    '{"name":{{json .Name}},"options":{{json .Options}}}',
+    ...names,
+  ]);
+  for (const line of stdout.split('\n').filter((entry) => entry.trim())) {
+    const volume = requireRecord(
+      parseJson(line, 'Docker volume', INVALID_DOCKER_OUTPUT),
+      'Volume',
+      INVALID_DOCKER_OUTPUT,
+    );
+    const name = requireString(volume.name, 'Volume name', INVALID_DOCKER_OUTPUT);
+    const device = isRecord(volume.options) ? volume.options.device : undefined;
+    devices.set(name, typeof device === 'string' && path.isAbsolute(device) ? device : undefined);
+  }
+  return devices;
+}
+
+/**
+ * Every running container with a mount that can reach `state/`, whoever
+ * started it, each with what reaches it. A bind mount, or a local volume
+ * bound to a host folder, reaches it when its folder is the state, inside
+ * it, or holds it, links resolved, since an agent container mounts the state
+ * through its release's folder. A volume of any other driver could point
+ * anywhere, so it counts too.
+ */
+async function containersReachingState(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
   const { stdout: listed } = await quietDocker(instance, seams, ['ps', '--quiet', '--no-trunc']);
   const ids = listed.split(/\s+/u).filter(Boolean);
   if (ids.length === 0) return [];
@@ -361,25 +401,52 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
     '{"name":{{json .Name}},"mounts":{{json .Mounts}}}',
     ...ids,
   ]);
+  const containers = stdout
+    .split('\n')
+    .filter((entry) => entry.trim())
+    .map((line) => {
+      const container = requireRecord(
+        parseJson(line, 'Docker inspection', INVALID_DOCKER_OUTPUT),
+        'Container',
+        INVALID_DOCKER_OUTPUT,
+      );
+      const name = requireString(container.name, 'Container name', INVALID_DOCKER_OUTPUT).replace(/^\//u, '');
+      if (!Array.isArray(container.mounts))
+        throw new GwsEaError(INVALID_DOCKER_OUTPUT, `Docker did not list ${name}'s mounts`);
+      return {
+        name,
+        mounts: container.mounts.map((mount) => requireRecord(mount, 'Container mount', INVALID_DOCKER_OUTPUT)),
+      };
+    });
+  const localVolumes = new Set<string>();
+  for (const { mounts } of containers) {
+    for (const mount of mounts) {
+      if (mount.Type === 'volume' && mount.Driver === 'local') {
+        localVolumes.add(requireString(mount.Name, 'Volume name', INVALID_DOCKER_OUTPUT));
+      }
+    }
+  }
+  const devices = await localVolumeDevices(instance, seams, [...localVolumes]);
   const state = canonicalPath(instance.state);
   const found: string[] = [];
-  for (const line of stdout.split('\n').filter((entry) => entry.trim())) {
-    const container = requireRecord(
-      parseJson(line, 'Docker inspection', INVALID_DOCKER_OUTPUT),
-      'Container',
-      INVALID_DOCKER_OUTPUT,
-    );
-    const name = requireString(container.name, 'Container name', INVALID_DOCKER_OUTPUT).replace(/^\//u, '');
-    if (!Array.isArray(container.mounts))
-      throw new GwsEaError(INVALID_DOCKER_OUTPUT, `Docker did not list ${name}'s mounts`);
-    for (const value of container.mounts) {
-      const mount = requireRecord(value, 'Container mount', INVALID_DOCKER_OUTPUT);
-      if (mount.Type !== 'bind') continue;
-      const source = requireString(mount.Source, 'Mount source', INVALID_DOCKER_OUTPUT);
-      const reached = canonicalPath(source);
-      if (isInside(reached, state) || isInside(state, reached)) {
-        found.push(name);
-        break;
+  for (const { name, mounts } of containers) {
+    for (const mount of mounts) {
+      if (mount.Type === 'bind') {
+        if (reachesState(requireString(mount.Source, 'Mount source', INVALID_DOCKER_OUTPUT), state)) {
+          found.push(name);
+          break;
+        }
+      } else if (mount.Type === 'volume') {
+        const volume = requireString(mount.Name, 'Volume name', INVALID_DOCKER_OUTPUT);
+        if (mount.Driver !== 'local') {
+          found.push(`${name} (its volume ${volume} is not local, so where it points is unknown)`);
+          break;
+        }
+        const device = devices.get(volume);
+        if (device !== undefined && reachesState(device, state)) {
+          found.push(name);
+          break;
+        }
       }
     }
   }
@@ -390,7 +457,7 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
  * Prove a stopped assistant quiet (KTD1), each writer where it runs: no
  * process runs from its instance root, no container carries its install's
  * label in any state (those the drain stopped get a moment to be removed), no
- * running container mounts its `state/`, and no process holds anything under
+ * running container can reach its `state/` through a mount, and no process holds anything under
  * it open, a database's `-wal`, `-shm`, and `-journal` side files included.
  * Docker Desktop's own VM is not a holder of its own: it is how containers
  * reach the Mac's files, and they are already accounted for. Refuses, naming
@@ -417,9 +484,9 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
   if (containers.length > 0) {
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
-  const mounting = await containersMountingState(instance, seams);
-  if (mounting.length > 0) {
-    throw notQuiet(root, `running containers ${mounting.join(', ')} mount its state`);
+  const reaching = await containersReachingState(instance, seams);
+  if (reaching.length > 0) {
+    throw notQuiet(root, `running containers ${reaching.join(', ')} mount its state`);
   }
   // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
   const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];

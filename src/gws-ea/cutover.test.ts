@@ -47,7 +47,12 @@ afterEach(removeTemporaryRoots);
 interface RunningContainer {
   readonly id: string;
   readonly name: string;
-  readonly mounts: ReadonlyArray<{ readonly Type: string; readonly Source: string }>;
+  readonly mounts: ReadonlyArray<{
+    readonly Type: string;
+    readonly Source: string;
+    readonly Name?: string;
+    readonly Driver?: string;
+  }>;
 }
 
 /** An assistant whose host is stopped, and what `ps`, Docker, and `lsof` report about it. */
@@ -67,6 +72,8 @@ interface Observed {
   processError?: string;
   /** The containers running on the assistant's Docker. */
   running?: readonly RunningContainer[];
+  /** Each named volume's driver options, as `docker volume inspect` shows them. */
+  volumes?: Readonly<Record<string, Readonly<Record<string, string>> | null>>;
   readonly commands: SanitizedCommand[];
 }
 
@@ -78,6 +85,15 @@ function observing(state: Observed): SanitizedCommandRunner {
     if (command.command === 'docker' && first === 'info') {
       if (state.infoFails) throw new GwsEaError('command_failed', 'Command failed (exit code 1): docker info');
       return { stdout: `${state.system ?? 'Docker Desktop'}\n`, stderr: '' };
+    }
+    if (command.command === 'docker' && first === 'volume') {
+      return {
+        stdout: command.args
+          .slice(4)
+          .map((name) => `${JSON.stringify({ name, options: state.volumes?.[name] ?? null })}\n`)
+          .join(''),
+        stderr: '',
+      };
     }
     if (command.command === 'docker' && first === 'container') {
       const asked = command.args.slice(4);
@@ -311,7 +327,11 @@ describe("Docker Desktop's own VM, the way containers reach the Mac's files (mac
       openFiles: vmHolds([path.join(target.state, 'data')]),
       processFiles: DESKTOP_DISK,
       running: [
-        { id: 'c-1', name: 'unrelated', mounts: [{ Type: 'volume', Source: '/var/lib/docker/volumes/x/_data' }] },
+        {
+          id: 'c-1',
+          name: 'unrelated',
+          mounts: [{ Type: 'volume', Name: 'x', Driver: 'local', Source: '/var/lib/docker/volumes/x/_data' }],
+        },
         { id: 'c-2', name: 'debug-shell', mounts: [{ Type: 'bind', Source: path.join(target.state, 'data') }] },
       ],
       commands: [],
@@ -432,6 +452,58 @@ describe("Docker Desktop's own VM, the way containers reach the Mac's files (mac
       });
     },
   );
+
+  it('refuses a running container whose local volume is bound to the state, and passes plain volumes', async () => {
+    const target = await quietTarget();
+    const volume = (name: string) => ({
+      Type: 'volume',
+      Name: name,
+      Driver: 'local',
+      Source: `/var/lib/docker/volumes/${name}/_data`,
+    });
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      running: [
+        { id: 'c-1', name: 'postgres', mounts: [volume('pgdata')] },
+        { id: 'c-2', name: 'bound', mounts: [volume('state-alias')] },
+      ],
+      volumes: { pgdata: null, 'state-alias': { type: 'none', o: 'bind', device: target.state } },
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: `The assistant at ${target.instanceRoot} is not quiet, so the switch went no further: running containers bound mount its state.`,
+    });
+    const inspected = state.commands.find((command) => command.args[0] === 'volume')!;
+    expect(inspected.args.slice(4).sort()).toEqual(['pgdata', 'state-alias']);
+  });
+
+  it('refuses a running container with a volume of another driver, whose source gws-ea cannot see', async () => {
+    const target = await quietTarget();
+    const state: Observed = {
+      processes: '',
+      containers: [[]],
+      openFiles: '',
+      running: [
+        {
+          id: 'c-1',
+          name: 'synced',
+          mounts: [{ Type: 'volume', Name: 'remote', Driver: 'sshfs', Source: '/var/lib/docker/plugins/x/remote' }],
+        },
+      ],
+      commands: [],
+    };
+
+    await expect(assertInstanceQuiet(target, seams(state))).rejects.toMatchObject({
+      code: 'instance_not_quiet',
+      message: expect.stringContaining(
+        'running containers synced (its volume remote is not local, so where it points is unknown) mount its state',
+      ),
+    });
+  });
 
   it('refuses a running container that mounts a folder holding the state', async () => {
     const target = await quietTarget();
