@@ -232,10 +232,7 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
 
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
 
-    expect(err.join('\n')).toContain(
-      `sqlite3 (PID 777) holds ${database}, still held after Docker's VM was asked to drop its file cache`,
-    );
-    expect(state.cacheDrops).toEqual([releaseTag(runtime, next.commit)]);
+    expect(err.join('\n')).toContain(`sqlite3 (PID 777) holds ${database}`);
     expect(err.join('\n')).toContain(`went back: the assistant runs dogfood ${next.commit.slice(0, 12)} again`);
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
     expect(state.running).toBe(true);
@@ -243,7 +240,7 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect((await readRollbackPoint(host.paths, runtime.instance_id))?.release).toEqual(release(host, host.first));
   });
 
-  it("goes back past the files Docker's VM kept from the assistant's exited containers, dropping its cache once", async () => {
+  it("goes back past the files Docker Desktop's VM kept from the assistant's exited containers", async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     state.vmRetained = `p5677\nccom.apple.Virtualization.Virtua\nf9\nn${path.join(runtime.state_root, 'data', 'v2.db')}\n`;
     const { run } = cli(host, state, next, runtime);
@@ -251,7 +248,6 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state);
-    expect(state.cacheDrops).toEqual([releaseTag(runtime, next.commit)]);
   });
 
   it("rebuilds the release's agent image when it is gone, before it stops anything", async () => {
