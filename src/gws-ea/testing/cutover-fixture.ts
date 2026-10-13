@@ -742,6 +742,8 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
     }
     return { stdout: '', stderr: '' };
   }
+  // The fixture's machine runs no container that mounts an assistant's state.
+  if (first === 'ps' && !spec.args.includes('--filter')) return { stdout: '', stderr: '' };
   if (first === 'ps') {
     const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
     return { stdout: (state.containers.get(label) ?? []).map((id) => `${id}\n`).join(''), stderr: '' };

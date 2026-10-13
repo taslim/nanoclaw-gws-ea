@@ -155,7 +155,7 @@ describe('proving a stopped assistant quiet', () => {
     expect(docker.env).toMatchObject({ DOCKER_HOST: target.dockerEndpoint, HOME: target.homeDirectory });
     const lsof = state.commands.find((command) => command.command === 'sh')!;
     expect(lsof.args.slice(2)).toEqual(['lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', target.state]);
-    // Nothing held, so nothing asks Docker's VM to drop its file cache.
+    // Nothing held, so Docker is asked nothing more.
     expect(state.commands.map((command) => command.command)).toEqual(['ps', 'docker', 'sh']);
   });
 

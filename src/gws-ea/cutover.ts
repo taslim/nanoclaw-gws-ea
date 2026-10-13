@@ -18,7 +18,7 @@
  * Chat receiving among them, KTD12), main's shared skills reconciled
  * (KTD16), and the follow-ups a committed release runs.
  */
-import { readdir, readFile, readlink, realpath, rm } from 'node:fs/promises';
+import { readdir, readFile, readlink, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -41,7 +41,7 @@ import {
   type OperationFollowUp,
   type OperationStop,
 } from './operation.js';
-import { isWithinDirectory, type ControlPlanePaths } from './paths.js';
+import { canonicalPath, isWithinDirectory, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
@@ -342,16 +342,6 @@ async function dockerDesktopVm(
   return undefined;
 }
 
-/** A path with its links resolved, or as it is when it no longer exists. */
-async function resolved(file: string): Promise<string> {
-  try {
-    return await realpath(file);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return path.resolve(file);
-    throw error;
-  }
-}
-
 /**
  * Every running container with a bind mount inside `state/`, its source's
  * links resolved: an agent container mounts the state through its release's
@@ -369,7 +359,7 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
     '{"name":{{json .Name}},"mounts":{{json .Mounts}}}',
     ...ids,
   ]);
-  const state = await realpath(instance.state);
+  const state = canonicalPath(instance.state);
   const found: string[] = [];
   for (const line of stdout.split('\n').filter((entry) => entry.trim())) {
     const container = requireRecord(
@@ -384,7 +374,7 @@ async function containersMountingState(instance: QuietInstance, seams: Quiescenc
       const mount = requireRecord(value, 'Container mount', INVALID_DOCKER_OUTPUT);
       if (mount.Type !== 'bind') continue;
       const source = requireString(mount.Source, 'Mount source', INVALID_DOCKER_OUTPUT);
-      if (isInside(await resolved(source), state)) {
+      if (isInside(canonicalPath(source), state)) {
         found.push(name);
         break;
       }
