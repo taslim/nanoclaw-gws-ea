@@ -99,8 +99,33 @@ leaves unrelated cache entries untouched. Selection is cleared while disabled
 before files are removed, so an interrupted removal stays safely disabled.
 
 Runtime bounds are 64 MiB encoded input, 30 minutes decoded audio, two minutes
-decoding, ten minutes recognition, and eight pending notes per host. Exceeding a
-bound is a complete-note failure; partial transcript prefixes are never accepted
+decoding, ten minutes recognition, and eight pending notes per assistant host
+process. Exceeding a bound is a complete-note failure; partial transcript
+prefixes are never accepted
 as successful instructions. Silence and missing setup receive an honest normal
 assistant reply. Installing later does not automatically resume an earlier
 unprocessed note.
+
+## Acceptance status and comparison
+
+Implementation and local contract/engine checks are complete. Live Google Chat
+notes, the receiving assistant's intended actions and quiet normal reply, and
+real-note model qualification remain pending by user direction. Public speech
+and silence smoke checks demonstrate the engine interface; they do not qualify
+the initial turbo candidate or the whole voice job.
+
+The [private comparison CLI and acceptance protocol](../src/modules/gws-ea-voice/testing/README.md)
+compare the same operator-supplied human notes through verified base, small,
+and turbo installations. The CLI records faithful speech, exact source/asset
+identities, host facts, and complete decode-plus-recognition wall time in a new
+private output directory outside the checkout. It downloads nothing and
+changes no host setting. Human intention review, actual tool results,
+follow-through, ordinary responses, separate phase timings, queue wait, and
+child peak RSS remain the live acceptance evidence; the CLI produces no quality
+score or qualification decision.
+
+Google Chat retries an incomplete audio SDK claim through the ordinary router.
+Completed SDK claims and mailbox source IDs prevent ordinary duplicate turns.
+The SDK completion mark is not atomic with a non-mailbox interceptor effect;
+a hard death between that effect and the mark can repeat it. Voice preserves
+that native recovery boundary and introduces no new ingress guarantee.
