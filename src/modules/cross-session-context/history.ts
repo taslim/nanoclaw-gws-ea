@@ -12,6 +12,7 @@
  * "session not found" as a nonexistent id (no cross-group existence oracle).
  */
 import { TIMEZONE } from '../../config.js';
+import { parseInboundContent } from '../../channels/inbound-content.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -40,12 +41,8 @@ function cell(value: string): string {
 function parseText(raw: string): { text: string; sender: string | null } {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const text =
-      typeof parsed.text === 'string' && parsed.text.length > 0
-        ? parsed.text
-        : typeof parsed.action === 'string'
-          ? `[${parsed.action}]`
-          : '';
+    const content = parseInboundContent(raw);
+    const text = content.text.length > 0 ? content.text : typeof parsed.action === 'string' ? `[${parsed.action}]` : '';
     return { text, sender: typeof parsed.sender === 'string' ? parsed.sender : null };
   } catch {
     return { text: raw, sender: null };

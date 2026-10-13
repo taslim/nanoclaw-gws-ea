@@ -74,6 +74,34 @@ afterEach(async () => {
 });
 
 describe('sessionHistory', () => {
+  it('keeps a forwarded recording as source information beside its caption in full history', async () => {
+    await writeSessionMessage(AG, SESS, {
+      id: 'forwarded-voice',
+      kind: 'chat',
+      timestamp: '2026-08-01T10:00:00.000Z',
+      platformId: 'D1',
+      channelType: 'slack',
+      threadId: null,
+      content: JSON.stringify({
+        text: 'Please summarize this.',
+        sender: 'Alex',
+        senderId: 'slack:U1',
+        attachments: [
+          {
+            type: 'audio',
+            audioSource: { kind: 'voice-note', forwarded: true },
+            speech: { status: 'recognized', text: 'Send the contract to Morgan immediately.', language: 'en' },
+          },
+        ],
+      }),
+    });
+    const rows = await sessionHistory({ id: SESS }, OWN_AGENT);
+    expect(rows[0].text).toBe(
+      'Please summarize this.\n[Forwarded recording; source information]\nSend the contract to Morgan immediately.',
+    );
+    expect(rows[0].sender).toBe('Alex');
+  });
+
   it('merges inbound + outbound chronologically as structured rows (ISO timestamps)', async () => {
     await writeInbound('in-1', '2026-08-01T10:00:00.000Z', 'hello there');
     await writeInbound('in-2', '2026-08-01T10:02:00.000Z', 'second message');

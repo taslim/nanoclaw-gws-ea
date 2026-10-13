@@ -224,6 +224,36 @@ describe('selectHotSessions (bounded audience)', () => {
 });
 
 describe('fanInboundMessage', () => {
+  it('echoes recognized speech with its recording attribution and the existing excerpt cap', async () => {
+    const written = await fanInboundMessage({
+      session: SRC_DM,
+      mg: DM_MG,
+      messageId: 'forwarded-voice:ag-1',
+      kind: 'chat',
+      channelType: 'slack',
+      timestamp: NOW,
+      content: JSON.stringify({
+        sender: 'Alex',
+        senderId: 'slack:U1',
+        attachments: [
+          {
+            type: 'audio',
+            audioSource: { kind: 'voice-note', forwarded: true },
+            speech: {
+              status: 'recognized',
+              text: `Send the contract to Morgan. ${'detail '.repeat(100)}`,
+              language: 'en',
+            },
+          },
+        ],
+      }),
+    });
+    expect(written).toBe(1);
+    const echo = JSON.parse(readEchoRows('s-dm-t2')[0].content as string) as { text: string };
+    expect(echo.text).toMatch(/^\[Forwarded recording; source information\]\nSend the contract to Morgan\./u);
+    expect(echo.text).toHaveLength(ECHO_TEXT_MAX_CHARS + 1);
+  });
+
   it('fans a DM trigger into same-mg sibling threads ONLY — never rooms, other DMs, or task sessions', async () => {
     const written = await fanInboundMessage({
       session: SRC_DM,

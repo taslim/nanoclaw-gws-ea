@@ -27,6 +27,7 @@ import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import { isUniqueViolation } from './db/errors.js';
+import { prepareInboundContent } from './inbound-preparation.js';
 import {
   createMessagingGroupIfAbsent,
   getMessagingGroupAgents,
@@ -265,7 +266,26 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
  * Route an inbound message from a channel adapter to the correct session.
  * Creates messaging group + session if they don't exist yet.
  */
+const conversationTails = new Map<string, Promise<void>>();
+
 export async function routeInbound(event: InboundEvent): Promise<void> {
+  const conversation = JSON.stringify([event.instance ?? event.channelType, event.channelType, event.platformId]);
+  const previous = conversationTails.get(conversation) ?? Promise.resolve();
+  const routed = previous.then(() => routeInboundOrdered(event));
+  // The caller sees routing failures, while the next event gets a settled tail.
+  const tail = routed.then(
+    () => undefined,
+    () => undefined,
+  );
+  conversationTails.set(conversation, tail);
+  try {
+    await routed;
+  } finally {
+    if (conversationTails.get(conversation) === tail) conversationTails.delete(conversation);
+  }
+}
+
+async function routeInboundOrdered(event: InboundEvent): Promise<void> {
   // Pre-route interceptors — let modules consume messages before any routing
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
@@ -436,6 +456,25 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   let engagedCount = 0;
   let accumulatedCount = 0;
   let subscribed = false;
+  let prepared: Promise<InboundEvent> | undefined;
+  const prepare = (session: Session): Promise<InboundEvent> => {
+    prepared ??= prepareInboundContent({
+      content: event.message.content,
+      channelType: event.channelType,
+      instance: event.instance ?? event.channelType,
+      platformId: event.platformId,
+      messageId: event.message.id,
+      timestamp: event.message.timestamp,
+      ...(event.message.authenticatedSender === undefined
+        ? {}
+        : {
+            authenticatedSender: { ...event.message.authenticatedSender },
+          }),
+      session: { ...session },
+      messagingGroup: { ...mg },
+    }).then((content) => ({ ...event, message: { ...event.message, content } }));
+    return prepared;
+  };
 
   for (const agent of agents) {
     const agentGroup = await getAgentGroup(agent.agent_group_id);
@@ -462,7 +501,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'wake');
+      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'wake', prepare);
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -494,7 +533,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'accumulate');
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        'accumulate',
+        prepare,
+      );
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -654,6 +703,7 @@ async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   delivery: Delivery,
+  prepare?: (session: Session) => Promise<InboundEvent>,
 ): Promise<void> {
   const wake = delivery === 'wake';
   // Apply the resolved thread policy (wiring override AND channel declaration
@@ -708,6 +758,10 @@ async function deliverToAgent(
       return;
     }
   }
+
+  // Admission and typed command classification used the original event.
+  // Preparation replaces only content and is reused across admitted targets.
+  if (prepare) event = await prepare(session);
 
   if (wake) {
     // Cross-session context backfill: a just-born or long-idle session is

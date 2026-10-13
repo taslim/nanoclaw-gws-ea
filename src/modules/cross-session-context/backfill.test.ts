@@ -131,6 +131,27 @@ beforeEach(() => {
 });
 
 describe('backfillSession — new session', () => {
+  it('includes a forwarded voice opener as recording information when a later thread catches up', async () => {
+    siblings['sess-old'] = {
+      root: {
+        timestamp: iso(NOW - 50 * 60_000),
+        content: JSON.stringify({
+          sender: 'Alex',
+          senderId: 'U1',
+          attachments: [
+            {
+              type: 'audio',
+              audioSource: { kind: 'voice-note', forwarded: true },
+              speech: { status: 'recognized', text: 'Book Friday if Sarah confirms.', language: 'en' },
+            },
+          ],
+        }),
+      },
+    };
+    await backfillSession(AG, NEW_SESSION, DM_MG, { created: true, now: NOW });
+    expect(texts()).toEqual(['[Forwarded recording; source information]\nBook Friday if Sarah confirms.']);
+  });
+
   it('seeds the new session with hot sibling roots + top-level agent posts, ordered by time, in ONE mailbox session', async () => {
     await backfillSession(AG, NEW_SESSION, DM_MG, { created: true, now: NOW });
 
