@@ -128,4 +128,8 @@ Google Chat retries an incomplete audio SDK claim through the ordinary router.
 Completed SDK claims and mailbox source IDs prevent ordinary duplicate turns.
 The SDK completion mark is not atomic with a non-mailbox interceptor effect;
 a hard death between that effect and the mark can repeat it. Voice preserves
-that native recovery boundary and introduces no new ingress guarantee.
+that native recovery boundary and introduces no new ingress guarantee. A
+routing failure releases the conversation queue. If fan-out was only partly
+written, a later cancellation can reach a previously unwritten target before
+the failed note is redelivered there. Successful preparation preserves order;
+retry after a routing failure retains the native recovery limits.

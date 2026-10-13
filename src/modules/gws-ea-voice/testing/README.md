@@ -97,7 +97,11 @@ fan-out, and restart after insertion. Inspect one ordinary mailbox turn and
 one verified effect; do not infer recovery from a transcript alone. The
 existing SDK completion and non-mailbox interceptor effect are not atomic:
 hard death between the effect and its completion mark can repeat that effect.
-This slice adds no stronger ingress guarantee.
+Also fail routing after a partial fan-out, send cancellation, and then retry
+the note. The native failure path releases the conversation queue, so a target
+that missed the original note can receive cancellation before redelivery.
+Record that distinction from successful preparation ordering. This slice adds
+no stronger ingress guarantee.
 
 Measure actual source duration, media hydration, queue wait, separate decode
 and inference time, child peak RSS, and whole ordinary response latency with

@@ -55,6 +55,30 @@ describe('bounded local recognition children', () => {
     stop.abort();
     await expect(operation).rejects.toThrow();
   });
+  it.each([false, true])('rejects oversized watched-file output when child stays running: %s', async (keepRunning) => {
+    const output = path.join(root, 'recognition.json');
+    const pidFile = path.join(root, 'child.pid');
+    await expect(
+      runVoiceProcess(
+        process.execPath,
+        [
+          '-e',
+          `const fs=require('node:fs');fs.writeFileSync(process.argv[1],String(process.pid));fs.writeFileSync(process.argv[2],'x'.repeat(4096));${keepRunning ? 'setInterval(()=>{},1000);' : ''}`,
+          pidFile,
+          output,
+        ],
+        {
+          cwd: root,
+          timeoutMs: 2000,
+          maxOutputBytes: 1024,
+          watchedFile: { path: output, maxBytes: 100 },
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'VoiceProcessError', code: 'output-limit' });
+    expect((await fs.stat(output)).size).toBe(4096);
+    const pid = Number(await fs.readFile(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+  });
   it("kills descendants that would otherwise keep the exited parent's pipes open", async () => {
     const output = await runVoiceProcess(
       process.execPath,
