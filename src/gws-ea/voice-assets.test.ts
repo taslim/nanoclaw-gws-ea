@@ -90,8 +90,8 @@ describe('host voice policy and immutable assets', () => {
     const script = `import {readVoiceHostPolicy} from ${JSON.stringify(source)};const deadline=setTimeout(()=>{console.log('hung');process.exit(0)},200);readVoiceHostPolicy(process.argv[1]).then(()=>{clearTimeout(deadline);console.log('accepted')},error=>{clearTimeout(deadline);console.log(error.name)});`;
     const result = await runVoiceProcess(
       process.execPath,
-      ['--import', 'tsx', '--input-type=module', '-e', script, fifo],
-      { cwd: process.cwd(), timeoutMs: 2000, maxOutputBytes: 1024 },
+      ['--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script, fifo],
+      { cwd: root, timeoutMs: 2000, maxOutputBytes: 1024 },
     );
     expect(result.toString().trim()).toBe('VoiceAssetsError');
   });

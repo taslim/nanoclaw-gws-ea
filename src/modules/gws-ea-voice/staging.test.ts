@@ -49,8 +49,8 @@ describe('original recording admission', () => {
       const script = `import {readOriginalAudio} from ${JSON.stringify(source)}; const deadline=setTimeout(()=>{console.log('hung');process.exit(0)},200); readOriginalAudio({path:process.argv[1]},process.argv[2]).then(()=>{clearTimeout(deadline);console.log('accepted')},error=>{clearTimeout(deadline);console.log(error.code)});`;
       const result = await runVoiceProcess(
         process.execPath,
-        ['--import', 'tsx', '--input-type=module', '-e', script, fifo, root],
-        { cwd: process.cwd(), timeoutMs: 2000, maxOutputBytes: 1024 },
+        ['--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script, fifo, root],
+        { cwd: root, timeoutMs: 2000, maxOutputBytes: 1024 },
       );
       expect(result.toString().trim()).toBe('unsafe-audio');
     },
