@@ -771,6 +771,65 @@ describe('unknown-channel registration flow', () => {
     expect(stillPending).toBe(0);
   });
 
+  it('replays a newly approved owner DM without blocking that conversation', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { sessionDir } = await import('../../session-manager.js');
+    const Database = (await import('better-sqlite3')).default;
+    const fromOwner = (id: string, text: string) => ({
+      ...dmEvent('dm-owner', text),
+      message: {
+        id,
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', text }),
+        timestamp: now(),
+        isMention: true,
+        deduplicate: true,
+      },
+    });
+    const original = fromOwner('owner-original', 'Original request');
+    await expectAsyncDelivery(() => routeInbound(original));
+    await answer('mg-dm-owner', 'new_agent');
+
+    await routeInbound(fromOwner('owner-name', 'Replay Assistant'));
+    await routeInbound(fromOwner('owner-follow-up', 'Follow-up request'));
+    await routeInbound(original);
+
+    const session = await getDb().get<{ id: string; agent_group_id: string }>(
+      'SELECT id, agent_group_id FROM sessions WHERE messaging_group_id = ?',
+      'mg-dm-owner',
+    );
+    expect(session).toBeDefined();
+    const inbound = new Database(path.join(sessionDir(session!.agent_group_id, session!.id), 'inbound.db'), {
+      readonly: true,
+    });
+    try {
+      const messages = inbound
+        .prepare('SELECT id, content FROM messages_in WHERE trigger = 1 ORDER BY seq')
+        .all() as Array<{
+        id: string;
+        content: string;
+      }>;
+      expect(messages.map(({ id }) => id)).toEqual([
+        `owner-original:${session!.agent_group_id}`,
+        `owner-follow-up:${session!.agent_group_id}`,
+      ]);
+      expect(messages.map(({ content }) => (JSON.parse(content) as { text: string }).text)).toEqual([
+        'Original request',
+        'Follow-up request',
+      ]);
+    } finally {
+      inbound.close();
+    }
+    expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(0);
+    expect(
+      await countRows(
+        'SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?',
+        'telegram:owner',
+        session!.agent_group_id,
+      ),
+    ).toBe(1);
+  }, 2_000);
+
   it("create new agent: a reaction or a quiet event in the owner's DM is not taken as the name", async () => {
     const { routeInbound } = await import('../../router.js');
     await answer(await pendingRegistration('chat-create-aside'), 'new_agent');

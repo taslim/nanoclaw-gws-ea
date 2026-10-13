@@ -397,10 +397,10 @@ setChannelRequestGate(async (mg, event) => {
 });
 
 /**
- * Wire an approved channel to an agent group and replay the stored event.
+ * Wire an approved channel to an agent group and return the event to replay.
  * Shared by both approve paths (connect-existing button, free-text new-agent
- * name reply) so they produce identical wirings. Returns true when the wiring
- * was created — callers must not confirm success to the approver otherwise.
+ * name reply) so they produce identical wirings. Returns null if wiring failed
+ * — callers must not confirm success to the approver otherwise.
  *
  * Engage defaults come from the channel's declared defaults (DM vs group
  * context). isGroup uses the adapter's own flag with the persisted row as
@@ -412,7 +412,7 @@ async function wireApprovedChannel(
   agentGroupId: string,
   approverId: string,
   answer?: ResponsePayload,
-): Promise<boolean> {
+): Promise<InboundEvent | null> {
   let event: InboundEvent;
   try {
     event = JSON.parse(row.original_message) as InboundEvent;
@@ -422,7 +422,7 @@ async function wireApprovedChannel(
       err,
     });
     await deletePendingChannelApproval(row.messaging_group_id);
-    return false;
+    return null;
   }
 
   const mg = await getMessagingGroup(row.messaging_group_id);
@@ -445,7 +445,7 @@ async function wireApprovedChannel(
       err,
     });
     await deletePendingChannelApproval(row.messaging_group_id);
-    return false;
+    return null;
   }
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -484,16 +484,18 @@ async function wireApprovedChannel(
 
   await deletePendingChannelApproval(row.messaging_group_id);
   if (answer) await showApprovalOutcome(CHANNEL_REGISTRATION, answer, row);
+  return event;
+}
 
+async function replayApprovedChannel(event: InboundEvent, messagingGroupId: string): Promise<void> {
   try {
     await routeInbound(event);
   } catch (err) {
     log.error('Failed to replay message after channel approval', {
-      messagingGroupId: row.messaging_group_id,
+      messagingGroupId,
       err,
     });
   }
-  return true;
 }
 
 /**
@@ -688,7 +690,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   // ── Wire + replay (shared path for connect and create) ──
-  await wireApprovedChannel(row, targetAgentGroupId, approverId, payload);
+  const event = await wireApprovedChannel(row, targetAgentGroupId, approverId, payload);
+  if (event) await replayApprovedChannel(event, row.messaging_group_id);
   return true;
 }
 
@@ -736,6 +739,9 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   });
 
   const wired = await wireApprovedChannel(row, ag.id, userId);
+  // This interceptor holds the DM's route tail. Enqueue replay after wiring,
+  // but release the current route before waiting on that same conversation.
+  if (wired) void replayApprovedChannel(wired, row.messaging_group_id);
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
