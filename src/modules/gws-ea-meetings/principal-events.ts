@@ -49,7 +49,13 @@
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
-import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import {
+  canChangeEvents,
+  EVENT_ID,
+  hidesPrivateEvents,
+  isPrincipalCalendar,
+  recordOwnCalendarChange,
+} from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
@@ -342,7 +348,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         `${calendarId} is not one of the principal's calendars in your list, nor your own: you write only on those.`,
       );
     }
-    if (entry.accessRole !== 'writer' && entry.accessRole !== 'owner') {
+    if (!canChangeEvents(entry)) {
       throw forbidden('Google lets you see that calendar but not change it.');
     }
     return { entry, owner, principal };
@@ -387,6 +393,11 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     const matterId = await requestedMatter(content.matter, session);
 
     const { entry, owner, principal } = await writableCalendarOf(calendarId);
+    if (hidden && hidesPrivateEvents(entry)) {
+      throw forbidden(
+        'That calendar is shared with you without its private events, so Google lets you add only events that are not private there.',
+      );
+    }
     // The calendar's owner is its organizer; on the assistant's own, the principal is on it only when named.
     const attendees = guestsOn(entry.id, guests);
     const invited = guests.filter((address) => !isOwnerAddress(entry.id, address));

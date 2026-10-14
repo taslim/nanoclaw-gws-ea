@@ -477,6 +477,20 @@ describe('create_event', () => {
     expect(calendar.events).toEqual([]);
   });
 
+  it('writes on a calendar it may change without seeing the principal’s private events, but makes no event private there', async () => {
+    calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writerWithoutPrivateAccess' });
+
+    expect(refusal(await send(main, 'create_event', { ...FOCUS, private: true }))).toMatch(
+      /shared with you without its private events, so Google lets you add only events that are not private there/u,
+    );
+    expect(calendar.events).toEqual([]);
+
+    const created = data(await send(main, 'create_event', FOCUS));
+    const event = calendar.event(PRINCIPAL, String(created.event));
+    expect(event).toMatchObject({ summary: 'Focus: board deck', attendees: [PRINCIPAL_GUEST] });
+    expect(event?.visibility).toBeUndefined();
+  });
+
   it('refuses times it cannot read, a repetition that is not one, and a Meet link the calendar does not allow', async () => {
     calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'owner' });
     for (const [fields, problem] of [

@@ -185,16 +185,54 @@ export function isPrincipalCalendar(entry: CalendarListEntry, principal: Princip
 }
 
 /**
+ * The access roles that let the assistant change a calendar's events.
+ * `writerWithoutPrivateAccess` shows the owner's private events only as busy
+ * time, and lets it write only events that are not private.
+ */
+const CHANGING_ROLES: ReadonlySet<string> = new Set(['owner', 'writer', 'writerWithoutPrivateAccess']);
+
+/** Every access role the host knows. */
+const KNOWN_ROLES: ReadonlySet<string> = new Set([...CHANGING_ROLES, 'reader', 'freeBusyReader']);
+
+/** Whether Google lets the assistant change events on a calendar. */
+export function canChangeEvents(entry: Pick<CalendarListEntry, 'accessRole'>): boolean {
+  return entry.accessRole !== undefined && CHANGING_ROLES.has(entry.accessRole);
+}
+
+/** Whether a calendar is shared with the assistant without its private events, so it writes none there. */
+export function hidesPrivateEvents(entry: Pick<CalendarListEntry, 'accessRole'>): boolean {
+  return entry.accessRole === 'writerWithoutPrivateAccess';
+}
+
+/**
  * Whether the assistant can book on a calendar: one of the principal's that
- * Google lets it write events on, as `writer` or `owner`.
+ * Google lets it change events on.
  */
 export function isBookableCalendar(entry: CalendarListEntry, principal: PrincipalRecognizer): boolean {
-  return isPrincipalCalendar(entry, principal) && (entry.accessRole === 'writer' || entry.accessRole === 'owner');
+  return isPrincipalCalendar(entry, principal) && canChangeEvents(entry);
 }
 
 /** Whether Google shows the assistant a calendar's events, not only when it is busy. */
 export function isReadable(entry: CalendarListEntry): boolean {
-  return entry.accessRole === 'reader' || entry.accessRole === 'writer' || entry.accessRole === 'owner';
+  return entry.accessRole === 'reader' || canChangeEvents(entry);
+}
+
+/** Roles the poll has warned of since the host started, so a role is logged once rather than every minute. */
+const warnedRoles = new Set<string>();
+
+/**
+ * Warn, once per role, of a principal calendar whose access role the host
+ * does not know: the assistant neither reads nor books on it until the host
+ * learns the role.
+ */
+function warnOfUnknownRole(entry: CalendarListEntry): void {
+  const role = entry.accessRole;
+  if (role === undefined || KNOWN_ROLES.has(role) || warnedRoles.has(role)) return;
+  warnedRoles.add(role);
+  log.warn('Google gave an access role the host does not know: no reading or booking on that calendar', {
+    calendarId: entry.id,
+    role,
+  });
 }
 
 function hasWanted(entry: CalendarListEntry): boolean {
@@ -431,6 +469,7 @@ export async function syncCalendarList(
   await tellMainOfDrops(principal, at);
   const calendars = entries.filter((entry) => isPrincipalCalendar(entry, principal));
   for (const entry of calendars) {
+    warnOfUnknownRole(entry);
     if (!isReadable(entry) || hasWanted(entry)) continue;
     const kept = (entry.notificationSettings?.notifications ?? []).filter(
       (notification) => !WANTED_NOTIFICATIONS.some((wanted) => wanted.type === notification.type),

@@ -85,6 +85,7 @@ import {
   registerDeliveryAction,
   setDeliveryAdapter,
 } from '../../delivery.js';
+import { log } from '../../log.js';
 import { parseIsoTimestamp } from '../../mailbox/model.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
@@ -2958,6 +2959,31 @@ describe('calendar access per address', () => {
     await inbox.tick();
     expect(await access()).toEqual({ [PRINCIPAL_HOME]: 'none', [PRINCIPAL]: 'bookable', [WORK]: 'readable' });
     expect(calendar.patches.map((patch) => patch.calendarId)).toContain(WORK);
+  });
+
+  it("records a calendar it may change without seeing the principal's private events as bookable, and turns its notifications on", async () => {
+    calendar.share(WORK, 'writerWithoutPrivateAccess');
+    calendar.patches.length = 0;
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+
+    expect(await access()).toMatchObject({ [WORK]: 'bookable' });
+    expect(calendar.patches.map((patch) => patch.calendarId)).toEqual([WORK]);
+    expect(notes(ACCESS_DROPPED)).toEqual([]);
+  });
+
+  it('records a calendar shared with a role the host does not know as none, and warns of that role once', async () => {
+    const warn = vi.spyOn(log, 'warn');
+    calendar.share(WORK, 'someNewRole');
+    await addPrincipalAddress(WORK);
+    await inbox.tick();
+    later(60_000);
+    await inbox.tick();
+    const warned = warn.mock.calls.filter(([message]) => message.includes('access role the host does not know'));
+    warn.mockRestore();
+
+    expect(await access()).toMatchObject({ [WORK]: 'none' });
+    expect(warned).toEqual([[expect.any(String), { calendarId: WORK, role: 'someNewRole' }]]);
   });
 
   it("adds a new address's calendar on the next poll; one not shared is none without failing the sync, and a later share is picked up on retry", async () => {
