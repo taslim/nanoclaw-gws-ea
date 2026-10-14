@@ -39,7 +39,9 @@ import {
   failedOutcome,
   inspectOperation,
   liveCheckoutCommits,
+  operationContinuationArgv,
   readRollbackPoint,
+  recoveryCommandLine,
   type OperationFollowUp,
   type OperationInspection,
   type OperationKind,
@@ -1505,7 +1507,7 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
   if (details) return renderStatusDetails(status, timezone);
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
   const actions = statusActions(status).flatMap((action) =>
-    action.kind === 'command' ? [action.argv.join(' ')] : [action.instruction],
+    action.kind === 'command' ? [recoveryCommandLine(action.argv)] : [action.instruction],
   );
   return [
     `Assistant ${status.instance_id}`,
@@ -1535,7 +1537,10 @@ function statusActions(status: AssistantStatus): NextAction[] {
   if (status.removal_in_progress) return [command('remove')];
   const operation = status.operation;
   if (operation.state === 'open')
-    return [command(operation.kind), ...(operation.kind === 'update' ? [command('rollback')] : [])];
+    return [
+      { kind: 'command', argv: operationContinuationArgv(status.instance_id, operation) },
+      ...(operation.revert_with !== null ? [command('rollback')] : []),
+    ];
   if (operation.state === 'failed') return [command('update')];
   if (operation.state === 'committed') return [command(operation.kind)];
   const actions: NextAction[] = [];

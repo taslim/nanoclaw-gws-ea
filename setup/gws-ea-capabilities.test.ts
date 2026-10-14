@@ -5,6 +5,7 @@ import path from 'node:path';
 import * as prompts from '@clack/prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { expectResultContract } from '../src/gws-ea/testing/result-contract.js';
 import { main } from './gws-ea.js';
 
 vi.mock('@clack/prompts', async (original) => ({
@@ -48,7 +49,8 @@ describe('native capability driver', () => {
       });
       const { confirm, spinner, note } = prompts;
       expect(await main(['capabilities', 'check', 'voice', mode], { interactive: true })).toBe(0);
-      if (mode === '--json')
+      if (mode === '--json') {
+        expectResultContract('capabilities check', JSON.parse(output.join('')));
         expect(JSON.parse(output.join(''))).toMatchObject({
           schema_version: 1,
           command: 'capabilities check',
@@ -56,7 +58,7 @@ describe('native capability driver', () => {
           changed: false,
           data: { name: 'voice', assets: { status: 'absent' }, activation: { status: 'disabled' } },
         });
-      else {
+      } else {
         expect(output.join('')).toContain('voice (host)');
         expect(output.join('')).toContain('Selected assets: absent');
         expect(output.join('')).toContain('Actions: show, check, install, enable, disable, uninstall');

@@ -58,6 +58,7 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/mdast": "4.0.4",
     "@types/node": "^22.10.0",
+    "ajv": "6.14.0",
     "eslint": "^9.35.0",
     "eslint-plugin-no-catch-all": "^1.1.0",
     "globals": "^15.12.0",

@@ -43,6 +43,7 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import type { CliRuntime } from './cli.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { removeToolCheckouts, toolCheckoutWorld } from './testing/stray-fixture.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
@@ -551,6 +552,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     } finally {
       held?.release();
     }
+    expectResultContract('update', JSON.parse(out.join('\n')));
     expect(JSON.parse(out.join('\n'))).toMatchObject({
       schema_version: 1,
       command: 'update',
@@ -580,6 +582,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const confirmUpdateAll = vi.fn(async () => true);
     const { run, out } = fleetCli(machineFleet, { confirmUpdateAll });
     expect(await run(['update', '--all', '--json', '--no-input'])).toBe(10);
+    expectResultContract('update', JSON.parse(out.join('\n')));
     expect(JSON.parse(out.join('\n'))).toMatchObject({
       outcome: 'paused',
       changed: false,

@@ -34,6 +34,7 @@ import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { FULL_CHECK_MS } from './stray-install.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { present, removeToolCheckouts, toolCheckoutWorld, type ToolCheckoutWorld } from './testing/stray-fixture.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
@@ -82,6 +83,7 @@ describe('managed machine results', () => {
         }),
       ).toBe(10);
       const result = JSON.parse(stdout.join('')) as Record<string, unknown>;
+      expectResultContract('create', result);
       const registry = await readRegistry(paths);
       const id = Object.keys(registry.instances)[0];
       expect(result).toMatchObject({
@@ -101,24 +103,31 @@ describe('managed machine results', () => {
     }
   });
 
-  it('does not publish an allocated creation ID when input collection fails before reservation', async () => {
-    const paths = await testPaths();
-    const io = lines();
-    expect(
-      await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE, '--json'], {
-        paths,
-        ...io.runtime,
-        ...createRuntime(),
-        collectCreateInputs: async () => {
-          throw new GwsEaError('input_failed', 'Inputs could not be read.');
-        },
-      }),
-    ).toBe(1);
-    const result = JSON.parse(io.out.join('\n')) as Record<string, unknown>;
-    expect(result).toMatchObject({ outcome: 'failed', changed: false, data: null, error: { code: 'input_failed' } });
-    expect(JSON.stringify(result.next_actions)).not.toContain('resume');
-    expect((await readRegistry(paths)).instances).toEqual({});
-  });
+  it.each([
+    { code: 'input_failed', outcome: 'failed', exit: 1 },
+    { code: 'cancelled', outcome: 'cancelled', exit: 0 },
+  ])(
+    'does not publish an allocated creation ID when input collection is $outcome before reservation',
+    async ({ code, outcome, exit }) => {
+      const paths = await testPaths();
+      const io = lines();
+      expect(
+        await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE, '--json'], {
+          paths,
+          ...io.runtime,
+          ...createRuntime(),
+          collectCreateInputs: async () => {
+            throw new GwsEaError(code, 'Input collection stopped.');
+          },
+        }),
+      ).toBe(exit);
+      const result = JSON.parse(io.out.join('\n')) as Record<string, unknown>;
+      expectResultContract('create', result);
+      expect(result).toMatchObject({ outcome, changed: false, data: null, error: { code } });
+      expect(JSON.stringify(result.next_actions)).not.toContain('resume');
+      expect((await readRegistry(paths)).instances).toEqual({});
+    },
+  );
 
   it('pauses with the removal preview in no-input JSON mode without asking or removing', async () => {
     const paths = await testPaths();
@@ -134,6 +143,7 @@ describe('managed machine results', () => {
         removeAssistant,
       }),
     ).toBe(10);
+    expectResultContract('remove', JSON.parse(io.out.join('\n')));
     expect(JSON.parse(io.out.join('\n'))).toMatchObject({
       outcome: 'paused',
       changed: false,
@@ -149,6 +159,7 @@ describe('managed machine results', () => {
     const before = await everythingUnder(paths);
     const io = lines();
     expect(await runCli(['resume', '--json'], { paths, ...io.runtime })).toBe(2);
+    expectResultContract('resume', JSON.parse(io.out.join('\n')));
     expect(JSON.parse(io.out.join('\n'))).toMatchObject({
       schema_version: 1,
       command: 'resume',
@@ -160,6 +171,36 @@ describe('managed machine results', () => {
       diagnostics: {},
     });
     expect(await everythingUnder(paths)).toEqual(before);
+  });
+
+  it.each([
+    { command: 'list', argv: ['list', '--json'] },
+    { command: 'create', argv: ['create', '--track', 'dogfood', '--json'] },
+  ])('returns one failure envelope for unsafe initialization of $command', async ({ command, argv }) => {
+    const paths = await testPaths();
+    const alias = path.join(path.dirname(paths.configRoot), 'config-link');
+    await symlink(paths.configRoot, alias);
+    const before = await everythingUnder(paths);
+    const io = lines();
+    vi.stubEnv('GWS_EA_CONFIG_ROOT', alias);
+    vi.stubEnv('GWS_EA_STATE_ROOT', paths.stateRoot);
+    try {
+      await expect(runCli(argv, io.runtime)).resolves.toBe(1);
+      expect(io.out).toHaveLength(1);
+      expectResultContract(command, JSON.parse(io.out[0]));
+      expect(JSON.parse(io.out[0])).toMatchObject({
+        schema_version: 1,
+        command,
+        outcome: 'failed',
+        changed: false,
+        data: null,
+        error: { code: 'unsafe_path' },
+        diagnostics: {},
+      });
+      expect(await everythingUnder(paths)).toEqual(before);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('preserves schema keys while redacting credential values in early errors', async () => {
@@ -287,6 +328,7 @@ describe('host-wide optional voice commands', () => {
     const paths = await testPaths();
     const io = lines();
     expect(await runCli(['capabilities', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
+    expectResultContract('capabilities enable', JSON.parse(io.out.join('\n')));
     expect(JSON.parse(io.out.join('\n'))).toMatchObject({
       schema_version: 1,
       command: 'capabilities enable',
@@ -480,6 +522,7 @@ describe('gws-ea usage', () => {
     const paths = await testPaths();
     const io = lines();
     expect(await runCli(args, { paths, ...io.runtime })).toBe(0);
+    expectResultContract('list', JSON.parse(io.out.join('\n')));
     expect(JSON.parse(io.out.join('\n'))).toEqual({
       schema_version: 1,
       command: 'list',

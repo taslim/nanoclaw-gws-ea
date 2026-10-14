@@ -28,12 +28,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
+import { parseInvocation } from './command-parser.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
   advanceOperation,
+  admitInstanceCommand,
   beginOperation,
   beginOperationReturn,
   closeOperationFailed,
@@ -51,6 +53,7 @@ import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
 import { writeInstanceMarker } from './registry.js';
+import type { NextAction } from './result.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
@@ -61,7 +64,9 @@ import {
   type StatusObservers,
 } from './status.js';
 import { commitAll, git } from './testing/cutover-fixture.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError, releaseOf, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { resolveUpdateIntent } from './update.js';
 import type { LatestDelivery } from './verify.js';
 
 const roots: string[] = [];
@@ -544,13 +549,15 @@ function command(host: Machine, state: World, observers: Partial<StatusObservers
 async function statusJson(host: Machine, state: World, instanceId: string, observers?: Partial<StatusObservers>) {
   const { runtime, output } = command(host, state, observers);
   const exitCode = await runStatusCommand(runtime, { instanceId, json: true });
+  const result = JSON.parse(output.stdout.join('\n')) as {
+    data: Record<string, unknown> & StatusShape;
+    next_actions: readonly NextAction[];
+  };
+  expectResultContract('status', result);
   return {
     exitCode,
-    status: (JSON.parse(output.stdout.join('\n')) as { data: Record<string, unknown> & StatusShape }).data as Record<
-      string,
-      unknown
-    > &
-      StatusShape,
+    status: result.data,
+    nextActions: result.next_actions,
     output,
   };
 }
@@ -1277,6 +1284,79 @@ describe('status', () => {
     expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
     expect(listed.output.stdout.join('\n')).toMatch(new RegExp(` +update failed$`, 'mu'));
     expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
+  });
+
+  it('offers only continuation for an open update superseding one closed for fix-forward', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    await updateFailedWithoutReturn(host.paths, reservation, {
+      ...releaseOf(reservation),
+      deployed_commit: 'c'.repeat(40),
+    });
+    const target = { ...releaseOf(reservation), deployed_commit: await nextRelease(host) };
+    // beginOperation carries no_rollback_target from the failed operation to its open successor.
+    await updateUnfinishedAt(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const { status, nextActions } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+
+    expect(status.operation).toMatchObject({ state: 'open', kind: 'update', to: target, revert_with: null });
+    expect.soft(nextActions).toEqual([{ kind: 'command', argv: ['gws-ea', 'update', '--id', id] }]);
+    expect(text.output.stdout.filter((line) => line.startsWith('  Next:'))).toEqual([
+      `  Next: gws-ea update --id ${id}`,
+    ]);
+    expect(text.output.stdout.join('\n')).not.toContain('gws-ea rollback');
+  });
+
+  it.each([
+    { change: 'custom track', track: 'candidate' },
+    { change: 'source remote', track: 'dogfood' },
+  ])('offers an admitted continuation for an interrupted $change change', async ({ track }) => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const commit = await nextRelease(host);
+    const remote = path.join(host.root, track === 'dogfood' ? 'mirror source' : 'mirror');
+    git(host.root, 'clone', '--quiet', host.tool, remote);
+    git(remote, 'branch', track === 'dogfood' ? 'rebuild-v2' : track);
+    const target: ReleaseCoordinates = { source_remote: remote, release_track: track, deployed_commit: commit };
+    await updateUnfinishedAt(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const { status, nextActions } = await statusJson(host, state, id);
+    const continuation = nextActions[0];
+    if (continuation?.kind !== 'command') throw new Error('Status did not offer a command to continue its update');
+    const invocation = parseInvocation(continuation.argv.slice(1));
+    expect(invocation.definition.path).toEqual(['update']);
+    expect(invocation.options.id).toBe(id);
+    // The actual argv is parsed and resolved at the recorded target tool revision, then checked by the native gate.
+    const intent = await resolveUpdateIntent(
+      host.paths,
+      {
+        instanceId: invocation.options.id,
+        track: invocation.options.track,
+        sourceRemote: invocation.options['source-remote'],
+      },
+      { toolRoot: host.tool },
+    );
+    await expect(
+      admitInstanceCommand(host.paths, reservation, { command: 'update', target: intent.target }),
+    ).resolves.toBeUndefined();
+    expect(intent.target).toEqual(target);
+    expect(continuation.argv).toEqual(['gws-ea', 'update', '--id', id, '--track', track, '--source-remote', remote]);
+
+    const displayedRemote = track === 'dogfood' ? `'${remote}'` : remote;
+    const expected = `gws-ea update --id ${id} --track ${track} --source-remote ${displayedRemote}`;
+    expect(status.operation).toMatchObject({ state: 'open', to: target, continue_with: expected });
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(text.output.stdout).toContain(`  Next: ${expected}`);
+    expect(text.output.stdout.find((line) => line.startsWith('  Operation:'))).toContain(
+      `continue it with ${expected}`,
+    );
   });
 
   it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {

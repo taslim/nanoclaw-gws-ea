@@ -460,12 +460,35 @@ function committedByRegistry(record: OperationRecord, reservation: InstanceReser
   );
 }
 
+/** Continue an open operation at its recorded target, before the registry has adopted those coordinates. */
+export function operationContinuationArgv(
+  instanceId: string,
+  operation: Pick<OperationRecord, 'kind' | 'from' | 'to'>,
+): readonly string[] {
+  const argv = ['gws-ea', operation.kind, '--id', instanceId];
+  if (
+    operation.kind === 'update' &&
+    (operation.from.release_track !== operation.to.release_track ||
+      operation.from.source_remote !== operation.to.source_remote)
+  )
+    argv.push('--track', operation.to.release_track, '--source-remote', operation.to.source_remote);
+  return argv;
+}
+
+/** Copyable human recovery guidance, derived from argv without interpreting a shell fragment. */
+export function recoveryCommandLine(argv: readonly string[]): string {
+  return argv
+    .map((argument) => (/^[a-zA-Z0-9_./:@=+-]+$/u.test(argument) ? argument : `'${argument.replaceAll("'", `'\\''`)}'`))
+    .join(' ');
+}
+
 export function operationNextSteps(record: OperationRecord): OperationNextSteps {
   const id = record.instance_id;
   if (record.closed === 'failed') return { continueWith: `gws-ea update --id ${id}` };
+  const continueWith = recoveryCommandLine(operationContinuationArgv(id, record));
   return record.kind === 'update' && !record.no_rollback_target
-    ? { continueWith: `gws-ea update --id ${id}`, revertWith: `gws-ea rollback --id ${id}` }
-    : { continueWith: `gws-ea ${record.kind} --id ${id}` };
+    ? { continueWith, revertWith: `gws-ea rollback --id ${id}` }
+    : { continueWith };
 }
 
 /** The clause naming what reverts an unfinished operation, or nothing when only continuing it can. */

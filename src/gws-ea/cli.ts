@@ -2178,6 +2178,25 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     },
   };
   const environment = runtime.environment ?? process.env;
+  if (invocation.definition.outputModes.includes('json')) {
+    // Initialize managed paths before dispatch, while no domain effects have occurred.
+    try {
+      runtime = { ...runtime, paths: runtime.paths ?? resolveControlPlanePaths() };
+      // eslint-disable-next-line no-catch-all/no-catch-all -- This boundary serializes initialization failures without exposing raw filesystem errors.
+    } catch (error) {
+      registerErrorSecrets();
+      const instruction = 'Inspect and correct GWS_EA_CONFIG_ROOT and GWS_EA_STATE_ROOT before continuing.';
+      emitResult(
+        managedResult(invocation.definition.path.join(' '), {
+          outcome: 'failed',
+          error,
+          next_actions: [{ kind: 'external', instruction }],
+        }),
+      );
+      presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: [instruction] });
+      return EXIT_CODES.failed;
+    }
+  }
   switch (handler.kind) {
     case 'capability': {
       const command = handler.command;
