@@ -530,6 +530,39 @@ describe('GWS-EA command runner', () => {
     expect((await failure(runSanitizedCommand(command))).code).toBe('command_output_limit');
     await expect(runSanitizedCommand({ ...command, stream: true })).resolves.toMatchObject({ stdout: '' });
   });
+
+  it.each(['stdout', 'stderr', 'close'])(
+    'rejects a failed %s log sink and terminates the running command',
+    async (stream) => {
+      const run = await runLog();
+      const pidFile = path.join(run.directory, 'child.pid');
+      const noSpace = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      const error = await run.step('build', async (step) => {
+        const write = step.write;
+        vi.spyOn(step, 'write').mockImplementation((text) => {
+          if (!text.startsWith('$ ') && text.includes('stream marker')) throw noSpace;
+          write(text);
+        });
+        return failure(
+          runSanitizedCommand({
+            command: NODE,
+            args: [
+              '--eval',
+              `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.${stream === 'close' ? 'stdout' : stream}.write('stream marker${stream === 'close' ? '' : '\\n'}'); ${stream === 'close' ? '' : 'setInterval(() => {}, 1000);'}`,
+            ],
+            cwd: process.cwd(),
+            stream: true,
+            timeoutMs: 2000,
+          }),
+        );
+      });
+      expect(error).toMatchObject({ code: 'command_failed', details: { errno: 'ENOSPC' } });
+      expect(error.message).toContain('log');
+      const pid = await readPid(pidFile);
+      expect(pid).toBeTypeOf('number');
+      expect(isAlive(pid!)).toBe(false);
+    },
+  );
 });
 
 describe('GWS-EA process replacement', () => {

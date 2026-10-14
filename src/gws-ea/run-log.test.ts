@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ const OTHER_INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -85,6 +87,20 @@ describe('GWS-EA run log', () => {
     expect(progression).toMatch(/provision_gcp \[\d+ms\] → failed ===\n {2}error: command_failed\n/u);
     expect(progression).toContain('  message: Command failed: gcloud projects describe x (exit code 2)\n');
     expect(progression).toMatch(/## \S+Z · aborted at provision_gcp \(err=command_failed\)\n$/u);
+  });
+
+  it('preserves the primary error when recording the failed step runs out of disk space', async () => {
+    const run = await startRunLog({ paths: await controlPlanePaths(), command: 'capabilities install' });
+    const primary = new GwsEaError('voice_build_failed', 'compiler failed');
+    vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    });
+    await expect(
+      run.step('build', async () => {
+        throw primary;
+      }),
+    ).rejects.toBe(primary);
+    expect(run.loggingError).toBe('ENOSPC');
   });
 
   it('logs pre-reservation runs under logs/runs and moves them when an instance is reserved', async () => {

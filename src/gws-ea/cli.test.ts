@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
@@ -364,6 +365,103 @@ describe('managed machine results', () => {
 });
 
 describe('host-wide optional voice commands', () => {
+  it('emits the primary managed failure even when failure and abort logging run out of space', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const append = fs.appendFileSync;
+    const appendSpy = vi.spyOn(fs, 'appendFileSync').mockImplementation((...args) => {
+      if (String(args[1]).includes('→ failed') || String(args[1]).includes('aborted')) {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return append(...args);
+    });
+    const exit = await runCli(
+      ['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
+      { paths, ...io.runtime },
+    );
+    expect(exit).toBe(1);
+    expect(JSON.parse(io.out.join('\n'))).toMatchObject({
+      error: {
+        code: 'voice_build_prerequisite',
+        message: expect.stringContaining('Diagnostic log incomplete (ENOSPC)'),
+      },
+    });
+    appendSpy.mockRestore();
+    const retry = lines();
+    expect(
+      await runCli(['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
+        paths,
+        ...retry.runtime,
+      }),
+    ).toBe(1);
+    expect(JSON.parse(retry.out.join('\n'))).toMatchObject({ error: { code: 'voice_build_prerequisite' } });
+    expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+  });
+  it('keeps install retry options and private diagnostics when an explicit CMake path is missing', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const cmake = path.join(paths.configRoot, 'missing cmake');
+    expect(
+      await runCli(['capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
+        paths,
+        ...io.runtime,
+        environment: { PATH: paths.configRoot },
+      }),
+    ).toBe(1);
+    const result = JSON.parse(io.out.join('\n')) as { diagnostics: { run_log: string; step_log: string } };
+    expectResultContract('capabilities install', result);
+    expect(result).toMatchObject({
+      error: { code: 'voice_build_prerequisite', message: expect.stringContaining(cmake) },
+      next_actions: [
+        { kind: 'external', instruction: expect.stringContaining('Correct --cmake') },
+        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
+      ],
+      diagnostics: { run_log: expect.any(String), step_log: expect.any(String) },
+    });
+    expect(await readFile(result.diagnostics.step_log, 'utf8')).toContain(cmake);
+    expect((await stat(result.diagnostics.step_log)).mode & 0o077).toBe(0);
+    await expect(readFile(path.join(paths.configRoot, 'voice.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('shows repair, stderr, and logs when an installed prerequisite fails in human output', async () => {
+    const paths = await testPaths();
+    const cmake = path.join(paths.configRoot, 'cmake');
+    await writeFile(cmake, `#!${process.execPath}\nprocess.stderr.write('broken developer path\\n');process.exit(2);`, {
+      mode: 0o700,
+    });
+    const io = lines();
+    expect(await runCli(['capabilities', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
+    expect(io.err.join('\n')).toContain('broken developer path');
+    expect(io.err.join('\n')).toContain('Log:');
+    expect(io.err.join('\n')).toContain('Correct --cmake');
+    expect(io.err.join('\n')).toContain(`--cmake '${cmake}'`);
+  });
+  it('offers host-specific CMake guidance without installing or downloading anything', async () => {
+    const paths = await testPaths();
+    await writeFile(
+      path.join(paths.configRoot, 'brew'),
+      `#!${process.execPath}\nthrow new Error('must not execute brew');`,
+      { mode: 0o700 },
+    );
+    const io = lines();
+    const fetch = vi.spyOn(globalThis, 'fetch');
+    try {
+      expect(
+        await runCli(['capabilities', 'install', 'voice'], {
+          paths,
+          ...io.runtime,
+          environment: { PATH: paths.configRoot },
+        }),
+      ).toBe(1);
+      expect(io.err.join('\n')).toContain(
+        process.platform === 'darwin' ? 'brew install cmake' : 'sudo apt-get install cmake',
+      );
+      expect(io.err.join('\n')).toContain('Missing CMake');
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
   it('names explicit installation when enabling absent voice assets, without an instance or a download', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];
@@ -426,6 +524,7 @@ function neverCalled(): never {
 const PRIVATE_REMOTE = 'git@github.com:example/nanoclaw-gws-ea-private.git';
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   googleConnection.resources = undefined;
   for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });

@@ -7,7 +7,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installVoiceAssets, voiceInstallationDirectory } from './install-voice.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandRunner } from './process.js';
-import { VOICE_SOURCE_ARTIFACTS, voiceModelUrl, type VoiceAssetReceipt } from './voice-assets.js';
+import { GwsEaError } from './types.js';
+import { startRunLog } from './run-log.js';
+import { registerSecret } from './redact.js';
+import {
+  VOICE_SOURCE_ARTIFACTS,
+  voiceModelUrl,
+  verifyVoiceInstallation,
+  type VoiceAssetReceipt,
+} from './voice-assets.js';
+
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  return { ...actual, rm: vi.fn(actual.rm) };
+});
 
 vi.mock('./voice-assets.js', async (original) => {
   const actual = await original<typeof import('./voice-assets.js')>();
@@ -93,7 +106,7 @@ function fetchRecipe(): typeof globalThis.fetch {
 function compiler(commands: SanitizedCommand[]): SanitizedCommandRunner {
   return async (command) => {
     commands.push(command);
-    if (command.command === 'tar') {
+    if (command.command === 'tar' && command.args[0] !== '--version') {
       const destination = command.args[command.args.indexOf('-C') + 1];
       for (const file of ['LICENSE', 'COPYING.LGPLv2.1', 'LICENSE.md'])
         await writeFile(path.join(destination, file), 'source license');
@@ -109,6 +122,58 @@ function compiler(commands: SanitizedCommand[]): SanitizedCommandRunner {
 }
 
 describe('explicit pinned voice recipe', () => {
+  it.each(['cmake', 'cc', 'c++', 'make', 'tar'])(
+    'identifies missing %s before any download instead of blaming every prerequisite',
+    async (tool) => {
+      const fetch = fetchRecipe();
+      await expect(
+        installVoiceAssets(
+          paths,
+          {},
+          {
+            fetch,
+            runCommand: async (command) => {
+              if (command.command === tool)
+                throw new GwsEaError('executable_not_found', 'missing', {
+                  details: { program: tool, searched: ['/fixture/bin'] },
+                });
+              return { stdout: 'version', stderr: '' };
+            },
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: 'voice_build_prerequisite',
+        message: expect.stringContaining(tool),
+        details: { program: tool, searched: ['/fixture/bin'], failure: 'missing' },
+      });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+    },
+  );
+  it('preserves an installed compiler failure instead of telling the operator it is missing', async () => {
+    const fetch = fetchRecipe();
+    await expect(
+      installVoiceAssets(
+        paths,
+        {},
+        {
+          fetch,
+          runCommand: async (command) => {
+            if (command.command === 'cc')
+              throw new GwsEaError('command_failed', 'compiler failed', {
+                details: { program: 'cc', exitCode: 1, stderrTail: 'invalid active developer path' },
+              });
+            return { stdout: 'version', stderr: '' };
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'voice_build_prerequisite',
+      message: expect.stringContaining('failed'),
+      details: { failure: 'failed', exitCode: 1, stderrTail: 'invalid active developer path' },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it('checks prerequisites before downloading and cleans its unpublished build on failure', async () => {
     const fetch = fetchRecipe();
     await expect(
@@ -136,7 +201,7 @@ describe('explicit pinned voice recipe', () => {
       ),
     ).rejects.toMatchObject({ code: 'voice_checksum_failed' });
     expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
-    expect(commands.some((command) => command.command === 'tar')).toBe(false);
+    expect(commands.some((command) => command.command === 'tar' && command.args[0] !== '--version')).toBe(false);
   });
   it('installs base by default, records exact build/source provenance, and reuses it without downloads', async () => {
     const commands: SanitizedCommand[] = [];
@@ -190,15 +255,75 @@ describe('explicit pinned voice recipe', () => {
         {
           fetch: fetchRecipe(),
           runCommand: async (command) => {
-            if (command.args[0] === '--build') throw new Error('compiler failed');
+            if (command.args[0] === '--build')
+              throw new GwsEaError('command_failed', 'compiler failed', {
+                details: { exitCode: 2, stderrTail: 'fatal compiler diagnostic' },
+              });
             return base(command);
           },
         },
       ),
-    ).rejects.toThrow('compiler failed');
+    ).rejects.toMatchObject({
+      code: 'voice_build_failed',
+      details: {
+        stage: 'Building whisper.cpp',
+        exitCode: 2,
+        stderrTail: 'fatal compiler diagnostic',
+        published: false,
+      },
+    });
     expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
     await expect(readFile(path.join(paths.configRoot, 'voice.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
+  it.each(['network', 'http', 'stream'])(
+    'names the source artifact on a %s download failure and cleans scratch',
+    async (failure) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new Error('socket closed'));
+        },
+      });
+      await expect(
+        installVoiceAssets(
+          paths,
+          {},
+          {
+            runCommand: compiler([]),
+            fetch: async () => {
+              if (failure === 'network') throw new TypeError('fetch failed');
+              return failure === 'http' ? new Response(null, { status: 503 }) : new Response(body);
+            },
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: 'voice_download_failed',
+        message: expect.stringContaining('whisper.tar.gz'),
+        details: { artifact: 'whisper.tar.gz', published: false },
+      });
+      expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+    },
+  );
+  it.each([false, true])(
+    'reports verification failure before/after publication (published=%s) without deleting published assets',
+    async (published) => {
+      const commands: SanitizedCommand[] = [];
+      const verify = vi.mocked(verifyVoiceInstallation);
+      if (published) {
+        const original = verify.getMockImplementation()!;
+        verify.mockImplementationOnce(original);
+      }
+      verify.mockRejectedValueOnce(new Error('receipt verification failed'));
+      await expect(
+        installVoiceAssets(paths, {}, { fetch: fetchRecipe(), runCommand: compiler(commands) }),
+      ).rejects.toMatchObject({
+        code: 'voice_install_failed',
+        details: { published, stage: published ? 'Verifying published voice assets' : 'Verifying staged voice assets' },
+      });
+      expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual(
+        published ? [path.basename(voiceInstallationDirectory(paths, 'base'))] : [],
+      );
+    },
+  );
   it('rejects unsupported hosts before creating optional state', async () => {
     const fetch = fetchRecipe();
     await expect(installVoiceAssets(paths, {}, { platform: 'win32', fetch })).rejects.toMatchObject({
@@ -206,5 +331,144 @@ describe('explicit pinned voice recipe', () => {
     });
     expect(fetch).not.toHaveBeenCalled();
     await expect(readdir(paths.stateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+  it.each([false, true])(
+    'retains the primary outcome and owned scratch location if cleanup fails (published=%s)',
+    async (published) => {
+      vi.mocked(rm).mockRejectedValueOnce(Object.assign(new Error('cleanup denied'), { code: 'EACCES' }));
+      await expect(
+        installVoiceAssets(
+          paths,
+          {},
+          {
+            fetch: fetchRecipe(),
+            runCommand: published
+              ? compiler([])
+              : async () => {
+                  throw new GwsEaError('command_failed', 'primary failure');
+                },
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: published ? 'voice_cleanup_failed' : 'voice_build_prerequisite',
+        details: { published, scratchDirectory: expect.stringContaining('/.build-') },
+      });
+      const directories = await readdir(path.join(paths.stateRoot, 'voice'));
+      expect(directories.filter((name) => name.startsWith('.build-'))).toHaveLength(1);
+      expect(directories.includes(path.basename(voiceInstallationDirectory(paths, 'base')))).toBe(published);
+    },
+  );
+  it.each([
+    ['FFmpeg', true],
+    ['whisper.cpp', true],
+    ['whisper.cpp', false],
+  ] as const)(
+    'retains safe %s configure diagnostics when present=%s before removing scratch',
+    async (engine, available) => {
+      const secret = 'fixture-configure-secret-92734';
+      registerSecret(secret);
+      const run = await startRunLog({ paths, command: 'capabilities install' });
+      let log = '';
+      const base = compiler([]);
+      await expect(
+        run.step('install voice', async (step) => {
+          log = step.rawLog;
+          return installVoiceAssets(
+            paths,
+            {},
+            {
+              fetch: fetchRecipe(),
+              runCommand: async (command) => {
+                if (engine === 'FFmpeg' ? command.command.endsWith('/configure') : command.args[0] === '-S') {
+                  const diagnostic =
+                    engine === 'FFmpeg'
+                      ? path.join(command.cwd, 'ffbuild/config.log')
+                      : path.join(command.args[3], 'CMakeFiles/CMakeConfigureLog.yaml');
+                  if (available) {
+                    await mkdir(path.dirname(diagnostic), { recursive: true });
+                    await writeFile(diagnostic, `compiler probe failed; ${secret}`);
+                  }
+                  throw new GwsEaError('command_failed', 'C compiler test failed', {
+                    details: { stderrTail: 'compiler probe failed' },
+                  });
+                }
+                return base(command);
+              },
+            },
+          );
+        }),
+      ).rejects.toMatchObject({
+        code: 'voice_build_failed',
+        message: expect.stringContaining('C compiler test failed'),
+        details: { stage: `Configuring ${engine}` },
+      });
+      const retained = await readFile(log, 'utf8');
+      expect(retained).toContain(available ? 'compiler probe failed' : 'Build diagnostic unavailable (ENOENT)');
+      expect(retained).not.toContain(secret);
+      expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+    },
+  );
+
+  it('drops the partial first diagnostic line before redaction at the byte limit', async () => {
+    const secret = 'boundary-secret-92734';
+    registerSecret(secret);
+    const run = await startRunLog({ paths, command: 'capabilities install' });
+    let log = '';
+    const base = compiler([]);
+    await expect(
+      run.step('build', async (step) => {
+        log = step.rawLog;
+        return installVoiceAssets(
+          paths,
+          {},
+          {
+            fetch: fetchRecipe(),
+            runCommand: async (command) => {
+              if (command.command.endsWith('/configure')) {
+                await mkdir(path.join(command.cwd, 'ffbuild'));
+                await writeFile(
+                  path.join(command.cwd, 'ffbuild/config.log'),
+                  `${secret}${'x'.repeat(16350)}\nuseful complete line\n`,
+                );
+                throw new GwsEaError('command_failed', 'configure failed');
+              }
+              return base(command);
+            },
+          },
+        );
+      }),
+    ).rejects.toMatchObject({ code: 'voice_build_failed' });
+    const retained = await readFile(log, 'utf8');
+    expect(retained).not.toContain('92734');
+    expect(retained).toContain('useful complete line');
+  });
+
+  it('cleans scratch and preserves the build failure when the diagnostic sink fails', async () => {
+    const run = await startRunLog({ paths, command: 'capabilities install' });
+    const base = compiler([]);
+    await expect(
+      run.step('build', async (step) =>
+        installVoiceAssets(
+          paths,
+          {},
+          {
+            fetch: fetchRecipe(),
+            runCommand: async (command) => {
+              if (command.command.endsWith('/configure')) {
+                vi.spyOn(step, 'write').mockImplementation(() => {
+                  throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+                });
+                throw new GwsEaError('command_failed', 'original configure failure');
+              }
+              return base(command);
+            },
+          },
+        ),
+      ),
+    ).rejects.toMatchObject({
+      code: 'voice_build_failed',
+      message: expect.stringContaining('original configure failure'),
+    });
+    expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
   });
 });

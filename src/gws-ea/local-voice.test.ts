@@ -9,6 +9,7 @@ import { capabilityLines, inspectVoiceCapability } from './capabilities.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { deriveGcpClaims } from './gcp-identity.js';
+import type { NanoclawServiceHelpers } from './service-control.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { reserveInstance } from './journal.js';
@@ -287,6 +288,32 @@ describe('shared voice operator lifecycle', () => {
     }
     expect((await readLocalVoicePolicy(paths)).enabled).toBe(false);
   });
+  it('reports registry contention as busy with an exact enable retry and no policy change', async () => {
+    const installation = await assets();
+    await policy(installation);
+    const release = await processLock(paths.registryLock);
+    const output: string[] = [];
+    try {
+      const exit = await runCli(['capabilities', 'enable', 'voice', '--json'], {
+        paths,
+        stdout: (line) => output.push(line),
+        stderr: () => undefined,
+      });
+      expect(exit).toBe(75);
+      expect(JSON.parse(output.join('\n'))).toMatchObject({
+        outcome: 'busy',
+        changed: false,
+        error: { code: 'registry_busy' },
+        next_actions: [
+          { kind: 'external', instruction: expect.any(String) },
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+        ],
+      });
+      expect((await readLocalVoicePolicy(paths)).enabled).toBe(false);
+    } finally {
+      release?.();
+    }
+  }, 10_000);
   it('requires explicit disablement and preserves assets while old preparation is queued', async () => {
     await assistant(32400);
     const installation = await assets();
@@ -357,6 +384,69 @@ describe('shared voice operator lifecycle', () => {
       code: 'voice_assets_unowned',
     });
   });
+  it('preserves an external selection ownership error instead of recommending an impossible removal', async () => {
+    const installation = await assets();
+    const external = { ...installation, installationDir: root };
+    installed.set(root, external);
+    await policy(external);
+    await expect(enableLocalVoice(paths)).rejects.toMatchObject({ code: 'voice_assets_unowned' });
+    expect((await readLocalVoicePolicy(paths)).enabled).toBe(false);
+  });
+  it('retains the selected small model in corrupt-asset recovery', async () => {
+    const installation = await assets('small');
+    await policy(installation);
+    installed.delete(installation.installationDir);
+    await expect(enableLocalVoice(paths)).rejects.toMatchObject({
+      code: 'voice_assets_invalid',
+      details: { model: 'small' },
+    });
+  });
+  it.each(['quiet', 'holding', 'live'] as const)(
+    'can recover unknown release removal only when managed, stopped, and %s',
+    async (state) => {
+      const runtime = await assistant(32700);
+      await writeFile(path.join(runtime.checkout_root, 'src/gws-ea/voice-compatibility.json'), '{bad json');
+      const installation = await assets();
+      await policy(installation);
+      const helpers: NanoclawServiceHelpers = {
+        createCommandRunner: () => ({ run: () => '', tryRun: () => ({ ok: true, stdout: '' }) }),
+        detectService: () => ({ mode: 'launchd', active: state === 'live' }),
+        stopService: async () => undefined,
+        startService: () => undefined,
+        drainContainers: async () => undefined,
+        verifyServiceHealth: async () => true,
+      };
+      const operation = uninstallLocalVoice(paths, {
+        serviceHelpers: helpers,
+        quiescence: {
+          platform: 'darwin',
+          runCommand: async (command) => {
+            if (command.command === 'ps')
+              return {
+                stdout: state === 'holding' ? `44 node ${runtime.instance_root}/src/index.ts\n` : '',
+                stderr: '',
+              };
+            return { stdout: '', stderr: '' };
+          },
+        },
+        fileHolders: async () => [],
+        ncl: async () => {
+          throw new Error('Unknown release must not be queried');
+        },
+      });
+      if (state === 'quiet') {
+        await operation;
+        expect((await readLocalVoicePolicy(paths)).installationDir).toBeNull();
+        await expect(lstat(installation.installationDir)).rejects.toMatchObject({ code: 'ENOENT' });
+      } else {
+        await expect(operation).rejects.toMatchObject({
+          code: 'voice_drain_unproven',
+          details: { instanceId: runtime.instance_id },
+        });
+        expect((await readLocalVoicePolicy(paths)).installationDir).toBe(installation.installationDir);
+      }
+    },
+  );
   it('clears a missing recipe-owned selection so explicit repair can reinstall it', async () => {
     const installation = await assets();
     await policy(installation);
@@ -488,6 +578,7 @@ describe('native public capability journeys', () => {
       result: {
         command: 'capabilities list',
         changed: false,
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice'] }],
         data: {
           capabilities: [
             {
@@ -504,6 +595,73 @@ describe('native public capability journeys', () => {
     await expect(readFile(voicePolicyFile(paths))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(hostProbe).not.toHaveBeenCalled();
     expect(installer.build).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('repairs a missing selected small model when enabled=%s', async (enabled) => {
+    const installation = await assets('small');
+    await policy(installation, enabled);
+    await rm(installation.installationDir, { recursive: true });
+    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+      exit: 0,
+      result: {
+        data: { assets: { status: 'absent', selected_model: 'small', provenance: null } },
+        next_actions: [
+          ...(enabled ? [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] }] : []),
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+        ],
+      },
+    });
+    if (enabled) {
+      const human: string[] = [];
+      expect(
+        await runCli(['capabilities', 'show', 'voice'], {
+          paths,
+          stdout: (line) => human.push(line),
+          stderr: (line) => human.push(line),
+          environment: {},
+        }),
+      ).toBe(0);
+      expect(human.join('\n')).toContain('gws-ea capabilities disable voice');
+      expect(human.join('\n')).toContain('gws-ea capabilities install voice --model small');
+      expect((await invoke(['capabilities', 'disable', 'voice'])).exit).toBe(0);
+    }
+    installer.build.mockResolvedValue(installation);
+    expect((await invoke(['capabilities', 'install', 'voice', '--model', 'small'])).exit).toBe(0);
+    expect(installer.build).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ model: 'small' }),
+      expect.anything(),
+    );
+  });
+  it('offers complete human and JSON recovery for a corrupt selected small model', async () => {
+    const installation = await assets('small');
+    await policy(installation);
+    installed.delete(installation.installationDir);
+    const answer = await invoke(['capabilities', 'enable', 'voice']);
+    expect(answer).toMatchObject({
+      exit: 1,
+      result: {
+        error: { code: 'voice_assets_invalid' },
+        next_actions: [
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'uninstall', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+        ],
+      },
+    });
+    const human: string[] = [];
+    expect(
+      await runCli(['capabilities', 'enable', 'voice'], {
+        paths,
+        upsertEnvVars,
+        stdout: (line) => human.push(line),
+        stderr: (line) => human.push(line),
+        environment: {},
+      }),
+    ).toBe(1);
+    const text = human.join('\n');
+    expect(text).toContain('gws-ea capabilities disable voice');
+    expect(text).toContain('gws-ea capabilities uninstall voice');
+    expect(text).toContain('gws-ea capabilities install voice --model small');
   });
   it('installs inactive, enables two compatible assistants once, and retains unknown compatibility', async () => {
     const first = await assistant(34000);
@@ -524,6 +682,11 @@ describe('native public capability journeys', () => {
           activation: { status: 'disabled' },
           assets: { status: 'verified', selected_model: 'base', provenance: { model: 'base' } },
         },
+        next_actions: [
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+          { kind: 'external', instruction: expect.stringContaining(unknown.instance_id) },
+          { kind: 'command', argv: ['gws-ea', 'status', '--id', unknown.instance_id] },
+        ],
       },
     });
     const enabled = await invoke(['capabilities', 'enable', 'voice']);

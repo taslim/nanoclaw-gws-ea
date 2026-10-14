@@ -389,12 +389,15 @@ function execute(
     let stdoutBytes = 0;
     const retainedStderr = createRetainedStderr();
     let startError: Error | undefined;
-    let termination: 'timeout' | 'output_limit' | undefined;
+    let termination: 'timeout' | 'output_limit' | 'log_failure' | undefined;
+    let logFailure: unknown;
+    let closed = false;
     let pipeRelease: NodeJS.Timeout | undefined;
 
-    const terminate = (reason: 'timeout' | 'output_limit'): void => {
+    const terminate = (reason: NonNullable<typeof termination>): void => {
       if (termination !== undefined) return;
       termination = reason;
+      if (closed) return;
       if (pid !== undefined) signalGroup(pid, 'SIGKILL');
       // A process that escaped the group can hold the pipes open; stop waiting for it.
       pipeRelease = setTimeout(() => {
@@ -403,11 +406,22 @@ function execute(
       }, PIPE_RELEASE_GRACE_MS);
     };
 
+    const writeStream = (text: string): void => {
+      if (logFailure !== undefined) return;
+      try {
+        step?.write(text);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Event callbacks must reject the awaited command, never throw out of the event loop.
+      } catch (error) {
+        logFailure = error;
+        terminate('log_failure');
+      }
+    };
+
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       if (tees) {
-        step?.write(tees.stdout.push(chunk));
+        writeStream(tees.stdout.push(chunk));
         return;
       }
       stdoutBytes += Buffer.byteLength(chunk);
@@ -416,7 +430,7 @@ function execute(
     });
     child.stderr.on('data', (chunk: string) => {
       retainedStderr.append(chunk);
-      if (tees) step?.write(tees.stderr.push(chunk));
+      if (tees) writeStream(tees.stderr.push(chunk));
     });
     child.once('error', (error) => {
       startError = error;
@@ -431,10 +445,11 @@ function execute(
     const timer = setTimeout(() => terminate('timeout'), timeoutMs);
 
     child.once('close', (code, signal) => {
+      closed = true;
       clearTimeout(timer);
       clearTimeout(pipeRelease);
       if (pid !== undefined) releaseGroup(pid);
-      if (tees) step?.write(`${tees.stdout.end()}${tees.stderr.end()}`);
+      if (tees) writeStream(`${tees.stdout.end()}${tees.stderr.end()}`);
       const facts: FailureFacts = { exitCode: code, signal, stderr: retainedStderr.text() };
       if (startError !== undefined) {
         const errno = errorCode(startError, 'unknown');
@@ -445,6 +460,17 @@ function execute(
             command,
             { ...facts, errno },
             startError,
+          ),
+        );
+      } else if (termination === 'log_failure') {
+        const errno = errorCode(logFailure, 'unknown');
+        reject(
+          commandFailure(
+            'command_failed',
+            `Command log could not be written (${errno})`,
+            command,
+            { ...facts, errno },
+            logFailure,
           ),
         );
       } else if (termination === 'timeout') {
@@ -510,9 +536,14 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
     return outcome;
   } catch (error) {
     const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
-    step?.write(
-      `  failed: ${error instanceof Error ? error.message : String(error)}\n${typeof tail === 'string' && tail ? `  stderr (tail):\n${indent(tail)}\n` : ''}`,
-    );
+    try {
+      step?.write(
+        `  failed: ${error instanceof Error ? error.message : String(error)}\n${typeof tail === 'string' && tail ? `  stderr (tail):\n${indent(tail)}\n` : ''}`,
+      );
+      // eslint-disable-next-line no-catch-all/no-catch-all -- Failure logging must preserve the original process error.
+    } catch {
+      /* The caller still receives the original command failure. */
+    }
     throw error;
   }
 };
