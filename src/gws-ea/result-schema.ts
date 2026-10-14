@@ -1,5 +1,7 @@
 /** Published schemas for the managed wire contract and native result facts. */
 import type { ResultSchema } from './command-definitions.js';
+import { VOICE_CAPABILITY } from './capabilities.js';
+import { OPERATION_PHASES } from './operation.js';
 
 const text = { type: 'string' } as const;
 const bool = { type: 'boolean' } as const;
@@ -9,6 +11,7 @@ const nil = { type: 'null' } as const;
 const nullable = (schema: ResultSchema): ResultSchema => ({ anyOf: [schema, nil] });
 const array = (items: ResultSchema): ResultSchema => ({ type: 'array', items });
 const choices = (...values: readonly string[]): ResultSchema => ({ type: 'string', enum: values });
+const voiceModel = choices(...VOICE_CAPABILITY.models);
 const object = (
   properties: Readonly<Record<string, ResultSchema>>,
   required = Object.keys(properties),
@@ -43,7 +46,7 @@ const followUp = {
 };
 const operationFacts = {
   kind: choices('update', 'rollback'),
-  phase: choices('staged', 'fenced', 'snapshotted', 'switched', 'started', 'verified', 'committed'),
+  phase: choices(...OPERATION_PHASES),
   from: release,
   to: release,
   started_at: time,
@@ -146,7 +149,7 @@ const voiceReceipt = object({
   recipe: text,
   platform: choices('darwin', 'linux'),
   architecture: choices('arm64', 'x64'),
-  model: choices('base', 'small', 'large-v3-turbo-q5_0'),
+  model: voiceModel,
   builtAt: time,
   artifacts: object({
     ffmpeg: artifactReceipt,
@@ -158,7 +161,7 @@ const voiceReceipt = object({
 const source = { url: text, sha256: text };
 export const VOICE_CAPABILITY_SCHEMA = object({
   name: { const: 'voice' },
-  actions: array(choices('show', 'check', 'install', 'enable', 'disable', 'uninstall')),
+  actions: array(choices(...VOICE_CAPABILITY.actions)),
   scope: { const: 'host' },
   summary: text,
   availability: object({ status: choices('supported', 'unsupported'), platform: text, architecture: text }),
@@ -167,10 +170,10 @@ export const VOICE_CAPABILITY_SCHEMA = object({
     status: choices('verified', 'absent', 'invalid', 'unknown'),
     reason: nullable(text),
     selected_directory: nullable(text),
-    selected_model: nullable(choices('base', 'small', 'large-v3-turbo-q5_0')),
+    selected_model: nullable(voiceModel),
     installations: array(
       object({
-        model: choices('base', 'small', 'large-v3-turbo-q5_0'),
+        model: voiceModel,
         directory: text,
         status: choices('verified', 'absent', 'invalid', 'unknown'),
         reason: nullable(text),
@@ -179,8 +182,8 @@ export const VOICE_CAPABILITY_SCHEMA = object({
     ),
     provenance: nullable(voiceReceipt),
   }),
-  default_model: choices('base', 'small', 'large-v3-turbo-q5_0'),
-  models: array(choices('base', 'small', 'large-v3-turbo-q5_0')),
+  default_model: voiceModel,
+  models: array(voiceModel),
   prerequisites: array(text),
   readiness_limits: array(text),
   recipe: text,

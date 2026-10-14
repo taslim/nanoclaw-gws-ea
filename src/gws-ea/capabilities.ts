@@ -197,6 +197,35 @@ async function inspectAssistant(
   }
 }
 
+type VoiceConsumers = Pick<
+  VoiceCapabilityObservation,
+  'assistants' | 'compatible_assistant_ids' | 'unsupported_assistant_ids' | 'unknown_assistant_ids'
+>;
+
+export async function inspectVoiceConsumers(
+  paths: ControlPlanePaths,
+  options: Pick<VoiceCapabilityInspection, 'checkConsumers' | 'ncl'> = {},
+): Promise<VoiceConsumers> {
+  const instanceIds = Object.keys((await readRegistry(paths)).instances).sort();
+  const assistants: VoiceCapabilityAssistant[] = [];
+  // Bound simultaneous native host queries while preserving the registry's sorted output.
+  const batchSize = 4;
+  for (let offset = 0; offset < instanceIds.length; offset += batchSize) {
+    const batch = instanceIds.slice(offset, offset + batchSize);
+    assistants.push(...(await Promise.all(batch.map((id) => inspectAssistant(paths, id, options)))));
+  }
+  const ids = (compatibility: VoiceReleaseCompatibility): string[] =>
+    assistants
+      .filter((assistant) => assistant.compatibility === compatibility)
+      .map((assistant) => assistant.instance_id);
+  return {
+    assistants,
+    compatible_assistant_ids: ids('compatible'),
+    unsupported_assistant_ids: ids('unsupported'),
+    unknown_assistant_ids: ids('unknown'),
+  };
+}
+
 /** Local independent facts, plus bounded native health only for an explicit check. No runtime mutation. */
 export async function inspectVoiceCapability(
   paths: ControlPlanePaths,
@@ -246,22 +275,13 @@ export async function inspectVoiceCapability(
     installations: installations.filter((installation) => installation.status !== 'absent'),
     provenance: selected?.receipt ?? null,
   };
-  const assistants: VoiceCapabilityAssistant[] = [];
-  for (const id of Object.keys((await readRegistry(paths)).instances).sort())
-    assistants.push(await inspectAssistant(paths, id, options));
-  const ids = (compatibility: VoiceReleaseCompatibility) =>
-    assistants
-      .filter((assistant) => assistant.compatibility === compatibility)
-      .map((assistant) => assistant.instance_id);
+  const consumers = await inspectVoiceConsumers(paths, options);
   return {
     ...VOICE_CAPABILITY,
     availability,
     activation,
     assets,
-    assistants,
-    compatible_assistant_ids: ids('compatible'),
-    unsupported_assistant_ids: ids('unsupported'),
-    unknown_assistant_ids: ids('unknown'),
+    ...consumers,
     future_compatible_assistants: true,
   };
 }

@@ -91,6 +91,12 @@ export type UpdateTargetResult =
   | { readonly instance_id: string; readonly outcome: 'skipped'; readonly reason: string }
   | { readonly instance_id: string; readonly outcome: 'failed' | 'busy' | 'unattempted' };
 
+export function initialUpdateTarget(candidate: UpdateCandidate): UpdateTargetResult {
+  return candidate.eligible
+    ? { instance_id: candidate.instanceId, outcome: 'unattempted' }
+    : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason };
+}
+
 /** The run's stop summary; its outcome is the exit code's. */
 export interface UpdateAllSummary {
   readonly outcome: 'ready' | 'failed' | 'busy';
@@ -366,12 +372,7 @@ export async function runUpdateAll(
   const skipped = skippedLines(plan.candidates);
   const release = shortCommit(plan.toolCommit);
   const targets = new Map<string, UpdateTargetResult>(
-    plan.candidates.map((candidate) => [
-      candidate.instanceId,
-      candidate.eligible
-        ? { instance_id: candidate.instanceId, outcome: 'unattempted' }
-        : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason },
-    ]),
+    plan.candidates.map((candidate) => [candidate.instanceId, initialUpdateTarget(candidate)]),
   );
   const results = (): UpdateTargetResult[] => plan.candidates.map((candidate) => targets.get(candidate.instanceId)!);
   if (eligible.length === 0) {

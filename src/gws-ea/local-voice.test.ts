@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli } from './cli.js';
+import { inspectVoiceCapability } from './capabilities.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -397,6 +398,33 @@ describe('voice readiness observation', () => {
 });
 
 describe('native public capability journeys', () => {
+  it('observes independent consumers while an earlier probe waits and retains sorted results', async () => {
+    const first = await assistant(34600);
+    const second = await assistant(34700);
+    const ids = [first.instance_id, second.instance_id].sort();
+    let releaseFirst = (): void => undefined;
+    const firstWaiting = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let probesStarted = 0;
+    const observed = await inspectVoiceCapability(paths, {
+      checkConsumers: true,
+      ncl: async (runtime) => {
+        probesStarted += 1;
+        if (probesStarted === 1) await firstWaiting;
+        else releaseFirst();
+        return health({ queued: runtime.instance_id === first.instance_id ? 2 : 3 });
+      },
+    });
+    expect(observed.assistants.map((consumer) => consumer.instance_id)).toEqual(ids);
+    expect(observed.assistants).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ instance_id: first.instance_id, consumer: expect.objectContaining({ queued: 2 }) }),
+        expect.objectContaining({ instance_id: second.instance_id, consumer: expect.objectContaining({ queued: 3 }) }),
+      ]),
+    );
+  });
+
   async function invoke(args: readonly string[]) {
     const stdout: string[] = [];
     const stderr: string[] = [];

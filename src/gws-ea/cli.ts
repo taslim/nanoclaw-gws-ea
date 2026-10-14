@@ -1,4 +1,9 @@
-import { capabilityLines, inspectVoiceCapability, voiceCapabilityRecovery } from './capabilities.js';
+import {
+  capabilityLines,
+  inspectVoiceCapability,
+  inspectVoiceConsumers,
+  voiceCapabilityRecovery,
+} from './capabilities.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -134,6 +139,7 @@ import {
   type UpdateSeams,
 } from './update.js';
 import {
+  initialUpdateTarget,
   planUpdateAll,
   runUpdateAll,
   type AssistantUpdate,
@@ -1210,12 +1216,7 @@ class Cli {
       );
       this.#rolloutPlan = plan;
       for (const candidate of plan.candidates)
-        this.#rolloutTargets.set(
-          candidate.instanceId,
-          candidate.eligible
-            ? { instance_id: candidate.instanceId, outcome: 'unattempted' }
-            : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason },
-        );
+        this.#rolloutTargets.set(candidate.instanceId, initialUpdateTarget(candidate));
       const summary = await runUpdateAll(
         plan,
         confirm,
@@ -1244,11 +1245,7 @@ class Cli {
           ? {
               plan,
               ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}),
-              targets: plan.candidates.map((candidate) =>
-                candidate.eligible
-                  ? { instance_id: candidate.instanceId, outcome: 'unattempted' as const }
-                  : { instance_id: candidate.instanceId, outcome: 'skipped' as const, reason: candidate.reason },
-              ),
+              targets: plan.candidates.map(initialUpdateTarget),
             }
           : null,
         error,
@@ -2181,7 +2178,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           }
           case 'enable': {
             await enableLocalVoice(paths, dependencies);
-            const capability = await inspectVoiceCapability(paths);
+            const capability = await inspectVoiceConsumers(paths);
             data = {
               name: 'voice',
               scope: 'host',
