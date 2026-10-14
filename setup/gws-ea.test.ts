@@ -142,6 +142,54 @@ function report(overrides: Partial<FailureReport> = {}): FailureReport {
 
 describe('launcher interaction modes', () => {
   afterEach(() => vi.clearAllMocks());
+  it.each([
+    { label: 'all streams attached', stdin: true, stdout: true, stderr: true, override: undefined, expected: true },
+    { label: 'stdout redirected', stdin: true, stdout: false, stderr: true, override: undefined, expected: true },
+    { label: 'stdin redirected', stdin: false, stdout: true, stderr: true, override: undefined, expected: false },
+    { label: 'stderr redirected', stdin: true, stdout: true, stderr: false, override: undefined, expected: false },
+    {
+      label: 'interactive explicitly disabled',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: false,
+      expected: false,
+    },
+    {
+      label: 'interactive explicitly enabled',
+      stdin: false,
+      stdout: false,
+      stderr: false,
+      override: true,
+      expected: true,
+    },
+  ])('uses the input and prompt streams with $label', async ({ stdin, stdout, stderr, override, expected }) => {
+    const streams = [process.stdin, process.stdout, process.stderr];
+    const descriptors = streams.map((stream) => Object.getOwnPropertyDescriptor(stream, 'isTTY'));
+    const ttyValues = [stdin, stdout, stderr];
+    try {
+      for (const [index, stream] of streams.entries()) {
+        Object.defineProperty(stream, 'isTTY', { configurable: true, value: ttyValues[index] });
+      }
+      await main(['create', '--track', 'dogfood'], { interactive: override });
+      const runtime = runtimeOf();
+      expect(Boolean(runtime.prompts)).toBe(expected);
+      expect(Boolean(runtime.presenter)).toBe(expected);
+      expect(Boolean(runtime.onFailure)).toBe(expected);
+      await runtime.collectCreateInputs!({ marker: 'context' } as never);
+      expect(fixture.collect).toHaveBeenCalledWith(
+        { marker: 'context' },
+        { providers: fixture.providers, interactive: expected },
+      );
+    } finally {
+      for (const [index, stream] of streams.entries()) {
+        const descriptor = descriptors[index];
+        if (descriptor) Object.defineProperty(stream, 'isTTY', descriptor);
+        else Reflect.deleteProperty(stream, 'isTTY');
+      }
+    }
+  });
+
   it.each([['--json'], ['--no-input']] as const)(
     'suppresses actual launcher hooks for %s despite an interactive override',
     async (mode) => {

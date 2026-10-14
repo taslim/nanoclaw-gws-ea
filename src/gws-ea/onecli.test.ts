@@ -831,13 +831,16 @@ describe('OneCLI runtime start and repair', () => {
     const layout = await layoutFixture();
     const { world, runner } = dockerWorld(layout);
     world.wrapperImageMissing = true;
+    const recordEffect = vi.fn<(changed: true | null) => void>();
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
       fetch: healthyFetch(),
+      recordEffect,
     });
 
     expect(world.builtImage).toBe(true);
+    expect(recordEffect.mock.calls).toEqual([[null], [true]]);
     const build = world.calls.find((call) => call.args[0] === 'build')!;
     expect(build.args).toContain(GATEWAY_IMAGE);
     expect(build.args.join(' ')).toContain(`ONECLI_BASE=ghcr.io/onecli/onecli:${PINS.gateway}`);
@@ -856,10 +859,12 @@ describe('OneCLI runtime start and repair', () => {
     const { world, runner } = dockerWorld(layout);
     world.wrapperImageMissing = true;
     world.failBuild = new GwsEaError('command_failed', 'docker build failed');
+    const recordEffect = vi.fn<(changed: true | null) => void>();
 
     await expect(
-      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch(), recordEffect }),
     ).rejects.toMatchObject({ code: 'command_failed' });
+    expect(recordEffect.mock.calls).toEqual([[null]]);
     // A failed build must abort before compose brings anything up.
     expect(world.calls.some((call) => call.args.includes('up'))).toBe(false);
   });
@@ -1020,30 +1025,69 @@ describe("an update's gateway image", () => {
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
   });
 
-  it('puts a kept Compose file back and brings the whole project up from it, converging when rerun', async () => {
+  it.each([
+    { state: 'present earlier release', image: RELEASE_GATEWAY_IMAGE, missing: false },
+    { state: 'missing current release', image: GATEWAY_IMAGE, missing: true },
+  ])('restores a $state gateway and converges when rerun', async ({ image, missing }) => {
     const layout = await layoutFixture();
     const running = await writeInstanceCompose(layout, GATEWAY_IMAGE);
-    const kept = renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE);
+    const kept = renderOnecliCompose(layout, PINS, image);
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.wrapperImageMissing = missing;
+    const recordEffect = vi.fn<(changed: true | null) => void>();
 
     await restoreReleaseGateway(
       layout,
       PINS,
       { compose: kept, left: running },
-      { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT },
+      { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT, recordEffect },
     );
 
     expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
     expect((await stat(layout.composeFile)).mode & 0o777).toBe(0o600);
-    // The kept image is present: nothing is built or pulled, and Compose brings every service to the file.
-    expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
+    expect(world.calls.some((call) => call.args[0] === 'build')).toBe(missing);
+    expect(recordEffect.mock.calls).toEqual(missing ? [[null], [true]] : []);
+    // Compose brings every service to the file without pulling images.
     expect(composeCalls(world)).toEqual([
       ['up', '--detach', '--wait', '--wait-timeout', String(ONECLI_WAIT_TIMEOUT_SECONDS), '--pull', 'never'],
     ]);
     expect(world.calls.every((call) => call.env?.DOCKER_HOST === DOCKER_ENDPOINT)).toBe(true);
 
-    await restoreReleaseGateway(layout, PINS, { compose: kept, left: running }, { dockerCommandRunner: runner });
+    world.wrapperImageMissing = false;
+    recordEffect.mockClear();
+    await restoreReleaseGateway(
+      layout,
+      PINS,
+      { compose: kept, left: running },
+      { dockerCommandRunner: runner, recordEffect },
+    );
     expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
+    expect(recordEffect).not.toHaveBeenCalled();
+  });
+
+  it('records an uncertain build effect and leaves the runtime unchanged when restoring its missing gateway fails', async () => {
+    const layout = await layoutFixture();
+    const running = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const kept = renderOnecliCompose(layout, PINS, GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, running);
+    world.wrapperImageMissing = true;
+    world.failBuild = new GwsEaError('command_failed', 'docker build failed');
+    const before = containerIds(world);
+    const recordEffect = vi.fn<(changed: true | null) => void>();
+
+    await expect(
+      restoreReleaseGateway(
+        layout,
+        PINS,
+        { compose: kept, left: running },
+        { dockerCommandRunner: runner, recordEffect },
+      ),
+    ).rejects.toBe(world.failBuild);
+
+    expect(recordEffect.mock.calls).toEqual([[null]]);
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(running);
+    expect(containerIds(world)).toEqual(before);
+    expect(composeCalls(world)).toEqual([]);
   });
 
   it('recreates the app a release renders differently, keeping its volumes, so the runtime verifies on its file', async () => {

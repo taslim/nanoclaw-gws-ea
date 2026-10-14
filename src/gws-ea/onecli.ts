@@ -341,7 +341,7 @@ export async function restoreReleaseGateway(
   if (wrapperImageHash(gateway) === undefined) {
     throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${gateway} is not a gws-ea wrapper image`);
   }
-  await ensureWrapperGatewayImage(docker, pins, gateway);
+  await ensureWrapperGatewayImage(docker, pins, gateway, dependencies.recordEffect);
   if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
     await writePrivateTextFile(layout.composeFile, compose);
   const before = new Set(await projectContainerIds(docker));
@@ -627,7 +627,7 @@ export async function reconcileOnecliRuntime(
     timeoutMs: ONECLI_PULL_TIMEOUT_MS,
     stream: true,
   });
-  await ensureWrapperGatewayImage(docker, pins, gatewayImage);
+  await ensureWrapperGatewayImage(docker, pins, gatewayImage, dependencies.recordEffect);
   const up = (args: readonly string[]): Promise<unknown> =>
     runner({
       ...buildComposeInvocation(layout, [

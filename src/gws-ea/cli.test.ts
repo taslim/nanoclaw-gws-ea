@@ -55,6 +55,70 @@ const roots: string[] = [];
 const servers: Server[] = [];
 
 describe('managed machine results', () => {
+  it('reports interruption while planning a bulk update before any assistant turn', async () => {
+    const paths = await testPaths();
+    const result = await runCliInChild(
+      paths,
+      ['update', '--all', '--yes', '--json'],
+      `serviceHelpers: {},
+       upsertEnvVars: async () => undefined,
+       hostStatus: {},
+       toolProviderSetup: async () => ({}),
+       update: { runCommand: async () => {
+         process.kill(process.pid, 'SIGINT');
+         await new Promise((resolve) => setTimeout(resolve, 60000));
+       } },`,
+    );
+    expect(result.exitCode).toBe(130);
+    expectResultContract('update', JSON.parse(result.stdout));
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      command: 'update',
+      outcome: 'failed',
+      changed: false,
+      data: null,
+      error: { code: 'interrupted', message: 'Interrupted by SIGINT.' },
+    });
+    await expect(stat(paths.logsRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('retains observed stray-cleanup effects when a bulk update is interrupted before planning', async () => {
+    const paths = await testPaths();
+    const tool = await toolCheckoutWorld();
+    await tool.write('data/v2.db', 'stray state');
+    await tool.write('nanoclaw.pid', '12345');
+    const result = await runCliInChild(
+      paths,
+      ['update', '--all', '--yes', '--json'],
+      `serviceHelpers: {},
+       upsertEnvVars: async () => undefined,
+       toolProviderSetup: async () => ({}),
+       hostStatus: { queryHost: async () => {
+         throw Object.assign(new Error('no host'), { code: 'ECONNREFUSED' });
+       } },
+       toolCheckout: {
+         root: ${JSON.stringify(tool.root)},
+         homeDirectory: ${JSON.stringify(tool.home)},
+         platform: 'macos',
+         backupEnv: () => { throw new Error('no env to back up'); },
+         runCommand: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+         resolveDocker: async () => {
+           process.kill(process.pid, 'SIGINT');
+           await new Promise((resolve) => setTimeout(resolve, 60000));
+         },
+       },`,
+    );
+    expect(result.exitCode).toBe(130);
+    expectResultContract('update', JSON.parse(result.stdout));
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      outcome: 'failed',
+      changed: true,
+      data: { cleanup: { checkout: tool.root, removed: ['nanoclaw.pid'] } },
+      error: { code: 'interrupted', message: 'Interrupted by SIGINT.' },
+    });
+    expect(await present(path.join(tool.root, 'nanoclaw.pid'))).toBe(false);
+    expect(await readFile(path.join(tool.root, 'data', 'v2.db'), 'utf8')).toBe('stray state');
+  });
+
   it('captures one creation pause on stdout with confirmed identity and progress on stderr', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];

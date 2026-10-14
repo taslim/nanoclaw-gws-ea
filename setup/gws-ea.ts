@@ -252,7 +252,7 @@ export async function main(argv: readonly string[], options: { readonly interact
   const interactive =
     invocation.options.json !== 'true' &&
     invocation.options['no-input'] !== 'true' &&
-    (options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY));
+    (options.interactive ?? Boolean(process.stdin.isTTY && process.stderr.isTTY));
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });

@@ -460,6 +460,7 @@ class Cli {
   readonly #interruptedResult: (result: ManagedResult) => void;
   /** Set while a terminal waits on a pause: a signal then stops the wait, not the run. */
   #waiting: AbortController | undefined;
+  #attemptActive = false;
   result: ManagedResult | undefined;
   #rolloutChanged: Changed = false;
   #rolloutLogs: string[] = [];
@@ -1192,6 +1193,26 @@ class Cli {
     this.#rolloutPlan = undefined;
     this.#rolloutTargets.clear();
     this.#rolloutCleanup = undefined;
+    const interrupted = (signal: NodeJS.Signals): void => {
+      if (this.#attemptActive) return;
+      this.result = managedResult('update', {
+        outcome: 'failed',
+        changed: this.#rolloutChanged,
+        data:
+          this.#rolloutPlan || this.#rolloutCleanup
+            ? {
+                ...(this.#rolloutPlan ? { plan: this.#rolloutPlan, targets: [...this.#rolloutTargets.values()] } : {}),
+                ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}),
+              }
+            : null,
+        error: new GwsEaError('interrupted', `Interrupted by ${signal}.`),
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--all', ...(yes ? ['--yes'] : [])] }],
+        diagnostics: this.#rolloutLogs[0] ? { run_log: this.#rolloutLogs[0] } : {},
+      });
+      this.#interruptedResult(this.result);
+      process.exit(128 + os.constants.signals[signal]);
+    };
+    for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupted);
     try {
       const confirm = updateConfirmation(yes, this.#runtime.confirmUpdateAll);
       const launcher = this.#updateLauncher();
@@ -1265,6 +1286,8 @@ class Cli {
         return { status: 'done', exitCode: EXIT_CODES.paused };
       }
       return { status: 'done', exitCode: reportStop(this.#presenter, error) };
+    } finally {
+      for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
@@ -1561,6 +1584,7 @@ class Cli {
       this.#interruptedResult(this.result);
       process.exit(128 + os.constants.signals[signal]);
     };
+    this.#attemptActive = true;
     for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupted);
     /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure into a redacted summary and exit code. */
     try {
@@ -1729,6 +1753,7 @@ class Cli {
       return { status: 'failed', report, retry: this.#retry(plan, state) };
     } finally {
       for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
+      this.#attemptActive = false;
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }

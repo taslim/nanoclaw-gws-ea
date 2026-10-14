@@ -31,6 +31,7 @@ import {
   machine,
   NEW_IMAGE,
   nextRelease,
+  PROVIDER_SETUP,
   release,
   releaseAgentImageKey,
   releaseTag,
@@ -174,6 +175,46 @@ async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, co
 }
 
 describe('gws-ea update --all', GIT_HEAVY, () => {
+  it('keeps the active assistant interruption handler authoritative and removes bulk handlers afterwards', async () => {
+    const host = await machine();
+    const first = await assistant(host, { port: 37_001 });
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first]);
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+    const before = signals.map((signal) => process.listeners(signal));
+    const interrupted = Symbol('process exited');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw interrupted;
+    });
+    let resolving = 0;
+    const { run, out } = fleetCli(machineFleet, {
+      toolProviderSetup: async () => {
+        if (++resolving === 2) process.emit('SIGINT', 'SIGINT');
+        return PROVIDER_SETUP;
+      },
+    });
+    try {
+      await run(['update', '--all', '--yes', '--json']);
+      expect(exit).toHaveBeenCalledExactlyOnceWith(130);
+      expect(out).toHaveLength(1);
+      expectResultContract('update', JSON.parse(out.join('\n')));
+      expect(JSON.parse(out.join('\n'))).toMatchObject({
+        outcome: 'failed',
+        error: { code: 'interrupted' },
+        data: {
+          plan: { toolCommit: next.commit },
+          targets: [{ instance_id: first.instance_id, outcome: 'failed' }],
+        },
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--id', first.instance_id, '--yes'] }],
+        diagnostics: { run_log: expect.any(String) },
+      });
+      expect(signals.map((signal) => process.listeners(signal))).toEqual(before);
+      await expectOnRelease(host, first, host.first);
+    } finally {
+      exit.mockRestore();
+    }
+  });
+
   it('updates only the assistants that can move, in list order, and skips and reports the rest, untouched', async () => {
     const host = await machine();
     // A mirror whose track never receives the next release: the assistant installed from it is not on its track.
