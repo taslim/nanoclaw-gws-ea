@@ -7,6 +7,7 @@ const INTERACTIVE_ENVIRONMENT_KEYS = [
   'LC_ALL',
   'LC_CTYPE',
   'TERM',
+  'NO_COLOR',
   'TMPDIR',
   'DISPLAY',
   'WAYLAND_DISPLAY',
@@ -16,6 +17,8 @@ const INTERACTIVE_ENVIRONMENT_KEYS = [
 ] as const;
 
 export interface InheritScriptOptions {
+  /** Route interactive child output beside the managed result; other setup callers retain inherited stdout. */
+  readonly output?: NodeJS.WriteStream;
   readonly env?: Readonly<Record<string, string>>;
 }
 
@@ -55,7 +58,7 @@ export function runInheritScript(cmd: string, args: string[], options: InheritSc
     // Tells the child it has a UI in front of it, so it can leave the
     // reporting to us instead of printing its own alongside ours.
     const child = spawn(cmd, args, {
-      stdio: 'inherit',
+      stdio: options.output ? ['inherit', options.output, 'inherit'] : 'inherit',
       env: options.env ?? { ...process.env, NANOCLAW_SETUP_WIZARD: '1' },
     });
     let settled = false;

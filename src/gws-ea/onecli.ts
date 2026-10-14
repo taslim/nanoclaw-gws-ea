@@ -95,6 +95,7 @@ export interface ImportedCredential {
 }
 
 export interface OnecliRuntimeDependencies {
+  readonly recordEffect?: (changed: true | null) => void;
   /** Runs Docker and the port-holder lookup. */
   readonly dockerCommandRunner?: OnecliCommandRunner;
   /** Reaches the runtime's health endpoints and its admin API. */
@@ -138,7 +139,7 @@ interface OnecliDocker {
 
 function dockerContext(
   layout: OnecliRuntimeLayout,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'>,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'>,
 ): OnecliDocker {
   return {
     layout,
@@ -235,7 +236,12 @@ async function instanceOnecliImages(layout: OnecliRuntimeLayout, pins: OnecliPin
  * this tool's firewall. The base is already local (pulled for the app
  * service), so only the small firewall layer is built.
  */
-async function ensureWrapperGatewayImage(docker: OnecliDocker, pins: OnecliPins, gatewayImage: string): Promise<void> {
+async function ensureWrapperGatewayImage(
+  docker: OnecliDocker,
+  pins: OnecliPins,
+  gatewayImage: string,
+  recordEffect?: OnecliRuntimeDependencies['recordEffect'],
+): Promise<void> {
   const { runner, environment, layout } = docker;
   // `image ls -q` exits 0 whether or not the tag exists (empty stdout when absent),
   // so a present image is a clean skip without catching a lookup failure.
@@ -254,6 +260,7 @@ async function ensureWrapperGatewayImage(docker: OnecliDocker, pins: OnecliPins,
       `This assistant's OneCLI gateway image ${gatewayImage} is missing, and this tool builds ${wrapper.image}. Resume it with the gws-ea release it runs to rebuild its gateway.`,
     );
   }
+  recordEffect?.(null);
   await runner({
     command: 'docker',
     args: [
@@ -273,6 +280,7 @@ async function ensureWrapperGatewayImage(docker: OnecliDocker, pins: OnecliPins,
     timeoutMs: ONECLI_BUILD_TIMEOUT_MS,
     stream: true,
   });
+  recordEffect?.(true);
 }
 
 /** The gateway image an instance runs, and the one the release an update stages runs. */
@@ -292,11 +300,12 @@ export interface GatewayImageChange {
 export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'> = {},
 ): Promise<GatewayImageChange> {
   const { gateway: current } = await instanceOnecliImages(layout, pins);
   const { image: release } = await resolveWrapperGatewayImage(pins);
-  if (release !== current) await ensureWrapperGatewayImage(dockerContext(layout, dependencies), pins, release);
+  if (release !== current)
+    await ensureWrapperGatewayImage(dockerContext(layout, dependencies), pins, release, dependencies.recordEffect);
   return { current, release };
 }
 
@@ -325,14 +334,14 @@ export async function restoreReleaseGateway(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   { compose, left }: GatewaySwitch,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { gateway } = parseOnecliComposeImages(compose);
   if (wrapperImageHash(gateway) === undefined) {
     throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${gateway} is not a gws-ea wrapper image`);
   }
-  await ensureWrapperGatewayImage(docker, pins, gateway);
+  await ensureWrapperGatewayImage(docker, pins, gateway, dependencies.recordEffect);
   if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
     await writePrivateTextFile(layout.composeFile, compose);
   const before = new Set(await projectContainerIds(docker));
@@ -618,7 +627,7 @@ export async function reconcileOnecliRuntime(
     timeoutMs: ONECLI_PULL_TIMEOUT_MS,
     stream: true,
   });
-  await ensureWrapperGatewayImage(docker, pins, gatewayImage);
+  await ensureWrapperGatewayImage(docker, pins, gatewayImage, dependencies.recordEffect);
   const up = (args: readonly string[]): Promise<unknown> =>
     runner({
       ...buildComposeInvocation(layout, [
@@ -686,7 +695,7 @@ async function foreignPortError(
  */
 export async function removeOnecliRuntime(
   layout: OnecliRuntimeLayout,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { runner, environment } = docker;

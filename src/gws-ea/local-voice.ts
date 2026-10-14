@@ -156,6 +156,7 @@ async function underVoiceLock<T>(paths: ControlPlanePaths, work: () => Promise<T
 }
 
 export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
+  readonly recordEffect?: (changed: true | null) => void;
   readonly upsertEnvVars?: UpsertEnvVars;
   readonly serviceHelpers?: NanoclawServiceHelpers;
   readonly ncl?: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
@@ -165,11 +166,12 @@ export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
 
 async function withManagedInstances<T>(
   paths: ControlPlanePaths,
-  work: (runtimes: readonly InstanceRuntimeConfig[]) => Promise<T>,
+  work: (runtimes: readonly InstanceRuntimeConfig[], unobservedInstanceIds: readonly string[]) => Promise<T>,
 ): Promise<T> {
   return withMachineLock(paths, async () => {
     const releases: Array<() => void> = [];
     const runtimes: InstanceRuntimeConfig[] = [];
+    const unobservedInstanceIds: string[] = [];
     try {
       const ids = Object.keys((await readRegistry(paths)).instances).sort();
       for (const id of ids) {
@@ -185,9 +187,10 @@ async function withManagedInstances<T>(
           runtimes.push(await loadInstanceRuntimeConfig(paths.runtimeFile(id)));
         } catch (error) {
           if (!isErrno(error, 'ENOENT')) throw error;
+          unobservedInstanceIds.push(id);
         }
       }
-      return await work(runtimes);
+      return await work(runtimes, unobservedInstanceIds);
     } finally {
       for (const release of releases.reverse()) release();
     }
@@ -203,13 +206,19 @@ export async function installLocalVoice(
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
     if (policy.enabled)
-      throw new GwsEaError('voice_enabled', 'Run gws-ea disable-voice before installing or selecting voice assets.');
+      throw new GwsEaError(
+        'voice_enabled',
+        'Run gws-ea capabilities disable voice before installing or selecting voice assets.',
+      );
+    dependencies.recordEffect?.(null);
     const installation = await installVoiceAssets(paths, request, dependencies);
+    dependencies.recordEffect?.(null);
     await writePrivate(voicePolicyFile(paths), {
       schemaVersion: 1,
       enabled: false,
       installationDir: installation.installationDir,
     } satisfies VoiceHostPolicy);
+    dependencies.recordEffect?.(true);
     return installation;
   });
 }
@@ -224,7 +233,7 @@ export async function enableLocalVoice(
     if (!policy.installationDir)
       throw new GwsEaError(
         'voice_not_installed',
-        'Voice is not installed. Run gws-ea install-voice, then gws-ea enable-voice.',
+        'Voice is not installed. Run gws-ea capabilities install voice, then gws-ea capabilities enable voice.',
       );
     try {
       const installation = await verifyVoiceInstallation(policy.installationDir);
@@ -237,7 +246,7 @@ export async function enableLocalVoice(
     } catch (error) {
       throw new GwsEaError(
         'voice_assets_invalid',
-        'Voice assets are unhealthy. Run gws-ea disable-voice, gws-ea uninstall-voice, then gws-ea install-voice.',
+        'Voice assets are unhealthy. Run gws-ea capabilities disable voice, gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
         { cause: error },
       );
     }
@@ -249,19 +258,30 @@ export async function enableLocalVoice(
           'The gws-ea launcher must supply its native environment writer to enable voice.',
         );
       if (upsert)
-        for (const runtime of runtimes) await bindInstanceVoicePolicy(runtime, voicePolicyFile(paths), upsert);
+        for (const runtime of runtimes) {
+          dependencies.recordEffect?.(null);
+          await bindInstanceVoicePolicy(runtime, voicePolicyFile(paths), upsert);
+          dependencies.recordEffect?.(true);
+        }
       const enabled = { ...policy, enabled: true } satisfies VoiceHostPolicy;
+      dependencies.recordEffect?.(null);
       await writePrivate(voicePolicyFile(paths), enabled);
+      dependencies.recordEffect?.(true);
       return enabled;
     });
   });
 }
 
 /** Stops new recognition without restarting text service or deleting assets. */
-export async function disableLocalVoice(paths: ControlPlanePaths): Promise<VoiceHostPolicy> {
+export async function disableLocalVoice(
+  paths: ControlPlanePaths,
+  dependencies: Pick<VoiceOperatorDependencies, 'recordEffect'> = {},
+): Promise<VoiceHostPolicy> {
   return underVoiceLock(paths, async () => {
     const disabled = { ...(await readLocalVoicePolicy(paths)), enabled: false } satisfies VoiceHostPolicy;
+    dependencies.recordEffect?.(null);
     await writePrivate(voicePolicyFile(paths), disabled);
+    dependencies.recordEffect?.(true);
     return disabled;
   });
 }
@@ -269,7 +289,7 @@ export async function disableLocalVoice(paths: ControlPlanePaths): Promise<Voice
 async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOperatorDependencies): Promise<void> {
   const compatibility = await voiceReleaseCompatibility(runtime.checkout_root);
   if (compatibility === 'unsupported') return;
-  const drain = `Wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea uninstall-voice.`;
+  const drain = `Wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea capabilities uninstall voice.`;
   if (compatibility === 'unknown')
     throw new GwsEaError('voice_drain_unproven', `Voice release compatibility cannot be observed. ${drain}`);
   const service = dependencies.serviceHelpers
@@ -317,7 +337,10 @@ export async function uninstallLocalVoice(
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
     if (policy.enabled)
-      throw new GwsEaError('voice_enabled', 'Run gws-ea disable-voice before gws-ea uninstall-voice.');
+      throw new GwsEaError(
+        'voice_enabled',
+        'Run gws-ea capabilities disable voice before gws-ea capabilities uninstall voice.',
+      );
     try {
       await assertPrivateDirectory(path.join(paths.stateRoot, 'voice'));
     } catch (error) {
@@ -340,18 +363,25 @@ export async function uninstallLocalVoice(
         'voice_assets_unowned',
         'The selected voice directory is outside this recipe-owned host cache; it will not be removed.',
       );
-    await withManagedInstances(paths, async (runtimes) => {
+    await withManagedInstances(paths, async (runtimes, unobservedInstanceIds) => {
+      if (unobservedInstanceIds.length)
+        throw new GwsEaError(
+          'voice_drain_unproven',
+          `Runtime configuration is missing for assistant ${unobservedInstanceIds.join(', ')}; its voice work cannot be observed. Restore the recorded runtime or finish removing that assistant before retrying gws-ea capabilities uninstall voice.`,
+        );
       for (const runtime of runtimes) await proveIdle(runtime, dependencies);
       for (const directory of directories) {
         const holders = await (dependencies.fileHolders ?? openFileHolders)(directory);
         if (holders.length)
           throw new GwsEaError(
             'voice_not_drained',
-            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea uninstall-voice.`,
+            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea capabilities uninstall voice.`,
           );
       }
       // Clear selection before any deletion so a partial removal remains safely disabled.
+      dependencies.recordEffect?.(null);
       await writePrivate(voicePolicyFile(paths), emptyPolicy());
+      dependencies.recordEffect?.(true);
       for (const directory of directories) await rm(directory, { recursive: true });
     });
   });

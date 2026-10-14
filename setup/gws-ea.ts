@@ -18,6 +18,7 @@ import {
   stopService,
   verifyServiceHealth,
 } from '../scripts/update/service.js';
+import { parseInvocation } from '../src/gws-ea/command-parser.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
@@ -31,7 +32,6 @@ import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-inp
 import { attendPause } from './gws-ea-pause.js';
 import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 import { confirmThenOpen, formatNoteLink } from './lib/browser.js';
-import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
 import { listSetupProviders, type SetupProviderEntry } from './providers/registry.js';
 import { upsertEnvVars } from './set-env.js';
@@ -53,20 +53,21 @@ interface RunningStep {
  */
 export function createTerminalPresenter(): Presenter {
   let running: RunningStep | undefined;
+  const color = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
   let spinner: ReturnType<typeof p.spinner> | undefined;
   let tick: NodeJS.Timeout | undefined;
 
   const elapsed = (step: RunningStep): string => ` (${fmtDuration(Date.now() - step.started)})`;
   const text = (step: RunningStep): string => {
     const suffix = elapsed(step);
-    return `${fitToWidth(step.reason ?? step.label, suffix)}${k.dim(suffix)}`;
+    return `${fitToWidth(step.reason ?? step.label, suffix)}${color ? k.dim(suffix) : suffix}`;
   };
   const draw = (): void => {
     if (running && spinner) spinner.message(text(running));
   };
   const start = (): void => {
     if (!running || spinner) return;
-    spinner = p.spinner();
+    spinner = p.spinner({ output: process.stderr });
     spinner.start(text(running));
     tick = setInterval(draw, 1000);
   };
@@ -80,6 +81,7 @@ export function createTerminalPresenter(): Presenter {
 
   return {
     event(event) {
+      if (event.type === 'domain-effect') return;
       if (event.type === 'step-started') {
         if (!event.label) return;
         halt()?.clear();
@@ -98,10 +100,10 @@ export function createTerminalPresenter(): Presenter {
       const stopped = halt();
       if (!stopped) return;
       const label = finished.label.replace(/…$/u, '');
-      const suffix = k.dim(elapsed(finished));
+      const suffix = color ? k.dim(elapsed(finished)) : elapsed(finished);
       if (event.type === 'step-failed') stopped.error(`${label} failed${suffix}`);
       else if (event.type === 'step-paused') stopped.stop(`${label}: waiting for you${suffix}`);
-      else stopped.stop(`${k.bold(label)}${suffix}`);
+      else stopped.stop(`${color ? k.bold(label) : label}${suffix}`);
     },
     suspend() {
       halt()?.clear();
@@ -112,7 +114,7 @@ export function createTerminalPresenter(): Presenter {
     line(line) {
       const wasRunning = spinner !== undefined;
       halt()?.clear();
-      p.log.info(line);
+      p.log.info(line, { output: process.stderr });
       if (wasRunning) start();
     },
     report(report) {
@@ -121,20 +123,19 @@ export function createTerminalPresenter(): Presenter {
       const details = report.details.join('\n');
       switch (report.outcome) {
         case 'ready':
-          p.log.success(report.headline);
-          if (details) p.log.message(details);
-          return;
         case 'paused':
-          p.log.warn(report.headline);
-          if (details) p.note(details, 'Next step');
+          // Result identities and continuation commands stay intact even on a narrow terminal.
+          process.stdout.write(`${[report.headline, ...report.details].join('\n')}\n`);
           return;
+        case 'diagnostic':
         case 'busy':
-          p.log.warn(report.headline);
+          p.log.warn(report.headline, { output: process.stderr });
+          if (details) p.log.message(details, { output: process.stderr });
           return;
         case 'failed':
-          p.log.error(report.headline);
-          if (details) p.log.message(details);
-          if (report.tail) dumpTranscriptOnFailure(report.tail);
+          p.log.error(report.headline, { output: process.stderr });
+          if (details) p.log.message(details, { output: process.stderr });
+          if (report.tail) p.log.message(report.tail, { output: process.stderr });
           return;
       }
     },
@@ -156,8 +157,14 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
           .filter((line) => line !== null)
           .join('\n'),
         "The assistant's Google sign-in",
+        { output: process.stderr },
       );
-      await confirmThenOpen(url, `Ready to sign in as ${account}? Press Enter to open your browser`);
+      await confirmThenOpen(url, `Ready to sign in as ${account}? Press Enter to open your browser`, {
+        output: process.stderr,
+        onDecline: () => {
+          throw new GwsEaError('cancelled', 'Google sign-in was cancelled; resume the assistant to continue.');
+        },
+      });
     },
     attendPause: (pause, signal) => attendPause(pause, signal),
   };
@@ -229,12 +236,23 @@ function toolProviderSetup(providers: readonly SetupProviderEntry[]): () => Prom
 /** Diagnosis first, then the retry offer. */
 async function handleFailure(report: FailureReport): Promise<'retry' | 'stop'> {
   await offerDiagnosis(report);
-  const answer = await p.confirm({ message: retryOffer(report.command), initialValue: true });
+  const answer = await p.confirm({ message: retryOffer(report.command), initialValue: true, output: process.stderr });
   return answer === true ? 'retry' : 'stop';
 }
 
 export async function main(argv: readonly string[], options: { readonly interactive?: boolean } = {}): Promise<number> {
-  const interactive = options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  let invocation;
+  try {
+    invocation = parseInvocation(argv);
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    return runCli(argv);
+  }
+  if (invocation.help || invocation.definition.handler.kind === 'discovery') return runCli(argv);
+  const interactive =
+    invocation.options.json !== 'true' &&
+    invocation.options['no-input'] !== 'true' &&
+    (options.interactive ?? Boolean(process.stdin.isTTY && process.stderr.isTTY));
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
@@ -265,11 +283,13 @@ export async function main(argv: readonly string[], options: { readonly interact
       (await p.confirm({
         message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
         initialValue: false,
+        output: process.stderr,
       })) === true,
     confirmUpdate: async (preview) =>
       (await p.confirm({
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,
         initialValue: false,
+        output: process.stderr,
       })) === true,
     confirmUpdateAll: async (plan) => {
       const count = plan.candidates.filter((candidate) => candidate.eligible).length;
@@ -277,6 +297,7 @@ export async function main(argv: readonly string[], options: { readonly interact
         (await p.confirm({
           message: `Update ${count} ${count === 1 ? 'assistant' : 'assistants'} to this tool's release ${plan.toolCommit.slice(0, 12)}, as planned above?`,
           initialValue: false,
+          output: process.stderr,
         })) === true
       );
     },
@@ -284,6 +305,7 @@ export async function main(argv: readonly string[], options: { readonly interact
       (await p.confirm({
         message: `Restore assistant ${preview.instanceId}'s pre-update snapshot on ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}, discarding what it recorded since?`,
         initialValue: false,
+        output: process.stderr,
       })) === true,
     onFailure: handleFailure,
   });

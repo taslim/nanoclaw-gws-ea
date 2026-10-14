@@ -158,11 +158,15 @@ function resourceRunner<Context>(context: Context, runtime: ProvisionRuntime) {
     });
     if (before.status === 'present') return undefined;
     if (before.status === 'pause') return before.pause;
+    runtime.emit?.({ type: 'domain-effect', step: id, changed: null });
     const applied = await resource.apply(context);
     if (applied) return applied;
     // A change can take a while to become visible, so absent is waited on here too.
     const after = await observe(id, resource, { waitOnAbsent: true, applyOnUnknown: false });
-    if (after.status === 'present') return undefined;
+    if (after.status === 'present') {
+      runtime.emit?.({ type: 'domain-effect', step: id, changed: before.status === 'absent' ? true : null });
+      return undefined;
+    }
     if (after.status === 'pause') return after.pause;
     const seenReason = after.status === 'absent' && after.reason ? `: ${after.reason}` : '';
     throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up${seenReason}`);

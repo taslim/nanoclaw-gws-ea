@@ -106,6 +106,7 @@ export function runtimeServiceTarget(
 
 /** Boundary seams; each defaults to this process's. */
 export interface ServiceControlOptions {
+  readonly recordEffect?: (changed: true | null) => void;
   readonly platform?: NodeJS.Platform;
   readonly uid?: number;
   /** Where the tool environment and the user-bus variables are read. */
@@ -233,7 +234,9 @@ export function createServiceControl(
   /** NanoClaw's stop returns once the host has exited, and throws when it cannot stop it. */
   const stopHost = async (handle: NanoclawServiceHandle): Promise<void> => {
     try {
+      options.recordEffect?.(null);
       await helpers.stopService(handle, env);
+      options.recordEffect?.(true);
     } catch (cause) {
       throw new GwsEaError(
         'service_still_running',
@@ -264,8 +267,10 @@ export function createServiceControl(
   /** Start the way NanoClaw's own transaction does: the service's handle, marked active. */
   const startHandle = (handle: NanoclawServiceHandle): void => {
     try {
+      options.recordEffect?.(null);
       resetFailed(handle);
       helpers.startService({ ...handle, active: true }, root, env);
+      options.recordEffect?.(true);
     } catch (cause) {
       throw new GwsEaError(
         'service_start_failed',

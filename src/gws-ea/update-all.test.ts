@@ -31,6 +31,7 @@ import {
   machine,
   NEW_IMAGE,
   nextRelease,
+  PROVIDER_SETUP,
   release,
   releaseAgentImageKey,
   releaseTag,
@@ -43,6 +44,7 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import type { CliRuntime } from './cli.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { removeToolCheckouts, toolCheckoutWorld } from './testing/stray-fixture.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
@@ -173,6 +175,46 @@ async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, co
 }
 
 describe('gws-ea update --all', GIT_HEAVY, () => {
+  it('keeps the active assistant interruption handler authoritative and removes bulk handlers afterwards', async () => {
+    const host = await machine();
+    const first = await assistant(host, { port: 37_001 });
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first]);
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+    const before = signals.map((signal) => process.listeners(signal));
+    const interrupted = Symbol('process exited');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw interrupted;
+    });
+    let resolving = 0;
+    const { run, out } = fleetCli(machineFleet, {
+      toolProviderSetup: async () => {
+        if (++resolving === 2) process.emit('SIGINT', 'SIGINT');
+        return PROVIDER_SETUP;
+      },
+    });
+    try {
+      await run(['update', '--all', '--yes', '--json']);
+      expect(exit).toHaveBeenCalledExactlyOnceWith(130);
+      expect(out).toHaveLength(1);
+      expectResultContract('update', JSON.parse(out.join('\n')));
+      expect(JSON.parse(out.join('\n'))).toMatchObject({
+        outcome: 'failed',
+        error: { code: 'interrupted' },
+        data: {
+          plan: { toolCommit: next.commit },
+          targets: [{ instance_id: first.instance_id, outcome: 'failed' }],
+        },
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--id', first.instance_id, '--yes'] }],
+        diagnostics: { run_log: expect.any(String) },
+      });
+      expect(signals.map((signal) => process.listeners(signal))).toEqual(before);
+      await expectOnRelease(host, first, host.first);
+    } finally {
+      exit.mockRestore();
+    }
+  });
+
   it('updates only the assistants that can move, in list order, and skips and reports the rest, untouched', async () => {
     const host = await machine();
     // A mirror whose track never receives the next release: the assistant installed from it is not on its track.
@@ -199,14 +241,14 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const before = await Promise.all(skipped.map((runtime) => footprint(machineFleet, runtime)));
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => false);
     const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => false);
-    const { run, out, err } = fleetCli(machineFleet, { confirmUpdate, confirmUpdateAll });
+    const { run, transcript: out, err } = fleetCli(machineFleet, { confirmUpdate, confirmUpdateAll });
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 
     // --yes answers the plan's question, and no assistant is asked about on its own.
     expect(confirmUpdateAll).not.toHaveBeenCalled();
     expect(confirmUpdate).not.toHaveBeenCalled();
-    expect(err).toEqual([]);
+    expect(err.some((line) => line.startsWith('Stopped at '))).toBe(false);
     // Only the two that could move were updated, in list order, each with its own preview and summary.
     expect(out.filter((line) => line.startsWith('Assistant: '))).toEqual([
       `Assistant: ${earlier.instance_id}`,
@@ -260,7 +302,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const machineFleet = await fleet(host, next, [first, second]);
     machineFleet.state.buildFails = true;
     const untouched = await footprint(machineFleet, second);
-    const { run, out, err } = fleetCli(machineFleet);
+    const { run, transcript: out, err } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(1);
 
@@ -294,14 +336,13 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const later = await nextRelease(host);
     const { logs: _logs, ...untouched } = await footprint(machineFleet, second);
     const out: string[] = [];
-    const { run, err } = fleetCli(machineFleet, {
-      stdout: (line) => {
-        out.push(line);
-        if (line !== `Updating assistant ${second.instance_id} (2 of 2)…`) return;
-        git(next.tool, 'fetch', '--quiet', 'origin');
-        git(next.tool, 'checkout', '--quiet', '--detach', later.commit);
-      },
-    });
+    const record = (line: string): void => {
+      out.push(line);
+      if (line !== `Updating assistant ${second.instance_id} (2 of 2)…`) return;
+      git(next.tool, 'fetch', '--quiet', 'origin');
+      git(next.tool, 'checkout', '--quiet', '--detach', later.commit);
+    };
+    const { run } = fleetCli(machineFleet, { stdout: record, stderr: record });
 
     expect(await run(['update', '--all', '--yes'])).toBe(1);
 
@@ -313,12 +354,12 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const { logs: _after, ...left } = await footprint(machineFleet, second);
     expect(left).toEqual(untouched);
     expect(new Set(serviceCallsOf(machineFleet.state, second))).toEqual(new Set([`detect ${second.install_id}`]));
-    expect(err).toContain(
+    expect(out).toContain(
       `gws-ea's checkout ${next.tool} moved from ${short(next.commit)} to ${short(later.commit)} while update --all ran, ` +
         `so assistant ${second.instance_id} was not updated: one run deploys only the release it started with, ${short(next.commit)}. ` +
         `Run gws-ea update --all again to update to ${short(later.commit)}.`,
     );
-    expect(err.slice(-3)).toEqual([
+    expect(out.slice(-3)).toEqual([
       `update --all stopped at assistant ${second.instance_id}.`,
       `Updated ${first.instance_id}: dogfood ${short(host.first)} → dogfood ${short(next.commit)}`,
       `Stopped at ${second.instance_id}; its summary above says why and what to run.`,
@@ -340,7 +381,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       .mockResolvedValue('stop');
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => true);
     const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
-    const { run, out, err } = fleetCli(machineFleet, { onFailure, confirmUpdate, confirmUpdateAll });
+    const { run, transcript: out, err } = fleetCli(machineFleet, { onFailure, confirmUpdate, confirmUpdateAll });
 
     expect(await run(['update', '--all'])).toBe(1);
 
@@ -390,7 +431,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       },
     };
     const before = await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)));
-    const { run, out } = fleetCli(machineFleet, { serviceHelpers });
+    const { run, transcript: out } = fleetCli(machineFleet, { serviceHelpers });
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 
@@ -419,7 +460,11 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const asked: Array<{ readonly toolCommit: string; readonly shown: readonly string[]; readonly staged: boolean }> =
       [];
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => true);
-    const { run, out, err } = fleetCli(machineFleet, {
+    const {
+      run,
+      transcript: out,
+      err,
+    } = fleetCli(machineFleet, {
       releaseMigrations: async () => [...LIVE_MIGRATIONS, ADDED_MIGRATION],
       confirmUpdate,
       confirmUpdateAll: async (plan) => {
@@ -449,7 +494,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(asked).toEqual([{ toolCommit: next.commit, shown: plan, staged: false }]);
     expect(confirmUpdate).not.toHaveBeenCalled();
     expect(out).toEqual([...plan, 'Update cancelled. No assistant was changed.']);
-    expect(err).toEqual([]);
+    expect(err.some((line) => line.startsWith('Stopped at '))).toBe(false);
     // Nothing of either changed: files, run logs, registry entry, and images; each was only observed.
     expect(await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)))).toEqual(
       before,
@@ -470,7 +515,11 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => false);
     const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
     const tool = await toolCheckoutWorld();
-    const { run, out, err } = fleetCli(machineFleet, {
+    const {
+      run,
+      transcript: out,
+      err,
+    } = fleetCli(machineFleet, {
       releaseMigrations: async () => [...LIVE_MIGRATIONS, ADDED_MIGRATION],
       confirmUpdate,
       confirmUpdateAll,
@@ -486,7 +535,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     ]);
     expect(confirmUpdateAll).toHaveBeenCalledOnce();
     expect(confirmUpdate).not.toHaveBeenCalled();
-    expect(err).toEqual([]);
+    expect(err.some((line) => line.startsWith('Stopped at '))).toBe(false);
     await expectOnRelease(host, first, next.commit);
     await expectOnRelease(host, second, next.commit);
     // What the plan said each adds is what each one's dry run on a copy of its database added.
@@ -527,29 +576,66 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(state.labels.get(image!)).toBe(releaseAgentImageKey(next));
   });
 
-  it('stops with exit 75 when another command holds an assistant, leaving the next one untouched', async () => {
+  it('reports completed, skipped, busy and unattempted targets with the first blocking exit', async () => {
     const host = await machine();
-    const first = await assistant(host, { port: 37_001 });
-    const second = await assistant(host, { port: 37_101 });
+    const completed = await assistant(host, { port: 37_001 });
+    const busy = await assistant(host, { port: 37_101 });
+    const skipped = await assistant(host, { port: 37_201 });
+    const unattempted = await assistant(host, { port: 37_301 });
     const next = await nextRelease(host);
-    const machineFleet = await fleet(host, next, [first, second]);
-    const untouched = await footprint(machineFleet, second);
-    const held = await acquireInstanceOperation(host.paths, first.instance_id, { command: 'start' });
-    const { run, err } = fleetCli(machineFleet);
+    const machineFleet = await fleet(host, next, [completed, busy, skipped, unattempted]);
+    machineFleet.stopped.add(skipped.install_id);
+    const untouched = await footprint(machineFleet, unattempted);
+    const held = await acquireInstanceOperation(host.paths, busy.instance_id, { command: 'start' });
+    const { run, out, err } = fleetCli(machineFleet);
     try {
-      expect(await run(['update', '--all', '--yes'])).toBe(75);
+      expect(await run(['update', '--all', '--yes', '--json'])).toBe(75);
     } finally {
       held?.release();
     }
+    expectResultContract('update', JSON.parse(out.join('\n')));
+    expect(JSON.parse(out.join('\n'))).toMatchObject({
+      schema_version: 1,
+      command: 'update',
+      outcome: 'busy',
+      changed: true,
+      data: {
+        targets: [
+          { instance_id: completed.instance_id, outcome: 'completed' },
+          { instance_id: busy.instance_id, outcome: 'busy' },
+          { instance_id: skipped.instance_id, outcome: 'skipped' },
+          { instance_id: unattempted.instance_id, outcome: 'unattempted' },
+        ],
+      },
+    });
+    expect(err.join('\n')).toContain('Preparing the new release');
+    await expectOnRelease(host, completed, next.commit);
+    await expectOnRelease(host, busy, host.first);
+    expect(await footprint(machineFleet, unattempted)).toEqual(untouched);
+  });
 
-    expect(err).toContain('Instance operation is already in progress; no action was taken.');
-    expect(err.slice(-3)).toEqual([
-      `update --all stopped: another command holds assistant ${first.instance_id}; 1 not attempted.`,
-      `Stopped at ${first.instance_id}; its summary above says why and what to run.`,
-      `Not attempted: ${second.instance_id}`,
-    ]);
-    await expectOnRelease(host, first, host.first);
-    expect(await footprint(machineFleet, second)).toEqual(untouched);
+  it('returns the no-input plan before staging and never calls consent hooks', async () => {
+    const host = await machine();
+    const first = await assistant(host, { port: 37_001 });
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first]);
+    const before = await footprint(machineFleet, first);
+    const confirmUpdateAll = vi.fn(async () => true);
+    const { run, out } = fleetCli(machineFleet, { confirmUpdateAll });
+    expect(await run(['update', '--all', '--json', '--no-input'])).toBe(10);
+    expectResultContract('update', JSON.parse(out.join('\n')));
+    expect(JSON.parse(out.join('\n'))).toMatchObject({
+      outcome: 'paused',
+      changed: false,
+      data: {
+        plan: { toolCommit: next.commit, candidates: [{ instanceId: first.instance_id, eligible: true }] },
+        targets: [{ instance_id: first.instance_id, outcome: 'unattempted' }],
+      },
+      error: { code: 'confirmation_required' },
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--all', '--yes'] }],
+    });
+    expect(confirmUpdateAll).not.toHaveBeenCalled();
+    expect(await footprint(machineFleet, first)).toEqual(before);
   });
 
   it('exits 0 with nothing to update when no assistant can move, staging nothing and asking nothing', async () => {
@@ -561,7 +647,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(await fleetCli(machineFleet).run(['update', '--id', current.instance_id, '--yes'])).toBe(0);
     machineFleet.stopped.add(stopped.install_id);
     const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
-    const { run, out } = fleetCli(machineFleet, { confirmUpdateAll });
+    const { run, transcript: out } = fleetCli(machineFleet, { confirmUpdateAll });
 
     expect(await run(['update', '--all'])).toBe(0);
 
@@ -598,7 +684,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
         onecli_project: `gws-ea-${creating.replaceAll('-', '')}`,
       },
     });
-    const { run, out } = fleetCli(machineFleet);
+    const { run, transcript: out } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 
@@ -616,14 +702,14 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const machineFleet = await fleet(host, next, [unreadable, eligible]);
     await rm(layoutOf(host, unreadable).receipt(releaseName(host.first)));
-    const { run, out, err } = fleetCli(machineFleet);
+    const { run, transcript: out, err } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(1);
 
-    expect(err).toEqual([
+    expect(err.slice(-1)).toEqual([
       `Could not tell whether assistant ${unreadable.instance_id} can be updated (ENOENT); gws-ea status --id ${unreadable.instance_id} shows its state. Nothing was updated.`,
     ]);
-    expect(out).toEqual(['Checking which assistants can be updated…']);
+    expect(out[0]).toBe('Checking which assistants can be updated…');
     await expectOnRelease(host, eligible, host.first);
   });
 
@@ -633,7 +719,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const next = await nextRelease(host);
     const machineFleet = await fleet(host, next, [runtime]);
     await writeFile(path.join(next.tool, 'release.txt'), 'edited\n');
-    const { run, out, err } = fleetCli(machineFleet);
+    const { run, transcript: out, err } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(1);
 
@@ -655,7 +741,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect((await readOperationRecord(host.paths, pending.instance_id))?.phase).toBe('committed');
     machineFleet.state.rebuildFails = false;
     const rebuilds = machineFleet.state.rebuilds.length;
-    const { run, out } = fleetCli(machineFleet);
+    const { run, transcript: out } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 
@@ -685,7 +771,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(record?.phase).toBe('committed');
     expect(record?.follow_ups).toContainEqual(expect.objectContaining({ kind: 'rebuild_group_image' }));
     const rebuilds = machineFleet.state.rebuilds.length;
-    const { run, out } = fleetCli(machineFleet);
+    const { run, transcript: out } = fleetCli(machineFleet);
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 

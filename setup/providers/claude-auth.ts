@@ -56,14 +56,14 @@ function cancelled(value: unknown): never {
   throw new Error('Provider authentication returned an invalid answer');
 }
 
-async function collectSubscriptionToken(): Promise<string> {
+async function collectSubscriptionToken(output?: NodeJS.WriteStream): Promise<string> {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'nanoclaw-claude-auth-'));
   const outputFile = path.join(directory, 'credential');
   try {
     const exitCode = await runInheritScript(
       '/bin/bash',
       ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', outputFile],
-      { env: buildInteractiveEnvironment() },
+      { env: buildInteractiveEnvironment(), ...(output ? { output } : {}) },
     );
     if (exitCode !== 0) throw new Error("Couldn't complete the Claude sign-in");
     const info = await stat(outputFile);
@@ -84,12 +84,13 @@ async function collectSubscriptionToken(): Promise<string> {
   }
 }
 
-async function collectPastedToken(method: 'oauth' | 'api'): Promise<string> {
+async function collectPastedToken(method: 'oauth' | 'api', output?: NodeJS.WriteStream): Promise<string> {
   const label = method === 'oauth' ? 'OAuth token' : 'API key';
   const prefix = method === 'oauth' ? 'sk-ant-oat' : 'sk-ant-api';
   const answer = await p.password({
     message: `Paste your ${label}`,
     clearOnError: true,
+    output,
     validate: (value) => {
       const cleaned = (value ?? '').replace(/\s+/gu, '');
       if (!cleaned) return 'Required';
@@ -108,6 +109,7 @@ async function collectPastedToken(method: 'oauth' | 'api'): Promise<string> {
 
 export async function collectClaudeCredential(options: {
   readonly allowSkip: boolean;
+  readonly output?: NodeJS.WriteStream;
   readonly allowAmbientConfiguration?: boolean;
 }): Promise<CollectedProviderCredential | null> {
   const custom = customEndpointCredential(options.allowAmbientConfiguration === true);
@@ -132,12 +134,16 @@ export async function collectClaudeCredential(options: {
   const answer = await brightSelect<string>({
     message: 'How would you like to connect to Claude?',
     options: choices,
+    output: options.output,
   });
   if (p.isCancel(answer) || typeof answer !== 'string') return cancelled(answer);
   if (answer === 'skip') return null;
   if (answer !== 'subscription' && answer !== 'oauth' && answer !== 'api') return cancelled(answer);
 
-  const value = answer === 'subscription' ? await collectSubscriptionToken() : await collectPastedToken(answer);
+  const value =
+    answer === 'subscription'
+      ? await collectSubscriptionToken(options.output)
+      : await collectPastedToken(answer, options.output);
   return {
     method: answer,
     credential: { ...claudeCredentialMetadata(), value },

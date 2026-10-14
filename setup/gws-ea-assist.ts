@@ -32,7 +32,6 @@ import {
 import { redact } from '../src/gws-ea/redact.js';
 import { writePrivateTextFile } from '../src/gws-ea/secrets.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { note } from './lib/theme.js';
 
 /** `-p` with no tools, an empty strict MCP configuration, and nothing saved to resume. */
 const CLAUDE_DIAGNOSIS_ARGS = [
@@ -84,11 +83,11 @@ export interface DiagnosisUi {
 }
 
 const terminalUi: DiagnosisUi = {
-  note: (message, title) => note(message, title),
-  confirm: async (message) => (await p.confirm({ message, initialValue: false })) === true,
-  warn: (message) => p.log.warn(message),
+  note: (message, title) => p.note(message, title, { output: process.stderr }),
+  confirm: async (message) => (await p.confirm({ message, initialValue: false, output: process.stderr })) === true,
+  warn: (message) => p.log.warn(message, { output: process.stderr }),
   async wait(label, work) {
-    const spinner = p.spinner();
+    const spinner = p.spinner({ output: process.stderr });
     spinner.start(label);
     try {
       const result = await work();

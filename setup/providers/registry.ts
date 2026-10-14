@@ -36,6 +36,7 @@ export interface SetupProviderProvisioning {
   credentialMetadata(options?: { readonly allowAmbientConfiguration?: boolean }): SetupProviderCredentialMetadata;
   collectCredential(options: {
     readonly allowSkip: boolean;
+    readonly output?: NodeJS.WriteStream;
     readonly allowAmbientConfiguration?: boolean;
   }): Promise<CollectedProviderCredential | null>;
 }

@@ -180,6 +180,40 @@ async function expectUpdated(host: Machine, runtime: InstanceRuntimeConfig, to: 
 }
 
 describe('staging an update while the assistant serves', GIT_HEAVY, () => {
+  it('returns the staged no-input preview and retains preparation while the serving release stays unchanged', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime, applying(ADDED_MIGRATION));
+    const layout = layoutOf(host, runtime);
+    const before = await snapshot(layout.state);
+    const confirmUpdate = vi.fn(async () => true);
+    const { run, out, err } = cli(host, state, next, runtime, { confirmUpdate });
+    expect(await run(['update', '--id', runtime.instance_id, '--no-input', '--json'])).toBe(10);
+    expect(JSON.parse(out.join('\n'))).toMatchObject({
+      outcome: 'paused',
+      changed: true,
+      data: {
+        instance_id: runtime.instance_id,
+        staging: { retained: true, release: release(host, next.commit) },
+        preview: {
+          instanceId: runtime.instance_id,
+          from: release(host, host.first),
+          to: release(host, next.commit),
+          migrations: [ADDED_MIGRATION],
+        },
+      },
+      error: { code: 'confirmation_required' },
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--id', runtime.instance_id, '--yes'] }],
+    });
+    expect(confirmUpdate).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('Preparing the new release');
+    expect(await snapshot(layout.state)).toEqual(before);
+    expect(await readlink(layout.current)).toBe(releaseName(host.first));
+    expect(await exists(layout.receipt(releaseName(next.commit)))).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+
   it("stages the tool's release in its own folder, writing nothing into the assistant's state, and previews it", async () => {
     const host = await machine();
     const runtime = await assistant(host, { gateway: DEPLOYED_GATEWAY });
@@ -395,7 +429,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const state = world(runtime);
     const inode = await centralInode(runtime);
     const displaced = state.tags.get(`${imageBase(runtime)}:ag-research`)!;
-    const { run, out } = cli(host, state, next, runtime);
+    const { run, transcript: out } = cli(host, state, next, runtime);
 
     expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
@@ -622,7 +656,9 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await run(['update', '--id', runtime.instance_id])).toBe(0);
 
     expect(asked).toHaveLength(1);
-    expect(out).toContain('Update cancelled. The assistant is unchanged.');
+    expect(out).toContain('Update cancelled. The serving release is unchanged; staged assets are retained.');
+    expect(out).toContain(`Assistant: ${runtime.instance_id}`);
+    expect(out).toContain(`Next: gws-ea status --id ${runtime.instance_id}`);
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
     expect(state.running).toBe(true);

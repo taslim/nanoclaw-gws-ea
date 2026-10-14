@@ -50,6 +50,14 @@ describe('shared Claude credential flow', () => {
     );
   });
 
+  it('routes managed credential prompts beside stdout results while retaining setup defaults', async () => {
+    fixture.select.mockResolvedValue('api');
+    fixture.password.mockResolvedValue('sk-ant-api-explicit');
+    await collectClaudeCredential({ allowSkip: false, allowAmbientConfiguration: false, output: process.stderr });
+    expect(fixture.select).toHaveBeenCalledWith(expect.objectContaining({ output: process.stderr }));
+    expect(fixture.password).toHaveBeenCalledWith(expect.objectContaining({ output: process.stderr }));
+  });
+
   it('describes and collects a configured compatible endpoint without a second questionnaire', async () => {
     vi.stubEnv('NANOCLAW_ANTHROPIC_BASE_URL', 'https://models.example.test/v1');
     vi.stubEnv('NANOCLAW_ANTHROPIC_AUTH_TOKEN', 'private-token');
@@ -96,7 +104,9 @@ describe('shared Claude credential flow', () => {
       return 0;
     });
 
-    await expect(collectClaudeCredential({ allowSkip: false, allowAmbientConfiguration: false })).resolves.toEqual({
+    await expect(
+      collectClaudeCredential({ allowSkip: false, allowAmbientConfiguration: false, output: process.stderr }),
+    ).resolves.toEqual({
       method: 'subscription',
       credential: {
         name: 'Anthropic',
@@ -108,7 +118,7 @@ describe('shared Claude credential flow', () => {
     expect(fixture.runInheritScript).toHaveBeenCalledWith(
       '/bin/bash',
       ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', expect.any(String)],
-      { env: { NANOCLAW_SETUP_WIZARD: '1', HOME: '/Users/operator' } },
+      { env: { NANOCLAW_SETUP_WIZARD: '1', HOME: '/Users/operator' }, output: process.stderr },
     );
   });
 });

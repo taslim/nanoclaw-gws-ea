@@ -201,7 +201,7 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     await converse(runtime, 'm2');
     expect(mainSkills(runtime)).toEqual(['agent-browser', 'gmail']);
     const inode = await centralInode(runtime);
-    const { run, out } = cli(host, state, next, runtime);
+    const { run, transcript: out } = cli(host, state, next, runtime);
 
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
 
@@ -287,16 +287,29 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
   it('shows the snapshot time and what it discards, and refuses without --yes when nobody can be asked', async () => {
     const { host, runtime, next, state } = await migrated();
     const events = state.events.length;
-    const { run, out, err } = cli(host, state, next, runtime);
+    const confirmRollback = vi.fn(async () => true);
+    const { run, out } = cli(host, state, next, runtime, { confirmRollback });
 
-    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
+    expect(await run(['rollback', '--id', runtime.instance_id, '--json', '--no-input'])).toBe(10);
 
-    const printed = out.join('\n');
-    expect(printed).toMatch(/Restores the snapshot taken .*, because the update migrated the central database\./u);
-    expect(printed).toContain('Inbound messages lost: 1 (m2)');
-    expect(printed).toContain('Central rows added since: schema_version 1');
-    expect(printed).toContain(`kept in ${path.join(layoutOf(host, runtime).root, 'quarantine')}`);
-    expect(err.join('\n')).toContain('needs confirmation: pass --yes');
+    expect(JSON.parse(out.join('\n'))).toMatchObject({
+      outcome: 'paused',
+      changed: false,
+      data: {
+        instance_id: runtime.instance_id,
+        preview: {
+          instanceId: runtime.instance_id,
+          reason: 'central_schema',
+          discarded: { inbound: { count: 1, ids: ['m2'] }, centralRows: [{ table: 'schema_version', count: 1 }] },
+          keptAt: expect.stringContaining(path.join(layoutOf(host, runtime).root, 'quarantine')),
+        },
+      },
+      error: { code: 'input_required' },
+      next_actions: expect.arrayContaining([
+        { kind: 'command', argv: ['gws-ea', 'rollback', '--id', runtime.instance_id, '--yes'] },
+      ]),
+    });
+    expect(confirmRollback).not.toHaveBeenCalled();
     // Nothing changed: the assistant was never stopped, and no record was written.
     expect(state.events.slice(events)).toEqual([]);
     expect(state.running).toBe(true);
@@ -307,7 +320,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
   it('serves the release it would leave again when the restore is declined', async () => {
     const { host, runtime, next, state } = await migrated();
     const shown: RollbackPreview[] = [];
-    const { run, out } = cli(host, state, next, runtime, {
+    const { run, transcript: out } = cli(host, state, next, runtime, {
       confirmRollback: async (preview) => {
         shown.push(preview);
         return false;
@@ -330,7 +343,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
 
   it('restores the snapshot once confirmed, keeping the state it replaced in quarantine', async () => {
     const { host, runtime, next, state } = await migrated();
-    const { run, out } = cli(host, state, next, runtime);
+    const { run, transcript: out } = cli(host, state, next, runtime);
 
     expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
@@ -359,7 +372,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     } finally {
       inbound.close();
     }
-    const { run, out } = cli(host, state, next, runtime);
+    const { run, transcript: out } = cli(host, state, next, runtime);
 
     expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 

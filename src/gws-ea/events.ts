@@ -14,6 +14,7 @@ import type { RunLog, StepLog } from './run-log.js';
 import { GwsEaError, type GwsEaErrorOptions } from './types.js';
 
 export type RunEvent =
+  | { readonly type: 'domain-effect'; readonly step: string; readonly changed: true | null }
   /** Unlabeled steps are logged but not rendered as progress. */
   | { readonly type: 'step-started'; readonly step: string; readonly label?: string }
   | { readonly type: 'step-waiting'; readonly step: string; readonly reason: string }

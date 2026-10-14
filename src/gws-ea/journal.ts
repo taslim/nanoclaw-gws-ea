@@ -108,6 +108,8 @@ export interface InstanceOperation {
   readonly [operationBrand]: true;
   /** Throws `operation_inactive` once released; every write under the lock checks it first. */
   assertActive(): void;
+  /** Evidence from persistent journal/receipt writes for the invocation result. */
+  readonly recordEffect?: (changed: true | null) => void;
   release(): void;
 }
 
@@ -325,8 +327,12 @@ async function updateProvisionJournal(
   change: (journal: ProvisionJournal) => ProvisionJournal,
 ): Promise<ProvisionJournal> {
   assertActiveOperation(operation);
-  const next = change(await readProvisionJournal(operation.paths, operation.instanceId));
+  const current = await readProvisionJournal(operation.paths, operation.instanceId);
+  const next = change(current);
+  if (next === current) return current;
+  operation.recordEffect?.(null);
   await writePrivate(operation.paths.journalFile(operation.instanceId), next);
+  operation.recordEffect?.(true);
   return next;
 }
 
@@ -421,6 +427,7 @@ export async function acquireInstanceOperation(
   paths: ControlPlanePaths,
   instanceId: string,
   intent: OperationIntent = { command: 'resume' },
+  recordEffect?: InstanceOperation['recordEffect'],
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
   await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
@@ -438,7 +445,7 @@ export async function acquireInstanceOperation(
     }
     const reservation = await getInstanceReservation(paths, instanceId);
     await preparePrivateDirectory(paths.instanceRoot(instanceId));
-    await admitInstanceCommand(paths, reservation, intent);
+    await admitInstanceCommand(paths, reservation, intent, recordEffect);
     if (CONTRACT_BOUND.has(intent.command)) await readProvisionJournal(paths, instanceId);
   } catch (error) {
     unlock();
@@ -449,6 +456,7 @@ export async function acquireInstanceOperation(
     instanceId,
     paths,
     [operationBrand]: true,
+    ...(recordEffect ? { recordEffect } : {}),
     assertActive: () => assertActiveOperation(operation),
     release: () => {
       if (!active) return;

@@ -140,6 +140,74 @@ function report(overrides: Partial<FailureReport> = {}): FailureReport {
   };
 }
 
+describe('launcher interaction modes', () => {
+  afterEach(() => vi.clearAllMocks());
+  it.each([
+    { label: 'all streams attached', stdin: true, stdout: true, stderr: true, override: undefined, expected: true },
+    { label: 'stdout redirected', stdin: true, stdout: false, stderr: true, override: undefined, expected: true },
+    { label: 'stdin redirected', stdin: false, stdout: true, stderr: true, override: undefined, expected: false },
+    { label: 'stderr redirected', stdin: true, stdout: true, stderr: false, override: undefined, expected: false },
+    {
+      label: 'interactive explicitly disabled',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: false,
+      expected: false,
+    },
+    {
+      label: 'interactive explicitly enabled',
+      stdin: false,
+      stdout: false,
+      stderr: false,
+      override: true,
+      expected: true,
+    },
+  ])('uses the input and prompt streams with $label', async ({ stdin, stdout, stderr, override, expected }) => {
+    const streams = [process.stdin, process.stdout, process.stderr];
+    const descriptors = streams.map((stream) => Object.getOwnPropertyDescriptor(stream, 'isTTY'));
+    const ttyValues = [stdin, stdout, stderr];
+    try {
+      for (const [index, stream] of streams.entries()) {
+        Object.defineProperty(stream, 'isTTY', { configurable: true, value: ttyValues[index] });
+      }
+      await main(['create', '--track', 'dogfood'], { interactive: override });
+      const runtime = runtimeOf();
+      expect(Boolean(runtime.prompts)).toBe(expected);
+      expect(Boolean(runtime.presenter)).toBe(expected);
+      expect(Boolean(runtime.onFailure)).toBe(expected);
+      await runtime.collectCreateInputs!({ marker: 'context' } as never);
+      expect(fixture.collect).toHaveBeenCalledWith(
+        { marker: 'context' },
+        { providers: fixture.providers, interactive: expected },
+      );
+    } finally {
+      for (const [index, stream] of streams.entries()) {
+        const descriptor = descriptors[index];
+        if (descriptor) Object.defineProperty(stream, 'isTTY', descriptor);
+        else Reflect.deleteProperty(stream, 'isTTY');
+      }
+    }
+  });
+
+  it.each([['--json'], ['--no-input']] as const)(
+    'suppresses actual launcher hooks for %s despite an interactive override',
+    async (mode) => {
+      await main(['remove', '--id', '11111111-1111-4111-8111-111111111111', mode], { interactive: true });
+      const runtime = runtimeOf();
+      expect(runtime.prompts).toBeUndefined();
+      expect(runtime.confirmRemoval).toBeUndefined();
+      expect(runtime.confirmUpdate).toBeUndefined();
+      expect(runtime.confirmUpdateAll).toBeUndefined();
+      expect(runtime.confirmRollback).toBeUndefined();
+      expect(runtime.onFailure).toBeUndefined();
+      expect(runtime.presenter).toBeUndefined();
+      expect(fixture.confirm).not.toHaveBeenCalled();
+      expect(fixture.offerDiagnosis).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('GWS-EA driver', () => {
   afterEach(() => {
     vi.clearAllMocks();
@@ -176,7 +244,7 @@ describe('GWS-EA driver', () => {
   });
 
   it('wires the spinner, prompts, gcloud guidance, and failure loop on a TTY', async () => {
-    await main(['resume', '--id', 'x'], { interactive: true });
+    await main(['resume', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
     const runtime = runtimeOf();
 
     expect(runtime.presenter).toBeDefined();
@@ -211,7 +279,7 @@ describe('GWS-EA driver', () => {
   });
 
   it('offers diagnosis, then a retry, after an interactive failure', async () => {
-    await main(['resume', '--id', 'x'], { interactive: true });
+    await main(['resume', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
     const { onFailure } = runtimeOf();
 
     await expect(onFailure!(report())).resolves.toBe('retry');
@@ -237,7 +305,9 @@ describe('GWS-EA driver', () => {
   ] as const)(
     'offers to run a failed %s again, since only create and resume continue from where they stopped',
     async (command, step) => {
-      await main([command, '--id', 'x'], { interactive: true });
+      await main(command === 'cleanup' ? [command] : [command, '--id', '11111111-1111-4111-8111-111111111111'], {
+        interactive: true,
+      });
       const { onFailure } = runtimeOf();
 
       await onFailure!(report({ command, step, nextAction: `Retry with: gws-ea ${command} --id x` }));
@@ -245,12 +315,13 @@ describe('GWS-EA driver', () => {
       expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
         message: `Retry now? gws-ea runs ${command} again.`,
         initialValue: true,
+        output: process.stderr,
       });
     },
   );
 
   it("gives an update this tool's provider setup, read only when an update asks for it", async () => {
-    await main(['update', '--id', 'x'], { interactive: false });
+    await main(['update', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: false });
     const runtime = runtimeOf();
     expect(fixture.providers[0]!.provisioning.credentialMetadata).not.toHaveBeenCalled();
 
@@ -272,7 +343,7 @@ describe('GWS-EA driver', () => {
   });
 
   it('asks before a rollback restores a snapshot on a TTY, naming the assistant and the release, defaulting to keep what it recorded', async () => {
-    await main(['rollback', '--id', 'x'], { interactive: true });
+    await main(['rollback', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
     const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'a'.repeat(40) } };
 
@@ -281,11 +352,12 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
       message: `Restore assistant x's pre-update snapshot on dogfood ${'a'.repeat(12)}, discarding what it recorded since?`,
       initialValue: false,
+      output: process.stderr,
     });
   });
 
   it('asks before an update on a TTY, naming the assistant and its new release, defaulting to wait', async () => {
-    await main(['update', '--id', 'x'], { interactive: true });
+    await main(['update', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
     const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
 
@@ -294,6 +366,7 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
       message: `Update assistant x to dogfood ${'b'.repeat(12)}?`,
       initialValue: false,
+      output: process.stderr,
     });
   });
 
@@ -314,6 +387,7 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
       message: `Update 2 assistants to this tool's release ${'c'.repeat(12)}, as planned above?`,
       initialValue: false,
+      output: process.stderr,
     });
   });
 
@@ -329,12 +403,13 @@ describe('GWS-EA driver', () => {
   });
 
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
-    await main(['remove', '--id', 'x'], { interactive: true });
+    await main(['remove', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
     await expect(runtimeOf().confirmRemoval!({ instanceId: 'x', gcpProject: 'p' } as never)).resolves.toBe(false);
     expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
       message: expect.stringMatching(/assistant x .*GCP project p\?$/u),
       initialValue: false,
+      output: process.stderr,
     });
   });
 });
@@ -388,9 +463,11 @@ describe('GWS-EA terminal presenter', () => {
       details: ['Log: /logs/progress.log'],
       tail: 'last stderr line',
     });
-    expect(fixture.log.error).toHaveBeenCalledWith('Stopped at start_onecli: OneCLI did not become healthy');
-    expect(fixture.log.message).toHaveBeenCalledWith('Log: /logs/progress.log');
-    expect(fixture.dump).toHaveBeenCalledWith('last stderr line');
+    expect(fixture.log.error).toHaveBeenCalledWith('Stopped at start_onecli: OneCLI did not become healthy', {
+      output: process.stderr,
+    });
+    expect(fixture.log.message).toHaveBeenCalledWith('Log: /logs/progress.log', { output: process.stderr });
+    expect(fixture.log.message).toHaveBeenCalledWith('last stderr line', { output: process.stderr });
   });
 });
 
@@ -407,7 +484,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
   });
 
   async function wiredHelpers(runner: NanoclawCommandRunner): Promise<NanoclawServiceHelpers> {
-    await main(['remove', '--id', 'x'], { interactive: false });
+    await main(['remove', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: false });
     const helpers = runtimeOf().serviceHelpers;
     if (!helpers) throw new Error('The driver supplied no service helpers');
     return { ...helpers, createCommandRunner: () => runner };

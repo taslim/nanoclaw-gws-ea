@@ -39,7 +39,14 @@ jobs:
       - name: Typecheck container
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
+      - name: Install completion test shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh fish
+
       - name: Host tests
+        env:
+          GWS_EA_FISH_TEST_BINARY: /usr/bin/fish
         run: pnpm exec vitest run
 
       - name: Container tests

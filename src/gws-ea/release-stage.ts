@@ -68,6 +68,7 @@ export interface ReleaseStageRequest {
 
 /** The boundaries staging crosses; each defaults to this process's. */
 export interface ReleaseStageSeams extends CheckoutRuntime {
+  readonly recordEffect?: (changed: true | null) => void;
   /** Runs the release's frozen install and its build. */
   readonly runSetupCommand?: ReleasePreflightRuntime['runSetupCommand'];
   /** The operator's environment, which Docker runs with. */
@@ -89,11 +90,13 @@ export async function stageRelease(request: ReleaseStageRequest, seams: ReleaseS
   const layout = paths.instanceLayout(view.instance_id);
   const name = releaseName(view.deployed_commit);
   if (await isReleaseComplete(layout, name)) return;
+  seams.recordEffect?.(null);
   await discardIncompleteRelease(layout, name);
   const release = layout.release(name);
   const run = seams.runCommand ?? runSanitizedCommand;
 
   await materializeReleaseCheckout(paths, view, seams);
+  seams.recordEffect?.(true);
   const preflight = await runReleasePreflight(
     { ...request.provider, checkoutRoot: release },
     { runCommand: run, runSetupCommand: seams.runSetupCommand },

@@ -66,6 +66,8 @@ export interface ToolCheckout extends StraySeams {
 
 /** Upstream's helpers removal stops the stray's host with; the launcher supplies them. */
 export interface StrayLauncher {
+  readonly recordRemoved?: (part: string) => void;
+  readonly recordEffect?: (changed: true | null) => void;
   readonly hostStatus: HostStatusHelpers;
   readonly serviceHelpers: NanoclawServiceHelpers;
 }
@@ -239,6 +241,7 @@ export async function removeStrayInstall(
       throw error;
     }
     removed.push(label);
+    launcher.recordRemoved?.(label);
   };
 
   const answering = await host();
@@ -246,6 +249,7 @@ export async function removeStrayInstall(
   // NanoClaw's own nohup stop would signal.
   if (answering === undefined) await remove(path.join(root, 'nanoclaw.pid'), 'nanoclaw.pid');
   if (typeof answering === 'number') {
+    launcher.recordEffect?.(null);
     (checkout.terminate ?? terminate)(answering);
     // Gone, or replaced by a service manager restarting it, which the teardown stops.
     const now = await pollUntil(
@@ -258,7 +262,9 @@ export async function removeStrayInstall(
       },
     );
     if (now === answering) throw stillAnswering();
+    launcher.recordEffect?.(true);
   }
+  launcher.recordEffect?.(null);
   await uninstallNanoclaw(
     {
       checkoutRoot: root,
@@ -268,13 +274,16 @@ export async function removeStrayInstall(
     },
     { platform: stray.platform, run, sleep, serviceHelpers: launcher.serviceHelpers, recordedImages: [] },
   );
+  for (const part of strayParts({ ...found, files: [] })) launcher.recordRemoved?.(part);
   if ((await host()) !== undefined) throw stillAnswering();
 
   const env = path.join(root, '.env');
   if (await exists(env)) {
     const backup = checkout.backupEnv(env);
     await rm(env, { force: true });
-    removed.push(`.env (kept as ${path.basename(backup)})`);
+    const part = `.env (kept as ${path.basename(backup)})`;
+    removed.push(part);
+    launcher.recordRemoved?.(part);
   }
   for (const [entry, label] of [
     ['groups', 'groups/'],
@@ -289,8 +298,14 @@ export async function removeStrayInstall(
   const logEntries = (await entryAt(logs))?.isDirectory()
     ? (await readdir(logs)).filter((entry) => entry !== OWN_LOG)
     : [];
-  for (const entry of logEntries) await rm(path.join(logs, entry), { recursive: true, force: true });
-  if (logEntries.length > 0) removed.push("NanoClaw's logs");
+  for (const entry of logEntries) {
+    await rm(path.join(logs, entry), { recursive: true, force: true });
+    launcher.recordEffect?.(true);
+  }
+  if (logEntries.length > 0) {
+    removed.push("NanoClaw's logs");
+    launcher.recordRemoved?.("NanoClaw's logs");
+  }
   // NanoClaw's setup links `ncl` to its checkout; a link to any other install stays.
   const ncl = path.join(stray.homeDirectory, '.local', 'bin', 'ncl');
   const linked = await readlink(ncl).then(

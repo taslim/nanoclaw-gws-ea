@@ -390,7 +390,9 @@ describe('operation gate', () => {
         const refusal = await acquireInstanceOperation(paths, instanceId, { command }).catch((error: unknown) => error);
         expect(refusal, `${command} at ${phase}`).toMatchObject({ code: 'operation_in_progress' });
         expect((refusal as Error).message).toContain(`(${phase})`);
-        expect((refusal as Error).message).toContain(`gws-ea update --id ${instanceId}`);
+        expect((refusal as Error).message).toContain(
+          `gws-ea update --id ${instanceId} --track ${TO.release_track} --source-remote ${TO.source_remote}`,
+        );
         expect((refusal as Error).message).toContain(`gws-ea rollback --id ${instanceId}`);
       }
       const moved = await acquireInstanceOperation(paths, instanceId, { command: 'update', target: NEWER }).catch(
@@ -464,7 +466,9 @@ describe('operation gate', () => {
     (await held(paths, instanceId, { command: 'update', target: TO })).release();
     expect(await inspectOperation(paths, await getInstanceReservation(paths, instanceId))).toMatchObject({
       state: 'open',
-      next: { continueWith: `gws-ea update --id ${instanceId}` },
+      next: {
+        continueWith: `gws-ea update --id ${instanceId} --track ${NEWER.release_track} --source-remote ${NEWER.source_remote}`,
+      },
     });
   });
 
@@ -555,7 +559,10 @@ describe('operation inspection for list and status', () => {
       expect(await inspectOperation(paths, await getInstanceReservation(paths, instanceId))).toEqual({
         state: 'open',
         record: expect.objectContaining({ kind: 'update', phase: 'fenced', to: TO, stop: STOP }),
-        next: { continueWith: `gws-ea update --id ${instanceId}`, revertWith: `gws-ea rollback --id ${instanceId}` },
+        next: {
+          continueWith: `gws-ea update --id ${instanceId} --track ${TO.release_track} --source-remote ${TO.source_remote}`,
+          revertWith: `gws-ea rollback --id ${instanceId}`,
+        },
       });
     } finally {
       holder.release();

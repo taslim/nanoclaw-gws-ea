@@ -131,7 +131,7 @@ export async function installVoiceAssets(
     } catch (error) {
       throw new GwsEaError(
         'voice_assets_invalid',
-        'Existing voice assets are invalid. Disable voice, run gws-ea uninstall-voice, then gws-ea install-voice.',
+        'Existing voice assets are invalid. Disable voice, run gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
         { cause: error },
       );
     }
@@ -157,7 +157,7 @@ export async function installVoiceAssets(
     } catch (error) {
       throw new GwsEaError(
         'voice_build_prerequisite',
-        'Voice installation needs CMake, a C compiler, and make. Install those tools, then retry gws-ea install-voice (or pass --cmake /absolute/path).',
+        'Voice installation needs CMake, a C compiler, and make. Install those tools, then retry gws-ea capabilities install voice (or pass --cmake /absolute/path).',
         { cause: error },
       );
     }

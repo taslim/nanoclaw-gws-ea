@@ -81,13 +81,30 @@ export type AssistantUpdate =
   | { readonly kind: 'completed'; readonly release: ReleaseCoordinates };
 
 /** How one assistant's turn ended: its update's end, a failure, or another command holding it. */
-export type UpdateTurn = AssistantUpdate | { readonly kind: 'failed' } | { readonly kind: 'busy' };
+export type UpdateTurn =
+  | AssistantUpdate
+  | { readonly kind: 'failed'; readonly exitCode?: number }
+  | { readonly kind: 'busy' };
+
+export type UpdateTargetResult =
+  | { readonly instance_id: string; readonly outcome: 'completed'; readonly update: AssistantUpdate }
+  | { readonly instance_id: string; readonly outcome: 'skipped'; readonly reason: string }
+  | { readonly instance_id: string; readonly outcome: 'failed' | 'busy' | 'unattempted' };
+
+export function initialUpdateTarget(candidate: UpdateCandidate): UpdateTargetResult {
+  return candidate.eligible
+    ? { instance_id: candidate.instanceId, outcome: 'unattempted' }
+    : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason };
+}
 
 /** The run's stop summary; its outcome is the exit code's. */
 export interface UpdateAllSummary {
   readonly outcome: 'ready' | 'failed' | 'busy';
   readonly headline: string;
   readonly details: readonly string[];
+  readonly targets: readonly UpdateTargetResult[];
+  readonly cancelled?: boolean;
+  readonly exitCode?: number;
 }
 
 /** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
@@ -346,11 +363,18 @@ export async function runUpdateAll(
   plan: UpdateAllPlan,
   confirm: (plan: UpdateAllPlan) => Promise<boolean>,
   updateOne: (instanceId: string, toolCommit: string) => Promise<UpdateTurn>,
-  present: (line: string) => void,
+  present: {
+    readonly preview: (headline: string, details: readonly string[]) => void;
+    readonly progress: (line: string) => void;
+  },
 ): Promise<UpdateAllSummary> {
   const eligible = plan.candidates.flatMap((candidate) => (candidate.eligible ? [candidate.instanceId] : []));
   const skipped = skippedLines(plan.candidates);
   const release = shortCommit(plan.toolCommit);
+  const targets = new Map<string, UpdateTargetResult>(
+    plan.candidates.map((candidate) => [candidate.instanceId, initialUpdateTarget(candidate)]),
+  );
+  const results = (): UpdateTargetResult[] => plan.candidates.map((candidate) => targets.get(candidate.instanceId)!);
   if (eligible.length === 0) {
     return {
       outcome: 'ready',
@@ -359,23 +383,35 @@ export async function runUpdateAll(
           ? 'Nothing to update: no assistants are registered on this machine.'
           : `Nothing to update: no assistant here can move to this tool's release ${release}.`,
       details: skipped,
+      targets: results(),
     };
   }
   const assistants = eligible.length === 1 ? '1 assistant' : `${eligible.length} assistants`;
-  present(`Plan: update ${assistants} to this tool's release ${release}, one at a time:`);
-  for (const line of planLines(plan.candidates)) present(line);
-  // Asked once, before anything is staged: a no changes nothing, as a no to `update --id` does.
+  present.preview(
+    `Plan: update ${assistants} to this tool's release ${release}, one at a time:`,
+    planLines(plan.candidates),
+  );
+  // Asked once, before staging: declining this plan retains no rollout preparation.
   if (!(await confirm(plan))) {
-    return { outcome: 'ready', headline: 'Update cancelled. No assistant was changed.', details: [] };
+    return {
+      outcome: 'ready',
+      cancelled: true,
+      headline: 'Update cancelled. No assistant was changed.',
+      details: [],
+      targets: results(),
+    };
   }
   const ended = new Map<string, AssistantUpdate>();
   for (const [index, instanceId] of eligible.entries()) {
-    present(`Updating assistant ${instanceId} (${index + 1} of ${eligible.length})…`);
+    present.progress(`Updating assistant ${instanceId} (${index + 1} of ${eligible.length})…`);
     const turn = await updateOne(instanceId, plan.toolCommit);
     if (turn.kind === 'failed' || turn.kind === 'busy') {
+      targets.set(instanceId, { instance_id: instanceId, outcome: turn.kind });
       const rest = eligible.slice(index + 1);
       return {
         ...stopOf(turn, instanceId, rest.length > 0 ? `; ${rest.length} not attempted` : ''),
+        targets: results(),
+        exitCode: turn.kind === 'busy' ? 75 : (turn.exitCode ?? 1),
         details: [
           ...outcomeLines(ended, skipped),
           `Stopped at ${instanceId}; its summary above says why and what to run.`,
@@ -384,10 +420,12 @@ export async function runUpdateAll(
       };
     }
     ended.set(instanceId, turn);
+    targets.set(instanceId, { instance_id: instanceId, outcome: 'completed', update: turn });
   }
   return {
     outcome: 'ready',
     headline: `update --all finished: ${counted(ended, skipped.length)}.`,
     details: outcomeLines(ended, skipped),
+    targets: results(),
   };
 }

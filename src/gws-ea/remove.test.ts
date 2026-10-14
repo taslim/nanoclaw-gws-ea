@@ -817,6 +817,12 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: STARTED });
     await signIn(paths, input);
+    const voicePolicy = path.join(paths.configRoot, 'voice.json');
+    const voiceAssets = path.join(paths.stateRoot, 'voice', 'shared-model.bin');
+    await mkdir(path.dirname(voiceAssets), { recursive: true, mode: 0o700 });
+    const policy = JSON.stringify({ schemaVersion: 1, enabled: true, installationDir: path.dirname(voiceAssets) });
+    await writeFile(voicePolicy, policy, { mode: 0o600 });
+    await writeFile(voiceAssets, 'shared immutable model');
     const removal = world(input);
     removal.gcloud.owned();
     removal.google.events.seedSubscription();
@@ -844,6 +850,8 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
       abandoned: [],
     });
     await expectGone(paths, input);
+    expect(await readFile(voicePolicy, 'utf8')).toBe(policy);
+    expect(await readFile(voiceAssets, 'utf8')).toBe('shared immutable model');
   });
 
   it('counts the subscription gone without asking Google when the assistant never signed in', async () => {
@@ -1745,13 +1753,16 @@ describe('removal command', () => {
     );
 
     expect(exitCode).toBe(0);
-    // What removal deletes, all of it the assistant's own: nothing outside the machine but its Google Cloud project.
+    // Scope and consequences are visible before consent; a decline names read-only inspection.
     expect(output.slice(output.indexOf(`Assistant: ${input.instance_id}`))).toEqual([
       `Assistant: ${input.instance_id}`,
       `NanoClaw: ${paths.checkoutRoot(input.instance_id)}`,
       `OneCLI: ${input.exclusive_resource_claims.onecli_project}`,
       `Google Cloud project: ${input.exclusive_resource_claims.gcp_project_id} (${ACCOUNT})`,
+      'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
       'Removal cancelled. Nothing was changed.',
+      `Assistant: ${input.instance_id}`,
+      `Next: gws-ea status --id ${input.instance_id}`,
     ]);
     expect(remove).not.toHaveBeenCalled();
   });
@@ -1799,7 +1810,7 @@ describe('removal command', () => {
         stderr: (line) => errors.push(line),
         removeAssistant: remove,
       }),
-    ).toBe(1);
+    ).toBe(2);
     expect(errors[0]).toBe('--abandon: "registry" cannot be abandoned; choose from gcp-project, chat-subscription');
     expect(remove).not.toHaveBeenCalled();
   });

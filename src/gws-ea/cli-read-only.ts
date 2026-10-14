@@ -2,9 +2,9 @@
  * The read-only commands `list`, `status`, and `logs`, which `cli.ts`
  * dispatches outside its attempt loop (KTD10).
  *
- * This module sits below `cli.ts` and imports nothing from it, so the command
- * vocabulary both use lives here: a command's flags, the `--id` it targets,
- * and how a command run outside the attempt loop ends.
+ * This module sits below `cli.ts` and imports nothing from it. Public grammar
+ * lives in command-definitions; this module owns observation handlers,
+ * explicit target resolution, and how an outside-attempt command ends.
  */
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
@@ -16,20 +16,12 @@ import { buildToolEnvironment, type SanitizedCommand } from './process.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import type { HostStatusHelpers } from './service.js';
 import { hostLogFiles, type NanoclawServiceHelpers } from './service-control.js';
-import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOnlyCommandRuntime } from './status.js';
+import { runListCommand, runStatusCommand, type ReadOnlyCommandRuntime } from './status.js';
+import type { CommandOptions } from './command-parser.js';
 import { detectStrayInstall, strayNote, type ToolCheckout } from './stray-install.js';
 import { GwsEaError } from './types.js';
 
 type LineWriter = (line: string) => void;
-
-/** The flags a command takes: options with a value, and switches without. */
-export interface OptionSpec {
-  readonly values: readonly string[];
-  readonly switches: readonly string[];
-}
-
-/** Parsed flags: each option's value, and `'true'` for each switch given. */
-export type CommandOptions = Readonly<Record<string, string>>;
 
 export function requireOption(options: CommandOptions, name: string): string {
   const value = options[name];
@@ -68,10 +60,8 @@ export interface ReadOnlyContext {
   readonly toolCheckout?: ToolCheckout;
 }
 
-/** A read-only command: its lines in `gws-ea --help`, its flags, and what it does. */
+/** Existing observation handler; its public grammar is owned by command-definitions. */
 export interface ReadOnlyCommand {
-  readonly usage: readonly string[];
-  readonly options: OptionSpec;
   run(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd>;
 }
 
@@ -111,16 +101,13 @@ async function withStrayInstallNote(context: ReadOnlyContext, command: () => Pro
 }
 
 /**
- * The read-only commands, by name. `runCli` dispatches them without the
- * attempt loop, parsing each one's flags from its `options`, and `--help`
- * prints each one's `usage` in this order.
+ * The observation handlers, bound by command-definitions and dispatched
+ * outside the attempt loop after the shared parser validates their grammar.
  */
 export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
   [
     'list',
     {
-      usage: LIST_USAGE,
-      options: { values: [], switches: ['json'] },
       run: (context, options) =>
         withStrayInstallNote(context, () =>
           runListCommand(observationRuntime(context), { json: options.json === 'true' }),
@@ -130,12 +117,14 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
   [
     'status',
     {
-      usage: STATUS_USAGE,
-      options: { values: ['id'], switches: ['json'] },
       run: (context, options) => {
         const instanceId = targetInstance(options);
         return withStrayInstallNote(context, () =>
-          runStatusCommand(observationRuntime(context), { instanceId, json: options.json === 'true' }),
+          runStatusCommand(observationRuntime(context), {
+            instanceId,
+            json: options.json === 'true',
+            details: options.details === 'true',
+          }),
         );
       },
     },
@@ -143,11 +132,6 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
   [
     'logs',
     {
-      usage: [
-        'logs --id <instance_id> [--errors] [--follow]',
-        "       Prints the assistant's host log, or its error log with --errors; --follow keeps printing.",
-      ],
-      options: { values: ['id'], switches: ['errors', 'follow'] },
       run: showHostLog,
     },
   ],

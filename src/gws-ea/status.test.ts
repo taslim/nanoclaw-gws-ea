@@ -28,12 +28,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
+import { parseInvocation } from './command-parser.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
   advanceOperation,
+  admitInstanceCommand,
   beginOperation,
   beginOperationReturn,
   closeOperationFailed,
@@ -51,19 +53,20 @@ import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
 import { writeInstanceMarker } from './registry.js';
+import type { NextAction } from './result.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
-  LIST_USAGE,
   PROBE_NAMES,
-  STATUS_USAGE,
   runListCommand,
   runStatusCommand,
   type ReadOnlyCommandRuntime,
   type StatusObservers,
 } from './status.js';
 import { commitAll, git } from './testing/cutover-fixture.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError, releaseOf, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { resolveUpdateIntent } from './update.js';
 import type { LatestDelivery } from './verify.js';
 
 const roots: string[] = [];
@@ -546,7 +549,17 @@ function command(host: Machine, state: World, observers: Partial<StatusObservers
 async function statusJson(host: Machine, state: World, instanceId: string, observers?: Partial<StatusObservers>) {
   const { runtime, output } = command(host, state, observers);
   const exitCode = await runStatusCommand(runtime, { instanceId, json: true });
-  return { exitCode, status: JSON.parse(output.stdout.join('\n')) as Record<string, unknown> & StatusShape, output };
+  const result = JSON.parse(output.stdout.join('\n')) as {
+    data: Record<string, unknown> & StatusShape;
+    next_actions: readonly NextAction[];
+  };
+  expectResultContract('status', result);
+  return {
+    exitCode,
+    status: result.data,
+    nextActions: result.next_actions,
+    output,
+  };
 }
 
 type ProbeShape = { status: string; reason: string | null } & Record<string, unknown>;
@@ -768,7 +781,7 @@ describe('status', () => {
     });
 
     const ok = command(host, state);
-    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false, details: true });
     expect(ok.output.stdout).toContainEqual(expect.stringMatching(/^ {2}ok {8}inbox {11}last polled /u));
 
     const unhealthySince = '2026-09-28T13:00:00.000Z';
@@ -1002,7 +1015,7 @@ describe('status', () => {
     });
 
     const shown = command(host, state, observers);
-    await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false, details: true });
     const inboxLine = shown.output.stdout.findIndex((line) => /^ {2}ok {8}inbox /u.test(line));
     const checked = formatLocalTime(checkedAt, 'America/New_York');
     expect(shown.output.stdout.slice(inboxLine + 1, inboxLine + 6)).toEqual([
@@ -1022,7 +1035,7 @@ describe('status', () => {
 
     const { status } = await statusJson(host, state, reservation.instance_id);
     const { runtime, output } = command(host, state);
-    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true });
 
     expect(status.release).toEqual({
       deployed_commit: host.release,
@@ -1109,7 +1122,9 @@ describe('status', () => {
     const state = world(reservation);
     const { runtime, output } = command(host, state);
 
-    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true })).toBe(
+      0,
+    );
 
     const text = output.stdout.join('\n');
     expect(text).toContain(`Assistant ${reservation.instance_id}`);
@@ -1134,7 +1149,9 @@ describe('status', () => {
     await recordedWith(host.paths, reservation, { kind, to, followUp });
     const { runtime, output } = command(host, world(reservation));
 
-    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true })).toBe(
+      0,
+    );
 
     // After a rollback, update --id would go on to stage a new update rather than only retry its follow-ups.
     expect(output.stdout).toContain(
@@ -1154,12 +1171,16 @@ describe('status', () => {
     const { status } = await statusJson(host, state, unstarted.instance_id);
     const listed = command(host, state);
     expect(await runListCommand(listed.runtime, { json: true })).toBe(0);
-    const listing = JSON.parse(listed.output.stdout.join('\n')) as { assistants: Array<{ service: unknown }> };
+    const listing = (JSON.parse(listed.output.stdout.join('\n')) as { data: unknown }).data as {
+      assistants: Array<{ service: unknown }>;
+    };
 
     expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
     expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false })).toBe(0);
+    expect(
+      await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false, details: true }),
+    ).toBe(0);
     const voice = text.output.stdout.find((line) => /\bvoice\b/u.test(line));
     expect(voice).toContain('host enablement unknown');
     expect(voice).not.toContain('disabled host-wide');
@@ -1188,9 +1209,11 @@ describe('status', () => {
 
     const { exitCode, status } = await statusJson(host, state, reservation.instance_id, observers);
     const text = command(host, state, observers);
-    expect(await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(
+      await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false, details: true }),
+    ).toBe(0);
     const listed = command(host, state, observers);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...listed.runtime, columns: 500 }, { json: false })).toBe(0);
 
     expect(exitCode).toBe(0);
     expect(status).toMatchObject({ phase: { state: 'fenced' }, operation: { state: 'none' } });
@@ -1248,9 +1271,9 @@ describe('status', () => {
 
     const { status } = await statusJson(host, state, id);
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false, details: true })).toBe(0);
     const listed = command(host, state);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...listed.runtime, columns: 500 }, { json: false })).toBe(0);
 
     expect(status.operation).toMatchObject({
       state: 'failed',
@@ -1263,6 +1286,79 @@ describe('status', () => {
     expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
   });
 
+  it('offers only continuation for an open update superseding one closed for fix-forward', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    await updateFailedWithoutReturn(host.paths, reservation, {
+      ...releaseOf(reservation),
+      deployed_commit: 'c'.repeat(40),
+    });
+    const target = { ...releaseOf(reservation), deployed_commit: await nextRelease(host) };
+    // beginOperation carries no_rollback_target from the failed operation to its open successor.
+    await updateUnfinishedAt(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const { status, nextActions } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+
+    expect(status.operation).toMatchObject({ state: 'open', kind: 'update', to: target, revert_with: null });
+    expect.soft(nextActions).toEqual([{ kind: 'command', argv: ['gws-ea', 'update', '--id', id] }]);
+    expect(text.output.stdout.filter((line) => line.startsWith('  Next:'))).toEqual([
+      `  Next: gws-ea update --id ${id}`,
+    ]);
+    expect(text.output.stdout.join('\n')).not.toContain('gws-ea rollback');
+  });
+
+  it.each([
+    { change: 'custom track', track: 'candidate' },
+    { change: 'source remote', track: 'dogfood' },
+  ])('offers an admitted continuation for an interrupted $change change', async ({ track }) => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const commit = await nextRelease(host);
+    const remote = path.join(host.root, track === 'dogfood' ? 'mirror source' : 'mirror');
+    git(host.root, 'clone', '--quiet', host.tool, remote);
+    git(remote, 'branch', track === 'dogfood' ? 'rebuild-v2' : track);
+    const target: ReleaseCoordinates = { source_remote: remote, release_track: track, deployed_commit: commit };
+    await updateUnfinishedAt(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const { status, nextActions } = await statusJson(host, state, id);
+    const continuation = nextActions[0];
+    if (continuation?.kind !== 'command') throw new Error('Status did not offer a command to continue its update');
+    const invocation = parseInvocation(continuation.argv.slice(1));
+    expect(invocation.definition.path).toEqual(['update']);
+    expect(invocation.options.id).toBe(id);
+    // The actual argv is parsed and resolved at the recorded target tool revision, then checked by the native gate.
+    const intent = await resolveUpdateIntent(
+      host.paths,
+      {
+        instanceId: invocation.options.id,
+        track: invocation.options.track,
+        sourceRemote: invocation.options['source-remote'],
+      },
+      { toolRoot: host.tool },
+    );
+    await expect(
+      admitInstanceCommand(host.paths, reservation, { command: 'update', target: intent.target }),
+    ).resolves.toBeUndefined();
+    expect(intent.target).toEqual(target);
+    expect(continuation.argv).toEqual(['gws-ea', 'update', '--id', id, '--track', track, '--source-remote', remote]);
+
+    const displayedRemote = track === 'dogfood' ? `'${remote}'` : remote;
+    const expected = `gws-ea update --id ${id} --track ${track} --source-remote ${displayedRemote}`;
+    expect(status.operation).toMatchObject({ state: 'open', to: target, continue_with: expected });
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(text.output.stdout).toContain(`  Next: ${expected}`);
+    expect(text.output.stdout.find((line) => line.startsWith('  Operation:'))).toContain(
+      `continue it with ${expected}`,
+    );
+  });
+
   it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
@@ -1272,7 +1368,7 @@ describe('status', () => {
     const id = reservation.instance_id;
 
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false, details: true })).toBe(0);
 
     expect(text.output.stdout).toContain(
       `  Operation: Its rollback to dogfood ${'c'.repeat(12)} failed, and so did returning to the release it left (switched); ` +
@@ -1287,11 +1383,18 @@ describe('status', () => {
     const unknown = randomUUID();
 
     expect(await runStatusCommand(runtime, { instanceId: unknown, json: true })).toBe(1);
-    expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false })).toBe(1);
+    expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false, details: true })).toBe(1);
 
-    expect(output.stdout).toEqual([]);
-    expect(output.stderr.join('\n')).toContain(`No assistant ${unknown} is registered on this machine`);
-    expect(output.stderr.join('\n')).toContain('gws-ea list');
+    expect(JSON.parse(output.stdout.join('\n'))).toMatchObject({
+      outcome: 'failed',
+      changed: false,
+      data: null,
+      error: {
+        code: 'unknown_instance',
+        message: expect.stringContaining(`No assistant ${unknown} is registered on this machine`),
+      },
+    });
+    expect(output.stdout.join('\n')).toContain('gws-ea list');
   });
 });
 
@@ -1308,7 +1411,9 @@ describe('list', () => {
 
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
-    const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
+    const listing = (JSON.parse(json.output.stdout.join('\n')) as { data: unknown }).data as {
+      assistants: Array<Record<string, unknown>>;
+    };
     const current = {
       deployed_commit: host.release,
       tool_commit: host.release,
@@ -1356,7 +1461,7 @@ describe('list', () => {
     );
 
     const text = command(host, state);
-    expect(await runListCommand(text.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...text.runtime, columns: 500 }, { json: false })).toBe(0);
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
@@ -1403,9 +1508,9 @@ describe('list', () => {
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
     const text = command(host, state);
-    expect(await runListCommand(text.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...text.runtime, columns: 500 }, { json: false })).toBe(0);
 
-    const listing = JSON.parse(json.output.stdout.join('\n')) as {
+    const listing = (JSON.parse(json.output.stdout.join('\n')) as { data: unknown }).data as {
       assistants: Array<{ instance_id: string; release: unknown }>;
     };
     expect(Object.fromEntries(listing.assistants.map(({ instance_id, release }) => [instance_id, release]))).toEqual({
@@ -1580,7 +1685,7 @@ describe('read-only commands', () => {
     expect(everything).not.toContain(SENTINEL);
     expect(everything).not.toContain('GWS_EA_');
     // The real readers did observe the fixture.
-    const status = JSON.parse(outputs[1]!.stdout.join('\n')) as StatusShape;
+    const status = (JSON.parse(outputs[1]!.stdout.join('\n')) as { data: unknown }).data as StatusShape;
     expect(status.probes.delivery).toMatchObject({ status: 'ok', last: { message_out_id: 'out-welcome' } });
     expect(status.rollback).toMatchObject({ available: true, schema_moved: true });
     expect(status.probes.checkout).toMatchObject({ status: 'ok', commit: host.release });
@@ -1588,28 +1693,30 @@ describe('read-only commands', () => {
   });
 });
 
-describe('help', () => {
-  it('names every JSON field the commands print', () => {
-    const help = [...LIST_USAGE, ...STATUS_USAGE].join('\n');
-    for (const field of [
-      ...LIST_FIELDS,
-      ...STATUS_FIELDS,
-      ...PROBE_NAMES,
-      'tool_commit',
-      'behind_tool_release',
-      'previous_commit',
-      'schema_moved',
-      'last_success_at',
-      'calendar_notifications',
-      'calendar_access',
-      'consumer_connected',
-      'last_pull_at',
-      'subscription_state',
-      'subscription_expire_time',
-      'sign_in_needed',
-    ]) {
-      expect(help, field).toContain(field);
-    }
+describe('human observation presentation', () => {
+  it('leads with a concise full-ID service and conversation summary, with an explicit detail action', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const { runtime, output } = command(host, world(reservation));
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    const text = output.stdout.join('\n');
+    expect(output.stdout[0]).toBe(`Assistant ${reservation.instance_id}`);
+    expect(text).toContain('Service:');
+    expect(text).toContain('Conversation:');
+    expect(text).toContain(`gws-ea status --id ${reservation.instance_id} --details`);
+    expect(text).not.toContain('Schema:');
+    expect(text).not.toContain('Probes:');
+  });
+
+  it('uses stacked narrow records and retains each full assistant identity', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const { runtime, output } = command(host, world(reservation));
+    expect(await runListCommand({ ...runtime, columns: 40 }, { json: false })).toBe(0);
+    expect(output.stdout[0]).toBe(`Assistant ${reservation.instance_id}`);
+    expect(output.stdout.at(-1)).toBe('Observed: Sep 28, 2026, 10:30 AM');
+    expect(output.stdout).toContain(`  Next: gws-ea status --id ${reservation.instance_id}`);
+    expect(output.stdout.join('\n')).not.toContain('INSTANCE ID');
   });
 
   it('pins the order of the fields status prints', async () => {

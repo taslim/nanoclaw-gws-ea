@@ -353,9 +353,15 @@ export async function readOperationRecord(
   return parseOperationRecord(raw, instanceId);
 }
 
-async function writeRecord(paths: ControlPlanePaths, record: OperationRecord): Promise<OperationRecord> {
+async function writeRecord(
+  paths: ControlPlanePaths,
+  record: OperationRecord,
+  recordEffect?: InstanceOperation['recordEffect'],
+): Promise<OperationRecord> {
   const validated = parseOperationRecord(record, record.instance_id);
+  recordEffect?.(null);
   await writePrivate(paths.operationFile(record.instance_id), validated);
+  recordEffect?.(true);
   return validated;
 }
 
@@ -419,22 +425,28 @@ async function settleRollbackPoint(paths: ControlPlanePaths, record: OperationRe
 async function settleCommitted(
   paths: ControlPlanePaths,
   record: OperationRecord,
+  recordEffect?: InstanceOperation['recordEffect'],
 ): Promise<OperationRecord | undefined> {
+  recordEffect?.(null);
   await settleRollbackPoint(paths, record);
-  return settleFollowUps(paths, record);
+  recordEffect?.(true);
+  return settleFollowUps(paths, record, recordEffect);
 }
 
 /** A committed record with what is left to follow up, or no record once nothing is. */
 async function settleFollowUps(
   paths: ControlPlanePaths,
   record: OperationRecord,
+  recordEffect?: InstanceOperation['recordEffect'],
 ): Promise<OperationRecord | undefined> {
   if (record.follow_ups.length === 0) {
+    recordEffect?.(null);
     await removePrivateFile(paths.operationFile(record.instance_id));
+    recordEffect?.(true);
     return undefined;
   }
   const { returning: _returning, closed: _closed, ...rest } = record;
-  return writeRecord(paths, { ...rest, phase: 'committed', updated_at: new Date().toISOString() });
+  return writeRecord(paths, { ...rest, phase: 'committed', updated_at: new Date().toISOString() }, recordEffect);
 }
 
 /** An open record whose target the registry already names passed its commit point. */
@@ -448,12 +460,35 @@ function committedByRegistry(record: OperationRecord, reservation: InstanceReser
   );
 }
 
+/** Continue an open operation at its recorded target, before the registry has adopted those coordinates. */
+export function operationContinuationArgv(
+  instanceId: string,
+  operation: Pick<OperationRecord, 'kind' | 'from' | 'to'>,
+): readonly string[] {
+  const argv = ['gws-ea', operation.kind, '--id', instanceId];
+  if (
+    operation.kind === 'update' &&
+    (operation.from.release_track !== operation.to.release_track ||
+      operation.from.source_remote !== operation.to.source_remote)
+  )
+    argv.push('--track', operation.to.release_track, '--source-remote', operation.to.source_remote);
+  return argv;
+}
+
+/** Copyable human recovery guidance, derived from argv without interpreting a shell fragment. */
+export function recoveryCommandLine(argv: readonly string[]): string {
+  return argv
+    .map((argument) => (/^[a-zA-Z0-9_./:@=+-]+$/u.test(argument) ? argument : `'${argument.replaceAll("'", `'\\''`)}'`))
+    .join(' ');
+}
+
 export function operationNextSteps(record: OperationRecord): OperationNextSteps {
   const id = record.instance_id;
   if (record.closed === 'failed') return { continueWith: `gws-ea update --id ${id}` };
+  const continueWith = recoveryCommandLine(operationContinuationArgv(id, record));
   return record.kind === 'update' && !record.no_rollback_target
-    ? { continueWith: `gws-ea update --id ${id}`, revertWith: `gws-ea rollback --id ${id}` }
-    : { continueWith: `gws-ea ${record.kind} --id ${id}` };
+    ? { continueWith, revertWith: `gws-ea rollback --id ${id}` }
+    : { continueWith };
 }
 
 /** The clause naming what reverts an unfinished operation, or nothing when only continuing it can. */
@@ -553,10 +588,13 @@ export async function admitInstanceCommand(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   intent: OperationIntent,
+  recordEffect?: InstanceOperation['recordEffect'],
 ): Promise<void> {
   const record = await readOperationRecord(paths, reservation.instance_id);
   if (!record) return;
-  const resolved = committedByRegistry(record, reservation) ? await settleCommitted(paths, record) : record;
+  const resolved = committedByRegistry(record, reservation)
+    ? await settleCommitted(paths, record, recordEffect)
+    : record;
   if (!resolved || resolved.phase === 'committed') return;
   const refused = refusal(resolved, intent);
   if (refused) throw refused;
@@ -691,20 +729,24 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
       "The assistant's recorded release is not the one this operation moves",
     );
   }
-  return writeRecord(paths, {
-    schema_version: OPERATION_RECORD_SCHEMA_VERSION,
-    instance_id: instanceId,
-    kind: start.kind,
-    commit_point: commitPoint,
-    from,
-    to,
-    phase: 'staged',
-    started_at: startedAt,
-    updated_at: now,
-    ...(start.manifest ? { manifest: start.manifest } : {}),
-    follow_ups: followUps,
-    ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
-  });
+  return writeRecord(
+    paths,
+    {
+      schema_version: OPERATION_RECORD_SCHEMA_VERSION,
+      instance_id: instanceId,
+      kind: start.kind,
+      commit_point: commitPoint,
+      from,
+      to,
+      phase: 'staged',
+      started_at: startedAt,
+      updated_at: now,
+      ...(start.manifest ? { manifest: start.manifest } : {}),
+      follow_ups: followUps,
+      ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
+    },
+    operation.recordEffect,
+  );
 }
 
 /** An open record that may still move: not committed, closed, or going back. */
@@ -736,7 +778,11 @@ export async function advanceOperation(
       `An update or rollback cannot move back from ${record.phase} to ${phase}`,
     );
   }
-  return writeRecord(operation.paths, { ...record, ...facts, phase, updated_at: new Date().toISOString() });
+  return writeRecord(
+    operation.paths,
+    { ...record, ...facts, phase, updated_at: new Date().toISOString() },
+    operation.recordEffect,
+  );
 }
 
 /** Add facts to an open operation without moving its phase. */
@@ -746,7 +792,11 @@ export async function recordOperationFacts(
 ): Promise<OperationRecord> {
   const record = await currentRecord(operation);
   assertMoving(record);
-  return writeRecord(operation.paths, { ...record, ...facts, updated_at: new Date().toISOString() });
+  return writeRecord(
+    operation.paths,
+    { ...record, ...facts, updated_at: new Date().toISOString() },
+    operation.recordEffect,
+  );
 }
 
 /** Mark a rollback that failed as going back to the release it left (KTD5); continuing it finishes the return. */
@@ -756,7 +806,11 @@ export async function beginOperationReturn(operation: InstanceOperation): Promis
   if (record.kind !== 'rollback' || record.commit_point !== 'registry' || record.phase === 'committed') {
     throw new GwsEaError('operation_phase', `Only a rollback of a committed release goes back to it`);
   }
-  return writeRecord(operation.paths, { ...record, returning: true, updated_at: new Date().toISOString() });
+  return writeRecord(
+    operation.paths,
+    { ...record, returning: true, updated_at: new Date().toISOString() },
+    operation.recordEffect,
+  );
 }
 
 /** Close an operation that cannot go back for fix-forward (KTD9): only an update to another release replaces it. */
@@ -764,7 +818,11 @@ export async function closeOperationFailed(operation: InstanceOperation): Promis
   const record = await currentRecord(operation);
   if (record.phase === 'committed') throw new GwsEaError('operation_phase', 'A committed operation is not closed');
   const { returning: _returning, ...rest } = record;
-  return writeRecord(operation.paths, { ...rest, closed: 'failed', updated_at: new Date().toISOString() });
+  return writeRecord(
+    operation.paths,
+    { ...rest, closed: 'failed', updated_at: new Date().toISOString() },
+    operation.recordEffect,
+  );
 }
 
 /**
@@ -792,7 +850,9 @@ export async function discardOperation(operation: InstanceOperation): Promise<vo
     });
     return;
   }
+  operation.recordEffect?.(null);
   await removePrivateFile(operation.paths.operationFile(operation.instanceId));
+  operation.recordEffect?.(true);
 }
 
 /**
@@ -820,9 +880,11 @@ export async function commitOperationRelease(operation: InstanceOperation): Prom
         "The assistant's recorded release is not the one this rollback restores",
       );
     }
+    operation.recordEffect?.(null);
     await swapInstanceRelease(paths, instanceId, record.from, record.to);
+    operation.recordEffect?.(true);
   }
-  return settleCommitted(paths, record);
+  return settleCommitted(paths, record, operation.recordEffect);
 }
 
 /** Add follow-ups to a committed operation's, each at most once: a rebuild records the image it displaces first. */
@@ -832,11 +894,15 @@ export async function addFollowUps(
 ): Promise<OperationRecord> {
   const record = await currentRecord(operation);
   if (record.phase !== 'committed') throw new GwsEaError('operation_phase', 'Follow-ups run once committed');
-  return writeRecord(operation.paths, {
-    ...record,
-    follow_ups: planFollowUps(record.follow_ups, followUps),
-    updated_at: new Date().toISOString(),
-  });
+  return writeRecord(
+    operation.paths,
+    {
+      ...record,
+      follow_ups: planFollowUps(record.follow_ups, followUps),
+      updated_at: new Date().toISOString(),
+    },
+    operation.recordEffect,
+  );
 }
 
 /** Mark one follow-up done; the record is deleted with the last. Returns what is left. */
@@ -847,10 +913,14 @@ export async function completeFollowUp(
   const record = await currentRecord(operation);
   if (record.phase !== 'committed') throw new GwsEaError('operation_phase', 'Follow-ups run once committed');
   const done = followUpKey(followUp);
-  return settleFollowUps(operation.paths, {
-    ...record,
-    follow_ups: record.follow_ups.filter((pending) => followUpKey(pending) !== done),
-  });
+  return settleFollowUps(
+    operation.paths,
+    {
+      ...record,
+      follow_ups: record.follow_ups.filter((pending) => followUpKey(pending) !== done),
+    },
+    operation.recordEffect,
+  );
 }
 
 /**

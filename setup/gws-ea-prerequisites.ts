@@ -55,8 +55,8 @@ export interface GuidedPrerequisiteDependencies {
 }
 
 const defaultPrompts: PromptAdapter = {
-  note: p.note,
-  confirm: p.confirm,
+  note: (message, title) => p.note(message, title, { output: process.stderr }),
+  confirm: (options) => p.confirm({ ...options, output: process.stderr }),
   isCancel: p.isCancel,
 };
 
@@ -86,7 +86,7 @@ function defaultResolveExecutable(searchPath: string): Promise<string> {
 }
 
 function defaultRunLogin(executable: string, args: readonly string[]): Promise<number> {
-  return runInheritScript(executable, [...args], { env: buildInteractiveEnvironment() });
+  return runInheritScript(executable, [...args], { env: buildInteractiveEnvironment(), output: process.stderr });
 }
 
 /** Locate gcloud (including the installer's default directory) and put it on PATH for later children. */
