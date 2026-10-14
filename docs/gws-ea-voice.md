@@ -49,11 +49,11 @@ PATH at service runtime. Source, build, model, and license provenance stay with
 the installation. Download checksums and model sizes are checked before
 publication; interrupted or failed builds publish no installation.
 
-The initial default candidate is `large-v3-turbo-q5_0`. Explicit comparison
-models are available through `capabilities install voice --model base` or `--model small`.
+The default model is `base`. Larger models are explicit operator choices through
+`capabilities install voice --model small` or `--model large-v3-turbo-q5_0`.
 Disable voice before changing the selected installation. Real principal-note
 quality qualification and Google Chat live acceptance remain pending; the
-candidate is not a claim that those launch gates passed. Recorded engine smoke
+default is not a claim that those launch gates passed. Recorded engine smoke
 proves the pinned interface, decoding, and silence handling, and does not prove
 intention accuracy or successful assistant actions.
 
@@ -136,7 +136,7 @@ Implementation and local contract/engine checks are complete. Live Google Chat
 notes, the receiving assistant's intended actions and quiet normal reply, and
 real-note model qualification remain pending by user direction. Public speech
 and silence smoke checks demonstrate the engine interface; they do not qualify
-the initial turbo candidate or the whole voice job.
+the base default or the whole voice job.
 
 The [private comparison CLI and acceptance protocol](../src/modules/gws-ea-voice/testing/README.md)
 compare the same operator-supplied human notes through verified base, small,

@@ -31,7 +31,7 @@ describe('shipped voice capability catalog', () => {
       activation: { status: 'disabled', enabled: false },
       assets: { status: 'absent', installations: [] },
       assistants: [],
-      default_model: 'large-v3-turbo-q5_0',
+      default_model: 'base',
     });
     expect(await readdir(root)).toEqual([]);
   });

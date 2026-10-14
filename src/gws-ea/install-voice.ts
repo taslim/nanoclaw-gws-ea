@@ -20,8 +20,8 @@ import {
   type VerifiedVoiceInstallation,
 } from './voice-assets.js';
 
-/** Initial quality candidate; real principal-note qualification remains the launch gate. */
-export const DEFAULT_VOICE_MODEL: VoiceModelId = 'large-v3-turbo-q5_0';
+/** Default for explicit installation; real principal-note qualification remains a launch gate. */
+export const DEFAULT_VOICE_MODEL: VoiceModelId = 'base';
 const LICENSE_INPUTS = [
   {
     file: 'Whisper-model-MIT.txt',

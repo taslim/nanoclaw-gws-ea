@@ -114,6 +114,6 @@ timeouts as failures, not successful long-note cases.
 Choose the smallest candidate that meets that latency budget and has zero
 critical wrong dates, conditions, negations, numbers, recipients, lost requests,
 or extra side effects across the repeated cases. Record human review plus
-actual tool-side verification. The initial turbo installer candidate stays
+actual tool-side verification. The base installer default stays
 unqualified until these gates pass. WhatsApp and additional providers/channels
 are outside this acceptance slice.

@@ -138,12 +138,12 @@ describe('explicit pinned voice recipe', () => {
     expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
     expect(commands.some((command) => command.command === 'tar')).toBe(false);
   });
-  it('publishes the verified owned tree once, records exact build/source provenance, and reuses it without downloads', async () => {
+  it('installs base by default, records exact build/source provenance, and reuses it without downloads', async () => {
     const commands: SanitizedCommand[] = [];
     const fetch = fetchRecipe();
     const result = await installVoiceAssets(
       paths,
-      { model: 'base', cmake: '/operator/tools/cmake' },
+      { cmake: '/operator/tools/cmake' },
       { fetch, runCommand: compiler(commands) },
     );
     expect(result.installationDir).toBe(voiceInstallationDirectory(paths, 'base'));
@@ -169,7 +169,7 @@ describe('explicit pinned voice recipe', () => {
     expect(
       await installVoiceAssets(
         paths,
-        { model: 'base' },
+        {},
         {
           fetch,
           runCommand: async () => {
