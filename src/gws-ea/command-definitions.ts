@@ -1,4 +1,13 @@
-import { managedResultSchema, operationDataSchema, LIST_DATA_SCHEMA, STATUS_DATA_SCHEMA } from './result-schema.js';
+import { VOICE_CAPABILITY } from './capabilities.js';
+import {
+  managedResultSchema,
+  operationDataSchema,
+  LIST_DATA_SCHEMA,
+  STATUS_DATA_SCHEMA,
+  CAPABILITY_LIST_SCHEMA,
+  VOICE_CAPABILITY_SCHEMA,
+  VOICE_OPERATION_SCHEMA,
+} from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
   | 'create'
@@ -16,7 +25,10 @@ export type CommandHandler =
   | { readonly kind: 'attempt'; readonly command: AttemptCommand }
   | { readonly kind: 'observation'; readonly command: 'list' | 'status' | 'logs' }
   | { readonly kind: 'native'; readonly command: 'ncl' }
-  | { readonly kind: 'voice'; readonly command: 'install-voice' | 'enable-voice' | 'disable-voice' | 'uninstall-voice' }
+  | {
+      readonly kind: 'capability';
+      readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
+    }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
 export type OutputMode = 'human' | 'json' | 'native' | 'shell';
@@ -44,7 +56,7 @@ export interface ArgumentDefinition {
 export interface CommandDefinition {
   readonly path: readonly string[];
   readonly summary: string;
-  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Optional voice' | 'Discovery';
+  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Capabilities' | 'Discovery';
   readonly handler: CommandHandler;
   readonly options: readonly OptionDefinition[];
   readonly arguments?: readonly ArgumentDefinition[];
@@ -340,62 +352,120 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('cleanup')),
   },
-  {
-    path: ['install-voice'],
-    group: 'Optional voice',
-    handler: { kind: 'voice', command: 'install-voice' },
-    summary: 'Build and select shared local voice assets, initially disabled.',
-    scope: 'host',
-    options: [
-      {
-        name: 'model',
-        type: 'string',
-        valueName: 'base|small|large-v3-turbo-q5_0',
-        choices: ['base', 'small', 'large-v3-turbo-q5_0'],
-        description: 'Voice model; defaults to large-v3-turbo-q5_0.',
-      },
-      value('cmake', '/absolute/path', 'Explicit CMake executable.'),
-    ],
-    effects: ['Downloads and builds shared host assets; installation leaves recognition disabled.'],
-    prerequisites: ['Supported host and build tools; host-wide voice lock must be free.'],
-    recovery: ['Rerun installation after fixing its reported asset or build blocker.'],
-    examples: ['gws-ea install-voice --model large-v3-turbo-q5_0'],
-    outputModes: managedModes,
-    resultSchema: managedResultSchema(operationDataSchema('install-voice')),
-  },
-  ...(['enable-voice', 'disable-voice', 'uninstall-voice'] as const).map(
-    (command): CommandDefinition => ({
-      path: [command],
-      group: 'Optional voice',
-      handler: { kind: 'voice', command },
+  ...(['list', ...VOICE_CAPABILITY.actions] as const).map((command): CommandDefinition => {
+    if (command === 'list' || command === 'show' || command === 'check')
+      return {
+        path: ['capabilities', command],
+        group: 'Capabilities',
+        handler: { kind: 'capability', command },
+        summary:
+          command === 'list'
+            ? 'List supported optional host capabilities and their installed and enabled state.'
+            : command === 'show'
+              ? 'Show voice scope, assets, compatibility, prerequisites, and readiness limits.'
+              : 'Verify selected voice assets and observe managed consumers without changing state.',
+        scope: 'host',
+        options: [],
+        ...(command === 'list'
+          ? {}
+          : {
+              arguments: [
+                {
+                  name: 'capability',
+                  description: 'Shipped capability to inspect.',
+                  required: true,
+                  choices: [VOICE_CAPABILITY.name],
+                },
+              ],
+            }),
+        effects: [
+          command === 'check'
+            ? 'Read-only asset verification and bounded native voice health probes; no downloads, enablement, restart, or recording processing.'
+            : 'Read-only local capability and release inspection; consumer readiness requires check.',
+        ],
+        prerequisites: observationPrerequisites,
+        recovery: ['Inspect capability facts; use its explicit install, enable, disable, or uninstall action.'],
+        examples: [`gws-ea capabilities ${command}${command === 'list' ? '' : ' voice'} --json`],
+        outputModes: managedModes,
+        resultSchema: managedResultSchema(command === 'list' ? CAPABILITY_LIST_SCHEMA : VOICE_CAPABILITY_SCHEMA),
+      };
+    if (command === 'install')
+      return {
+        path: ['capabilities', 'install'],
+        group: 'Capabilities',
+        handler: { kind: 'capability', command: 'install' },
+        summary: 'Build and select shared local voice assets, initially disabled.',
+        scope: 'host',
+        arguments: [
+          {
+            name: 'capability',
+            description: 'Shipped capability to install.',
+            required: true,
+            choices: [VOICE_CAPABILITY.name],
+          },
+        ],
+        options: [
+          {
+            name: 'model',
+            type: 'string',
+            valueName: 'base|small|large-v3-turbo-q5_0',
+            choices: VOICE_CAPABILITY.models,
+            description: `Voice model; defaults to ${VOICE_CAPABILITY.default_model}.`,
+          },
+          value('cmake', '/absolute/path', 'Explicit CMake executable.'),
+        ],
+        effects: [
+          'Downloads and builds pinned shared host assets; installation leaves recognition disabled.',
+          'Verifies and reuses a valid existing installation without downloads.',
+        ],
+        prerequisites: VOICE_CAPABILITY.prerequisites,
+        recovery: [
+          'For corrupt assets: capabilities disable voice, capabilities uninstall voice, then capabilities install voice.',
+        ],
+        examples: ['gws-ea capabilities install voice --model large-v3-turbo-q5_0'],
+        outputModes: managedModes,
+        resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
+      };
+    return {
+      path: ['capabilities', command],
+      group: 'Capabilities',
+      handler: { kind: 'capability', command },
       scope: 'host',
       options: [],
+      arguments: [
+        {
+          name: 'capability',
+          description: 'Shipped capability to operate.',
+          required: true,
+          choices: [VOICE_CAPABILITY.name],
+        },
+      ],
       summary:
-        command === 'enable-voice'
-          ? 'Enable recognition for compatible current and future assistants.'
-          : command === 'disable-voice'
-            ? 'Stop new recognition while retaining shared assets.'
-            : 'Remove recipe-owned shared assets after all consumers drain.',
+        command === 'enable'
+          ? 'Enable voice for compatible current and future assistants.'
+          : command === 'disable'
+            ? 'Prevent new recognition while retaining shared assets.'
+            : 'Remove recipe-owned voice assets after managed consumers drain.',
       effects: [
-        command === 'enable-voice'
-          ? 'Enables shared voice host-wide.'
-          : command === 'disable-voice'
-            ? 'Disables new recognition; text service remains available.'
-            : 'Removes recipe-owned assets only.',
+        command === 'enable'
+          ? 'Enables voice host-wide; recognition success is not established.'
+          : command === 'disable'
+            ? 'Disables new recognition; existing preparation finishes and assets remain.'
+            : 'Removes recipe-owned assets only; unreachable consumers do not prove drainage.',
       ],
       prerequisites: [
-        command === 'enable-voice'
-          ? 'Voice assets must already be installed.'
-          : command === 'disable-voice'
+        command === 'enable'
+          ? 'Valid recipe-owned voice assets must already be installed.'
+          : command === 'disable'
             ? 'Host-wide voice lock must be free.'
-            : 'Voice must be disabled and every consumer proven drained.',
+            : 'Voice must be disabled, every managed consumer proven drained, and recipe-owned files have no open holders.',
       ],
-      recovery: ["Follow the operation's reported asset, policy, or consumer blocker."],
-      examples: [`gws-ea ${command}`],
+      recovery: ['Follow the reported policy, asset, or consumer blocker; check observes readiness without repair.'],
+      examples: [`gws-ea capabilities ${command} voice`],
       outputModes: managedModes,
-      resultSchema: managedResultSchema(operationDataSchema(command)),
-    }),
-  ),
+      resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
+    };
+  }),
   ...(['help', 'schema'] as const).map(
     (command): CommandDefinition => ({
       path: [command],
@@ -477,4 +547,17 @@ export function findCommand(path: readonly string[]): CommandDefinition | undefi
   return COMMAND_DEFINITIONS.find(
     (command) => command.path.length === path.length && command.path.every((part, index) => part === path[index]),
   );
+}
+
+/** Namespaces are derived from registered leaves, never fake operations. */
+export interface CommandNamespace {
+  readonly path: readonly string[];
+  readonly commands: readonly CommandDefinition[];
+}
+export type DiscoveryTarget = CommandDefinition | CommandNamespace;
+export function findNamespace(path: readonly string[]): CommandNamespace | undefined {
+  const commands = COMMAND_DEFINITIONS.filter(
+    (command) => command.path.length > path.length && path.every((part, index) => command.path[index] === part),
+  );
+  return path.length > 0 && commands.length > 0 ? { path, commands } : undefined;
 }

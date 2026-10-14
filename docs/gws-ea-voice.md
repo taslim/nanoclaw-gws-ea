@@ -19,8 +19,11 @@ processes are private to an instance.
 Run these commands from the operator's existing gws-ea checkout:
 
 ```sh
-gws-ea install-voice
-gws-ea enable-voice
+gws-ea capabilities list
+gws-ea capabilities show voice
+gws-ea capabilities install voice
+gws-ea capabilities enable voice
+gws-ea capabilities check voice
 gws-ea status --id <instance_id>
 ```
 
@@ -44,7 +47,7 @@ the installation. Download checksums and model sizes are checked before
 publication; interrupted or failed builds publish no installation.
 
 The initial default candidate is `large-v3-turbo-q5_0`. Explicit comparison
-models are available through `install-voice --model base` or `--model small`.
+models are available through `capabilities install voice --model base` or `--model small`.
 Disable voice before changing the selected installation. Real principal-note
 quality qualification and Google Chat live acceptance remain pending; the
 candidate is not a claim that those launch gates passed. Recorded engine smoke
@@ -60,6 +63,22 @@ Instance `.env` files carry only `GWS_EA_VOICE_POLICY_FILE`, the same absolute
 policy locator. This is a native configuration binding, not per-assistant
 enablement. Enabling binds current instances; creates and release cutovers bind
 future compatible hosts. Hosts read the shared policy for each note.
+
+`capabilities list` distinguishes supported host functionality, installed
+recipe-owned directories, the selected assets, and host activation. `capabilities
+show voice` reports the selected model, exact recipe and source provenance,
+installation prerequisites, current release compatibility, and readiness limits.
+`capabilities check voice --json` verifies assets and queries only bounded native
+voice health. It retains unknown compatibility and unreachable consumers;
+missing or corrupt assets never count as drained consumers. These observations
+do not download, enable, restart, or process recordings. Principal response
+preferences remain principal-owned. Inspection returns exit 0 when the
+observation completed, including absent assets, corrupt assets, disabled policy,
+or unreachable consumers retained as facts; it does not mean voice is ready.
+Every managed JSON result uses the schema-version-1 envelope. Invalid or
+unsupported invocations return exit 2; operational failure returns 1 and busy
+returns 75. Voice failures retain native error codes and structured next actions
+when the domain has an exact recovery command.
 
 `status --json` reports the global flag, verified/absent/invalid assets, release
 compatibility, observed host readiness, queued and active preparation, and the
@@ -79,8 +98,8 @@ operator repair commands.
 ## Disable and remove
 
 ```sh
-gws-ea disable-voice
-gws-ea uninstall-voice
+gws-ea capabilities disable voice
+gws-ea capabilities uninstall voice
 ```
 
 Disablement stops new recognition everywhere without restarting text service.
@@ -133,3 +152,14 @@ routing failure releases the conversation queue. If fan-out was only partly
 written, a later cancellation can reach a previously unwritten target before
 the failed note is redelivered there. Successful preparation preserves order;
 retry after a routing failure retains the native recovery limits.
+
+## Command revision
+
+Voice operations now use the native `capabilities` namespace. Older root voice
+commands are rejected as usage errors; use `gws-ea help capabilities` to discover
+the current actions. Existing policies, immutable asset receipts, journals,
+permissions, and principal preferences keep their existing formats. No storage
+migration is needed. Verify the revision with `gws-ea capabilities show voice
+--json` and `gws-ea capabilities check voice --json`. To roll back the command
+interface, use the previously committed tool release; the shared policy and
+installed assets remain compatible.

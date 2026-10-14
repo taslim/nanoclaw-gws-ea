@@ -817,6 +817,12 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: STARTED });
     await signIn(paths, input);
+    const voicePolicy = path.join(paths.configRoot, 'voice.json');
+    const voiceAssets = path.join(paths.stateRoot, 'voice', 'shared-model.bin');
+    await mkdir(path.dirname(voiceAssets), { recursive: true, mode: 0o700 });
+    const policy = JSON.stringify({ schemaVersion: 1, enabled: true, installationDir: path.dirname(voiceAssets) });
+    await writeFile(voicePolicy, policy, { mode: 0o600 });
+    await writeFile(voiceAssets, 'shared immutable model');
     const removal = world(input);
     removal.gcloud.owned();
     removal.google.events.seedSubscription();
@@ -844,6 +850,8 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
       abandoned: [],
     });
     await expectGone(paths, input);
+    expect(await readFile(voicePolicy, 'utf8')).toBe(policy);
+    expect(await readFile(voiceAssets, 'utf8')).toBe('shared immutable model');
   });
 
   it('counts the subscription gone without asking Google when the assistant never signed in', async () => {

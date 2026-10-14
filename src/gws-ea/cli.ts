@@ -1,3 +1,4 @@
+import { capabilityLines, inspectVoiceCapability, voiceCapabilityRecovery } from './capabilities.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -14,7 +15,13 @@ import { formatLocalTime } from '../timezone.js';
 import { READ_ONLY_COMMANDS, requireOption, targetInstance, type CommandEnd } from './cli-read-only.js';
 import type { AttemptCommand as Command } from './command-definitions.js';
 import { completionScript, helpLines, schemaDocument, toolVersion } from './command-discovery.js';
-import { discoveryTarget, parseInvocation, type CommandOptions, type ParsedInvocation } from './command-parser.js';
+import {
+  discoveryTarget,
+  parseInvocation,
+  requestedCommandPath,
+  type CommandOptions,
+  type ParsedInvocation,
+} from './command-parser.js';
 import {
   CREATE_INPUT_FLAGS,
   SECRET_INPUTS,
@@ -2023,7 +2030,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     if (json) resultWritten = true;
     resultOutput(line);
   };
-  const requestedCommand = outer.find((arg) => !arg.startsWith('-')) ?? '';
+  const requestedCommand = requestedCommandPath(outer);
   const emitResult = (result: ManagedResult): void => {
     if (json && !resultWritten) output(resultJson(result));
   };
@@ -2126,10 +2133,14 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   };
   const environment = runtime.environment ?? process.env;
   switch (handler.kind) {
-    case 'voice': {
+    case 'capability': {
       const command = handler.command;
       let changed: Changed = false;
-      let data: import('./result.js').VoiceOperationData | null = null;
+      let data:
+        | import('./result.js').VoiceOperationData
+        | import('./capabilities.js').VoiceCapabilityObservation
+        | import('./capabilities.js').CapabilityList
+        | null = null;
       const stopObservingInterruption = observeInterruption(() => ({ changed, data }));
       try {
         const paths = runtime.paths ?? resolveControlPlanePaths();
@@ -2143,7 +2154,15 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           },
         };
         switch (command) {
-          case 'install-voice': {
+          case 'list':
+          case 'show':
+          case 'check': {
+            const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
+            data = command === 'list' ? { capabilities: [capability] } : capability;
+            if (!json) for (const line of capabilityLines(capability, command !== 'list')) output(line);
+            break;
+          }
+          case 'install': {
             const model = options.model ?? DEFAULT_VOICE_MODEL;
             if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
               throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
@@ -2152,35 +2171,49 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
               dependencies,
             );
-            data = { scope: 'host', installation_dir: installed.installationDir, enabled: false };
+            data = { name: 'voice', scope: 'host', installation_dir: installed.installationDir, enabled: false };
             presenter.report({
               outcome: 'ready',
               headline: `Voice assets installed at ${installed.installationDir}; voice remains disabled.`,
-              details: ['Run gws-ea enable-voice.'],
+              details: ['Run gws-ea capabilities enable voice.'],
             });
             break;
           }
-          case 'enable-voice':
+          case 'enable': {
             await enableLocalVoice(paths, dependencies);
-            data = { scope: 'host', enabled: true };
+            const capability = await inspectVoiceCapability(paths);
+            data = {
+              name: 'voice',
+              scope: 'host',
+              enabled: true,
+              compatible_assistant_ids: capability.compatible_assistant_ids,
+              unsupported_assistant_ids: capability.unsupported_assistant_ids,
+              unknown_assistant_ids: capability.unknown_assistant_ids,
+              future_compatible_assistants: true,
+            };
             presenter.report({
               outcome: 'ready',
               headline: 'Voice enabled host-wide for every compatible current and future assistant.',
-              details: [],
+              details: [
+                `Compatible current assistants: ${capability.compatible_assistant_ids.join(', ') || 'none observed'}`,
+                `Unknown compatibility: ${capability.unknown_assistant_ids.join(', ') || 'none observed'}`,
+                'Run gws-ea capabilities check voice to observe readiness; enablement does not establish successful recognition.',
+              ],
             });
             break;
-          case 'disable-voice':
+          }
+          case 'disable':
             await disableLocalVoice(paths, dependencies);
-            data = { scope: 'host', enabled: false };
+            data = { name: 'voice', scope: 'host', enabled: false };
             presenter.report({
               outcome: 'ready',
-              headline: 'Voice disabled host-wide; shared assets retained and text service available.',
+              headline: 'Voice disabled host-wide; shared assets retained and existing preparation finishes.',
               details: [],
             });
             break;
-          case 'uninstall-voice':
+          case 'uninstall':
             await uninstallLocalVoice(paths, dependencies);
-            data = { scope: 'host', enabled: false };
+            data = { name: 'voice', scope: 'host', enabled: false };
             presenter.report({
               outcome: 'ready',
               headline: 'Recipe-owned voice assets removed; text service remains available.',
@@ -2198,6 +2231,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             changed,
             data,
             error,
+            next_actions: voiceCapabilityRecovery(error),
           }),
         );
         return reportStop(presenter, error);

@@ -4,8 +4,10 @@ import {
   COMMAND_DEFINITIONS,
   COMMON_OPTIONS,
   findCommand,
+  findNamespace,
   optionsFor,
   type CommandDefinition,
+  type DiscoveryTarget,
   type OptionDefinition,
 } from './command-definitions.js';
 
@@ -78,7 +80,9 @@ function validateArguments(command: CommandDefinition, values: readonly string[]
     const value = values[index];
     if (definition.required && value === undefined) invalid(`Missing required ${definition.name}`);
     if (value !== undefined && definition.choices && !definition.choices.includes(value))
-      invalid(`${definition.name} must be ${definition.choices.join(', ')}.`);
+      invalid(
+        `${definition.name} must be ${definition.choices.join(', ')}.${definition.name === 'capability' ? ' Run gws-ea capabilities list for supported capabilities.' : ''}`,
+      );
   }
   if (!definitions.some((argument) => argument.variadic) && values.length > definitions.length)
     invalid(`Unexpected argument ${JSON.stringify(values[definitions.length])}`);
@@ -106,17 +110,21 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
     const candidates = COMMAND_DEFINITIONS.filter((command) =>
       path.every((part, offset) => command.path[offset] === part),
     );
-    if (candidates.length === 0) invalid(`Unknown command ${JSON.stringify(path.join(' '))}.`);
+    if (candidates.length === 0)
+      invalid(
+        `Unknown command ${JSON.stringify(path.join(' '))}.${path[0] === 'capabilities' ? ' Run gws-ea help capabilities for supported actions.' : ''}`,
+      );
     definition = candidates.find((command) => command.path.length === path.length);
     if (definition) break;
   }
+  const namespace = !definition ? findNamespace(path) : undefined;
   if (!definition) {
-    if (path.length > 0) invalid(`Unknown command ${JSON.stringify(path.join(' '))}.`);
+    if (path.length > 0 && !namespace) invalid(`Unknown command ${JSON.stringify(path.join(' '))}.`);
     if (own.length > 0 && parsed.options.help !== 'true') invalid('Missing command.');
     definition = findCommand(['help']);
   }
   if (!definition) throw new Error('The command definitions must include help.');
-  const positionals: string[] = [];
+  const positionals: string[] = namespace ? [...namespace.path] : [];
   while (index < own.length) {
     if (own[index].startsWith('-')) index = consumeOption(own, index, optionsFor(definition), parsed, definition);
     else {
@@ -159,9 +167,31 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
 }
 
 /** Scoped help/schema paths must identify an implemented command, even when --help is present. */
-export function discoveryTarget(path: readonly string[]): CommandDefinition | undefined {
+export function discoveryTarget(path: readonly string[]): DiscoveryTarget | undefined {
   if (path.length === 0) return undefined;
-  const command = findCommand(path);
+  const command = findCommand(path) ?? findNamespace(path);
   if (!command) invalid(`Unknown command ${JSON.stringify(path.join(' '))}.`);
   return command;
+}
+
+/** Best-known canonical path for parse failures; unknown nested paths retain their supplied words. */
+export function requestedCommandPath(args: readonly string[]): string {
+  const path: string[] = [];
+  const delimiter = args.indexOf('--');
+  const outer = delimiter < 0 ? args : args.slice(0, delimiter);
+  const definitions = [...COMMON_OPTIONS, ...COMMAND_DEFINITIONS.flatMap((command) => command.options)];
+  for (let index = 0; index < outer.length; index += 1) {
+    const token = outer[index];
+    if (token.startsWith('-') && token !== '--version') {
+      if (
+        !token.includes('=') &&
+        definitions.some((option) => option.type === 'string' && `--${option.name}` === token)
+      )
+        index += 1;
+      continue;
+    }
+    path.push(token);
+    if (findCommand(path)) break;
+  }
+  return path.join(' ');
 }

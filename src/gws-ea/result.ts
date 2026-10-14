@@ -1,3 +1,4 @@
+import type { CapabilityList, VoiceCapabilityObservation } from './capabilities.js';
 import type { StartOutcome, StopOutcome, RestartOutcome } from './service-control.js';
 /** Managed invocation facts, shared by the terminal and machine boundaries. */
 import type { ProvisionHumanPause } from './phases.js';
@@ -38,11 +39,22 @@ export interface OperationData {
   readonly targets?: readonly UpdateTargetResult[];
 }
 export interface VoiceOperationData {
+  readonly name: 'voice';
   readonly scope: 'host';
+  readonly compatible_assistant_ids?: readonly string[];
+  readonly unsupported_assistant_ids?: readonly string[];
+  readonly unknown_assistant_ids?: readonly string[];
+  readonly future_compatible_assistants?: true;
   readonly enabled?: boolean;
   readonly installation_dir?: string;
 }
-export type CommandData = OperationData | VoiceOperationData | AssistantListing | AssistantStatus;
+export type CommandData =
+  | OperationData
+  | VoiceOperationData
+  | CapabilityList
+  | VoiceCapabilityObservation
+  | AssistantListing
+  | AssistantStatus;
 export interface ManagedResult<T = CommandData> {
   readonly schema_version: 1;
   readonly command: string;

@@ -6,6 +6,7 @@ import {
   COMMON_OPTIONS,
   optionsFor,
   type CommandDefinition,
+  type DiscoveryTarget,
   type OptionDefinition,
 } from './command-definitions.js';
 import { buildToolEnvironment, runSanitizedCommand } from './process.js';
@@ -30,12 +31,12 @@ function commandUsage(command: CommandDefinition): string {
 }
 
 /** Human discovery is rendered directly from the same definitions as parsing. */
-export function helpLines(command?: CommandDefinition): readonly string[] {
+export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if (!command) {
     return [
       'Usage: gws-ea <command> [options]',
       'Operate managed Google Workspace assistants and their optional host capabilities.',
-      ...(['Assistants', 'Service', 'Advanced', 'Optional voice', 'Discovery'] as const).flatMap((group) => [
+      ...(['Assistants', 'Service', 'Advanced', 'Capabilities', 'Discovery'] as const).flatMap((group) => [
         '',
         `${group}:`,
         ...COMMAND_DEFINITIONS.filter((definition) => definition.group === group).map(
@@ -57,6 +58,17 @@ export function helpLines(command?: CommandDefinition): readonly string[] {
       '  10 human prerequisite; 75 busy; 128 + signal interrupted. ncl and logs retain native exits.',
     ];
   }
+  if ('commands' in command)
+    return [
+      `Usage: gws-ea ${command.path.join(' ')} <action> [options]`,
+      'Operate optional host capabilities. Assistant lifecycle commands use an explicit --id.',
+      '',
+      'Scope: host',
+      'Commands:',
+      ...command.commands.map((definition) => `  ${definition.path.join(' ')}  ${definition.summary}`),
+      '',
+      `Run gws-ea help ${command.path.join(' ')} <action> for effects, prerequisites, and recovery.`,
+    ];
   return [
     `Usage: gws-ea ${commandUsage(command)}`,
     command.summary,
@@ -84,32 +96,34 @@ export function helpLines(command?: CommandDefinition): readonly string[] {
   ];
 }
 
-export function schemaDocument(command?: CommandDefinition) {
+export function schemaDocument(command?: DiscoveryTarget) {
   return {
     schema_version: 1,
     tool: 'gws-ea',
-    commands: (command ? [command] : COMMAND_DEFINITIONS).map((definition) => ({
-      path: definition.path,
-      summary: definition.summary,
-      arguments: (definition.arguments ?? []).map((argument) => ({
-        ...argument,
-        required: argument.required ?? false,
-        variadic: argument.variadic ?? false,
-      })),
-      options: optionsFor(definition).map((option) => ({
-        ...option,
-        required: option.required ?? false,
-        repeatable: option.repeatable ?? false,
-      })),
-      scope: definition.scope,
-      effects: definition.effects,
-      prerequisites: definition.prerequisites,
-      recovery: definition.recovery,
-      examples: definition.examples,
-      output_modes: definition.outputModes,
-      result_schema: definition.resultSchema,
-      pass_through: definition.passThrough ?? false,
-    })),
+    commands: (command ? ('commands' in command ? command.commands : [command]) : COMMAND_DEFINITIONS).map(
+      (definition) => ({
+        path: definition.path,
+        summary: definition.summary,
+        arguments: (definition.arguments ?? []).map((argument) => ({
+          ...argument,
+          required: argument.required ?? false,
+          variadic: argument.variadic ?? false,
+        })),
+        options: optionsFor(definition).map((option) => ({
+          ...option,
+          required: option.required ?? false,
+          repeatable: option.repeatable ?? false,
+        })),
+        scope: definition.scope,
+        effects: definition.effects,
+        prerequisites: definition.prerequisites,
+        recovery: definition.recovery,
+        examples: definition.examples,
+        output_modes: definition.outputModes,
+        result_schema: definition.resultSchema,
+        pass_through: definition.passThrough ?? false,
+      }),
+    ),
   };
 }
 

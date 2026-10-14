@@ -140,6 +140,90 @@ export const STATUS_DATA_SCHEMA = object({
   }),
   probes,
 });
+const artifactReceipt = object({ file: text, size: count, sha256: text });
+const voiceReceipt = object({
+  schemaVersion: { const: 1 },
+  recipe: text,
+  platform: choices('darwin', 'linux'),
+  architecture: choices('arm64', 'x64'),
+  model: choices('base', 'small', 'large-v3-turbo-q5_0'),
+  builtAt: time,
+  artifacts: object({
+    ffmpeg: artifactReceipt,
+    whisperCli: artifactReceipt,
+    model: artifactReceipt,
+    vad: artifactReceipt,
+  }),
+});
+const source = { url: text, sha256: text };
+export const VOICE_CAPABILITY_SCHEMA = object({
+  name: { const: 'voice' },
+  actions: array(choices('show', 'check', 'install', 'enable', 'disable', 'uninstall')),
+  scope: { const: 'host' },
+  summary: text,
+  availability: object({ status: choices('supported', 'unsupported'), platform: text, architecture: text }),
+  activation: object({ status: choices('enabled', 'disabled', 'unknown'), enabled: effect, reason: nullable(text) }),
+  assets: object({
+    status: choices('verified', 'absent', 'invalid', 'unknown'),
+    reason: nullable(text),
+    selected_directory: nullable(text),
+    selected_model: nullable(choices('base', 'small', 'large-v3-turbo-q5_0')),
+    installations: array(
+      object({
+        model: choices('base', 'small', 'large-v3-turbo-q5_0'),
+        directory: text,
+        status: choices('verified', 'absent', 'invalid', 'unknown'),
+        reason: nullable(text),
+        receipt: nullable(voiceReceipt),
+      }),
+    ),
+    provenance: nullable(voiceReceipt),
+  }),
+  default_model: choices('base', 'small', 'large-v3-turbo-q5_0'),
+  models: array(choices('base', 'small', 'large-v3-turbo-q5_0')),
+  prerequisites: array(text),
+  readiness_limits: array(text),
+  recipe: text,
+  sources: object({
+    whisper: object(source),
+    ffmpeg: object(source),
+    vad: object({ ...source, filename: text, size: count }),
+  }),
+  assistants: array(
+    object({
+      instance_id: text,
+      compatibility: choices('compatible', 'unsupported', 'unknown'),
+      readiness: choices('ready', 'unavailable', 'unknown'),
+      reason: nullable(text),
+      consumer: object({
+        status: choices('observed', 'unknown', 'not-applicable'),
+        enabled: effect,
+        queued: nullable(count),
+        inflight: nullable(count),
+      }),
+      last_outcome: nullable(object({ status: choices('recognized', 'no-speech', 'unavailable', 'failed'), at: time })),
+      last_failure: nullable(object({ reason: text, at: time })),
+    }),
+  ),
+  compatible_assistant_ids: array(text),
+  unsupported_assistant_ids: array(text),
+  unknown_assistant_ids: array(text),
+  future_compatible_assistants: { const: true },
+});
+export const CAPABILITY_LIST_SCHEMA = object({ capabilities: array(VOICE_CAPABILITY_SCHEMA) });
+export const VOICE_OPERATION_SCHEMA = object(
+  {
+    name: { const: 'voice' },
+    scope: { const: 'host' },
+    enabled: bool,
+    installation_dir: text,
+    compatible_assistant_ids: array(text),
+    unsupported_assistant_ids: array(text),
+    unknown_assistant_ids: array(text),
+    future_compatible_assistants: { const: true },
+  },
+  ['name', 'scope'],
+);
 const pause = object(
   {
     phase: text,
@@ -278,7 +362,7 @@ export function operationDataSchema(command: string): ResultSchema {
     case 'cleanup':
       return object({ cleanup }, []);
     default:
-      return object({ scope: { const: 'host' }, enabled: bool, installation_dir: text }, ['scope']);
+      throw new Error(`No operation data schema for ${command}`);
   }
 }
 /** Each command publishes its whole result, including normally handled error/pause paths. */

@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { runCli } from './cli.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -50,6 +51,13 @@ vi.mock('./install-voice.js', async (original) => ({
   ...(await original<typeof import('./install-voice.js')>()),
   installVoiceAssets: installer.build,
 }));
+const hostProbe = vi.hoisted(() =>
+  vi.fn<(runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>>(),
+);
+vi.mock('./ncl.js', async (original) => ({
+  ...(await original<typeof import('./ncl.js')>()),
+  runInstanceNclJson: hostProbe,
+}));
 const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup/set-env.ts'))) as {
   upsertEnvVars: UpsertEnvVars;
 };
@@ -64,6 +72,7 @@ beforeEach(async () => {
   });
   installed.clear();
   installer.build.mockReset();
+  hostProbe.mockReset();
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
@@ -384,5 +393,192 @@ describe('voice readiness observation', () => {
       enabled: true,
     });
     expect((await readLocalVoicePolicy(paths)).enabled).toBe(true);
+  });
+});
+
+describe('native public capability journeys', () => {
+  async function invoke(args: readonly string[]) {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const exit = await runCli([...args, '--json'], {
+      paths,
+      upsertEnvVars,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      environment: {},
+    });
+    return { exit, result: JSON.parse(stdout.join('\n')) as Record<string, unknown>, stderr };
+  }
+  it('lists supported voice separately from absent assets and disabled policy without creating state', async () => {
+    const answer = await invoke(['capabilities', 'list']);
+    expect(answer).toMatchObject({
+      exit: 0,
+      result: {
+        command: 'capabilities list',
+        changed: false,
+        data: {
+          capabilities: [
+            {
+              name: 'voice',
+              scope: 'host',
+              availability: { status: 'supported' },
+              assets: { status: 'absent' },
+              activation: { status: 'disabled' },
+            },
+          ],
+        },
+      },
+    });
+    await expect(readFile(voicePolicyFile(paths))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(hostProbe).not.toHaveBeenCalled();
+    expect(installer.build).not.toHaveBeenCalled();
+  });
+  it('installs inactive, enables two compatible assistants once, and retains unknown compatibility', async () => {
+    const first = await assistant(34000);
+    const second = await assistant(34100);
+    const unknown = await assistant(34200);
+    await writeFile(path.join(unknown.checkout_root, 'src/gws-ea/voice-compatibility.json'), '{');
+    const installation = await assets();
+    installer.build.mockResolvedValue(installation);
+    expect(await invoke(['capabilities', 'install', 'voice', '--model', 'base'])).toMatchObject({
+      exit: 0,
+      result: { command: 'capabilities install', changed: true, data: { enabled: false } },
+    });
+    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+      exit: 0,
+      result: {
+        changed: false,
+        data: {
+          activation: { status: 'disabled' },
+          assets: { status: 'verified', selected_model: 'base', provenance: { model: 'base' } },
+        },
+      },
+    });
+    const enabled = await invoke(['capabilities', 'enable', 'voice']);
+    expect(enabled).toMatchObject({
+      exit: 0,
+      result: {
+        data: {
+          enabled: true,
+          compatible_assistant_ids: expect.arrayContaining([first.instance_id, second.instance_id]),
+          unknown_assistant_ids: [unknown.instance_id],
+          future_compatible_assistants: true,
+        },
+      },
+    });
+    for (const runtime of [first, second])
+      expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(voicePolicyFile(paths));
+    expect(hostProbe).not.toHaveBeenCalled();
+    hostProbe.mockResolvedValue(health({ enabled: true, readiness: 'ready' }));
+    expect(await invoke(['capabilities', 'check', 'voice'])).toMatchObject({
+      exit: 0,
+      result: {
+        changed: false,
+        data: {
+          activation: { status: 'enabled' },
+          assets: { status: 'verified' },
+          assistants: expect.arrayContaining([
+            expect.objectContaining({ instance_id: first.instance_id, readiness: 'ready', last_outcome: null }),
+            expect.objectContaining({
+              instance_id: unknown.instance_id,
+              compatibility: 'unknown',
+              readiness: 'unknown',
+            }),
+          ]),
+        },
+      },
+    });
+  });
+  it('checks independent consumer facts with corrupt assets and retains unreachable consumers', async () => {
+    const active = await assistant(34300);
+    const unreachable = await assistant(34400);
+    const unsupported = await assistant(34500, false);
+    const installation = await assets();
+    await policy(installation);
+    installed.clear();
+    hostProbe.mockImplementation(async (runtime) => {
+      if (runtime.instance_id === unreachable.instance_id) throw new Error('host unreachable');
+      return health({ queued: 2, inflight: 1 });
+    });
+    const before = await readFile(voicePolicyFile(paths), 'utf8');
+    const beforeMetadata = await lstat(voicePolicyFile(paths));
+    const answer = await invoke(['capabilities', 'check', 'voice']);
+    expect(answer).toMatchObject({
+      exit: 0,
+      result: {
+        changed: false,
+        data: {
+          assets: { status: 'invalid' },
+          activation: { status: 'disabled' },
+          assistants: expect.arrayContaining([
+            expect.objectContaining({
+              instance_id: active.instance_id,
+              compatibility: 'compatible',
+              consumer: { status: 'observed', queued: 2, inflight: 1, enabled: false },
+              readiness: 'unavailable',
+            }),
+            expect.objectContaining({
+              instance_id: unreachable.instance_id,
+              compatibility: 'compatible',
+              consumer: { status: 'unknown', queued: null, inflight: null, enabled: null },
+              readiness: 'unknown',
+            }),
+            expect.objectContaining({
+              instance_id: unsupported.instance_id,
+              compatibility: 'unsupported',
+              consumer: { status: 'not-applicable', queued: null, inflight: null, enabled: null },
+            }),
+          ]),
+        },
+      },
+    });
+    expect(await readFile(voicePolicyFile(paths), 'utf8')).toBe(before);
+    const afterMetadata = await lstat(voicePolicyFile(paths));
+    expect([afterMetadata.ino, afterMetadata.mtimeMs, afterMetadata.ctimeMs]).toEqual([
+      beforeMetadata.ino,
+      beforeMetadata.mtimeMs,
+      beforeMetadata.ctimeMs,
+    ]);
+    expect(installer.build).not.toHaveBeenCalled();
+    await writePrivate(voicePolicyFile(paths), { schemaVersion: 1, enabled: false, installationDir: null });
+    expect(await invoke(['capabilities', 'check', 'voice'])).toMatchObject({
+      exit: 0,
+      result: {
+        data: {
+          assets: { status: 'absent' },
+          assistants: expect.arrayContaining([
+            expect.objectContaining({
+              instance_id: active.instance_id,
+              consumer: { status: 'observed', queued: 2, inflight: 1, enabled: false },
+            }),
+          ]),
+        },
+      },
+    });
+    await policy(installation);
+    hostProbe.mockRejectedValue(new Error('host unreachable'));
+    expect(await invoke(['capabilities', 'uninstall', 'voice'])).toMatchObject({
+      exit: 1,
+      result: {
+        changed: false,
+        error: { code: 'voice_drain_unproven' },
+        next_actions: expect.arrayContaining([{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] }]),
+      },
+    });
+  });
+  it('retains policy uncertainty and excludes external verified bytes from installed ownership', async () => {
+    const installation = await assets();
+    const external = { ...installation, installationDir: root };
+    installed.set(root, external);
+    await policy(external);
+    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+      exit: 0,
+      result: { data: { assets: { status: 'invalid' } } },
+    });
+    await writeFile(voicePolicyFile(paths), '{');
+    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+      exit: 0,
+      result: { data: { activation: { status: 'unknown', enabled: null }, assets: { status: 'unknown' } } },
+    });
   });
 });

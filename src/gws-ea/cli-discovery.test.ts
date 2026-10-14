@@ -82,6 +82,73 @@ describe('local CLI discovery and grammar', () => {
     expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['help', 'capabilities'],
+    ['capabilities', '--help'],
+    ['help', 'capabilities', 'install'],
+    ['capabilities', 'install', '--help'],
+  ])('discovers capability namespaces and operations for %j', async (...args) => {
+    const io = capture();
+    expect(await runCli(args, io.runtime)).toBe(0);
+    expect(io.stdout.join('\n')).toContain('gws-ea capabilities');
+    expect(io.stdout.join('\n')).toContain('host');
+    expect(io.stdout.join('\n')).not.toContain('install-voice');
+    expect(io.stderr).toEqual([]);
+    expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
+  });
+
+  it('renders identical help for both capability install forms', async () => {
+    const direct = capture();
+    const requested = capture();
+    expect(await runCli(['capabilities', 'install', '--help'], direct.runtime)).toBe(0);
+    expect(await runCli(['help', 'capabilities', 'install'], requested.runtime)).toBe(0);
+    expect(direct.stdout).toEqual(requested.stdout);
+    expect(direct.stdout.join('\n')).toContain('--model');
+    expect(direct.stdout.join('\n')).toContain('--cmake');
+  });
+
+  it.each([
+    { args: ['capabilities', 'install', 'voice', '--invented', '--json'], command: 'capabilities install' },
+    { args: ['--json', 'capabilities', 'invented', 'voice'], command: 'capabilities invented voice' },
+    { args: ['capabilities', 'enable', 'calendar', '--json'], command: 'capabilities enable' },
+  ])('retains the requested nested path in usage for $command', async ({ args, command }) => {
+    const io = capture();
+    expect(await runCli(args, io.runtime)).toBe(2);
+    expect(JSON.parse(io.stdout.join('\n'))).toMatchObject({
+      schema_version: 1,
+      command,
+      outcome: 'failed',
+      changed: false,
+      error: { code: 'invalid_arguments' },
+    });
+    expect(io.stderr.join('\n')).toMatch(/Unknown option|Unknown command|voice/u);
+    if (args.includes('invented')) expect(io.stderr.join('\n')).toContain('gws-ea help capabilities');
+    if (args.includes('calendar')) expect(io.stderr.join('\n')).toContain('gws-ea capabilities list');
+  });
+
+  it('rejects removed root voice paths and publishes only the static voice catalog', async () => {
+    const io = capture();
+    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
+    const schema = JSON.parse(io.stdout.join('\n')) as {
+      commands: { path: string[]; arguments: { choices?: string[] }[] }[];
+    };
+    expect(schema.commands.map((command) => command.path.join(' '))).toEqual([
+      'capabilities list',
+      'capabilities show',
+      'capabilities check',
+      'capabilities install',
+      'capabilities enable',
+      'capabilities disable',
+      'capabilities uninstall',
+    ]);
+    expect(schema.commands.slice(1).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
+    for (const command of ['install-voice', 'enable-voice', 'disable-voice', 'uninstall-voice']) {
+      const removed = capture();
+      expect(await runCli([command], removed.runtime)).toBe(2);
+      expect(removed.stderr.join('\n')).toContain('Unknown command');
+    }
+  });
+
   it('publishes parser options, scope, modes, and results in command schema', async () => {
     const io = capture();
     expect(await runCli(['schema', 'create', '--json'], io.runtime)).toBe(0);
@@ -191,7 +258,7 @@ describe('local CLI discovery and grammar', () => {
       `${generated}
 COMP_WORDS=(gws-ea --quiet update --s); COMP_CWORD=3; _gws_ea
 printf '%s\\n' "\${COMPREPLY[@]}"
-COMP_WORDS=(gws-ea install-voice --model=small); COMP_CWORD=2; _gws_ea
+COMP_WORDS=(gws-ea capabilities install voice --model=small); COMP_CWORD=4; _gws_ea
 printf '%s\\n' "\${COMPREPLY[@]}"
 COMP_WORDS=(gws-ea ncl --id id -- groups --j); COMP_CWORD=6; _gws_ea
 printf 'child-candidates:%s\\n' "\${#COMPREPLY[@]}"

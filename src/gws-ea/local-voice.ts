@@ -204,7 +204,10 @@ export async function installLocalVoice(
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
     if (policy.enabled)
-      throw new GwsEaError('voice_enabled', 'Run gws-ea disable-voice before installing or selecting voice assets.');
+      throw new GwsEaError(
+        'voice_enabled',
+        'Run gws-ea capabilities disable voice before installing or selecting voice assets.',
+      );
     dependencies.recordEffect?.(null);
     const installation = await installVoiceAssets(paths, request, dependencies);
     dependencies.recordEffect?.(null);
@@ -228,7 +231,7 @@ export async function enableLocalVoice(
     if (!policy.installationDir)
       throw new GwsEaError(
         'voice_not_installed',
-        'Voice is not installed. Run gws-ea install-voice, then gws-ea enable-voice.',
+        'Voice is not installed. Run gws-ea capabilities install voice, then gws-ea capabilities enable voice.',
       );
     try {
       const installation = await verifyVoiceInstallation(policy.installationDir);
@@ -241,7 +244,7 @@ export async function enableLocalVoice(
     } catch (error) {
       throw new GwsEaError(
         'voice_assets_invalid',
-        'Voice assets are unhealthy. Run gws-ea disable-voice, gws-ea uninstall-voice, then gws-ea install-voice.',
+        'Voice assets are unhealthy. Run gws-ea capabilities disable voice, gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
         { cause: error },
       );
     }
@@ -284,7 +287,7 @@ export async function disableLocalVoice(
 async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOperatorDependencies): Promise<void> {
   const compatibility = await voiceReleaseCompatibility(runtime.checkout_root);
   if (compatibility === 'unsupported') return;
-  const drain = `Wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea uninstall-voice.`;
+  const drain = `Wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea capabilities uninstall voice.`;
   if (compatibility === 'unknown')
     throw new GwsEaError('voice_drain_unproven', `Voice release compatibility cannot be observed. ${drain}`);
   const service = dependencies.serviceHelpers
@@ -332,7 +335,10 @@ export async function uninstallLocalVoice(
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
     if (policy.enabled)
-      throw new GwsEaError('voice_enabled', 'Run gws-ea disable-voice before gws-ea uninstall-voice.');
+      throw new GwsEaError(
+        'voice_enabled',
+        'Run gws-ea capabilities disable voice before gws-ea capabilities uninstall voice.',
+      );
     try {
       await assertPrivateDirectory(path.join(paths.stateRoot, 'voice'));
     } catch (error) {
@@ -362,7 +368,7 @@ export async function uninstallLocalVoice(
         if (holders.length)
           throw new GwsEaError(
             'voice_not_drained',
-            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea uninstall-voice.`,
+            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea capabilities uninstall voice.`,
           );
       }
       // Clear selection before any deletion so a partial removal remains safely disabled.

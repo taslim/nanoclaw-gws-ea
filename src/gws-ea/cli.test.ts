@@ -266,13 +266,13 @@ describe('host-wide optional voice commands', () => {
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
       expect(
-        await runCli(['enable-voice'], {
+        await runCli(['capabilities', 'enable', 'voice'], {
           paths,
           stdout: (line) => stdout.push(line),
           stderr: (line) => stderr.push(line),
         }),
       ).toBe(1);
-      expect(stderr.join('\n')).toContain('gws-ea install-voice');
+      expect(stderr.join('\n')).toContain('gws-ea capabilities install voice');
       expect(stderr.join('\n')).not.toContain('Unknown command');
       expect(fetch).not.toHaveBeenCalled();
       await expect(readFile(path.join(paths.configRoot, 'voice.json'), 'utf8')).rejects.toMatchObject({
@@ -283,11 +283,28 @@ describe('host-wide optional voice commands', () => {
     }
   });
 
+  it('returns native errors and exact recovery commands for absent assets in JSON', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    expect(await runCli(['capabilities', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
+    expect(JSON.parse(io.out.join('\n'))).toMatchObject({
+      schema_version: 1,
+      command: 'capabilities enable',
+      outcome: 'failed',
+      changed: false,
+      error: { code: 'voice_not_installed' },
+      next_actions: [
+        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice'] },
+        { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+      ],
+    });
+  });
+
   it('rejects per-assistant voice configuration', async () => {
     const paths = await testPaths();
     const stderr: string[] = [];
     expect(
-      await runCli(['enable-voice', '--id', randomUUID()], {
+      await runCli(['capabilities', 'enable', 'voice', '--id', randomUUID()], {
         paths,
         stdout: () => undefined,
         stderr: (line) => stderr.push(line),
