@@ -21,6 +21,7 @@ import { readRegistry } from './registry.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import {
   verifyVoiceInstallation,
+  VoiceAssetsError,
   VOICE_MODEL_CATALOG,
   VOICE_RECIPE_ID,
   VOICE_SOURCE_ARTIFACTS,
@@ -37,7 +38,7 @@ export const VOICE_CAPABILITY = {
   models: Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[],
   prerequisites: [
     'macOS or Linux on arm64 or x64.',
-    'Installation requires CMake, a C compiler, make, and tar; installed programs do not need build tools.',
+    'Installation requires CMake, C/C++ compilers, make, and tar; installed programs do not need build tools.',
     'Enabling requires verified recipe-owned installed assets.',
   ],
   readiness_limits: [
@@ -138,7 +139,12 @@ async function inspectInstallation(directory: string, model: VoiceModelId): Prom
     return { ...facts, status: 'verified', reason: null, receipt: installation.receipt };
     // eslint-disable-next-line no-catch-all/no-catch-all -- Verification failures are retained observations, never repairs.
   } catch (error) {
-    return { ...facts, status: 'invalid', reason: safeErrorMessage(error), receipt: null };
+    return {
+      ...facts,
+      status: 'invalid',
+      reason: error instanceof VoiceAssetsError ? error.message : safeErrorMessage(error),
+      receipt: null,
+    };
   }
 }
 
@@ -274,7 +280,8 @@ export async function inspectVoiceCapability(
           ? 'Selected assets are outside this recipe-owned host cache.'
           : (selected?.reason ?? null),
     selected_directory: selectedDirectory,
-    selected_model: selected?.receipt?.model ?? null,
+    // Directory identity retains the operator's selection; provenance separately proves verified assets.
+    selected_model: selected?.model ?? null,
     installations: installations.filter((installation) => installation.status !== 'absent'),
     provenance: selected?.receipt ?? null,
   };
@@ -336,35 +343,164 @@ export function capabilityLines(
         ...(assistant.reason ? [`    Cause: ${assistant.reason}`] : []),
       ]),
       ...capability.readiness_limits.map((line) => `  ${line}`),
-      '  Next: gws-ea capabilities check voice; gws-ea help capabilities install',
     );
   lines.push(`Observed: ${formatLocalTime(capability.observed_at, timezone)}`);
   return lines;
 }
 
+/** Handoffs follow observed facts; an unknown consumer never becomes evidence of readiness. */
+export function voiceCapabilityNextActions(
+  capability: VoiceCapabilityObservation,
+  checked: boolean,
+): readonly NextAction[] {
+  const command = (action: string, ...args: string[]): NextAction => ({
+    kind: 'command',
+    argv: ['gws-ea', 'capabilities', action, 'voice', ...args],
+  });
+  if (capability.availability.status === 'unsupported')
+    return [
+      {
+        kind: 'external',
+        instruction: 'Voice requires macOS/Linux on arm64/x64. Use a supported host for local voice.',
+      },
+    ];
+  if (capability.activation.status === 'unknown')
+    return [
+      {
+        kind: 'external',
+        instruction:
+          capability.activation.reason ?? 'Inspect and restore a valid disabled voice policy before continuing.',
+      },
+    ];
+  if (capability.assets.status === 'absent')
+    return [
+      command('install', ...(capability.assets.selected_model ? ['--model', capability.assets.selected_model] : [])),
+    ];
+  if (capability.assets.status === 'unknown')
+    return [
+      {
+        kind: 'external',
+        instruction: capability.assets.reason ?? 'Inspect the selected voice assets before continuing.',
+      },
+    ];
+  if (capability.assets.status === 'invalid') {
+    const selected = capability.assets.installations.find(
+      (installation) => installation.directory === capability.assets.selected_directory,
+    );
+    return voiceCapabilityRecovery(
+      new GwsEaError(
+        selected ? 'voice_assets_invalid' : 'voice_assets_unowned',
+        capability.assets.reason ?? 'Selected assets are invalid.',
+        { details: selected ? { model: selected.model } : {} },
+      ),
+    );
+  }
+  const actions: NextAction[] =
+    capability.activation.status === 'disabled' ? [command('enable')] : checked ? [] : [command('check')];
+  for (const id of capability.unsupported_assistant_ids)
+    actions.push({ kind: 'command', argv: ['gws-ea', 'update', '--id', id] });
+  for (const assistant of capability.assistants)
+    if (
+      assistant.compatibility === 'unknown' ||
+      (checked && assistant.compatibility === 'compatible' && assistant.consumer.status === 'unknown')
+    ) {
+      actions.push(
+        {
+          kind: 'external',
+          instruction: `Voice state could not be observed for assistant ${assistant.instance_id}. Inspect its runtime, release, and service status.`,
+        },
+        { kind: 'command', argv: ['gws-ea', 'status', '--id', assistant.instance_id] },
+      );
+    }
+  return actions;
+}
+
 /** Exact recovery commands for the voice domain's existing error codes. */
-export function voiceCapabilityRecovery(error: unknown): readonly NextAction[] {
+export function voiceCapabilityRecovery(
+  error: unknown,
+  request: { readonly action?: string; readonly model?: string; readonly cmake?: string } = {},
+): readonly NextAction[] {
   if (!(error instanceof GwsEaError)) return [];
+  const selected = request.model ?? error.details?.model;
+  const model =
+    selected === 'base' || selected === 'small' || selected === 'large-v3-turbo-q5_0' ? selected : undefined;
+  const installOptions = [...(model ? ['--model', model] : []), ...(request.cmake ? ['--cmake', request.cmake] : [])];
   const command = (action: 'install' | 'enable' | 'disable' | 'uninstall' | 'check'): NextAction => ({
     kind: 'command',
-    argv: ['gws-ea', 'capabilities', action, 'voice'],
+    argv: ['gws-ea', 'capabilities', action, 'voice', ...(action === 'install' ? installOptions : [])],
   });
+  const retry: NextAction = {
+    kind: 'command',
+    argv: [
+      'gws-ea',
+      'capabilities',
+      request.action ?? 'install',
+      'voice',
+      ...(request.action === 'install' || !request.action ? installOptions : []),
+    ],
+  };
   switch (error.code) {
+    case 'voice_build_prerequisite':
+      return [
+        {
+          kind: 'external',
+          instruction: typeof error.details?.instruction === 'string' ? error.details.instruction : error.message,
+        },
+        retry,
+      ];
+    case 'voice_download_failed':
+    case 'voice_checksum_failed':
+    case 'voice_build_failed':
+    case 'voice_install_failed':
+    case 'voice_cleanup_failed':
+      return [
+        {
+          kind: 'external',
+          instruction:
+            'Inspect the retained step log and repair the reported network, toolchain, or filesystem failure before retrying. Published assets, if any, remain disabled.',
+        },
+        retry,
+      ];
+    case 'voice_busy':
+    case 'instance_busy':
+    case 'registry_busy':
+      return [{ kind: 'external', instruction: 'Let the other operation finish, then retry.' }, retry];
     case 'voice_not_installed':
       return [command('install'), command('enable')];
     case 'voice_assets_invalid':
       return [command('disable'), command('uninstall'), command('install')];
     case 'voice_enabled':
       return [command('disable')];
+    case 'voice_assets_unowned':
+      return [
+        {
+          kind: 'external',
+          instruction:
+            'Selected assets are outside the recipe-owned cache. Inspect the policy; disable voice before explicitly installing/selecting recipe-owned assets. External assets will not be deleted.',
+        },
+        command('disable'),
+        command('install'),
+      ];
+    case 'voice_policy_invalid':
+      return [{ kind: 'external', instruction: error.message }];
+    case 'voice_operation_failed':
+      return [
+        { kind: 'external', instruction: error.message },
+        { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] },
+        retry,
+      ];
     case 'voice_drain_unproven':
     case 'voice_not_drained':
       return [
         command('check'),
         {
           kind: 'external',
-          instruction:
-            'Let current preparation and asset holders finish, or stop the affected assistant and prove it quiet before retrying uninstall.',
+          instruction: error.message,
         },
+        ...(typeof error.details?.instanceId === 'string'
+          ? [{ kind: 'command' as const, argv: ['gws-ea', 'stop', '--id', error.details.instanceId] }]
+          : []),
+        command('uninstall'),
       ];
     default:
       return [];

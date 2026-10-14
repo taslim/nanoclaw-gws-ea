@@ -3,6 +3,7 @@ import {
   inspectVoiceCapability,
   inspectVoiceConsumers,
   voiceCapabilityRecovery,
+  voiceCapabilityNextActions,
 } from './capabilities.js';
 import os from 'node:os';
 import {
@@ -17,6 +18,7 @@ import {
 import path from 'node:path';
 
 import { formatLocalTime } from '../timezone.js';
+import { errorCode } from '../community-portal/errors.js';
 import { READ_ONLY_COMMANDS, requireOption, targetInstance, type CommandEnd } from './cli-read-only.js';
 import type { AttemptCommand as Command } from './command-definitions.js';
 import { completionScript, helpLines, schemaDocument, toolVersion } from './command-discovery.js';
@@ -304,6 +306,14 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+function nextActionLines(actions: readonly NextAction[]): string[] {
+  return actions.map((action) =>
+    action.kind === 'external'
+      ? action.instruction
+      : `Next: ${action.argv.map((value) => (/^[a-zA-Z0-9_-]+$/u.test(value) ? value : shellQuote(value))).join(' ')}`,
+  );
+}
+
 /** `--billing-account`: the billing account a pause offered, as Google names it. */
 function parseBillingAccount(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
@@ -318,7 +328,10 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 }
 
 function isBusy(error: unknown): boolean {
-  return error instanceof GwsEaError && (error.code === 'instance_busy' || error.code === 'voice_busy');
+  return (
+    error instanceof GwsEaError &&
+    (error.code === 'instance_busy' || error.code === 'voice_busy' || error.code === 'registry_busy')
+  );
 }
 
 /**
@@ -1924,14 +1937,19 @@ async function prepareNcl(
 }
 
 /** The stop summary and exit code of a command that failed outside the attempt loop. */
-function reportStop(presenter: Presenter, error: unknown): number {
+function reportStop(presenter: Presenter, error: unknown, details: readonly string[] = [], tail?: string): number {
   if (isBusy(error)) {
-    presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: [] });
+    presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details });
     return EXIT_CODES.busy;
   }
   const usage =
     error instanceof GwsEaError && error.code === 'invalid_arguments' ? ['Run gws-ea --help for usage.'] : [];
-  presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: usage });
+  presenter.report({
+    outcome: 'failed',
+    headline: safeErrorMessage(error),
+    details: [...usage, ...details],
+    ...(tail ? { tail } : {}),
+  });
   return usage.length ? EXIT_CODES.usage : EXIT_CODES.failed;
 }
 
@@ -2225,6 +2243,9 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   switch (handler.kind) {
     case 'capability': {
       const command = handler.command;
+      let run: RunLog | undefined;
+      let stepLog: string | undefined;
+      let actions: readonly NextAction[] = [];
       let changed: Changed = false;
       let data:
         | import('./result.js').VoiceOperationData
@@ -2234,6 +2255,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       const stopObservingInterruption = observeInterruption(() => ({ changed, data }));
       try {
         const paths = runtime.paths ?? resolveControlPlanePaths();
+        registerErrorSecrets();
         const dependencies = {
           environment,
           upsertEnvVars: runtime.upsertEnvVars,
@@ -2248,24 +2270,32 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           case 'show':
           case 'check': {
             const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
+            actions = voiceCapabilityNextActions(capability, command === 'check');
             data = command === 'list' ? { capabilities: [capability] } : capability;
-            if (!json) for (const line of capabilityLines(capability, command !== 'list')) output(line);
+            if (!json)
+              for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
+                output(line);
             break;
           }
           case 'install': {
             const model = options.model ?? DEFAULT_VOICE_MODEL;
             if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
               throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
-            const installed = await installLocalVoice(
-              paths,
-              { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
-              dependencies,
-            );
+            run = await startRunLog({ paths, command: 'capabilities install', meta: { model } });
+            const installed = await run.step('install voice', async (step) => {
+              stepLog = step.rawLog;
+              return installLocalVoice(
+                paths,
+                { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
+                dependencies,
+              );
+            });
+            actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] }];
             data = { name: 'voice', scope: 'host', installation_dir: installed.installationDir, enabled: false };
             presenter.report({
               outcome: 'ready',
               headline: `Voice assets installed at ${installed.installationDir}; voice remains disabled.`,
-              details: ['Run gws-ea capabilities enable voice.'],
+              details: nextActionLines(actions),
             });
             break;
           }
@@ -2281,13 +2311,14 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               unknown_assistant_ids: capability.unknown_assistant_ids,
               future_compatible_assistants: true,
             };
+            actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] }];
             presenter.report({
               outcome: 'ready',
               headline: 'Voice enabled host-wide for every compatible current and future assistant.',
               details: [
                 `Compatible current assistants: ${capability.compatible_assistant_ids.join(', ') || 'none observed'}`,
                 `Unknown compatibility: ${capability.unknown_assistant_ids.join(', ') || 'none observed'}`,
-                'Run gws-ea capabilities check voice to observe readiness; enablement does not establish successful recognition.',
+                ...nextActionLines(actions),
               ],
             });
             break;
@@ -2311,20 +2342,49 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             });
             break;
         }
-        emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'succeeded', changed, data }));
+        run?.complete();
+        emitResult(
+          managedResult(invocation.definition.path.join(' '), {
+            outcome: 'succeeded',
+            changed,
+            data,
+            next_actions: actions,
+            diagnostics: run ? { run_log: run.progressLog } : {},
+          }),
+        );
         return EXIT_CODES.ready;
         // eslint-disable-next-line no-catch-all/no-catch-all -- Every managed voice failure has the same result boundary.
-      } catch (error) {
+      } catch (cause) {
+        const error =
+          cause instanceof GwsEaError
+            ? cause
+            : new GwsEaError(
+                'voice_operation_failed',
+                `Voice ${command} failed (${errorCode(cause)}). Inspect the operator state directories, permissions, available disk space, and retained log if present before retrying.`,
+                { cause },
+              );
+        run?.abort(cause);
+        registerErrorSecrets();
+        const actions = voiceCapabilityRecovery(error, {
+          action: command,
+          ...(options.model ? { model: options.model } : {}),
+          ...(options.cmake ? { cmake: options.cmake } : {}),
+        });
+        const details = nextActionLines(actions);
+        if (run) details.push(`Log: ${run.progressLog}`);
+        if (stepLog) details.push(`Step log: ${stepLog}`);
         emitResult(
           managedResult(invocation.definition.path.join(' '), {
             outcome: isBusy(error) ? 'busy' : 'failed',
             changed,
             data,
             error,
-            next_actions: voiceCapabilityRecovery(error),
+            next_actions: actions,
+            diagnostics: { ...(run ? { run_log: run.progressLog } : {}), ...(stepLog ? { step_log: stepLog } : {}) },
           }),
         );
-        return reportStop(presenter, error);
+        const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
+        return reportStop(presenter, error, details, typeof tail === 'string' ? tail : undefined);
       } finally {
         stopObservingInterruption();
       }

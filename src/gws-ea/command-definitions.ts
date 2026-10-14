@@ -435,7 +435,9 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         ],
         prerequisites: VOICE_CAPABILITY.prerequisites,
         recovery: [
-          'For corrupt assets: capabilities disable voice, capabilities uninstall voice, then capabilities install voice.',
+          'Preflight identifies the failed tool and manual repair; system tools are never installed automatically.',
+          'Download/build failures retain private run/step logs and a retry preserving --model and --cmake.',
+          'For corrupt assets: capabilities disable voice, capabilities uninstall voice, then capabilities install voice with the original --model.',
         ],
         examples: ['gws-ea capabilities install voice --model large-v3-turbo-q5_0'],
         outputModes: managedModes,

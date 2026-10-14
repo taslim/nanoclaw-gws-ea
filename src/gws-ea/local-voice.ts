@@ -235,19 +235,23 @@ export async function enableLocalVoice(
         'voice_not_installed',
         'Voice is not installed. Run gws-ea capabilities install voice, then gws-ea capabilities enable voice.',
       );
+    const model = (Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[]).find(
+      (model) => voiceInstallationDirectory(paths, model) === policy.installationDir,
+    );
+    if (!model)
+      throw new GwsEaError(
+        'voice_assets_unowned',
+        'Selected voice assets are outside this operator recipe-owned cache.',
+      );
     try {
       const installation = await verifyVoiceInstallation(policy.installationDir);
-      if (installation.installationDir !== voiceInstallationDirectory(paths, installation.receipt.model)) {
-        throw new GwsEaError(
-          'voice_assets_unowned',
-          'Selected voice assets are outside this operator recipe-owned cache.',
-        );
-      }
+      if (installation.receipt.model !== model)
+        throw new GwsEaError('voice_assets_invalid', 'Selected model differs from its recipe-owned directory.');
     } catch (error) {
       throw new GwsEaError(
         'voice_assets_invalid',
         'Voice assets are unhealthy. Run gws-ea capabilities disable voice, gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
-        { cause: error },
+        { cause: error, details: { model } },
       );
     }
     return withManagedInstances(paths, async (runtimes) => {
@@ -289,9 +293,7 @@ export async function disableLocalVoice(
 async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOperatorDependencies): Promise<void> {
   const compatibility = await voiceReleaseCompatibility(runtime.checkout_root);
   if (compatibility === 'unsupported') return;
-  const drain = `Wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea capabilities uninstall voice.`;
-  if (compatibility === 'unknown')
-    throw new GwsEaError('voice_drain_unproven', `Voice release compatibility cannot be observed. ${drain}`);
+  const drain = `Assistant ${runtime.instance_id}: wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea capabilities uninstall voice.`;
   const service = dependencies.serviceHelpers
     ? createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime)).detect()
     : undefined;
@@ -311,21 +313,28 @@ async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOper
     } catch (error) {
       throw new GwsEaError('voice_drain_unproven', `The stopped assistant is not yet quiet. ${drain}`, {
         cause: error,
+        details: { instanceId: runtime.instance_id },
       });
     }
   }
+  if (compatibility === 'unknown')
+    throw new GwsEaError('voice_drain_unproven', `Voice release compatibility cannot be observed. ${drain}`, {
+      details: { instanceId: runtime.instance_id },
+    });
   let health: ObservedVoiceHealth;
   try {
     health = parseVoiceHealth(await (dependencies.ncl ?? runInstanceNclJson)(runtime, VOICE_HEALTH_ARGS));
   } catch (error) {
     throw new GwsEaError('voice_drain_unproven', `The assistant's voice work could not be observed. ${drain}`, {
       cause: error,
+      details: { instanceId: runtime.instance_id },
     });
   }
   if (health.enabled || health.queued || health.inflight)
     throw new GwsEaError(
       'voice_not_drained',
       `The assistant still has voice work or has not observed disablement. ${drain}`,
+      { details: { instanceId: runtime.instance_id } },
     );
 }
 

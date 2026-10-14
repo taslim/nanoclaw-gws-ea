@@ -364,6 +364,71 @@ describe('managed machine results', () => {
 });
 
 describe('host-wide optional voice commands', () => {
+  it('keeps install retry options and private diagnostics when an explicit CMake path is missing', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const cmake = path.join(paths.configRoot, 'missing cmake');
+    expect(
+      await runCli(['capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
+        paths,
+        ...io.runtime,
+        environment: { PATH: paths.configRoot },
+      }),
+    ).toBe(1);
+    const result = JSON.parse(io.out.join('\n')) as { diagnostics: { run_log: string; step_log: string } };
+    expectResultContract('capabilities install', result);
+    expect(result).toMatchObject({
+      error: { code: 'voice_build_prerequisite', message: expect.stringContaining(cmake) },
+      next_actions: [
+        { kind: 'external', instruction: expect.stringContaining('Correct --cmake') },
+        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
+      ],
+      diagnostics: { run_log: expect.any(String), step_log: expect.any(String) },
+    });
+    expect(await readFile(result.diagnostics.step_log, 'utf8')).toContain(cmake);
+    expect((await stat(result.diagnostics.step_log)).mode & 0o077).toBe(0);
+    await expect(readFile(path.join(paths.configRoot, 'voice.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('shows repair, stderr, and logs when an installed prerequisite fails in human output', async () => {
+    const paths = await testPaths();
+    const cmake = path.join(paths.configRoot, 'cmake');
+    await writeFile(cmake, `#!${process.execPath}\nprocess.stderr.write('broken developer path\\n');process.exit(2);`, {
+      mode: 0o700,
+    });
+    const io = lines();
+    expect(await runCli(['capabilities', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
+    expect(io.err.join('\n')).toContain('broken developer path');
+    expect(io.err.join('\n')).toContain('Log:');
+    expect(io.err.join('\n')).toContain('Correct --cmake');
+    expect(io.err.join('\n')).toContain(`--cmake '${cmake}'`);
+  });
+  it('offers host-specific CMake guidance without installing or downloading anything', async () => {
+    const paths = await testPaths();
+    await writeFile(
+      path.join(paths.configRoot, 'brew'),
+      `#!${process.execPath}\nthrow new Error('must not execute brew');`,
+      { mode: 0o700 },
+    );
+    const io = lines();
+    const fetch = vi.spyOn(globalThis, 'fetch');
+    try {
+      expect(
+        await runCli(['capabilities', 'install', 'voice'], {
+          paths,
+          ...io.runtime,
+          environment: { PATH: paths.configRoot },
+        }),
+      ).toBe(1);
+      expect(io.err.join('\n')).toContain(
+        process.platform === 'darwin' ? 'brew install cmake' : 'sudo apt-get install cmake',
+      );
+      expect(io.err.join('\n')).toContain('Missing CMake');
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
   it('names explicit installation when enabling absent voice assets, without an instance or a download', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];

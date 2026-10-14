@@ -3,11 +3,17 @@ import { createHash } from 'node:crypto';
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
-import { isErrno } from '../community-portal/errors.js';
+import { errorCode, isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import {
+  buildToolEnvironment,
+  resolveExecutable,
+  runSanitizedCommand,
+  type SanitizedCommandRunner,
+} from './process.js';
 import { GwsEaError } from './types.js';
+import { activeStep } from './run-log.js';
 import {
   VOICE_MODEL_CATALOG,
   VOICE_RECIPE_ID,
@@ -61,6 +67,29 @@ export function voiceInstallationDirectory(
   return path.join(paths.stateRoot, 'voice', `${VOICE_RECIPE_ID}-${platform}-${architecture}-${model}`);
 }
 
+async function prerequisiteRepair(
+  tool: string,
+  explicitCmake: boolean,
+  platform: NodeJS.Platform,
+  searchPath: string | undefined,
+): Promise<string> {
+  if (explicitCmake)
+    return `Correct --cmake: ${tool} must be an executable CMake binary, or omit --cmake to use CMake on PATH.`;
+  if (platform === 'darwin') {
+    if (tool !== 'cmake')
+      return 'Install or repair Apple Command Line Tools: xcode-select --install. If already installed, inspect xcode-select -p and the developer-path error below.';
+    try {
+      await resolveExecutable('brew', searchPath);
+      return 'Install CMake: brew install cmake. Alternatively supply --cmake /absolute/path/to/cmake.';
+    } catch (error) {
+      if (!(error instanceof GwsEaError) || error.code !== 'executable_not_found') throw error;
+      return 'Install CMake from https://cmake.org/download/ and put it on PATH, or supply --cmake /absolute/path/to/cmake.';
+    }
+  }
+  const packages = tool === 'cmake' ? 'cmake' : tool === 'tar' ? 'tar xz-utils' : 'build-essential';
+  return `Install or repair ${tool} with your distribution's package manager. On Debian/Ubuntu: sudo apt-get install ${packages}. Check PATH before retrying.`;
+}
+
 async function digest(file: string): Promise<VoiceArtifactReceipt> {
   const handle = await open(file, 'r');
   try {
@@ -73,6 +102,26 @@ async function digest(file: string): Promise<VoiceArtifactReceipt> {
   }
 }
 
+async function retainBuildDiagnostic(file: string): Promise<void> {
+  const step = activeStep();
+  if (!step) return;
+  try {
+    const handle = await open(file, 'r');
+    try {
+      const size = (await handle.stat()).size;
+      const tail = Buffer.alloc(Math.min(size, 16 * 1024));
+      const { bytesRead } = await handle.read(tail, 0, tail.length, Math.max(0, size - tail.length));
+      step.write(`\n${file} (last ${bytesRead} bytes):\n${tail.subarray(0, bytesRead).toString('utf8')}\n`);
+    } finally {
+      await handle.close();
+    }
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Optional diagnostic collection must preserve the original build failure.
+  } catch (error) {
+    // Diagnostic collection must not replace the failed build.
+    step.write(`Build diagnostic unavailable (${errorCode(error)}): ${file}\n`);
+  }
+}
+
 async function download(
   fetch: typeof globalThis.fetch,
   url: string,
@@ -80,31 +129,61 @@ async function download(
   sha256: string,
   expectedSize?: number,
 ): Promise<void> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(30 * 60_000) });
-  if (!response.ok || !response.body)
-    throw new GwsEaError('voice_download_failed', `Voice download failed (${response.status}): ${url}`);
-  const handle = await open(destination, 'wx', 0o600);
-  const reader = response.body.getReader();
-  const hash = createHash('sha256');
-  let size = 0;
+  const artifact = path.basename(destination);
   try {
-    for (;;) {
-      const item = await reader.read();
-      if (item.done) break;
-      size += item.value.byteLength;
-      if (size > (expectedSize ?? 256 * 1024 * 1024))
-        throw new GwsEaError('voice_download_failed', 'Voice download exceeds its pinned size bound');
-      hash.update(item.value);
-      await handle.writeFile(item.value);
+    activeStep()?.write(`Downloading ${artifact}: ${url}\n`);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30 * 60_000) });
+    if (!response.ok || !response.body) {
+      await response.body
+        ?.cancel()
+        .catch((error: unknown) => activeStep()?.write(`Response cleanup failed: ${String(error)}\n`));
+      throw new GwsEaError('voice_download_failed', `HTTP ${response.status} or missing response body`, {
+        details: { httpStatus: response.status },
+      });
     }
-    await handle.sync();
-    if ((expectedSize !== undefined && size !== expectedSize) || hash.digest('hex') !== sha256) {
-      throw new GwsEaError('voice_checksum_failed', `Voice download does not match its pinned checksum: ${url}`);
+    const reader = response.body.getReader();
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    let failed = false;
+    let failure: unknown;
+    try {
+      handle = await open(destination, 'wx', 0o600);
+      const hash = createHash('sha256');
+      let size = 0;
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) break;
+        size += item.value.byteLength;
+        if (size > (expectedSize ?? 256 * 1024 * 1024))
+          throw new GwsEaError('voice_download_failed', 'Download exceeds its pinned size bound');
+        hash.update(item.value);
+        await handle.writeFile(item.value);
+      }
+      await handle.sync();
+      if ((expectedSize !== undefined && size !== expectedSize) || hash.digest('hex') !== sha256)
+        throw new GwsEaError('voice_checksum_failed', 'Download does not match its pinned size/checksum');
+      // eslint-disable-next-line no-catch-all/no-catch-all -- Save the primary error until independent resource cleanup completes.
+    } catch (error) {
+      failed = true;
+      failure = error;
     }
-  } finally {
-    await reader.cancel();
+    // An errored stream may reject cancel; it must not hide the download error or leak the file handle.
+    const cleanup = await Promise.allSettled([reader.cancel(), ...(handle ? [handle.close()] : [])]);
     reader.releaseLock();
-    await handle.close();
+    for (const result of cleanup)
+      if (result.status === 'rejected') {
+        if (!failed) {
+          failed = true;
+          failure = result.reason;
+        } else activeStep()?.write(`Download cleanup failed: ${String(result.reason)}\n`);
+      }
+    if (failed) throw failure;
+  } catch (error) {
+    activeStep()?.write(`Download failed: ${String(error)}\n`);
+    throw new GwsEaError(
+      error instanceof GwsEaError ? error.code : 'voice_download_failed',
+      `Download of ${artifact} failed${error instanceof GwsEaError ? `: ${error.message}` : ''}. Check network/proxy access and available disk space, then retry; checksum verification stays required.`,
+      { cause: error, details: { ...(error instanceof GwsEaError ? error.details : {}), artifact, url } },
+    );
   }
 }
 
@@ -132,7 +211,7 @@ export async function installVoiceAssets(
       throw new GwsEaError(
         'voice_assets_invalid',
         'Existing voice assets are invalid. Disable voice, run gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
-        { cause: error },
+        { cause: error, details: { model } },
       );
     }
   } catch (error) {
@@ -144,27 +223,56 @@ export async function installVoiceAssets(
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const environment = buildToolEnvironment(dependencies.environment ?? process.env);
   const invoke = (command: string, args: readonly string[], cwd = work) =>
-    run({ command, args, cwd, env: environment, timeoutMs: 30 * 60_000, outputLimitBytes: 2 * 1024 * 1024 });
+    run({
+      command,
+      args,
+      cwd,
+      env: environment,
+      timeoutMs: 30 * 60_000,
+      outputLimitBytes: 2 * 1024 * 1024,
+      ...(args[0] === '--version' ? {} : { stream: true }),
+    });
+  let stage = 'Checking voice prerequisites';
+  let published = false;
+  let failure: GwsEaError | undefined;
+  let installation: VerifiedVoiceInstallation | undefined;
   try {
     const cmake = request.cmake ?? 'cmake';
     if (request.cmake && !path.isAbsolute(request.cmake))
       throw new GwsEaError('invalid_arguments', '--cmake must be an absolute executable path');
-    dependencies.progress?.('Checking CMake, C compiler, and make…');
-    try {
-      await invoke(cmake, ['--version']);
-      await invoke('cc', ['--version']);
-      await invoke('make', ['--version']);
-    } catch (error) {
-      throw new GwsEaError(
-        'voice_build_prerequisite',
-        'Voice installation needs CMake, a C compiler, and make. Install those tools, then retry gws-ea capabilities install voice (or pass --cmake /absolute/path).',
-        { cause: error },
-      );
+    dependencies.progress?.('Checking CMake, C/C++ compilers, make, and tar…');
+    for (const [tool, label] of [
+      [cmake, 'CMake'],
+      ['cc', 'C compiler'],
+      ['c++', 'C++ compiler'],
+      ['make', 'make'],
+      ['tar', 'tar'],
+    ] as const) {
+      try {
+        await invoke(tool, ['--version']);
+      } catch (error) {
+        const missing = error instanceof GwsEaError && error.code === 'executable_not_found';
+        const instruction = await prerequisiteRepair(tool, tool === request.cmake, platform, environment.PATH);
+        throw new GwsEaError(
+          'voice_build_prerequisite',
+          `${missing ? 'Missing' : 'Preflight failed for'} ${label} (${tool})${missing ? ': executable unavailable' : ': --version failed'}. ${instruction}`,
+          {
+            cause: error,
+            details: {
+              ...(error instanceof GwsEaError ? error.details : {}),
+              program: tool,
+              failure: missing ? 'missing' : 'failed',
+              instruction,
+            },
+          },
+        );
+      }
     }
     await mkdir(path.join(publish, 'bin'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(publish, 'models'), { mode: 0o700 });
     await mkdir(path.join(publish, 'licenses'), { mode: 0o700 });
     const fetch = dependencies.fetch ?? globalThis.fetch;
+    stage = 'Downloading pinned voice inputs';
     dependencies.progress?.('Downloading and verifying pinned voice sources, model, and VAD…');
     const modelPin = VOICE_MODEL_CATALOG[model];
     // Sequential downloads keep bounded memory and leave one owned scratch tree on failure.
@@ -198,7 +306,9 @@ export async function installVoiceAssets(
     const ffmpeg = path.join(work, 'ffmpeg');
     await mkdir(whisper, { mode: 0o700 });
     await mkdir(ffmpeg, { mode: 0o700 });
+    stage = 'Extracting whisper.cpp';
     await invoke('tar', ['-xzf', path.join(work, 'whisper.tar.gz'), '--strip-components=1', '-C', whisper]);
+    stage = 'Extracting FFmpeg';
     await invoke('tar', ['-xJf', path.join(work, 'ffmpeg.tar.xz'), '--strip-components=1', '-C', ffmpeg]);
     dependencies.progress?.('Building the service-usable local recognizer and file decoder…');
     const whisperBuild = path.join(work, 'whisper-build');
@@ -214,7 +324,9 @@ export async function installVoiceAssets(
       `-DGGML_METAL=${platform === 'darwin' ? 'ON' : 'OFF'}`,
       ...(platform === 'darwin' ? ['-DGGML_METAL_EMBED_LIBRARY=ON'] : []),
     ];
+    stage = 'Configuring whisper.cpp';
     await invoke(cmake, cmakeArgs);
+    stage = 'Building whisper.cpp';
     await invoke(cmake, ['--build', whisperBuild, '--config', 'Release', '--target', 'whisper-cli', '-j', '4']);
     const ffmpegArgs = [
       '--disable-shared',
@@ -235,8 +347,11 @@ export async function installVoiceAssets(
       '--enable-filter=aresample,aformat,anull',
       '--disable-asm',
     ];
+    stage = 'Configuring FFmpeg';
     await invoke(path.join(ffmpeg, 'configure'), ffmpegArgs, ffmpeg);
+    stage = 'Building FFmpeg';
     await invoke('make', ['-j4'], ffmpeg);
+    stage = 'Staging voice programs and licenses';
     await copyFile(path.join(whisperBuild, 'bin', 'whisper-cli'), path.join(publish, 'bin', 'whisper-cli'));
     await copyFile(path.join(ffmpeg, 'ffmpeg'), path.join(publish, 'bin', 'ffmpeg'));
     for (const file of ['bin/ffmpeg', 'bin/whisper-cli']) await chmod(path.join(publish, file), 0o500);
@@ -264,6 +379,7 @@ export async function installVoiceAssets(
       builtAt: new Date().toISOString(),
       artifacts,
     };
+    stage = 'Recording voice build provenance';
     await writePrivate(path.join(publish, 'receipt.json'), receipt);
     await writePrivate(path.join(publish, 'build.json'), {
       schemaVersion: 1,
@@ -275,10 +391,54 @@ export async function installVoiceAssets(
       ffmpeg: ffmpegArgs,
       compiler: (await invoke('cc', ['--version'])).stdout.trim(),
     });
+    stage = 'Verifying staged voice assets';
     await verifyVoiceInstallation(publish);
+    stage = 'Publishing voice assets';
     await rename(publish, destination);
-    return await verifyVoiceInstallation(destination);
-  } finally {
-    await rm(work, { recursive: true, force: true });
+    published = true;
+    stage = 'Verifying published voice assets';
+    installation = await verifyVoiceInstallation(destination);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- The installer attributes every build-stage error, then cleans only its owned scratch tree.
+  } catch (error) {
+    if (stage === 'Configuring FFmpeg') await retainBuildDiagnostic(path.join(work, 'ffmpeg', 'ffbuild', 'config.log'));
+    if (stage === 'Configuring whisper.cpp')
+      await retainBuildDiagnostic(path.join(work, 'whisper-build', 'CMakeFiles', 'CMakeConfigureLog.yaml'));
+    const code = error instanceof GwsEaError ? error.code : 'voice_install_failed';
+    failure = new GwsEaError(
+      code === 'command_failed' || code === 'command_timeout' ? 'voice_build_failed' : code,
+      `${stage} failed${error instanceof GwsEaError ? `: ${error.message}` : ` (${errorCode(error)})`}`,
+      {
+        cause: error,
+        details: {
+          ...(error instanceof GwsEaError ? error.details : { reasonCode: errorCode(error) }),
+          stage,
+          published,
+          installationDir: destination,
+          model,
+        },
+      },
+    );
+    activeStep()?.write(`${stage} failed: ${String(error)}\n`);
   }
+  try {
+    await rm(work, { recursive: true, force: true });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A cleanup failure augments the primary failure or reports retained published assets.
+  } catch (error) {
+    failure = new GwsEaError(
+      failure instanceof GwsEaError ? failure.code : 'voice_cleanup_failed',
+      `${failure instanceof GwsEaError ? failure.message : 'Voice assets were published.'} Scratch cleanup failed; inspect ${work} before retrying.`,
+      {
+        cause: failure ?? error,
+        details: {
+          ...(failure instanceof GwsEaError ? failure.details : {}),
+          scratchDirectory: work,
+          published,
+          installationDir: destination,
+        },
+      },
+    );
+  }
+  if (failure) throw failure;
+  if (!installation) throw new GwsEaError('voice_install_failed', 'Voice installation produced no verified result.');
+  return installation;
 }
