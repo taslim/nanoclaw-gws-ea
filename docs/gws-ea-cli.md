@@ -8,6 +8,8 @@ Start with `gws-ea --help`. Use `gws-ea help update` or `gws-ea update --help`
 for a command's flags, scope, effects, prerequisites, recovery, and examples.
 `gws-ea help capabilities install` and `gws-ea capabilities install --help`
 print identical help. Invalid paths remain errors even with `--help`.
+See [the voice guide](gws-ea-voice.md) for optional voice installation,
+activation, and health checks.
 
 ## Find and inspect an assistant
 
@@ -112,6 +114,7 @@ Managed `--json` invocations emit one result document on stdout. It contains
 effects, false for confirmed absence of effects, and null for uncertainty;
 creating a log alone is not a domain change. A pause can retain preparation.
 Treat `next_actions` as domain-specific continuation, not blanket replay advice.
+Read `data.assistants` for `list` and `data.probes` for `status`.
 The schema publishes argument and option types, repeatability, modes, effects,
 and exact result shapes. Help is human-only; combining `--help` with `--json`
 returns one usage-error document directing automation to `schema`.
@@ -139,22 +142,10 @@ unchanged; put child JSON flags there, as in
 `gws-ea ncl --id <full-id> -- groups list --json`. Outer no-input flags do not
 change the delegated command's interactive behavior.
 
-## Completion and deliberate interface changes
+## Shell completion
 
 `gws-ea completion bash`, `zsh`, or `fish` prints a shell script for the user to
 source through their preferred shell configuration. Generation does not install
 or execute it. Completion includes nested help/schema paths, scoped options,
 local capability names, enum values, and file arguments with spaces. It stops at
 `--`; it does not query the registry for ID suggestions.
-
-Older inspection consumers can detect this interface by `schema_version: 1` and
-its result envelope. Update first-party scripts to read `data.assistants` for
-list or `data.probes` for status, and use exit 2 for invalid syntax. Separate
-stdout results from stderr progress. Verify with `schema`, `list --json`, and an
-explicit `status --json`. The four old root voice paths were replaced natively;
-see [the voice guide](gws-ea-voice.md). There are no compatibility aliases.
-
-If an external consumer cannot be updated immediately, keep using its previously
-pinned tool revision until it is updated; do not rewrite stored assistant
-journals or receipts to undo an interface change. Assistant rollback remains the
-separate release operation described above.

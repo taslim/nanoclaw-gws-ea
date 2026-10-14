@@ -27,6 +27,9 @@ gws-ea capabilities check voice
 gws-ea status --id <instance_id> --details
 ```
 
+Use `gws-ea help capabilities` to discover available actions and
+`gws-ea help capabilities install` for installation options.
+
 Installation is explicit and leaves voice disabled. Package installation,
 container builds, assistant creation, ordinary updates, and incoming notes never
 download a recognizer or model. Repeating installation verifies and reuses an
@@ -154,27 +157,6 @@ routing failure releases the conversation queue. If fan-out was only partly
 written, a later cancellation can reach a previously unwritten target before
 the failed note is redelivered there. Successful preparation preserves order;
 retry after a routing failure retains the native recovery limits.
-
-## Command revision
-
-Voice operations now use the native `capabilities` namespace. Older root voice
-commands are rejected with usage exit 2; update first-party callers natively:
-
-| Former path       | Current path                   |
-| ----------------- | ------------------------------ |
-| `install-voice`   | `capabilities install voice`   |
-| `enable-voice`    | `capabilities enable voice`    |
-| `disable-voice`   | `capabilities disable voice`   |
-| `uninstall-voice` | `capabilities uninstall voice` |
-
-Keep supported operation flags after the new command path. There are no aliases.
-Use `gws-ea help capabilities` to discover
-the current actions. Existing policies, immutable asset receipts, journals,
-permissions, and principal preferences keep their existing formats. No storage
-migration is needed. Verify the revision with `gws-ea capabilities show voice
---json` and `gws-ea capabilities check voice --json`. To roll back the command
-interface, use the previously committed tool release; the shared policy and
-installed assets remain compatible.
 
 See [the CLI guide](gws-ea-cli.md) for explicit assistant IDs, machine envelopes,
 stdout/stderr composition, confirmation pauses, discovery, and shell completion.
