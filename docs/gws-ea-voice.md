@@ -55,6 +55,9 @@ bounded redacted subprocess stderr, and report both log paths. Build output and
 available configure diagnostics survive scratch cleanup. The JSON envelope
 exposes the same recovery through `next_actions` and log paths through
 `diagnostics`. Retry commands preserve explicit `--model` and `--cmake` choices.
+If logging fails, the managed result identifies the incomplete log and its error
+code. The build stops, owned scratch is cleaned, and the original failure remains
+available even when the filesystem cannot record another log entry.
 
 The pinned recipe builds whisper.cpp 1.9.5 and FFmpeg 8.1, with Silero VAD 6.2.0.
 FFmpeg accepts local media files and has network protocols disabled. Program
@@ -103,6 +106,7 @@ when the domain has an exact recovery command.
 Human and JSON inspection handoffs follow the observed state: install absent
 assets, enable verified disabled assets, check enabled consumers, or inspect and
 repair unknown state. Unsupported assistant releases receive an update command.
+Enabled missing assets receive disablement before reinstalling the selected model.
 
 `status --json` reports the global flag, verified/absent/invalid assets, release
 compatibility, observed host readiness, queued and active preparation, and the

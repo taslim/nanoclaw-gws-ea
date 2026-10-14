@@ -110,15 +110,25 @@ async function retainBuildDiagnostic(file: string): Promise<void> {
     try {
       const size = (await handle.stat()).size;
       const tail = Buffer.alloc(Math.min(size, 16 * 1024));
-      const { bytesRead } = await handle.read(tail, 0, tail.length, Math.max(0, size - tail.length));
-      step.write(`\n${file} (last ${bytesRead} bytes):\n${tail.subarray(0, bytesRead).toString('utf8')}\n`);
+      const offset = Math.max(0, size - tail.length);
+      const { bytesRead } = await handle.read(tail, 0, tail.length, offset);
+      const text = tail.subarray(0, bytesRead).toString('utf8');
+      // A cut credential is no longer recognizable by the redactor. Keep complete lines only.
+      const firstNewline = text.indexOf('\n');
+      const excerpt = offset === 0 ? text : firstNewline < 0 ? '' : text.slice(firstNewline + 1);
+      step.write(`\n${file} (bounded diagnostic excerpt):\n${excerpt}\n`);
     } finally {
       await handle.close();
     }
     // eslint-disable-next-line no-catch-all/no-catch-all -- Optional diagnostic collection must preserve the original build failure.
   } catch (error) {
     // Diagnostic collection must not replace the failed build.
-    step.write(`Build diagnostic unavailable (${errorCode(error)}): ${file}\n`);
+    try {
+      step.write(`Build diagnostic unavailable (${errorCode(error)}): ${file}\n`);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- A broken diagnostic sink must not replace the original build failure.
+    } catch {
+      /* Preserve the build failure and continue scratch cleanup. */
+    }
   }
 }
 
@@ -418,19 +428,24 @@ export async function installVoiceAssets(
         },
       },
     );
-    activeStep()?.write(`${stage} failed: ${String(error)}\n`);
+    try {
+      activeStep()?.write(`${stage} failed: ${String(error)}\n`);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- Cleanup remains mandatory when logging itself fails.
+    } catch {
+      /* The managed failure already retains the stage and cause. */
+    }
   }
   try {
     await rm(work, { recursive: true, force: true });
     // eslint-disable-next-line no-catch-all/no-catch-all -- A cleanup failure augments the primary failure or reports retained published assets.
   } catch (error) {
     failure = new GwsEaError(
-      failure instanceof GwsEaError ? failure.code : 'voice_cleanup_failed',
-      `${failure instanceof GwsEaError ? failure.message : 'Voice assets were published.'} Scratch cleanup failed; inspect ${work} before retrying.`,
+      failure?.code ?? 'voice_cleanup_failed',
+      `${failure?.message ?? 'Voice assets were published.'} Scratch cleanup failed; inspect ${work} before retrying.`,
       {
         cause: failure ?? error,
         details: {
-          ...(failure instanceof GwsEaError ? failure.details : {}),
+          ...failure?.details,
           scratchDirectory: work,
           published,
           installationDir: destination,

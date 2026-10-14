@@ -18,7 +18,7 @@ import { mkdir, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { isErrno } from '../community-portal/errors.js';
+import { errorCode, isErrno } from '../community-portal/errors.js';
 import { PauseRequired } from './events.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { envKeyNames, redact, registerSecretDirectory, safeErrorCode } from './redact.js';
@@ -49,6 +49,8 @@ export interface RunLog {
   readonly id: string;
   readonly directory: string;
   readonly progressLog: string;
+  /** Secondary failure while recording a primary operation failure. */
+  readonly loggingError?: string;
   step<T>(name: string, body: (step: StepLog) => Promise<T>): Promise<T>;
   userInput(key: string, value: string): void;
   /** Move a pre-reservation run under its newly reserved instance. */
@@ -132,6 +134,7 @@ class Run implements RunLog {
   readonly #failures = new WeakMap<object, string>();
   #stepCount = 0;
   #lastStep: string | undefined;
+  #loggingError: string | undefined;
 
   constructor(id: string, directory: string, paths: ControlPlanePaths) {
     this.id = id;
@@ -145,6 +148,10 @@ class Run implements RunLog {
 
   get progressLog(): string {
     return path.join(this.#directory, PROGRESS_LOG);
+  }
+
+  get loggingError(): string | undefined {
+    return this.#loggingError;
   }
 
   append(lines: readonly string[]): void {
@@ -169,10 +176,18 @@ class Run implements RunLog {
     const runDirectory = (): string => this.#directory;
     const descriptor = fs.openSync(path.join(this.#directory, relativeRawLog), 'wx', 0o600);
     let open = true;
+    let writeFailed = false;
     const facts: Array<readonly [string, string]> = [];
     let marked: 'paused' | undefined;
     const write = (text: string): void => {
-      if (open && text) fs.writeSync(descriptor, redact(text));
+      if (!open || writeFailed || !text) return;
+      try {
+        fs.writeSync(descriptor, redact(text));
+      } catch (error) {
+        writeFailed = true;
+        this.#loggingError ??= errorCode(error);
+        throw error;
+      }
     };
     const step: StepLog = {
       name,
@@ -205,13 +220,14 @@ class Run implements RunLog {
       entry(marked ?? 'success');
       return result;
     } catch (error) {
-      if (error instanceof PauseRequired) {
-        entry('paused');
-        throw error;
-      }
       // Attribute each failure to the innermost step that raised it.
       if (typeof error === 'object' && error !== null && !this.#failures.has(error)) this.#failures.set(error, name);
-      entry('failed', error);
+      try {
+        entry(error instanceof PauseRequired ? 'paused' : 'failed', error);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Record a secondary log failure without replacing the operation's error.
+      } catch (logError) {
+        this.#loggingError ??= errorCode(logError);
+      }
       throw error;
     } finally {
       open = false;

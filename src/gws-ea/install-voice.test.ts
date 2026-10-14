@@ -358,14 +358,65 @@ describe('explicit pinned voice recipe', () => {
       expect(directories.includes(path.basename(voiceInstallationDirectory(paths, 'base')))).toBe(published);
     },
   );
-  it('retains redacted FFmpeg configure diagnostics before removing scratch', async () => {
-    const secret = 'fixture-configure-secret-92734';
+  it.each([
+    ['FFmpeg', true],
+    ['whisper.cpp', true],
+    ['whisper.cpp', false],
+  ] as const)(
+    'retains safe %s configure diagnostics when present=%s before removing scratch',
+    async (engine, available) => {
+      const secret = 'fixture-configure-secret-92734';
+      registerSecret(secret);
+      const run = await startRunLog({ paths, command: 'capabilities install' });
+      let log = '';
+      const base = compiler([]);
+      await expect(
+        run.step('install voice', async (step) => {
+          log = step.rawLog;
+          return installVoiceAssets(
+            paths,
+            {},
+            {
+              fetch: fetchRecipe(),
+              runCommand: async (command) => {
+                if (engine === 'FFmpeg' ? command.command.endsWith('/configure') : command.args[0] === '-S') {
+                  const diagnostic =
+                    engine === 'FFmpeg'
+                      ? path.join(command.cwd, 'ffbuild/config.log')
+                      : path.join(command.args[3], 'CMakeFiles/CMakeConfigureLog.yaml');
+                  if (available) {
+                    await mkdir(path.dirname(diagnostic), { recursive: true });
+                    await writeFile(diagnostic, `compiler probe failed; ${secret}`);
+                  }
+                  throw new GwsEaError('command_failed', 'C compiler test failed', {
+                    details: { stderrTail: 'compiler probe failed' },
+                  });
+                }
+                return base(command);
+              },
+            },
+          );
+        }),
+      ).rejects.toMatchObject({
+        code: 'voice_build_failed',
+        message: expect.stringContaining('C compiler test failed'),
+        details: { stage: `Configuring ${engine}` },
+      });
+      const retained = await readFile(log, 'utf8');
+      expect(retained).toContain(available ? 'compiler probe failed' : 'Build diagnostic unavailable (ENOENT)');
+      expect(retained).not.toContain(secret);
+      expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+    },
+  );
+
+  it('drops the partial first diagnostic line before redaction at the byte limit', async () => {
+    const secret = 'boundary-secret-92734';
     registerSecret(secret);
     const run = await startRunLog({ paths, command: 'capabilities install' });
     let log = '';
     const base = compiler([]);
     await expect(
-      run.step('install voice', async (step) => {
+      run.step('build', async (step) => {
         log = step.rawLog;
         return installVoiceAssets(
           paths,
@@ -375,20 +426,49 @@ describe('explicit pinned voice recipe', () => {
             runCommand: async (command) => {
               if (command.command.endsWith('/configure')) {
                 await mkdir(path.join(command.cwd, 'ffbuild'));
-                await writeFile(path.join(command.cwd, 'ffbuild/config.log'), `compiler probe failed; ${secret}`);
-                throw new GwsEaError('command_failed', 'C compiler test failed', {
-                  details: { stderrTail: 'see ffbuild/config.log' },
-                });
+                await writeFile(
+                  path.join(command.cwd, 'ffbuild/config.log'),
+                  `${secret}${'x'.repeat(16350)}\nuseful complete line\n`,
+                );
+                throw new GwsEaError('command_failed', 'configure failed');
               }
               return base(command);
             },
           },
         );
       }),
-    ).rejects.toMatchObject({ code: 'voice_build_failed', details: { stage: 'Configuring FFmpeg' } });
+    ).rejects.toMatchObject({ code: 'voice_build_failed' });
     const retained = await readFile(log, 'utf8');
-    expect(retained).toContain('compiler probe failed');
-    expect(retained).not.toContain(secret);
+    expect(retained).not.toContain('92734');
+    expect(retained).toContain('useful complete line');
+  });
+
+  it('cleans scratch and preserves the build failure when the diagnostic sink fails', async () => {
+    const run = await startRunLog({ paths, command: 'capabilities install' });
+    const base = compiler([]);
+    await expect(
+      run.step('build', async (step) =>
+        installVoiceAssets(
+          paths,
+          {},
+          {
+            fetch: fetchRecipe(),
+            runCommand: async (command) => {
+              if (command.command.endsWith('/configure')) {
+                vi.spyOn(step, 'write').mockImplementation(() => {
+                  throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+                });
+                throw new GwsEaError('command_failed', 'original configure failure');
+              }
+              return base(command);
+            },
+          },
+        ),
+      ),
+    ).rejects.toMatchObject({
+      code: 'voice_build_failed',
+      message: expect.stringContaining('original configure failure'),
+    });
     expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
   });
 });

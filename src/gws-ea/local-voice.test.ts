@@ -596,17 +596,72 @@ describe('native public capability journeys', () => {
     expect(hostProbe).not.toHaveBeenCalled();
     expect(installer.build).not.toHaveBeenCalled();
   });
-  it('reinstalls a missing selected small model without claiming verified provenance or falling back to base', async () => {
+  it.each([false, true])('repairs a missing selected small model when enabled=%s', async (enabled) => {
     const installation = await assets('small');
-    await policy(installation);
+    await policy(installation, enabled);
     await rm(installation.installationDir, { recursive: true });
     expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
       exit: 0,
       result: {
         data: { assets: { status: 'absent', selected_model: 'small', provenance: null } },
-        next_actions: [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] }],
+        next_actions: [
+          ...(enabled ? [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] }] : []),
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+        ],
       },
     });
+    if (enabled) {
+      const human: string[] = [];
+      expect(
+        await runCli(['capabilities', 'show', 'voice'], {
+          paths,
+          stdout: (line) => human.push(line),
+          stderr: (line) => human.push(line),
+          environment: {},
+        }),
+      ).toBe(0);
+      expect(human.join('\n')).toContain('gws-ea capabilities disable voice');
+      expect(human.join('\n')).toContain('gws-ea capabilities install voice --model small');
+      expect((await invoke(['capabilities', 'disable', 'voice'])).exit).toBe(0);
+    }
+    installer.build.mockResolvedValue(installation);
+    expect((await invoke(['capabilities', 'install', 'voice', '--model', 'small'])).exit).toBe(0);
+    expect(installer.build).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ model: 'small' }),
+      expect.anything(),
+    );
+  });
+  it('offers complete human and JSON recovery for a corrupt selected small model', async () => {
+    const installation = await assets('small');
+    await policy(installation);
+    installed.delete(installation.installationDir);
+    const answer = await invoke(['capabilities', 'enable', 'voice']);
+    expect(answer).toMatchObject({
+      exit: 1,
+      result: {
+        error: { code: 'voice_assets_invalid' },
+        next_actions: [
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'uninstall', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+        ],
+      },
+    });
+    const human: string[] = [];
+    expect(
+      await runCli(['capabilities', 'enable', 'voice'], {
+        paths,
+        upsertEnvVars,
+        stdout: (line) => human.push(line),
+        stderr: (line) => human.push(line),
+        environment: {},
+      }),
+    ).toBe(1);
+    const text = human.join('\n');
+    expect(text).toContain('gws-ea capabilities disable voice');
+    expect(text).toContain('gws-ea capabilities uninstall voice');
+    expect(text).toContain('gws-ea capabilities install voice --model small');
   });
   it('installs inactive, enables two compatible assistants once, and retains unknown compatibility', async () => {
     const first = await assistant(34000);

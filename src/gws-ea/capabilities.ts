@@ -16,6 +16,7 @@ import { runInstanceNclJson } from './ncl.js';
 import type { ControlPlanePaths } from './paths.js';
 import { safeErrorMessage } from './redact.js';
 import type { NextAction } from './result.js';
+import type { CommandHandler } from './command-definitions.js';
 import { GwsEaError } from './types.js';
 import { readRegistry } from './registry.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
@@ -353,7 +354,7 @@ export function voiceCapabilityNextActions(
   capability: VoiceCapabilityObservation,
   checked: boolean,
 ): readonly NextAction[] {
-  const command = (action: string, ...args: string[]): NextAction => ({
+  const command = (action: (typeof VOICE_CAPABILITY.actions)[number], ...args: string[]): NextAction => ({
     kind: 'command',
     argv: ['gws-ea', 'capabilities', action, 'voice', ...args],
   });
@@ -374,6 +375,7 @@ export function voiceCapabilityNextActions(
     ];
   if (capability.assets.status === 'absent')
     return [
+      ...(capability.activation.status === 'enabled' ? [command('disable')] : []),
       command('install', ...(capability.assets.selected_model ? ['--model', capability.assets.selected_model] : [])),
     ];
   if (capability.assets.status === 'unknown')
@@ -418,12 +420,15 @@ export function voiceCapabilityNextActions(
 /** Exact recovery commands for the voice domain's existing error codes. */
 export function voiceCapabilityRecovery(
   error: unknown,
-  request: { readonly action?: string; readonly model?: string; readonly cmake?: string } = {},
+  request: {
+    readonly action?: Extract<CommandHandler, { kind: 'capability' }>['command'];
+    readonly model?: string;
+    readonly cmake?: string;
+  } = {},
 ): readonly NextAction[] {
   if (!(error instanceof GwsEaError)) return [];
   const selected = request.model ?? error.details?.model;
-  const model =
-    selected === 'base' || selected === 'small' || selected === 'large-v3-turbo-q5_0' ? selected : undefined;
+  const model = VOICE_CAPABILITY.models.find((candidate) => candidate === selected);
   const installOptions = [...(model ? ['--model', model] : []), ...(request.cmake ? ['--cmake', request.cmake] : [])];
   const command = (action: 'install' | 'enable' | 'disable' | 'uninstall' | 'check'): NextAction => ({
     kind: 'command',
@@ -484,11 +489,7 @@ export function voiceCapabilityRecovery(
     case 'voice_policy_invalid':
       return [{ kind: 'external', instruction: error.message }];
     case 'voice_operation_failed':
-      return [
-        { kind: 'external', instruction: error.message },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] },
-        retry,
-      ];
+      return [{ kind: 'external', instruction: error.message }, command('check'), retry];
     case 'voice_drain_unproven':
     case 'voice_not_drained':
       return [

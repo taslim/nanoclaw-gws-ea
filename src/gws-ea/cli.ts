@@ -2355,7 +2355,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         return EXIT_CODES.ready;
         // eslint-disable-next-line no-catch-all/no-catch-all -- Every managed voice failure has the same result boundary.
       } catch (cause) {
-        const error =
+        let error =
           cause instanceof GwsEaError
             ? cause
             : new GwsEaError(
@@ -2363,7 +2363,19 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                 `Voice ${command} failed (${errorCode(cause)}). Inspect the operator state directories, permissions, available disk space, and retained log if present before retrying.`,
                 { cause },
               );
-        run?.abort(cause);
+        let logFailure = run?.loggingError;
+        try {
+          run?.abort(cause);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- A full or unavailable log must not suppress the managed result.
+        } catch (logError) {
+          logFailure = errorCode(logError);
+        }
+        if (logFailure)
+          error = new GwsEaError(
+            error.code,
+            `${error.message} Diagnostic log incomplete (${logFailure}); check available disk space and permissions before retrying.`,
+            { cause: error, details: { ...error.details, logFailure } },
+          );
         registerErrorSecrets();
         const actions = voiceCapabilityRecovery(error, {
           action: command,
@@ -2383,7 +2395,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             diagnostics: { ...(run ? { run_log: run.progressLog } : {}), ...(stepLog ? { step_log: stepLog } : {}) },
           }),
         );
-        const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
+        const tail = error.details?.stderrTail;
         return reportStop(presenter, error, details, typeof tail === 'string' ? tail : undefined);
       } finally {
         stopObservingInterruption();

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
@@ -364,6 +365,38 @@ describe('managed machine results', () => {
 });
 
 describe('host-wide optional voice commands', () => {
+  it('emits the primary managed failure even when failure and abort logging run out of space', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const append = fs.appendFileSync;
+    const appendSpy = vi.spyOn(fs, 'appendFileSync').mockImplementation((...args) => {
+      if (String(args[1]).includes('→ failed') || String(args[1]).includes('aborted')) {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return append(...args);
+    });
+    const exit = await runCli(
+      ['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
+      { paths, ...io.runtime },
+    );
+    expect(exit).toBe(1);
+    expect(JSON.parse(io.out.join('\n'))).toMatchObject({
+      error: {
+        code: 'voice_build_prerequisite',
+        message: expect.stringContaining('Diagnostic log incomplete (ENOSPC)'),
+      },
+    });
+    appendSpy.mockRestore();
+    const retry = lines();
+    expect(
+      await runCli(['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
+        paths,
+        ...retry.runtime,
+      }),
+    ).toBe(1);
+    expect(JSON.parse(retry.out.join('\n'))).toMatchObject({ error: { code: 'voice_build_prerequisite' } });
+    expect(await readdir(path.join(paths.stateRoot, 'voice'))).toEqual([]);
+  });
   it('keeps install retry options and private diagnostics when an explicit CMake path is missing', async () => {
     const paths = await testPaths();
     const io = lines();
@@ -491,6 +524,7 @@ function neverCalled(): never {
 const PRIVATE_REMOTE = 'git@github.com:example/nanoclaw-gws-ea-private.git';
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   googleConnection.resources = undefined;
   for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
