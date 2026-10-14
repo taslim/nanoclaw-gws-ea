@@ -638,7 +638,7 @@ describe("external-email's reply", () => {
     await inbox.tick();
     expect(await threadMessages(key, 'principal')).toHaveLength(1);
 
-    const id = await reply(session, key, 'Thursday at **10** works for Pat.\n\nBest,');
+    const id = await reply(session, key, 'Thursday at **10** works for Pat.\n\nBest,\nJuno | EA to Pat');
     expect(deliveryStatus(session, id)).toBe('delivered');
     const [sent] = gmail.sent;
     expect(sent.to).toEqual([JANE, SAM]);

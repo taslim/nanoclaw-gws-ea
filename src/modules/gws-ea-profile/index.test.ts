@@ -15,7 +15,6 @@ import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { recordCalendarAccess } from '../gws-ea-inbox/db.js';
 import { gwsEaInboxCalendarAccessMigration } from '../gws-ea-inbox/migration.js';
-import { emailSignature } from '../gws-ea-inbox/render.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -724,7 +723,7 @@ describe("external-email's pointer and audience", () => {
     await expect(recordExternalEmailAgentGroupId(research.id)).rejects.toThrow(/already bound/);
   });
 
-  it('writes each document for its audience: external-email gets the two names and no address', async () => {
+  it('writes each document for its audience: external-email gets the two names, its signature, and no address', async () => {
     await recordExternalEmailAgentGroupId(ee.id);
 
     expect(await projectDocAudience(main.id)).toBe('main');
@@ -734,7 +733,9 @@ describe("external-email's pointer and audience", () => {
     const [section] = await getRequiredProjectDocSections(ee);
     expect(section).toEqual({
       name: 'Assistant Identity',
-      body: 'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
+      body:
+        'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
+        '\n\nYour email signature:\n\nAya | EA to Morgan',
     });
     const [other] = await getRequiredProjectDocSections(research);
     expect(other?.body).toContain('`morgan@example.test`');
@@ -847,8 +848,6 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
       },
     });
     expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
-    // The signature reads the profile at each send.
-    expect(emailSignature(await getGwsEaProfile())).toBe('Aya | EA to Juno Hale');
     // main's identity text is composed at its next start, from the profile.
     const [section] = await getRequiredProjectDocSections(main);
     expect(section?.body).toContain('Juno Hale is the principal.');

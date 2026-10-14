@@ -104,15 +104,16 @@ function displayName(value: string, label: string): string {
 /**
  * The longest name `main` may set for the principal. A name with titles and
  * a suffix fits well within it, and it keeps a sentence of instructions out
- * of every signature the name reaches.
+ * of the signature the name reaches.
  */
 const PRINCIPAL_NAME_MAX_LENGTH = 80;
 
 /**
  * Why `name` could not be a person's name, or undefined when it could
- * (KTD9). The name reaches every outgoing signature and external-email's
- * instructions, so it carries no address, link or markup: a dot directly
- * before two letters is a domain, which mail clients turn into a link.
+ * (KTD9). The name reaches external-email's instructions and, through the
+ * signature they give it, its email, so it carries no address, link or
+ * markup: a dot directly before two letters is a domain, which mail clients
+ * turn into a link.
  */
 function personalNameProblem(name: string): string | undefined {
   if (!name) return 'it is empty';
