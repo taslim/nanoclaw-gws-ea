@@ -191,9 +191,10 @@ export async function replacePrincipalCalendars(calendarIds: readonly string[], 
 /**
  * What the assistant can do with a principal address's main calendar, by
  * Google's access role for it in the assistant's calendar list: book on it
- * (`writer` or `owner`), read its events (`reader`), see only when it is busy
- * (`freeBusyReader`), or nothing, because it is not shared with the
- * assistant or not in its list.
+ * (`owner`, `writer`, or `writerWithoutPrivateAccess`), read its events
+ * (`reader`), see only when it is busy (`freeBusyReader`), or nothing,
+ * because it is not shared with the assistant, not in its list, or shared
+ * with a role the host does not know.
  */
 export type CalendarAccess = 'bookable' | 'readable' | 'free-busy' | 'none';
 
