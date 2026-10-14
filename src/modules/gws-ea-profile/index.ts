@@ -139,9 +139,9 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
 
 /**
  * Who the assistant and the principal are, for each audience (KTD14). Main
- * reads the principal's addresses live. Outside email and casual chats get
- * names only; a chat job additionally gets the assistant's web address while
- * explicitly allowed to delegate. The browser gives that alias to websites, never
+ * reads the principal's addresses live. Outside email gets names and its
+ * email signature, casual chats names only; a chat job additionally gets
+ * the assistant's web address while explicitly allowed to delegate. The browser gives that alias to websites, never
  * the address it converses from, and knows the principal's addresses only
  * to recognize them (R34). Any other group gets the addresses as of
  * its container's start: the default `group` CLI scope leaves the live list
@@ -157,7 +157,13 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const principal = escapeMarkdownInline(profile.principal_display_name);
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
-  if (audience === 'external-email' || audience === 'external-chat') return { name: 'Assistant Identity', body: names };
+  if (audience === 'external-email') {
+    return {
+      name: 'Assistant Identity',
+      body: `${names}\n\nYour email signature:\n\n${assistant} | EA to ${principal}`,
+    };
+  }
+  if (audience === 'external-chat') return { name: 'Assistant Identity', body: names };
   if (audience === 'browser') {
     const body = `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
     return { name: 'Assistant Identity', body: `${names}${body}` };
@@ -510,11 +516,11 @@ function receiptText(changes: readonly ProfileChange[]): string {
 }
 
 /**
- * What follows the change, and when: the host's readers now, main's own copies on its next start.
+ * What follows the change, and when: the host's readers now, each agent's own copy on its next start.
  * to: main
  */
 const TAKES_EFFECT =
-  "The host's email signatures and external-email's offered times use the new values now. Your own clock and the identity in your instructions follow at your next start, with nothing for you to do.";
+  "The times external-email offers use the new values now. Your own clock and the identity in your instructions follow at your next start; external-email's identity and email signature follow at its next start, with nothing for you to do.";
 
 async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMainCaller(ctx, NAME_AND_TIMEZONE);

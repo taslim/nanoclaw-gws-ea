@@ -1251,7 +1251,7 @@ describe('routing by audience', () => {
     expect(hostText(email.text)).not.toContain('My 3pm');
     expect(await outsideMail()).toEqual([]);
 
-    const id = await mainReplies(threadKey, 'Done: your 3pm is now **Thursday** at 15:00.\n\nBest,');
+    const id = await mainReplies(threadKey, 'Done: your 3pm is now **Thursday** at 15:00.');
     expect(deliveryStatus(main, id)).toBe('delivered');
     const [answer, ...others] = gmail.sent;
     expect(others).toEqual([]);
@@ -1264,8 +1264,8 @@ describe('routing by audience', () => {
     expect(header(answer.headers, 'Subject')).toBe('Re: My 3pm');
     expect(header(answer.headers, 'In-Reply-To')).toBe('<p1@principal.example>');
     expect(header(answer.headers, 'References')).toBe('<p1@principal.example>');
-    expect(answer.text).toContain('Thursday');
-    expect(answer.text).toContain('Best,\nJuno | EA to Pat\n');
+    // Its words alone, as main wrote them: the host signs nothing.
+    expect(answer.text.slice(0, answer.text.indexOf('\n\nOn '))).toBe('Done: your 3pm is now Thursday at 15:00.');
     expect(answer.text).toMatch(/Pat <pat@principal\.example> wrote:\n\n> Can you move my 3pm to Thursday\?/u);
     expect(answer.html).toContain('<strong>Thursday</strong>');
     expect((await threadMessages(threadKey, 'principal')).map((m) => m.gmailMessageId)).toEqual([gmailId, answer.id]);
