@@ -1,6 +1,7 @@
 /** The shipped optional host catalog. Voice owns its actions, locks, policy, and asset recipe. */
 import { lstat } from 'node:fs/promises';
 
+import { formatLocalTime } from '../timezone.js';
 import { isErrno } from '../community-portal/errors.js';
 import { DEFAULT_VOICE_MODEL, voiceInstallationDirectory } from './install-voice.js';
 import {
@@ -71,6 +72,7 @@ interface VoiceInstallationObservation {
   readonly receipt: VoiceAssetReceipt | null;
 }
 export interface VoiceCapabilityObservation {
+  readonly observed_at: string;
   readonly name: 'voice';
   readonly actions: typeof VOICE_CAPABILITY.actions;
   readonly scope: 'host';
@@ -231,6 +233,7 @@ export async function inspectVoiceCapability(
   paths: ControlPlanePaths,
   options: VoiceCapabilityInspection = {},
 ): Promise<VoiceCapabilityObservation> {
+  const observedAt = new Date().toISOString();
   const platform = options.platform ?? process.platform;
   const architecture = options.architecture ?? process.arch;
   const availability = {
@@ -278,6 +281,7 @@ export async function inspectVoiceCapability(
   const consumers = await inspectVoiceConsumers(paths, options);
   return {
     ...VOICE_CAPABILITY,
+    observed_at: observedAt,
     availability,
     activation,
     assets,
@@ -287,7 +291,11 @@ export async function inspectVoiceCapability(
 }
 
 /** Scope-conscious terminal facts use the same inspection data as machine output. */
-export function capabilityLines(capability: VoiceCapabilityObservation, detailed: boolean): readonly string[] {
+export function capabilityLines(
+  capability: VoiceCapabilityObservation,
+  detailed: boolean,
+  timezone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+): readonly string[] {
   const lines = [
     `${capability.name} (host): ${capability.summary}`,
     `  Host: ${capability.availability.status} (${capability.availability.platform}/${capability.availability.architecture})`,
@@ -311,15 +319,26 @@ export function capabilityLines(capability: VoiceCapabilityObservation, detailed
       ...Object.entries(capability.sources).map(
         ([name, source]) => `  Source ${name}: ${source.url} (sha256 ${source.sha256})`,
       ),
-      ...(capability.assets.provenance ? [`  Verified build: ${capability.assets.provenance.builtAt}`] : []),
+      ...(capability.assets.provenance
+        ? [`  Verified build: ${formatLocalTime(capability.assets.provenance.builtAt, timezone)}`]
+        : []),
       ...capability.prerequisites.map((line) => `  Prerequisite: ${line}`),
-      ...capability.assistants.map(
-        (assistant) =>
-          `  ${assistant.instance_id}: ${assistant.compatibility}; readiness ${assistant.readiness}; consumer ${assistant.consumer.status}; queued ${assistant.consumer.queued ?? 'unknown'}; inflight ${assistant.consumer.inflight ?? 'unknown'}${assistant.reason ? `; ${assistant.reason}` : ''}`,
-      ),
+      ...capability.assistants.flatMap((assistant) => [
+        `  Assistant ${assistant.instance_id}`,
+        `    Release: ${assistant.compatibility}; readiness: ${assistant.readiness}; consumer: ${assistant.consumer.status}`,
+        `    Work: queued ${assistant.consumer.queued ?? 'unknown'}; inflight ${assistant.consumer.inflight ?? 'unknown'}`,
+        `    Last recognition: ${assistant.last_outcome ? `${assistant.last_outcome.status} ${formatLocalTime(assistant.last_outcome.at, timezone)}` : 'unobserved'}`,
+        ...(assistant.last_failure
+          ? [
+              `    Last failure: ${assistant.last_failure.reason} ${formatLocalTime(assistant.last_failure.at, timezone)}`,
+            ]
+          : []),
+        ...(assistant.reason ? [`    Cause: ${assistant.reason}`] : []),
+      ]),
       ...capability.readiness_limits.map((line) => `  ${line}`),
       '  Next: gws-ea capabilities check voice; gws-ea help capabilities install',
     );
+  lines.push(`Observed: ${formatLocalTime(capability.observed_at, timezone)}`);
   return lines;
 }
 

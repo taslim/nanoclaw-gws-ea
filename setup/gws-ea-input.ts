@@ -47,11 +47,11 @@ export interface GwsEaCreateInputDependencies {
 }
 
 const defaultPrompts: PromptAdapter = {
-  note: (message, title) => p.note(message, title),
-  text: (options) => p.text(options),
-  select: (options) => brightSelect<string>(options),
+  note: (message, title) => p.note(message, title, { output: process.stderr }),
+  text: (options) => p.text({ ...options, output: process.stderr }),
+  select: (options) => brightSelect<string>({ ...options, output: process.stderr }),
   isCancel: p.isCancel,
-  logInfo: (message) => p.log.info(message),
+  logInfo: (message) => p.log.info(message, { output: process.stderr }),
 };
 
 function cancelled(): never {
@@ -263,7 +263,15 @@ export async function collectGwsEaCreateInput(
 
   const source: InputSource = { context, prompts, interactive: dependencies.interactive ?? true };
 
-  note(source, `Release track ${context.track}`, 'New assistant');
+  note(
+    source,
+    [
+      `Release track ${context.track}.`,
+      'Your operator Google Cloud account manages resources. The assistant uses its own Workspace account for mail and Chat.',
+      'Principal addresses identify the person served; choose their Chat address from that list. Provider sign-in is a separate identity.',
+    ].join('\n'),
+    'New assistant',
+  );
   const assistantFirst = await textInput(source, 'assistant-first-name', 'Assistant first name');
   const assistantLast = await textInput(source, 'assistant-last-name', 'Assistant last name', {
     optional: true,
@@ -335,15 +343,16 @@ export async function authenticateGwsEaProvider(
   try {
     collected = await provider.provisioning.collectCredential({
       allowSkip: false,
+      output: process.stderr,
       allowAmbientConfiguration: false,
     });
   } catch (error) {
     if (error instanceof GwsEaError) throw error;
+    if (error instanceof Error && error.message === 'Provider authentication was cancelled')
+      throw new GwsEaError('cancelled', error.message);
     throw new GwsEaError(
       'provider_authentication_failed',
-      error instanceof Error && error.message === 'Provider authentication was cancelled'
-        ? error.message
-        : `Could not authenticate ${provider.label}; retry to continue provisioning.`,
+      `Could not authenticate ${provider.label}; retry to continue provisioning.`,
     );
   }
   if (!collected) throw new GwsEaError('provider_credential_required', 'Provider authentication is required');

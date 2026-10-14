@@ -24,6 +24,7 @@ describe('shipped voice capability catalog', () => {
     const voice = await inspectVoiceCapability(paths, { platform: 'win32', architecture: 'x64' });
     expect(voice).toMatchObject({
       name: 'voice',
+      observed_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT.*Z$/u),
       actions: ['show', 'check', 'install', 'enable', 'disable', 'uninstall'],
       scope: 'host',
       availability: { status: 'unsupported', platform: 'win32' },

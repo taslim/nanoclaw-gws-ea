@@ -53,7 +53,11 @@ function consumeOption(
   );
   if (!definition) {
     if (name === 'json' && command && !command.outputModes.includes('json'))
-      invalid(`${command.path.join(' ')} does not support --json.`);
+      invalid(
+        command.path[0] === 'help'
+          ? 'Help is human-only. Use gws-ea schema [command path] --json for machine discovery.'
+          : `${command.path.join(' ')} does not support --json.`,
+      );
     invalid(`Unknown option ${rawName}`);
   }
   if (!definition.repeatable && parsed.options[definition.name] !== undefined)
@@ -126,13 +130,20 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
   if (!definition) throw new Error('The command definitions must include help.');
   const positionals: string[] = namespace ? [...namespace.path] : [];
   while (index < own.length) {
-    if (own[index].startsWith('-')) index = consumeOption(own, index, optionsFor(definition), parsed, definition);
+    const versionTarget =
+      own[index] === '--version' &&
+      definition.handler.kind === 'discovery' &&
+      (definition.handler.command === 'help' || definition.handler.command === 'schema');
+    if (own[index].startsWith('-') && !versionTarget)
+      index = consumeOption(own, index, optionsFor(definition), parsed, definition);
     else {
       positionals.push(own[index]);
       index += 1;
     }
   }
   // Leading common options must obey the selected command's output modes too.
+  if (parsed.options.json === 'true' && (parsed.options.help === 'true' || definition.path[0] === 'help'))
+    invalid('Help is human-only. Use gws-ea schema [command path] --json for machine discovery.');
   if (parsed.options.json === 'true' && !definition.outputModes.includes('json'))
     invalid(`${definition.path.join(' ')} does not support --json.`);
   const help =

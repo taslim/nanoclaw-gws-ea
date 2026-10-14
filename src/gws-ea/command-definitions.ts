@@ -43,7 +43,12 @@ interface OptionBase {
 
 export type OptionDefinition =
   | (OptionBase & { readonly type: 'boolean'; readonly short?: string })
-  | (OptionBase & { readonly type: 'string'; readonly valueName: string; readonly choices?: readonly string[] });
+  | (OptionBase & {
+      readonly type: 'string';
+      readonly valueName: string;
+      readonly valueKind?: 'file';
+      readonly choices?: readonly string[];
+    });
 
 export interface ArgumentDefinition {
   readonly name: string;
@@ -77,7 +82,12 @@ export interface CommandDefinition {
   readonly passThrough?: boolean;
 }
 
-const value = (name: string, valueName: string, description: string, required = false): OptionDefinition => ({
+const value = (
+  name: string,
+  valueName: string,
+  description: string,
+  required = false,
+): Extract<OptionDefinition, { readonly type: 'string' }> => ({
   name,
   type: 'string',
   valueName,
@@ -87,16 +97,14 @@ const value = (name: string, valueName: string, description: string, required = 
 const flag = (name: string, description: string): OptionDefinition => ({ name, type: 'boolean', description });
 const id = value('id', 'instance_id', 'The full assistant ID; never inferred from the registry.', true);
 const yes = flag('yes', "Supply this command's defined confirmation; never substitutes for OAuth consent.");
-const secrets = value(
-  'secrets-file',
-  'file',
-  'Owner-only file under the config root containing GWS_EA_PROVIDER_CREDENTIAL.',
-);
-const googleClient = value(
-  'google-client-file',
-  'file',
-  "Desktop OAuth client downloaded for the assistant's Google sign-in.",
-);
+const secrets: OptionDefinition = {
+  ...value('secrets-file', 'file', 'Owner-only file under the config root containing GWS_EA_PROVIDER_CREDENTIAL.'),
+  valueKind: 'file',
+};
+const googleClient: OptionDefinition = {
+  ...value('google-client-file', 'file', "Desktop OAuth client downloaded for the assistant's Google sign-in."),
+  valueKind: 'file',
+};
 const managedModes = ['human', 'json'] as const;
 const nativeResult: ResultSchema = {
   type: 'string',
@@ -141,9 +149,15 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     ],
     effects: [
       "Deploys this tool's own committed, clean release on the selected track.",
+      'Automatically removes a stray NanoClaw install from this authoring checkout, within its existing ownership rules.',
       'Reserves owned resources and journals provisioning; creation can pause for a person.',
     ],
-    prerequisites: ['Supported host, Docker, Google Cloud and Workspace access, and provider credentials.'],
+    prerequisites: [
+      'Supported host, Docker, Google Cloud and Workspace access, and provider credentials.',
+      '--google-account is the operator managing Cloud resources; --assistant-workspace-email is the assistant account receiving mail and Chat.',
+      '--principal-email names the person served, once per address; --principal-chat-email selects their Chat address from that list.',
+      '--provider selects the agent runtime; its credential identity is independent of the Google identities.',
+    ],
     recovery: [
       'Continue the creation journal with resume --id <instance_id>; inspect with status or tear down with remove.',
     ],
@@ -171,7 +185,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     handler: { kind: 'observation', command: 'status' },
     summary: 'Observe one assistant, its operation, and runtime health.',
     scope: 'assistant',
-    options: [id],
+    options: [id, flag('details', 'Include technical probes, fingerprints, and diagnostics.')],
     effects: ['Read-only live probes; degraded health still returns success after observation.'],
     prerequisites: observationPrerequisites,
     recovery: ["Use the observed operation's continuation or recovery action."],
@@ -249,6 +263,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       yes,
     ],
     effects: [
+      'Automatically removes a stray NanoClaw install from this authoring checkout, within its existing ownership rules.',
       'Single-assistant update stages a release before confirmation; then stops briefly, switches, verifies, and retains the previous release.',
       '--all shows the plan before staging, asks once unless --yes is supplied, and pins one target for sequential rollout.',
     ],
@@ -412,7 +427,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             choices: VOICE_CAPABILITY.models,
             description: `Voice model; defaults to ${VOICE_CAPABILITY.default_model}.`,
           },
-          value('cmake', '/absolute/path', 'Explicit CMake executable.'),
+          { ...value('cmake', '/absolute/path', 'Explicit CMake executable.'), valueKind: 'file' },
         ],
         effects: [
           'Downloads and builds pinned shared host assets; installation leaves recognition disabled.',

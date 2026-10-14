@@ -1753,13 +1753,16 @@ describe('removal command', () => {
     );
 
     expect(exitCode).toBe(0);
-    // What removal deletes, all of it the assistant's own: nothing outside the machine but its Google Cloud project.
+    // Scope and consequences are visible before consent; a decline names read-only inspection.
     expect(output.slice(output.indexOf(`Assistant: ${input.instance_id}`))).toEqual([
       `Assistant: ${input.instance_id}`,
       `NanoClaw: ${paths.checkoutRoot(input.instance_id)}`,
       `OneCLI: ${input.exclusive_resource_claims.onecli_project}`,
       `Google Cloud project: ${input.exclusive_resource_claims.gcp_project_id} (${ACCOUNT})`,
+      'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
       'Removal cancelled. Nothing was changed.',
+      `Assistant: ${input.instance_id}`,
+      `Next: gws-ea status --id ${input.instance_id}`,
     ]);
     expect(remove).not.toHaveBeenCalled();
   });

@@ -112,6 +112,7 @@ const probes = object({
   }),
 });
 export const LIST_DATA_SCHEMA = object({
+  observed_at: time,
   assistants: array(
     object({
       instance_id: text,
@@ -160,6 +161,7 @@ const voiceReceipt = object({
 });
 const source = { url: text, sha256: text };
 export const VOICE_CAPABILITY_SCHEMA = object({
+  observed_at: time,
   name: { const: 'voice' },
   actions: array(choices(...VOICE_CAPABILITY.actions)),
   scope: { const: 'host' },
@@ -357,7 +359,17 @@ export function operationDataSchema(command: string): ResultSchema {
         [],
       );
     case 'update':
-      return object({ ...common, preview: updatePreview, update: assistantUpdate, plan, targets }, []);
+      return object(
+        {
+          ...common,
+          preview: updatePreview,
+          staging: object({ retained: { const: true }, release }),
+          update: assistantUpdate,
+          plan,
+          targets,
+        },
+        [],
+      );
     case 'rollback':
       return object({ ...identity, preview: rollbackPreview, rollback }, []);
     case 'remove':

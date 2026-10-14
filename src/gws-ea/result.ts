@@ -22,6 +22,7 @@ export interface OperationData {
     'phase' | 'code' | 'message' | 'details' | 'actionUrl' | 'resumeFlag' | 'choices'
   >;
   readonly preview?: RemovalPreview | UpdatePreview | RollbackPreview;
+  readonly staging?: { readonly retained: true; readonly release: import('./types.js').ReleaseCoordinates };
   readonly update?: AssistantUpdate;
   readonly rollback?: RollbackOutcome;
   readonly removal?: RemovalOutcome;

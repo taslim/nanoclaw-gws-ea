@@ -53,13 +53,14 @@ interface RunningStep {
  */
 export function createTerminalPresenter(): Presenter {
   let running: RunningStep | undefined;
+  const color = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
   let spinner: ReturnType<typeof p.spinner> | undefined;
   let tick: NodeJS.Timeout | undefined;
 
   const elapsed = (step: RunningStep): string => ` (${fmtDuration(Date.now() - step.started)})`;
   const text = (step: RunningStep): string => {
     const suffix = elapsed(step);
-    return `${fitToWidth(step.reason ?? step.label, suffix)}${k.dim(suffix)}`;
+    return `${fitToWidth(step.reason ?? step.label, suffix)}${color ? k.dim(suffix) : suffix}`;
   };
   const draw = (): void => {
     if (running && spinner) spinner.message(text(running));
@@ -99,10 +100,10 @@ export function createTerminalPresenter(): Presenter {
       const stopped = halt();
       if (!stopped) return;
       const label = finished.label.replace(/…$/u, '');
-      const suffix = k.dim(elapsed(finished));
+      const suffix = color ? k.dim(elapsed(finished)) : elapsed(finished);
       if (event.type === 'step-failed') stopped.error(`${label} failed${suffix}`);
       else if (event.type === 'step-paused') stopped.stop(`${label}: waiting for you${suffix}`);
-      else stopped.stop(`${k.bold(label)}${suffix}`);
+      else stopped.stop(`${color ? k.bold(label) : label}${suffix}`);
     },
     suspend() {
       halt()?.clear();
@@ -122,13 +123,11 @@ export function createTerminalPresenter(): Presenter {
       const details = report.details.join('\n');
       switch (report.outcome) {
         case 'ready':
-          p.log.success(report.headline);
-          if (details) p.log.message(details);
-          return;
         case 'paused':
-          p.log.warn(report.headline);
-          if (details) p.note(details, 'Next step');
+          // Result identities and continuation commands stay intact even on a narrow terminal.
+          process.stdout.write(`${[report.headline, ...report.details].join('\n')}\n`);
           return;
+        case 'diagnostic':
         case 'busy':
           p.log.warn(report.headline, { output: process.stderr });
           if (details) p.log.message(details, { output: process.stderr });
@@ -158,8 +157,14 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
           .filter((line) => line !== null)
           .join('\n'),
         "The assistant's Google sign-in",
+        { output: process.stderr },
       );
-      await confirmThenOpen(url, `Ready to sign in as ${account}? Press Enter to open your browser`);
+      await confirmThenOpen(url, `Ready to sign in as ${account}? Press Enter to open your browser`, {
+        output: process.stderr,
+        onDecline: () => {
+          throw new GwsEaError('cancelled', 'Google sign-in was cancelled; resume the assistant to continue.');
+        },
+      });
     },
     attendPause: (pause, signal) => attendPause(pause, signal),
   };
@@ -247,7 +252,7 @@ export async function main(argv: readonly string[], options: { readonly interact
   const interactive =
     invocation.options.json !== 'true' &&
     invocation.options['no-input'] !== 'true' &&
-    (options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY));
+    (options.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY));
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });

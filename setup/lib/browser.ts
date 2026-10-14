@@ -17,6 +17,7 @@
  * confirmation.
  */
 import { spawn } from 'child_process';
+import type { Writable } from 'node:stream';
 
 import * as p from '@clack/prompts';
 import k from 'kleur';
@@ -58,7 +59,9 @@ export function formatNoteLink(url: string): string | null {
 
 /**
  * Gate a browser-open on a confirm so the user is ready for their browser
- * to take focus. Proceeds on cancel as well. On headless devices both the
+ * to take focus. Managed callers use onDecline to return cancellation through
+ * their own outcome boundary; other setup callers retain their existing policy.
+ * On headless devices both the
  * prompt and the open are skipped — the URL is already surfaced inside
  * the surrounding note (via `formatNoteLink`).
  *
@@ -67,22 +70,28 @@ export function formatNoteLink(url: string): string | null {
  * <url>" in dim) so the user has a copy-paste path right next to the
  * action button without needing to scroll back up to the card.
  */
-export async function confirmThenOpen(url: string, message = 'Press Enter to open your browser'): Promise<void> {
+export async function confirmThenOpen(
+  url: string,
+  message = 'Press Enter to open your browser',
+  options: { readonly output?: Writable; readonly onDecline?: () => never } = {},
+): Promise<void> {
+  const output = options.output ?? process.stdout;
   if (isHeadless()) {
     // No browser to open here — ALWAYS surface the URL itself, and print it
-    // RAW on stdout: clack notes wrap long lines and inject gutter pipes and
-    // spaces mid-URL, breaking copy-paste (live-hit). Plain stdout is the
-    // only rendering that keeps the URL contiguous.
-    p.log.info('Open this URL in a browser on any device:');
-    process.stdout.write(`\n${url}\n\n`);
+    // RAW on the configured output: clack notes wrap long lines and inject
+    // gutter pipes and spaces mid-URL, breaking copy-paste (live-hit). Plain output is the
+    // rendering that keeps the URL contiguous.
+    p.log.info('Open this URL in a browser on any device:', { output });
+    output.write(`\n${url}\n\n`);
     return;
   }
   const fallback = `\n${k.dim(`If browser does not appear, please visit: ${url}`)}`;
-  ensureAnswer(
-    await p.confirm({
-      message: `${message}${fallback}`,
-      initialValue: true,
-    }),
-  );
+  const answer = await p.confirm({
+    message: `${message}${fallback}`,
+    initialValue: true,
+    output,
+  });
+  if (answer !== true && options.onDecline) options.onDecline();
+  ensureAnswer(answer);
   openUrl(url);
 }

@@ -46,6 +46,22 @@ describe('local CLI discovery and grammar', () => {
   });
 
   it.each([
+    ['status', '--help', '--json'],
+    ['schema', '--help', '--json'],
+    ['--json', '--help'],
+    ['capabilities', 'install', '--help', '--json'],
+  ])('rejects machine help %j with one JSON usage result and schema guidance', async (...args) => {
+    const io = capture();
+    expect(await runCli(args, io.runtime)).toBe(2);
+    expect(JSON.parse(io.stdout.join('\n'))).toMatchObject({
+      outcome: 'failed',
+      changed: false,
+      error: { code: 'invalid_arguments', message: expect.stringContaining('schema') },
+    });
+    expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['misspelled', '--help'],
     ['help', 'misspelled'],
     ['completion', 'powershell'],
@@ -234,6 +250,15 @@ describe('local CLI discovery and grammar', () => {
       for (const option of command.options) expect(completion).toContain(`--${option.name}`);
     }
     expect(completionIo.stderr).toEqual([]);
+  });
+
+  it('discovers the declared version path in scoped help and schema', async () => {
+    const help = capture();
+    expect(await runCli(['help', '--version'], help.runtime)).toBe(0);
+    expect(help.stdout.join('\n')).toContain('distinct from an assistant');
+    const schema = capture();
+    expect(await runCli(['schema', '--version', '--json'], schema.runtime)).toBe(0);
+    expect(JSON.parse(schema.stdout.join('\n')).commands[0].path).toEqual(['--version']);
   });
 
   it('reports the tool package release and actual checkout revision', async () => {

@@ -24,7 +24,7 @@ gws-ea capabilities show voice
 gws-ea capabilities install voice
 gws-ea capabilities enable voice
 gws-ea capabilities check voice
-gws-ea status --id <instance_id>
+gws-ea status --id <instance_id> --details
 ```
 
 Installation is explicit and leaves voice disabled. Package installation,
@@ -75,6 +75,8 @@ do not download, enable, restart, or process recordings. Principal response
 preferences remain principal-owned. Inspection returns exit 0 when the
 observation completed, including absent assets, corrupt assets, disabled policy,
 or unreachable consumers retained as facts; it does not mean voice is ready.
+Every inspection includes `observed_at` in ISO UTC. Human observation and
+verified-build times use the install timezone; stored receipt times are unchanged.
 Every managed JSON result uses the schema-version-1 envelope. Invalid or
 unsupported invocations return exit 2; operational failure returns 1 and busy
 returns 75. Voice failures retain native error codes and structured next actions
@@ -156,10 +158,23 @@ retry after a routing failure retains the native recovery limits.
 ## Command revision
 
 Voice operations now use the native `capabilities` namespace. Older root voice
-commands are rejected as usage errors; use `gws-ea help capabilities` to discover
+commands are rejected with usage exit 2; update first-party callers natively:
+
+| Former path       | Current path                   |
+| ----------------- | ------------------------------ |
+| `install-voice`   | `capabilities install voice`   |
+| `enable-voice`    | `capabilities enable voice`    |
+| `disable-voice`   | `capabilities disable voice`   |
+| `uninstall-voice` | `capabilities uninstall voice` |
+
+Keep supported operation flags after the new command path. There are no aliases.
+Use `gws-ea help capabilities` to discover
 the current actions. Existing policies, immutable asset receipts, journals,
 permissions, and principal preferences keep their existing formats. No storage
 migration is needed. Verify the revision with `gws-ea capabilities show voice
 --json` and `gws-ea capabilities check voice --json`. To roll back the command
 interface, use the previously committed tool release; the shared policy and
 installed assets remain compatible.
+
+See [the CLI guide](gws-ea-cli.md) for explicit assistant IDs, machine envelopes,
+stdout/stderr composition, confirmation pauses, discovery, and shell completion.

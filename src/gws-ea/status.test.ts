@@ -774,7 +774,7 @@ describe('status', () => {
     });
 
     const ok = command(host, state);
-    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false, details: true });
     expect(ok.output.stdout).toContainEqual(expect.stringMatching(/^ {2}ok {8}inbox {11}last polled /u));
 
     const unhealthySince = '2026-09-28T13:00:00.000Z';
@@ -1008,7 +1008,7 @@ describe('status', () => {
     });
 
     const shown = command(host, state, observers);
-    await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false, details: true });
     const inboxLine = shown.output.stdout.findIndex((line) => /^ {2}ok {8}inbox /u.test(line));
     const checked = formatLocalTime(checkedAt, 'America/New_York');
     expect(shown.output.stdout.slice(inboxLine + 1, inboxLine + 6)).toEqual([
@@ -1028,7 +1028,7 @@ describe('status', () => {
 
     const { status } = await statusJson(host, state, reservation.instance_id);
     const { runtime, output } = command(host, state);
-    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false });
+    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true });
 
     expect(status.release).toEqual({
       deployed_commit: host.release,
@@ -1115,7 +1115,9 @@ describe('status', () => {
     const state = world(reservation);
     const { runtime, output } = command(host, state);
 
-    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true })).toBe(
+      0,
+    );
 
     const text = output.stdout.join('\n');
     expect(text).toContain(`Assistant ${reservation.instance_id}`);
@@ -1140,7 +1142,9 @@ describe('status', () => {
     await recordedWith(host.paths, reservation, { kind, to, followUp });
     const { runtime, output } = command(host, world(reservation));
 
-    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false, details: true })).toBe(
+      0,
+    );
 
     // After a rollback, update --id would go on to stage a new update rather than only retry its follow-ups.
     expect(output.stdout).toContain(
@@ -1167,7 +1171,9 @@ describe('status', () => {
     expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
     expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false })).toBe(0);
+    expect(
+      await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false, details: true }),
+    ).toBe(0);
     const voice = text.output.stdout.find((line) => /\bvoice\b/u.test(line));
     expect(voice).toContain('host enablement unknown');
     expect(voice).not.toContain('disabled host-wide');
@@ -1196,9 +1202,11 @@ describe('status', () => {
 
     const { exitCode, status } = await statusJson(host, state, reservation.instance_id, observers);
     const text = command(host, state, observers);
-    expect(await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    expect(
+      await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false, details: true }),
+    ).toBe(0);
     const listed = command(host, state, observers);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...listed.runtime, columns: 500 }, { json: false })).toBe(0);
 
     expect(exitCode).toBe(0);
     expect(status).toMatchObject({ phase: { state: 'fenced' }, operation: { state: 'none' } });
@@ -1256,9 +1264,9 @@ describe('status', () => {
 
     const { status } = await statusJson(host, state, id);
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false, details: true })).toBe(0);
     const listed = command(host, state);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...listed.runtime, columns: 500 }, { json: false })).toBe(0);
 
     expect(status.operation).toMatchObject({
       state: 'failed',
@@ -1280,7 +1288,7 @@ describe('status', () => {
     const id = reservation.instance_id;
 
     const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false, details: true })).toBe(0);
 
     expect(text.output.stdout).toContain(
       `  Operation: Its rollback to dogfood ${'c'.repeat(12)} failed, and so did returning to the release it left (switched); ` +
@@ -1295,7 +1303,7 @@ describe('status', () => {
     const unknown = randomUUID();
 
     expect(await runStatusCommand(runtime, { instanceId: unknown, json: true })).toBe(1);
-    expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false })).toBe(1);
+    expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false, details: true })).toBe(1);
 
     expect(JSON.parse(output.stdout.join('\n'))).toMatchObject({
       outcome: 'failed',
@@ -1373,7 +1381,7 @@ describe('list', () => {
     );
 
     const text = command(host, state);
-    expect(await runListCommand(text.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...text.runtime, columns: 500 }, { json: false })).toBe(0);
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
@@ -1420,7 +1428,7 @@ describe('list', () => {
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
     const text = command(host, state);
-    expect(await runListCommand(text.runtime, { json: false })).toBe(0);
+    expect(await runListCommand({ ...text.runtime, columns: 500 }, { json: false })).toBe(0);
 
     const listing = (JSON.parse(json.output.stdout.join('\n')) as { data: unknown }).data as {
       assistants: Array<{ instance_id: string; release: unknown }>;
@@ -1606,6 +1614,31 @@ describe('read-only commands', () => {
 });
 
 describe('human observation presentation', () => {
+  it('leads with a concise full-ID service and conversation summary, with an explicit detail action', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const { runtime, output } = command(host, world(reservation));
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    const text = output.stdout.join('\n');
+    expect(output.stdout[0]).toBe(`Assistant ${reservation.instance_id}`);
+    expect(text).toContain('Service:');
+    expect(text).toContain('Conversation:');
+    expect(text).toContain(`gws-ea status --id ${reservation.instance_id} --details`);
+    expect(text).not.toContain('Schema:');
+    expect(text).not.toContain('Probes:');
+  });
+
+  it('uses stacked narrow records and retains each full assistant identity', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const { runtime, output } = command(host, world(reservation));
+    expect(await runListCommand({ ...runtime, columns: 40 }, { json: false })).toBe(0);
+    expect(output.stdout[0]).toBe(`Assistant ${reservation.instance_id}`);
+    expect(output.stdout.at(-1)).toBe('Observed: Sep 28, 2026, 10:30 AM');
+    expect(output.stdout).toContain(`  Next: gws-ea status --id ${reservation.instance_id}`);
+    expect(output.stdout.join('\n')).not.toContain('INSTANCE ID');
+  });
+
   it('pins the order of the fields status prints', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });

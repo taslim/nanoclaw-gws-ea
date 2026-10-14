@@ -195,6 +195,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       changed: true,
       data: {
         instance_id: runtime.instance_id,
+        staging: { retained: true, release: release(host, next.commit) },
         preview: {
           instanceId: runtime.instance_id,
           from: release(host, host.first),
@@ -656,6 +657,8 @@ describe('gws-ea update', GIT_HEAVY, () => {
 
     expect(asked).toHaveLength(1);
     expect(out).toContain('Update cancelled. The serving release is unchanged; staged assets are retained.');
+    expect(out).toContain(`Assistant: ${runtime.instance_id}`);
+    expect(out).toContain(`Next: gws-ea status --id ${runtime.instance_id}`);
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
     expect(state.running).toBe(true);

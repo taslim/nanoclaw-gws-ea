@@ -16,6 +16,7 @@
  */
 import { SelectPrompt } from '@clack/core';
 import { isCancel } from '@clack/prompts';
+import type { Writable } from 'node:stream';
 import { styleText } from 'node:util';
 
 import { brandBody } from './theme.js';
@@ -64,6 +65,7 @@ export interface BrightSelectOptions<T> {
   message: string;
   options: BrightSelectOption<T>[];
   initialValue?: T;
+  output?: Writable;
 }
 
 /**
@@ -104,6 +106,7 @@ export async function brightSelect<T>(opts: BrightSelectOptions<T>): Promise<T |
   return new SelectPrompt({
     options: options as Array<{ value: T; label?: string; hint?: string }>,
     initialValue,
+    output: opts.output,
     render() {
       const st = this.state as PromptState;
       const color = stateColor(st);

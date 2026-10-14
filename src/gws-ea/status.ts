@@ -280,6 +280,7 @@ export interface ListedAssistant {
 }
 
 export interface AssistantListing {
+  readonly observed_at: string;
   readonly assistants: readonly ListedAssistant[];
 }
 
@@ -370,6 +371,8 @@ export interface ReadOnlyCommandRuntime extends ObservationContext {
   readonly stderr: LineWriter;
   /** Where human output renders times; this machine's timezone by default. JSON stays ISO-8601 UTC. */
   readonly timezone?: string;
+  /** Available output width; narrow and redirected output keeps full identities in stacked records. */
+  readonly columns?: number;
 }
 
 /** A probe that could not observe: its result is unknown, for this reason. */
@@ -1185,6 +1188,7 @@ export async function observeAssistantStatus(
  * service detection, and where each stands against the tool's own release.
  */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
+  const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const registry = await readRegistry(context.paths);
   const observers = resolveObservers(context.observers);
   const reservations = Object.values(registry.instances).sort(
@@ -1214,7 +1218,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
       };
     }),
   );
-  return { assistants };
+  return { observed_at: observedAt, assistants };
 }
 
 function operationSummary(operation: OperationView): string {
@@ -1296,7 +1300,7 @@ function behindCell(release: ReleaseView): string {
   return release.behind_tool_release ? 'yes' : 'no';
 }
 
-function renderList(listing: AssistantListing): string[] {
+function renderList(listing: AssistantListing, columns: number, timezone: string): string[] {
   if (listing.assistants.length === 0) return ['No assistants are registered on this machine.'];
   const rows = [
     ['INSTANCE ID', 'ACCOUNT', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'PHASE', 'OPERATION'],
@@ -1317,7 +1321,24 @@ function renderList(listing: AssistantListing): string[] {
       (line) => `${id}: ${line}`,
     ),
   );
-  return [...table(rows), ...(details.length > 0 ? ['', ...details] : [])];
+  const rendered = table(rows);
+  const records = rendered.some((line) => line.length > columns)
+    ? listing.assistants.flatMap((assistant, index) => [
+        ...(index === 0 ? [] : ['']),
+        `Assistant ${assistant.instance_id}`,
+        `  Account: ${assistant.account}`,
+        `  Release: ${assistant.track} ${shortCommit(assistant.deployed_commit)}; behind tool: ${behindCell(assistant.release)}`,
+        `  Service: ${assistant.service.state}${assistant.service.reason ? `; ${assistant.service.reason}` : ''}`,
+        `  Phase: ${phaseDetail(assistant.phase)}`,
+        `  Operation: ${assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation)}`,
+        `  Next: gws-ea status --id ${assistant.instance_id}`,
+      ])
+    : rendered;
+  return [
+    ...records,
+    ...(details.length > 0 ? ['', ...details] : []),
+    `Observed: ${formatLocalTime(listing.observed_at, timezone)}`,
+  ];
 }
 
 function releaseLine(instanceId: string, release: ReleaseView): string {
@@ -1424,7 +1445,7 @@ function calendarAccessLines(views: readonly CalendarAccessView[] | null, timezo
   );
 }
 
-function renderStatus(status: AssistantStatus, timezone: string): string[] {
+function renderStatusDetails(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
   const schemaLine =
@@ -1456,6 +1477,51 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   return lines;
 }
 
+/** Conversation health requires every part of the observed path; missing facts remain unknown. */
+function conversationSummary(status: AssistantStatus): string {
+  const names = [
+    'host',
+    'chat',
+    'onecli',
+    'main_identity',
+    'external_email',
+    'inbox',
+    'workspace',
+    'principal',
+    'delivery',
+  ] as const;
+  const degraded = names.filter((name) => status.probes[name].status === 'degraded');
+  const unknown = names.filter((name) => status.probes[name].status === 'unknown');
+  if (degraded.length === 0 && unknown.length === 0)
+    return 'ready (observed host, Chat, identities, authorization, and delivery)';
+  return [
+    ...(degraded.length ? [`degraded (${degraded.join(', ')})`] : []),
+    ...(unknown.length ? [`unknown (${unknown.join(', ')})`] : []),
+    ...(status.probes.chat.sign_in_needed === true ? ['Google sign-in needed'] : []),
+  ].join('; ');
+}
+
+function renderStatus(status: AssistantStatus, timezone: string, details: boolean): string[] {
+  if (details) return renderStatusDetails(status, timezone);
+  const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
+  const actions = statusActions(status).flatMap((action) =>
+    action.kind === 'command' ? [action.argv.join(' ')] : [action.instruction],
+  );
+  return [
+    `Assistant ${status.instance_id}`,
+    `  Account: ${status.registry.account}`,
+    `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
+    `  Conversation: ${conversationSummary(status)}`,
+    `  Phase: ${phaseDetail(status.phase)}`,
+    `  Release: ${status.registry.track} ${shortCommit(status.release.deployed_commit)}; ${status.release.behind_tool_release === null ? 'tool comparison unknown (see --details)' : status.release.behind_tool_release ? 'tool release is newer' : 'not behind tool release'}`,
+    `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
+    ...operation.slice(1).map((line) => `             ${line}`),
+    ...actions.map((action) => `  Next: ${action}`),
+    `  Details: gws-ea status --id ${status.instance_id} --details`,
+    `Observed: ${formatLocalTime(status.observed_at, timezone)}`,
+  ];
+}
+
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {
   return runtime.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
@@ -1476,7 +1542,7 @@ function statusActions(status: AssistantStatus): NextAction[] {
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
-  if (status.probes.host.status !== 'ok')
+  if (PROBE_NAMES.some((name) => name !== 'voice' && status.probes[name].status !== 'ok'))
     actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });
   return actions;
 }
@@ -1497,7 +1563,7 @@ export async function runListCommand(
   }
   for (const line of options.json
     ? [resultJson(managedResult('list', { outcome: 'succeeded', data: listing }))]
-    : renderList(listing))
+    : renderList(listing, runtime.columns ?? process.stdout.columns ?? 80, timezoneOf(runtime)))
     runtime.stdout(line);
   return OBSERVED;
 }
@@ -1505,7 +1571,7 @@ export async function runListCommand(
 /** `gws-ea status --id <id> [--json]`: prints the observations, and returns the exit code. */
 export async function runStatusCommand(
   runtime: ReadOnlyCommandRuntime,
-  options: { readonly instanceId: string; readonly json: boolean },
+  options: { readonly instanceId: string; readonly json: boolean; readonly details?: boolean },
 ): Promise<number> {
   let status: AssistantStatus;
   try {
@@ -1518,7 +1584,7 @@ export async function runStatusCommand(
   }
   const lines = options.json
     ? [resultJson(managedResult('status', { outcome: 'succeeded', data: status, next_actions: statusActions(status) }))]
-    : renderStatus(status, timezoneOf(runtime));
+    : renderStatus(status, timezoneOf(runtime), options.details === true);
   for (const line of lines) runtime.stdout(line);
   return OBSERVED;
 }

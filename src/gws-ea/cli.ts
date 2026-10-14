@@ -172,7 +172,7 @@ type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
 
 /** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
 export interface StopReport {
-  readonly outcome: 'ready' | 'paused' | 'failed' | 'busy';
+  readonly outcome: 'ready' | 'paused' | 'failed' | 'busy' | 'diagnostic';
   readonly headline: string;
   readonly details: readonly string[];
   /** The failed command's redacted stderr tail. */
@@ -1160,7 +1160,10 @@ class Cli {
         const staged = await prepareUpdate(operation, intent, dependencies);
         state.data = { ...state.data, preview: staged.preview };
         this.#presenter.report(previewReport(updatePreviewLines(staged.preview)));
+        state.data = { ...state.data, staging: { retained: true, release: staged.to } };
         if (!(await confirmStagedUpdate(operation, staged, confirm))) return undefined;
+        const { staging: _staging, ...accepted } = state.data;
+        state.data = accepted;
       }
       return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
     } finally {
@@ -1377,6 +1380,13 @@ class Cli {
       try {
         found = await detectStrayInstall(checkout, this.#paths);
         if (strayParts(found).length === 0) return undefined;
+        this.#presenter.report({
+          outcome: 'diagnostic',
+          headline: `Cleanup scope: authoring checkout ${checkout.root}.`,
+          details: [
+            `Automatically removing its stray NanoClaw install: ${strayParts(found).join(', ')}; managed assistants are outside this scope.`,
+          ],
+        });
         const parts: string[] = [];
         const removed = await removeStrayInstall(checkout, found, {
           ...stray,
@@ -1450,7 +1460,7 @@ class Cli {
       }
     });
     if (line?.kind === 'warning') this.#presenter.report({ outcome: 'failed', headline: line.text, details: [] });
-    else if (line) this.#presenter.line(line.text);
+    else if (line) this.#presenter.report({ outcome: 'diagnostic', headline: line.text, details: [] });
   }
 
   /** `cleanup`: what `create` and `update` start with, asked for, so Docker that cannot be checked is a failure (KTD7). */
@@ -1589,17 +1599,36 @@ class Cli {
         data: this.#data(state),
         next_actions: [
           ...(outcome.status === 'paused' ? this.#actions(plan, state, outcome.pause) : []),
+          ...(outcome.status === 'ready' && outcome.cancelled && state.instanceId
+            ? [{ kind: 'command' as const, argv: ['gws-ea', 'status', '--id', state.instanceId] }]
+            : []),
           ...(state.data.cleanup?.incomplete ? [{ kind: 'command' as const, argv: ['gws-ea', 'cleanup'] }] : []),
         ],
         diagnostics: { run_log: run.progressLog },
       });
       if (outcome.status === 'paused') {
         run.pause(outcome.pause.code, outcome.pause.phase);
-        presenter.report(pauseReport(outcome.pause, continueWith, run.progressLog));
+        const report = pauseReport(outcome.pause, continueWith, run.progressLog);
+        presenter.report({ ...report, details: [...report.details, ...retainedEffectLines(state.data)] });
         return { status: 'done', exitCode: EXIT_CODES.paused };
       }
       run.complete();
-      presenter.report({ outcome: 'ready', headline: outcome.message, details: outcome.details ?? [] });
+      presenter.report({
+        outcome: 'ready',
+        headline: outcome.message,
+        details: [
+          ...(outcome.details ?? []),
+          ...(outcome.cancelled && state.instanceId ? [`Assistant: ${state.instanceId}`] : []),
+          ...(plan.command === 'cleanup' ? [] : retainedEffectLines(state.data)),
+          ...(state.reserved && state.instanceId
+            ? [
+                plan.command === 'remove' && !outcome.cancelled
+                  ? 'Next: gws-ea list'
+                  : `Next: gws-ea status --id ${state.instanceId}`,
+              ]
+            : []),
+        ],
+      });
       return { status: 'done', exitCode: EXIT_CODES.ready };
     } catch (error) {
       if (plan.command === 'cleanup' && state.data.cleanup)
@@ -1680,7 +1709,11 @@ class Cli {
       }
       const nextAction = this.#nextAction(plan, state);
       if (error instanceof GwsEaError && error.code === 'cancelled') {
-        presenter.report({ outcome: 'ready', headline: safeErrorMessage(error), details: log });
+        presenter.report({
+          outcome: 'ready',
+          headline: safeErrorMessage(error),
+          details: [...retainedEffectLines(state.data), ...log],
+        });
         return { status: 'done', exitCode: EXIT_CODES.ready };
       }
       if (!run) {
@@ -1705,6 +1738,21 @@ class Cli {
 function pauseFacts(pause: ProvisionHumanPause): NonNullable<OperationData['pause']> {
   const { settled: _settled, kind: _kind, ...facts } = pause;
   return facts;
+}
+
+function retainedEffectLines(data: OperationData): string[] {
+  return [
+    ...(data.preparation
+      ? [
+          'Bootstrap preparation remains; reservation could not be confirmed. Inspect the cause before starting a new creation.',
+        ]
+      : []),
+    ...(data.cleanup
+      ? [
+          `Authoring checkout ${data.cleanup.checkout}: removed ${data.cleanup.removed.join(', ') || 'no confirmed resources'}${data.cleanup.incomplete ? '; cleanup remains incomplete; run gws-ea cleanup' : ''}.`,
+        ]
+      : []),
+  ];
 }
 
 function signInDetails(signInNeeded: string | null): string[] {
@@ -1977,6 +2025,7 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
     `NanoClaw: ${preview.checkout}`,
     `OneCLI: ${preview.onecliProject}`,
     `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
+    'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
   ];
 }
 

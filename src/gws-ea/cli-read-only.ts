@@ -120,7 +120,11 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
       run: (context, options) => {
         const instanceId = targetInstance(options);
         return withStrayInstallNote(context, () =>
-          runStatusCommand(observationRuntime(context), { instanceId, json: options.json === 'true' }),
+          runStatusCommand(observationRuntime(context), {
+            instanceId,
+            json: options.json === 'true',
+            details: options.details === 'true',
+          }),
         );
       },
     },

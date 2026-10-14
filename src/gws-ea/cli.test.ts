@@ -485,7 +485,7 @@ describe('gws-ea usage', () => {
       command: 'list',
       outcome: 'succeeded',
       changed: false,
-      data: { assistants: [] },
+      data: { observed_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT.*Z$/u), assistants: [] },
       error: null,
       next_actions: [],
       diagnostics: {},
@@ -2530,10 +2530,32 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
 
     expect(run.exitCode).toBe(10);
     expect(run.err.some((line) => /^instance_id: /u.test(line))).toBe(true);
-    expect(run.err[0]).toBe(`Removed a stray NanoClaw install from ${w.root}: data/.`);
+    expect(run.err[0]).toBe(`Cleanup scope: authoring checkout ${w.root}.`);
+    expect(run.err).toContain(`Removed a stray NanoClaw install from ${w.root}: data/.`);
     expect(run.err.findIndex((line) => line.startsWith('instance_id:'))).toBeGreaterThan(0);
     expect(await present(path.join(w.root, 'data'))).toBe(false);
     expect(run.out).toContain(`Paused at bind_principal: ${DM_PAUSE.message}`);
+  });
+
+  it('keeps automatic cleanup scope and effects under quiet while suppressing progress', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    const io = lines();
+    expect(
+      await runCli(['create', '--track', 'dogfood', '--quiet'], {
+        paths,
+        ...io.runtime,
+        ...createRuntime(),
+        ...launcherStrayHandling(w),
+        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+      }),
+    ).toBe(10);
+    expect(io.err[0]).toBe(`Cleanup scope: authoring checkout ${w.root}.`);
+    expect(io.err).toContain(`Removed a stray NanoClaw install from ${w.root}: data/.`);
+    expect(io.err.some((line) => line.startsWith('instance_id:'))).toBe(false);
+    expect(io.out.join('\n')).toContain(`Authoring checkout ${w.root}: removed data/.`);
+    expect(await present(path.join(w.root, 'data'))).toBe(false);
   });
 
   it('warns once and goes on creating when the stray install cannot be removed', async () => {
@@ -2550,7 +2572,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     const run = await create(paths, { ...launcherStrayHandling(w), toolCheckout: checkout });
 
     expect(run.exitCode).toBe(10);
-    expect(run.err.filter((line) => line.includes('stray'))).toEqual([
+    expect(run.err.filter((line) => line.startsWith('Warning:'))).toEqual([
       `Warning: could not remove the stray NanoClaw install in ${w.root} (data/v2.db); retry with gws-ea cleanup. Docker is not running at unix:///fake/docker.sock`,
     ]);
     expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
@@ -2583,7 +2605,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     }
 
     expect(run.exitCode).toBe(10);
-    expect(run.err.filter((line) => line.includes('stray'))).toEqual([
+    expect(run.err.filter((line) => line.startsWith('Warning:'))).toEqual([
       `Warning: could not check ${w.root} for a stray NanoClaw install; retry with gws-ea cleanup. Unexpected control-plane failure.`,
     ]);
     expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
@@ -2722,7 +2744,13 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     for (const [index, args] of commands.entries()) {
       const run = await observe(args, w.checkout);
       expect(run.exitCode).toBe(without[index]!.exitCode);
-      expect(run.out).toEqual(without[index]!.out);
+      const observations = (lines: readonly string[]): string[] =>
+        lines.map((line) =>
+          line
+            .replace(/"observed_at": "[^"]+"/u, '"observed_at": "<time>"')
+            .replace(/^Observed:.*$/u, 'Observed: <time>'),
+        );
+      expect(observations(run.out)).toEqual(observations(without[index]!.out));
       expect(run.err).toEqual([
         ...without[index]!.err,
         `Note: a stray NanoClaw install is in ${w.root} (1 image tag); gws-ea cleanup removes it.`,

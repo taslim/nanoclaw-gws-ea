@@ -279,6 +279,14 @@ describe('GWS-EA interactive create input', () => {
 });
 
 describe('GWS-EA provider authentication', () => {
+  it('propagates provider cancellation through the managed cancelled outcome', async () => {
+    const claude = provider('claude', 'Claude');
+    vi.mocked(claude.provisioning!.collectCredential).mockRejectedValueOnce(
+      new Error('Provider authentication was cancelled'),
+    );
+    await expect(authenticateGwsEaProvider('claude', [claude])).rejects.toMatchObject({ code: 'cancelled' });
+  });
+
   it('delegates credential collection to the selected composed provider', async () => {
     const claude = provider('claude', 'Claude');
 
@@ -290,6 +298,7 @@ describe('GWS-EA provider authentication', () => {
     });
     expect(claude.provisioning?.collectCredential).toHaveBeenCalledWith({
       allowSkip: false,
+      output: process.stderr,
       allowAmbientConfiguration: false,
     });
   });

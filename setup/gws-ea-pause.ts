@@ -49,11 +49,11 @@ export interface PauseDependencies {
 }
 
 const defaultPrompts: PausePrompts = {
-  note: (message, title) => p.note(message, title),
-  info: (message) => p.log.info(message),
-  confirm: (options) => p.confirm(options),
-  select: (options) => p.select(options),
-  text: (options) => p.text(options),
+  note: (message, title) => p.note(message, title, { output: process.stderr }),
+  info: (message) => p.log.info(message, { output: process.stderr }),
+  confirm: (options) => p.confirm({ ...options, output: process.stderr }),
+  select: (options) => p.select({ ...options, output: process.stderr }),
+  text: (options) => p.text({ ...options, output: process.stderr }),
   isCancel: (value) => p.isCancel(value),
 };
 

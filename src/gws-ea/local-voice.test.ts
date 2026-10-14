@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli } from './cli.js';
-import { inspectVoiceCapability } from './capabilities.js';
+import { capabilityLines, inspectVoiceCapability } from './capabilities.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -79,7 +79,10 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-async function assets(model: 'base' | 'small' = 'base'): Promise<VerifiedVoiceInstallation> {
+async function assets(
+  model: 'base' | 'small' = 'base',
+  builtAt = new Date().toISOString(),
+): Promise<VerifiedVoiceInstallation> {
   const directory = voiceInstallationDirectory(paths, model);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const installation = {
@@ -94,7 +97,7 @@ async function assets(model: 'base' | 'small' = 'base'): Promise<VerifiedVoiceIn
       platform: 'darwin',
       architecture: 'arm64',
       model,
-      builtAt: new Date().toISOString(),
+      builtAt,
       artifacts: {
         ffmpeg: { file: 'bin/ffmpeg', size: 1, sha256: '0'.repeat(64) },
         whisperCli: { file: 'bin/whisper-cli', size: 1, sha256: '0'.repeat(64) },
@@ -175,6 +178,38 @@ function health(overrides: Record<string, unknown> = {}): unknown {
     ...overrides,
   };
 }
+
+describe('human voice observation timestamps', () => {
+  it('shows consumer readiness separately from actual recognition in human catalog facts', async () => {
+    const runtime = await assistant(34900);
+    const installation = await assets();
+    await policy(installation, true);
+    hostProbe.mockResolvedValue(health({ enabled: true, readiness: 'ready' }));
+    const ready = await inspectVoiceCapability(paths, { checkConsumers: true });
+    expect(capabilityLines(ready, true, 'America/Los_Angeles').join('\n')).toContain('Last recognition: unobserved');
+    const at = '2026-09-28T14:00:00.000Z';
+    hostProbe.mockResolvedValue(
+      health({ enabled: true, readiness: 'ready', lastOutcome: { status: 'recognized', at } }),
+    );
+    const recognized = await inspectVoiceCapability(paths, { checkConsumers: true });
+    const lines = capabilityLines(recognized, true, 'America/Los_Angeles');
+    expect(lines).toContain(`  Assistant ${runtime.instance_id}`);
+    expect(lines).toContain('    Last recognition: recognized Sep 28, 2026, 7:00 AM');
+    expect(recognized.assistants[0]?.last_outcome?.at).toBe(at);
+  });
+
+  it('formats verified receipt timestamps locally without rewriting the stored provenance', async () => {
+    const builtAt = '2026-09-28T14:00:00.000Z';
+    const installation = await assets('base', builtAt);
+    await policy(installation);
+    const observed = await inspectVoiceCapability(paths);
+    const lines = capabilityLines(observed, true, 'America/Los_Angeles');
+    expect(lines).toContain('  Verified build: Sep 28, 2026, 7:00 AM');
+    expect(observed.assets.provenance?.builtAt).toBe(builtAt);
+    expect(observed.observed_at).toMatch(/^\d{4}-\d\d-\d\dT.*Z$/u);
+    expect(lines.at(-1)).toMatch(/^Observed: [A-Z][a-z]{2} /u);
+  });
+});
 
 describe('shared voice operator lifecycle', () => {
   it('installs without enabling and serializes concurrent shared mutations', async () => {
