@@ -166,11 +166,12 @@ export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
 
 async function withManagedInstances<T>(
   paths: ControlPlanePaths,
-  work: (runtimes: readonly InstanceRuntimeConfig[]) => Promise<T>,
+  work: (runtimes: readonly InstanceRuntimeConfig[], unobservedInstanceIds: readonly string[]) => Promise<T>,
 ): Promise<T> {
   return withMachineLock(paths, async () => {
     const releases: Array<() => void> = [];
     const runtimes: InstanceRuntimeConfig[] = [];
+    const unobservedInstanceIds: string[] = [];
     try {
       const ids = Object.keys((await readRegistry(paths)).instances).sort();
       for (const id of ids) {
@@ -186,9 +187,10 @@ async function withManagedInstances<T>(
           runtimes.push(await loadInstanceRuntimeConfig(paths.runtimeFile(id)));
         } catch (error) {
           if (!isErrno(error, 'ENOENT')) throw error;
+          unobservedInstanceIds.push(id);
         }
       }
-      return await work(runtimes);
+      return await work(runtimes, unobservedInstanceIds);
     } finally {
       for (const release of releases.reverse()) release();
     }
@@ -361,7 +363,12 @@ export async function uninstallLocalVoice(
         'voice_assets_unowned',
         'The selected voice directory is outside this recipe-owned host cache; it will not be removed.',
       );
-    await withManagedInstances(paths, async (runtimes) => {
+    await withManagedInstances(paths, async (runtimes, unobservedInstanceIds) => {
+      if (unobservedInstanceIds.length)
+        throw new GwsEaError(
+          'voice_drain_unproven',
+          `Runtime configuration is missing for assistant ${unobservedInstanceIds.join(', ')}; its voice work cannot be observed. Restore the recorded runtime or finish removing that assistant before retrying gws-ea capabilities uninstall voice.`,
+        );
       for (const runtime of runtimes) await proveIdle(runtime, dependencies);
       for (const directory of directories) {
         const holders = await (dependencies.fileHolders ?? openFileHolders)(directory);

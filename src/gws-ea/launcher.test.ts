@@ -54,6 +54,27 @@ describe('GWS-EA shell launcher', () => {
       execFileAsync('/bin/bash', [LAUNCHER, 'probe'], { cwd: root, env: { PATH: `.::${path.join(root, 'absent')}` } }),
     ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('Node.js was not found on PATH') });
   });
+
+  it('honors NO_COLOR before Node prompt styling initializes, even with FORCE_COLOR set', async () => {
+    const root = await temporaryRoot();
+    const trustedBin = path.join(root, 'trusted-bin');
+    await mkdir(trustedBin);
+    // Exercise Node's real color precedence at the launched-process boundary.
+    const quote = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
+    const program =
+      'import { styleText } from "node:util"; process.stdout.write(styleText("cyan", "result")); process.stderr.write(styleText("cyan", "prompt"));';
+    await writeFile(
+      path.join(trustedBin, 'node'),
+      `#!/bin/sh\nexec ${quote(process.execPath)} --input-type=module -e ${quote(program)}\n`,
+      { mode: 0o755 },
+    );
+    const result = await execFileAsync('/bin/bash', [LAUNCHER, 'probe'], {
+      cwd: root,
+      env: { PATH: trustedBin, NO_COLOR: '1', FORCE_COLOR: '3' },
+    });
+    expect(result.stdout).toBe('result');
+    expect(result.stderr).toBe('prompt');
+  });
 });
 
 describe('GWS-EA machine setup', () => {

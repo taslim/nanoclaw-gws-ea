@@ -299,7 +299,7 @@ describe('shared voice operator lifecycle', () => {
     expect((await readLocalVoicePolicy(paths)).installationDir).toBe(installation.installationDir);
   });
   it('refuses unobserved live work and orphaned consumers of an older installed model', async () => {
-    await assistant(32500);
+    const runtime = await assistant(32500);
     const older = await assets('base');
     const current = await assets('small');
     await policy(current);
@@ -318,7 +318,16 @@ describe('shared voice operator lifecycle', () => {
           directory === older.installationDir ? [{ pid: 44, command: 'whisper-cli', file: older.model }] : [],
       }),
     ).rejects.toMatchObject({ code: 'voice_not_drained' });
+    await rm(paths.runtimeFile(runtime.instance_id));
+    await expect(
+      uninstallLocalVoice(paths, { ncl: async () => health(), fileHolders: async () => [] }),
+    ).rejects.toMatchObject({
+      code: 'voice_drain_unproven',
+      message: expect.stringContaining(runtime.instance_id),
+    });
     expect((await readLocalVoicePolicy(paths)).installationDir).toBe(current.installationDir);
+    expect((await lstat(older.installationDir)).isDirectory()).toBe(true);
+    expect((await lstat(current.installationDir)).isDirectory()).toBe(true);
   });
   it('removes only owned recipe directories after all preparations and orphaned children drain', async () => {
     await assistant(32600);

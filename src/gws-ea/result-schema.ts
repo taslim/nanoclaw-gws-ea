@@ -4,6 +4,10 @@ import { VOICE_CAPABILITY } from './capabilities.js';
 import { OPERATION_PHASES } from './operation.js';
 
 const text = { type: 'string' } as const;
+/** Native protocol text shares the published string shape, but retains its producer semantics. */
+export const ERROR_CODE_SCHEMA = { type: 'string' } as const;
+export const RESUME_FLAGS_SCHEMA = { type: 'string' } as const;
+export const PROVISION_PHASE_SCHEMA = { type: 'string' } as const;
 const bool = { type: 'boolean' } as const;
 const count = { type: 'integer', minimum: 0 } as const;
 const time = { type: 'string', format: 'date-time' } as const;
@@ -56,7 +60,7 @@ const continuation = { continue_with: text, revert_with: nullable(text) };
 const operation = {
   oneOf: [
     object({ state: { const: 'none' } }),
-    object({ state: { const: 'unreadable' }, code: text, message: text }),
+    object({ state: { const: 'unreadable' }, code: ERROR_CODE_SCHEMA, message: text }),
     object({ state: { const: 'open' }, ...operationFacts, ...continuation }),
     object({ state: { const: 'failed' }, ...operationFacts, ...continuation, outcome: text }),
     object({ state: { const: 'committed' }, ...operationFacts, follow_ups: array(followUp) }),
@@ -231,18 +235,18 @@ export const VOICE_OPERATION_SCHEMA = object(
 );
 const pause = object(
   {
-    phase: text,
-    code: text,
+    phase: PROVISION_PHASE_SCHEMA,
+    code: ERROR_CODE_SCHEMA,
     message: text,
     details: array(text),
     actionUrl: text,
-    resumeFlag: text,
+    resumeFlag: RESUME_FLAGS_SCHEMA,
     choices: array(object({ id: text, label: text })),
   },
   ['phase', 'code', 'message'],
 );
 const cleanup = object(
-  { checkout: text, removed: array(text), incomplete: bool, error: object({ code: text, message: text }) },
+  { checkout: text, removed: array(text), incomplete: bool, error: object({ code: ERROR_CODE_SCHEMA, message: text }) },
   ['checkout', 'removed'],
 );
 const removalPreview = object({
@@ -388,7 +392,7 @@ export function managedResultSchema(data: ResultSchema): ResultSchema {
     outcome: choices('succeeded', 'paused', 'failed', 'busy', 'cancelled'),
     changed: effect,
     data: nullable(data),
-    error: nullable(object({ code: text, message: text })),
+    error: nullable(object({ code: ERROR_CODE_SCHEMA, message: text })),
     next_actions: array({
       oneOf: [
         object({ kind: { const: 'command' }, argv: array(text) }),

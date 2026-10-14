@@ -2,6 +2,12 @@
 
 set -euo pipefail
 
+# Node's prompt styling otherwise lets FORCE_COLOR override NO_COLOR.
+# Apply the CLI's explicit opt-out before any terminal helper initializes.
+if [ -n "${NO_COLOR:-}" ]; then
+  unset FORCE_COLOR
+fi
+
 # The operator's PATH is the executable trust boundary, minus empty and
 # relative entries, which would resolve against whatever directory the
 # operator happens to be in. The TypeScript control plane applies the same
