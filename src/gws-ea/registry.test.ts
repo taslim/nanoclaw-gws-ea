@@ -670,12 +670,13 @@ describe('create recovery contract', () => {
       };
     };
     const output: string[] = [];
+    const progress: string[] = [];
     const resolveCalls: Array<[string, string]> = [];
     expect(
       await runCli(createArgs(), {
         paths,
         stdout: (line) => output.push(line),
-        stderr: () => undefined,
+        stderr: (line) => progress.push(line),
         checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
         resolveReleaseTarget: async ({ track, source }) => {
@@ -691,16 +692,19 @@ describe('create recovery contract', () => {
         collectCreateInputs: async () => createSetupInput(),
       }),
     ).toBe(10);
-    const instanceId = output[0]!.slice('instance_id: '.length);
+    const instanceIds = Object.keys((await readRegistry(paths)).instances);
+    expect(instanceIds).toHaveLength(1);
+    const instanceId = instanceIds[0]!;
     expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/rebuild-v2']]);
     expect(portsReleased).toBe(true);
-    expect(output.slice(1, 6)).toEqual([
+    expect(progress).toEqual([
       'Resolving the release…',
       'Reserving the assistant…',
+      `instance_id: ${instanceId}`,
       'Configuring Google Cloud…',
       'Waiting for the service account…',
-      "Paused at verify_conversation: Ask the principal to reply to the assistant's welcome.",
     ]);
+    expect(output[0]).toBe("Paused at verify_conversation: Ask the principal to reply to the assistant's welcome.");
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
       allocated_ports: { onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -724,6 +728,7 @@ describe('create recovery contract', () => {
   it('provisions from the documented create command and prints the exact command for each choice a pause offers', async () => {
     const paths = await testPaths();
     const output: string[] = [];
+    const progress: string[] = [];
     let idWasPrintedBeforeCollection = false;
     const pause = {
       status: 'paused' as const,
@@ -740,7 +745,9 @@ describe('create recovery contract', () => {
       },
     };
     const collectCreateInputs = async () => {
-      idWasPrintedBeforeCollection = /^instance_id: [0-9a-f-]{36}$/u.test(output[0] ?? '');
+      idWasPrintedBeforeCollection = [...output, ...progress].some((line) =>
+        /^instance_id: [0-9a-f-]{36}$/u.test(line),
+      );
       return createSetupInput();
     };
 
@@ -748,14 +755,17 @@ describe('create recovery contract', () => {
       await runCli(['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'], {
         paths,
         stdout: (line) => output.push(line),
-        stderr: () => undefined,
+        stderr: (line) => progress.push(line),
         ...productionRuntime(),
         collectCreateInputs,
         advanceProvision: async () => pause,
       }),
     ).toBe(10);
-    expect(idWasPrintedBeforeCollection).toBe(true);
-    const instanceId = output[0]!.slice('instance_id: '.length);
+    expect(idWasPrintedBeforeCollection).toBe(false);
+    const instanceIds = Object.keys((await readRegistry(paths)).instances);
+    expect(instanceIds).toHaveLength(1);
+    const instanceId = instanceIds[0]!;
+    expect(progress).toContain(`instance_id: ${instanceId}`);
     expect(output).toContain(
       `  "Northwind (01A2B3-C4D5E6-F7A8B9)": gws-ea resume --id ${instanceId} --billing-account '01A2B3-C4D5E6-F7A8B9'`,
     );
@@ -778,7 +788,7 @@ describe('create recovery contract', () => {
     );
   });
 
-  it('leaves no instance state and gives a rerun command when validation fails before reservation', async () => {
+  it('reports cancellation without publishing an ID or leaving instance state before reservation', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
@@ -795,9 +805,10 @@ describe('create recovery contract', () => {
       },
     );
 
-    expect(exitCode).toBe(1);
-    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
-    expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
+    expect(exitCode).toBe(0);
+    expect(stdout[0]).toBe('Assistant creation was cancelled');
+    expect([...stdout, ...stderr].join('\n')).not.toContain('instance_id:');
+    expect([...stdout, ...stderr].join('\n')).not.toContain('gws-ea resume');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
@@ -820,7 +831,8 @@ describe('create recovery contract', () => {
     });
 
     expect(exitCode).toBe(1);
-    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stdout).toEqual([]);
+    expect(stderr.join('\n')).not.toContain('instance_id:');
     expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
@@ -848,7 +860,8 @@ describe('create recovery contract', () => {
     });
 
     expect(exitCode).toBe(1);
-    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stdout).toEqual([]);
+    expect(stderr.join('\n')).not.toContain('instance_id:');
     expect(stderr.join('\n')).toContain('Bootstrap manifest schema is unsupported');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
@@ -857,6 +870,7 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     let stagedBeforeReservation = false;
+    let candidateId = '';
 
     expect(
       await runCli(createArgs(), {
@@ -864,6 +878,7 @@ describe('create recovery contract', () => {
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
         reserveInstance: async (_paths, input) => {
+          candidateId = input.instance_id;
           stagedBeforeReservation = (await readFile(paths.bootstrapFile(input.instance_id), 'utf8')).includes(
             '"schema_version": 1',
           );
@@ -873,10 +888,11 @@ describe('create recovery contract', () => {
       }),
     ).toBe(1);
 
-    const instanceId = stdout[0]!.slice('instance_id: '.length);
+    expect(stdout).toEqual([]);
+    expect(candidateId).toMatch(/^[0-9a-f-]{36}$/u);
     expect(stagedBeforeReservation).toBe(true);
-    await expect(stat(paths.bootstrapFile(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(stat(paths.instanceRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(paths.bootstrapFile(candidateId))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(paths.instanceRoot(candidateId))).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
@@ -904,7 +920,7 @@ describe('create recovery contract', () => {
     expect((await readRegistry(paths)).instances).toEqual({ [owner.instance_id]: owner });
   });
 
-  it('prints the id before reservation and only the exact safe resume command after a post-reservation failure', async () => {
+  it('reports the confirmed ID and exact safe resume command after a post-reservation failure', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
@@ -920,9 +936,11 @@ describe('create recovery contract', () => {
     });
 
     expect(exitCode).toBe(1);
-    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/);
-    const instanceId = stdout[0]!.slice('instance_id: '.length);
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
+    expect(stdout).toEqual([]);
+    const instanceIds = Object.keys((await readRegistry(paths)).instances);
+    expect(instanceIds).toHaveLength(1);
+    const instanceId = instanceIds[0]!;
+    expect(stderr).toContain(`instance_id: ${instanceId}`);
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
@@ -970,8 +988,10 @@ describe('create recovery contract', () => {
       }),
     ).toBe(1);
 
-    const instanceId = stdout[0]!.slice('instance_id: '.length);
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
+    expect(stdout).toEqual([]);
+    const instanceIds = Object.keys((await readRegistry(paths)).instances);
+    expect(instanceIds).toHaveLength(1);
+    const instanceId = instanceIds[0]!;
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(stderr.join('\n')).not.toContain('gws-ea create --track');

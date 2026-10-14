@@ -68,7 +68,14 @@ describe('local CLI discovery and grammar', () => {
   ])('rejects invalid outer syntax %j before any operation', async (...args) => {
     const io = capture();
     expect(await runCli(args, io.runtime)).toBe(2);
-    expect(io.stdout).toEqual([]);
+    const outer = args.slice(0, args.indexOf('--') < 0 ? args.length : args.indexOf('--'));
+    if (outer.includes('--json'))
+      expect(JSON.parse(io.stdout.join('\n'))).toMatchObject({
+        outcome: 'failed',
+        changed: false,
+        error: { code: 'invalid_arguments' },
+      });
+    else expect(io.stdout).toEqual([]);
     expect(io.stderr.join('\n')).toMatch(
       /provided twice|Unknown option|does not take a value|does not support --json/u,
     );
@@ -89,7 +96,36 @@ describe('local CLI discovery and grammar', () => {
             expect.objectContaining({ name: 'principal-email', type: 'string', repeatable: true }),
           ]),
           output_modes: ['human', 'json'],
-          result_schema: expect.objectContaining({ type: 'object' }),
+          result_schema: expect.objectContaining({
+            type: 'object',
+            required: [
+              'schema_version',
+              'command',
+              'outcome',
+              'changed',
+              'data',
+              'error',
+              'next_actions',
+              'diagnostics',
+            ],
+            additionalProperties: false,
+            properties: expect.objectContaining({
+              schema_version: { const: 1 },
+              outcome: { type: 'string', enum: ['succeeded', 'paused', 'failed', 'busy', 'cancelled'] },
+              data: {
+                anyOf: [
+                  expect.objectContaining({
+                    type: 'object',
+                    properties: expect.objectContaining({
+                      instance_id: { type: 'string' },
+                      pause: expect.objectContaining({ required: ['phase', 'code', 'message'] }),
+                    }),
+                  }),
+                  { type: 'null' },
+                ],
+              },
+            }),
+          }),
         },
       ],
     });

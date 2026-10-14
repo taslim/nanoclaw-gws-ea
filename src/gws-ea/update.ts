@@ -647,6 +647,7 @@ async function stageUpdate(
         },
         {
           ...checkoutRuntime(dependencies),
+          recordEffect: (changed) => reporter.emit?.({ type: 'domain-effect', step: 'stage_release', changed }),
           ...(dependencies.runSetupCommand ? { runSetupCommand: dependencies.runSetupCommand } : {}),
           ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
         },
@@ -659,7 +660,11 @@ async function stageUpdate(
     prepareReleaseGatewayImage(
       onecli,
       { gateway: LAUNCHER_PINS.onecliGateway },
-      { dockerCommandRunner: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
+      {
+        dockerCommandRunner: run,
+        recordEffect: (changed) => reporter.emit?.({ type: 'domain-effect', step: 'prepare_gateway_image', changed }),
+        ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
+      },
     ),
   );
 

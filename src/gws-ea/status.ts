@@ -1,3 +1,4 @@
+import { managedResult, resultJson, type NextAction } from './result.js';
 /**
  * `list` and `status`: the operator's read-only view of the assistants on
  * this machine (R1, R2, KTD10). Both read only local state and what each
@@ -1455,38 +1456,29 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   return lines;
 }
 
-/**
- * `list`'s and `status`'s lines in `gws-ea --help`, naming every JSON field
- * they print. `--help` indents each line by two spaces.
- */
-export const LIST_USAGE: readonly string[] = [
-  'list [--json]',
-  "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
-  '       release is newer. JSON: {"assistants": [...]}, each with instance_id, account, track,',
-  '       deployed_commit, phase (state: live with its release|fenced|unknown), release',
-  '       (deployed_commit, tool_commit, behind_tool_release: true|false, or null with a reason when',
-  '       unknown), service (state: running|stopped|not_installed|unmanaged|unknown, reason), operation',
-  '       (state: none|open|failed|committed|unreadable), removal_in_progress.',
-];
-
-export const STATUS_USAGE: readonly string[] = [
-  'status --id <instance_id> [--json]',
-  '       One assistant, observed live and read-only; it never repairs. JSON: instance_id, observed_at,',
-  '       phase, registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
-  '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
-  '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, image (tag), service, host, chat (consumer_connected, last_pull_at,',
-  '       subscription_state: unknown|active|suspended|expired, subscription_expire_time, sign_in_needed),',
-  '       onecli, main_identity, external_email, inbox (state, since, last_success_at, calendar_notifications,',
-  "       calendar_access: each principal address with its calendar's access,",
-  '       unchecked|bookable|readable|free-busy|none, and checked_at), workspace (account), principal,',
-  '       delivery, voice (enabled host-wide, assets, compatibility, readiness, queued, inflight, last_outcome, last_failure);',
-  '       each probe has status ok|degraded|unknown and a reason. list and status exit 0 once they',
-  '       observed, whatever the health; status exits 1 for an unknown ID.',
-];
-
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {
   return runtime.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+/** Recovery comes from native operation/probe facts, never their display strings. */
+function statusActions(status: AssistantStatus): NextAction[] {
+  const command = (verb: string): NextAction => ({
+    kind: 'command',
+    argv: ['gws-ea', verb, '--id', status.instance_id],
+  });
+  if (status.removal_in_progress) return [command('remove')];
+  const operation = status.operation;
+  if (operation.state === 'open')
+    return [command(operation.kind), ...(operation.kind === 'update' ? [command('rollback')] : [])];
+  if (operation.state === 'failed') return [command('update')];
+  if (operation.state === 'committed') return [command(operation.kind)];
+  const actions: NextAction[] = [];
+  if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
+  if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
+    actions.push(command('connect-google'));
+  if (status.probes.host.status !== 'ok')
+    actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });
+  return actions;
 }
 
 /** `gws-ea list [--json]`: prints the listing, and returns the exit code. */
@@ -1499,10 +1491,14 @@ export async function runListCommand(
     listing = await listAssistants(runtime);
     // eslint-disable-next-line no-catch-all/no-catch-all -- The command boundary turns a failure into a redacted message and exit code.
   } catch (error) {
-    runtime.stderr(safeErrorMessage(error));
+    if (options.json) runtime.stdout(resultJson(managedResult('list', { outcome: 'failed', error })));
+    else runtime.stderr(safeErrorMessage(error));
     return FAILED;
   }
-  for (const line of options.json ? [JSON.stringify(listing, null, 2)] : renderList(listing)) runtime.stdout(line);
+  for (const line of options.json
+    ? [resultJson(managedResult('list', { outcome: 'succeeded', data: listing }))]
+    : renderList(listing))
+    runtime.stdout(line);
   return OBSERVED;
 }
 
@@ -1516,10 +1512,13 @@ export async function runStatusCommand(
     status = await observeAssistantStatus(runtime, options.instanceId);
     // eslint-disable-next-line no-catch-all/no-catch-all -- The command boundary turns a failure into a redacted message and exit code.
   } catch (error) {
-    runtime.stderr(safeErrorMessage(error));
+    if (options.json) runtime.stdout(resultJson(managedResult('status', { outcome: 'failed', error })));
+    else runtime.stderr(safeErrorMessage(error));
     return FAILED;
   }
-  const lines = options.json ? [JSON.stringify(status, null, 2)] : renderStatus(status, timezoneOf(runtime));
+  const lines = options.json
+    ? [resultJson(managedResult('status', { outcome: 'succeeded', data: status, next_actions: statusActions(status) }))]
+    : renderStatus(status, timezoneOf(runtime));
   for (const line of lines) runtime.stdout(line);
   return OBSERVED;
 }

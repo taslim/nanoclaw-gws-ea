@@ -1114,6 +1114,8 @@ export function cli(
 ) {
   const out: string[] = [];
   const err: string[] = [];
+  /** Ordered human trace for domain sequencing; raw streams remain available for wire assertions. */
+  const transcript: string[] = [];
   const {
     serviceHelpers,
     providerSetup,
@@ -1125,8 +1127,14 @@ export function cli(
   const run = (args: readonly string[]) =>
     runCli(args, {
       paths: host.paths,
-      stdout: (line) => out.push(line),
-      stderr: (line) => err.push(line),
+      stdout: (line) => {
+        out.push(line);
+        transcript.push(line);
+      },
+      stderr: (line) => {
+        err.push(line);
+        transcript.push(line);
+      },
       serviceHelpers,
       toolProviderSetup: async () => providerSetup,
       upsertEnvVars: upsert,
@@ -1134,7 +1142,7 @@ export function cli(
       update: seams,
       ...overrides,
     });
-  return { run, out, err };
+  return { run, out, err, transcript };
 }
 
 /** `status` for the assistant, observed through the same fakes: it must answer in any state. */

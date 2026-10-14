@@ -54,9 +54,7 @@ import { writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
-  LIST_USAGE,
   PROBE_NAMES,
-  STATUS_USAGE,
   runListCommand,
   runStatusCommand,
   type ReadOnlyCommandRuntime,
@@ -546,7 +544,15 @@ function command(host: Machine, state: World, observers: Partial<StatusObservers
 async function statusJson(host: Machine, state: World, instanceId: string, observers?: Partial<StatusObservers>) {
   const { runtime, output } = command(host, state, observers);
   const exitCode = await runStatusCommand(runtime, { instanceId, json: true });
-  return { exitCode, status: JSON.parse(output.stdout.join('\n')) as Record<string, unknown> & StatusShape, output };
+  return {
+    exitCode,
+    status: (JSON.parse(output.stdout.join('\n')) as { data: Record<string, unknown> & StatusShape }).data as Record<
+      string,
+      unknown
+    > &
+      StatusShape,
+    output,
+  };
 }
 
 type ProbeShape = { status: string; reason: string | null } & Record<string, unknown>;
@@ -1154,7 +1160,9 @@ describe('status', () => {
     const { status } = await statusJson(host, state, unstarted.instance_id);
     const listed = command(host, state);
     expect(await runListCommand(listed.runtime, { json: true })).toBe(0);
-    const listing = JSON.parse(listed.output.stdout.join('\n')) as { assistants: Array<{ service: unknown }> };
+    const listing = (JSON.parse(listed.output.stdout.join('\n')) as { data: unknown }).data as {
+      assistants: Array<{ service: unknown }>;
+    };
 
     expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
     expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
@@ -1289,9 +1297,16 @@ describe('status', () => {
     expect(await runStatusCommand(runtime, { instanceId: unknown, json: true })).toBe(1);
     expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false })).toBe(1);
 
-    expect(output.stdout).toEqual([]);
-    expect(output.stderr.join('\n')).toContain(`No assistant ${unknown} is registered on this machine`);
-    expect(output.stderr.join('\n')).toContain('gws-ea list');
+    expect(JSON.parse(output.stdout.join('\n'))).toMatchObject({
+      outcome: 'failed',
+      changed: false,
+      data: null,
+      error: {
+        code: 'unknown_instance',
+        message: expect.stringContaining(`No assistant ${unknown} is registered on this machine`),
+      },
+    });
+    expect(output.stdout.join('\n')).toContain('gws-ea list');
   });
 });
 
@@ -1308,7 +1323,9 @@ describe('list', () => {
 
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
-    const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
+    const listing = (JSON.parse(json.output.stdout.join('\n')) as { data: unknown }).data as {
+      assistants: Array<Record<string, unknown>>;
+    };
     const current = {
       deployed_commit: host.release,
       tool_commit: host.release,
@@ -1405,7 +1422,7 @@ describe('list', () => {
     const text = command(host, state);
     expect(await runListCommand(text.runtime, { json: false })).toBe(0);
 
-    const listing = JSON.parse(json.output.stdout.join('\n')) as {
+    const listing = (JSON.parse(json.output.stdout.join('\n')) as { data: unknown }).data as {
       assistants: Array<{ instance_id: string; release: unknown }>;
     };
     expect(Object.fromEntries(listing.assistants.map(({ instance_id, release }) => [instance_id, release]))).toEqual({
@@ -1580,7 +1597,7 @@ describe('read-only commands', () => {
     expect(everything).not.toContain(SENTINEL);
     expect(everything).not.toContain('GWS_EA_');
     // The real readers did observe the fixture.
-    const status = JSON.parse(outputs[1]!.stdout.join('\n')) as StatusShape;
+    const status = (JSON.parse(outputs[1]!.stdout.join('\n')) as { data: unknown }).data as StatusShape;
     expect(status.probes.delivery).toMatchObject({ status: 'ok', last: { message_out_id: 'out-welcome' } });
     expect(status.rollback).toMatchObject({ available: true, schema_moved: true });
     expect(status.probes.checkout).toMatchObject({ status: 'ok', commit: host.release });
@@ -1588,30 +1605,7 @@ describe('read-only commands', () => {
   });
 });
 
-describe('help', () => {
-  it('names every JSON field the commands print', () => {
-    const help = [...LIST_USAGE, ...STATUS_USAGE].join('\n');
-    for (const field of [
-      ...LIST_FIELDS,
-      ...STATUS_FIELDS,
-      ...PROBE_NAMES,
-      'tool_commit',
-      'behind_tool_release',
-      'previous_commit',
-      'schema_moved',
-      'last_success_at',
-      'calendar_notifications',
-      'calendar_access',
-      'consumer_connected',
-      'last_pull_at',
-      'subscription_state',
-      'subscription_expire_time',
-      'sign_in_needed',
-    ]) {
-      expect(help, field).toContain(field);
-    }
-  });
-
+describe('human observation presentation', () => {
   it('pins the order of the fields status prints', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });

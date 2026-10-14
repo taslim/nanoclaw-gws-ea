@@ -1,3 +1,4 @@
+import { managedResultSchema, operationDataSchema, LIST_DATA_SCHEMA, STATUS_DATA_SCHEMA } from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
   | 'create'
@@ -85,11 +86,6 @@ const googleClient = value(
   "Desktop OAuth client downloaded for the assistant's Google sign-in.",
 );
 const managedModes = ['human', 'json'] as const;
-const attemptResult: ResultSchema = {
-  type: 'object',
-  description:
-    'Operation result: completion, a human prerequisite, operational failure, or a busy lock. Command data describes observed effects and recovery.',
-};
 const nativeResult: ResultSchema = {
   type: 'string',
   description: 'Raw delegated output; the child owns its exit contract.',
@@ -141,7 +137,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     ],
     examples: ['gws-ea create --track dogfood', 'gws-ea create --track=prod --principal-email=principal@example.com'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('create')),
   },
   {
     path: ['list'],
@@ -155,19 +151,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Inspect an assistant with status --id <instance_id>.'],
     examples: ['gws-ea list', 'gws-ea --json list'],
     outputModes: managedModes,
-    resultSchema: {
-      type: 'object',
-      properties: {
-        assistants: {
-          type: 'array',
-          items: {
-            type: 'object',
-            description: 'Assistant registry, phase, release comparison, service observation, and operation.',
-          },
-        },
-      },
-      required: ['assistants'],
-    },
+    resultSchema: managedResultSchema(LIST_DATA_SCHEMA),
   },
   {
     path: ['status'],
@@ -181,24 +165,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ["Use the observed operation's continuation or recovery action."],
     examples: ['gws-ea status --id <instance_id> --json'],
     outputModes: managedModes,
-    resultSchema: {
-      type: 'object',
-      properties: {
-        instance_id: { type: 'string' },
-        observed_at: { type: 'string', format: 'date-time' },
-        probes: {
-          type: 'object',
-          description:
-            'Checkout, image, service, host, Chat, gateway, identity, inbox, delivery, and voice observations.',
-        },
-        operation: { type: 'object' },
-        registry: { type: 'object' },
-        release: { type: 'object' },
-        rollback: { type: 'object' },
-        schema: { type: 'object' },
-      },
-      required: ['instance_id', 'observed_at', 'probes'],
-    },
+    resultSchema: managedResultSchema(STATUS_DATA_SCHEMA),
   },
   {
     path: ['resume'],
@@ -218,7 +185,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ["Rerun resume with the pause's supplied inputs, or remove the partially created assistant."],
     examples: ['gws-ea resume --id <instance_id> --chat-configured'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('resume')),
   },
   {
     path: ['connect-google'],
@@ -232,7 +199,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Rerun with the supplied Google client file and complete the offered consent step.'],
     examples: ['gws-ea connect-google --id <instance_id> --google-client-file <file>'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('connect-google')),
   },
   ...(['start', 'stop', 'restart'] as const).map(
     (command): CommandDefinition => ({
@@ -253,7 +220,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       recovery: ['Inspect status and logs for the explicitly named assistant.'],
       examples: [`gws-ea ${command} --id <instance_id>`],
       outputModes: managedModes,
-      resultSchema: attemptResult,
+      resultSchema: managedResultSchema(operationDataSchema(command)),
     }),
   ),
   {
@@ -282,7 +249,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     ],
     examples: ['gws-ea update --id <instance_id> --yes', 'gws-ea update --all --yes'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('update')),
   },
   {
     path: ['rollback'],
@@ -299,7 +266,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Rerun rollback to continue it; an unfinished update can also be reverted.'],
     examples: ['gws-ea rollback --id <instance_id>', 'gws-ea rollback --id <instance_id> --snapshot --yes'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('rollback')),
   },
   {
     path: ['remove'],
@@ -321,7 +288,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Rerun removal to continue its retained journal after fixing the stated blocker.'],
     examples: ['gws-ea remove --id <instance_id> --yes'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('remove')),
   },
   {
     path: ['logs'],
@@ -371,7 +338,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Fix a reported ownership or teardown blocker, then rerun cleanup.'],
     examples: ['gws-ea cleanup'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('cleanup')),
   },
   {
     path: ['install-voice'],
@@ -394,7 +361,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: ['Rerun installation after fixing its reported asset or build blocker.'],
     examples: ['gws-ea install-voice --model large-v3-turbo-q5_0'],
     outputModes: managedModes,
-    resultSchema: attemptResult,
+    resultSchema: managedResultSchema(operationDataSchema('install-voice')),
   },
   ...(['enable-voice', 'disable-voice', 'uninstall-voice'] as const).map(
     (command): CommandDefinition => ({
@@ -426,7 +393,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       recovery: ["Follow the operation's reported asset, policy, or consumer blocker."],
       examples: [`gws-ea ${command}`],
       outputModes: managedModes,
-      resultSchema: attemptResult,
+      resultSchema: managedResultSchema(operationDataSchema(command)),
     }),
   ),
   ...(['help', 'schema'] as const).map(

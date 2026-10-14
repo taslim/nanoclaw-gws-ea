@@ -829,7 +829,9 @@ async function removeLocked(
   const file = paths.removalFile(instanceId);
   const record = async (change: (current: RemovalReceipt) => RemovalReceipt): Promise<void> => {
     receipt = change(receipt);
+    reporter.emit?.({ type: 'domain-effect', step: 'remove', changed: null });
     await writePrivate(file, receipt);
+    reporter.emit?.({ type: 'domain-effect', step: 'remove', changed: true });
   };
   await preparePrivateDirectory(paths.removalRoot);
   await record((current) => current);

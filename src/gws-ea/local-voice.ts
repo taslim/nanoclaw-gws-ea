@@ -156,6 +156,7 @@ async function underVoiceLock<T>(paths: ControlPlanePaths, work: () => Promise<T
 }
 
 export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
+  readonly recordEffect?: (changed: true | null) => void;
   readonly upsertEnvVars?: UpsertEnvVars;
   readonly serviceHelpers?: NanoclawServiceHelpers;
   readonly ncl?: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
@@ -204,12 +205,15 @@ export async function installLocalVoice(
     const policy = await readLocalVoicePolicy(paths);
     if (policy.enabled)
       throw new GwsEaError('voice_enabled', 'Run gws-ea disable-voice before installing or selecting voice assets.');
+    dependencies.recordEffect?.(null);
     const installation = await installVoiceAssets(paths, request, dependencies);
+    dependencies.recordEffect?.(null);
     await writePrivate(voicePolicyFile(paths), {
       schemaVersion: 1,
       enabled: false,
       installationDir: installation.installationDir,
     } satisfies VoiceHostPolicy);
+    dependencies.recordEffect?.(true);
     return installation;
   });
 }
@@ -249,19 +253,30 @@ export async function enableLocalVoice(
           'The gws-ea launcher must supply its native environment writer to enable voice.',
         );
       if (upsert)
-        for (const runtime of runtimes) await bindInstanceVoicePolicy(runtime, voicePolicyFile(paths), upsert);
+        for (const runtime of runtimes) {
+          dependencies.recordEffect?.(null);
+          await bindInstanceVoicePolicy(runtime, voicePolicyFile(paths), upsert);
+          dependencies.recordEffect?.(true);
+        }
       const enabled = { ...policy, enabled: true } satisfies VoiceHostPolicy;
+      dependencies.recordEffect?.(null);
       await writePrivate(voicePolicyFile(paths), enabled);
+      dependencies.recordEffect?.(true);
       return enabled;
     });
   });
 }
 
 /** Stops new recognition without restarting text service or deleting assets. */
-export async function disableLocalVoice(paths: ControlPlanePaths): Promise<VoiceHostPolicy> {
+export async function disableLocalVoice(
+  paths: ControlPlanePaths,
+  dependencies: Pick<VoiceOperatorDependencies, 'recordEffect'> = {},
+): Promise<VoiceHostPolicy> {
   return underVoiceLock(paths, async () => {
     const disabled = { ...(await readLocalVoicePolicy(paths)), enabled: false } satisfies VoiceHostPolicy;
+    dependencies.recordEffect?.(null);
     await writePrivate(voicePolicyFile(paths), disabled);
+    dependencies.recordEffect?.(true);
     return disabled;
   });
 }
@@ -351,7 +366,9 @@ export async function uninstallLocalVoice(
           );
       }
       // Clear selection before any deletion so a partial removal remains safely disabled.
+      dependencies.recordEffect?.(null);
       await writePrivate(voicePolicyFile(paths), emptyPolicy());
+      dependencies.recordEffect?.(true);
       for (const directory of directories) await rm(directory, { recursive: true });
     });
   });

@@ -472,9 +472,12 @@ describe('GWS-EA unattended create input', () => {
         stateRoot: path.join(root, 'state'),
       });
       const out: string[] = [];
+      const err: string[] = [];
       const exitCode = await runCli(
         [
           'create',
+          '--json',
+          '--no-input',
           '--track',
           'dogfood',
           '--source-remote',
@@ -486,7 +489,7 @@ describe('GWS-EA unattended create input', () => {
         {
           paths,
           stdout: (line) => out.push(line),
-          stderr: (line) => out.push(line),
+          stderr: (line) => err.push(line),
           environment: {},
           collectCreateInputs: (context) =>
             collectGwsEaCreateInput(context, {
@@ -515,8 +518,16 @@ describe('GWS-EA unattended create input', () => {
       );
 
       expect(exitCode).toBe(10);
-      const instanceId = out[0]!.slice('instance_id: '.length);
-      expect(out).toContain(`Continue with: gws-ea resume --id ${instanceId} --chat-configured`);
+      const result = JSON.parse(out.join('\n')) as { data: { instance_id: string }; next_actions: unknown };
+      expect(result).toMatchObject({
+        outcome: 'paused',
+        changed: true,
+        data: { instance_id: expect.any(String) },
+        next_actions: [
+          { kind: 'command', argv: ['gws-ea', 'resume', '--id', result.data.instance_id, '--chat-configured'] },
+        ],
+      });
+      expect(err.join('\n')).toContain('Reserving the assistant');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

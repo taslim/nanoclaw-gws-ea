@@ -1,4 +1,13 @@
 import os from 'node:os';
+import {
+  combineEffects,
+  managedResult,
+  resultJson,
+  type Changed,
+  type ManagedResult,
+  type NextAction,
+  type OperationData,
+} from './result.js';
 import path from 'node:path';
 
 import { formatLocalTime } from '../timezone.js';
@@ -8,6 +17,7 @@ import { completionScript, helpLines, schemaDocument, toolVersion } from './comm
 import { discoveryTarget, parseInvocation, type CommandOptions, type ParsedInvocation } from './command-parser.js';
 import {
   CREATE_INPUT_FLAGS,
+  SECRET_INPUTS,
   loadSecretSource,
   parsePrincipalEmailFlags,
   PRINCIPAL_EMAIL_FLAG,
@@ -38,7 +48,7 @@ import {
   reserveInstance,
   type InstanceOperation,
 } from './journal.js';
-import { readOperationRecord } from './operation.js';
+import { type OperationIntent, readOperationRecord } from './operation.js';
 import { disableLocalVoice, enableLocalVoice, installLocalVoice, uninstallLocalVoice } from './local-voice.js';
 import { DEFAULT_VOICE_MODEL } from './install-voice.js';
 import type { VoiceModelId } from './voice-assets.js';
@@ -60,7 +70,7 @@ import {
   runProductionProvision,
   validateProductionBootstrapManifest,
 } from './provision.js';
-import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
+import { redact, registerSecret, safeErrorCode, safeErrorMessage } from './redact.js';
 import { allocateInstanceId, getInstanceReservation, validateReservation } from './registry.js';
 import {
   resolveReleaseTarget,
@@ -122,6 +132,7 @@ import {
   type AssistantUpdate,
   type UpdateAllPlan,
   type UpdateTurn,
+  type UpdateTargetResult,
 } from './update-all.js';
 import {
   GwsEaError,
@@ -133,7 +144,7 @@ import {
   type ReleaseCoordinates,
 } from './types.js';
 
-/** Unlabeled, so a scripted create's first line stays its `instance_id`. */
+/** Unlabeled prerequisite checks stay out of terminal progress. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
 
 /** Signals that end a run, recorded in its log first. */
@@ -342,7 +353,7 @@ function createLinePresenter(output: LineWriter, errorOutput: LineWriter): Prese
   const progress = (text: string): void => {
     if (text === last) return;
     last = text;
-    output(text);
+    errorOutput(text);
   };
   return {
     event(event) {
@@ -351,7 +362,7 @@ function createLinePresenter(output: LineWriter, errorOutput: LineWriter): Prese
     },
     suspend: () => undefined,
     resume: () => undefined,
-    line: output,
+    line: errorOutput,
     report(report) {
       const write = report.outcome === 'ready' || report.outcome === 'paused' ? output : errorOutput;
       write(report.headline);
@@ -392,7 +403,12 @@ function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => str
 }
 
 type Outcome =
-  | { readonly status: 'ready'; readonly message: string; readonly details?: readonly string[] }
+  | {
+      readonly status: 'ready';
+      readonly message: string;
+      readonly details?: readonly string[];
+      readonly cancelled?: boolean;
+    }
   | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
 
 type Attempt =
@@ -403,6 +419,8 @@ type Attempt =
 interface AttemptState {
   instanceId?: string;
   reserved: boolean;
+  changed: Changed;
+  data: OperationData;
 }
 
 interface Session {
@@ -426,13 +444,22 @@ class Cli {
   readonly #paths: ControlPlanePaths;
   readonly #presenter: Presenter;
   readonly #runtime: CliRuntime;
+  readonly #interruptedResult: (result: ManagedResult) => void;
   /** Set while a terminal waits on a pause: a signal then stops the wait, not the run. */
   #waiting: AbortController | undefined;
+  result: ManagedResult | undefined;
+  #rolloutChanged: Changed = false;
+  #rolloutLogs: string[] = [];
+  #rolloutStopped: ManagedResult | undefined;
+  #rolloutPlan: UpdateAllPlan | undefined;
+  #rolloutTargets = new Map<string, UpdateTargetResult>();
+  #rolloutCleanup: OperationData['cleanup'];
 
-  constructor(runtime: CliRuntime, presenter: Presenter) {
+  constructor(runtime: CliRuntime, presenter: Presenter, interruptedResult: (result: ManagedResult) => void) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
     this.#presenter = presenter;
     this.#runtime = runtime;
+    this.#interruptedResult = interruptedResult;
   }
 
   /**
@@ -603,6 +630,79 @@ class Cli {
     }
   }
 
+  #data(state: AttemptState): OperationData | null {
+    const { instance_id: _id, ...facts } = state.data;
+    const data = { ...facts, ...(state.reserved && state.instanceId ? { instance_id: state.instanceId } : {}) };
+    return Object.keys(data).length > 0 ? data : null;
+  }
+
+  #actions(plan: AttemptPlan, state: AttemptState, pause?: ProvisionHumanPause, error?: unknown): NextAction[] {
+    if (isBusy(error))
+      return state.reserved && state.instanceId
+        ? [{ kind: 'command', argv: ['gws-ea', 'status', '--id', state.instanceId] }]
+        : [];
+    if (!state.reserved && plan.command === 'create')
+      return [
+        ...(error instanceof PauseRequired
+          ? error.instructions.map((instruction) => ({ kind: 'external' as const, instruction }))
+          : []),
+        {
+          kind: 'external',
+          instruction: 'Inspect the failure and supplied creation inputs before starting a new creation.',
+        },
+      ];
+    if (isStateRefusal(error))
+      return state.instanceId ? [{ kind: 'command', argv: ['gws-ea', 'status', '--id', state.instanceId] }] : [];
+    const command = plan.command === 'create' ? 'resume' : plan.command;
+    const base = ['gws-ea', command, ...(state.instanceId ? ['--id', state.instanceId] : [])];
+    const retained =
+      command === 'resume' || command === 'connect-google'
+        ? ['secrets-file']
+        : command === 'update'
+          ? ['track', 'source-remote']
+          : command === 'remove'
+            ? ['abandon']
+            : [];
+    for (const flag of retained) if (plan.options[flag]) base.push(`--${flag}`, plan.options[flag]);
+    if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
+    if (plan.options.yes === 'true') base.push('--yes');
+    const actions: NextAction[] = [];
+    if (pause?.actionUrl) actions.push({ kind: 'external', instruction: pause.message, url: pause.actionUrl });
+    if (pause?.choices?.length && pause.resumeFlag)
+      return [
+        ...actions,
+        ...pause.choices.map((choice) => ({ kind: 'command' as const, argv: [...base, pause.resumeFlag!, choice.id] })),
+      ];
+    if (pause?.resumeFlag?.includes('<'))
+      actions.push({ kind: 'external', instruction: `Supply the input requested by ${pause.resumeFlag}.` });
+    else if (pause?.resumeFlag) base.push(pause.resumeFlag);
+    if (error instanceof PauseRequired)
+      actions.push(...error.instructions.map((instruction) => ({ kind: 'external' as const, instruction })));
+    if (error instanceof GwsEaError && error.code === 'input_required')
+      actions.push({ kind: 'external', instruction: safeErrorMessage(error) });
+    if (
+      error instanceof GwsEaError &&
+      (error.code === 'confirmation_required' ||
+        (error.code === 'input_required' && command === 'rollback' && state.data.preview !== undefined))
+    )
+      base.push('--yes');
+    actions.push({ kind: 'command', argv: base });
+    if (error instanceof RemovalPause)
+      actions.push({
+        kind: 'command',
+        argv: [
+          'gws-ea',
+          'remove',
+          '--id',
+          state.instanceId!,
+          '--yes',
+          '--abandon',
+          [...new Set([...(plan.options.abandon?.split(',') ?? []), error.resource])].join(','),
+        ],
+      });
+    return actions;
+  }
+
   /** Create and resume continue by resuming once the assistant is reserved; every other attempt is retried as given. */
   #nextAction(plan: AttemptPlan, state: AttemptState): string {
     const resumes = (plan.command === 'create' || plan.command === 'resume') && state.reserved;
@@ -620,6 +720,12 @@ class Cli {
       ...(plan.options['secrets-file'] ? ['--secrets-file', plan.options['secrets-file']] : []),
     ];
     return () => this.prepare('resume', parseInvocation(['resume', ...resumeArgs]))();
+  }
+
+  #acquire(reporter: StepReporter, instanceId: string, intent: OperationIntent): Promise<InstanceOperation | null> {
+    return acquireInstanceOperation(this.#paths, instanceId, intent, (changed) =>
+      reporter.emit?.({ type: 'domain-effect', step: intent.command, changed }),
+    );
   }
 
   #checkPrerequisites(request: PrerequisiteRequest, interaction: Interaction): Promise<Prerequisites> {
@@ -660,9 +766,7 @@ class Cli {
     );
     const instanceId = await allocateInstanceId(paths);
     state.instanceId = instanceId;
-    this.#presenter.line(`instance_id: ${instanceId}`);
-    // After the ID, which scripts read as the first line.
-    await this.#cleanStrayInstall(reporter);
+    await this.#cleanStrayInstall(reporter, state);
 
     const provided: Partial<Record<CreateInputFlag, string>> = {};
     for (const flag of CREATE_INPUT_FLAGS) if (options[flag] !== undefined) provided[flag] = options[flag];
@@ -689,10 +793,13 @@ class Cli {
     );
     await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
       await this.#reserve(state, track, source.remote, setup, release.deployed_commit, prerequisites.account);
+      state.changed = combineEffects(state.changed, true);
+      state.data = { ...state.data, instance_id: instanceId };
+      this.#presenter.line(`instance_id: ${instanceId}`);
       await run.assignInstance(instanceId);
     });
 
-    const operation = await acquireInstanceOperation(paths, instanceId, { command: 'create' });
+    const operation = await this.#acquire(reporter, instanceId, { command: 'create' });
     if (!operation) throw busy();
     try {
       return await this.#provision(reporter, operation, interaction);
@@ -724,20 +831,27 @@ class Cli {
         ports: held.ports,
         gcpAccount,
       });
+      const beforePreparation = state.changed;
+      state.changed = combineEffects(state.changed, null);
       await installProductionBootstrapManifest(paths, instanceId, bootstrapManifest);
+      state.changed = combineEffects(beforePreparation, true);
       try {
         await (this.#runtime.reserveInstance ?? reserveInstance)(paths, input);
         state.reserved = true;
+        state.changed = combineEffects(state.changed, true);
       } catch (error) {
         try {
           await getInstanceReservation(paths, instanceId);
           state.reserved = true;
-          // eslint-disable-next-line no-catch-all/no-catch-all -- An unobservable reservation counts as reserved: resuming is safe, discarding it is not. The original error is rethrown below.
+          state.changed = combineEffects(state.changed, true);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Preserve uncertainty without publishing an unconfirmed assistant identity.
         } catch (observationError) {
           if (observationError instanceof GwsEaError && observationError.code === 'unknown_instance') {
             await removeProductionBootstrapManifest(paths, instanceId);
+            state.changed = beforePreparation;
           } else {
-            state.reserved = true;
+            state.changed = combineEffects(state.changed, null);
+            state.data = { ...state.data, preparation: { bootstrap_manifest: 'retained', reservation: 'unknown' } };
           }
         }
         throw error;
@@ -776,7 +890,7 @@ class Cli {
   }
 
   async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
-    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'resume' });
+    const operation = await this.#acquire(reporter, instanceId, { command: 'resume' });
     if (!operation) throw busy();
     try {
       await runStep(reporter, PREREQUISITES_STEP, async () => {
@@ -794,7 +908,7 @@ class Cli {
   }
 
   async #removeWork(
-    { reporter, interaction }: Session,
+    { reporter, interaction, state }: Session,
     options: CommandOptions,
     instanceId: string,
     abandon: ReadonlySet<AbandonableResource>,
@@ -802,21 +916,29 @@ class Cli {
     const preview = await runStep(reporter, { id: 'inspect' }, () =>
       (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId),
     );
-    for (const line of removalPreviewLines(preview)) this.#presenter.line(line);
+    state.data = { ...state.data, preview };
+    this.#presenter.report(previewReport(removalPreviewLines(preview)));
     if (!options.yes) {
       const confirm = this.#runtime.confirmRemoval;
       if (!confirm) {
-        throw new GwsEaError(
-          'input_required',
+        throw new PauseRequired(
+          'confirmation_required',
           'Removal needs confirmation: pass --yes, or run gws-ea remove in a terminal to be asked.',
+          [],
         );
       }
-      if (!(await confirm(preview))) return { status: 'ready', message: 'Removal cancelled. Nothing was changed.' };
+      if (!(await confirm(preview)))
+        return { status: 'ready', cancelled: true, message: 'Removal cancelled. Nothing was changed.' };
     }
     const remove: RemoveAssistantRunner = this.#runtime.removeAssistant ?? removeAssistant;
     const removed = await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
       remove(this.#paths, instanceId, { interaction, abandon, reporter, serviceHelpers: this.#runtime.serviceHelpers }),
     );
+    state.changed = combineEffects(
+      state.changed,
+      removed ? removed.removed.length > 0 || removed.abandoned.length > 0 : null,
+    );
+    state.data = { ...state.data, ...(removed ? { removal: removed } : {}) };
     return {
       status: 'ready',
       message: `Assistant ${instanceId} was removed.`,
@@ -838,7 +960,7 @@ class Cli {
    * recreating the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
-    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
+    const operation = await this.#acquire(reporter, instanceId, { command: 'connect-google' });
     if (!operation) throw busy();
     try {
       const runtime = await loadCreatedRuntime(this.#paths, instanceId);
@@ -888,8 +1010,8 @@ class Cli {
     }
   }
 
-  async #serviceWork({ reporter }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
-    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command });
+  async #serviceWork({ reporter, state }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
+    const operation = await this.#acquire(reporter, instanceId, { command });
     if (!operation) throw busy();
     try {
       const record = await loadCreatedRuntime(this.#paths, instanceId);
@@ -897,12 +1019,18 @@ class Cli {
       if (!helpers) {
         throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
       }
-      const service = createServiceControl(helpers, runtimeServiceTarget(record));
+      const service = createServiceControl(helpers, runtimeServiceTarget(record), {
+        recordEffect: (changed) => {
+          state.changed = combineEffects(state.changed, changed);
+        },
+      });
       switch (command) {
         case 'start': {
           const started = await runStep(reporter, { id: 'start', label: 'Starting the assistant…' }, () =>
             service.start(),
           );
+          state.changed = combineEffects(state.changed, started === 'started');
+          state.data = { ...state.data, service: { action: command, result: started } };
           await verifyServing(reporter, service, instanceId);
           return {
             status: 'ready',
@@ -916,6 +1044,8 @@ class Cli {
           const stopped = await runStep(reporter, { id: 'stop', label: 'Stopping the assistant…' }, () =>
             service.stop(),
           );
+          state.changed = combineEffects(state.changed, stopped === 'stopped');
+          state.data = { ...state.data, service: { action: command, result: stopped } };
           return stopped === 'stopped'
             ? {
                 status: 'ready',
@@ -931,6 +1061,8 @@ class Cli {
           const restarted = await runStep(reporter, { id: 'restart', label: 'Restarting the assistant…' }, () =>
             service.restart(),
           );
+          state.changed = combineEffects(state.changed, restarted === 'restarted' || restarted === 'started');
+          state.data = { ...state.data, service: { action: command, result: restarted } };
           await verifyServing(reporter, service, instanceId);
           return {
             status: 'ready',
@@ -955,10 +1087,11 @@ class Cli {
   }
 
   /** `update --id`: one assistant's update, reported as its stop summary. */
-  async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
+  async #updateWork({ reporter, state }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
     const confirm = updateConfirmation(yes, this.#runtime.confirmUpdate);
-    await this.#cleanStrayInstall(reporter);
-    const update = await this.#updateAssistant(reporter, request, confirm, this.#updateLauncher());
+    await this.#cleanStrayInstall(reporter, state);
+    const update = await this.#updateAssistant(reporter, request, confirm, this.#updateLauncher(), state);
+    if (update) state.data = { ...state.data, update };
     return updateOutcome(request.instanceId, update);
   }
 
@@ -978,12 +1111,13 @@ class Cli {
     request: UpdateRequest,
     confirm: (preview: UpdatePreview) => Promise<boolean>,
     launcher: UpdateLauncher,
+    state: AttemptState,
   ): Promise<AssistantUpdate | undefined> {
     const seams = this.#runtime.update ?? {};
     const intent = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
       resolveUpdateIntent(this.#paths, request, seams),
     );
-    const operation = await acquireInstanceOperation(this.#paths, request.instanceId, {
+    const operation = await this.#acquire(reporter, request.instanceId, {
       command: 'update',
       target: intent.target,
     });
@@ -1011,13 +1145,18 @@ class Cli {
         sameRelease(unfinished.to, intent.target);
       if (!continuing) {
         const staged = await prepareUpdate(operation, intent, dependencies);
-        for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
+        state.data = { ...state.data, preview: staged.preview };
+        this.#presenter.report(previewReport(updatePreviewLines(staged.preview)));
         if (!(await confirmStagedUpdate(operation, staged, confirm))) return undefined;
       }
       return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
     } finally {
       operation.release();
     }
+  }
+
+  #rolloutStop(): ManagedResult | undefined {
+    return this.#rolloutStopped;
   }
 
   /**
@@ -1030,14 +1169,27 @@ class Cli {
    */
   async #updateAll(yes: boolean): Promise<Attempt> {
     /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure before the first turn into a redacted summary and exit code. */
+    let plan: UpdateAllPlan | undefined;
+    this.#rolloutChanged = false;
+    this.#rolloutLogs = [];
+    this.#rolloutStopped = undefined;
+    this.#rolloutPlan = undefined;
+    this.#rolloutTargets.clear();
+    this.#rolloutCleanup = undefined;
     try {
       const confirm = updateConfirmation(yes, this.#runtime.confirmUpdateAll);
       const launcher = this.#updateLauncher();
-      const reporter: StepReporter = { emit: (event) => this.#presenter.event(event) };
+      const reporter: StepReporter = {
+        emit: (event) => {
+          if (event.type === 'domain-effect')
+            this.#rolloutChanged = combineEffects(this.#rolloutChanged, event.changed);
+          this.#presenter.event(event);
+        },
+      };
       // Once for the run, not per assistant: every turn shares the tool checkout.
       await this.#cleanStrayInstall(reporter);
       const { releaseMigrations } = this.#runtime;
-      const plan = await runStep(
+      plan = await runStep(
         reporter,
         { id: 'check_assistants', label: 'Checking which assistants can be updated…' },
         async () =>
@@ -1049,15 +1201,62 @@ class Cli {
             ...(releaseMigrations ? { releaseMigrations } : {}),
           }),
       );
+      this.#rolloutPlan = plan;
+      for (const candidate of plan.candidates)
+        this.#rolloutTargets.set(
+          candidate.instanceId,
+          candidate.eligible
+            ? { instance_id: candidate.instanceId, outcome: 'unattempted' }
+            : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason },
+        );
       const summary = await runUpdateAll(
         plan,
         confirm,
         (instanceId, toolCommit) => this.#updateTurn(instanceId, toolCommit, yes, launcher),
-        (line) => this.#presenter.line(line),
+        {
+          preview: (headline, details) => this.#presenter.report({ outcome: 'ready', headline, details }),
+          progress: (line) => this.#presenter.line(line),
+        },
       );
       this.#presenter.report(summary);
-      return { status: 'done', exitCode: EXIT_CODES[summary.outcome] };
+      const stopped = this.#rolloutStop();
+      this.result = managedResult('update', {
+        outcome: summary.cancelled ? 'cancelled' : summary.outcome === 'ready' ? 'succeeded' : summary.outcome,
+        changed: this.#rolloutChanged,
+        data: { plan, targets: summary.targets, ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}) },
+        ...(stopped?.error ? { error: new GwsEaError(stopped.error.code, stopped.error.message) } : {}),
+        next_actions: stopped?.next_actions ?? [],
+        diagnostics: stopped?.diagnostics ?? (this.#rolloutLogs[0] ? { run_log: this.#rolloutLogs[0] } : {}),
+      });
+      return { status: 'done', exitCode: summary.exitCode ?? EXIT_CODES[summary.outcome] };
     } catch (error) {
+      this.result = managedResult('update', {
+        outcome: error instanceof PauseRequired ? 'paused' : isBusy(error) ? 'busy' : 'failed',
+        changed: this.#rolloutChanged,
+        data: plan
+          ? {
+              plan,
+              ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}),
+              targets: plan.candidates.map((candidate) =>
+                candidate.eligible
+                  ? { instance_id: candidate.instanceId, outcome: 'unattempted' as const }
+                  : { instance_id: candidate.instanceId, outcome: 'skipped' as const, reason: candidate.reason },
+              ),
+            }
+          : null,
+        error,
+        next_actions:
+          error instanceof PauseRequired ? [{ kind: 'command', argv: ['gws-ea', 'update', '--all', '--yes'] }] : [],
+        diagnostics: this.#rolloutLogs[0] ? { run_log: this.#rolloutLogs[0] } : {},
+      });
+      if (error instanceof PauseRequired) {
+        this.#presenter.report({
+          outcome: 'paused',
+          headline: safeErrorMessage(error),
+          details: ['Continue with: gws-ea update --all --yes'],
+        });
+        return { status: 'done', exitCode: EXIT_CODES.paused };
+      }
       return { status: 'done', exitCode: reportStop(this.#presenter, error) };
     }
     /* eslint-enable no-catch-all/no-catch-all */
@@ -1083,13 +1282,28 @@ class Cli {
       args: ['--id', instanceId, ...(yes ? ['--yes'] : [])],
       options: { id: instanceId, ...(yes ? { yes: 'true' } : {}) },
       instanceId,
-      work: async ({ reporter }) => {
-        turn.ended = await this.#updateAssistant(reporter, request, confirmWithoutAsking, launcher);
+      work: async ({ reporter, state }) => {
+        turn.ended = await this.#updateAssistant(reporter, request, confirmWithoutAsking, launcher, state);
+        if (turn.ended) state.data = { ...state.data, update: turn.ended };
         return updateOutcome(instanceId, turn.ended);
       },
     });
-    if (attempt.status === 'done' && attempt.exitCode === EXIT_CODES.ready && turn.ended) return turn.ended;
-    return { kind: attempt.status === 'done' && attempt.exitCode === EXIT_CODES.busy ? 'busy' : 'failed' };
+    if (this.result) {
+      this.#rolloutChanged = combineEffects(this.#rolloutChanged, this.result.changed);
+      if (this.result.diagnostics.run_log) this.#rolloutLogs.push(this.result.diagnostics.run_log);
+    }
+    if (attempt.status === 'done' && attempt.exitCode === EXIT_CODES.ready && turn.ended) {
+      this.#rolloutTargets.set(instanceId, { instance_id: instanceId, outcome: 'completed', update: turn.ended });
+      return turn.ended;
+    }
+    this.#rolloutStopped = this.result;
+    this.#rolloutTargets.set(instanceId, {
+      instance_id: instanceId,
+      outcome: attempt.status === 'done' && attempt.exitCode === EXIT_CODES.busy ? 'busy' : 'failed',
+    });
+    return attempt.status === 'done' && attempt.exitCode === EXIT_CODES.busy
+      ? { kind: 'busy' }
+      : { kind: 'failed', exitCode: attempt.status === 'done' ? attempt.exitCode : EXIT_CODES.failed };
   }
 
   /**
@@ -1099,7 +1313,7 @@ class Cli {
    * on; a code-only rollback loses nothing and is not asked about. A
    * committed rollback's follow-ups run last.
    */
-  async #rollbackWork({ reporter }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
+  async #rollbackWork({ reporter, state }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
     const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
     if (!serviceHelpers || !upsertEnvVars || !hostStatus) {
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
@@ -1110,11 +1324,12 @@ class Cli {
     const request: RollbackRequest = {
       ...(options.snapshot === 'true' ? { snapshot: true } : {}),
       present: (preview) => {
-        for (const line of rollbackPreviewLines(preview, timezone)) this.#presenter.line(line);
+        state.data = { ...state.data, preview };
+        this.#presenter.report(previewReport(rollbackPreviewLines(preview, timezone)));
       },
       ...(confirm ? { confirm } : {}),
     };
-    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'rollback' });
+    const operation = await this.#acquire(reporter, instanceId, { command: 'rollback' });
     if (!operation) throw busy();
     try {
       const dependencies: CutoverDependencies = {
@@ -1128,6 +1343,7 @@ class Cli {
       if (outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished') {
         await finishFollowUps(operation, dependencies);
       }
+      state.data = { ...state.data, rollback: outcome };
       return rollbackOutcome(instanceId, outcome, timezone);
     } finally {
       operation.release();
@@ -1148,7 +1364,7 @@ class Cli {
    * NanoClaw runs there. With none, nothing is printed; a failure is one
    * warning, and the command goes on.
    */
-  async #cleanStrayInstall(reporter: StepReporter): Promise<void> {
+  async #cleanStrayInstall(reporter: StepReporter, state?: AttemptState): Promise<void> {
     const stray = this.#strayHandling();
     if (!stray) return;
     const { checkout } = stray;
@@ -1157,21 +1373,84 @@ class Cli {
       try {
         found = await detectStrayInstall(checkout, this.#paths);
         if (strayParts(found).length === 0) return undefined;
-        const removed = await removeStrayInstall(checkout, found, stray);
-        return `Removed a stray NanoClaw install from ${checkout.root}: ${removed.join(', ')}.`;
+        const parts: string[] = [];
+        const removed = await removeStrayInstall(checkout, found, {
+          ...stray,
+          recordEffect: (changed) => {
+            if (state) state.changed = combineEffects(state.changed, changed);
+            else this.#rolloutChanged = combineEffects(this.#rolloutChanged, changed);
+          },
+          recordRemoved: (part) => {
+            parts.push(part);
+            if (state) {
+              state.changed = combineEffects(state.changed, true);
+              state.data = { ...state.data, cleanup: { checkout: checkout.root, removed: [...parts] } };
+            } else {
+              this.#rolloutChanged = combineEffects(this.#rolloutChanged, true);
+              this.#rolloutCleanup = { checkout: checkout.root, removed: [...parts] };
+            }
+          },
+        });
+        if (state) {
+          state.changed = combineEffects(state.changed, removed.length > 0);
+          state.data = { ...state.data, cleanup: { checkout: checkout.root, removed } };
+        } else {
+          this.#rolloutChanged = combineEffects(this.#rolloutChanged, removed.length > 0);
+          this.#rolloutCleanup = { checkout: checkout.root, removed };
+        }
+        return {
+          kind: 'removed' as const,
+          text: `Removed a stray NanoClaw install from ${checkout.root}: ${removed.join(', ')}.`,
+        };
         // eslint-disable-next-line no-catch-all/no-catch-all -- A stray install never stops a create or update; its failure is a warning.
       } catch (error) {
+        if (found && strayParts(found).length > 0) {
+          if (state) {
+            state.changed = combineEffects(state.changed, null);
+            state.data = {
+              ...state.data,
+              cleanup: {
+                checkout: checkout.root,
+                removed: state.data.cleanup?.removed ?? [],
+                incomplete: true,
+                error: { code: safeErrorCode(error), message: safeErrorMessage(error) },
+              },
+            };
+          } else {
+            this.#rolloutChanged = combineEffects(this.#rolloutChanged, null);
+            this.#rolloutCleanup = {
+              checkout: checkout.root,
+              removed: this.#rolloutCleanup?.removed ?? [],
+              incomplete: true,
+              error: { code: safeErrorCode(error), message: safeErrorMessage(error) },
+            };
+          }
+        }
+        if (!found) {
+          const cleanup = {
+            checkout: checkout.root,
+            removed: [],
+            incomplete: true,
+            error: { code: safeErrorCode(error), message: safeErrorMessage(error) },
+          };
+          if (state) state.data = { ...state.data, cleanup };
+          else this.#rolloutCleanup = cleanup;
+        }
         const what = found
           ? `remove the stray NanoClaw install in ${checkout.root} (${strayParts(found).join(', ')})`
           : `check ${checkout.root} for a stray NanoClaw install`;
-        return `Warning: could not ${what}; retry with gws-ea cleanup. ${safeErrorMessage(error)}`;
+        return {
+          kind: 'warning' as const,
+          text: `Warning: could not ${what}; retry with gws-ea cleanup. ${safeErrorMessage(error)}`,
+        };
       }
     });
-    if (line) this.#presenter.line(line);
+    if (line?.kind === 'warning') this.#presenter.report({ outcome: 'failed', headline: line.text, details: [] });
+    else if (line) this.#presenter.line(line.text);
   }
 
   /** `cleanup`: what `create` and `update` start with, asked for, so Docker that cannot be checked is a failure (KTD7). */
-  async #cleanupWork({ reporter }: Session): Promise<Outcome> {
+  async #cleanupWork({ reporter, state }: Session): Promise<Outcome> {
     const stray = this.#strayHandling();
     if (!stray) throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     const { checkout } = stray;
@@ -1189,12 +1468,27 @@ class Cli {
         return detected;
       },
     );
+    state.data = { cleanup: { checkout: checkout.root, removed: [] } };
     if (strayParts(found).length === 0) {
       return { status: 'ready', message: `No stray NanoClaw install in ${checkout.root}.` };
     }
+    state.changed = combineEffects(state.changed, null);
     const removed = await runStep(reporter, { id: 'remove_stray', label: 'Removing the stray NanoClaw install…' }, () =>
-      removeStrayInstall(checkout, found, stray),
+      removeStrayInstall(checkout, found, {
+        ...stray,
+        recordEffect: (changed) => {
+          state.changed = combineEffects(state.changed, changed);
+        },
+        recordRemoved: (part) => {
+          state.changed = combineEffects(state.changed, true);
+          state.data = {
+            cleanup: { checkout: checkout.root, removed: [...(state.data.cleanup?.removed ?? []), part] },
+          };
+        },
+      }),
     );
+    state.changed = removed.length > 0;
+    state.data = { cleanup: { checkout: checkout.root, removed } };
     return { status: 'ready', message: `Removed the stray NanoClaw install from ${checkout.root}.`, details: removed };
   }
 
@@ -1216,6 +1510,8 @@ class Cli {
     const state: AttemptState = {
       ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
       reserved: plan.instanceId !== undefined,
+      changed: false,
+      data: plan.instanceId ? { instance_id: plan.instanceId } : {},
     };
     const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
     let run: RunLog | undefined;
@@ -1228,6 +1524,27 @@ class Cli {
         return;
       }
       run?.interrupt(signal);
+      this.result = managedResult(plan.command, {
+        outcome: 'failed',
+        changed: state.changed,
+        data: this.#data(state),
+        error: new GwsEaError('interrupted', `Interrupted by ${signal}.`),
+        next_actions: this.#actions(plan, state),
+        diagnostics: run ? { run_log: run.progressLog } : {},
+      });
+      if (this.#rolloutPlan && state.instanceId) {
+        this.#rolloutTargets.set(state.instanceId, { instance_id: state.instanceId, outcome: 'failed' });
+        this.result = {
+          ...this.result,
+          changed: combineEffects(this.#rolloutChanged, state.changed),
+          data: {
+            plan: this.#rolloutPlan,
+            targets: [...this.#rolloutTargets.values()],
+            ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}),
+          },
+        };
+      }
+      this.#interruptedResult(this.result);
       process.exit(128 + os.constants.signals[signal]);
     };
     for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupted);
@@ -1249,6 +1566,7 @@ class Cli {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
         if (event.type === 'step-failed') failures.push(event);
         if (event.type === 'step-paused' && !event.pause) pausedForInput ??= event.step;
+        if (event.type === 'domain-effect') state.changed = combineEffects(state.changed, event.changed);
         presenter.event(event);
       };
       const reporter = { emit, run };
@@ -1260,6 +1578,17 @@ class Cli {
         terminal: presenter,
       });
       const outcome = await plan.work({ reporter, interaction, secrets, state });
+      if (outcome.status === 'paused') state.data = { ...state.data, pause: pauseFacts(outcome.pause) };
+      this.result = managedResult(plan.command, {
+        outcome: outcome.status === 'paused' ? 'paused' : outcome.cancelled ? 'cancelled' : 'succeeded',
+        changed: state.changed,
+        data: this.#data(state),
+        next_actions: [
+          ...(outcome.status === 'paused' ? this.#actions(plan, state, outcome.pause) : []),
+          ...(state.data.cleanup?.incomplete ? [{ kind: 'command' as const, argv: ['gws-ea', 'cleanup'] }] : []),
+        ],
+        diagnostics: { run_log: run.progressLog },
+      });
       if (outcome.status === 'paused') {
         run.pause(outcome.pause.code, outcome.pause.phase);
         presenter.report(pauseReport(outcome.pause, continueWith, run.progressLog));
@@ -1269,15 +1598,53 @@ class Cli {
       presenter.report({ outcome: 'ready', headline: outcome.message, details: outcome.details ?? [] });
       return { status: 'done', exitCode: EXIT_CODES.ready };
     } catch (error) {
+      if (plan.command === 'cleanup' && state.data.cleanup)
+        state.data = {
+          ...state.data,
+          cleanup: {
+            ...state.data.cleanup,
+            incomplete: true,
+            error: { code: safeErrorCode(error), message: safeErrorMessage(error) },
+          },
+        };
+      const missingInitial =
+        plan.command === 'create' && !state.reserved && error instanceof GwsEaError && error.code === 'input_required';
+      this.result = managedResult(plan.command, {
+        outcome: isBusy(error)
+          ? 'busy'
+          : error instanceof PauseRequired ||
+              (!missingInitial && error instanceof GwsEaError && error.code === 'input_required')
+            ? 'paused'
+            : error instanceof GwsEaError && error.code === 'cancelled'
+              ? 'cancelled'
+              : 'failed',
+        changed: state.changed,
+        data: this.#data(state),
+        error,
+        next_actions: this.#actions(plan, state, undefined, error),
+        diagnostics: {
+          ...(run ? { run_log: run.progressLog } : {}),
+          ...(failures[0]?.rawLog ? { step_log: failures[0].rawLog } : {}),
+        },
+      });
+      if (missingInitial) {
+        run?.abort(error);
+        presenter.report({
+          outcome: 'failed',
+          headline: safeErrorMessage(error),
+          details: ['Supply the required creation inputs.'],
+        });
+        return { status: 'done', exitCode: EXIT_CODES.usage };
+      }
       const step = (error instanceof PauseRequired ? pausedForInput : failures[0]?.step) ?? plan.command;
       const log = run ? [`Log: ${run.progressLog}`] : [];
-      if (error instanceof PauseRequired) {
+      if (error instanceof PauseRequired || (error instanceof GwsEaError && error.code === 'input_required')) {
         run?.pause(error.code);
         presenter.report({
           outcome: 'paused',
           headline: `Paused at ${step}: ${safeErrorMessage(error)}`,
           details: [
-            ...error.instructions,
+            ...(error instanceof PauseRequired ? error.instructions : []),
             `Continue with: ${continueWith()}`,
             ...(error instanceof RemovalPause ? [`Or leave it behind: ${continueWith(error.resource)}`] : []),
             ...log,
@@ -1287,7 +1654,19 @@ class Cli {
       }
       run?.abort(error);
       if (isBusy(error)) {
-        presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: log });
+        presenter.report({
+          outcome: 'busy',
+          headline: safeErrorMessage(error),
+          details: [
+            ...(state.instanceId
+              ? [
+                  `Assistant: ${state.instanceId}; blocked command: ${plan.command}`,
+                  `Inspect with: gws-ea status --id ${state.instanceId}`,
+                ]
+              : []),
+            ...log,
+          ],
+        });
         return { status: 'done', exitCode: EXIT_CODES.busy };
       }
       // Retrying cannot help, and this command's own rerun is not the way on.
@@ -1296,7 +1675,11 @@ class Cli {
         return { status: 'done', exitCode: EXIT_CODES.failed };
       }
       const nextAction = this.#nextAction(plan, state);
-      if (!run || (error instanceof GwsEaError && error.code === 'cancelled')) {
+      if (error instanceof GwsEaError && error.code === 'cancelled') {
+        presenter.report({ outcome: 'ready', headline: safeErrorMessage(error), details: log });
+        return { status: 'done', exitCode: EXIT_CODES.ready };
+      }
+      if (!run) {
         presenter.report({
           outcome: 'failed',
           headline: `Stopped at ${step}: ${safeErrorMessage(error)}`,
@@ -1315,6 +1698,11 @@ class Cli {
 }
 
 /** A release served through a broken Google sign-in says so after where it left the assistant (KTD12). */
+function pauseFacts(pause: ProvisionHumanPause): NonNullable<OperationData['pause']> {
+  const { settled: _settled, kind: _kind, ...facts } = pause;
+  return facts;
+}
+
 function signInDetails(signInNeeded: string | null): string[] {
   return signInNeeded ? [`${signInNeeded}.`] : [];
 }
@@ -1363,6 +1751,7 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
     case 'declined':
       return {
         status: 'ready',
+        cancelled: true,
         message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseLine(outcome.release)} as before.`,
       };
   }
@@ -1378,7 +1767,12 @@ function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outco
 
 /** The stop summary of one assistant's update; undefined when its preview was declined. */
 function updateOutcome(instanceId: string, update: AssistantUpdate | undefined): Outcome {
-  if (!update) return { status: 'ready', message: 'Update cancelled. The assistant is unchanged.' };
+  if (!update)
+    return {
+      status: 'ready',
+      cancelled: true,
+      message: 'Update cancelled. The serving release is unchanged; staged assets are retained.',
+    };
   switch (update.kind) {
     case 'updated':
       return updatedOutcome(instanceId, update.updated);
@@ -1393,22 +1787,23 @@ async function confirmWithoutAsking(): Promise<boolean> {
 }
 
 /**
- * How an update is confirmed: `--yes`, or a terminal to ask on. Settled
- * first, so a run that could never be confirmed stops before anything is
- * read or staged.
+ * `--yes` or a terminal supplies the existing confirmation. Missing consent
+ * pauses only when the domain has produced its preview.
  */
 function updateConfirmation<Preview>(
   yes: boolean,
   prompt: ((preview: Preview) => Promise<boolean>) | undefined,
 ): (preview: Preview) => Promise<boolean> {
-  const confirm = yes ? confirmWithoutAsking : prompt;
-  if (!confirm) {
-    throw new GwsEaError(
-      'input_required',
-      'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
-    );
-  }
-  return confirm;
+  return yes
+    ? confirmWithoutAsking
+    : (prompt ??
+        (async () => {
+          throw new PauseRequired(
+            'confirmation_required',
+            'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
+            [],
+          );
+        }));
 }
 
 /** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */
@@ -1516,7 +1911,7 @@ function failureReport(
     ...(failed?.rawLog ? { rawLog: failed.rawLog } : {}),
     runDirectory: run.directory,
     ...(typeof tail === 'string' && tail ? { tail: redact(tail) } : {}),
-    ...(state.instanceId ? { instanceId: state.instanceId } : {}),
+    ...(state.reserved && state.instanceId ? { instanceId: state.instanceId } : {}),
   };
 }
 
@@ -1568,6 +1963,10 @@ function createReservation(
   return validateReservation(input);
 }
 
+function previewReport(lines: readonly string[]): StopReport {
+  return { outcome: 'ready', headline: lines[0] ?? 'Preview', details: lines.slice(1) };
+}
+
 function removalPreviewLines(preview: RemovalPreview): string[] {
   return [
     `Assistant: ${preview.instanceId}`,
@@ -1607,8 +2006,58 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
 }
 
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
-  const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
-  const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
+  const registerErrorSecrets = (): void => {
+    for (const key of Object.values(SECRET_INPUTS)) {
+      const value = (runtime.environment ?? process.env)[key];
+      if (value) registerSecret(value);
+    }
+  };
+  const resultOutput = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
+  const rawErrorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
+  const errorOutput: LineWriter = (line) => rawErrorOutput(redact(line));
+  const delimiter = args.indexOf('--');
+  const outer = delimiter < 0 ? args : args.slice(0, delimiter);
+  const json = outer.includes('--json');
+  let resultWritten = false;
+  const output: LineWriter = (line) => {
+    if (json) resultWritten = true;
+    resultOutput(line);
+  };
+  const requestedCommand = outer.find((arg) => !arg.startsWith('-')) ?? '';
+  const emitResult = (result: ManagedResult): void => {
+    if (json && !resultWritten) output(resultJson(result));
+  };
+  /** Outside journalled attempts, the boundary can still report the facts already observed before exit. */
+  const observeInterruption = (facts: () => Pick<ManagedResult, 'changed' | 'data'>): (() => void) => {
+    if (!json) return () => undefined;
+    const interrupted = (signal: NodeJS.Signals): void => {
+      emitResult(
+        managedResult(invocation.definition.path.join(' '), {
+          outcome: 'failed',
+          ...facts(),
+          error: new GwsEaError('interrupted', `Interrupted by ${signal}.`),
+        }),
+      );
+      process.exit(128 + os.constants.signals[signal]);
+    };
+    for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupted);
+    return () => {
+      for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
+    };
+  };
+  if (json || outer.includes('--no-input')) {
+    const {
+      prompts: _prompts,
+      onFailure: _failure,
+      confirmRemoval: _remove,
+      confirmUpdate: _update,
+      confirmUpdateAll: _all,
+      confirmRollback: _rollback,
+      presenter: _presenter,
+      ...safe
+    } = runtime;
+    runtime = safe;
+  }
   let invocation: ParsedInvocation;
   try {
     invocation = parseInvocation(args);
@@ -1646,24 +2095,52 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     }
   } catch (error) {
     if (!(error instanceof GwsEaError)) throw error;
+    registerErrorSecrets();
+    emitResult(managedResult(requestedCommand, { outcome: 'failed', error }));
     errorOutput(error.message);
     errorOutput('Run gws-ea --help for usage.');
     return error.code === 'invalid_arguments' ? EXIT_CODES.usage : EXIT_CODES.failed;
   }
   const { handler } = invocation.definition;
   const { options } = invocation;
-  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const basePresenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const quiet = options.quiet === 'true';
+  const presenter: Presenter = {
+    event: (event) => {
+      if (!quiet) basePresenter.event(event);
+    },
+    suspend: () => basePresenter.suspend(),
+    resume: () => basePresenter.resume(),
+    line: (line) => {
+      if (!quiet) basePresenter.line(redact(line));
+    },
+    report: (report) => {
+      if (!json)
+        basePresenter.report({
+          ...report,
+          headline: redact(report.headline),
+          details: report.details.map(redact),
+          ...(report.tail ? { tail: redact(report.tail) } : {}),
+        });
+    },
+  };
   const environment = runtime.environment ?? process.env;
   switch (handler.kind) {
     case 'voice': {
       const command = handler.command;
-      return runOutsideAttempts(presenter, runtime.execve, async () => {
+      let changed: Changed = false;
+      let data: import('./result.js').VoiceOperationData | null = null;
+      const stopObservingInterruption = observeInterruption(() => ({ changed, data }));
+      try {
         const paths = runtime.paths ?? resolveControlPlanePaths();
         const dependencies = {
           environment,
           upsertEnvVars: runtime.upsertEnvVars,
           serviceHelpers: runtime.serviceHelpers,
           progress: (line: string) => presenter.line(line),
+          recordEffect: (effect: true | null) => {
+            changed = combineEffects(changed, effect);
+          },
         };
         switch (command) {
           case 'install-voice': {
@@ -1675,44 +2152,81 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
               dependencies,
             );
-            presenter.line(
-              `Voice assets installed at ${installed.installationDir}; voice remains disabled. Run gws-ea enable-voice.`,
-            );
+            data = { scope: 'host', installation_dir: installed.installationDir, enabled: false };
+            presenter.report({
+              outcome: 'ready',
+              headline: `Voice assets installed at ${installed.installationDir}; voice remains disabled.`,
+              details: ['Run gws-ea enable-voice.'],
+            });
             break;
           }
           case 'enable-voice':
             await enableLocalVoice(paths, dependencies);
-            presenter.line('Voice enabled host-wide for every compatible current and future assistant.');
+            data = { scope: 'host', enabled: true };
+            presenter.report({
+              outcome: 'ready',
+              headline: 'Voice enabled host-wide for every compatible current and future assistant.',
+              details: [],
+            });
             break;
           case 'disable-voice':
-            await disableLocalVoice(paths);
-            presenter.line('Voice disabled host-wide; shared assets retained and text service available.');
+            await disableLocalVoice(paths, dependencies);
+            data = { scope: 'host', enabled: false };
+            presenter.report({
+              outcome: 'ready',
+              headline: 'Voice disabled host-wide; shared assets retained and text service available.',
+              details: [],
+            });
             break;
           case 'uninstall-voice':
             await uninstallLocalVoice(paths, dependencies);
-            presenter.line('Recipe-owned voice assets removed; text service remains available.');
+            data = { scope: 'host', enabled: false };
+            presenter.report({
+              outcome: 'ready',
+              headline: 'Recipe-owned voice assets removed; text service remains available.',
+              details: [],
+            });
             break;
         }
-        return { exitCode: EXIT_CODES.ready };
-      });
+        emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'succeeded', changed, data }));
+        return EXIT_CODES.ready;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Every managed voice failure has the same result boundary.
+      } catch (error) {
+        emitResult(
+          managedResult(invocation.definition.path.join(' '), {
+            outcome: isBusy(error) ? 'busy' : 'failed',
+            changed,
+            data,
+            error,
+          }),
+        );
+        return reportStop(presenter, error);
+      } finally {
+        stopObservingInterruption();
+      }
     }
     case 'observation': {
       const readOnly = READ_ONLY_COMMANDS.get(handler.command);
       if (!readOnly) throw new Error(`Missing observation handler for ${handler.command}`);
-      return runOutsideAttempts(presenter, runtime.execve, () =>
-        readOnly.run(
-          {
-            paths: runtime.paths ?? resolveControlPlanePaths(),
-            output,
-            errorOutput,
-            environment,
-            serviceHelpers: runtime.serviceHelpers,
-            hostStatus: runtime.hostStatus,
-            toolCheckout: runtime.toolCheckout,
-          },
-          options,
-        ),
-      );
+      const stopObservingInterruption = observeInterruption(() => ({ changed: false, data: null }));
+      try {
+        return await runOutsideAttempts(presenter, runtime.execve, () =>
+          readOnly.run(
+            {
+              paths: runtime.paths ?? resolveControlPlanePaths(),
+              output,
+              errorOutput,
+              environment,
+              serviceHelpers: runtime.serviceHelpers,
+              hostStatus: runtime.hostStatus,
+              toolCheckout: runtime.toolCheckout,
+            },
+            options,
+          ),
+        );
+      } finally {
+        stopObservingInterruption();
+      }
     }
     case 'native':
       return runOutsideAttempts(presenter, runtime.execve, () =>
@@ -1721,20 +2235,27 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     case 'discovery':
       throw new Error('Discovery must finish before runtime dispatch.');
     case 'attempt': {
-      const cli = new Cli(runtime, presenter);
+      const cli = new Cli(runtime, presenter, emitResult);
       let next: () => Promise<Attempt>;
       try {
         next = cli.prepare(handler.command, invocation);
       } catch (error) {
         if (!(error instanceof GwsEaError)) throw error;
+        registerErrorSecrets();
         presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
+        emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'failed', error }));
         return initialInvocationExit(error);
       }
       for (;;) {
         const attempt = await next();
-        if (attempt.status === 'done') return attempt.exitCode;
-        if (!runtime.onFailure) return EXIT_CODES.failed;
-        if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
+        if (attempt.status === 'done') {
+          if (cli.result) emitResult(cli.result);
+          return attempt.exitCode;
+        }
+        if (!runtime.onFailure || (await runtime.onFailure(attempt.report)) !== 'retry') {
+          if (cli.result) emitResult(cli.result);
+          return EXIT_CODES.failed;
+        }
         next = attempt.retry;
       }
     }

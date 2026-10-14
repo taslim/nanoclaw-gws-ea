@@ -1799,7 +1799,7 @@ describe('removal command', () => {
         stderr: (line) => errors.push(line),
         removeAssistant: remove,
       }),
-    ).toBe(1);
+    ).toBe(2);
     expect(errors[0]).toBe('--abandon: "registry" cannot be abandoned; choose from gcp-project, chat-subscription');
     expect(remove).not.toHaveBeenCalled();
   });

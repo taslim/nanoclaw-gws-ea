@@ -263,7 +263,7 @@ export async function collectGwsEaCreateInput(
 
   const source: InputSource = { context, prompts, interactive: dependencies.interactive ?? true };
 
-  note(source, `Instance ${context.instanceId}\nRelease track ${context.track}`, 'New assistant');
+  note(source, `Release track ${context.track}`, 'New assistant');
   const assistantFirst = await textInput(source, 'assistant-first-name', 'Assistant first name');
   const assistantLast = await textInput(source, 'assistant-last-name', 'Assistant last name', {
     optional: true,
