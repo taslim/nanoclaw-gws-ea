@@ -1,0 +1,7 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gws-ea-browser",
+  "version": "1.0.0",
+  "description": "The sealed host-browser tool agent, with one session per main errand.",
+  "extensions": { "ai.nanoco.nanoclaw": { "agentName": "browser" } }
+}

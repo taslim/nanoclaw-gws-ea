@@ -65,8 +65,11 @@ function schemaOf(db: DbDriver): SchemaEntry[] {
 }
 
 describe('the matters migrations', () => {
-  it('are one: the matters with their links', () => {
-    expect(mattersMigrations().map((migration) => migration.name)).toEqual([CREATE_MATTERS]);
+  it('create matters and extend their native links with browser jobs', () => {
+    expect(mattersMigrations().map((migration) => migration.name)).toEqual([
+      CREATE_MATTERS,
+      'module:gws-ea-matters:browser-jobs',
+    ]);
   });
 
   it('are portable: async, and free of every banned construct', () => {

@@ -43,7 +43,7 @@ import { unguarded } from '../../guard/index.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { requestWake } from '../../request-wake.js';
-import { resolveSession, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, resolveSystemSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -60,6 +60,7 @@ import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.
 import { openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import './index.js';
+import '../gws-ea-browser/index.js';
 
 const PRINCIPAL_USER = 'gchat:users/pat';
 const PAT = 'pat@northwind.example';
@@ -277,6 +278,58 @@ beforeEach(async () => {
 afterEach(async () => {
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('a sealed browser errand failure', () => {
+  async function browserJob(): Promise<Session> {
+    await createAgentGroup({
+      id: 'ag-browser',
+      name: 'browser',
+      folder: 'browser',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'ag-browser');
+    return (await resolveSystemSession('ag-browser', 'system:a2a:ag-main:notice-job')).session;
+  }
+
+  it('tells main once of a failed job turn and names the native job thread', async () => {
+    const session = await browserJob();
+    const route = { channelType: 'agent', platformId: 'ag-main', threadId: session.thread_id };
+    queueTurnFailed(session, 'browser-turn-failed', route, ['delegation']);
+    await drain(session, 1);
+    expect(facts()).toHaveLength(1);
+    expect(facts()[0].text).toContain(`Browser job ${session.thread_id}`);
+    await forgetOutcome(session, 'browser-turn-failed', 0);
+    await drain(session, 1);
+    expect(facts()).toHaveLength(1);
+    expect(mainWakes()).toBe(1);
+  });
+
+  it('tells main once when a delegated inbound message is given up', async () => {
+    const session = await browserJob();
+    const route = { channelType: 'agent', platformId: 'ag-main', threadId: session.thread_id };
+    seedClaimed(session, 'browser-inbound-failed', 2, route);
+    await reconcileSession(session.id);
+    reclaim(session, 'browser-inbound-failed');
+    await reconcileSession(session.id);
+    expect(facts()).toHaveLength(1);
+    expect(facts()[0].text).toContain(`Browser job ${session.thread_id}`);
+    expect(mainWakes()).toBe(1);
+  });
+
+  it('tells main of a report that cannot be delivered', async () => {
+    const session = await browserJob();
+    queue(session, {
+      id: 'browser-report-failed',
+      content: { text: 'Private report words.' },
+      route: { channelType: 'agent', platformId: 'missing-main', threadId: session.thread_id },
+    });
+    await drain(session, 3);
+    expect(facts()).toHaveLength(1);
+    expect(facts()[0].text).toContain(`Browser job ${session.thread_id}`);
+    expect(facts()[0].text).not.toContain('Private report words.');
+  });
 });
 
 describe('an email external-email wrote that delivery gave up on', () => {

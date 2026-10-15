@@ -4,16 +4,23 @@ import { getDb } from '../../db/connection.js';
 import { hasControlCharacters, parseLine } from '../../gws-ea/validation.js';
 import { getThread, holdThread, placeThread, THREAD_HANDLER, threadPlacement } from '../gws-ea-inbox/thread-map.js';
 import { getPerson } from '../gws-ea-people/db.js';
+import {
+  cancelBrowserJob,
+  cancelBrowserJobInTransaction,
+  finishBrowserJobCancellation,
+  resolveBrowserJob,
+  type BrowserJobCancellation,
+} from '../gws-ea-browser/cancel.js';
 
 /** What a matter links to (R3), in the order a matter lists them. */
-export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory'] as const;
+export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory', 'job'] as const;
 export type LinkKind = (typeof LINK_KINDS)[number];
 
 /**
  * Pieces of work: each sits in at most one open matter, and placing it in
  * another moves it (R3). Only a piece is placed nowhere (R9).
  */
-export const PIECE_KINDS = ['thread', 'event', 'file'] as const satisfies readonly LinkKind[];
+export const PIECE_KINDS = ['thread', 'event', 'file', 'job'] as const satisfies readonly LinkKind[];
 export type PieceKind = (typeof PIECE_KINDS)[number];
 
 /** A link by id: a thread key, `<calendar id>/<event id>`, a Drive file id, a person id, or a memory path. */
@@ -205,6 +212,10 @@ function memoryPath(text: string, value: string): string {
 export function canonicalReference(kind: LinkKind, value: string): string {
   const text = value.trim();
   switch (kind) {
+    case 'job':
+      if (!/^system:a2a:[^:\s]+:[^\s]+$/u.test(text) || hasControlCharacters(text))
+        throw new Error('Job must name the native browser thread returned by delegation');
+      return text;
     case 'thread':
       if (!THREAD_KEY.test(text)) throw new Error(`Thread ${JSON.stringify(value)} is invalid: use its key, mail-…`);
       return text;
@@ -412,6 +423,8 @@ export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
 
 /** The host keeps only references it can resolve: a thread the inbox knows, a person with a record. */
 async function assertResolvable(link: LinkRef): Promise<void> {
+  if (link.kind === 'job' && !(await resolveBrowserJob(link.reference)))
+    throw new Error(`No browser job ${link.reference} exists`);
   if (link.kind === 'thread' && (await getThread(link.reference)) === undefined) {
     throw new Error(`No email thread ${link.reference} exists`);
   }
@@ -542,7 +555,7 @@ async function assertReopenable(matterId: string): Promise<void> {
          ON other.kind = mine.kind AND other.reference = mine.reference
         AND other.matter_open = 1 AND other.matter_id <> mine.matter_id
        JOIN gws_ea_matters holder ON holder.id = other.matter_id
-      WHERE mine.matter_id = ? AND mine.kind IN ('thread', 'event', 'file')
+      WHERE mine.matter_id = ? AND mine.kind IN ('thread', 'event', 'file', 'job')
       ORDER BY mine.kind, mine.reference
       LIMIT 1`,
     matterId,
@@ -722,6 +735,7 @@ export async function closeMatter(input: CloseMatterInput): Promise<Matter> {
   const outcome = parseOutcome(input.outcome);
   const now = new Date().toISOString();
   const db = getDb();
+  const cancellations: BrowserJobCancellation[] = [];
   await db.transaction(async () => {
     const row = await requireMatterRow(id);
     if (row.closed_at !== null) throw new Error(`${id} is already closed`);
@@ -742,8 +756,24 @@ export async function closeMatter(input: CloseMatterInput): Promise<Matter> {
     );
     await db.run('UPDATE gws_ea_matter_links SET matter_open = 0 WHERE matter_id = ?', id);
     for (const threadKey of await threadsOf(id)) await holdThread(threadKey);
+    const jobs = await db.all<{ reference: string }>(
+      "SELECT reference FROM gws_ea_matter_links WHERE matter_id = ? AND kind = 'job'",
+      id,
+    );
+    for (const job of jobs) cancellations.push(await cancelBrowserJobInTransaction(job.reference));
   });
+  for (const cancellation of cancellations) await finishBrowserJobCancellation(cancellation);
   return requireMatter(id);
+}
+
+/** Startup closes the gap when the host was down as a linked matter closed. */
+export async function cancelClosedMatterJobs(): Promise<void> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_browser_jobs'))) return;
+  const jobs = await db.all<{ reference: string }>(
+    "SELECT DISTINCT links.reference FROM gws_ea_matter_links links JOIN gws_ea_matters matters ON matters.id = links.matter_id WHERE links.kind = 'job' AND matters.closed_at IS NOT NULL",
+  );
+  for (const job of jobs) await cancelBrowserJob(job.reference);
 }
 
 /**

@@ -3,13 +3,70 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { parseIsoTimestamp } from '../model.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
-import { wrapSqliteInbound, wrapSqliteOutbound } from './index.js';
+import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from './index.js';
+import fs from 'node:fs';
+import { sessionMailboxPath } from './paths.js';
 
 describe('SQLite mailbox canonical serialization', () => {
   const databases: Database.Database[] = [];
 
   afterEach(() => {
     for (const database of databases.splice(0)) database.close();
+  });
+
+  it('reads an immutable outbound request by id through the host mailbox', async () => {
+    const db = new Database(':memory:');
+    databases.push(db);
+    db.exec(OUTBOUND_SCHEMA);
+    const outbound = wrapSqliteOutbound(db);
+    await outbound.writeDirect({
+      id: 'code-request',
+      kind: 'system',
+      channelType: null,
+      platformId: null,
+      threadId: null,
+      content: '{"action":"relay_code","code":"123456"}',
+    });
+    expect(outbound.getOutboundMessage('code-request')).toMatchObject({
+      id: 'code-request',
+      content: '{"action":"relay_code","code":"123456"}',
+    });
+    expect(outbound.getOutboundMessage('missing')).toBeUndefined();
+  });
+
+  it('reads the latest delivered agent report and excludes newer failed, pending and foreign reports', async () => {
+    const mailbox = new SqliteAgentMailbox();
+    const key = { agentGroupId: 'mailbox-browser-report-test', sessionId: 'job' };
+    mailbox.prepare(key);
+    try {
+      await mailbox.session(key, async (session) => {
+        for (const [id, target] of [
+          ['delivered', 'main'],
+          ['failed', 'main'],
+          ['pending', 'main'],
+          ['foreign', 'other'],
+        ] as const) {
+          await session.writeDirect({
+            id,
+            kind: 'chat',
+            channelType: 'agent',
+            platformId: target,
+            threadId: 'system:a2a:main:test',
+            content: JSON.stringify({ text: id }),
+          });
+        }
+        session.markDelivered('delivered', null);
+        session.markDeliveryFailed('failed');
+        session.markDelivered('foreign', null);
+        expect(session.getLatestDeliveredAgentReport('main')).toMatchObject({ content: '{"text":"delivered"}' });
+      });
+    } finally {
+      await mailbox.destroy(key);
+      fs.rmSync(sessionMailboxPath(key, 'inbound').replace(/\/job\/inbound\.db$/, ''), {
+        recursive: true,
+        force: true,
+      });
+    }
   });
 
   it('round-trips full lifecycle records through the SQLite adapter', async () => {

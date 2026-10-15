@@ -22,6 +22,7 @@ import { registerPersonForgetHook, registerPersonForgetReview } from '../gws-ea-
 import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
   getMatter,
+  cancelClosedMatterJobs,
   LINK_KINDS,
   listClosedMatters,
   listOpenMatters,
@@ -32,14 +33,16 @@ import {
 import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
-import { gwsEaMattersMigration } from './migration.js';
+import { gwsEaMattersMigration, gwsEaMatterJobsMigration } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
 import { syncVerdict, todayVerdict } from './sync.js';
 
 registerMigration(gwsEaMattersMigration);
+registerMigration(gwsEaMatterJobsMigration);
 
-onHostStart(({ signal }) => {
+onHostStart(async ({ signal }) => {
+  await cancelClosedMatterJobs();
   // Started, not awaited: host startup never waits on a pass.
   void runMattersLoop(signal);
 });
@@ -153,6 +156,12 @@ const LOOK_ARGS: ColumnDef[] = [
   },
 ];
 const LINK_ARGS: ColumnDef[] = [
+  {
+    name: 'job',
+    type: 'string',
+    description:
+      'Native browser job threads, comma-separated. A job sits in one open matter; placing it moves it. Closing its matter cancels it.',
+  },
   {
     name: 'thread',
     type: 'string',
