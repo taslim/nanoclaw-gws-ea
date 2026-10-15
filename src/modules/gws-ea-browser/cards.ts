@@ -58,8 +58,8 @@ export function renderPurchaseCard(
     ),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
-    `Card ending: ${facts.cardEnding}`,
-    `Address: ${quotePurchaseText(facts.address)}`,
+    facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
+    facts.address === null ? 'Address: not applicable' : `Address: ${quotePurchaseText(facts.address)}`,
     `Delivery: ${facts.delivery ? quotePurchaseText(facts.delivery.text) : 'Not applicable'}`,
     ...(bounds.deliveryWindow
       ? [

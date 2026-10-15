@@ -12,6 +12,14 @@ export interface FinancialCommitment {
   /** A per-person fee is multiplied by the host-read party size. */
   perPerson?: boolean;
 }
+export interface ReservationFacts {
+  venueId: string;
+  venueName: string;
+  partySize: number;
+  at: string;
+  endAt: string;
+  timeZone: string;
+}
 export interface PurchaseFacts {
   flowId: string;
   site: string;
@@ -22,12 +30,14 @@ export interface PurchaseFacts {
   currency: string;
   totalMinor: number;
   dueNowMinor: number;
-  cardEnding: string;
-  address: string;
+  cardEnding: string | null;
+  address: string | null;
   delivery?: { date: string; text: string };
   commitments: FinancialCommitment[];
   checkoutReference?: string;
-  reservation?: { venueId: string; partySize: number; at: string };
+  reservation?: ReservationFacts;
+  /** Explicit merchant evidence that a reservation has no financial commitment. Absence proves nothing. */
+  noCommitmentTerms?: string;
 }
 export interface PurchaseBounds {
   reservation?: { venueId: string; partySize: number; windowStart: string; windowEnd: string };
@@ -105,6 +115,7 @@ export function completePurchaseFacts(facts: PurchaseFacts): boolean {
     !facts.items.length ||
     !facts.account ||
     !facts.address ||
+    typeof facts.cardEnding !== 'string' ||
     !/^\d{4}$/u.test(facts.cardEnding) ||
     !/^[A-Z]{3}$/u.test(facts.currency)
   )

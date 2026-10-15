@@ -21,7 +21,14 @@ const facts: PurchaseFacts = {
   dueNowMinor: 0,
   cardEnding: '4242',
   address: 'Morgan',
-  reservation: { venueId: 'bistro-123', partySize: 4, at: '2026-10-20T19:30:00.000Z' },
+  reservation: {
+    venueId: 'bistro-123',
+    venueName: 'Bistro',
+    partySize: 4,
+    at: '2026-10-20T19:30:00.000Z',
+    endAt: '2026-10-20T21:00:00.000Z',
+    timeZone: 'UTC',
+  },
   commitments: [
     {
       kind: 'conditional_fee',
