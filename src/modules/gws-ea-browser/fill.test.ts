@@ -13,6 +13,7 @@ import type { BrowserExecutionContext } from './queue.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
 import * as nativeAuthentication from './authentication-submit.js';
+import { browserVault, websitePermitsOrigin } from './onepassword.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
@@ -123,7 +124,7 @@ function fixture(origin = 'https://www.shop.example') {
   } as unknown as BrowserExecutionContext;
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
-  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockImplementation(async () => ({
+  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockImplementation(async (element) => ({
     frameId: 'fixture-frame',
     loaderId: 'fixture-document',
     controlBackendNodeId: 1,
@@ -134,6 +135,10 @@ function fixture(origin = 'https://www.shop.example') {
       method: form.method,
       target: form.target,
       submit: true,
+      control:
+        (element as unknown as { node: unknown }).node === field
+          ? { tag: 'INPUT', name: field.name, type: field.type, autocomplete: field.getAttribute('autocomplete') ?? '' }
+          : { tag: 'BUTTON', name: '', type: 'submit', autocomplete: '' },
       fields: [field, button].map((node) => ({
         name: node.name,
         type: node.type,
@@ -141,6 +146,16 @@ function fixture(origin = 'https://www.shop.example') {
       })),
     },
   }));
+  const nativeFill = vi.fn(async (value: string) => {
+    field.value = value;
+    return true;
+  });
+  vi.spyOn(nativeAuthentication, 'fillNativeAuthenticationField').mockImplementation(
+    async (_frame, _field, _submit, value, assertActive) => {
+      await assertActive();
+      return nativeFill(value);
+    },
+  );
   const nativeSubmit = vi.fn(async () => undefined);
   vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(
     async (_frame, _binding, assertActive) => {
@@ -160,6 +175,7 @@ function fixture(origin = 'https://www.shop.example') {
     context,
     nodes,
     nativeSubmit,
+    nativeFill,
     setUrl: (value: string) => {
       url = value;
     },
@@ -173,13 +189,13 @@ function fixture(origin = 'https://www.shop.example') {
   };
 }
 
-it('inserts only via keyboard, blocks screenshots while active, clears same-page errors and redacts forever', async () => {
+it('blocks screenshots during target-bound insertion, clears same-page errors and redacts forever', async () => {
   const f = fixture();
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  const original = vi.mocked(f.page.keyboard.insertText).getMockImplementation()!;
-  vi.mocked(f.page.keyboard.insertText).mockImplementation(async (value) => {
+  const original = f.nativeFill.getMockImplementation()!;
+  f.nativeFill.mockImplementation(async (value) => {
     expect(await pageHasSecret(f.page)).toBe(true);
-    await original(value);
+    return original(value);
   });
   const result = await fillBoundBrowserSecret(f.context, binding, async () => SECRET);
   expect(result).toEqual({ status: 'cleared_after_submit' });
@@ -205,7 +221,8 @@ it('returns submitted after navigation and rechecks complete frame origin before
     return SECRET;
   });
   expect(await fillBoundBrowserSecret(f.context, binding, resolve)).toEqual({ status: 'origin_mismatch' });
-  expect(f.page.keyboard.insertText).toHaveBeenCalledTimes(1);
+  expect(f.nativeFill).toHaveBeenCalledTimes(1);
+  expect(f.page.keyboard.insertText).not.toHaveBeenCalled();
 });
 
 it('judges iframe origins and refuses HTTP and card targets before any resolver runs', async () => {
@@ -223,14 +240,14 @@ it('judges iframe origins and refuses HTTP and card targets before any resolver 
   });
 });
 
-it('detects focus drift and clears every field holding the value, including copied values', async () => {
+it('detects a changed target value and clears every field holding the value, including copied values', async () => {
   const f = fixture();
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
   const other = { ...f.field, value: '' };
   f.nodes.push(other);
-  vi.mocked(f.page.keyboard.insertText).mockImplementation(async (value) => {
-    f.focus(other);
+  f.nativeFill.mockImplementation(async (value) => {
     other.value = value;
+    return true;
   });
   await expect(fillBoundBrowserSecret(f.context, binding, async () => SECRET)).rejects.toMatchObject({
     code: 'forbidden',
@@ -294,4 +311,32 @@ it('refuses secret resolution while Playwright protocol debugging could disclose
   vi.stubEnv('DEBUG', 'pw:protocol');
   await expect(fillBoundBrowserSecret(f.context, binding, resolve)).rejects.toMatchObject({ code: 'forbidden' });
   expect(resolve).not.toHaveBeenCalled();
+});
+
+it('offers ExactDomain vault handles after redirecting to a different HTTPS origin on the same site', async () => {
+  const f = fixture();
+  const website = { url: 'https://login.shop.example', autofillBehavior: 'ExactDomain' };
+  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
+    websitePermitsOrigin(website, origin) ? [{ item_handle: 'vault_exact-login', title: 'Site login' }] : [],
+  );
+  expect((await observePage(f.page)).site?.vault_items).toEqual([]);
+  f.setUrl('https://login.shop.example/login');
+  expect((await observePage(f.page)).site?.vault_items).toEqual([
+    { item_handle: 'vault_exact-login', title: 'Site login' },
+  ]);
+  expect((await observePage(f.page)).site).toBeUndefined();
+});
+
+it('offers a newly attached login iframe origin without repeatedly refreshing an unchanged origin set', async () => {
+  const f = fixture();
+  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
+    origin === 'https://identity.example' ? [{ item_handle: 'vault_frame-login', title: 'Identity login' }] : [],
+  );
+  expect((await observePage(f.page)).site?.vault_items).toEqual([]);
+  const child = { url: () => 'https://identity.example/login', evaluate: async () => [] };
+  f.page.frames = () => [f.frame, child] as unknown as ReturnType<Page['frames']>;
+  expect((await observePage(f.page)).site?.vault_items).toEqual([
+    { item_handle: 'vault_frame-login', title: 'Identity login' },
+  ]);
+  expect((await observePage(f.page)).site).toBeUndefined();
 });

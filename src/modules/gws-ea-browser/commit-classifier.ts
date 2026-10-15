@@ -132,6 +132,7 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     return 'purchase_control';
   if (security.test(decoded)) return 'account_security';
   if (speaking.test(decoded)) return 'speaks_as_principal';
+  if (authenticationEndpoint(url)) return 'ordinary';
   const flow = merchantFlows.find((candidate) => candidate.matches(url));
   if (flow) return flow.classifyNavigation(url);
   if (

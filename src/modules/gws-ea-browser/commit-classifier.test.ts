@@ -79,6 +79,15 @@ it('blocks commit URLs and external protocols before navigation', () => {
   expect(classifyNavigationUrl('file:///etc/passwd')).toBe('blocked_address');
 });
 
+it('allows positively reviewed Amazon authentication routes while retaining financial and security denials', () => {
+  for (const path of ['/ap/signin', '/ap/mfa', '/ap/cvf'])
+    expect(classifyNavigationUrl(`https://www.amazon.com${path}`)).toBe('ordinary');
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?action=purchase')).toBe('purchase_control');
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?operation=change-password')).toBe('account_security');
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/unknown')).toBe('unsupported_merchant');
+  expect(classifyNavigationUrl('http://www.amazon.com/ap/signin')).toBe('unsupported_merchant');
+});
+
 it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
   registerReviewedMerchantFlow({
     id: 'test-unhandled-auth-flow',
@@ -123,6 +132,7 @@ it('submits positively identified native authentication forms without invoking a
   // This unit mocks only the native Chrome object binding. Native-world integrity has its own real-renderer suite.
   vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({
     facts: {
+      control: { tag: 'BUTTON', name: '', type: 'submit', autocomplete: '' },
       origin: 'https://auth-dispatch.example',
       action: form.action,
       method: 'post',

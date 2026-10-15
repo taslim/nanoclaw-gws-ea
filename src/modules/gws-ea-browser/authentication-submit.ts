@@ -45,6 +45,7 @@ export interface NativeAuthenticationFacts {
   method: string;
   target: string;
   submit: boolean;
+  control: { tag: string; name: string; type: string; autocomplete: string };
   fields: { name: string; type: string; autocomplete: string }[];
 }
 export interface NativeAuthenticationBinding {
@@ -77,6 +78,7 @@ const readControlSource = `
       method: formProperty(form, 'method'),
       target,
       submit: !control.matches(':disabled') && control.type === 'submit' && (!target || target === '_self'),
+      control: { tag: control.tagName, name: control.name || '', type: control.type || '', autocomplete: control.getAttribute('autocomplete') || '' },
       fields: Array.from(formProperty(form, 'elements'), field => ({
         name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || ''
       }))
@@ -95,6 +97,82 @@ async function attachFrameSession(frame: Frame): Promise<{ session: CDPSession; 
       // In-process frames belong to their nearest independently targeted ancestor.
       owner = parent;
     }
+  }
+}
+
+/** The value is a protocol argument, never executable source or a Playwright call-log argument.
+ * Node, document, origin and form validation and the native setter run atomically in the isolated world.
+ * Ambient focus is irrelevant: another frame cannot redirect this write.
+ */
+export async function fillNativeAuthenticationField(
+  frame: Frame,
+  field: NativeAuthenticationBinding,
+  submit: NativeAuthenticationBinding,
+  value: string,
+  assertActive: () => Promise<void>,
+): Promise<boolean> {
+  if (
+    field.frameId !== submit.frameId ||
+    field.loaderId !== submit.loaderId ||
+    field.formBackendNodeId !== submit.formBackendNodeId ||
+    field.facts.origin !== submit.facts.origin
+  )
+    return false;
+  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  try {
+    attached = await attachFrameSession(frame);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Renderer errors refuse the write without exposing protocol prose.
+  } catch (_error) {
+    return false;
+  }
+  const { session } = attached;
+  const objectGroup = `gws-ea-auth-${randomUUID()}`;
+  try {
+    const { frameTree } = await session.send('Page.getFrameTree');
+    const selected = findFrame(frameTree, field.frameId);
+    if (!selected || selected.frame.loaderId !== field.loaderId) return false;
+    const { executionContextId } = await session.send('Page.createIsolatedWorld', {
+      frameId: field.frameId,
+      worldName,
+    });
+    const objects: string[] = [];
+    for (const backendNodeId of [field.controlBackendNodeId, field.formBackendNodeId, submit.controlBackendNodeId]) {
+      const resolved = await session.send('DOM.resolveNode', { backendNodeId, executionContextId, objectGroup });
+      if (!resolved.object.objectId) return false;
+      objects.push(resolved.object.objectId);
+    }
+    await assertActive();
+    const result = await session.send('Runtime.callFunctionOn', {
+      objectId: objects[0],
+      returnByValue: true,
+      arguments: [
+        { objectId: objects[1] },
+        { objectId: objects[2] },
+        { value: field.facts },
+        { value: submit.facts },
+        { value },
+      ],
+      functionDeclaration: `function (form, submit, expectedField, expectedSubmit, value) {
+        ${readControlSource}
+        if (location.protocol !== 'https:' || location.origin !== expectedField.origin ||
+            !(this instanceof HTMLInputElement) || this.ownerDocument !== document ||
+            form.ownerDocument !== document || submit.ownerDocument !== document ||
+            !this.isConnected || this.matches(':disabled') || this.readOnly ||
+            formFor(this) !== form || formFor(submit) !== form ||
+            JSON.stringify(readControl(this)) !== JSON.stringify(expectedField) ||
+            JSON.stringify(readControl(submit)) !== JSON.stringify(expectedSubmit)) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        descriptor.set.call(this, value);
+        return descriptor.get.call(this) === value;
+      }`,
+    });
+    return !result.exceptionDetails && result.result.value === true;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a sign-in value.
+  } catch (_error) {
+    return false;
+  } finally {
+    await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
+    await session.detach().catch(() => undefined);
   }
 }
 

@@ -56,6 +56,7 @@ jobs:
           test -x "$GWS_EA_BROWSER_TEST_CHROME"
           xvfb-run --auto-servernum pnpm exec vitest run \
             src/modules/gws-ea-browser/authentication-submit.test.ts \
+            src/modules/gws-ea-browser/fill-native.test.ts \
             src/modules/gws-ea-browser/purchase.test.ts \
             src/modules/gws-ea-browser/recipes.test.ts \
             src/modules/gws-ea-browser/resy-signature.test.ts \

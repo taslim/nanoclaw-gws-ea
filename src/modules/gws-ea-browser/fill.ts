@@ -7,6 +7,11 @@ import {
 } from './authentication-signatures.js';
 import { activateControl, classifyActivation, withBrowserJobNavigation } from './commit-classifier.js';
 import {
+  fillNativeAuthenticationField,
+  inspectNativeAuthenticationControl,
+  type NativeAuthenticationBinding,
+} from './authentication-submit.js';
+import {
   browserDiagnosticsUnsafe,
   browserVault,
   BrowserVaultError,
@@ -33,6 +38,7 @@ export interface BoundBrowserSecretField {
   readonly origin: string;
   readonly field: BrowserSecretField;
   readonly authentication: AuthenticationFormSignature;
+  readonly nativeField: NativeAuthenticationBinding;
 }
 export type BrowserSecretFillResult = {
   status:
@@ -84,11 +90,21 @@ export async function bindBrowserSecretField(
     return input.isConnected && submit.isConnected && Boolean(input.form) && input.form === submit.form;
   }, submit.element);
   const authentication = sameForm && (await inspectAuthenticationControl(submit.element));
-  if (!authentication || (await classifyActivation(page, submit.element)) !== 'ordinary')
+  const nativeField = authentication && (await inspectNativeAuthenticationControl(target.element, target.frame));
+  if (
+    !authentication ||
+    !nativeField ||
+    nativeField.facts.control.tag !== 'INPUT' ||
+    authenticationFieldKind(nativeField.facts.control) !== field ||
+    nativeField.frameId !== authentication.native.frameId ||
+    nativeField.loaderId !== authentication.native.loaderId ||
+    nativeField.formBackendNodeId !== authentication.native.formBackendNodeId ||
+    (await classifyActivation(page, submit.element)) !== 'ordinary'
+  )
     throw forbidden(
       'This sign-in flow is unsupported. Take a fresh observation or use another supported sign-in method.',
     );
-  return { page, target, submit, origin: origin.origin, field, authentication };
+  return { page, target, submit, origin: origin.origin, field, authentication, nativeField };
 }
 
 async function originMatches(
@@ -104,20 +120,8 @@ async function originMatches(
     (await binding.submit.element.ownerFrame()) === binding.target.frame,
   );
 }
-async function focused(binding: BoundBrowserSecretField): Promise<boolean> {
-  if ((await fieldKind(binding.target.element)) !== binding.field) return false;
-  return binding.target.element.evaluate((node) => {
-    const e = node as unknown as {
-      isConnected: boolean;
-      disabled: boolean;
-      readOnly: boolean;
-      ownerDocument: { activeElement: unknown };
-    };
-    return e.isConnected && !e.disabled && !e.readOnly && e.ownerDocument.activeElement === node;
-  });
-}
 
-/** No secret is ever passed to an evaluate expression, locator fill, a logger or a response. */
+/** No secret is ever passed to a Playwright evaluate expression, locator fill, logger or response. */
 async function clearValueEverywhere(page: Page, value: string): Promise<boolean> {
   let complete = true;
   for (const frame of page.frames()) {
@@ -160,7 +164,11 @@ export async function fillBoundBrowserSecret(
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
     // A previously bound field/control may have been replaced or changed during an email wait.
     const rebound = await bindBrowserSecretField(page, target, submit, binding.field);
-    if (rebound.authentication.action !== binding.authentication.action) return { status: 'origin_mismatch' };
+    if (
+      JSON.stringify(rebound.nativeField) !== JSON.stringify(binding.nativeField) ||
+      JSON.stringify(rebound.authentication.native) !== JSON.stringify(binding.authentication.native)
+    )
+      return { status: 'origin_mismatch' };
     await context.assertActive();
     assertBrowserSecretDiagnosticsSafe();
     value = await resolve();
@@ -169,23 +177,23 @@ export async function fillBoundBrowserSecret(
     registerPageSecret(page, value);
     await bindPageSecretDocuments(page, value);
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
-    await target.element.focus();
-    if (!(await focused(binding))) throw forbidden('The sign-in field changed focus. Take a fresh observation.');
-    await target.element.evaluate((node) => {
-      (node as unknown as { value: string }).value = '';
-    });
-    await context.assertActive();
-    if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
-    if (!(await focused(binding))) throw forbidden('The sign-in field changed focus. Take a fresh observation.');
-    // Recheck after the final asynchronous liveness check, immediately before native insertion.
-    await context.assertActive();
-    if (!(await originMatches(binding, permitsOrigin)) || !(await focused(binding)))
-      return { status: 'origin_mismatch' };
     assertBrowserSecretDiagnosticsSafe();
-    await page.keyboard.insertText(value);
+    if (
+      !(await fillNativeAuthenticationField(
+        target.frame,
+        rebound.nativeField,
+        rebound.authentication.native,
+        value,
+        async () => {
+          await context.assertActive();
+          assertBrowserSecretDiagnosticsSafe();
+        },
+      ))
+    )
+      return { status: 'origin_mismatch' };
     await context.assertActive();
-    if (!(await focused(binding)) || (await target.element.inputValue()) !== value)
-      throw forbidden('The sign-in field changed focus. Take a fresh observation.');
+    if ((await target.element.inputValue()) !== value)
+      throw forbidden('The sign-in field changed. Take a fresh observation.');
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
     await context.assertActive();
     await activateControl(

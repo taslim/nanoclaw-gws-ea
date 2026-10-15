@@ -90,7 +90,7 @@ it('permits a fresh document and remembers tainted document identities across hi
   expect(await pageHasSecret(page)).toBe(true);
 });
 
-it('emits host site metadata once per private registrable domain, and keeps titles untrusted and redacted', async () => {
+it('emits host site metadata for changed full origins and keeps titles untrusted and redacted', async () => {
   let url = 'https://alice.github.io/login';
   const page = {
     url: () => url,
