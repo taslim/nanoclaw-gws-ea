@@ -113,6 +113,41 @@ it('preserves a sanitized native refusal before commit and uncertainty after a c
   await queue.stop();
 });
 
+it('retries a delegated terminal answer from its durable frame after startup interruption', async () => {
+  let unavailable = true;
+  const delivered: unknown[] = [];
+  let executions = 0;
+  registerBrowserQueuedAction('queue_terminal_answer_fixture', {
+    validate: () => ({}),
+    async execute() {
+      executions++;
+      return { status: 'completed' };
+    },
+    async deliverAnswer(_request, frame) {
+      delivered.push(frame);
+      if (unavailable) throw new Error('The main mailbox is unavailable');
+    },
+  });
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Expected browser job');
+  await store.accept(job, session, 'terminal-recovery', 'queue_terminal_answer_fixture', {}, 90_000);
+  const queue = new BrowserQueue(store, runtime);
+  await queue.start();
+  const id = browserRequestId(session.id, 'terminal-recovery');
+  const first = await store.request(id);
+  expect(first).toMatchObject({ answered_at: expect.any(String), delivered_at: null });
+  expect(delivered).not.toEqual([]);
+  expect(delivered[0]).toMatchObject({ id: 'terminal-recovery', data: { reason: 'interrupted' } });
+  expect(responses()).toHaveLength(1);
+  unavailable = false;
+  await queue.retryAnswers();
+  expect(await store.request(id)).toMatchObject({ delivered_at: expect.any(String) });
+  expect(delivered.at(-1)).toEqual(delivered[0]);
+  expect(responses()).toHaveLength(1);
+  expect(executions).toBe(0);
+  await queue.stop();
+});
+
 it('refuses main, external-email, a foreign thread and cancelled browser jobs', async () => {
   const queue = new BrowserQueue(store, runtime);
   for (const id of ['main-q', 'external-q']) {

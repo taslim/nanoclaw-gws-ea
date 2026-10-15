@@ -46,6 +46,8 @@ export interface BrowserExecutionContext {
 export interface BrowserQueuedAction {
   validate(content: Record<string, unknown>): Record<string, unknown>;
   execute(context: BrowserExecutionContext, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /** Host-only deferred callers receive every durable terminal outcome, including recovery and timeout. */
+  deliverAnswer?(request: BrowserRequest, frame: ResponseFrame): Promise<void>;
   budgetMs?: number;
 }
 
@@ -395,7 +397,9 @@ export class BrowserQueue {
     const session = await getSession(request.session_id);
     if (!session) return;
     try {
-      await writeActionResponse(session, request.request_id, JSON.parse(request.answer_json) as ResponseFrame);
+      const frame = JSON.parse(request.answer_json) as ResponseFrame;
+      await writeActionResponse(session, request.request_id, frame);
+      await actions.get(request.action)?.deliverAnswer?.(request, frame);
     } catch (_error) {
       return;
     } // Persisted answer remains eligible for the next mailbox retry.
