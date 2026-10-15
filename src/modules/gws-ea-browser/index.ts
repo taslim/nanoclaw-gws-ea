@@ -11,6 +11,7 @@ import { browserHealth } from './health.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
   browserPurchaseMigration,
+  browserReservationBoundsMigration,
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
@@ -49,6 +50,7 @@ import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './sched
 registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
 registerMigration(browserPurchaseMigration);
+registerMigration(browserReservationBoundsMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);

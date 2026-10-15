@@ -48,7 +48,7 @@ describe('standing reservation guarantee coverage', () => {
     ).toBe(true);
     expect(guaranteeCoversReservation(undefined, facts, bounds)).toBe(false);
     expect(guaranteeCoversReservation({ currency: 'USD', max_total_minor: 10000, revoked_at: null }, facts, {})).toBe(
-      true,
+      false,
     );
   });
   it.each(['hold', 'deposit', 'prepayment', 'trial', 'subscription'] as const)(

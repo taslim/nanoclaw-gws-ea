@@ -20,6 +20,7 @@ vi.mock('../../container-runner.js', () => ({
 }));
 vi.mock('../gws-ea-meetings/calendar-facts.js', () => ({ findPrincipalCalendarConflicts: calendar }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getDeliveryAction } from '../../delivery.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
@@ -172,6 +173,52 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     await load(true);
     expect(await purchase('second')).toMatchObject({ status: 'watch_spent' });
     expect(fixture.submitted()).toBe(1);
+  });
+  it('uses main-recorded bounds for one direct standing-guarantee booking across purchase requests', async () => {
+    await getDb().run('DELETE FROM gws_ea_browser_watches');
+    await getDb().run('DELETE FROM gws_ea_browser_watch_job_claims');
+    fixtureState.policy = [
+      'We have a 24-hour cancellation/no-show policy of $25 per person for guests booking with us.',
+    ];
+    const inventory = fixtureState.inventory as {
+      results: { venues: Array<{ slots: Array<{ payment: Record<string, unknown> }> }> };
+    };
+    inventory.results.venues[0].slots[0].payment.cancellation_fee = 25;
+    fixtureState.details.cancellation = { fee: { amount: 25 }, display: { policy: fixtureState.policy } };
+    await load();
+    const main = (await resolveSystemSession('reservation-main', 'system:reservation-source')).session;
+    const record = getDeliveryAction('reservation_bounds');
+    if (!record) throw new Error('No native reservation bounds action');
+    await record(
+      {
+        action: 'reservation_bounds',
+        requestId: 'direct-bounds',
+        thread: session.thread_id!,
+        venue_id: '25973',
+        party_size: 2,
+        window_start: '2026-10-17T15:00:00.000Z',
+        window_end: '2026-10-17T16:00:00.000Z',
+      },
+      main,
+    );
+    expect(await getDb().get('SELECT job_id FROM gws_ea_browser_reservation_bounds')).toEqual({ job_id: jobId });
+    await getDb().run(
+      'INSERT INTO gws_ea_browser_reservation_guarantees(id,approval_id,principal_user_id,currency,max_total_minor,created_at) VALUES(?,?,?,?,?,?)',
+      'standing',
+      'principal-approved',
+      'principal',
+      'USD',
+      10000,
+      new Date().toISOString(),
+    );
+    expect(await purchase('direct')).toMatchObject({ status: 'booked' });
+    expect(fixture.submitted()).toBe(1);
+    await load(true);
+    await purchase('direct-again');
+    expect(fixture.submitted()).toBe(1);
+    expect(await getDb().all('SELECT kind,state FROM gws_ea_browser_authorities')).toEqual([
+      { kind: 'reservation_guarantee', state: 'committed' },
+    ]);
   });
   it('treats calendar failure as unavailable and never consumes the marker', async () => {
     calendar.mockRejectedValue(new Error('Calendar unavailable'));

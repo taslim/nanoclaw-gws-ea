@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -13,7 +14,7 @@ import {
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
-import { browserDelegateGuard } from './cancel.js';
+import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
 import {
   completePurchaseFacts,
   amountMinor,
@@ -51,16 +52,7 @@ export function guaranteeCoversReservation(
   bounds: PurchaseBounds,
 ): boolean {
   const reservation = facts.reservation;
-  const delegated =
-    bounds.reservation ??
-    (reservation
-      ? {
-          venueId: reservation.venueId,
-          partySize: reservation.partySize,
-          windowStart: reservation.at,
-          windowEnd: reservation.at,
-        }
-      : undefined);
+  const delegated = bounds.reservation;
   if (
     !grant ||
     grant.revoked_at ||
@@ -100,35 +92,118 @@ export async function deriveReservationGuaranteeAuthority(
   bounds: PurchaseBounds,
   store = new PurchaseAuthorityStore(),
 ): Promise<SpendingAuthority | undefined> {
-  const grant = await store.db.get<StandingGuarantee>(
-    'SELECT * FROM gws_ea_browser_reservation_guarantees WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',
-  );
-  if (!guaranteeCoversReservation(grant, facts, bounds) || (await store.unresolved(facts.site)).length || !grant)
-    return undefined;
-  const attemptId = `attempt-${createHash('sha256').update(`${grant.id}\0${attemptKey}`).digest('hex')}`;
-  const id = `guarantee-${createHash('sha256').update(`${grant.id}\0${attemptId}`).digest('hex')}`;
-  const existing = await store.get(id);
-  if (existing) return existing.state === 'live' ? existing : undefined;
-  const exactBounds: PurchaseBounds = bounds.reservation
-    ? bounds
-    : {
-        ...bounds,
-        reservation: {
-          venueId: facts.reservation!.venueId,
-          partySize: facts.reservation!.partySize,
-          windowStart: facts.reservation!.at,
-          windowEnd: facts.reservation!.at,
-        },
-      };
-  return store.create({
-    id,
+  return store.db.transaction(async () => {
+    // Once this errand asks for checkout approval, a standing grant cannot replace that decision.
+    if (await store.db.get('SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? LIMIT 1', jobId))
+      return undefined;
+    const reservation = await readDelegatedReservationBounds(jobId, store.db);
+    const delegatedBounds = { ...bounds, reservation };
+    const grant = await store.db.get<StandingGuarantee>(
+      'SELECT * FROM gws_ea_browser_reservation_guarantees WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',
+    );
+    if (
+      !guaranteeCoversReservation(grant, facts, delegatedBounds) ||
+      (await store.unresolved(facts.site)).length ||
+      !grant
+    )
+      return undefined;
+    const prior = await store.db.all<SpendingAuthority>(
+      "SELECT * FROM gws_ea_browser_authorities WHERE job_id = ? AND kind = 'reservation_guarantee' ORDER BY created_at",
+      jobId,
+    );
+    if (
+      prior.some(
+        (authority) => authority.commit_started_at || ['committing', 'committed', 'unknown'].includes(authority.state),
+      )
+    )
+      return undefined;
+    const live = prior.find((authority) => authority.state === 'live' && authority.guarantee_id === grant.id);
+    if (live) return live;
+    const attemptId = `attempt-${createHash('sha256').update(`${grant.id}\0${jobId}\0${attemptKey}`).digest('hex')}`;
+    const id = `guarantee-${createHash('sha256').update(`${grant.id}\0${attemptId}`).digest('hex')}`;
+    if (await store.get(id)) return undefined;
+    return store.create({
+      id,
+      jobId,
+      kind: 'reservation_guarantee',
+      facts,
+      bounds: delegatedBounds,
+      attemptId,
+      guaranteeId: grant.id,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+  });
+}
+
+export async function readDelegatedReservationBounds(
+  jobId: string,
+  db: DbDriver = getDb(),
+): Promise<PurchaseBounds['reservation']> {
+  const row = await db.get<{ bounds_json: string }>(
+    'SELECT bounds_json FROM gws_ea_browser_reservation_bounds WHERE job_id = ?',
     jobId,
-    kind: 'reservation_guarantee',
-    facts,
-    bounds: exactBounds,
-    attemptId,
-    guaranteeId: grant.id,
-    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  );
+  return row ? (JSON.parse(row.bounds_json) as NonNullable<PurchaseBounds['reservation']>) : undefined;
+}
+
+/** Main records the principal's errand scope; this grants no financial authority by itself. */
+async function reservationBoundsRequest(
+  content: Record<string, unknown>,
+  session: Session,
+): Promise<Record<string, unknown>> {
+  if (session.agent_group_id !== (await getMainAgentGroupId()))
+    throw forbidden('Only main may record reservation bounds.');
+  if (
+    Object.keys(content).some(
+      (key) => !['action', 'requestId', 'thread', 'venue_id', 'party_size', 'window_start', 'window_end'].includes(key),
+    )
+  )
+    throw invalidArgs('Unknown reservation_bounds field.');
+  if (
+    typeof content.thread !== 'string' ||
+    typeof content.venue_id !== 'string' ||
+    !content.venue_id.trim() ||
+    content.venue_id.length > 256 ||
+    !Number.isSafeInteger(content.party_size) ||
+    Number(content.party_size) < 1
+  )
+    throw invalidArgs('Reservation bounds require a job thread, venue_id and positive party_size.');
+  const stamp = (value: unknown): string => {
+    if (
+      typeof value !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value) ||
+      !Number.isFinite(Date.parse(value))
+    )
+      throw invalidArgs('Reservation bounds require ISO timestamps with an explicit timezone.');
+    return new Date(value).toISOString();
+  };
+  const bounds = {
+    venueId: content.venue_id.trim(),
+    partySize: Number(content.party_size),
+    windowStart: stamp(content.window_start),
+    windowEnd: stamp(content.window_end),
+  };
+  if (bounds.windowEnd <= bounds.windowStart) throw invalidArgs('The reservation window must end after it starts.');
+  return getDb().transaction(async () => {
+    const job = await resolveBrowserJob(content.thread as string);
+    if (!job || job.cancelled) throw forbidden('No live main-owned browser job exists for that thread.');
+    const encoded = JSON.stringify(bounds);
+    const existing = await readDelegatedReservationBounds(job.id);
+    if (existing && JSON.stringify(existing) === encoded)
+      return { status: 'recorded', thread: job.thread_id, bounds: existing };
+    const authority = await getDb().get(
+      "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND kind = 'reservation_guarantee' AND (state <> 'revoked' OR commit_started_at IS NOT NULL) LIMIT 1",
+      job.id,
+    );
+    if (authority)
+      throw forbidden('This errand already has reservation authority. Open a new errand for different bounds.');
+    await getDb().run(
+      'INSERT INTO gws_ea_browser_reservation_bounds(job_id,bounds_json,created_at) VALUES(?,?,?) ON CONFLICT(job_id) DO UPDATE SET bounds_json=excluded.bounds_json',
+      job.id,
+      encoded,
+      new Date().toISOString(),
+    );
+    return { status: 'recorded', thread: job.thread_id, bounds };
   });
 }
 const guaranteeGuard = defineGuardedAction({
@@ -338,6 +413,11 @@ export async function reservationGuaranteeRequest(
   return { status: approvalId ? 'awaiting_principal' : 'refused' };
 }
 export function registerReservationGuaranteeDelivery(): void {
+  registerDeliveryAction(
+    'reservation_bounds',
+    answeringAction('reservation_bounds', reservationBoundsRequest),
+    answeredGuard(browserDelegateGuard),
+  );
   registerDeliveryAction(
     'reservation_guarantee',
     answeringAction('reservation_guarantee', reservationGuaranteeRequest),

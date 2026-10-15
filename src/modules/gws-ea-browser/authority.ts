@@ -159,11 +159,29 @@ export class PurchaseAuthorityStore {
             throw new PurchaseAuthorityError('authority_unavailable');
         }
       } else {
-        const grant = await this.db.get<{ revoked_at: string | null }>(
-          'SELECT revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
+        const { guaranteeCoversReservation, readDelegatedReservationBounds } =
+          await import('./reservation-guarantee.js');
+        const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
+          'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
           input.guaranteeId,
         );
-        if (!grant || grant.revoked_at) throw new PurchaseAuthorityError('authority_unavailable');
+        const reservation = await readDelegatedReservationBounds(input.jobId, this.db);
+        const checkout = await this.db.get(
+          'SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? LIMIT 1',
+          input.jobId,
+        );
+        const prior = await this.db.get(
+          "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND kind = 'reservation_guarantee' AND (state <> 'revoked' OR commit_started_at IS NOT NULL) LIMIT 1",
+          input.jobId,
+        );
+        if (
+          prior ||
+          checkout ||
+          !reservation ||
+          JSON.stringify(input.bounds.reservation) !== JSON.stringify(reservation) ||
+          !guaranteeCoversReservation(grant, input.facts, { ...input.bounds, reservation })
+        )
+          throw new PurchaseAuthorityError('authority_unavailable');
       }
       const at = new Date().toISOString();
       if (input.expiresAt <= at) throw new PurchaseAuthorityError('expired');
@@ -219,11 +237,20 @@ export class PurchaseAuthorityStore {
       if (!completePurchaseFacts(current))
         throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
       if (authority.guarantee_id) {
-        const grant = await this.db.get<{ revoked_at: string | null }>(
-          'SELECT revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
+        const { guaranteeCoversReservation, readDelegatedReservationBounds } =
+          await import('./reservation-guarantee.js');
+        const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
+          'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
           authority.guarantee_id,
         );
-        if (!grant || grant.revoked_at) throw new PurchaseAuthorityError('authority_unavailable');
+        const reservation = await readDelegatedReservationBounds(context.job.id, this.db);
+        const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
+        if (
+          !reservation ||
+          JSON.stringify(bounds.reservation) !== JSON.stringify(reservation) ||
+          !guaranteeCoversReservation(grant, current, { ...bounds, reservation })
+        )
+          throw new PurchaseAuthorityError('authority_unavailable');
       }
       const unresolved = await this.unresolved(current.site);
       const exceptions = JSON.parse(authority.exception_ids_json) as string[];

@@ -1,5 +1,20 @@
 import type { ModuleMigrationName, PortableMigration } from '../../db/migrations/index.js';
 
+/** Main's delegated reservation limits are independent of facts supplied by a page or browser job. */
+export const browserReservationBoundsMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:reservation-bounds',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_reservation_bounds (
+        job_id TEXT PRIMARY KEY REFERENCES gws_ea_browser_jobs(id),
+        bounds_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+  },
+};
+
 /** Watch grants and the one booking claim outlive queues and browser processes. */
 export const browserWatchesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,

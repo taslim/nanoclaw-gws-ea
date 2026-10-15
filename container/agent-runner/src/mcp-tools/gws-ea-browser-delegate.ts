@@ -66,4 +66,26 @@ export const reservationGuarantee = requestTool({
   repeatable: false,
   timeoutMs: 120_000,
 });
-registerTools([cancelJob, relayCode, reservationGuarantee], 'browser-delegate');
+export const reservationBounds = requestTool({
+  name: 'reservation_bounds',
+  description:
+    'Record the principal’s delegated venue, party size and time window for one direct reservation errand. Use the exact browser thread before asking it to commit under an existing standing guarantee. The browser cannot set or widen these bounds. This tool grants no financial permission; absent bounds require the usual principal purchase approval. One errand can use a standing guarantee for at most one booking. Repeating identical bounds is safe; changed bounds need a new errand after authority exists.',
+  properties: {
+    thread: THREAD,
+    venue_id: { type: 'string', minLength: 1, maxLength: 256 },
+    party_size: { type: 'integer', minimum: 1 },
+    window_start: {
+      type: 'string',
+      description: 'Earliest delegated reservation start as an ISO timestamp with timezone.',
+    },
+    window_end: {
+      type: 'string',
+      description: 'Latest delegated reservation start as an ISO timestamp with timezone.',
+    },
+  },
+  required: ['thread', 'venue_id', 'party_size', 'window_start', 'window_end'],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: 120_000,
+});
+registerTools([cancelJob, relayCode, reservationGuarantee, reservationBounds], 'browser-delegate');

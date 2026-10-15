@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it } from 'bun:test';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import Ajv from 'ajv';
-import { cancelJob, relayCode, reservationGuarantee } from './gws-ea-browser-delegate.js';
+import { cancelJob, relayCode, reservationGuarantee, reservationBounds } from './gws-ea-browser-delegate.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -74,6 +74,37 @@ it('keeps reservation guarantees main-only at the host and exposes a closed expl
     { operation: 'propose', currency: 'USD', max_total: '100.00', approved: true },
   ])
     expect(validate(fields)).toBe(false);
+});
+
+it('records delegated reservation bounds through the native host request with no model approval field', async () => {
+  const fields = {
+    thread: 'system:a2a:main:dinner',
+    venue_id: '25973',
+    party_size: 2,
+    window_start: '2030-10-17T18:00:00.000Z',
+    window_end: '2030-10-17T21:00:00.000Z',
+  };
+  const validate = new Ajv().compile(reservationBounds.tool.inputSchema);
+  expect(validate(fields)).toBe(true);
+  expect(validate({ ...fields, party_size: 0 })).toBe(false);
+  expect(validate({ ...fields, approved: true })).toBe(false);
+  const waiting = reservationBounds.handler(fields);
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'reservation_bounds', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'recorded' } },
+      }),
+    );
+  expect((await waiting).isError).not.toBe(true);
 });
 
 it('sends only the explicit guarantee proposal fields through the native request and reports its principal hold', async () => {
