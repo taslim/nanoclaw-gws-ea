@@ -1,11 +1,12 @@
 /** Approve handler for a held a2a message. (Reject is handled by the generic response-handler path.) */
+import { OutboundRefusedError } from '../../delivery.js';
 import { GuardDenyError } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { ApprovalHandler } from '../approvals/index.js';
 import { routeAgentMessage, type RoutableAgentMessage } from './agent-route.js';
 
 export const applyA2aMessageGate: ApprovalHandler = async ({ session, payload, approval, notify }) => {
-  const { id, platform_id, content, in_reply_to } = payload;
+  const { id, platform_id, content, in_reply_to, thread_id } = payload;
   if (typeof platform_id !== 'string' || !platform_id) {
     await notify('Message approved but the target agent group was missing from the request.');
     log.warn('a2a_message_gate apply: missing target', { sessionId: session.id });
@@ -17,6 +18,7 @@ export const applyA2aMessageGate: ApprovalHandler = async ({ session, payload, a
     platform_id,
     content: typeof content === 'string' ? content : '',
     in_reply_to: typeof in_reply_to === 'string' ? in_reply_to : null,
+    thread_id: typeof thread_id === 'string' ? thread_id : null,
   };
 
   // One replay semantics: re-enter the guarded route carrying the approval
@@ -28,7 +30,7 @@ export const applyA2aMessageGate: ApprovalHandler = async ({ session, payload, a
   try {
     await routeAgentMessage(msg, session, { grant: approval });
   } catch (err) {
-    if (err instanceof GuardDenyError) {
+    if (err instanceof GuardDenyError || err instanceof OutboundRefusedError) {
       log.warn('Approved a2a replay refused by the guard', {
         from: session.agent_group_id,
         to: platform_id,

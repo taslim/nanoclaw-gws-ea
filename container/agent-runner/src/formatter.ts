@@ -209,6 +209,8 @@ export interface RoutingContext {
    * them, so the host can tell whose they were; absent is none.
    */
   batch?: readonly string[];
+  /** One unambiguous thread per A2A peer in this batch; null means ambiguous. */
+  agentThreads?: Readonly<Record<string, string | null>>;
 }
 
 /** The messages a turn over `messages` answers: all but other conversations' echoes. */
@@ -235,7 +237,15 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // at least one task row and no non-task/non-echo row.
   const tasksOnly =
     messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m));
+  const agentThreads: Record<string, string | null> = {};
+  for (const message of nonEcho) {
+    if (message.channel_type !== 'agent' || !message.platform_id) continue;
+    const peer = message.platform_id;
+    const thread = message.thread_id;
+    agentThreads[peer] = !(peer in agentThreads) ? thread : agentThreads[peer] === thread ? thread : null;
+  }
   return {
+    agentThreads,
     platformId: first?.platform_id ?? null,
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
@@ -318,8 +328,9 @@ function formatSingleChat(msg: MessageInRow): string {
   const appContextSuffix = formatAppContext(content.app_context);
 
   const fromAttr = originAttr(msg);
+  const threadAttr = msg.channel_type === 'agent' && msg.thread_id ? ` thread="${escapeXml(msg.thread_id)}"` : '';
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
 }
 
 /** content.reaction, as the host's chat-sdk bridge writes it on a reaction's row. */

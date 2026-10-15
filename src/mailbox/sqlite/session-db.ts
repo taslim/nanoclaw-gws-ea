@@ -64,16 +64,21 @@ export interface DestinationRow {
   channel_type: string | null;
   platform_id: string | null;
   agent_group_id: string | null;
+  session_mode?: 'agent-shared' | 'per-thread';
 }
 
 export function replaceDestinations(db: Database.Database, entries: DestinationRow[]): void {
+  const columns = db.prepare("PRAGMA table_info('destinations')").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === 'session_mode')) {
+    db.exec("ALTER TABLE destinations ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'agent-shared'");
+  }
   const tx = db.transaction((rows: DestinationRow[]) => {
     db.prepare('DELETE FROM destinations').run();
     const stmt = db.prepare(
-      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id)`,
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id, session_mode)
+       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id, @session_mode)`,
     );
-    for (const row of rows) stmt.run(row);
+    for (const row of rows) stmt.run({ ...row, session_mode: row.session_mode ?? 'agent-shared' });
   });
   tx(entries);
 }

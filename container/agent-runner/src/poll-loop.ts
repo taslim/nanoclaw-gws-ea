@@ -388,6 +388,8 @@ export async function processQuery(
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
+  let threadBlockNudged = false;
+  let refusedThreadBlocks: string[] = [];
   // How many <message> blocks were delivered from 'text' events this turn
   // (chat runs, mid-turn delivery providers only). A frame-local count, never
   // keyed by content: it feeds the result door's nudge decision ("did this
@@ -434,6 +436,7 @@ export async function processQuery(
     routing: RoutingContext;
     unwrappedNudged: boolean;
     taskBlockNudged: boolean;
+    threadBlockNudged: boolean;
   };
   const queuedTurns: QueuedTurn[] = [];
   // A person waiting in a live chat is reminded of after a while if nothing has gone out (acknowledge.ts).
@@ -442,9 +445,10 @@ export async function processQuery(
     else stopWaiting();
   };
   const adoptTurn = (next: QueuedTurn): void => {
-    Object.assign(routing, next.routing);
+    Object.assign(routing, next.routing, { agentThreads: next.routing.agentThreads });
     unwrappedNudged = next.unwrappedNudged;
     taskBlockNudged = next.taskBlockNudged;
+    threadBlockNudged = next.threadBlockNudged;
     publishReplyRoute(routing);
     answering = true;
     awaitAnswer();
@@ -454,7 +458,7 @@ export async function processQuery(
   // Preserve its original route, prompt and retry guards until it is answered.
   const pushRetry = (prompt: string): void => {
     query.push(prompt);
-    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged });
+    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged, threadBlockNudged });
     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
   };
 
@@ -550,6 +554,7 @@ export async function processQuery(
           routing: extractRouting(keep),
           unwrappedNudged: false,
           taskBlockNudged: false,
+          threadBlockNudged: false,
         };
         if (answering) queuedTurns.push(next);
         else adoptTurn(next);
@@ -612,6 +617,7 @@ export async function processQuery(
           const scan = await deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
+          refusedThreadBlocks.push(...scan.refusedThreadBlocks);
         }
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
@@ -623,8 +629,12 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
-        if (resultText || failed) {
-          const { hasUnwrapped, taskBlocks } = await dispatchResultText(resultText, routing, {
+        if (resultText || failed || refusedThreadBlocks.length > 0) {
+          const {
+            hasUnwrapped,
+            taskBlocks,
+            refusedThreadBlocks: resultRefusals,
+          } = await dispatchResultText(resultText, routing, {
             midTurnSent,
             // For mid-turn delivery providers the result door NEVER delivers
             // content: mid-turn streaming is
@@ -642,6 +652,8 @@ export async function processQuery(
           });
           // Completed partial output remains deliverable, but an explicit
           // provider failure must keep its status and never trigger a retry.
+          refusedThreadBlocks.push(...resultRefusals);
+          const willRetryThreadBlocks = !failed && !threadBlockNudged && refusedThreadBlocks.length > 0;
           const willRetryTaskBlocks = !failed && shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
           // while explicit append-log calls remain optional additive notes.
@@ -664,12 +676,16 @@ export async function processQuery(
           // was delivered this turn — hasUnwrapped already folds in the
           // turn's mid-turn sent count. If a reply already went out as a
           // mid-turn block, the unwrapped tail stays in the scratchpad log.
-          const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged;
+          const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged && !willRetryThreadBlocks;
           notifyExchangeComplete(onExchangeComplete, {
             prompt: archivePrompts[0] ?? initialPrompt,
             result: archivedResult,
             continuation: queryContinuation ?? initialContinuation,
-            status: failed ? 'error' : hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+            status: failed
+              ? 'error'
+              : hasUnwrapped || willRetryTaskBlocks || willRetryThreadBlocks
+                ? 'undelivered'
+                : 'completed',
           });
           if (willRetryWrapping) {
             unwrappedNudged = true;
@@ -679,6 +695,13 @@ export async function processQuery(
               `<system>Your response was not delivered — nothing this turn was inside a <message to="name">...</message> block. ` +
                 `Please re-send your reply in one: every reply must be wrapped, and text outside a block, including <internal> scratchpad, is not delivered. ` +
                 `Your destinations: ${names}.</system>`,
+            );
+          }
+          if (willRetryThreadBlocks) {
+            threadBlockNudged = true;
+            const names = [...new Set(refusedThreadBlocks)].join(', ');
+            pushRetry(
+              `<system>Your message blocks to ${names} were not delivered because this batch has no unambiguous thread for that destination. Use send_message with an explicit thread: "new" for a separate errand, or the existing thread for a follow-up. Re-send only the refused blocks; other delivered messages already arrived.</system>`,
             );
           }
           if (willRetryTaskBlocks) {
@@ -704,6 +727,7 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        refusedThreadBlocks = [];
         stopWaiting();
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
@@ -933,6 +957,7 @@ const INTERNAL_SPAN_RE = /<internal\b[\s\S]*?<\/internal>/gi;
 export interface MidTurnScanResult {
   delivered: number;
   tail: string;
+  refusedThreadBlocks: string[];
 }
 
 export async function deliverMidTurnBlocks(
@@ -941,7 +966,7 @@ export async function deliverMidTurnBlocks(
   turnStartSeq?: number,
   carry = '',
 ): Promise<MidTurnScanResult> {
-  if (routing.taskRun) return { delivered: 0, tail: '' };
+  if (routing.taskRun) return { delivered: 0, tail: '', refusedThreadBlocks: [] };
   const input = carry + text;
   const tailStart = unresolvedTailStart(input);
   const settled = input.slice(0, tailStart);
@@ -959,6 +984,7 @@ export async function deliverMidTurnBlocks(
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
   let match: RegExpExecArray | null;
   let delivered = 0;
+  const refusedThreadBlocks: string[] = [];
   while ((match = MESSAGE_RE.exec(visible)) !== null) {
     const toName = match[1];
     const rawBody = match[2];
@@ -984,11 +1010,14 @@ export async function deliverMidTurnBlocks(
       log(`Mid-turn <message to="${toName}"> is a verbatim repeat of a message already sent this turn — skipped`);
       continue;
     }
-    await sendToDestination(dest, body, routing);
+    if (!(await sendToDestination(dest, body, routing))) {
+      refusedThreadBlocks.push(toName);
+      continue;
+    }
     delivered++;
     log(`Mid-turn delivery: <message to="${toName}"> (${body.length} chars)`);
   }
-  return { delivered, tail };
+  return { delivered, tail, refusedThreadBlocks };
 }
 
 const OPEN_INTERNAL_RE = /<internal\b/i;
@@ -1118,7 +1147,7 @@ export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
   options?: ResultDispatchOptions,
-): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
+): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[]; refusedThreadBlocks: string[] }> {
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1136,6 +1165,7 @@ export async function dispatchResultText(
   // <message to> blocks left inert in a task run — drives the same-turn
   // "use send_message" nudge in processQuery.
   const taskBlocks: TaskMessageBlock[] = [];
+  const refusedThreadBlocks: string[] = [];
   // A <message> block that did not go out, as opposed to prose outside any
   // block: only this asks a turn of only tasks for a re-send.
   let blockUndelivered = false;
@@ -1185,6 +1215,12 @@ export async function dispatchResultText(
     // then it goes to the scratchpad as undelivered content, which makes the
     // turn count as undelivered and fires the wrap-nudge: the model re-sends
     // and the retry streams through the mid-turn door.
+    if (dest.type === 'agent' && dest.sessionMode === 'per-thread' && !routing.agentThreads?.[dest.agentGroupId!]) {
+      refusedThreadBlocks.push(toName);
+      scratchpadParts.push(`[not delivered — explicit thread required; to="${toName}"] ${body}`);
+      blockUndelivered = true;
+      continue;
+    }
     if (options?.suppressDelivery) {
       if (options.turnDelivered) {
         log(`<message to="${toName}"> in final result after a same-turn delivery — repeat, result door does not send`);
@@ -1197,7 +1233,11 @@ export async function dispatchResultText(
       }
       continue;
     }
-    await sendToDestination(dest, body, routing);
+    if (!(await sendToDestination(dest, body, routing))) {
+      refusedThreadBlocks.push(toName);
+      blockUndelivered = true;
+      continue;
+    }
     sent++;
   }
   if (lastIndex < text.length) {
@@ -1224,7 +1264,7 @@ export async function dispatchResultText(
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped, taskBlocks };
+  return { sent, hasUnwrapped, taskBlocks, refusedThreadBlocks };
 }
 
 /**
@@ -1285,7 +1325,7 @@ export async function autoAppendTaskLog(text: string): Promise<void> {
   log('Task run log auto-appended from final text');
 }
 
-async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
+async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<boolean> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Thread per destination: the batch's own thread when the destination is the
@@ -1293,7 +1333,18 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // agent-shared sessions different destinations have different thread
   // contexts — stamping routing.threadId on every send would put one channel's
   // thread onto another.
-  const destRouting = resolveDestinationThread(channelType, platformId, routing);
+  const thread = routing.agentThreads?.[platformId];
+  if (dest.type === 'agent' && dest.sessionMode === 'per-thread' && !thread) {
+    log(`A2A block to "${dest.name}" refused — use send_message with an explicit thread`);
+    return false;
+  }
+  const destRouting =
+    dest.type === 'agent' && dest.sessionMode === 'per-thread'
+      ? {
+          threadId: thread!,
+          inReplyTo: routing.channelType === 'agent' && routing.platformId === platformId ? routing.inReplyTo : null,
+        }
+      : resolveDestinationThread(channelType, platformId, routing);
   await writeMessageOut({
     id: generateId(),
     in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
@@ -1304,6 +1355,7 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     content: JSON.stringify({ text: body }),
     batch: routing.batch,
   });
+  return true;
 }
 
 /** Publish `routing` as the reply stamp the MCP tools read, with its batch (null route clears it). */

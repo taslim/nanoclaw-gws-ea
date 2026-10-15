@@ -121,6 +121,43 @@ describe('destinations CLI custom ops project to inbound.db (#2465)', () => {
     }
   });
 
+  it('stores, lists and projects a per-thread destination', async () => {
+    const added = await dispatch(
+      {
+        id: 'req-thread-add',
+        command: 'destinations-add',
+        args: {
+          agent_group_id: SOURCE,
+          local_name: 'browser',
+          target_type: 'agent',
+          target_id: TARGET,
+          session_mode: 'per-thread',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    const listed = await dispatch(
+      { id: 'req-thread-list', command: 'destinations-list', args: { agent_group_id: SOURCE } },
+      { caller: 'host' },
+    );
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) throw new Error(listed.error.message);
+    expect(listed.data).toEqual(
+      expect.arrayContaining([expect.objectContaining({ local_name: 'browser', session_mode: 'per-thread' })]),
+    );
+    for (const sessionId of [SESSION_A, SESSION_B]) {
+      const db = new Database(inboundDbPath(SOURCE, sessionId), { readonly: true });
+      try {
+        expect(db.prepare("SELECT session_mode FROM destinations WHERE name = 'browser'").get()).toEqual({
+          session_mode: 'per-thread',
+        });
+      } finally {
+        db.close();
+      }
+    }
+  });
+
   it('remove: clears the destination from every active session inbound.db', async () => {
     await dispatch(
       {

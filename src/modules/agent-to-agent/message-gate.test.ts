@@ -9,7 +9,13 @@ import { getMessagePolicy, removeMessagePolicy, setMessagePolicy } from './db/ag
 import { applyA2aMessageGate } from './message-gate.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { getDb } from '../../db/connection.js';
-import { createPendingApproval, createSession, deletePendingApproval, getPendingApproval } from '../../db/sessions.js';
+import {
+  createPendingApproval,
+  createSession,
+  deletePendingApproval,
+  getPendingApproval,
+  getSessionsByAgentGroup,
+} from '../../db/sessions.js';
 import { requestApproval } from '../approvals/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -219,6 +225,31 @@ describe('agent message policies', () => {
   });
 
   // ── approve handler re-enters the guarded route with the grant ──
+
+  it('carries an approved per-thread message into its own session and keeps its thread in the hold', async () => {
+    await getDb().run(
+      "UPDATE agent_destinations SET session_mode = 'per-thread' WHERE agent_group_id = ? AND target_id = ?",
+      A,
+      B,
+    );
+    await setMessagePolicy(A, B, 'telegram:dana', now());
+    const payload = {
+      id: 'held-thread',
+      platform_id: B,
+      content: JSON.stringify({ text: 'approved errand' }),
+      in_reply_to: null,
+      thread_id: 'new',
+    };
+    await routeAgentMessage(payload, SA);
+    expect(vi.mocked(requestApproval).mock.calls[0][0].payload).toEqual(payload);
+    const approval = await seedA2aHold('appr-thread', payload);
+    const notify = vi.fn();
+    await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
+    const threaded = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:held-thread`)!;
+    expect(threaded).toBeDefined();
+    expect(readInbound(B, threaded.id)).toHaveLength(1);
+    expect(readInbound(B, SB.id)).toHaveLength(0);
+  });
 
   it('applyA2aMessageGate delivers the held message to the target (valid grant)', async () => {
     await setMessagePolicy(A, B, 'telegram:dana', now());

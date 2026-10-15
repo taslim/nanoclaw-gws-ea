@@ -8,6 +8,7 @@
  * the host side in delivery.ts via the agent_destinations table.
  */
 import fs from 'fs';
+import { loadConfig } from '../config.js';
 import path from 'path';
 
 import { findByName, getAllDestinations } from '../destinations.js';
@@ -42,6 +43,11 @@ function outboxFilename(requested: string | undefined, sourcePath: string): stri
   return name && name !== '.' && name !== '..' ? name : path.basename(sourcePath);
 }
 
+function threadReceipt(thread: string | null, id: string): string {
+  if (!thread) return '';
+  return ` (thread: ${thread === 'new' ? `system:a2a:${loadConfig().agentGroupId}:${id}` : thread})`;
+}
+
 function destinationList(): string {
   const all = getAllDestinations();
   if (all.length === 0) return '(none)';
@@ -54,10 +60,12 @@ function destinationList(): string {
  * A channel destination is threaded like the poll loop's explicit deliveries:
  * the thread of the message being answered (the published reply stamp) when it
  * came from that channel, else that channel's latest inbound thread. An agent
- * destination never carries a thread.
+ * destination carries an explicit errand thread, or the return thread of
+ * the message being answered for an agent-shared destination.
  */
 function resolveRouting(
   to: string,
+  thread: unknown,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   const dest = findByName(to);
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
@@ -70,7 +78,20 @@ function resolveRouting(
       resolvedName: to,
     };
   }
-  return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
+  if (dest.sessionMode === 'per-thread' && (typeof thread !== 'string' || !thread.trim())) {
+    return {
+      error: `Destination "${to}" requires thread: "new" for a new errand, or its existing thread for a follow-up.`,
+    };
+  }
+  const replyRoute = getCurrentReplyRoute();
+  const replyThread =
+    replyRoute?.channelType === 'agent' && replyRoute.platformId === dest.agentGroupId ? replyRoute.threadId : null;
+  return {
+    channel_type: 'agent',
+    platform_id: dest.agentGroupId!,
+    thread_id: typeof thread === 'string' ? thread : replyThread,
+    resolvedName: to,
+  };
 }
 
 export const sendMessage: McpToolDefinition = {
@@ -85,6 +106,11 @@ export const sendMessage: McpToolDefinition = {
           description: 'Destination name (e.g., "family", "worker-1").',
         },
         text: { type: 'string', description: 'Message content' },
+        thread: {
+          type: 'string',
+          description:
+            '"new" to start an errand, or the returned thread for a follow-up. Required for per-thread destinations.',
+        },
       },
       required: ['to', 'text'],
     },
@@ -95,7 +121,7 @@ export const sendMessage: McpToolDefinition = {
     if (!to) return err(`to is required. Options: ${destinationList()}`);
     if (!text) return err('text is required');
 
-    const routing = resolveRouting(to);
+    const routing = resolveRouting(to, args.thread);
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
@@ -110,7 +136,7 @@ export const sendMessage: McpToolDefinition = {
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
-    return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
+    return ok(`Message sent to ${routing.resolvedName} (id: ${seq})${threadReceipt(routing.thread_id, id)}`);
   },
 };
 
@@ -125,6 +151,10 @@ export const sendFile: McpToolDefinition = {
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
+        thread: {
+          type: 'string',
+          description: '"new" to start an errand, or its existing thread. Required for per-thread destinations.',
+        },
       },
       required: ['to', 'path'],
     },
@@ -135,7 +165,7 @@ export const sendFile: McpToolDefinition = {
     if (!to) return err(`to is required. Options: ${destinationList()}`);
     if (!filePath) return err('path is required');
 
-    const routing = resolveRouting(to);
+    const routing = resolveRouting(to, args.thread);
     if ('error' in routing) return err(routing.error);
 
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
@@ -159,7 +189,9 @@ export const sendFile: McpToolDefinition = {
     });
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
-    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
+    return ok(
+      `File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})${threadReceipt(routing.thread_id, id)}`,
+    );
   },
 };
 

@@ -562,3 +562,11 @@ describe('app_context rendering (Slack agent mode, contract C4)', () => {
     expect(result).toContain('(viewing: channel C1&lt;&amp;&gt;)');
   });
 });
+
+it('shows the A2A thread on the received message', () => {
+  const db = getInboundDb();
+  db.prepare(
+    "INSERT INTO messages_in (id, kind, timestamp, status, channel_type, platform_id, thread_id, content) VALUES (?, 'chat', ?, 'pending', 'agent', 'browser-group', ?, ?)",
+  ).run('thread-report', new Date().toISOString(), 'system:a2a:main:errand', JSON.stringify({ text: 'report' }));
+  expect(formatMessages(getPendingMessages())).toContain('thread="system:a2a:main:errand"');
+});
