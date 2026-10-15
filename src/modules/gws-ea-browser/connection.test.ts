@@ -7,10 +7,12 @@ import { afterEach, expect, it, vi } from 'vitest';
 
 import { connectChromePipe } from './connection.js';
 import { browserPaths } from './paths.js';
+import * as authentication from './authentication-submit.js';
 
 afterEach(() => vi.restoreAllMocks());
 
 it('lets a client install listeners after a reply before delivering a coalesced context event', async () => {
+  vi.spyOn(authentication, 'prepareAuthenticationIsolation').mockResolvedValue();
   const inbound = new PassThrough();
   const outbound = new PassThrough();
   const child = Object.assign(new EventEmitter(), {

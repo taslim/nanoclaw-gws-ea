@@ -10,6 +10,7 @@ import {
 import type { BrowserExecutionContext } from './queue.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
+import * as nativeAuthentication from './authentication-submit.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
@@ -17,6 +18,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 function fixture(origin = 'https://www.shop.example') {
   let url = `${origin}/login`;
@@ -117,6 +119,34 @@ function fixture(origin = 'https://www.shop.example') {
     runtime: { closeJob: vi.fn(async () => undefined) },
     job: { id: 'job' },
   } as unknown as BrowserExecutionContext;
+  // These tests double the external renderer boundary. Native node identity,
+  // prototype isolation and submission are exercised in the real Chrome suite.
+  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockImplementation(async () => ({
+    frameId: 'fixture-frame',
+    loaderId: 'fixture-document',
+    controlBackendNodeId: 1,
+    formBackendNodeId: 2,
+    facts: {
+      origin: new URL(url).origin,
+      action: form.action,
+      method: form.method,
+      target: form.target,
+      submit: true,
+      fields: [field, button].map((node) => ({
+        name: node.name,
+        type: node.type,
+        autocomplete: node.getAttribute('autocomplete') ?? '',
+      })),
+    },
+  }));
+  const nativeSubmit = vi.fn(async () => undefined);
+  vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(
+    async (_frame, _binding, assertActive) => {
+      await assertActive?.();
+      await nativeSubmit();
+      return true;
+    },
+  );
   const target = { ref: 'e1', generation: 1, element: handle(field), frame } as unknown as PinnedBrowserRef;
   const submit = { ref: 'e2', generation: 1, element: handle(button), frame } as unknown as PinnedBrowserRef;
   return {
@@ -127,6 +157,7 @@ function fixture(origin = 'https://www.shop.example') {
     submit,
     context,
     nodes,
+    nativeSubmit,
     setUrl: (value: string) => {
       url = value;
     },
@@ -157,7 +188,9 @@ it('inserts only via keyboard, blocks screenshots while active, clears same-page
 
 it('returns submitted after navigation and rechecks complete frame origin before resolving and inserting', async () => {
   const f = fixture();
-  f.field.ownerDocument.defaultView.HTMLFormElement.prototype.submit = f.navigate;
+  f.nativeSubmit.mockImplementation(async () => {
+    f.navigate();
+  });
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
   expect(await fillBoundBrowserSecret(f.context, binding, async () => SECRET)).toEqual({ status: 'submitted' });
   const resolve = vi.fn(async () => SECRET);
