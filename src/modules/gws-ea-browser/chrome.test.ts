@@ -113,6 +113,15 @@ describe('dedicated Chrome profile and launch', () => {
       credentialMode: 'email',
       paths,
     });
+    await writePrivateFile(
+      paths.policyFile,
+      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: ['email'] }),
+    );
+    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
+    await writePrivateFile(
+      paths.policyFile,
+      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }),
+    );
     await chmod(paths.policyFile, 0o644);
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
     expect((await lstat(paths.policyFile)).mode & 0o777).toBe(0o644);

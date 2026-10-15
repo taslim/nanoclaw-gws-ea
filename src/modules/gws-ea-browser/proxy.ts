@@ -14,7 +14,6 @@ export interface PublicBrowserProxy {
 }
 
 interface Destination {
-  host: string;
   port: number;
   address: string;
   family: 4 | 6;
@@ -45,7 +44,7 @@ async function destination(target: URL): Promise<Destination> {
   if (answers.length === 0 || answers.some(({ address }) => !publicAddress(address))) throw new RefusedDestination();
   const selected = answers[0];
   if (selected.family !== 4 && selected.family !== 6) throw new RefusedDestination();
-  return { host, port, address: selected.address, family: selected.family };
+  return { port, address: selected.address, family: selected.family };
 }
 
 function withoutHopHeaders(headers: http.IncomingHttpHeaders): http.OutgoingHttpHeaders {

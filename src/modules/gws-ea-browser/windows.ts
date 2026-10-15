@@ -22,6 +22,13 @@ export class JobWindows {
       release = resolve;
     });
     await prior;
+    let createdTargetId: string | undefined;
+    let setupFailed = false;
+    const closeCreatedTarget = async (): Promise<void> => {
+      if (createdTargetId) {
+        await this.connection.session.send('Target.closeTarget', { targetId: createdTargetId }).catch(() => undefined);
+      }
+    };
     try {
       const existing = this.pages.get(jobId);
       if (existing && !existing.page.isClosed()) {
@@ -56,6 +63,8 @@ export class JobWindows {
         })
         .then(
           (result) => {
+            createdTargetId = result.targetId;
+            if (setupFailed) void closeCreatedTarget();
             resolveTarget(result.targetId);
             return result;
           },
@@ -75,6 +84,10 @@ export class JobWindows {
         if (this.pages.get(jobId)?.page === page) this.pages.delete(jobId);
       });
       return page;
+    } catch (error) {
+      setupFailed = true;
+      await closeCreatedTarget();
+      throw error;
     } finally {
       release();
     }

@@ -43,7 +43,7 @@ export async function readBrowserPolicy(file = browserPolicyFile()): Promise<Bro
       Object.keys(record).some((key) => !['schemaVersion', 'enabled', 'credentialMode', 'chromePath'].includes(key)) ||
       record.schemaVersion !== 1 ||
       typeof record.enabled !== 'boolean' ||
-      !['email', '1password'].includes(String(record.credentialMode)) ||
+      (record.credentialMode !== 'email' && record.credentialMode !== '1password') ||
       (record.chromePath !== undefined &&
         (typeof record.chromePath !== 'string' || !path.isAbsolute(record.chromePath)))
     )
@@ -53,7 +53,7 @@ export async function readBrowserPolicy(file = browserPolicyFile()): Promise<Bro
       status: 'enabled',
       enabled: true,
       paths,
-      credentialMode: record.credentialMode as BrowserPolicyFile['credentialMode'],
+      credentialMode: record.credentialMode,
       chromePath: typeof record.chromePath === 'string' ? record.chromePath : SYSTEM_CHROME,
     };
   } catch (error) {

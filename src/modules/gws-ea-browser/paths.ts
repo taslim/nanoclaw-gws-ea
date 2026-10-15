@@ -38,7 +38,7 @@ export async function ensurePrivateDirectory(directory: string): Promise<void> {
   assertOwner(stat);
   if (!stat.isDirectory() || stat.isSymbolicLink())
     throw new Error('Browser directory is a symlink or not a directory');
-  await chmod(directory, 0o700);
+  if ((stat.mode & 0o7777) !== 0o700) await chmod(directory, 0o700);
 }
 
 async function makeTreePrivate(directory: string, singletonLinks = false): Promise<void> {
@@ -54,8 +54,9 @@ async function makeTreePrivate(directory: string, singletonLinks = false): Promi
       throw new Error('Browser private tree contains a symlink');
     }
     if (stat.isDirectory()) await makeTreePrivate(file);
-    else if (stat.isFile() && stat.nlink === 1) await chmod(file, 0o600);
-    else throw new Error('Browser private tree contains an unsafe file');
+    else if (stat.isFile() && stat.nlink === 1) {
+      if ((stat.mode & 0o7777) !== 0o600) await chmod(file, 0o600);
+    } else throw new Error('Browser private tree contains an unsafe file');
   }
 }
 

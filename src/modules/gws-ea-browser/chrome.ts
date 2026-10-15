@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 
 import {
@@ -117,7 +116,17 @@ export async function stopChrome(child: ChildProcess): Promise<void> {
   if (child.pid === undefined) return;
   const exited = once(child, 'exit').then(() => undefined);
   child.kill('SIGTERM');
-  await Promise.race([exited, delay(3_000)]);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      exited,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 3_000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGKILL');
     await exited;

@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ChromeConnection } from './connection.js';
 import { BROWSER_WINDOW_IDLE_MS, JobWindows } from './windows.js';
 
-function fixture(injectPopup = false) {
+function fixture(injectPopup = false, failSetup = false) {
   const events = new EventEmitter();
   const pages: Page[] = [];
   const targets = new WeakMap<Page, string>();
@@ -26,7 +26,10 @@ function fixture(injectPopup = false) {
         events.on('page', listener);
       }),
     newCDPSession: async (page: Page) => ({
-      send: async () => ({ targetInfo: { targetId: targets.get(page) } }),
+      send: async (method: string) => {
+        if (failSetup && method === 'Page.setInterceptFileChooserDialog') throw new Error('Page setup failed');
+        return { targetInfo: { targetId: targets.get(page) } };
+      },
       detach: async () => undefined,
     }),
   };
@@ -54,6 +57,11 @@ function fixture(injectPopup = false) {
     session: {
       async send(method: string, parameters: unknown) {
         sends.push({ method, parameters });
+        if (method === 'Target.closeTarget') {
+          const target = (parameters as { targetId: string }).targetId;
+          await pages.find((page) => targets.get(page) === target)?.close();
+          return { success: true };
+        }
         const targetId = `target-${pages.length + 1}`;
         if (injectPopup) events.emit('page', createPage('unrelated-popup'));
         const page = createPage(targetId);
@@ -89,6 +97,12 @@ describe('quiet job windows', () => {
     const { windows, pages } = fixture(true);
     expect(await windows.pageForJob('job')).toBe(pages[0]);
     await windows.close();
+  });
+  it('closes its created target if page security setup fails', async () => {
+    const { windows, pages } = fixture(true, true);
+    await expect(windows.pageForJob('job')).rejects.toThrow('Page setup failed');
+    expect(pages[0].isClosed()).toBe(true);
+    expect(windows.size).toBe(0);
   });
   it('has no OS focus, foreground-target, port or trace path in runtime source', async () => {
     const names = await readdir(new URL('.', import.meta.url));
