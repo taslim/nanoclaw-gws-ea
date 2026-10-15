@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-
 export interface FinancialCommitment {
   kind: 'retail' | 'hold' | 'deposit' | 'prepayment' | 'conditional_fee' | 'trial' | 'subscription';
   terms: string;
@@ -44,10 +42,6 @@ export function moneyMinor(value: string): number | undefined {
   const amount = Number(whole) * 100 + Number(fraction);
   return Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
 }
-export function purchaseFingerprint(facts: PurchaseFacts): string {
-  return createHash('sha256').update(JSON.stringify(facts)).digest('hex');
-}
-
 /** Compare material facts, never a byte hash: ordinary retail due-now tracks a falling total. */
 export function materialPurchaseChange(
   approved: PurchaseFacts,

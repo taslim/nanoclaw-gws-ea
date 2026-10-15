@@ -468,8 +468,8 @@ async function executeRelayCode(
       if (!(error instanceof SyntaxError)) throw error;
       original = undefined;
     }
-    if (!original || typeof original !== 'object' || Array.isArray(original)) return result;
-    const request = original as Record<string, unknown>;
+    if (!isRecord(original)) return result;
+    const request = original;
     const relayed = relayCode(request);
     if (
       request.action !== 'relay_code' ||

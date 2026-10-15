@@ -27,7 +27,7 @@ import { SiteLeaseStore } from './leases.js';
 import { BrowserStore } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
 import { readMerchantPurchase, readMerchantPurchaseEvidence, AMAZON_RETAIL } from './merchant-signatures.js';
-import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef, type BrowserRef } from './observe.js';
+import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
 import {
   BrowserQueue,
@@ -80,13 +80,6 @@ function cardPayload(card: PurchaseCard): Record<string, unknown> {
 }
 function stableId(prefix: string, value: string): string {
   return `${prefix}-${createHash('sha256').update(value).digest('hex')}`;
-}
-
-export interface PurchaseRequest {
-  operation: 'commit' | 'reconcile';
-  target: BrowserRef;
-  bounds: PurchaseBounds;
-  attemptId?: string;
 }
 
 function iso(value: unknown): string {

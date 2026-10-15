@@ -74,12 +74,12 @@ export async function claimSignInMail(mail: ParsedMail, at = new Date(), claimId
   if (!(await db.hasTable('gws_ea_browser_sign_in_claims')) || !mail.receivedAt) return false;
   return db.transaction(async () => {
     const claims = await db.all<SignInClaim>(
-      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND expires_at > ? ORDER BY since_at,id',
+      `SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND expires_at > ?${claimId === undefined ? '' : ' AND id = ?'} ORDER BY since_at,id`,
       'assistant',
       at.toISOString(),
+      ...(claimId === undefined ? [] : [claimId]),
     );
     for (const claim of claims) {
-      if (claimId !== undefined && claim.id !== claimId) continue;
       if (mail.receivedAt!.getTime() < Date.parse(claim.since_at) || !dkimAlignedToSite(mail.headers, claim.domain))
         continue;
       if (claim.gmail_message_id !== null) {
