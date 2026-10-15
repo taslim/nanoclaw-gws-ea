@@ -8,12 +8,16 @@ import { log } from '../../log.js';
 import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
-import { browserSiteLeasesMigration } from './migration.js';
+import { browserQueueMigration, browserSiteLeasesMigration } from './migration.js';
+import { BrowserStore } from './db.js';
+import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
+import './executor.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 
 registerMigration(browserSiteLeasesMigration);
+registerMigration(browserQueueMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -97,21 +101,32 @@ export class BrowserRuntime {
     const generation = ++this.generation;
     let connection: ChromeConnection | undefined;
     let child: ReturnType<typeof spawnChrome> | undefined;
+    let startupTimer: NodeJS.Timeout | undefined;
     try {
       await prepareChromeProfile(policy.paths);
       child = spawnChrome({ chromePath: policy.chromePath, paths: policy.paths, proxyUrl: proxy.url });
-      connection = await connectChromePipe(child, policy.paths);
-      const windows = new JobWindows(connection);
-      const probe = await windows.pageForJob('__host_launch_probe__');
-      try {
-        await this.verifyLaunch(probe);
-      } finally {
-        await windows.close();
-      }
-      this.attached = connection;
-      this.windows = new JobWindows(connection);
+      const spawned = child;
+      const attaching = (async () => {
+        connection = await connectChromePipe(spawned, policy.paths);
+        const windows = new JobWindows(connection);
+        const probe = await windows.pageForJob('__host_launch_probe__');
+        try {
+          await this.verifyLaunch(probe);
+        } finally {
+          await windows.close();
+        }
+        return connection;
+      })();
+      const attached = await Promise.race([
+        attaching,
+        new Promise<never>((_resolve, reject) => {
+          startupTimer = setTimeout(() => reject(new BrowserUnavailableError()), 30_000);
+          startupTimer.unref();
+        }),
+      ]);
+      this.attached = attached;
+      this.windows = new JobWindows(attached);
       this.lastFailure = null;
-      const attached = connection;
       attached.browser.once('disconnected', () => {
         if (this.closing || this.attached !== attached) return;
         this.attached = undefined;
@@ -127,13 +142,14 @@ export class BrowserRuntime {
         }, 1_000);
         this.restart.unref();
       });
-      return connection;
+      return attached;
     } catch (_error) {
       await connection?.close().catch(() => undefined);
       if (child) await stopChrome(child);
       this.lastFailure = { reason: 'browser_unavailable', at: new Date().toISOString() };
       throw new BrowserUnavailableError();
     } finally {
+      if (startupTimer) clearTimeout(startupTimer);
       this.starting = false;
     }
   }
@@ -263,6 +279,7 @@ export function getBrowserRuntime(): BrowserRuntime {
 }
 
 let reconcileTimer: NodeJS.Timeout | undefined;
+let reconciling = false;
 onHostStart(async ({ signal }) => {
   // Optional capability failures have a health outcome; other channels start.
   await runtime.reconcile().catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }));
@@ -271,13 +288,67 @@ onHostStart(async ({ signal }) => {
     return;
   }
   reconcileTimer = setInterval(() => {
+    if (reconciling) return;
+    reconciling = true;
     void (async () => {
       await runtime.reconcile();
       await runtime.closeIdleWindows();
-    })().catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }));
+      await queue?.retryAnswers();
+    })()
+      .catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }))
+      .finally(() => {
+        reconciling = false;
+      });
   }, 30_000);
   reconcileTimer.unref();
 });
+
+let queue: BrowserQueue | undefined;
+export function getBrowserQueue(): BrowserQueue {
+  queue ??= new BrowserQueue(new BrowserStore(), runtime);
+  return queue;
+}
+registerBrowserActionDelivery('browser', getBrowserQueue);
+onHostStart(async () => {
+  await getBrowserQueue().start();
+});
+onHostShutdown(async () => {
+  await queue?.stop();
+  queue = undefined;
+});
+
+export {
+  BrowserStore,
+  browserRequestId,
+  markBrowserRequestCommitStarted,
+  type BrowserJob,
+  type BrowserRequest,
+} from './db.js';
+export {
+  registerBrowserQueuedAction,
+  registerBrowserActionDelivery,
+  type BrowserExecutionContext,
+  type BrowserQueuedAction,
+} from './queue.js';
+export {
+  activateControl,
+  classifyActivation,
+  classifyNavigationUrl,
+  ensureBrowserNavigationGuard,
+  registerReviewedMerchantFlow,
+  withBrowserJobNavigation,
+} from './commit-classifier.js';
+export {
+  observePage,
+  pinBrowserRefs,
+  disposeBrowserRefs,
+  registerPageSecret,
+  releasePageSecret,
+  redactPageText,
+  pageHasSecret,
+  type BrowserRef,
+  type PinnedBrowserRef,
+} from './observe.js';
 onHostShutdown(async () => {
   if (reconcileTimer) clearInterval(reconcileTimer);
   reconcileTimer = undefined;

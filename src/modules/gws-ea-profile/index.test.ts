@@ -74,6 +74,7 @@ describe('GWS-EA profile module', () => {
       principal_timezone: null,
       main_agent_group_id: null,
       external_email_agent_group_id: null,
+      browser_agent_group_id: null,
       updated_at: null,
       principal_emails: [],
     });
@@ -994,6 +995,7 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
       [
         'assistant_display_name',
         'assistant_workspace_email',
+        'browser_agent_group_id',
         'external_email_agent_group_id',
         'main_agent_group_id',
         'principal_display_name',

@@ -80,11 +80,19 @@ export function requestIdOf(content: Record<string, unknown>): string | undefine
 }
 
 /** What an answering action does with a request: the answer's data, or an `ActionRefusal` or failure thrown. */
+export const ANSWER_LATER: unique symbol = Symbol('answer-later');
+
 export type ActionAnswer = (
   content: Record<string, unknown>,
   session: Session,
   requestId: string,
 ) => Promise<Record<string, unknown>>;
+
+export type DeferredActionAnswer = (
+  content: Record<string, unknown>,
+  session: Session,
+  requestId: string,
+) => Promise<Record<string, unknown> | typeof ANSWER_LATER>;
 
 function errorFrame(requestId: string, error: unknown): ResponseFrame {
   if (error instanceof ActionRefusal) {
@@ -109,7 +117,7 @@ async function writeAnswer(session: Session, requestId: string, frame: ResponseF
  * whatever its answer, so it is not done again. A request without a request
  * id has no tool waiting on it, so nothing answers it.
  */
-export function answeringAction(action: string, answer: ActionAnswer): GuardedDeliveryHandler {
+export function answeringAction(action: string, answer: DeferredActionAnswer): GuardedDeliveryHandler {
   return async (content, session) => {
     const requestId = requestIdOf(content);
     if (requestId === undefined) {
@@ -127,7 +135,9 @@ export function answeringAction(action: string, answer: ActionAnswer): GuardedDe
     let frame: ResponseFrame;
     /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
     try {
-      frame = { id: requestId, ok: true, data: await answer(content, session, requestId) };
+      const data = await answer(content, session, requestId);
+      if (data === ANSWER_LATER) return;
+      frame = { id: requestId, ok: true, data };
     } catch (error) {
       if (error instanceof ActionRefusal) {
         log.info('Action request refused', { action, requestId, sessionId: session.id, reason: error.message });

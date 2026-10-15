@@ -24,6 +24,7 @@ export interface GwsEaProfile {
   readonly main_agent_group_id: string | null;
   /** The agent group the host created for `external-email`, or null until it has. */
   readonly external_email_agent_group_id: string | null;
+  readonly browser_agent_group_id: string | null;
   readonly updated_at: string | null;
   /** The principal's email addresses, sorted. */
   readonly principal_emails: readonly string[];
@@ -287,6 +288,25 @@ export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   return row?.external_email_agent_group_id ?? null;
 }
 
+/** The host-stamped, sealed browser group. A caller cannot choose this identity. */
+export async function getBrowserAgentGroupId(): Promise<string | null> {
+  const row = await getDb().get<{ browser_agent_group_id: string | null }>(
+    'SELECT browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.browser_agent_group_id ?? null;
+}
+
+export async function setBrowserAgentGroupId(agentGroupId: string): Promise<void> {
+  identifier(agentGroupId, 'browser agent group ID');
+  const db = getDb();
+  await db.transaction(async () => {
+    const current = await getBrowserAgentGroupId();
+    if (current === agentGroupId) return;
+    if (current !== null) throw new Error('browser is already bound to an agent group');
+    await db.run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', agentGroupId);
+  });
+}
+
 /**
  * Record the agent group the host created for `external-email`. Recording the
  * same group again changes nothing; the pointer never moves to another one.
@@ -316,7 +336,7 @@ export async function projectDocAudience(agentGroupId: string): Promise<ProjectD
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
     `SELECT assistant_display_name, assistant_workspace_email, principal_display_name,
-            principal_timezone, main_agent_group_id, external_email_agent_group_id, updated_at
+            principal_timezone, main_agent_group_id, external_email_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );

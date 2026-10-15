@@ -2,11 +2,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import type { ChildProcess } from 'node:child_process';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { lookup } from '../../cli/registry.js';
 import { BrowserRuntime } from './index.js';
+import * as chrome from './chrome.js';
+import * as connection from './connection.js';
 import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
 
 let root: string;
@@ -94,5 +97,44 @@ describe('optional host browser lifecycle', () => {
   });
   it('registers read-only browser health as a host-only command', () => {
     expect(lookup('gws-ea-browser-health')).toMatchObject({ access: 'hidden', hostOnly: true });
+  });
+  it('bounds a stalled Chrome attachment and reports unavailable without retaining startup admission', async () => {
+    await ensureBrowserPaths(browserPaths(file));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    await runtime.reconcile();
+    let entered!: () => void;
+    const connecting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let rejectConnection!: (error: Error) => void;
+    vi.spyOn(chrome, 'spawnChrome').mockReturnValue({} as ChildProcess);
+    vi.spyOn(chrome, 'stopChrome').mockResolvedValue();
+    vi.spyOn(connection, 'connectChromePipe').mockImplementation(() => {
+      entered();
+      return new Promise((_resolve, reject) => {
+        rejectConnection = reject;
+      });
+    });
+    vi.useFakeTimers();
+    let outcome = 'pending';
+    const pending = runtime.pageForJob('stalled').then(
+      () => {
+        outcome = 'opened';
+      },
+      () => {
+        outcome = 'browser_unavailable';
+      },
+    );
+    try {
+      await connecting;
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(outcome).toBe('browser_unavailable');
+      expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
+    } finally {
+      rejectConnection(new Error('Owned test connection cleanup'));
+      await pending;
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 });

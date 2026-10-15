@@ -1,5 +1,13 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
+export const gwsEaBrowserPointerMigration: ModuleMigration = {
+  version: 4,
+  name: 'module:gws-ea-profile:browser-pointer',
+  async up(db) {
+    await db.exec('ALTER TABLE gws_ea_profile ADD COLUMN browser_agent_group_id TEXT REFERENCES agent_groups(id);');
+  },
+};
+
 export const gwsEaProfileMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-profile:create-profile',
