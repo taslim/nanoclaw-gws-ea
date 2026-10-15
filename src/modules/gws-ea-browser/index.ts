@@ -24,12 +24,15 @@ import {
   sweepBrowserJobSessions,
 } from './cancel.js';
 import { reconcileBrowserGroup } from './reconcile.js';
+import { browserSignInMigration } from './sign-in-migration.js';
+import { cleanupBrowserSignInMail, recoverBrowserSignInMail, registerSignInMailDelivery } from './sign-in-mail.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 
 registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
+registerMigration(browserSignInMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -300,6 +303,7 @@ let reconcileTimer: NodeJS.Timeout | undefined;
 let reconciling = false;
 onHostStart(async ({ signal }) => {
   const activeQueue = getBrowserQueue();
+  await recoverBrowserSignInMail();
   await activeQueue.start();
   configureBrowserCancellation(activeQueue);
   await reconcileBrowserGroup();
@@ -319,6 +323,7 @@ onHostStart(async ({ signal }) => {
       await runtime.closeIdleWindows();
       await queue?.retryAnswers();
       await sweepBrowserJobSessions();
+      await cleanupBrowserSignInMail();
     })()
       .catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }))
       .finally(() => {
@@ -335,9 +340,12 @@ export function getBrowserQueue(): BrowserQueue {
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
 registerBrowserActionDelivery('fill_secret', getBrowserQueue);
+registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
+registerSignInMailDelivery(getBrowserQueue);
 onHostShutdown(async () => {
   await queue?.stop();
+  await recoverBrowserSignInMail();
   queue = undefined;
 });
 
