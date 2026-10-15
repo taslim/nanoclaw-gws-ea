@@ -146,6 +146,9 @@ import {
   type Inbox,
 } from './index.js';
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
+import { claimSignInMail, createSignInClaim, finishSignInClaim } from './claims.js';
+import { parseGmailMessage } from './mime.js';
+import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
 import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
@@ -806,6 +809,44 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 // The channel's two messaging groups
 // ---------------------------------------------------------------------------
+
+it.each(['poll-first', 'reader-first'] as const)(
+  'settles sign-in before automated routing, retains the consumed message and routes the next normally (%s)',
+  async (order) => {
+    await browserSignInMigration.up(getDb());
+    await createSignInClaim({
+      id: 'browser-claim',
+      jobId: 'browser-job',
+      source: 'assistant',
+      origin: 'https://shop.example',
+      binding: { frame: 0, field: 'e1' },
+      at: new Date(now()),
+    });
+    const first = gmail.receive({
+      from: 'login@shop.example',
+      auth: 'dmarc-pass',
+      body: 'Your code is 642981',
+      extra: [{ name: 'Auto-Submitted', value: 'auto-generated' }],
+    });
+    if (order === 'reader-first') {
+      expect(
+        await claimSignInMail(parseGmailMessage(gmail.messages.get(first)!), new Date(now()), 'browser-claim'),
+      ).toBe(true);
+      await finishSignInClaim('browser-claim');
+    }
+    await inbox.tick();
+    expect(await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', first)).toEqual({
+      outcome: 'browser-sign-in',
+    });
+    expect(await getDb().all('SELECT * FROM gws_ea_thread_messages')).toEqual([]);
+    expect(await getSessionsByAgentGroup('ag-external')).toEqual([]);
+    expect(vi.mocked(requestWake)).not.toHaveBeenCalled();
+    await finishSignInClaim('browser-claim');
+    gmail.receive({ from: 'login@shop.example', auth: 'dmarc-pass', body: 'A second message' });
+    await inbox.tick();
+    expect(await getSessionsByAgentGroup('ag-external')).toHaveLength(1);
+  },
+);
 
 describe('the email channel', () => {
   it("is the inbox, wired to external-email per thread, and the principal's conversation, wired to main alone", async () => {

@@ -85,6 +85,7 @@ export interface GmailApi {
   listMessages(input: {
     readonly q?: string;
     readonly labelIds?: readonly string[];
+    readonly includeSpamTrash?: boolean;
     readonly maxResults: number;
   }): Promise<GmailMessageRef[]>;
   /**
@@ -314,7 +315,7 @@ export function createGmailApi(options: GoogleClientOptions): GmailApi {
     async listMessages(input) {
       const payload = await googleJson(
         options,
-        `${GMAIL}/messages${query({ q: input.q, labelIds: input.labelIds, maxResults: input.maxResults })}`,
+        `${GMAIL}/messages${query({ q: input.q, labelIds: input.labelIds, maxResults: input.maxResults, includeSpamTrash: input.includeSpamTrash === undefined ? undefined : String(input.includeSpamTrash) })}`,
       );
       if (!isRecord(payload)) throw unreadable('message list');
       return Array.isArray(payload.messages) ? payload.messages.map(toRef) : [];

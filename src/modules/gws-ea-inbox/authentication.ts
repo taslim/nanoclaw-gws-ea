@@ -35,6 +35,7 @@
  * name, signed by google.com, so the route tells that mail apart before the
  * rule for its From applies.
  */
+import { getDomain } from 'tldts';
 import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { domainOf, headerValues, parseAddressList, type MailHeader, type Mailbox } from './mime.js';
 
@@ -209,6 +210,21 @@ function dkimDomain(result: AuthResult): string | undefined {
 
 function passed(results: readonly AuthResult[], method: string, accept: (result: AuthResult) => boolean): boolean {
   return results.some((result) => result.method === method && result.result === 'pass' && accept(result));
+}
+
+/** Browser mail needs an aligned DKIM pass in Gmail's trace block; a DMARC pass alone never claims mail. */
+export function dkimAlignedToSite(headers: readonly MailHeader[], site: string): boolean {
+  const from = singleMailbox(headers, 'From');
+  const results = gmailResults(headers);
+  if (from === 'absent' || from === 'invalid' || !results) return false;
+  const sender = singleMailbox(headers, 'Sender');
+  if (sender !== 'absent' && (sender === 'invalid' || sender.address !== from.address)) return false;
+  const domain = domainOf(from.address);
+  if (getDomain(domain, { allowPrivateDomains: true }) !== site) return false;
+  return passed(results, 'dkim', (result) => {
+    const signer = dkimDomain(result);
+    return signer !== undefined && getDomain(signer, { allowPrivateDomains: true }) === site;
+  });
 }
 
 function named(mailbox: Mailbox): { readonly displayName?: string } {

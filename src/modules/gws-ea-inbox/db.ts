@@ -82,6 +82,7 @@ export async function unsettledMessages(): Promise<string[]> {
 /** Where routing left a message, as its settled record names it. */
 export type RouteOutcome =
   | 'own'
+  | 'browser-sign-in'
   | 'calendar-unreadable'
   | 'calendar-not-principal'
   | 'calendar-own-change'

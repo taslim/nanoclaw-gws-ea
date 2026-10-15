@@ -80,6 +80,7 @@ import {
   type SenderVerdict,
 } from './authentication.js';
 import { consumeOwnCalendarChange, parseCalendarNotification, type CalendarNotice } from './calendar-notifications.js';
+import { claimSignInMail } from './claims.js';
 import {
   clearUnsignedNotices,
   countSenderMessage,
@@ -789,6 +790,7 @@ export async function routeMail(
   options: { readonly limited: boolean },
 ): Promise<Routed> {
   if (mail.from && context.assistant.has(mail.from.address)) return settled('own');
+  if (await claimSignInMail(mail, context.at)) return settled('browser-sign-in');
   const verdict = authenticateSender(mail.headers, context.auth);
 
   if (verdict.kind === 'calendar-notification') {
