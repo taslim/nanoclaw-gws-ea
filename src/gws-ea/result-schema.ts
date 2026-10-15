@@ -2,6 +2,7 @@
 import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { OPERATION_PHASES } from './operation.js';
+import { BROWSER_CAPABILITY } from './browser-capability.js';
 
 const text = { type: 'string' } as const;
 /** Native protocol text shares the published string shape, but retains its producer semantics. */
@@ -219,7 +220,40 @@ export const VOICE_CAPABILITY_SCHEMA = object({
   unknown_assistant_ids: array(text),
   future_compatible_assistants: { const: true },
 });
-export const CAPABILITY_LIST_SCHEMA = object({ capabilities: array(VOICE_CAPABILITY_SCHEMA) });
+const browserMetadata = {
+  name: { const: 'browser' },
+  scope: { const: 'assistant' },
+  actions: array(choices(...BROWSER_CAPABILITY.actions)),
+  summary: text,
+};
+export const BROWSER_CAPABILITY_SCHEMA = object({
+  ...browserMetadata,
+  instance_id: text,
+  observed_at: time,
+  activation: choices('enabled', 'disabled', 'unavailable'),
+  credential_mode: choices('email', '1password'),
+  policy_file: text,
+  chrome: object({
+    path: text,
+    status: choices('not_checked', 'available', 'unavailable'),
+    version: nullable(text),
+    reason: nullable(text),
+  }),
+  vault: object({ status: choices('not_configured', 'configured', 'unavailable'), reason: nullable(text) }),
+  isolation: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
+  ready: bool,
+});
+export const BROWSER_OPERATION_SCHEMA = object({
+  ...browserMetadata,
+  instance_id: text,
+  enabled: bool,
+  credential_mode: choices('email', '1password'),
+  provider_revocation_required: bool,
+  changed: bool,
+});
+export const CAPABILITY_LIST_SCHEMA = object({
+  capabilities: array({ oneOf: [VOICE_CAPABILITY_SCHEMA, object({ ...browserMetadata, assistant_ids: array(text) })] }),
+});
 export const VOICE_OPERATION_SCHEMA = object(
   {
     name: { const: 'voice' },

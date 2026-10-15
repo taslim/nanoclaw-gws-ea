@@ -824,10 +824,27 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     await writeFile(voicePolicy, policy, { mode: 0o600 });
     await writeFile(voiceAssets, 'shared immutable model');
     const removal = world(input);
+    const browserFiles = [
+      'browser/profile/Cookies',
+      'browser/staging/private-download',
+      'secrets/browser-1password',
+    ].map((relative) => path.join(paths.instanceRoot(input.instance_id), relative));
+    for (const file of browserFiles) {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeFile(file, 'private browser material', { mode: 0o600 });
+    }
+    const uninstall = removal.dependencies.uninstallNanoclaw!;
+    const dependencies = {
+      ...removal.dependencies,
+      uninstallNanoclaw: async (...args: Parameters<typeof uninstall>) => {
+        for (const file of browserFiles) expect(await readFile(file, 'utf8')).toBe('private browser material');
+        await uninstall(...args);
+      },
+    };
     removal.gcloud.owned();
     removal.google.events.seedSubscription();
 
-    const outcome = await removeAssistant(paths, input.instance_id, removal.dependencies);
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
 
     expect(removal.order).toEqual(['nanoclaw', 'chat-subscription', 'gcp', 'onecli']);
     expect(removal.dependencies.resolveDocker).toHaveBeenCalledOnce();
@@ -850,6 +867,7 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
       abandoned: [],
     });
     await expectGone(paths, input);
+    for (const file of browserFiles) expect(await exists(file)).toBe(false);
     expect(await readFile(voicePolicy, 'utf8')).toBe(policy);
     expect(await readFile(voiceAssets, 'utf8')).toBe('shared immutable model');
   });
@@ -1718,6 +1736,9 @@ describe('removal safety', () => {
       docker_endpoint: DOCKER,
     });
     const names = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+    const cookies = path.join(paths.instanceRoot(input.instance_id), 'browser', 'profile', 'Cookies');
+    await mkdir(path.dirname(cookies), { recursive: true, mode: 0o700 });
+    await writeFile(cookies, 'recoverable profile', { mode: 0o600 });
     const definition = path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
     await mkdir(path.dirname(definition), { recursive: true });
     await writeFile(definition, 'plist', { mode: 0o600 });
@@ -1730,6 +1751,7 @@ describe('removal safety', () => {
       removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand, serviceHelpers }),
     ).rejects.toThrow(reason);
     expect(await exists(definition)).toBe(true);
+    expect(await readFile(cookies, 'utf8')).toBe('recoverable profile');
     // Nothing after the service stop ran: no host kill, drain, or container removal.
     expect(runCommand).not.toHaveBeenCalled();
     expect(serviceHelpers.drainContainers).not.toHaveBeenCalled();
@@ -1795,6 +1817,19 @@ describe('removal command', () => {
     expect(output.join('\n')).toContain(
       `Left behind: Google Cloud project ${input.exclusive_resource_claims.gcp_project_id}`,
     );
+    expect(output.join('\n')).toContain('1Password');
+    const json: string[] = [];
+    expect(
+      await runCli(
+        ['remove', '--id', input.instance_id, '--yes', '--json'],
+        cliRuntime(paths, json, { removeAssistant: remove }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(json.join('\n'))).toMatchObject({
+      next_actions: expect.arrayContaining([
+        { kind: 'external', instruction: expect.stringContaining('does not revoke the provider credential') },
+      ]),
+    });
   });
 
   it('rejects an unknown resource to abandon before anything runs', async () => {

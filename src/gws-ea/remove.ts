@@ -905,6 +905,8 @@ async function removeLocked(
       return undefined;
     },
     'instance-files': async () => {
+      // Includes browser/profile, host-only browser/staging, and secrets/browser-1password.
+      // This runs only after the native NanoClaw stop/drain resource has completed.
       await rm(paths.instanceRoot(instanceId), { recursive: true, force: true });
       return undefined;
     },

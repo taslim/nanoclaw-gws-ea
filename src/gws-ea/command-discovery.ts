@@ -35,7 +35,7 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if (!command) {
     return [
       'Usage: gws-ea <command> [options]',
-      'Operate managed Google Workspace assistants and their optional host capabilities.',
+      'Operate managed Google Workspace assistants and their optional capabilities.',
       ...(['Assistants', 'Service', 'Advanced', 'Capabilities', 'Discovery'] as const).flatMap((group) => [
         '',
         `${group}:`,
@@ -61,9 +61,9 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if ('commands' in command)
     return [
       `Usage: gws-ea ${command.path.join(' ')} <action> [options]`,
-      'Operate optional host capabilities. Assistant lifecycle commands use an explicit --id.',
+      'Operate optional capabilities. Assistant-scoped browser commands require an explicit --id; voice is host-wide.',
       '',
-      'Scope: host',
+      'Scope: each registered command declares host or assistant ownership.',
       'Commands:',
       ...command.commands.map((definition) => `  ${definition.path.join(' ')}  ${definition.summary}`),
       '',

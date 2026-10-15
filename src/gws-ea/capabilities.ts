@@ -1,5 +1,6 @@
 /** The shipped optional host catalog. Voice owns its actions, locks, policy, and asset recipe. */
 import { lstat } from 'node:fs/promises';
+import { BROWSER_CAPABILITY } from './browser-capability.js';
 
 import { formatLocalTime } from '../timezone.js';
 import { isErrno } from '../community-portal/errors.js';
@@ -110,7 +111,11 @@ export interface VoiceCapabilityObservation {
   readonly future_compatible_assistants: true;
 }
 export interface CapabilityList {
-  readonly capabilities: readonly VoiceCapabilityObservation[];
+  readonly capabilities: readonly (VoiceCapabilityObservation | BrowserCapabilityCatalog)[];
+}
+export type BrowserCapabilityCatalog = typeof BROWSER_CAPABILITY & { readonly assistant_ids: readonly string[] };
+export async function browserCapabilityCatalog(paths: ControlPlanePaths): Promise<BrowserCapabilityCatalog> {
+  return { ...BROWSER_CAPABILITY, assistant_ids: Object.keys((await readRegistry(paths)).instances).sort() };
 }
 export interface VoiceCapabilityInspection {
   readonly checkConsumers?: boolean;

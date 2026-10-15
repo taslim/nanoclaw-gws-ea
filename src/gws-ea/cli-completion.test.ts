@@ -27,6 +27,8 @@ const scenarios = [
   { words: ['gws-ea', 'schema', 'capabilities', ''], includes: 'install', excludes: 'create' },
   { words: ['gws-ea', 'help', '--version', ''], includes: '--help', excludes: 'create' },
   { words: ['gws-ea', 'capabilities', 'install', 'voice', ''], includes: '--model', excludes: 'voice' },
+  { words: ['gws-ea', 'capabilities', 'enable', 'browser', ''], includes: '--id', excludes: '--model' },
+  { words: ['gws-ea', 'capabilities', 'check', 'browser', ''], includes: '--id', excludes: '--token-stdin' },
   {
     words: ['gws-ea', 'capabilities', 'install', 'voice', '--model', '=', 'sm'],
     includes: 'small',

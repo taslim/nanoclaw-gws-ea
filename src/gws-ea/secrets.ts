@@ -7,9 +7,25 @@ import { isErrno } from '../community-portal/errors.js';
 import { isOwnerOnlyMode, isWithinDirectory } from './paths.js';
 import { syncDirectory } from './release-layout.js';
 import { GwsEaError } from './types.js';
+import { registerSecret } from './redact.js';
 import { parseJson } from './validation.js';
 
 const MAX_PRIVATE_FILE_BYTES = 1024 * 1024;
+
+/** Explicit stdin input only; never consult argv or the environment for browser credentials. */
+export async function readBrowserToken(input: AsyncIterable<string | Uint8Array>): Promise<string> {
+  let value = '';
+  for await (const chunk of input) {
+    value += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+    registerSecret(value);
+    if (Buffer.byteLength(value) > 16 * 1024)
+      throw new GwsEaError('invalid_browser_token', 'Browser token input exceeds 16 KiB.');
+  }
+  const token = value.trim();
+  if (!token || /\s/u.test(token))
+    throw new GwsEaError('invalid_browser_token', 'Supply exactly one non-empty service account token.');
+  return token;
+}
 
 /** Each owner-only rule's refusal: its code and what it says before the file's path. */
 type OwnerOnlyRefusals = Readonly<Record<'file' | 'owner' | 'mode' | 'size', readonly [code: string, message: string]>>;

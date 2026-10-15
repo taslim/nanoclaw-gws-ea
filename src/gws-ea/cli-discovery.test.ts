@@ -25,6 +25,33 @@ function capture() {
 }
 
 describe('local CLI discovery and grammar', () => {
+  it('declares only the four assistant browser actions with native scoped options', async () => {
+    const io = capture();
+    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
+    const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
+      JSON.parse(io.stdout.join('\n'));
+    const browser = schema.commands.filter((command) => command.path[2] === 'browser');
+    expect(browser.map((command) => command.path[1])).toEqual(['show', 'check', 'enable', 'disable']);
+    expect(browser.every((command) => command.scope === 'assistant')).toBe(true);
+    expect(browser.every((command) => command.options.some((option) => option.name === 'id' && option.required))).toBe(
+      true,
+    );
+    const missing = capture();
+    expect(await runCli(['capabilities', 'show', 'browser'], missing.runtime)).toBe(2);
+    expect(missing.stderr.join('\n')).toContain('--id');
+    const voice = capture();
+    expect(
+      await runCli(['capabilities', 'enable', 'voice', '--id', '00000000-0000-4000-8000-000000000001'], voice.runtime),
+    ).toBe(2);
+    expect(voice.stderr.join('\n')).toContain('Unknown option --id');
+    for (const action of ['install', 'uninstall']) {
+      const unsupported = capture();
+      expect(await runCli(['capabilities', action, 'browser', '--json'], unsupported.runtime)).toBe(2);
+    }
+    const invalid = capture();
+    expect(await runCli(['capabilities', 'check', 'browser', '--id', 'partial', '--json'], invalid.runtime)).toBe(2);
+    expect(JSON.parse(invalid.stdout.join('\n')).command).toBe('capabilities check browser');
+  });
   it.each([
     ['help', 'update'],
     ['update', '--help'],
@@ -142,7 +169,7 @@ describe('local CLI discovery and grammar', () => {
     if (args.includes('calendar')) expect(io.stderr.join('\n')).toContain('gws-ea capabilities list');
   });
 
-  it('rejects removed root voice paths and publishes only the static voice catalog', async () => {
+  it('rejects removed root voice paths and retains their capability protocol beside browser leaves', async () => {
     const io = capture();
     expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
     const schema = JSON.parse(io.stdout.join('\n')) as {
@@ -156,8 +183,12 @@ describe('local CLI discovery and grammar', () => {
       'capabilities enable',
       'capabilities disable',
       'capabilities uninstall',
+      'capabilities show browser',
+      'capabilities check browser',
+      'capabilities enable browser',
+      'capabilities disable browser',
     ]);
-    expect(schema.commands.slice(1).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
+    expect(schema.commands.slice(1, 7).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
     for (const command of ['install-voice', 'enable-voice', 'disable-voice', 'uninstall-voice']) {
       const removed = capture();
       expect(await runCli([command], removed.runtime)).toBe(2);

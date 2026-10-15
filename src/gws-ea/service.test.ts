@@ -106,6 +106,23 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string;
 }
 
 describe('GWS-EA instance runtime', () => {
+  it('persists the derived per-assistant browser policy locator without persisting browser state', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const policy = path.join(config.instance_root, 'browser', 'policy.json');
+    expect(await readFile(path.join(config.state_root, '.env'), 'utf8')).toContain(
+      `GWS_EA_BROWSER_POLICY_FILE=${policy}\n`,
+    );
+    const stored: unknown = JSON.parse(
+      await readFile(path.join(config.state_root, 'data/gws-ea/runtime.json'), 'utf8'),
+    );
+    expect(JSON.stringify(stored)).not.toContain('browser');
+    await expect(stat(path.join(config.instance_root, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await persistInstanceRuntime(config, upsertEnvVars);
+    expect(
+      (await readFile(path.join(config.state_root, '.env'), 'utf8')).match(/GWS_EA_BROWSER_POLICY_FILE=/gu),
+    ).toHaveLength(1);
+  });
   it('binds the custom-root shared voice locator without adding per-assistant runtime state', async () => {
     const { config } = await fixture();
     const locator = path.join(config.home_directory, 'custom-control-root', 'voice.json');
@@ -432,6 +449,7 @@ describe('GWS-EA instance runtime', () => {
         `NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`,
         `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
         `ONECLI_URL=${config.onecli_app_url}`,
+        `GWS_EA_BROWSER_POLICY_FILE=${path.join(config.instance_root, 'browser', 'policy.json')}`,
       ].sort(),
     );
   });

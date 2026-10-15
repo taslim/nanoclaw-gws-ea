@@ -4,7 +4,19 @@ import {
   inspectVoiceConsumers,
   voiceCapabilityRecovery,
   voiceCapabilityNextActions,
+  browserCapabilityCatalog,
 } from './capabilities.js';
+import {
+  BROWSER_REVOCATION_REMINDER,
+  browserCapabilityLines,
+  browserCapabilityNextActions,
+  disableBrowserCapability,
+  enableBrowserCapability,
+  inspectBrowserCapability,
+  type BrowserCapabilityInspection,
+  type BrowserCapabilityObservation,
+  type BrowserOperationData,
+} from './browser-capability.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -220,6 +232,11 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
+  /** The launcher supplies a hidden prompt only during interactive operation. */
+  promptBrowserToken?: () => Promise<string>;
+  /** Explicit --token-stdin source; never used without that flag. */
+  browserTokenInput?: AsyncIterable<string | Uint8Array>;
+  browserInspection?: BrowserCapabilityInspection;
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
@@ -694,6 +711,8 @@ class Cli {
     if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
     if (plan.options.yes === 'true') base.push('--yes');
     const actions: NextAction[] = [];
+    if (plan.command === 'remove' && state.data.removal)
+      actions.push({ kind: 'external', instruction: BROWSER_REVOCATION_REMINDER });
     if (pause?.actionUrl) actions.push({ kind: 'external', instruction: pause.message, url: pause.actionUrl });
     if (pause?.choices?.length && pause.resumeFlag)
       return [
@@ -1636,6 +1655,7 @@ class Cli {
         data: this.#data(state),
         next_actions: [
           ...(outcome.status === 'paused' ? this.#actions(plan, state, outcome.pause) : []),
+          ...(state.data.removal ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }] : []),
           ...(outcome.status === 'ready' && outcome.cancelled && state.instanceId
             ? [{ kind: 'command' as const, argv: ['gws-ea', 'status', '--id', state.instanceId] }]
             : []),
@@ -2088,6 +2108,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
       : []),
     ...(outcome?.abandoned.map(({ resource }) => leftBehind[resource]) ?? []),
+    ...(outcome ? [BROWSER_REVOCATION_REMINDER] : []),
     ...(outcome?.keyPolicyUnrestored
       ? [
           `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
@@ -2144,6 +2165,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   if (json || outer.includes('--no-input')) {
     const {
       prompts: _prompts,
+      promptBrowserToken: _browserPrompt,
       onFailure: _failure,
       confirmRemoval: _remove,
       confirmUpdate: _update,
@@ -2243,6 +2265,123 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   switch (handler.kind) {
     case 'capability': {
       const command = handler.command;
+      if (handler.name === 'browser') {
+        let changed: Changed = false;
+        let data: BrowserCapabilityObservation | BrowserOperationData | null = null;
+        const stop = observeInterruption(() => ({ changed, data }));
+        try {
+          const paths = runtime.paths ?? resolveControlPlanePaths();
+          const instanceId = targetInstance(options);
+          const dependencies = {
+            promptToken: runtime.promptBrowserToken,
+            stdin: runtime.browserTokenInput,
+            recordEffect: (effect: true | null) => {
+              changed = combineEffects(changed, effect);
+            },
+          };
+          let actions: readonly NextAction[] = [];
+          if (command === 'show' || command === 'check') {
+            data = await inspectBrowserCapability(paths, instanceId, {
+              ...runtime.browserInspection,
+              check: command === 'check',
+            });
+            actions = browserCapabilityNextActions(data);
+            const failed = command === 'check' && !data.ready;
+            if (!json) for (const line of [...browserCapabilityLines(data), ...nextActionLines(actions)]) output(line);
+            emitResult(
+              managedResult(invocation.definition.path.join(' '), {
+                outcome: failed ? 'failed' : 'succeeded',
+                changed,
+                data,
+                next_actions: actions,
+                ...(failed
+                  ? {
+                      error: new GwsEaError(
+                        'browser_check_failed',
+                        'Browser readiness was not established. Inspect the reported prerequisite and isolation facts.',
+                      ),
+                    }
+                  : {}),
+              }),
+            );
+            return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
+          }
+          if (command === 'enable') {
+            const mode = options['credential-mode'];
+            if (mode !== undefined && mode !== 'email' && mode !== '1password')
+              throw new GwsEaError('invalid_arguments', 'Credential mode must be email or 1password.');
+            data = await enableBrowserCapability(
+              paths,
+              instanceId,
+              { credentialMode: mode, tokenStdin: options['token-stdin'] === 'true' },
+              dependencies,
+            );
+          } else if (command === 'disable') {
+            data = await disableBrowserCapability(paths, instanceId, dependencies);
+          } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
+          actions = [
+            { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'browser', '--id', instanceId] },
+            ...(data.provider_revocation_required
+              ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }]
+              : []),
+          ];
+          presenter.report({
+            outcome: 'ready',
+            headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}; credential mode: ${data.credential_mode}.`,
+            details: nextActionLines(actions),
+          });
+          emitResult(
+            managedResult(invocation.definition.path.join(' '), {
+              outcome: 'succeeded',
+              changed,
+              data,
+              next_actions: actions,
+            }),
+          );
+          return EXIT_CODES.ready;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Every browser operation retains its observed effects in the managed boundary.
+        } catch (cause) {
+          const error =
+            cause instanceof GwsEaError
+              ? cause
+              : new GwsEaError(
+                  'browser_operation_failed',
+                  'Browser operation failed. Inspect the instance policy and owner-only secret permissions before retrying.',
+                  { cause },
+                );
+          const paused = error.code === 'browser_token_required';
+          const cancelled = error.code === 'cancelled';
+          const actions: readonly NextAction[] = [
+            {
+              kind: 'external',
+              instruction: paused
+                ? error.message
+                : 'Inspect the named assistant’s browser policy, permissions, runtime, and service state before retrying.',
+            },
+            ...(command === 'disable' ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }] : []),
+          ];
+          emitResult(
+            managedResult(invocation.definition.path.join(' '), {
+              outcome: cancelled ? 'cancelled' : paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
+              changed,
+              data,
+              error,
+              next_actions: actions,
+            }),
+          );
+          if (paused) {
+            presenter.report({ outcome: 'paused', headline: error.message, details: [] });
+            return EXIT_CODES.paused;
+          }
+          if (cancelled) {
+            presenter.report({ outcome: 'ready', headline: error.message, details: [] });
+            return EXIT_CODES.ready;
+          }
+          return reportStop(presenter, error, nextActionLines(actions));
+        } finally {
+          stop();
+        }
+      }
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
@@ -2271,10 +2410,15 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           case 'check': {
             const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
             actions = voiceCapabilityNextActions(capability, command === 'check');
-            data = command === 'list' ? { capabilities: [capability] } : capability;
+            const browser = command === 'list' ? await browserCapabilityCatalog(paths) : undefined;
+            data = command === 'list' && browser ? { capabilities: [capability, browser] } : capability;
             if (!json)
               for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
                 output(line);
+            if (!json && browser)
+              output(
+                `browser (assistant): ${browser.summary} Actions: ${browser.actions.join(', ')}. Assistants: ${browser.assistant_ids.join(', ') || 'none'}.`,
+              );
             break;
           }
           case 'install': {

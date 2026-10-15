@@ -1,4 +1,5 @@
 import { VOICE_CAPABILITY } from './capabilities.js';
+import { BROWSER_CAPABILITY } from './browser-capability.js';
 import {
   managedResultSchema,
   operationDataSchema,
@@ -7,6 +8,8 @@ import {
   CAPABILITY_LIST_SCHEMA,
   VOICE_CAPABILITY_SCHEMA,
   VOICE_OPERATION_SCHEMA,
+  BROWSER_CAPABILITY_SCHEMA,
+  BROWSER_OPERATION_SCHEMA,
 } from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
@@ -28,6 +31,7 @@ export type CommandHandler =
   | {
       readonly kind: 'capability';
       readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
+      readonly name?: 'browser';
     }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
@@ -375,7 +379,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         handler: { kind: 'capability', command },
         summary:
           command === 'list'
-            ? 'List supported optional host capabilities and their installed and enabled state.'
+            ? 'List optional capabilities, their ownership, and observed state.'
             : command === 'show'
               ? 'Show voice scope, assets, compatibility, prerequisites, and readiness limits.'
               : 'Verify selected voice assets and observe managed consumers without changing state.',
@@ -483,6 +487,80 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
     };
   }),
+  ...BROWSER_CAPABILITY.actions.map(
+    (command): CommandDefinition => ({
+      path: ['capabilities', command, 'browser'],
+      group: 'Capabilities',
+      handler: { kind: 'capability', command, name: 'browser' },
+      scope: 'assistant',
+      summary:
+        command === 'show'
+          ? 'Show one assistant’s browser policy and prerequisites.'
+          : command === 'check'
+            ? 'Check Chrome, optional vault, and agent-network isolation without changing state.'
+            : command === 'enable'
+              ? 'Enable one assistant’s host browser with email or optional 1Password sign-in.'
+              : 'Disable one assistant’s browser and delete its local vault token.',
+      options: [
+        id,
+        ...(command === 'enable'
+          ? [
+              {
+                ...value(
+                  'credential-mode',
+                  'email|1password',
+                  'Sign in with email codes/links (default), or a read-only service account for one dedicated 1Password vault.',
+                ),
+                choices: ['email', '1password'],
+              },
+              flag(
+                'token-stdin',
+                'Read the 1Password service account token from stdin; never from arguments or the environment.',
+              ),
+            ]
+          : []),
+      ],
+      effects:
+        command === 'show' || command === 'check'
+          ? [
+              'Read-only observation; no policy writes, downloads, service changes, or host reconciliation.',
+              ...(command === 'check'
+                ? [
+                    'Runs a bounded temporary container on the assistant network using its existing release image; never pulls an image.',
+                  ]
+                : []),
+            ]
+          : command === 'enable'
+            ? [
+                'Writes the optional owner-only token before the enabled instance policy; host reconciliation activates the browser.',
+                'Email code/link sign-in requires no token or token prompt.',
+              ]
+            : [
+                'Writes disabled policy first, then deletes the local token; the host stops jobs and withdraws cards on reconciliation, including after restart.',
+                'The operator separately revokes any configured service account/token in 1Password.',
+              ],
+      prerequisites: [
+        'An explicitly named managed assistant with a readable runtime record.',
+        'Google Chrome at its absolute configured path on the host.',
+      ],
+      recovery: [
+        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, token, host or Docker prerequisite.',
+      ],
+      examples: [
+        `gws-ea capabilities ${command} browser --id <instance_id>`,
+        ...(command === 'enable'
+          ? [
+              'gws-ea capabilities enable browser --id <instance_id> --credential-mode 1password',
+              'gws-ea capabilities enable browser --id <instance_id> --credential-mode 1password --token-stdin --no-input',
+            ]
+          : []),
+      ],
+      outputModes: managedModes,
+      resultSchema: managedResultSchema(
+        command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,
+      ),
+    }),
+  ),
   ...(['help', 'schema'] as const).map(
     (command): CommandDefinition => ({
       path: [command],
