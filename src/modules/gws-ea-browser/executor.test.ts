@@ -1,5 +1,8 @@
 import { expect, it } from 'vitest';
-import { validateBrowserBatch } from './executor.js';
+import type { Page } from 'playwright-core';
+import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
+import type { BrowserExecutionContext } from './queue.js';
+import { registerPageSecret } from './observe.js';
 
 it('rejects unknown actions and clipboard shortcuts without running a partial batch', () => {
   expect(() =>
@@ -14,4 +17,51 @@ it('rejects unknown actions and clipboard shortcuts without running a partial ba
   expect(
     validateBrowserBatch({ actions: [{ kind: 'navigate', url: 'https://example.com/' }, { kind: 'observe' }] }),
   ).toEqual({ actions: [{ kind: 'navigate', url: 'https://example.com/' }, { kind: 'observe' }] });
+});
+
+it('returns screenshots in a top-level image envelope linked to their action, while retaining secret refusal', async () => {
+  let screenshots = 0;
+  const page = {
+    url: () => 'about:blank',
+    context: () => ({ newCDPSession: async () => ({ on() {}, send: async () => undefined }) }),
+    on() {},
+    off() {},
+    once() {},
+    frames: () => [],
+    mainFrame: () => ({}),
+    isClosed: () => false,
+    locator: () => ({ ariaSnapshot: async () => '- document' }),
+    screenshot: async () => {
+      screenshots++;
+      return Buffer.from('screenshot');
+    },
+  } as unknown as Page;
+  const context = {
+    page: async () => page,
+    assertActive: async () => undefined,
+    remaining: () => 90_000,
+    signal: new AbortController().signal,
+    store: { db: {} },
+  } as unknown as BrowserExecutionContext;
+  const result = await executeBrowserBatch(context, {
+    actions: [{ kind: 'screenshot' }, { kind: 'observe' }, { kind: 'screenshot' }],
+  });
+  expect(result).toMatchObject({
+    status: 'completed',
+    actions: [
+      { index: 0, status: 'completed', image_index: 0 },
+      { index: 1, status: 'completed' },
+      { index: 2, status: 'completed', image_index: 1 },
+    ],
+    images: [
+      { mime_type: 'image/png', data: 'c2NyZWVuc2hvdA==' },
+      { mime_type: 'image/png', data: 'c2NyZWVuc2hvdA==' },
+    ],
+  });
+  expect(JSON.stringify(result.actions)).not.toContain('c2NyZWVuc2hvdA==');
+  registerPageSecret(page, 'password');
+  const refused = await executeBrowserBatch(context, { actions: [{ kind: 'screenshot' }] });
+  expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+  expect(refused.images).toBeUndefined();
+  expect(screenshots).toBe(2);
 });

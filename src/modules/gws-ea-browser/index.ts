@@ -12,6 +12,7 @@ import { browserQueueMigration, browserSiteLeasesMigration } from './migration.j
 import { BrowserStore } from './db.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
+import './capability.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';

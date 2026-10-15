@@ -235,6 +235,7 @@ async function executeBatch(
 ): Promise<Record<string, unknown>> {
   const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
+  const images: Array<{ mime_type: 'image/png'; data: string }> = [];
   const guard = await ensureBrowserNavigationGuard(page);
   guard.clearReason();
   let reason: BrowserStopReason | undefined;
@@ -354,13 +355,16 @@ async function executeBatch(
           }
           case 'screenshot':
             if (await pageHasSecret(page)) throw new BrowserBatchStop('secret_field');
-            else
-              data = {
+            else {
+              const image = {
                 mime_type: 'image/png',
                 data: (await page.screenshot({ type: 'png', timeout: Math.min(10_000, context.remaining()) })).toString(
                   'base64',
                 ),
-              };
+              } as const;
+              data = { image_index: images.length };
+              images.push(image);
+            }
             break;
           case 'upload':
             if (target) {
@@ -460,6 +464,7 @@ async function executeBatch(
     status: reason ? 'stopped' : 'completed',
     ...(reason ? { reason } : {}),
     actions: results,
+    ...(images.length ? { images } : {}),
     ...(observation ? { observation } : {}),
     repeat_safe: repeatSafe,
   };

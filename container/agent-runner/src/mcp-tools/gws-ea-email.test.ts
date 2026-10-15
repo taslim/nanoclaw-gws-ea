@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 
-import { requestAction } from '../action-request.js';
+import { answerResult, requestAction } from '../action-request.js';
 import * as messagesOut from '../db/messages-out.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
@@ -598,6 +598,38 @@ describe('a request the host is slow to answer', () => {
 });
 
 describe('requestAction', () => {
+  it('returns typed host images as MCP image content without putting encoded bytes in text', () => {
+    const data = {
+      status: 'completed',
+      actions: [{ index: 0, status: 'completed', image_index: 0 }],
+      images: [{ mime_type: 'image/png', data: 'c2NyZWVuc2hvdA==' }],
+    };
+    expect(answerResult({ id: 'act-image', ok: true, data })).toEqual({
+      content: [
+        { type: 'text', text: JSON.stringify({ status: 'completed', actions: data.actions }) },
+        { type: 'image', mimeType: 'image/png', data: 'c2NyZWVuc2hvdA==' },
+      ],
+    });
+    // An ordinary message still has exactly the established text result.
+    expect(answerResult({ id: 'act-text', ok: true, data: { message: 'Sent.', other: 1 } })).toEqual({
+      content: [{ type: 'text', text: 'Sent.' }],
+    });
+  });
+
+  it('refuses malformed image envelopes without exposing their encoded bytes', () => {
+    for (const images of [
+      'c2NyZWVuc2hvdA==',
+      [{ mime_type: 'text/html', data: 'c2NyZWVuc2hvdA==' }],
+      [{ mime_type: 'image/png', data: 'not base64' }],
+      [{ mime_type: 'image/png' }],
+      [null],
+    ]) {
+      const result = answerResult({ id: 'act-bad-image', ok: true, data: { images } });
+      expect(result.isError).toBe(true);
+      expect(text(result)).toBe("Error: The host's image answer was unreadable.");
+    }
+  });
+
   it('sends a request under the id its caller chose', async () => {
     const waiting = requestAction('tell_main', { account: 'Looped in.' }, { timeoutMs: 20, requestId: 'act-chosen-1' });
     const result = await waiting;

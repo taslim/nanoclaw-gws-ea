@@ -51,6 +51,17 @@ const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
 const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats'];
+const BROWSER_TOOLS = [
+  'browser',
+  'cancel_watch',
+  'fill_secret',
+  'list_watches',
+  'purchase',
+  'run_recipe',
+  'save_recipe',
+  'sign_in_code',
+  'watch',
+];
 
 /** Every tool of the default-on keys. */
 const DEFAULT_ON_TOOLS = [
@@ -110,6 +121,7 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
+    ['browser', ['browser'], BROWSER_TOOLS],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
     ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],
