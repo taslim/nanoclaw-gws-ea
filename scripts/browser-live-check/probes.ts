@@ -149,7 +149,7 @@ export async function launchProbeBrowser(
           child.kill('SIGTERM');
           return;
         }
-        transport.onmessage?.(message);
+        setImmediate(() => transport.onmessage?.(message));
       }
     });
     child.on('error', (error) => transport.onclose?.(error.message));

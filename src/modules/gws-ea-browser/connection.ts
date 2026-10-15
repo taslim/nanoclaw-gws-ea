@@ -73,7 +73,10 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
         terminate();
         return;
       }
-      transport.onmessage?.(message);
+      // Match Playwright's native pipe transport: each protocol message gets
+      // its own task so response continuations install listeners before the
+      // next event, even when Chrome coalesces both into one pipe chunk.
+      setImmediate(() => transport.onmessage?.(message));
     }
   });
   inbound.on('error', terminate);
