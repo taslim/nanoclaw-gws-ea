@@ -8,10 +8,16 @@ import { log } from '../../log.js';
 import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
-import { browserPurchaseMigration, browserQueueMigration, browserSiteLeasesMigration } from './migration.js';
+import {
+  browserPurchaseMigration,
+  browserQueueMigration,
+  browserRecipesMigration,
+  browserSiteLeasesMigration,
+} from './migration.js';
 import { BrowserStore } from './db.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
+import './recipes.js';
 import './capability.js';
 import './fill.js';
 import { browserDiagnosticsUnsafe } from './onepassword.js';
@@ -40,6 +46,7 @@ registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
 registerMigration(browserPurchaseMigration);
 registerMigration(browserSignInMigration);
+registerMigration(browserRecipesMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -350,6 +357,8 @@ export function getBrowserQueue(): BrowserQueue {
 registerBrowserActionDelivery('browser', getBrowserQueue);
 registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
+registerBrowserActionDelivery('save_recipe', getBrowserQueue);
+registerBrowserActionDelivery('run_recipe', getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);

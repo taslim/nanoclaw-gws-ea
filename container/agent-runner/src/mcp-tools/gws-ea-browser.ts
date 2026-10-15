@@ -224,7 +224,7 @@ export const purchase = requestTool({
 export const saveRecipe = requestTool({
   name: 'save_recipe',
   description:
-    'Save a range of this errand’s recorded actions as a named recipe with ordinary text inputs. Indices are global across this job’s requests, zero-based and inclusive. The host records locators and checkpoints; no executable code is accepted. Returns saved with the recipe id, name and parameters; use that id with run_recipe. ' +
+    'Save a range of this errand’s recorded actions as a named recipe. Bind ordinary type/select values, a single-field form_input value, or a click target’s exact accessible name. Indices are global across this job’s requests, zero-based and inclusive. The host records locators and checkpoints; no executable code is accepted. Returns saved with the recipe id, name and parameters; use that id with run_recipe. ' +
     NO_REPEAT,
   properties: {
     name: { type: 'string', description: 'A short task name for the path.' },
@@ -250,7 +250,7 @@ export const saveRecipe = requestTool({
 export const runRecipe = requestTool({
   name: 'run_recipe',
   description:
-    'Replay a host-recorded recipe with named ordinary inputs, checking the page between steps and stopping before any commit. Returns reached_commit_point with its ref, or checkpoint_failed with the failed step, expected and found state, and current observation. Use purchase at the commit point; repair a failed checkpoint with browser and save_recipe. ' +
+    'Replay a host-recorded recipe with named ordinary inputs, checking the page between steps and stopping before any commit. Returns completed when every step finishes without a commit, reached_commit_point with its ref before a purchase, or checkpoint_failed with the failed step, expected and found state, and current observation. Use purchase at the commit point; repair a failed checkpoint with browser and save_recipe. ' +
     NO_REPEAT,
   properties: {
     recipe_id: { type: 'string', description: 'A saved recipe id listed for this site.' },

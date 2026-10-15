@@ -1,5 +1,38 @@
 import type { ModuleMigrationName, PortableMigration } from '../../db/migrations/index.js';
 
+/** A recipe id is immutable; saving the same task appends a version for future errands. */
+export const browserRecipesMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:recipes',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_action_trace (
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        action_index INTEGER NOT NULL,
+        request_id TEXT NOT NULL,
+        step_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(job_id,action_index)
+      );
+      CREATE TABLE gws_ea_browser_recipes (
+        id TEXT PRIMARY KEY,
+        site TEXT NOT NULL,
+        name TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        source_job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        first_action INTEGER NOT NULL,
+        last_action INTEGER NOT NULL,
+        parameters_json TEXT NOT NULL,
+        steps_json TEXT NOT NULL,
+        read_only INTEGER NOT NULL CHECK(read_only IN(0,1)),
+        created_at TEXT NOT NULL,
+        UNIQUE(site,name,version)
+      );
+      CREATE INDEX gws_ea_browser_recipes_site ON gws_ea_browser_recipes(site,name,version);
+    `);
+  },
+};
+
 export const browserQueueMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 2,
   name: 'module:gws-ea-browser:durable-queue',

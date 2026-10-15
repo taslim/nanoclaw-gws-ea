@@ -196,6 +196,20 @@ export async function observePage(page: Page, assertActive?: () => Promise<void>
   return { generation: state.generation, url, snapshot, ...(delta ? { delta } : {}), ...(site ? { site } : {}) };
 }
 
+/** Structured host checkpoints replace native refs just like agent observations do. */
+export async function snapshotBrowserStructure(
+  page: Page,
+): Promise<{ generation: number; url: string; tree: unknown }> {
+  await collectSecretFields(page);
+  const generation = ++stateFor(page).generation;
+  const tree: unknown = await page.locator('body').ariaSnapshotJSON({ mode: 'ai' });
+  return {
+    generation,
+    url: redactPageText(page, page.url()),
+    tree: JSON.parse(redactPageText(page, JSON.stringify(tree))) as unknown,
+  };
+}
+
 export class BrowserRefError extends Error {
   constructor(readonly reason: 'stale_ref' | 'not_actionable') {
     super(reason);

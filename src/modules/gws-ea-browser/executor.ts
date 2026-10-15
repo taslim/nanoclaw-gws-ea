@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { errors, type Page } from 'playwright-core';
+import { errors, type Page, type ElementHandle, type JSHandle } from 'playwright-core';
 
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { sessionDir } from '../../session-manager.js';
@@ -27,6 +27,7 @@ import {
 } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { beginBrowserActionTrace, isReadOnlyBrowserAction } from './recipes.js';
 
 export type BrowserStopReason =
   | 'stale_ref'
@@ -59,6 +60,12 @@ export type BrowserAction =
 
 export interface BrowserBatch {
   actions: BrowserAction[];
+}
+/** Host callers may replay on a signed-out page; none of these options are model inputs. */
+export interface BrowserBatchOptions {
+  page?: Page;
+  record?: boolean;
+  readOnly?: boolean;
 }
 export interface BrowserActionResult {
   index: number;
@@ -180,12 +187,12 @@ export function validateBrowserBatch(content: Record<string, unknown>): BrowserB
   return { actions };
 }
 
-function actionRefs(action: BrowserAction): BrowserRef[] {
+export function browserActionRefs(action: BrowserAction): BrowserRef[] {
   if ('ref' in action) return [action];
   return action.kind === 'form_input' ? [...action.fields, ...(action.submit ? [action.submit] : [])] : [];
 }
 
-export async function isSecretBrowserField(target: PinnedBrowserRef): Promise<boolean> {
+export async function isSecretBrowserField(target: Pick<PinnedBrowserRef, 'element'>): Promise<boolean> {
   return target.element.evaluate((node) => {
     const e = node as unknown as { getAttribute(name: string): string | null };
     const type = e.getAttribute('type') ?? '';
@@ -213,6 +220,16 @@ class BrowserBatchStop extends Error {
   }
 }
 
+/** The keyboard and recipe paths must identify the very same native submit control. */
+export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSHandle<unknown>> {
+  return element.evaluateHandle((node) => {
+    const e = node as unknown as { tagName: string; form?: { querySelector(selector: string): unknown } };
+    return ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName)
+      ? (e.form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])') ?? null)
+      : node;
+  });
+}
+
 function batchErrorReason(
   error: unknown,
   blocked: ReturnType<BrowserNavigationGuard['reason']>,
@@ -229,10 +246,11 @@ function batchErrorReason(
 export async function executeBrowserBatch(
   context: BrowserExecutionContext,
   payload: Record<string, unknown>,
+  options: BrowserBatchOptions = {},
 ): Promise<Record<string, unknown>> {
-  const page = await context.page();
+  const page = options.page ?? (await context.page());
   try {
-    return await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page));
+    return await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page, options));
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
     throw error;
@@ -243,6 +261,7 @@ async function executeBatch(
   context: BrowserExecutionContext,
   payload: Record<string, unknown>,
   page: Page,
+  options: BrowserBatchOptions,
 ): Promise<Record<string, unknown>> {
   const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
@@ -258,11 +277,12 @@ async function executeBatch(
   };
   page.on('framenavigated', navigated);
   try {
-    refs = await pinBrowserRefs(page, actions.flatMap(actionRefs));
+    refs = await pinBrowserRefs(page, actions.flatMap(browserActionRefs));
     for (let index = 0; index < actions.length; index++) {
       const action = actions[index];
       const before = navigation;
       let data: Record<string, unknown> = {};
+      let trace: Awaited<ReturnType<typeof beginBrowserActionTrace>> | undefined;
       try {
         await context.assertActive();
         if (action.kind !== 'navigate' && /^https?:/u.test(page.url())) {
@@ -270,6 +290,13 @@ async function executeBatch(
           await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:action-release`);
           if (!lease.acquired) throw new BrowserBatchStop('site_busy');
         }
+        if (options.record !== false) {
+          trace = await beginBrowserActionTrace(context, page, action, refs);
+          data.trace_index = trace.index;
+        }
+        if (options.readOnly && !(await isReadOnlyBrowserAction(page, action, refs)))
+          throw new BrowserBatchStop('unsupported_merchant');
+        await context.assertActive();
         const target = 'ref' in action ? refs.get(action.ref) : undefined;
         if (['click', 'type', 'select', 'key', 'form_input', 'upload', 'download'].includes(action.kind))
           repeatSafe = false;
@@ -322,12 +349,7 @@ async function executeBatch(
                 await target.element.press(action.key, { timeout: context.remaining() });
               };
               if (/^(?:Shift\+)?Enter$/u.test(action.key)) {
-                const formSubmit = await target.element.evaluateHandle((node) => {
-                  const e = node as unknown as { tagName: string; form?: { querySelector(selector: string): unknown } };
-                  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName)
-                    ? (e.form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])') ?? null)
-                    : node;
-                });
+                const formSubmit = await browserKeyboardSubmitTarget(target.element);
                 try {
                   const submit = formSubmit.asElement();
                   if (!submit) throw new BrowserBatchStop('unsupported_merchant');
@@ -439,14 +461,16 @@ async function executeBatch(
         }
         const blocked = guard.reason();
         if (blocked && blocked !== 'ordinary') throw new BrowserBatchStop(blocked);
-        results[index] = { index, status: 'completed', ...data };
+        await trace?.finish();
+        results[index] = { index, status: 'completed', ...data, ...(trace ? { trace_index: trace.index } : {}) };
         if (navigation !== before) {
           reason = 'navigated';
           break;
         }
       } catch (error) {
         reason = batchErrorReason(error, guard.reason(), context, page);
-        results[index] = { index, status: 'stopped', reason };
+        await trace?.finish(reason);
+        results[index] = { index, status: 'stopped', reason, ...(trace ? { trace_index: trace.index } : {}) };
         break;
       }
     }

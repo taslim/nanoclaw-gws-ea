@@ -43,9 +43,13 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
     signal: new AbortController().signal,
     store: { db: {} },
   } as unknown as BrowserExecutionContext;
-  const result = await executeBrowserBatch(context, {
-    actions: [{ kind: 'screenshot' }, { kind: 'observe' }, { kind: 'screenshot' }],
-  });
+  const result = await executeBrowserBatch(
+    context,
+    {
+      actions: [{ kind: 'screenshot' }, { kind: 'observe' }, { kind: 'screenshot' }],
+    },
+    { record: false },
+  );
   expect(result).toMatchObject({
     status: 'completed',
     actions: [
@@ -60,7 +64,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   });
   expect(JSON.stringify(result.actions)).not.toContain('c2NyZWVuc2hvdA==');
   registerPageSecret(page, 'password');
-  const refused = await executeBrowserBatch(context, { actions: [{ kind: 'screenshot' }] });
+  const refused = await executeBrowserBatch(context, { actions: [{ kind: 'screenshot' }] }, { record: false });
   expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
   expect(refused.images).toBeUndefined();
   expect(screenshots).toBe(2);

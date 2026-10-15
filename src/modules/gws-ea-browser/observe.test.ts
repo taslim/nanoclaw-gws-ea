@@ -8,7 +8,29 @@ import {
   registerBrowserSiteInfoProvider,
   pageHasSecret,
   bindPageSecretDocuments,
+  snapshotBrowserStructure,
+  pinBrowserRefs,
 } from './observe.js';
+
+it('invalidates earlier agent refs when the host captures a structured recipe checkpoint', async () => {
+  const page = {
+    url: () => 'https://example.com/search',
+    frames: () => [],
+    locator: () => ({
+      ariaSnapshot: async () => '- textbox "Party size" [ref=e1]',
+      ariaSnapshotJSON: async () => [{ role: 'textbox', name: 'Party size', ref: 'e2' }],
+    }),
+  } as unknown as Page;
+  const observation = await observePage(page);
+  const structured = await snapshotBrowserStructure(page);
+  expect(structured).toMatchObject({
+    generation: observation.generation + 1,
+    tree: [{ role: 'textbox', name: 'Party size' }],
+  });
+  await expect(pinBrowserRefs(page, [{ ref: 'e1', generation: observation.generation }])).rejects.toMatchObject({
+    reason: 'stale_ref',
+  });
+});
 
 it('redacts registered field values and bearer URLs from every observation', async () => {
   const page = {
