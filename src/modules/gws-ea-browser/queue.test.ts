@@ -1,10 +1,15 @@
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+const root = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-queue-tests');
+});
 
 vi.mock('../../config.js', async () => ({
   ...(await vi.importActual<typeof import('../../config.js')>('../../config.js')),
-  DATA_DIR: '/private/tmp/browser-queue-tests',
+  DATA_DIR: root,
 }));
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -21,7 +26,6 @@ import { BrowserQueue, browserRequestGuard, registerBrowserQueuedAction } from '
 
 let store: BrowserStore;
 let session: Session;
-const root = '/private/tmp/browser-queue-tests';
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());
@@ -110,6 +114,54 @@ it('preserves a sanitized native refusal before commit and uncertainty after a c
       }),
     ]),
   );
+  await queue.stop();
+});
+
+it('blocks the whole site before delivering an uncertain marked purchase answer', async () => {
+  registerBrowserQueuedAction('queue_marked_purchase_fixture', {
+    validate: () => ({}),
+    async execute(context) {
+      await context.markCommitStarted();
+      const at = new Date().toISOString();
+      await store.db.run(
+        `INSERT INTO gws_ea_browser_authorities
+         (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at,commit_request_id)
+         VALUES(?,?,'checkout','committing',?,'{}','[]',?,?,?,?)`,
+        'marked-authority',
+        context.job.id,
+        JSON.stringify({ site: 'amazon.com' }),
+        'marked-attempt',
+        new Date(Date.now() + 60_000).toISOString(),
+        at,
+        context.request.id,
+      );
+      await store.db.run(
+        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at)
+         VALUES(?,?,?,'amazon.com',?,?)`,
+        'marked-attempt',
+        'marked-authority',
+        context.job.id,
+        JSON.stringify({ site: 'amazon.com' }),
+        at,
+      );
+      throw new Error('The browser disconnected after the durable commit marker');
+    },
+    async deliverAnswer() {
+      expect(
+        await store.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', 'amazon.com'),
+      ).toEqual({ site: 'amazon.com' });
+    },
+  });
+  const queue = new BrowserQueue(store, runtime);
+  await queue.start();
+  await queue.accept('queue_marked_purchase_fixture', {}, session, 'marked-purchase');
+  await queue.idle();
+  expect(await store.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', 'amazon.com')).toEqual({
+    site: 'amazon.com',
+  });
+  expect(await store.request(browserRequestId(session.id, 'marked-purchase'))).toMatchObject({
+    delivered_at: expect.any(String),
+  });
   await queue.stop();
 });
 

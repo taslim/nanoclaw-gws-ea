@@ -1,4 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
+import { amazonRetailFlow } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
@@ -32,8 +33,9 @@ export interface ReviewedMerchantFlow {
   matches(url: URL): boolean;
   classifyControl(page: Page, element: ElementHandle, facts: ControlFacts): Promise<ActivationClass>;
   classifyNavigation(url: URL): ActivationClass;
+  verifyPurchaseControl?(page: Page, element: ElementHandle): Promise<boolean>;
 }
-const merchantFlows: ReviewedMerchantFlow[] = [];
+const merchantFlows: ReviewedMerchantFlow[] = [amazonRetailFlow];
 
 /** Trusted source registrations only. Neither page prose nor stored recipes can register support. */
 export function registerReviewedMerchantFlow(flow: ReviewedMerchantFlow): void {
@@ -52,8 +54,18 @@ const ordinaryName =
 
 export function classifyControlFacts(facts: ControlFacts): ActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
-  if (security.test(evidence)) return 'account_security';
-  if (speaking.test(evidence)) return 'speaks_as_principal';
+  if (
+    security.test(evidence) ||
+    /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu.test(
+      evidence,
+    )
+  )
+    return 'account_security';
+  if (
+    speaking.test(evidence) ||
+    /\b(?:write a review|message (?:the |a )?(?:restaurant|seller|host))\b/iu.test(evidence)
+  )
+    return 'speaks_as_principal';
   if (purchase.test(evidence)) return 'purchase_control';
   // Money/payment clues can stop work; their absence never proves an unknown control safe.
   if (facts.transaction) return 'unsupported_merchant';
@@ -102,6 +114,15 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
   } catch (_error) {
     return 'blocked_address';
   }
+  if (security.test(decoded)) return 'account_security';
+  if (speaking.test(decoded)) return 'speaks_as_principal';
+  const reviewed = merchantFlows.find((candidate) => candidate.matches(url));
+  if (
+    reviewed &&
+    reviewed.classifyNavigation(url) === 'ordinary' &&
+    ![...url.searchParams.keys()].some((name) => /^(?:action|operation|intent|command|do)$/iu.test(name))
+  )
+    return 'ordinary';
   if (
     purchase.test(decoded) ||
     /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu.test(
@@ -237,7 +258,8 @@ export async function activateControl(
   if (classification === 'purchase_control' && authority) {
     const source = new URL(page.url());
     const flow = dispatch.flow;
-    if (!flow) throw new BrowserActivationError('unsupported_merchant');
+    if (!flow?.verifyPurchaseControl || !(await flow.verifyPurchaseControl(page, element)))
+      throw new BrowserActivationError('unsupported_merchant');
     await authority.commitStarted();
     approvedPresses.set(page, { origin: source.origin, flow });
     try {

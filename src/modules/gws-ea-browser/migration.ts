@@ -68,3 +68,94 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
     `);
   },
 };
+
+/** Spending state is independent of transient approval cards and session lifetime. */
+export const browserPurchaseMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 4,
+  name: 'module:gws-ea-browser:purchases',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_browser_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1));
+      CREATE TABLE gws_ea_browser_purchase_cards (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        request_id TEXT NOT NULL UNIQUE,
+        approval_id TEXT UNIQUE,
+        approval_json TEXT,
+        status TEXT NOT NULL CHECK(status IN ('open','approved','rejected','expired','withdrawn','superseded')),
+        facts_json TEXT NOT NULL,
+        bounds_json TEXT NOT NULL,
+        exception_ids_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        notified_at TEXT
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_current_card ON gws_ea_browser_purchase_cards(job_id) WHERE status = 'open';
+      CREATE TABLE gws_ea_browser_reservation_guarantees (
+        id TEXT PRIMARY KEY,
+        approval_id TEXT NOT NULL UNIQUE,
+        principal_user_id TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        max_total_minor INTEGER NOT NULL CHECK(max_total_minor >= 0),
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+      CREATE TABLE gws_ea_browser_guarantee_proposals (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        request_id TEXT NOT NULL UNIQUE,
+        approval_id TEXT UNIQUE,
+        currency TEXT NOT NULL,
+        max_total_minor INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open','approved','withdrawn','expired','rejected')),
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE gws_ea_browser_authorities (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        approval_id TEXT UNIQUE,
+        card_id TEXT REFERENCES gws_ea_browser_purchase_cards(id),
+        kind TEXT NOT NULL CHECK(kind IN ('checkout','watch','reservation_guarantee')),
+        state TEXT NOT NULL CHECK(state IN ('live','committing','committed','unknown','revoked')),
+        facts_json TEXT NOT NULL,
+        bounds_json TEXT NOT NULL,
+        exception_ids_json TEXT NOT NULL,
+        guarantee_id TEXT REFERENCES gws_ea_browser_reservation_guarantees(id),
+        attempt_id TEXT NOT NULL UNIQUE,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        commit_started_at TEXT,
+        commit_request_id TEXT,
+        outcome_json TEXT,
+        notified_at TEXT,
+        UNIQUE(guarantee_id,attempt_id)
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_live_checkout ON gws_ea_browser_authorities(job_id) WHERE kind = 'checkout' AND state IN ('live','committing');
+      CREATE TABLE gws_ea_browser_pending_commits (
+        authority_id TEXT PRIMARY KEY REFERENCES gws_ea_browser_authorities(id),
+        generation INTEGER NOT NULL DEFAULT 0,
+        queued_request_id TEXT
+      );
+      CREATE TABLE gws_ea_browser_purchase_attempts (
+        id TEXT PRIMARY KEY,
+        authority_id TEXT NOT NULL UNIQUE REFERENCES gws_ea_browser_authorities(id),
+        job_id TEXT NOT NULL,
+        site TEXT NOT NULL,
+        facts_json TEXT NOT NULL,
+        attempted_at TEXT NOT NULL,
+        resolution TEXT CHECK(resolution IN ('committed','not_committed')),
+        evidence_json TEXT,
+        merchant_record_id TEXT,
+        merchant_account TEXT,
+        reconciled_at TEXT
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_record_attempt ON gws_ea_browser_purchase_attempts(site,merchant_account,merchant_record_id) WHERE merchant_record_id IS NOT NULL;
+      CREATE INDEX gws_ea_browser_unresolved_site ON gws_ea_browser_purchase_attempts(site,resolution);
+      CREATE TABLE gws_ea_browser_purchase_blocks (
+        site TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+      );
+    `);
+  },
+};

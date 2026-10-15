@@ -30,4 +30,40 @@ export const relayCode = requestTool({
   timeoutMs: 120_000,
 });
 
-registerTools([cancelJob, relayCode], 'browser-delegate');
+export const reservationGuarantee = requestTool({
+  name: 'reservation_guarantee',
+  description:
+    'Read, propose or revoke the principal’s optional standing permission for reservation cancellation/no-show fees. Propose requires an explicit currency and maximum TOTAL per reservation, as an exact decimal string. Only a principal approval activates permission. Nothing is due at booking; holds, deposits, prepayments, trials and subscriptions always need separate approval. No amount or currency is assumed. Revocation stops every uncommitted child authority. After a timeout use request_status before retrying a proposal.',
+  properties: {
+    operation: { type: 'string', enum: ['read', 'propose', 'revoke'] },
+    currency: { type: 'string', pattern: '^[A-Z]{3}$' },
+    max_total: { type: 'string', pattern: '^\\d+(?:\\.\\d{2})?$' },
+  },
+  required: ['operation'],
+  additionalProperties: false,
+  oneOf: [
+    {
+      properties: { operation: { enum: ['read', 'revoke'] } },
+      not: { anyOf: [{ required: ['currency'] }, { required: ['max_total'] }] },
+    },
+    { properties: { operation: { const: 'propose' } }, required: ['currency', 'max_total'] },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'read' || fields.operation === 'revoke')
+      return fields.currency === undefined && fields.max_total === undefined
+        ? fields
+        : 'Only propose takes currency and max_total.';
+    if (
+      fields.operation !== 'propose' ||
+      typeof fields.currency !== 'string' ||
+      !/^[A-Z]{3}$/u.test(fields.currency) ||
+      typeof fields.max_total !== 'string' ||
+      !/^\d+(?:\.\d{2})?$/u.test(fields.max_total)
+    )
+      return 'Propose requires an explicit currency and maximum total decimal amount.';
+    return fields;
+  },
+  repeatable: false,
+  timeoutMs: 120_000,
+});
+registerTools([cancelJob, relayCode, reservationGuarantee], 'browser-delegate');

@@ -4,10 +4,11 @@ import { getSession, updateSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
-import type { Session } from '../../types.js';
+import type { PendingApproval, Session } from '../../types.js';
 import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { SiteLeaseStore } from './leases.js';
+import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
 
@@ -44,6 +45,19 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
     'SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? ORDER BY site',
     job.id,
   );
+  const purchases = await store.db.hasTable('gws_ea_browser_purchase_cards');
+  const card = purchases
+    ? await store.db.get(
+        "SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' LIMIT 1",
+        job.id,
+      )
+    : undefined;
+  const authority = purchases
+    ? await store.db.get(
+        "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state IN ('live','committing') LIMIT 1",
+        job.id,
+      )
+    : undefined;
   const running = await store.db.get(
     'SELECT 1 FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     job.id,
@@ -63,7 +77,13 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
   }
   return {
     job,
-    state: job.cancelled ? 'cancelled' : running || leases.length > 0 ? 'working' : 'idle',
+    state: job.cancelled
+      ? 'cancelled'
+      : card
+        ? 'awaiting_principal'
+        : running || authority || leases.length > 0
+          ? 'working'
+          : 'idle',
     held_sites: leases.map((lease) => lease.site),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
   };
@@ -74,6 +94,7 @@ export interface BrowserJobCancellation {
   readonly thread: string;
   readonly job: BrowserJob;
   readonly waitingJobs: readonly string[];
+  readonly withdrawnCards?: readonly PendingApproval[];
 }
 
 /** DB-only half: callers may join authority/watch/card changes in this same transaction. */
@@ -84,13 +105,29 @@ export async function cancelBrowserJobInTransaction(
   const job = await resolveBrowserJob(thread, store);
   if (!job) throw invalidArgs('No main-owned browser job exists for that thread.');
   if (job.cancelled) return { status: 'already_cancelled', thread, job, waitingJobs: [] };
+  const purchases = await store.db.hasTable('gws_ea_browser_authorities');
+  const committing = purchases
+    ? await store.db.get(
+        "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
+        job.id,
+      )
+    : undefined;
+  const withdrawnCards = purchases ? await detachPurchaseCards(job.id, 'withdrawn') : [];
+  if (committing) {
+    await store.db.run(
+      'UPDATE gws_ea_browser_jobs SET cancel_requested = 1,updated_at = ? WHERE id = ?',
+      new Date().toISOString(),
+      job.id,
+    );
+    return { status: 'in_progress', thread, job, waitingJobs: [], withdrawnCards };
+  }
   await store.db.run(
     'UPDATE gws_ea_browser_jobs SET cancelled = 1, updated_at = ? WHERE id = ?',
     new Date().toISOString(),
     job.id,
   );
   const waitingJobs = await new SiteLeaseStore(store.db).release(job.id);
-  return { status: 'cancelled', thread, job, waitingJobs };
+  return { status: 'cancelled', thread, job, waitingJobs, withdrawnCards };
 }
 
 let cancellationQueue: BrowserQueue | undefined;
@@ -104,7 +141,9 @@ export async function finishBrowserJobCancellation(
   result: BrowserJobCancellation,
   queue = cancellationQueue,
 ): Promise<void> {
-  if (!queue || result.status === 'already_cancelled') return;
+  if (result.withdrawnCards)
+    await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
+  if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
   await queue.interruptJob(result.job.id);
   await queue.runtime.closeJob(result.job.id);
   await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
@@ -128,6 +167,16 @@ export async function sweepBrowserJobSessions(
   for (const job of jobs) {
     const session = await getSession(job.browser_session_id);
     if (!session || session.status !== 'active' || session.container_status === 'running') continue;
+    if (
+      !(
+        Math.max(
+          Date.parse(job.updated_at),
+          Date.parse(session.created_at),
+          Date.parse(session.last_active ?? session.created_at),
+        ) <= cutoff
+      )
+    )
+      continue;
     const view = await readBrowserJob(job.thread_id, store);
     if (!view || (view.state !== 'idle' && view.state !== 'cancelled')) continue;
     if ((await store.pending(job.id)).length > 0) continue;
@@ -165,7 +214,17 @@ export async function sweepBrowserJobSessions(
       // Re-read host-owned work under the closing transaction; workers cannot race it.
       const pending = await store.pending(job.id);
       const lease = await store.db.get('SELECT 1 FROM gws_ea_browser_site_leases WHERE job_id = ? LIMIT 1', job.id);
-      if (pending.length > 0 || lease) return;
+      const purchase =
+        (await store.db.hasTable('gws_ea_browser_authorities')) &&
+        ((await store.db.get(
+          "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state IN ('live','committing') LIMIT 1",
+          job.id,
+        )) ||
+          (await store.db.get(
+            "SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' LIMIT 1",
+            job.id,
+          )));
+      if (pending.length > 0 || lease || purchase) return;
       await updateSession(session.id, { status: 'closed' });
     });
   }

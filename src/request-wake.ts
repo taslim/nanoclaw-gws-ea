@@ -25,7 +25,9 @@ export type WakeReason =
   | 'interactive'
   | 'cli'
   | 'approval-response'
-  | 'adoption';
+  | 'adoption'
+  | 'browser-purchase-outcome'
+  | 'browser-purchase-card';
 
 export async function requestWake(session: Session, _reason: WakeReason): Promise<boolean> {
   return wakeContainer(session);

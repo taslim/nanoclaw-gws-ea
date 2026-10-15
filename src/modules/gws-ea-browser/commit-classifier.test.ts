@@ -1,5 +1,7 @@
-import { expect, it, vi } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
+import * as nativeAuthentication from './authentication-submit.js';
+afterEach(() => vi.restoreAllMocks());
 import {
   activateControl,
   classifyControlFacts,
@@ -118,6 +120,23 @@ it('submits positively identified native authentication forms without invoking a
     once: () => undefined,
     context: () => ({ newCDPSession: async () => ({ on: () => undefined, send: async () => undefined }) }),
   } as unknown as Page;
+  // This unit mocks only the native Chrome object binding. Native-world integrity has its own real-renderer suite.
+  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({
+    facts: {
+      origin: 'https://auth-dispatch.example',
+      action: form.action,
+      method: 'post',
+      submit: true,
+      fields: [
+        { name: 'username', type: 'text', autocomplete: 'username' },
+        { name: 'password', type: 'password', autocomplete: 'current-password' },
+      ],
+    },
+  } as unknown as NonNullable<Awaited<ReturnType<typeof nativeAuthentication.inspectNativeAuthenticationControl>>>);
+  vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(async () => {
+    native();
+    return true;
+  });
   const arbitraryCallback = vi.fn(async () => undefined);
   await activateControl(page, element, arbitraryCallback);
   expect(native).toHaveBeenCalledTimes(1);
@@ -125,4 +144,26 @@ it('submits positively identified native authentication forms without invoking a
   form.action = 'https://auth-dispatch.example/place-order';
   await expect(activateControl(page, element, arbitraryCallback)).rejects.toMatchObject({ reason: 'purchase_control' });
   expect(arbitraryCallback).not.toHaveBeenCalled();
+});
+
+it('recognizes the reviewed read-only Amazon review URL and refuses unknown activating/security paths', () => {
+  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html')).toBe('ordinary');
+  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/static-submit-decoupled.html')).toBe(
+    'purchase_control',
+  );
+  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html?action=buy')).toBe(
+    'purchase_control',
+  );
+  expect(classifyNavigationUrl('https://www.amazon.com/unknown-oneclick')).toBe('purchase_control');
+  for (const [name, reason] of [
+    ['Write a review', 'speaks_as_principal'],
+    ['Message the restaurant', 'speaks_as_principal'],
+    ['Change sign-in email', 'account_security'],
+    ['Update phone', 'account_security'],
+    ['Manage two-factor', 'account_security'],
+    ['Update payment method', 'account_security'],
+  ])
+    expect(
+      classifyControlFacts({ name, tag: 'button', type: 'submit', role: 'button', href: null, transaction: true }),
+    ).toBe(reason);
 });

@@ -3,6 +3,8 @@ import { stopped } from './queue.js';
 
 /** Runs before workers: a marker is never interpreted as permission to repeat a press. */
 export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
+  const { recoverBrowserPurchases } = await import('./purchase.js');
+  await recoverBrowserPurchases(queue);
   for (const request of await queue.store.pending()) {
     await queue.finish(
       request,

@@ -372,6 +372,14 @@ export class BrowserQueue {
     const at = new Date().toISOString();
     const latest = await this.store.request(request.id);
     if (!latest) return;
+    if (
+      latest.commit_started_at &&
+      !(result instanceof ActionRefusal) &&
+      (result.status === 'outcome_unknown' || result.reason === 'outcome_unknown')
+    ) {
+      const { recordUnknownBrowserPurchaseRequest } = await import('./purchase.js');
+      await recordUnknownBrowserPurchaseRequest(request.id);
+    }
     const frame: ResponseFrame =
       result instanceof ActionRefusal
         ? {

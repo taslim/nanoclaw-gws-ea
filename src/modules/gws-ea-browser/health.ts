@@ -5,6 +5,5 @@ export async function browserHealth(): Promise<
   { schemaVersion: 1 } & ReturnType<ReturnType<typeof getBrowserRuntime>['state']>
 > {
   const runtime = getBrowserRuntime();
-  await runtime.reconcile();
   return { schemaVersion: 1, ...runtime.state() };
 }

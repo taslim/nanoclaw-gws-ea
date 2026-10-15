@@ -75,6 +75,7 @@ const DEFAULT_ON_TOOLS = [
   'install_packages',
   'request_status',
   'relay_code',
+  'reservation_guarantee',
   'send_card',
   'send_file',
   'send_message',
@@ -125,7 +126,7 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     ['browser', ['browser'], BROWSER_TOOLS],
-    ['browser-delegate', ['browser-delegate'], ['cancel_job', 'relay_code']],
+    ['browser-delegate', ['browser-delegate'], ['cancel_job', 'relay_code', 'reservation_guarantee']],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
     ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],

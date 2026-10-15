@@ -8,7 +8,7 @@ import { log } from '../../log.js';
 import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
-import { browserQueueMigration, browserSiteLeasesMigration } from './migration.js';
+import { browserPurchaseMigration, browserQueueMigration, browserSiteLeasesMigration } from './migration.js';
 import { BrowserStore } from './db.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
@@ -29,9 +29,16 @@ import { cleanupBrowserSignInMail, recoverBrowserSignInMail, registerSignInMailD
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
+import {
+  registerBrowserPurchaseDelivery,
+  resumeBrowserPurchaseCommits,
+  sweepBrowserPurchaseState,
+} from './purchase.js';
+import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 
 registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
+registerMigration(browserPurchaseMigration);
 registerMigration(browserSignInMigration);
 
 export class BrowserUnavailableError extends Error {
@@ -305,6 +312,7 @@ onHostStart(async ({ signal }) => {
   const activeQueue = getBrowserQueue();
   await recoverBrowserSignInMail();
   await activeQueue.start();
+  await resumeBrowserPurchaseCommits(activeQueue);
   configureBrowserCancellation(activeQueue);
   await reconcileBrowserGroup();
   await sweepBrowserJobSessions();
@@ -324,6 +332,7 @@ onHostStart(async ({ signal }) => {
       await queue?.retryAnswers();
       await sweepBrowserJobSessions();
       await cleanupBrowserSignInMail();
+      await sweepBrowserPurchaseState(activeQueue);
     })()
       .catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }))
       .finally(() => {
@@ -343,11 +352,8 @@ registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
-onHostShutdown(async () => {
-  await queue?.stop();
-  await recoverBrowserSignInMail();
-  queue = undefined;
-});
+registerBrowserPurchaseDelivery(getBrowserQueue);
+registerReservationGuaranteeDelivery();
 
 export {
   BrowserStore,
@@ -384,6 +390,9 @@ export {
 onHostShutdown(async () => {
   if (reconcileTimer) clearInterval(reconcileTimer);
   reconcileTimer = undefined;
+  await queue?.stop();
+  await recoverBrowserSignInMail();
+  queue = undefined;
   await runtime.shutdown();
 });
 
