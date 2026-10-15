@@ -8,6 +8,7 @@ import { log } from '../../log.js';
 import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
+import { readBrowserEvidence } from './evidence.js';
 import {
   browserPurchaseMigration,
   browserQueueMigration,
@@ -425,4 +426,23 @@ register({
     return undefined;
   },
   handler: async () => browserHealth(),
+});
+
+register({
+  name: 'gws-ea-browser-evidence',
+  description: 'Inspect existing browser job timing and operational metadata.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    if (Object.keys(raw).some((key) => key !== 'job') || typeof raw.job !== 'string' || !raw.job.trim())
+      throw new Error('Browser evidence requires only --job <thread>.');
+    return { job: raw.job };
+  },
+  async handler({ job }) {
+    try {
+      return await readBrowserEvidence(job);
+    } catch (_error) {
+      throw new Error('Browser metadata is unavailable for this job.', { cause: _error });
+    }
+  },
 });

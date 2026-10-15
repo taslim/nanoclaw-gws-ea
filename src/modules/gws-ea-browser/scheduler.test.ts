@@ -131,6 +131,10 @@ it('shares exactly identical read-only checks, while different parties and versi
   await scheduler.tick();
   expect(checks).toBe(1);
   expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toHaveLength(1);
+  expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_check_members ORDER BY watch_id')).toEqual([
+    { watch_id: 'a' },
+    { watch_id: 'b' },
+  ]);
   expect(await getDb().all("SELECT status FROM gws_ea_browser_watches WHERE id IN ('a','b')")).toEqual([
     { status: 'armed' },
     { status: 'armed' },
@@ -141,6 +145,12 @@ it('shares exactly identical read-only checks, while different parties and versi
   vi.setSystemTime(new Date('2026-10-15T12:02:02Z'));
   await scheduler.tick();
   expect(checks).toBe(3);
+  expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_check_members ORDER BY watch_id')).toEqual([
+    { watch_id: 'a' },
+    { watch_id: 'b' },
+    { watch_id: 'c' },
+    { watch_id: 'd' },
+  ]);
 });
 it('does not check pending setup cards and never consumes a booking claim after a failed calendar read', async () => {
   await arm('a', 'same');

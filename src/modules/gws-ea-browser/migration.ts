@@ -42,6 +42,11 @@ export const browserWatchesMigration: PortableMigration & { name: ModuleMigratio
         outcome TEXT, next_check_at TEXT, backoff_until TEXT
       );
       CREATE INDEX gws_ea_browser_watch_check_budget ON gws_ea_browser_watch_checks(site,started_at);
+      CREATE TABLE gws_ea_browser_watch_check_members (
+        check_id TEXT NOT NULL REFERENCES gws_ea_browser_watch_checks(id),
+        watch_id TEXT NOT NULL REFERENCES gws_ea_browser_watches(id),
+        PRIMARY KEY(check_id,watch_id)
+      );
       CREATE TABLE gws_ea_browser_watch_site_state (
         site TEXT PRIMARY KEY, last_check_at TEXT, last_interval_ms INTEGER,
         next_allowed_at TEXT, backoff_until TEXT, consecutive_blocks INTEGER NOT NULL DEFAULT 0,

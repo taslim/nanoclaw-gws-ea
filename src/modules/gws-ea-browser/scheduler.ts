@@ -181,12 +181,15 @@ export class BrowserWatchScheduler {
           first.next_check_at,
           at,
         );
-        for (const watch of watches)
-          await db.run(
+        for (const watch of watches) {
+          const changed = await db.run(
             "UPDATE gws_ea_browser_watches SET status='checking',pending_request_id=? WHERE id=? AND status='armed'",
             id,
             watch.id,
           );
+          if (changed.changes)
+            await db.run('INSERT INTO gws_ea_browser_watch_check_members(check_id,watch_id) VALUES(?,?)', id, watch.id);
+        }
         if (notify)
           await db.run(
             'UPDATE gws_ea_browser_watch_notify SET consumed_at=? WHERE site=? AND consumed_at IS NULL',
