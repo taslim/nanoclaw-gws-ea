@@ -17,6 +17,7 @@ export interface BrowserJobView {
   readonly job: BrowserJob;
   readonly state: BrowserJobState;
   readonly held_sites: readonly string[];
+  readonly waiting_sign_in?: { readonly site: string; readonly origin: string; readonly expires_at: string };
   /** The delivered report's raw text; the rendering boundary frames it as untrusted. */
   readonly last_report?: { readonly at: string; readonly text: string };
 }
@@ -62,6 +63,9 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
     'SELECT 1 FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     job.id,
   );
+  const waitingSignIn = job.cancelled
+    ? undefined
+    : await (await import('./sign-in-mail.js')).readPendingSignInSite(job.id);
   const report = await withExistingMailboxSession(browser, job.browser_session_id, (mailbox) =>
     mailbox.getLatestDeliveredAgentReport(job.source_agent_group_id),
   );
@@ -85,6 +89,7 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
           ? 'working'
           : 'idle',
     held_sites: leases.map((lease) => lease.site),
+    ...(waitingSignIn ? { waiting_sign_in: waitingSignIn } : {}),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
   };
 }

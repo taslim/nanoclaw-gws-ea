@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+const root = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'matter-browser-tests');
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  DATA_DIR: '/private/tmp/matter-browser-tests',
+  DATA_DIR: root,
 }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
@@ -28,7 +33,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await closeDb();
-  fs.rmSync('/private/tmp/matter-browser-tests', { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 it('places a job once, renders state and delivered report freshly, then cancels it when its matter closes', async () => {
@@ -82,4 +87,27 @@ it('cancels jobs linked to closed matters during startup reconciliation', async 
   );
   await cancelClosedMatterJobs();
   expect(await readBrowserJob(THREAD)).toMatchObject({ state: 'cancelled' });
+});
+
+it('names the host-recorded site when the principal needs to relay a sign-in code', async () => {
+  const matter = (
+    await openMatter({
+      title: 'Sign in',
+      openLoop: 'Waiting for the principal code.',
+      links: [{ kind: 'job', reference: THREAD }],
+    })
+  ).matter;
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_sign_in_claims
+     (id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
+     VALUES(?,?,'principal','https://login.merchant.example','merchant.example','{}',?,?,'waiting')`,
+    'principal-site',
+    THREAD,
+    at,
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  expect(await renderMatter(matter)).toContain(
+    'principal sign-in code for merchant.example (https://login.merchant.example)',
+  );
 });

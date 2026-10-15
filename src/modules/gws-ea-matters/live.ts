@@ -362,8 +362,11 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
         const view = await readBrowserJob(link.reference);
         if (!view) return { line: 'no such browser job' };
         const held = view.held_sites.length === 0 ? '' : `; sites: ${view.held_sites.join(', ')}`;
+        const signIn = view.waiting_sign_in
+          ? `; waiting for a principal sign-in code for ${view.waiting_sign_in.site} (${view.waiting_sign_in.origin})`
+          : '';
         return {
-          line: `${view.state}${held}`,
+          line: `${view.state}${held}${signIn}`,
           ...(view.last_report
             ? {
                 framed: `  Last report ${formatLocalTime(view.last_report.at, lens.timezone)}:\n${untrusted(view.last_report.text, FRAME_LIMIT, 'browser')}`,

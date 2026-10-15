@@ -69,6 +69,28 @@ it('creates the job on first reference and derives state freshly from held work'
   });
 });
 
+it('exposes only the live host-recorded principal sign-in site for a code request', async () => {
+  const thread = session.thread_id!;
+  await readBrowserJob(thread);
+  const at = new Date().toISOString();
+  const expires = new Date(Date.now() + 60_000).toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_sign_in_claims
+     (id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
+     VALUES(?,?,'principal','https://login.merchant.example','merchant.example','{}',?,?,'waiting')`,
+    'principal-wait',
+    thread,
+    at,
+    expires,
+  );
+  expect(await readBrowserJob(thread)).toMatchObject({
+    state: 'idle',
+    waiting_sign_in: { site: 'merchant.example', origin: 'https://login.merchant.example', expires_at: expires },
+  });
+  await getDb().run("UPDATE gws_ea_browser_sign_in_claims SET state = 'finished'");
+  expect(await readBrowserJob(thread)).not.toHaveProperty('waiting_sign_in');
+});
+
 it('cancels at the host, releases site leases and refuses later browser use', async () => {
   const thread = session.thread_id!;
   await readBrowserJob(thread);
