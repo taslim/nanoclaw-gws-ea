@@ -15,7 +15,7 @@ import { wakeContainer } from '../../container-runner.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import { clearOutbox, writeSessionMessage } from '../../session-manager.js';
+import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserJob, type BrowserRequest } from './db.js';
 import type { BrowserRuntime } from './index.js';
@@ -23,6 +23,8 @@ import { SiteLeaseStore } from './leases.js';
 import { sweepBrowserStartup } from './start-sweep.js';
 import { readBrowserPolicy } from './policy.js';
 import { reconcileBrowserGroup } from './reconcile.js';
+import { writeBrowserNotice } from './notices.js';
+import { browserAdmissionReady } from './group.js';
 
 export const BROWSER_REQUEST_BUDGET_MS = 90_000;
 export const BROWSER_REQUEST_MAX_BUDGET_MS = 100_000;
@@ -65,6 +67,8 @@ export const browserRequestGuard = defineGuardedAction({
     if (actor.kind !== 'agent' || !actor.sessionId) return DENY('Only a live browser job may use the host browser.');
     if (!(await readBrowserPolicy()).enabled)
       return DENY('The operator needs to enable the browser for this assistant.');
+    if (!browserAdmissionReady())
+      return DENY('The browser is temporarily unavailable; the operator can check browser health.');
     const session = await getSession(actor.sessionId);
     if (
       !session ||
@@ -367,17 +371,15 @@ export class BrowserQueue {
       const session = job && !job.cancelled ? await getSession(job.browser_session_id) : undefined;
       if (!session || session.status !== 'active') continue;
       try {
-        await writeSessionMessage(session.agent_group_id, session.id, {
-          id: `browser-site-${Buffer.from(`${eventId}\0${jobId}`).toString('base64url')}`,
-          kind: 'system',
-          timestamp: new Date().toISOString(),
-          content: JSON.stringify({
+        await writeBrowserNotice(
+          session,
+          `browser-site-${Buffer.from(`${eventId}\0${jobId}`).toString('base64url')}`,
+          JSON.stringify({
             type: 'browser_site_available',
             job: jobId,
             message: 'A site you were waiting for is available. Continue the errand from a fresh observation.',
           }),
-          trigger: true,
-        });
+        );
       } catch (error) {
         if (!isUniqueViolation(error)) throw error;
       }

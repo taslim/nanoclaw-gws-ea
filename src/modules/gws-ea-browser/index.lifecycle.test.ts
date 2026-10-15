@@ -7,7 +7,16 @@ import type { ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { lookup } from '../../cli/registry.js';
-import { BrowserRuntime } from './index.js';
+import { BrowserRuntime, getBrowserRuntime } from './index.js';
+import { getHostStartCallbacks } from '../../host-lifecycle.js';
+import { closeDb, initTestDb } from '../../db/index.js';
+import { BrowserQueue } from './queue.js';
+import { BrowserWatchScheduler } from './scheduler.js';
+import * as group from './group.js';
+import * as reconciliation from './reconcile.js';
+import * as signInMail from './sign-in-mail.js';
+import * as purchases from './purchase.js';
+import * as cancellation from './cancel.js';
 import * as chrome from './chrome.js';
 import * as connection from './connection.js';
 import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
@@ -41,6 +50,99 @@ async function listening(port: number): Promise<boolean> {
 }
 
 describe('optional host browser lifecycle', () => {
+  it('contains startup and sweep projection failures while durable maintenance continues and admission stays closed', async () => {
+    const db = await initTestDb();
+    const recoverMail = vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
+    const queueStart = vi.spyOn(BrowserQueue.prototype, 'start').mockResolvedValue();
+    const resume = vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
+    const reconcile = vi
+      .spyOn(reconciliation, 'reconcileBrowserGroup')
+      .mockRejectedValue(new Error('EACCES: browser template'));
+    vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
+    const idle = vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+    const retry = vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
+    const sweep = vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
+    const cleanup = vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
+    const expire = vi.spyOn(purchases, 'sweepBrowserPurchaseState').mockResolvedValue();
+    const startWatch = vi.spyOn(BrowserWatchScheduler.prototype, 'start').mockImplementation(() => undefined);
+    const stopWatch = vi.spyOn(BrowserWatchScheduler.prototype, 'stop').mockResolvedValue();
+    vi.useFakeTimers();
+    try {
+      const start = getHostStartCallbacks().at(-1)!;
+      await expect(
+        start({ db, signal: new AbortController().signal, deliveryAdapter: { deliver: async () => undefined } }),
+      ).resolves.toBeUndefined();
+      expect(recoverMail.mock.invocationCallOrder[0]).toBeLessThan(queueStart.mock.invocationCallOrder[0]!);
+      expect(queueStart.mock.invocationCallOrder[0]).toBeLessThan(resume.mock.invocationCallOrder[0]!);
+      expect(resume.mock.invocationCallOrder[0]).toBeLessThan(reconcile.mock.invocationCallOrder[0]!);
+      expect(group.browserAdmissionReady()).toBe(false);
+      expect(getBrowserRuntime().state().ready).toBe(false);
+      expect(startWatch).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(retry).toHaveBeenCalled();
+      expect(sweep).toHaveBeenCalled();
+      expect(cleanup).toHaveBeenCalled();
+      expect(expire).toHaveBeenCalled();
+      reconcile.mockResolvedValue();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(group.browserAdmissionReady()).toBe(true);
+      expect(startWatch).toHaveBeenCalledOnce();
+      const priorExpiry = expire.mock.calls.length;
+      reconcile.mockRejectedValue(new Error('EACCES: active destination projection'));
+      idle.mockRejectedValue(new Error('EACCES: idle cleanup'));
+      retry.mockRejectedValue(new Error('EACCES: mailbox temporarily unavailable'));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(group.browserAdmissionReady()).toBe(false);
+      expect(stopWatch).toHaveBeenCalledOnce();
+      expect(expire.mock.calls.length).toBe(priorExpiry + 1);
+      expect(cleanup.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      await closeDb();
+    }
+  });
+
+  it('does not reconcile or admit browser work before failed purchase recovery is retried successfully', async () => {
+    const db = await initTestDb();
+    vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
+    vi.spyOn(BrowserQueue.prototype, 'start')
+      .mockRejectedValueOnce(new Error('EIO: purchase recovery'))
+      .mockResolvedValue();
+    const resume = vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
+    const reconcile = vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
+    vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
+    vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+    vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
+    vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
+    vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
+    vi.spyOn(purchases, 'sweepBrowserPurchaseState').mockResolvedValue();
+    vi.spyOn(BrowserWatchScheduler.prototype, 'start').mockImplementation(() => undefined);
+    vi.spyOn(BrowserWatchScheduler.prototype, 'stop').mockResolvedValue();
+    vi.useFakeTimers();
+    try {
+      await expect(
+        getHostStartCallbacks().at(-1)!({
+          db,
+          signal: new AbortController().signal,
+          deliveryAdapter: { deliver: async () => undefined },
+        }),
+      ).resolves.toBeUndefined();
+      expect(group.browserAdmissionReady()).toBe(false);
+      expect(resume).not.toHaveBeenCalled();
+      expect(reconcile).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(resume).toHaveBeenCalledOnce();
+      expect(reconcile).toHaveBeenCalledOnce();
+      expect(group.browserAdmissionReady()).toBe(true);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      await closeDb();
+    }
+  });
   it('does not admit a browser while Playwright protocol diagnostics can expose credentials', async () => {
     await ensureBrowserPaths(browserPaths(file));
     await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));

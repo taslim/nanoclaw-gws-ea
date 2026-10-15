@@ -32,6 +32,16 @@ export const BROWSER_PLUGIN = 'gws-ea-browser';
 export const BROWSER_NAME = 'browser';
 export const BROWSER_MODEL = 'claude-sonnet-5-5';
 
+let admissionReady = false;
+/** Recovery and destination projection must finish before a sealed session may wake. */
+export function browserAdmissionReady(): boolean {
+  return admissionReady;
+}
+/** Only the host browser lifecycle opens admission; a failed sweep closes it again. */
+export function setBrowserAdmissionReady(ready: boolean): void {
+  admissionReady = ready;
+}
+
 /** Exact capabilities; every errand has isolated provider state and no shared memory. */
 export const BROWSER_CAPABILITIES: readonly string[] = [
   'browser',
@@ -167,6 +177,7 @@ registerProtectedGroupPolicy('gws-ea-browser:host-owned', async (agentGroupId) =
 registerSessionAdmissionPolicy('gws-ea-browser:stamped-reach', async ({ key }) => {
   if (!(await getDb().hasTable('gws_ea_profile')) || key.agentGroupId !== (await getBrowserAgentGroupId())) return;
   if (!(await readBrowserPolicy()).enabled) throw new Error('browser may not start: the operator must enable it');
+  if (!browserAdmissionReady()) throw new Error('browser may not start: host browser recovery is unavailable');
   const session = await getSession(key.sessionId);
   const main = await getMainAgentGroupId();
   if (

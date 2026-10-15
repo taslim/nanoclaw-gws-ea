@@ -8,7 +8,7 @@ import { getPendingApproval, getSession } from '../../db/sessions.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { requestWake } from '../../request-wake.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { writeBrowserNotice } from './notices.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { PendingApproval } from '../../types.js';
 import {
@@ -334,13 +334,11 @@ export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void>
     const session = job ? await getSession(job.browser_session_id) : undefined;
     if (!session || session.status !== 'active') continue;
     try {
-      await writeSessionMessage(session.agent_group_id, session.id, {
-        id: `browser-watch-${digest(`${notice.watch_id}\0${notice.event_key}`)}`,
-        kind: 'system',
-        timestamp: new Date().toISOString(),
-        trigger: true,
-        content: notice.outcome_json,
-      });
+      await writeBrowserNotice(
+        session,
+        `browser-watch-${digest(`${notice.watch_id}\0${notice.event_key}`)}`,
+        notice.outcome_json,
+      );
       // eslint-disable-next-line no-catch-all/no-catch-all -- Retain a durable notice when its mailbox cannot be written.
     } catch (error) {
       if (!isUniqueViolation(error)) continue;

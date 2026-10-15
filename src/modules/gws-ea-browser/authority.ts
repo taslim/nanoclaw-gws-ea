@@ -4,7 +4,7 @@ import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { requestWake } from '../../request-wake.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { writeBrowserNotice } from './notices.js';
 import { markBrowserRequestCommitStarted } from './db.js';
 import {
   completePurchaseFacts,
@@ -339,12 +339,10 @@ export async function notifyPurchaseOutcome(authorityId: string, store = new Pur
         : 'outcome_unknown';
   const facts = JSON.parse(authority.facts_json) as PurchaseFacts;
   try {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `browser-purchase-${authority.id}-${status}`,
-      kind: 'system',
-      timestamp: new Date().toISOString(),
-      trigger: true,
-      content: JSON.stringify({
+    await writeBrowserNotice(
+      session,
+      `browser-purchase-${authority.id}-${status}`,
+      JSON.stringify({
         type: 'browser_purchase_outcome',
         job: authority.job_id,
         attempt_id: authority.attempt_id,
@@ -359,7 +357,7 @@ export async function notifyPurchaseOutcome(authorityId: string, store = new Pur
             }
           : {}),
       }),
-    });
+    );
   } catch (error) {
     if (!isUniqueViolation(error)) throw error;
   }

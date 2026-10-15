@@ -24,13 +24,15 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import './guidance.js';
-import { browserGroupDrift, ensureBrowserGroup } from './group.js';
+import { browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 
 beforeEach(async () => {
+  setBrowserAdmissionReady(true);
   fs.rmSync(ROOT, { recursive: true, force: true });
   await runMigrations(await initTestDb());
 });
 afterEach(async () => {
+  setBrowserAdmissionReady(false);
   delete process.env.GWS_EA_BROWSER_POLICY_FILE;
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -70,7 +72,7 @@ it('stamps the exact sealed composition once and refuses capability drift at adm
   expect(resolveCapabilities('all', 'main')).not.toContain('browser');
 });
 
-it('composes main delegation only with enabled policy and gives the disabled operator instruction otherwise', async () => {
+it('keeps active main guidance conditional so enablement changes need no container restart', async () => {
   const main = { id: 'main', name: 'main', folder: 'main', agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(main);
   const { getDb } = await import('../../db/connection.js');
@@ -78,16 +80,25 @@ it('composes main delegation only with enabled policy and gives the disabled ope
   const file = `${ROOT}/browser/policy.json`;
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
-  let sections = await getRequiredProjectDocSections(main);
-  expect(sections.find((section) => section.name === 'Browser delegation')?.body).toMatch(/operator.*enable/i);
+  const original = await getRequiredProjectDocSections(main);
+  const initialGuidance = original.find((section) => section.name === 'Browser delegation')?.body;
+  expect(initialGuidance).toContain('available destinations');
+  expect(initialGuidance).toContain('even if it was absent from your initial destination list');
+  expect(initialGuidance).toMatch(/operator.*enable/i);
+  expect(initialGuidance).toContain('thread: "new"');
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
-  sections = await getRequiredProjectDocSections(main);
+  const sections = await getRequiredProjectDocSections(main);
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
+  expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('thread: "new"');
   expect(guidance).toContain('relay_code');
   expect(guidance).toContain('no_item_for_site');
   expect(guidance).toContain('outcome_unknown');
   expect(guidance).toContain('password or token');
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  expect(
+    (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,
+  ).toBe(initialGuidance);
 });
 
 it('admits only canonical main errand sessions to the sealed browser group', async () => {
@@ -109,6 +120,15 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
   const own = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
   await expect(
     assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+  ).resolves.toBeUndefined();
+  setBrowserAdmissionReady(false);
+  for (const disposition of ['create', 'adopt'] as const)
+    await expect(
+      assertSessionAdmitted({ disposition, key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+    ).rejects.toThrow('host browser recovery is unavailable');
+  setBrowserAdmissionReady(true);
+  await expect(
+    assertSessionAdmitted({ disposition: 'adopt', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
   ).resolves.toBeUndefined();
   for (const thread of ['system:a2a:external:errand', 'system:task:scheduled', 'system:channel:chat']) {
     const foreign = (await resolveSystemSession(id, thread)).session;

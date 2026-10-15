@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const ROOT = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -14,7 +16,7 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getDestinationByName } from '../agent-to-agent/db/agent-destinations.js';
-import { resolveSystemSession } from '../../session-manager.js';
+import { resolveSystemSession, sessionDir } from '../../session-manager.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
@@ -24,8 +26,11 @@ import { routeAgentMessage } from '../agent-to-agent/agent-route.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import './guidance.js';
+import * as destinationProjection from '../agent-to-agent/write-destinations.js';
+import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 
 beforeEach(async () => {
+  setBrowserAdmissionReady(true);
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   await runMigrations(await initTestDb());
   await createAgentGroup({
@@ -38,8 +43,38 @@ beforeEach(async () => {
   await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
 });
 afterEach(async () => {
+  setBrowserAdmissionReady(false);
+  vi.restoreAllMocks();
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+it('repairs active main destination projection after interrupted enable and disable', async () => {
+  const main = (await resolveSystemSession('main', 'system:test:already-active')).session;
+  const file = `${ROOT}/browser/policy.json`;
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  const projection = vi.spyOn(destinationProjection, 'writeDestinations');
+  projection.mockRejectedValueOnce(new Error('EACCES: owned destination file'));
+  await expect(reconcileBrowserGroup(file)).rejects.toThrow('EACCES');
+  expect(browserAdmissionReady()).toBe(false);
+  await reconcileBrowserGroup(file);
+  const names = (): unknown[] => {
+    const db = new Database(path.join(sessionDir('main', main.id), 'inbound.db'), { readonly: true });
+    try {
+      return db.prepare('SELECT name FROM destinations ORDER BY name').all();
+    } finally {
+      db.close();
+    }
+  };
+  expect(names()).toContainEqual({ name: 'browser' });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  projection.mockRejectedValueOnce(new Error('EACCES: owned destination file'));
+  await expect(reconcileBrowserGroup(file)).rejects.toThrow('EACCES');
+  // The central edge is already gone; retry must still clear the active mailbox.
+  expect(await getDestinationByName('main', 'browser')).toBeUndefined();
+  expect(names()).toContainEqual({ name: 'browser' });
+  await reconcileBrowserGroup(file);
+  expect(names()).not.toContainEqual({ name: 'browser' });
 });
 
 it('creates the sealed per-thread edge and disables every delegated errand even before its first browser call', async () => {

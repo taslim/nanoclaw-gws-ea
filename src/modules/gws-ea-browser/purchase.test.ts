@@ -44,6 +44,7 @@ import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority }
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
 import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
+import { setBrowserAdmissionReady } from './group.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -323,8 +324,10 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     if (!getDeliveryAction('reservation_guarantee')) registerReservationGuaranteeDelivery();
     await queue.start();
     await resumeBrowserPurchaseCommits(queue);
+    setBrowserAdmissionReady(true);
   });
   afterEach(async () => {
+    setBrowserAdmissionReady(false);
     await queue?.stop();
     await page?.context().close();
     delete process.env.GWS_EA_BROWSER_POLICY_FILE;
@@ -501,31 +504,75 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(submitted).toBe(1);
     expect((await grant()).state).toBe('committed');
   });
-  it('keeps a lapsed authority live and commits a rebuilt matching checkout without a new card', async () => {
-    await buy();
-    const [row] = await approvals();
-    await queue.accept(
-      'browser',
-      { actions: [{ kind: 'navigate', url: `${AMAZON_RETAIL.origin}/s?k=kettle` }] },
-      session,
-      'leave-review',
-    );
-    await queue.idle();
-    await click(row);
-    await queue.idle();
-    expect(submitted).toBe(0);
-    expect((await grant()).state).toBe('live');
-    await queue.accept(
-      'browser',
-      { actions: [{ kind: 'navigate', url: `${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}` }] },
-      session,
-      'rebuild-review',
-    );
-    await queue.idle();
-    await buy('rebuilt');
-    expect(submitted).toBe(1);
-    expect(sent).toHaveLength(1);
-  });
+  it.each([
+    ['lapsed checkout', false, 'checkout_lapsed'],
+    ['closed idle page', true, 'unsupported_merchant'],
+  ] as const)(
+    'resumes approval after restart with a %s and revalidates the rebuilt checkout',
+    async (_name, closePage, status) => {
+      await buy();
+      const [row] = await approvals();
+      await queue.accept(
+        'browser',
+        { actions: [{ kind: 'navigate', url: `${AMAZON_RETAIL.origin}/s?k=kettle` }] },
+        session,
+        'leave-review',
+      );
+      await queue.idle();
+      await queue.stop();
+      await queue.start();
+      await resumeBrowserPurchaseCommits(queue);
+      if (closePage) {
+        await page.close();
+        page = await browser.newPage();
+      }
+      await click(row);
+      await queue.idle();
+      expect(submitted).toBe(0);
+      const authority = await grant();
+      expect(authority.state).toBe('live');
+      const notices = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox
+          .getInboundHistory(100)
+          .filter((message) =>
+            (JSON.parse(message.content) as { text?: string }).text?.includes('"authority_unspent"'),
+          ),
+      );
+      expect(notices).toHaveLength(1);
+      const notice = notices?.[0];
+      if (!notice) throw new Error('Expected native purchase continuation');
+      expect(notice).toMatchObject({ kind: 'chat' });
+      const envelope = JSON.parse(notice.content) as { text: string };
+      expect(JSON.parse(envelope.text)).toMatchObject({
+        type: 'browser_purchase_outcome',
+        status,
+        authority_id: authority.id,
+        authority_unspent: true,
+        safe_to_rebuild: true,
+      });
+      await queue.retryAnswers();
+      expect(
+        await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox
+            .getInboundHistory(100)
+            .filter((message) =>
+              (JSON.parse(message.content) as { text?: string }).text?.includes('"authority_unspent"'),
+            ),
+        ),
+      ).toHaveLength(1);
+      await queue.accept(
+        'browser',
+        { actions: [{ kind: 'navigate', url: `${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}` }] },
+        session,
+        'rebuild-review',
+      );
+      await queue.idle();
+      await buy('rebuilt');
+      expect(submitted).toBe(1);
+      expect(sent).toHaveLength(1);
+      expect((await grant()).state).toBe('committed');
+    },
+  );
   it('cancels an open card atomically and expires unanswered cards through the native lifecycle', async () => {
     await buy();
     const [row] = await approvals();
@@ -554,9 +601,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         .getInboundHistory(100)
         .filter(
           (message) =>
-            (JSON.parse(message.content) as { type?: string; attempt_id?: string }).type ===
-              'browser_purchase_outcome' &&
-            (JSON.parse(message.content) as { attempt_id?: string }).attempt_id === authority.attempt_id,
+            (JSON.parse(message.content) as { text?: string }).text?.includes('"browser_purchase_outcome"') &&
+            (JSON.parse(message.content) as { text?: string }).text?.includes(authority.attempt_id),
         ),
     );
     expect(notes).toHaveLength(1);

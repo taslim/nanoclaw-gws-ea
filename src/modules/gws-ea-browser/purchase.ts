@@ -2,10 +2,13 @@ import { createHash } from 'node:crypto';
 import type { ElementHandle, Page } from 'playwright-core';
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
+import { isUniqueViolation } from '../../db/errors.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getPendingApproval, getSession } from '../../db/sessions.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import type { ResponseFrame } from '../../cli/frame.js';
+import { requestWake } from '../../request-wake.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
@@ -24,11 +27,12 @@ import {
 } from './cards.js';
 import { activateControl, BrowserSiteBusyError, withBrowserJobNavigation } from './commit-classifier.js';
 import { SiteLeaseStore } from './leases.js';
-import { BrowserStore } from './db.js';
+import { BrowserStore, type BrowserRequest } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
 import { readMerchantPurchase, readMerchantPurchaseEvidence } from './merchant-signatures.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
+import { writeBrowserNotice } from './notices.js';
 import {
   BrowserQueue,
   registerBrowserActionDelivery,
@@ -558,12 +562,63 @@ export async function executeBrowserPurchase(
 }
 
 registerBrowserQueuedAction('purchase', { validate: validatePurchaseRequest, execute: executeBrowserPurchase });
+
+/** Internal approval work has no polling MCP caller; every pre-commit answer resumes its job. */
+async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
+  if (request.commit_started_at) return; // Marked outcomes already use the durable authority notification.
+  const payload = JSON.parse(request.payload_json) as Record<string, unknown>;
+  const authority =
+    typeof payload.authority_id === 'string' ? await new PurchaseAuthorityStore().get(payload.authority_id) : undefined;
+  if (!authority || authority.job_id !== request.job_id || authority.outcome_json) return;
+  const job = await new BrowserStore().getJob(request.job_id);
+  const session = job ? await getSession(job.browser_session_id) : undefined;
+  if (!job || !session || session.id !== request.session_id) return;
+  const data =
+    frame.ok && isRecord(frame.data)
+      ? frame.data
+      : {
+          status: 'stopped',
+          reason: frame.ok ? 'browser_unavailable' : frame.error.code,
+        };
+  const unspent = authority.state === 'live' && !authority.commit_started_at;
+  const cancellation = await getDb().get<{ cancel_requested: number }>(
+    'SELECT cancel_requested FROM gws_ea_browser_jobs WHERE id=?',
+    job.id,
+  );
+  const rebuild =
+    unspent &&
+    authority.expires_at > new Date().toISOString() &&
+    !job.cancelled &&
+    cancellation?.cancel_requested === 0;
+  try {
+    await writeBrowserNotice(
+      session,
+      `browser-commit-${request.id}`,
+      JSON.stringify({
+        ...data,
+        type: 'browser_purchase_outcome',
+        job: job.id,
+        authority_id: authority.id,
+        authority_unspent: unspent,
+        safe_to_rebuild: rebuild,
+        repeat_safe: false,
+        message: rebuild
+          ? 'No purchase was attempted. Rebuild the supported checkout from a fresh observation and call purchase; the host will revalidate the original approved facts, bounds and expiry. Do not repeat the internal commit request.'
+          : 'No purchase was attempted. The existing approval cannot currently be used; report this outcome and continue only through the normal purchase flow.',
+      }),
+    );
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+  }
+  void requestWake(session, 'browser-purchase-outcome').catch(() => undefined);
+}
 registerBrowserQueuedAction('browser_purchase_commit', {
   validate(content) {
     if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');
     return { authority_id: content.authority_id };
   },
   execute: (context, payload) => executeAuthorizedPurchase(context, String(payload.authority_id)),
+  deliverAnswer: deliverPurchaseCommitAnswer,
 });
 export function registerBrowserPurchaseDelivery(queue: () => BrowserQueue): void {
   getPurchaseQueue = queue;

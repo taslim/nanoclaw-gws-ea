@@ -9,12 +9,23 @@ import {
 } from '../agent-to-agent/db/agent-destinations.js';
 import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { cancelBrowserJob } from './cancel.js';
-import { ensureBrowserGroup } from './group.js';
+import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 import { readBrowserPolicy } from './policy.js';
 import './destination-policy.js';
 
 /** Called by the browser composition on start, every use and periodic sweep, after request recovery. */
 export async function reconcileBrowserGroup(policyFile?: string): Promise<void> {
+  try {
+    await reconcileDestinations(policyFile);
+  } catch (error) {
+    // On-use reconciliation shares the same admission boundary as startup and
+    // sweeps. A partially projected map cannot keep a previous ready state.
+    setBrowserAdmissionReady(false);
+    throw error;
+  }
+}
+
+async function reconcileDestinations(policyFile?: string): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
   const main = await getMainAgentGroupId();
   const policy = await readBrowserPolicy(policyFile);
@@ -42,7 +53,9 @@ export async function reconcileBrowserGroup(policyFile?: string): Promise<void> 
       browser,
       browser,
     );
-    const owners = new Set(rows.map((row) => row.agent_group_id));
+    // Retry projection even when a prior sweep deleted the central edge before
+    // its mailbox write failed. Active containers may still hold that old map.
+    const owners = new Set([browser, ...(main === null ? [] : [main]), ...rows.map((row) => row.agent_group_id)]);
     for (const row of rows) await deleteDestination(row.agent_group_id, row.local_name);
     for (const owner of owners) await project(owner);
     return;
@@ -66,33 +79,37 @@ export async function reconcileBrowserGroup(policyFile?: string): Promise<void> 
       inbound_untrusted: 0,
       created_at: new Date().toISOString(),
     });
-    await project(browser);
   }
   const current = await getDestinationByName(main, 'browser');
   if (
-    current?.target_type === 'agent' &&
-    current.target_id === browser &&
-    current.session_mode === 'per-thread' &&
-    current.inbound_untrusted === 1
-  )
-    return;
-  // A stale or unsafe edge is replaced natively, never layered with a second route.
-  for (const destination of await getDestinations(main)) {
-    if (
-      destination.local_name === 'browser' ||
-      (destination.target_type === 'agent' && destination.target_id === browser)
+    !(
+      current?.target_type === 'agent' &&
+      current.target_id === browser &&
+      current.session_mode === 'per-thread' &&
+      current.inbound_untrusted === 1
     )
-      await deleteDestination(main, destination.local_name);
+  ) {
+    // A stale or unsafe edge is replaced natively, never layered with a second route.
+    for (const destination of await getDestinations(main)) {
+      if (
+        destination.local_name === 'browser' ||
+        (destination.target_type === 'agent' && destination.target_id === browser)
+      )
+        await deleteDestination(main, destination.local_name);
+    }
+    await createDestination({
+      agent_group_id: main,
+      local_name: 'browser',
+      target_type: 'agent',
+      target_id: browser,
+      session_mode: 'per-thread',
+      inbound_untrusted: 1,
+      created_at: new Date().toISOString(),
+    });
   }
-  await createDestination({
-    agent_group_id: main,
-    local_name: 'browser',
-    target_type: 'agent',
-    target_id: browser,
-    session_mode: 'per-thread',
-    inbound_untrusted: 1,
-    created_at: new Date().toISOString(),
-  });
+  // A correct central row is not evidence that its last mailbox projection
+  // succeeded. Re-project both directions, including already-active main.
+  await project(browser);
   await project(main);
 }
 

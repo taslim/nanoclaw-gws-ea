@@ -2,7 +2,7 @@ import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { writeBrowserNotice } from './notices.js';
 import { requestWake } from '../../request-wake.js';
 import { formatLocalTime } from '../../timezone.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
@@ -145,12 +145,10 @@ export async function notifyPurchaseCard(cardId: string, outcome: string): Promi
   const session = job ? await getSession(job.browser_session_id) : undefined;
   if (!session) return;
   try {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `browser-card-${card.id}-${outcome}`,
-      kind: 'system',
-      timestamp: new Date().toISOString(),
-      trigger: true,
-      content: JSON.stringify({
+    await writeBrowserNotice(
+      session,
+      `browser-card-${card.id}-${outcome}`,
+      JSON.stringify({
         type: 'browser_purchase_outcome',
         job: card.job_id,
         card_id: card.id,
@@ -159,7 +157,7 @@ export async function notifyPurchaseCard(cardId: string, outcome: string): Promi
           ? { message: 'The principal declined. Remove the cart items you added; do not try another purchase path.' }
           : {}),
       }),
-    });
+    );
   } catch (error) {
     if (!isUniqueViolation(error)) throw error;
   }

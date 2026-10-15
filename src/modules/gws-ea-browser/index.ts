@@ -23,7 +23,7 @@ import './recipes.js';
 import './capability.js';
 import './fill.js';
 import { browserDiagnosticsUnsafe } from './onepassword.js';
-import './group.js';
+import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
 import './guidance.js';
 import {
@@ -77,7 +77,10 @@ export class BrowserRuntime {
   private lastFailure: { reason: 'browser_unavailable'; at: string } | null = null;
   private readonly disconnectListeners = new Set<() => void>();
 
-  constructor(private readonly policyFile?: string) {}
+  constructor(
+    private readonly policyFile?: string,
+    private readonly admissionReady: () => boolean = () => true,
+  ) {}
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.tail.then(operation);
@@ -291,6 +294,7 @@ export class BrowserRuntime {
 
   state(): {
     enabled: boolean;
+    ready: boolean;
     reason?: string;
     credentialMode?: 'email' | '1password';
     proxy: { state: 'listening'; port: number } | { state: 'stopped' };
@@ -302,6 +306,7 @@ export class BrowserRuntime {
   } {
     return {
       enabled: this.policy.enabled,
+      ready: this.admissionReady() && this.policy.enabled && this.proxy !== undefined && !this.stopped,
       ...(this.policy.enabled ? { credentialMode: this.policy.credentialMode } : { reason: this.policy.reason }),
       proxy: this.proxy ? { state: 'listening', port: this.proxy.port } : { state: 'stopped' },
       chrome: this.attached
@@ -313,7 +318,7 @@ export class BrowserRuntime {
   }
 }
 
-const runtime = new BrowserRuntime();
+const runtime = new BrowserRuntime(undefined, browserAdmissionReady);
 export function getBrowserRuntime(): BrowserRuntime {
   return runtime;
 }
@@ -322,32 +327,68 @@ let watchScheduler: BrowserWatchScheduler | undefined;
 let reconcileTimer: NodeJS.Timeout | undefined;
 let reconciling = false;
 onHostStart(async ({ signal }) => {
+  setBrowserAdmissionReady(false);
   const activeQueue = getBrowserQueue();
-  await recoverBrowserSignInMail();
-  await activeQueue.start();
-  await resumeBrowserPurchaseCommits(activeQueue);
   configureBrowserCancellation(activeQueue);
-  await reconcileBrowserGroup();
-  await sweepBrowserJobSessions();
-  // Optional capability failures have a health outcome; other channels start.
-  await runtime.reconcile().catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }));
+  let recovered = false;
+  const optional = async (operation: () => Promise<void>): Promise<boolean> => {
+    // Optional capability failures must not stop messaging or later cleanup.
+    /* eslint-disable no-catch-all/no-catch-all -- each optional host task has an independent retry boundary */
+    try {
+      await operation();
+      return true;
+    } catch (_error) {
+      log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' });
+      return false;
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  };
+  const reconcile = async (): Promise<void> => {
+    const ready = await optional(async () => {
+      if (!recovered) {
+        await recoverBrowserSignInMail();
+        // Queue startup recovers purchase markers before any worker can run.
+        await activeQueue.start();
+        await resumeBrowserPurchaseCommits(activeQueue);
+        recovered = true;
+      }
+      await reconcileBrowserGroup();
+      await runtime.reconcile();
+    });
+    setBrowserAdmissionReady(ready && !signal.aborted);
+    if (!ready || signal.aborted) {
+      const scheduler = watchScheduler;
+      watchScheduler = undefined;
+      if (scheduler) await optional(() => scheduler.stop());
+    } else if (!watchScheduler) {
+      watchScheduler = createBrowserWatchScheduler(activeQueue);
+      watchScheduler.start(signal);
+    }
+  };
+  const maintain = async (): Promise<void> => {
+    // Failed mandatory recovery cannot be bypassed by expiry or session work.
+    if (!recovered) return;
+    for (const task of [
+      () => runtime.closeIdleWindows(),
+      () => activeQueue.retryAnswers(),
+      () => sweepBrowserJobSessions(),
+      () => cleanupBrowserSignInMail(),
+      () => sweepBrowserPurchaseState(activeQueue),
+    ])
+      await optional(task);
+  };
+  await reconcile();
+  await maintain();
   if (signal.aborted) {
     await runtime.stop();
     return;
   }
-  watchScheduler = createBrowserWatchScheduler(activeQueue);
-  watchScheduler.start(signal);
   reconcileTimer = setInterval(() => {
     if (reconciling) return;
     reconciling = true;
     void (async () => {
-      await reconcileBrowserGroup();
-      await runtime.reconcile();
-      await runtime.closeIdleWindows();
-      await queue?.retryAnswers();
-      await sweepBrowserJobSessions();
-      await cleanupBrowserSignInMail();
-      await sweepBrowserPurchaseState(activeQueue);
+      await reconcile();
+      await maintain();
     })()
       .catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }))
       .finally(() => {
@@ -406,6 +447,7 @@ export {
   type PinnedBrowserRef,
 } from './observe.js';
 onHostShutdown(async () => {
+  setBrowserAdmissionReady(false);
   if (reconcileTimer) clearInterval(reconcileTimer);
   reconcileTimer = undefined;
   await watchScheduler?.stop();

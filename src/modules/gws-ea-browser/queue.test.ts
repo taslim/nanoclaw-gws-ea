@@ -23,6 +23,7 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
 import { BrowserQueue, browserRequestGuard, registerBrowserQueuedAction } from './queue.js';
+import { setBrowserAdmissionReady } from './group.js';
 
 let store: BrowserStore;
 let session: Session;
@@ -40,6 +41,7 @@ beforeEach(async () => {
   store = new BrowserStore();
 });
 afterEach(async () => {
+  setBrowserAdmissionReady(false);
   vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
@@ -50,11 +52,15 @@ it('rechecks operator enablement for a previously live browser job', async () =>
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
   vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+  setBrowserAdmissionReady(true);
   const input = {
     actor: { kind: 'agent' as const, agentGroupId: session.agent_group_id, sessionId: session.id },
     payload: {},
   };
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'allow' });
+  setBrowserAdmissionReady(false);
+  expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
+  setBrowserAdmissionReady(true);
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
 });
@@ -197,6 +203,52 @@ it('retries a delegated terminal answer from its durable frame after startup int
   expect(delivered.at(-1)).toEqual(delivered[0]);
   expect(responses()).toHaveLength(1);
   expect(executions).toBe(0);
+  await queue.stop();
+});
+
+it('wakes an interrupted internal purchase after restart without consuming or pressing its authority', async () => {
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Expected browser job');
+  const at = new Date().toISOString();
+  await store.db.run(
+    `INSERT INTO gws_ea_browser_authorities
+     (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+     VALUES('restart-live',?,'checkout','live',?,'{}','[]','restart-attempt',?,?)`,
+    job.id,
+    JSON.stringify({ site: 'amazon.com' }),
+    new Date(Date.now() + 60_000).toISOString(),
+    at,
+  );
+  const queue = new BrowserQueue(store, runtime);
+  await queue.accept('browser_purchase_commit', { authority_id: 'restart-live' }, session, 'internal-restart');
+  await queue.start();
+  await queue.idle();
+  const notes = (): Array<{ kind: string; trigger: number; content: string }> => {
+    const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    try {
+      return inbound
+        .prepare("SELECT kind,trigger,content FROM messages_in WHERE id LIKE 'browser-commit-%'")
+        .all() as Array<{ kind: string; trigger: number; content: string }>;
+    } finally {
+      inbound.close();
+    }
+  };
+  expect(notes()).toHaveLength(1);
+  expect(notes()[0]).toMatchObject({ kind: 'chat', trigger: 1 });
+  const envelope = JSON.parse(notes()[0].content) as { text: string };
+  expect(JSON.parse(envelope.text)).toMatchObject({
+    type: 'browser_purchase_outcome',
+    reason: 'interrupted',
+    authority_id: 'restart-live',
+    authority_unspent: true,
+    safe_to_rebuild: true,
+  });
+  await queue.retryAnswers();
+  expect(notes()).toHaveLength(1);
+  expect(
+    await store.db.get('SELECT state,commit_started_at FROM gws_ea_browser_authorities WHERE id = ?', 'restart-live'),
+  ).toEqual({ state: 'live', commit_started_at: null });
+  expect(await store.db.all('SELECT * FROM gws_ea_browser_purchase_attempts')).toEqual([]);
   await queue.stop();
 });
 
