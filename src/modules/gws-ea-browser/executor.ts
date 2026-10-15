@@ -21,6 +21,7 @@ import {
   observePage,
   pageHasSecret,
   pinBrowserRefs,
+  readBrowserRef,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
@@ -78,14 +79,10 @@ function text(value: unknown, name: string): string {
   return value;
 }
 function ref(value: Record<string, unknown>): BrowserRef {
-  if (
-    typeof value.ref !== 'string' ||
-    !/^e\d+$/u.test(value.ref) ||
-    !Number.isInteger(value.generation) ||
-    Number(value.generation) < 1
-  )
-    throw invalidArgs('A browser ref needs ref and its snapshot generation.');
-  return { ref: value.ref, generation: Number(value.generation) };
+  return readBrowserRef(
+    { ref: value.ref, generation: value.generation },
+    'A browser ref needs ref and its snapshot generation.',
+  );
 }
 function safeKey(value: unknown): string {
   const key = text(value, 'key');

@@ -1,5 +1,7 @@
 import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
+import { invalidArgs } from '../../cli/delivery-action.js';
+import { isRecord } from '../../gws-ea/validation.js';
 
 export interface BrowserObservation {
   generation: number;
@@ -11,6 +13,21 @@ export interface BrowserObservation {
 export interface BrowserRef {
   ref: string;
   generation: number;
+}
+
+export const BROWSER_REF_PATTERN = /^(?:f\d+)?e\d+$/u;
+
+export function readBrowserRef(raw: unknown, message: string): BrowserRef {
+  if (
+    !isRecord(raw) ||
+    Object.keys(raw).some((key) => !['ref', 'generation'].includes(key)) ||
+    typeof raw.ref !== 'string' ||
+    !BROWSER_REF_PATTERN.test(raw.ref) ||
+    !Number.isInteger(raw.generation) ||
+    Number(raw.generation) < 1
+  )
+    throw invalidArgs(message);
+  return { ref: raw.ref, generation: Number(raw.generation) };
 }
 export interface PinnedBrowserRef extends BrowserRef {
   element: ElementHandle;
@@ -188,7 +205,7 @@ export class BrowserRefError extends Error {
 /** Resolve the entire batch before another snapshot can replace e1 with a different element. */
 export async function pinBrowserRefs(page: Page, refs: readonly BrowserRef[]): Promise<Map<string, PinnedBrowserRef>> {
   const state = stateFor(page);
-  if (refs.some((ref) => ref.generation !== state.generation || !/^e\d+$/u.test(ref.ref)))
+  if (refs.some((ref) => ref.generation !== state.generation || !BROWSER_REF_PATTERN.test(ref.ref)))
     throw new BrowserRefError('stale_ref');
   const pinned = new Map<string, PinnedBrowserRef>();
   try {

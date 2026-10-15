@@ -12,6 +12,7 @@ import {
   writeActionResponse,
 } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -51,6 +52,7 @@ import {
   bindPageSecretDocuments,
   disposeBrowserRefs,
   pinBrowserRefs,
+  readBrowserRef,
   registerPageSecret,
   releasePageSecret,
   type BrowserRef,
@@ -65,18 +67,7 @@ interface SignInPayload extends Record<string, unknown> {
   submit?: BrowserRef;
 }
 function browserRef(raw: unknown): BrowserRef {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw))
-    throw invalidArgs('Choose a field and send control from a fresh observation.');
-  const value = raw as Record<string, unknown>;
-  if (
-    Object.keys(value).some((key) => !['ref', 'generation'].includes(key)) ||
-    typeof value.ref !== 'string' ||
-    !/^e\d+$/u.test(value.ref) ||
-    !Number.isInteger(value.generation) ||
-    Number(value.generation) < 1
-  )
-    throw invalidArgs('Choose a field and send control from a fresh observation.');
-  return { ref: value.ref, generation: Number(value.generation) };
+  return readBrowserRef(raw, 'Choose a field and send control from a fresh observation.');
 }
 export function validateSignInCode(content: Record<string, unknown>): SignInPayload {
   if (
@@ -539,10 +530,8 @@ async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame)
     throw forbidden('The principal relay is no longer attached to its main-owned job.');
   const claim = await getSignInClaim(payload.claim_id);
   if (claim && claim.job_id !== job.id) throw forbidden('The principal relay belongs to another browser job.');
-  const status =
-    frame.ok && (frame.data.status === 'code_filled' || frame.data.status === 'no_wait')
-      ? frame.data.status
-      : 'origin_mismatch';
+  const data = frame.ok && isRecord(frame.data) ? frame.data : undefined;
+  const status = data && (data.status === 'code_filled' || data.status === 'no_wait') ? data.status : 'origin_mismatch';
   await writeActionResponse(source, payload.source_request_id, {
     id: payload.source_request_id,
     ok: true,

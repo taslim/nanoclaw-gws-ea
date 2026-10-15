@@ -5,7 +5,7 @@ import { registerTools } from './server.js';
 export const BROWSER_REQUEST_TIMEOUT_MS = 120_000;
 
 const REF_FIELDS = {
-  ref: { type: 'string', pattern: '^e\\d+$', description: 'The element ref from the latest observation.' },
+  ref: { type: 'string', pattern: '^(?:f\\d+)?e\\d+$', description: 'The element ref from the latest observation.' },
   generation: { type: 'integer', minimum: 1, description: 'The generation of that observation.' },
 } as const;
 const REF = {

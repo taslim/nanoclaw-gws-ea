@@ -16,6 +16,7 @@ import {
 import {
   disposeBrowserRefs,
   pinBrowserRefs,
+  readBrowserRef,
   registerPageSecret,
   bindPageSecretDocuments,
   releasePageSecret,
@@ -268,25 +269,12 @@ export function validateFillSecret(content: Record<string, unknown>): FillSecret
     !['username', 'password', 'otp'].includes(String(content.field))
   )
     throw invalidArgs('Choose a listed vault item and a username, password or one-time-code field.');
-  const ref = (raw: unknown): BrowserRef => {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw))
-      throw invalidArgs('Choose a field and submit control from a fresh observation.');
-    const value = raw as Record<string, unknown>;
-    if (
-      Object.keys(value).some((key) => !['ref', 'generation'].includes(key)) ||
-      typeof value.ref !== 'string' ||
-      !/^e\d+$/u.test(value.ref) ||
-      !Number.isInteger(value.generation) ||
-      Number(value.generation) < 1
-    )
-      throw invalidArgs('Choose a field and submit control from a fresh observation.');
-    return { ref: value.ref, generation: Number(value.generation) };
-  };
+  const message = 'Choose a field and submit control from a fresh observation.';
   return {
     item_handle: content.item_handle,
     field: content.field as BrowserSecretField,
-    target: ref(content.target),
-    submit: ref(content.submit),
+    target: readBrowserRef(content.target, message),
+    submit: readBrowserRef(content.submit, message),
   };
 }
 
