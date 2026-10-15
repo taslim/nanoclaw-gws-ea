@@ -225,11 +225,16 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
 
   it('keeps selected upload bytes immutable until the page closes, then removes private staging', async () => {
     const original = Buffer.from('The original document selected for upload.');
-    const source = path.join(sessionDir(session.agent_group_id, session.id), 'supporting.txt');
+    const source = path.join(sessionDir(session.agent_group_id, session.id), 'documents', 'supporting.txt');
+    fs.mkdirSync(path.dirname(source));
     fs.writeFileSync(source, original);
     const result = await executeBrowserBatch(
       context,
-      { actions: [{ kind: 'upload', ...(await target('Supporting document')), path: '/workspace/supporting.txt' }] },
+      {
+        actions: [
+          { kind: 'upload', ...(await target('Supporting document')), path: '/workspace/documents/supporting.txt' },
+        ],
+      },
       { record: false },
     );
     expect(result).toMatchObject({ status: 'completed', actions: [{ status: 'completed' }] });

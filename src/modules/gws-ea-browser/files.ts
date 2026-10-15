@@ -45,6 +45,38 @@ async function equalFiles(left: FileHandle, right: FileHandle): Promise<boolean>
   }
 }
 
+/** Bind every path component to the open, so a directory swap cannot redirect the copy. */
+async function openUploadSource(source: string): Promise<FileHandle> {
+  if (process.platform === 'darwin') {
+    // Darwin's open(2) protects the entire lookup. Combining this with O_NOFOLLOW is EINVAL.
+    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h
+    const noFollowAny = 0x20000000;
+    return open(source, constants.O_RDONLY | noFollowAny);
+  }
+  if (process.platform !== 'linux') throw new Error('Safe upload opening requires macOS or Linux');
+  // Node has no openat API. Linux procfs resolves each child from the held directory inode,
+  // including after its original name is renamed or replaced with a symlink.
+  const components = source.split(path.sep).filter(Boolean);
+  let directory = await open(
+    path.parse(source).root,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    for (const component of components.slice(0, -1)) {
+      const next = await open(
+        `/proc/self/fd/${directory.fd}/${component}`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const previous = directory;
+      directory = next;
+      await previous.close();
+    }
+    return await open(`/proc/self/fd/${directory.fd}/${components.at(-1)!}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } finally {
+    await directory.close();
+  }
+}
+
 /** Only the host copy is given to Chrome; later container mutations cannot change it. */
 export async function stageBrowserUpload(
   sessionRoot: string,
@@ -63,15 +95,13 @@ export async function stageBrowserUpload(
   }
   if (!isPathInside(base, await realpath(source))) throw new Error('Upload escaped session');
   await ensurePrivateDirectory(stagingRoot);
-  const input = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const input = await openUploadSource(source);
   const directory = path.join(stagingRoot, `upload-${randomUUID()}`);
   await ensurePrivateDirectory(directory);
   const target = path.join(directory, path.basename(source));
   try {
     const stat = await input.stat();
-    const pathStat = await lstat(source);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.ino !== pathStat.ino || stat.dev !== pathStat.dev)
-      throw new Error('Upload is not a regular session file');
+    if (!stat.isFile() || stat.nlink !== 1) throw new Error('Upload is not a regular session file');
     const output = await open(
       target,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
