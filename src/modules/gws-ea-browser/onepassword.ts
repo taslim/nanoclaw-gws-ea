@@ -72,7 +72,6 @@ export class BrowserVault {
   private client: Promise<Client> | undefined;
   private token: string | undefined;
   private vaultId: string | undefined;
-  private overviews: ItemOverview[] = [];
   private handles = new Map<string, ItemOverview>();
   private refreshedAt = -Infinity;
   private rateLimitedUntil = 0;
@@ -84,7 +83,6 @@ export class BrowserVault {
     this.client = undefined;
     this.token = undefined;
     this.vaultId = undefined;
-    this.overviews = [];
     this.handles.clear();
     this.refreshedAt = -Infinity;
   }
@@ -161,22 +159,25 @@ export class BrowserVault {
         content: { active: true, archived: false },
       });
       await assertActive();
-      this.overviews = items.filter(
+      const overviews = items.filter(
         (item) =>
           item.category === 'Login' &&
           item.state === 'active' &&
           item.vaultId === this.vaultId &&
           /^[a-z\d_-]+$/iu.test(item.id),
       );
-      const byId = new Map(this.overviews.map((item) => [item.id, item]));
+      const byId = new Map(overviews.map((item) => [item.id, item]));
       for (const [handle, previous] of this.handles) {
         const current = byId.get(previous.id);
         if (current) this.handles.set(handle, current);
         else this.handles.delete(handle);
       }
-      for (const item of this.overviews)
-        if (![...this.handles.values()].some((existing) => existing.id === item.id))
+      const retainedIds = new Set([...this.handles.values()].map((item) => item.id));
+      for (const item of overviews)
+        if (!retainedIds.has(item.id)) {
           this.handles.set(`vault_${randomUUID()}`, item);
+          retainedIds.add(item.id);
+        }
       this.refreshedAt = Date.now();
     })();
     try {
