@@ -97,7 +97,9 @@ export async function requestOrigin(
   agentGroupId: string,
   from: MessagingGroup | undefined,
   posted: MessagingGroup,
+  originLine?: string,
 ): Promise<RequestOrigin | undefined> {
+  if (originLine !== undefined) return { line: originLine, details: { facts: { asked_from: originLine } } };
   if (from?.id === posted.id || (await getMessagingGroupAgentByPair(posted.id, agentGroupId))) return undefined;
   if (!from) {
     return {

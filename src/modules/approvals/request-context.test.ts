@@ -210,7 +210,7 @@ async function answer(questionId: string, value: string, reason?: string): Promi
 }
 
 /** `session`'s agent asks, through the approvals primitive, to change a setting. */
-function askToChangeSetting(session: Session, agentName: string): Promise<void> {
+function askToChangeSetting(session: Session, agentName: string): Promise<string | null> {
   return requestApproval({
     session,
     agentName,
