@@ -439,7 +439,7 @@ export async function prepareWatchCommit(
   authority: SpendingAuthority,
   facts: PurchaseFacts,
 ): Promise<WatchClaimCallback | WatchPurchaseRefusal> {
-  const watchId = (authority as SpendingAuthority & { watch_id?: string | null }).watch_id;
+  const watchId = authority.watch_id;
   const watch = watchId ? await getBrowserWatch(watchId, context.store.db) : undefined;
   if (!watch || compareWatchBounds(boundsOf(watch), facts, new Date().toISOString()).status !== 'within_bounds')
     return { status: 'outside_bounds', watchId: watchId ?? '' };
@@ -934,24 +934,24 @@ export async function detachBrowserWatchCards(
     ...[jobId, ...(watchId ? [watchId] : [])],
   );
   const withdrawn: PendingApproval[] = [];
+  const approvals = await db.all<PendingApproval>('SELECT * FROM pending_approvals WHERE action = ?', APPROVAL_ACTION);
+  const approvalsByWatch = new Map<string, PendingApproval[]>();
+  for (const approval of approvals) {
+    const payload = JSON.parse(approval.payload) as { watchId?: string };
+    if (typeof payload.watchId === 'string')
+      approvalsByWatch.set(payload.watchId, [...(approvalsByWatch.get(payload.watchId) ?? []), approval]);
+  }
   for (const watch of watches) {
-    const approvals = await db.all<PendingApproval>(
-      'SELECT * FROM pending_approvals WHERE action = ?',
-      APPROVAL_ACTION,
-    );
-    for (const approval of approvals) {
-      const payload = JSON.parse(approval.payload) as { watchId?: string };
-      if (payload.watchId === watch.id) {
-        const detached = await detachApproval(approval.approval_id);
-        if (detached) {
-          withdrawn.push(detached);
-          await db.run(
-            'UPDATE gws_ea_browser_watches SET approval_id = ?,approval_json = COALESCE(approval_json,?) WHERE id = ?',
-            detached.approval_id,
-            JSON.stringify(detached),
-            watch.id,
-          );
-        }
+    for (const approval of approvalsByWatch.get(watch.id) ?? []) {
+      const detached = await detachApproval(approval.approval_id);
+      if (detached) {
+        withdrawn.push(detached);
+        await db.run(
+          'UPDATE gws_ea_browser_watches SET approval_id = ?,approval_json = COALESCE(approval_json,?) WHERE id = ?',
+          detached.approval_id,
+          JSON.stringify(detached),
+          watch.id,
+        );
       }
     }
     await db.run(
@@ -1104,10 +1104,6 @@ registerBrowserQueuedAction('browser_watch_book', {
       }
       const { executeBrowserPurchase } = await import('./purchase.js');
       const outcome = await executeBrowserPurchase(context, { target: result.target });
-      await context.store.db.run(
-        "UPDATE gws_ea_browser_watches SET status = 'armed',pending_request_id = NULL WHERE id = ? AND status = 'preparing'",
-        watch.id,
-      );
       return outcome;
     } finally {
       await context.store.db.run(

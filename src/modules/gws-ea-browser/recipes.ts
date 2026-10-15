@@ -602,36 +602,35 @@ function bindAction(step: BrowserRecipeStep, refs: BrowserRef[], value?: string)
   }
   return action;
 }
+async function observationRefs(page: Page, observation: BrowserObservation): Promise<Map<string, PinnedBrowserRef>> {
+  return pinBrowserRefs(
+    page,
+    [...observation.snapshot.matchAll(/\[ref=((?:f\d+)?e\d+)\]/gu)].map((match) => ({
+      ref: match[1],
+      generation: observation.generation,
+    })),
+  );
+}
 async function nativeRef(
   page: Page,
   target: StructuredBrowserLocator,
-  observation: BrowserObservation,
+  pinned: ReadonlyMap<string, PinnedBrowserRef>,
 ): Promise<BrowserRef> {
   const element = await resolveLocator(page, target);
   try {
-    return await nativeRefForElement(page, element, observation);
+    return await nativeRefForElement(element, pinned);
   } finally {
     await element.dispose();
   }
 }
 async function nativeRefForElement(
-  page: Page,
   element: ElementHandle,
-  observation: BrowserObservation,
+  pinned: ReadonlyMap<string, PinnedBrowserRef>,
 ): Promise<BrowserRef> {
   const frame = await element.ownerFrame();
-  const refs = [...observation.snapshot.matchAll(/\[ref=((?:f\d+)?e\d+)\]/gu)].map((match) => ({
-    ref: match[1],
-    generation: observation.generation,
-  }));
-  const pinned = await pinBrowserRefs(page, refs);
-  try {
-    for (const candidate of pinned.values())
-      if (candidate.frame === frame && (await candidate.element.evaluate((node, other) => node === other, element)))
-        return { ref: candidate.ref, generation: candidate.generation };
-  } finally {
-    await disposeBrowserRefs(pinned);
-  }
+  for (const candidate of pinned.values())
+    if (candidate.frame === frame && (await candidate.element.evaluate((node, other) => node === other, element)))
+      return { ref: candidate.ref, generation: candidate.generation };
   throw new Error('No current native ref for the recorded target');
 }
 interface ActiveUrlInput {
@@ -717,7 +716,14 @@ export async function executeRecipe(
     let refs: BrowserRef[];
     try {
       refs = [];
-      for (const locator of targets) refs.push(await nativeRef(page, locator, observation));
+      if (targets.length) {
+        const pinned = await observationRefs(page, observation);
+        try {
+          for (const locator of targets) refs.push(await nativeRef(page, locator, pinned));
+        } finally {
+          await disposeBrowserRefs(pinned);
+        }
+      }
     } catch (_error) {
       return failed(index, { elements: step.targets }, { elements: 'missing or changed' });
     }
@@ -743,21 +749,26 @@ export async function executeRecipe(
       if (!commit) return failed(index, { commit: 'recorded control' }, { commit: 'unavailable' });
       try {
         let target: BrowserRef;
-        if (action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)) {
-          const element = await resolveLocator(page, commit);
-          try {
-            const handle = await browserKeyboardSubmitTarget(element);
+        const pinned = await observationRefs(page, observation);
+        try {
+          if (action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)) {
+            const element = await resolveLocator(page, commit);
             try {
-              const submit = handle.asElement();
-              if (!submit) throw new Error('No submit control');
-              target = await nativeRefForElement(page, submit, observation);
+              const handle = await browserKeyboardSubmitTarget(element);
+              try {
+                const submit = handle.asElement();
+                if (!submit) throw new Error('No submit control');
+                target = await nativeRefForElement(submit, pinned);
+              } finally {
+                await handle.dispose();
+              }
             } finally {
-              await handle.dispose();
+              await element.dispose();
             }
-          } finally {
-            await element.dispose();
-          }
-        } else target = await nativeRef(page, commit, observation);
+          } else target = await nativeRef(page, commit, pinned);
+        } finally {
+          await disposeBrowserRefs(pinned);
+        }
         return {
           status: 'reached_commit_point',
           step: index,

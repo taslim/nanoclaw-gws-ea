@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { createServer, type Server } from 'node:http';
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
@@ -380,6 +380,53 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', () => {
     ).toMatchObject({ status: 'checkpoint_failed', found: { target_url: 'origin, path or query keys changed' } });
     expect(page.url()).toBe('http://fixture.example/search');
   });
+  it('resolves one snapshot generation once when replaying a multi-field form', async () => {
+    await page.setContent(
+      '<body><h1>Details</h1><label>Party size<input name="party"></label><label>Contact<input name="contact"></label></body>',
+    );
+    const observed = await observePage(page);
+    const ref = (name: string): BrowserRef => {
+      const line = observed.snapshot
+        .split('\n')
+        .find((value) => value.includes(JSON.stringify(name)) && value.includes('[ref='));
+      const value = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
+      if (!value) throw new Error('Missing native field');
+      return { ref: value, generation: observed.generation };
+    };
+    await executeBrowserBatch(context, {
+      actions: [
+        {
+          kind: 'form_input',
+          fields: [
+            { ...ref('Party size'), value: '3' },
+            { ...ref('Contact'), value: 'Morgan' },
+          ],
+        },
+      ],
+    });
+    const saved = await saveBrowserRecipe(context, {
+      name: 'Details',
+      first_action: 0,
+      last_action: 0,
+      parameters: [],
+    });
+    await page.getByRole('textbox', { name: 'Party size', exact: true }).fill('');
+    await page.getByRole('textbox', { name: 'Contact', exact: true }).fill('');
+    const snapshot = await observePage(page);
+    const allRefs = [...snapshot.snapshot.matchAll(/\[ref=((?:f\d+)?e\d+)\]/gu)].length;
+    const resolve = vi.spyOn(page, 'getByRef');
+    try {
+      expect(
+        await executeRecipe(context, { recipe_id: saved.recipe_id, parameters: {} }, { record: false }),
+      ).toMatchObject({ status: 'completed' });
+      expect(await page.getByRole('textbox', { name: 'Party size', exact: true }).inputValue()).toBe('3');
+      expect(await page.getByRole('textbox', { name: 'Contact', exact: true }).inputValue()).toBe('Morgan');
+      expect(resolve.mock.calls.length).toBeLessThanOrEqual(allRefs + 2);
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
   it('reports heading drift and filled-value drift with the current observation', async () => {
     await executeBrowserBatch(context, { actions: [{ kind: 'type', ...(await target('Party size')), text: '2' }] });
     const saved = await saveBrowserRecipe(context, {

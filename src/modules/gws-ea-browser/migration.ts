@@ -55,6 +55,8 @@ export const browserWatchesMigration: PortableMigration & { name: ModuleMigratio
         site TEXT NOT NULL, message_id TEXT NOT NULL, received_at TEXT NOT NULL,
         consumed_at TEXT, PRIMARY KEY(site,message_id)
       );
+      CREATE INDEX gws_ea_browser_watch_pending_notices ON gws_ea_browser_watch_notices(created_at) WHERE delivered_at IS NULL;
+      CREATE INDEX gws_ea_browser_watch_pending_notify ON gws_ea_browser_watch_notify(site) WHERE consumed_at IS NULL;
       ALTER TABLE gws_ea_browser_authorities ADD COLUMN watch_id TEXT REFERENCES gws_ea_browser_watches(id);
     `);
   },
