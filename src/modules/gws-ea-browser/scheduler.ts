@@ -45,6 +45,7 @@ interface SiteState {
   consecutive_blocks: number;
   budget_scale: number;
 }
+const MAX_CONCURRENT_SITES = 4;
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
 const watchBounds = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json) as WatchBounds;
 function groupKey(watch: WatchRow): string {
@@ -149,11 +150,26 @@ export class BrowserWatchScheduler {
     const rows = await db.all<WatchRow>(
       "SELECT w.* FROM gws_ea_browser_watches w JOIN gws_ea_browser_jobs j ON j.id=w.job_id WHERE w.status='armed' AND j.cancelled=0 AND j.cancel_requested=0 ORDER BY w.next_check_at,w.created_at,w.id",
     );
-    const groups = new Map<string, WatchRow[]>();
+    const sites = new Map<string, Map<string, WatchRow[]>>();
     for (const row of rows) {
+      let groups = sites.get(row.site);
+      if (!groups) {
+        groups = new Map();
+        sites.set(row.site, groups);
+      }
       const key = groupKey(row);
       groups.set(key, [...(groups.get(key) ?? []), row]);
     }
+    const pending = sites.values();
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: Math.min(MAX_CONCURRENT_SITES, sites.size) }, async () => {
+        for (const groups of pending) await this.runSite(groups);
+      }),
+    );
+    for (const outcome of outcomes) if (outcome.status === 'rejected') throw outcome.reason;
+  }
+  private async runSite(groups: Map<string, WatchRow[]>): Promise<void> {
+    const db = this.queue.store.db;
     for (const watches of groups.values()) {
       if (this.controller.signal.aborted) return;
       const first = watches[0];
@@ -313,6 +329,7 @@ export class BrowserWatchScheduler {
     availability: Extract<ReservationAvailability, { status: 'ready' }>,
   ): Promise<void> {
     const queuedSlots = new Set<string>();
+    const calendarResults = new Map<string, 'free' | 'calendar_conflict' | 'calendar_unavailable'>();
     for (const watch of watches) {
       const current = await this.queue.store.db.get<WatchRow>(
         'SELECT * FROM gws_ea_browser_watches WHERE id=?',
@@ -340,15 +357,19 @@ export class BrowserWatchScheduler {
           await emitWatchNotice(watch, 'outside_bounds', `outside:${key}`, { slot: reservation });
           continue;
         }
-        let calendarStatus: 'calendar_conflict' | 'calendar_unavailable' | undefined;
-        try {
-          const calendar = await this.deps.calendar(reservation.at, reservation.endAt);
-          if (calendar.conflicts.length || calendar.conflicts_not_listed) calendarStatus = 'calendar_conflict';
-          // eslint-disable-next-line no-catch-all/no-catch-all -- Unavailable calendar data never counts as a free slot.
-        } catch (_error) {
-          calendarStatus = 'calendar_unavailable';
+        const calendarKey = JSON.stringify([reservation.at, reservation.endAt]);
+        let calendarStatus = calendarResults.get(calendarKey);
+        if (!calendarStatus) {
+          try {
+            const calendar = await this.deps.calendar(reservation.at, reservation.endAt);
+            calendarStatus = calendar.conflicts.length || calendar.conflicts_not_listed ? 'calendar_conflict' : 'free';
+            // eslint-disable-next-line no-catch-all/no-catch-all -- Unavailable calendar data never counts as a free slot.
+          } catch (_error) {
+            calendarStatus = 'calendar_unavailable';
+          }
+          calendarResults.set(calendarKey, calendarStatus);
         }
-        if (calendarStatus) {
+        if (calendarStatus !== 'free') {
           await emitWatchNotice(watch, calendarStatus, `${calendarStatus}:${key}`, { slot: reservation });
           continue;
         }

@@ -70,16 +70,18 @@ const bounds: WatchBounds = {
   financial: { freeOnly: true, currency: 'USD', maxTotalMinor: 0, maxDueNowMinor: 0 },
   until: '2026-10-16T18:00:00Z',
 };
-async function arm(id: string, key: string, party = 4, version = 1): Promise<void> {
+async function arm(id: string, key: string, party = 4, version = 1, site = bounds.site): Promise<void> {
   const at = new Date().toISOString();
   await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,'resy.com','recipe',?,?,?,?,'armed',?,?,?)`,
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
+    site,
+    `recipe:${site}`,
     version,
     JSON.stringify({ party: String(party) }),
     key,
-    JSON.stringify({ ...bounds, partySize: party }),
+    JSON.stringify({ ...bounds, site, partySize: party }),
     at,
     at,
     at,
@@ -114,22 +116,125 @@ function availability(partySize = 4): Extract<ReservationAvailability, { status:
 }
 const freeCalendar = async () => ({ conflicts: [], conflicts_not_listed: 0, message: 'Free' });
 
+it('finishes another site while the first is pending and keeps checks within each site sequential', async () => {
+  await arm('a', 'first');
+  await arm('b', 'second');
+  await arm('c', 'first', 4, 1, 'opentable.com');
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started: (() => void) | undefined;
+  const firstStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const activeSites = new Set<string>();
+  const overlap: string[] = [];
+  const order: string[] = [];
+  const scheduler = createBrowserWatchScheduler(queue, {
+    policy: (site) => ({ ...watchSitePolicy(site), floorMs: 0 }),
+    check: async (_queue, input) => {
+      if (activeSites.has(input.site)) overlap.push(input.site);
+      activeSites.add(input.site);
+      order.push(`start:${input.site}`);
+      if (input.site === 'resy.com' && order.length === 1) {
+        started?.();
+        await pending;
+      }
+      order.push(`finish:${input.site}`);
+      activeSites.delete(input.site);
+      const found = { ...availability(), site: input.site, slots: [] };
+      return { status: 'ready', availability: found };
+    },
+    calendar: freeCalendar,
+    random: () => 0.5,
+  });
+  const ticking = scheduler.tick();
+  try {
+    await firstStarted;
+    await vi.waitFor(async () => {
+      expect(
+        await getDb().get('SELECT outcome,finished_at FROM gws_ea_browser_watch_checks WHERE site=?', 'opentable.com'),
+      ).toEqual({ outcome: 'ready', finished_at: expect.any(String) });
+    });
+    expect(await getDb().get('SELECT finished_at FROM gws_ea_browser_watch_checks WHERE site=?', 'resy.com')).toEqual({
+      finished_at: null,
+    });
+  } finally {
+    release?.();
+    await ticking;
+  }
+  expect(overlap).toEqual([]);
+  expect(order).toEqual([
+    'start:resy.com',
+    'start:opentable.com',
+    'finish:opentable.com',
+    'finish:resy.com',
+    'start:resy.com',
+    'finish:resy.com',
+  ]);
+  expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toHaveLength(3);
+});
+
+it('limits concurrent site pipelines to four and starts the next site as soon as capacity frees', async () => {
+  const sites = ['resy.com', 'opentable.com', 'exploretock.com', 'four.example', 'five.example'];
+  for (const site of sites) await arm(site, 'same', 4, 1, site);
+  const releases = new Map<string, () => void>();
+  let concurrent = 0;
+  let maximum = 0;
+  let draining = false;
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async (_queue, input) => {
+      concurrent++;
+      maximum = Math.max(maximum, concurrent);
+      await new Promise<void>((resolve) => {
+        releases.set(input.site, resolve);
+        if (draining) resolve();
+      });
+      concurrent--;
+      return { status: 'ready', availability: { ...availability(), site: input.site, slots: [] } };
+    },
+    calendar: freeCalendar,
+    random: () => 0.5,
+  });
+  const ticking = scheduler.tick();
+  try {
+    await vi.waitFor(() => expect(releases.size).toBe(4));
+    expect(await getDb().all('SELECT site FROM gws_ea_browser_watch_checks')).toHaveLength(4);
+    releases.values().next().value?.();
+    await vi.waitFor(() => expect(releases.size).toBe(5));
+    expect(concurrent).toBe(4);
+    expect(maximum).toBe(4);
+  } finally {
+    draining = true;
+    for (const release of releases.values()) release();
+    await ticking;
+  }
+  expect(await getDb().all("SELECT site FROM gws_ea_browser_watch_checks WHERE outcome='ready'")).toHaveLength(5);
+});
+
 it('shares exactly identical read-only checks, while different parties and versions consume the same site budget', async () => {
   await arm('a', 'same');
   await arm('b', 'same');
   await arm('c', 'different-party', 2);
   await arm('d', 'different-version', 4, 2);
   let checks = 0;
+  const calendar = vi.fn(freeCalendar);
   const scheduler = createBrowserWatchScheduler(queue, {
     check: async (_queue, input) => {
       checks++;
       return { status: 'ready', availability: availability(Number(input.parameters.party)) };
     },
-    calendar: freeCalendar,
+    calendar,
     random: () => 0.5,
   });
   await scheduler.tick();
   expect(checks).toBe(1);
+  expect(calendar).toHaveBeenCalledTimes(1);
+  expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_notices ORDER BY watch_id')).toEqual([
+    { watch_id: 'a' },
+    { watch_id: 'b' },
+  ]);
   expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toHaveLength(1);
   expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_check_members ORDER BY watch_id')).toEqual([
     { watch_id: 'a' },
@@ -145,6 +250,7 @@ it('shares exactly identical read-only checks, while different parties and versi
   vi.setSystemTime(new Date('2026-10-15T12:02:02Z'));
   await scheduler.tick();
   expect(checks).toBe(3);
+  expect(calendar).toHaveBeenCalledTimes(3);
   expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_check_members ORDER BY watch_id')).toEqual([
     { watch_id: 'a' },
     { watch_id: 'b' },
@@ -154,25 +260,58 @@ it('shares exactly identical read-only checks, while different parties and versi
 });
 it('does not check pending setup cards and never consumes a booking claim after a failed calendar read', async () => {
   await arm('a', 'same');
+  await arm('b', 'same');
   await arm('pending', 'pending');
   await getDb().run("UPDATE gws_ea_browser_watches SET status='awaiting_principal' WHERE id='pending'");
+  const calendar = vi.fn(async () => {
+    throw new Error('Calendar access failed');
+  });
   const scheduler = createBrowserWatchScheduler(queue, {
     check: async () => ({ status: 'ready', availability: availability() }),
-    calendar: async () => {
-      throw new Error('Calendar access failed');
-    },
+    calendar,
     random: () => 0.5,
   });
   await scheduler.tick();
-  expect(await getDb().all('SELECT outcome_json FROM gws_ea_browser_watch_notices')).toEqual([
-    { outcome_json: expect.stringContaining('calendar_unavailable') },
-  ]);
+  expect(calendar).toHaveBeenCalledTimes(1);
+  expect(await getDb().all('SELECT watch_id,outcome_json FROM gws_ea_browser_watch_notices ORDER BY watch_id')).toEqual(
+    [
+      { watch_id: 'a', outcome_json: expect.stringContaining('calendar_unavailable') },
+      { watch_id: 'b', outcome_json: expect.stringContaining('calendar_unavailable') },
+    ],
+  );
   expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
     state: 'available',
   });
   expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'pending')).toEqual({
     status: 'awaiting_principal',
   });
+});
+
+it.each([
+  ['arrival', { at: '2026-10-16T20:00:00Z' }],
+  ['departure', { endAt: '2026-10-16T22:00:00Z' }],
+] as const)('reads the calendar separately when only the slot %s changes', async (_name, change) => {
+  await arm('a', 'same');
+  await arm('b', 'same');
+  const found = availability();
+  found.slots.push({
+    id: 'another-slot',
+    reservation: { ...found.slots[0].reservation, ...change },
+  });
+  const calendar = vi.fn(freeCalendar);
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => ({ status: 'ready', availability: found }),
+    calendar,
+    random: () => 0.5,
+  });
+  await scheduler.tick();
+  expect(calendar.mock.calls).toEqual(found.slots.map(({ reservation }) => [reservation.at, reservation.endAt]));
+  expect(await getDb().all('SELECT watch_id FROM gws_ea_browser_watch_notices ORDER BY watch_id')).toEqual([
+    { watch_id: 'a' },
+    { watch_id: 'a' },
+    { watch_id: 'b' },
+    { watch_id: 'b' },
+  ]);
 });
 it('backs off and halves budgets on the first block, waking blocked after three consecutive checks', async () => {
   await arm('a', 'same');
