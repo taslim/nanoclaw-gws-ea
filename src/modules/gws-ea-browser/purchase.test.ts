@@ -588,6 +588,39 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await approvals()).toHaveLength(0);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_authorities')).toEqual([]);
   });
+  it('releases a superseded card site while keeping the replacement card site held', async () => {
+    await buy('old-card');
+    const card = await getDb().get<{ id: string; facts_json: string }>(
+      "SELECT id,facts_json FROM gws_ea_browser_purchase_cards WHERE status = 'open'",
+    );
+    if (!card) throw new Error('Missing initial card');
+    // Seed the durable state of a card prepared on another supported site.
+    await getDb().run(
+      'UPDATE gws_ea_browser_purchase_cards SET facts_json = ? WHERE id = ?',
+      JSON.stringify({ ...JSON.parse(card.facts_json), site: 'resy.com', origin: 'https://resy.com' }),
+      card.id,
+    );
+    await getDb().run("UPDATE gws_ea_browser_site_leases SET site = 'resy.com' WHERE site = 'amazon.com'");
+    const waiting = (await resolveSystemSession('browser-p', 'system:a2a:main-p:waiting-purchase')).session;
+    const waitingJob = await queue.store.jobForSession(waiting);
+    if (!waitingJob) throw new Error('Missing waiting job');
+    expect(await queue.leases.acquire(waitingJob.id, 'https://resy.com/')).toMatchObject({ acquired: false });
+    await buy('replacement-card');
+    expect(await queue.leases.owned(session.thread_id!, 'resy.com')).toBe(false);
+    expect(await queue.leases.owned(session.thread_id!, 'amazon.com')).toBe(true);
+    const available = await withExistingMailboxSession(waiting.agent_group_id, waiting.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .filter((message) =>
+          (JSON.parse(message.content) as { text?: string }).text?.includes('browser_site_available'),
+        ),
+    );
+    expect(available).toHaveLength(1);
+    expect(await queue.leases.acquire(waitingJob.id, 'https://resy.com/')).toMatchObject({ acquired: true });
+    await click((await approvals())[0], 'reject');
+    expect(await queue.leases.owned(session.thread_id!, 'amazon.com')).toBe(false);
+    expect(submitted).toBe(0);
+  });
   it('records unknown once, retains its block after cancellation, and never repeats its consumed authority', async () => {
     confirmation = false;
     await buy();
@@ -706,16 +739,19 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       sawPost = resolve;
     });
     await buy();
+    await queue.leases.acquire(session.thread_id!, 'https://resy.com/');
+    await queue.leases.holdForPurchase(session.thread_id!, 'resy.com');
     await click((await approvals())[0]);
     await posted;
     expect((await grant()).state).toBe('committing');
     expect(await cancelBrowserJob(session.thread_id!)).toMatchObject({ status: 'in_progress' });
     expect((await queue.store.getJob(session.thread_id!))?.cancelled).toBe(0);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toHaveLength(1);
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toHaveLength(2);
     release();
     await queue.idle();
     expect((await grant()).state).toBe('committed');
     expect((await queue.store.getJob(session.thread_id!))?.cancelled).toBe(1);
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toHaveLength(0);
     expect(submitted).toBe(1);
   });
   it('recovers the marker-to-press gap as unknown before admission and frees only its lease, retaining the site purchase block', async () => {

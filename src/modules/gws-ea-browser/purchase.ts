@@ -218,10 +218,11 @@ async function requestPurchaseCard(
       facts.site,
       context.job.id,
     );
-    return old;
+    return { cards: old, waitingJobs: await new SiteLeaseStore(db).releaseUnheldPurchases(context.job.id) };
   });
+  await context.wakeWaiters(detached.waitingJobs, `superseded-${id}`);
   await finishPurchaseCardWithdrawals(
-    detached,
+    detached.cards,
     'Withdrawn: the checkout changed. A fresh card contains the current facts.',
   );
   const approvalId = await requestApproval({
@@ -349,19 +350,8 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
     payload.cardId,
   );
   if (card && getPurchaseQueue) {
-    const facts = JSON.parse(card.facts_json) as PurchaseFacts;
     const queue = getPurchaseQueue();
-    const outstanding =
-      (await getDb().get(
-        "SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' LIMIT 1",
-        card.job_id,
-      )) ||
-      (await getDb().get(
-        "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state IN ('live','committing') LIMIT 1",
-        card.job_id,
-      ));
-    if (outstanding) return;
-    await queue.wakeWaiters(await queue.leases.release(card.job_id, facts.site), `card-${card.id}-${status}`);
+    await queue.wakeWaiters(await queue.leases.releaseUnheldPurchases(card.job_id), `card-${card.id}-${status}`);
   }
 });
 
@@ -663,30 +653,11 @@ export async function recoverBrowserPurchases(queue: BrowserQueue): Promise<void
       attempt.site,
       new Date().toISOString(),
     );
-  // Only a current card/live authority keeps its cart. Unknown attempts are protected by site blocks instead.
-  for (const lease of await store.db.all<{ site: string; job_id: string }>(
-    "SELECT site,job_id FROM gws_ea_browser_site_leases WHERE state = 'purchase'",
-  )) {
-    const at = new Date().toISOString();
-    const cards = await store.db.all<PurchaseCard>(
-      "SELECT * FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' AND expires_at > ?",
-      lease.job_id,
-      at,
-    );
-    const authorities = await store.db.all<SpendingAuthority>(
-      "SELECT * FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'live' AND expires_at > ?",
-      lease.job_id,
-      at,
-    );
-    const held = [...cards, ...authorities].some(
-      (row) => (JSON.parse(row.facts_json) as PurchaseFacts).site === lease.site,
-    );
-    if (!held)
-      await queue.wakeWaiters(
-        await queue.leases.release(lease.job_id, lease.site),
-        `purchase-recovery-${lease.job_id}-${lease.site}`,
-      );
-  }
+  // Unknown attempts are protected by site blocks, never stale cart leases.
+  for (const job of await store.db.all<{ job_id: string }>(
+    "SELECT DISTINCT job_id FROM gws_ea_browser_site_leases WHERE state = 'purchase'",
+  ))
+    await queue.wakeWaiters(await queue.leases.releaseUnheldPurchases(job.job_id), `purchase-recovery-${job.job_id}`);
   // Old accepted requests will be answered interrupted. Recovery always creates a fresh request id afterward.
   await store.db.run('UPDATE gws_ea_browser_pending_commits SET generation = generation + 1,queued_request_id = NULL');
   for (const authority of await store.db.all<SpendingAuthority>(

@@ -356,6 +356,7 @@ export class BrowserQueue {
   }
 
   private async releaseJobLeases(jobId: string, eventId: string): Promise<void> {
+    await this.wakeWaiters(await this.leases.releaseUnheldPurchases(jobId), `${eventId}:purchase-holds`);
     const leases = await this.store.db.all<{ site: string }>(
       "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state <> 'purchase'",
       jobId,

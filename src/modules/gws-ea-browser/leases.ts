@@ -1,6 +1,7 @@
 import { getDomain } from 'tldts';
 
 import type { DbDriver } from '../../db/driver.js';
+import type { PurchaseFacts } from './fingerprint.js';
 
 export function browserSite(url: string): string {
   const parsed = new URL(url);
@@ -92,6 +93,32 @@ export class SiteLeaseStore {
       (await this.db.get('SELECT site FROM gws_ea_browser_site_leases WHERE site = ? AND job_id = ?', site, jobId)) !==
       undefined
     );
+  }
+
+  /** Only a current card or unspent/in-progress authority keeps its own site's cart. */
+  async releaseUnheldPurchases(jobId: string): Promise<string[]> {
+    if (!(await this.db.hasTable('gws_ea_browser_authorities'))) return [];
+    return this.db.transaction(async () => {
+      const at = new Date().toISOString();
+      const current = await this.db.all<{ facts_json: string }>(
+        `SELECT facts_json FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' AND expires_at > ?
+         UNION ALL
+         SELECT facts_json FROM gws_ea_browser_authorities WHERE job_id = ? AND (state = 'committing' OR (state = 'live' AND expires_at > ?))`,
+        jobId,
+        at,
+        jobId,
+        at,
+      );
+      const held = new Set(current.map((row) => (JSON.parse(row.facts_json) as PurchaseFacts).site));
+      const leases = await this.db.all<{ site: string }>(
+        "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state = 'purchase'",
+        jobId,
+      );
+      const waiting = new Set<string>();
+      for (const lease of leases)
+        if (!held.has(lease.site)) for (const job of await this.release(jobId, lease.site)) waiting.add(job);
+      return [...waiting];
+    });
   }
 
   /** The caller wakes returned jobs after commit; it never awaits delivery inside a transaction. */
