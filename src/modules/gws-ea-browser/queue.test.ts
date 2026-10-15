@@ -12,6 +12,7 @@ import { getDb } from '../../db/connection.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
+import { forbidden } from '../../cli/delivery-action.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
@@ -60,6 +61,41 @@ function responses(): unknown[] {
     db.close();
   }
 }
+
+it('preserves a sanitized native refusal before commit and uncertainty after a commit marker', async () => {
+  registerBrowserQueuedAction('queue_refusal_fixture', {
+    validate: (content) => ({ marked: content.marked === true }),
+    async execute(context, payload) {
+      if (payload.marked) await context.markCommitStarted();
+      throw forbidden('The bound authentication field is no longer safe.');
+    },
+  });
+  const queue = new BrowserQueue(store, runtime);
+  await queue.start();
+  await queue.accept('queue_refusal_fixture', {}, session, 'refused-before');
+  await queue.accept('queue_refusal_fixture', { marked: true }, session, 'refused-after');
+  await queue.idle();
+  expect(responses()).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        requestId: 'refused-before',
+        frame: {
+          id: 'refused-before',
+          ok: false,
+          error: { code: 'forbidden', message: 'The bound authentication field is no longer safe.' },
+        },
+      }),
+      expect.objectContaining({
+        requestId: 'refused-after',
+        frame: expect.objectContaining({
+          ok: true,
+          data: expect.objectContaining({ reason: 'outcome_unknown', repeat_safe: false }),
+        }),
+      }),
+    ]),
+  );
+  await queue.stop();
+});
 
 it('refuses main, external-email, a foreign thread and cancelled browser jobs', async () => {
   const queue = new BrowserQueue(store, runtime);

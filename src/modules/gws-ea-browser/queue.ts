@@ -2,6 +2,7 @@ import type { Page } from 'playwright-core';
 
 import {
   ANSWER_LATER,
+  ActionRefusal,
   answeredGuard,
   answeringAction,
   forbidden,
@@ -307,9 +308,16 @@ export class BrowserQueue {
         started,
         controller.signal.aborted && latest?.commit_started_at ? stopped('outcome_unknown', false) : result,
       );
-    } catch (_error) {
+    } catch (error) {
       const latest = await this.store.request(request.id);
-      await this.finish(started, stopped(latest?.commit_started_at ? 'outcome_unknown' : 'browser_unavailable', false));
+      await this.finish(
+        started,
+        latest?.commit_started_at
+          ? stopped('outcome_unknown', false)
+          : error instanceof ActionRefusal
+            ? error
+            : stopped('browser_unavailable', false),
+      );
     } finally {
       if (timer) clearTimeout(timer);
       // An interrupted SDK call may finish late. Keep this job quarantined until it settles;
@@ -354,18 +362,25 @@ export class BrowserQueue {
     }
   }
 
-  async finish(request: BrowserRequest, result: Record<string, unknown>): Promise<void> {
+  async finish(request: BrowserRequest, result: Record<string, unknown> | ActionRefusal): Promise<void> {
     const at = new Date().toISOString();
     const latest = await this.store.request(request.id);
     if (!latest) return;
-    const frame: ResponseFrame = {
-      id: request.request_id,
-      ok: true,
-      data: {
-        ...result,
-        timing: { accepted_at: request.accepted_at, started_at: latest.started_at, answered_at: at },
-      },
-    };
+    const frame: ResponseFrame =
+      result instanceof ActionRefusal
+        ? {
+            id: request.request_id,
+            ok: false,
+            error: { code: result.code, message: result.message },
+          }
+        : {
+            id: request.request_id,
+            ok: true,
+            data: {
+              ...result,
+              timing: { accepted_at: request.accepted_at, started_at: latest.started_at, answered_at: at },
+            },
+          };
     await this.store.answer(request.id, frame, at);
     const answered = await this.store.request(request.id);
     if (answered) await this.deliver(answered);
