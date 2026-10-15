@@ -274,6 +274,9 @@ export interface PendingApproval {
 // ── Agent destinations (central DB) ──
 
 export interface AgentDestination {
+  session_mode?: 'agent-shared' | 'per-thread';
+  /** Treat inbound messages from this destination as untrusted source material. */
+  inbound_untrusted?: 0 | 1;
   agent_group_id: string;
   local_name: string;
   target_type: 'channel' | 'agent';

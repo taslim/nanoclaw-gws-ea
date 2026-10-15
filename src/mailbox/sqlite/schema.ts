@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS destinations (
   type            TEXT NOT NULL,
   channel_type    TEXT,
   platform_id     TEXT,
-  agent_group_id  TEXT
+  agent_group_id  TEXT,
+  session_mode    TEXT NOT NULL DEFAULT 'agent-shared'
 );
 
 CREATE TABLE IF NOT EXISTS session_routing (

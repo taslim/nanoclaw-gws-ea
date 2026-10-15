@@ -19,19 +19,29 @@
  * core throws with a "module not installed" message so retry → mark failed.
  */
 import fs from 'fs';
+import { createHash } from 'crypto';
 import path from 'path';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getSession } from '../../db/sessions.js';
+import { isUniqueViolation } from '../../db/errors.js';
+import { OutboundRefusedError } from '../../delivery.js';
+import { findSystemSession, getSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import {
+  resolveSession,
+  resolveSystemSession,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
 import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
+import { getDestinationByTarget } from './db/agent-destinations.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
 
 export { isSafeAttachmentName };
@@ -170,9 +180,19 @@ export function forwardAttachedFiles(
   return attachments;
 }
 
+type InboundFraming = (content: string, context: { sourceAgentGroupId: string; targetAgentGroupId: string }) => string;
+let inboundFraming: InboundFraming | undefined;
+
+/** Register product-owned source framing without coupling A2A to that product. */
+export function registerA2aInboundFraming(framing: InboundFraming): void {
+  if (inboundFraming) throw new Error('A2A inbound framing is already registered');
+  inboundFraming = framing;
+}
+
 export interface RoutableAgentMessage {
   id: string;
   platform_id: string | null;
+  thread_id?: string | null;
   content: string;
   /**
    * For replies, the id of the inbound message being replied to. The
@@ -211,6 +231,26 @@ async function resolveTargetSession(
   sourceSession: Session,
   targetAgentGroupId: string,
 ): Promise<Session> {
+  const destination = await getDestinationByTarget(sourceSession.agent_group_id, 'agent', targetAgentGroupId);
+  if (destination?.session_mode === 'per-thread') {
+    const prefix = `system:a2a:${sourceSession.agent_group_id}:`;
+    if (msg.thread_id === 'new') {
+      const thread = `${prefix}${msg.id}`;
+      const existing = await findSystemSession(targetAgentGroupId, thread, true);
+      if (existing?.status === 'closed')
+        throw new OutboundRefusedError('agent-to-agent:thread', 'Thread is closed. Open a new thread.');
+      return (await resolveSystemSession(targetAgentGroupId, thread)).session;
+    }
+    if (!msg.thread_id?.startsWith(prefix))
+      throw new OutboundRefusedError(
+        'agent-to-agent:thread',
+        'An explicit thread owned by the source agent is required.',
+      );
+    const target = await findSystemSession(targetAgentGroupId, msg.thread_id, true);
+    if (!target || target.status !== 'active')
+      throw new OutboundRefusedError('agent-to-agent:thread', 'Unknown or closed thread. Open a new thread.');
+    return target;
+  }
   const originSessionId = await withExistingMailboxSession(sourceSession.agent_group_id, sourceSession.id, (srcDb) => {
     let origin: string | null = null;
     if (msg.in_reply_to) {
@@ -252,7 +292,13 @@ export async function routeAgentMessage(
   const decision = await guard(a2aSend, {
     actor: { kind: 'agent', agentGroupId: sourceAgentGroupId, sessionId: session.id },
     resource: { from: sourceAgentGroupId, to: targetAgentGroupId },
-    payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
+    payload: {
+      id: msg.id,
+      platform_id: targetAgentGroupId,
+      content: msg.content,
+      in_reply_to: msg.in_reply_to,
+      thread_id: msg.thread_id ?? null,
+    },
     grant: opts.grant ?? null,
   });
 
@@ -278,6 +324,7 @@ export async function routeAgentMessage(
         platform_id: targetAgentGroupId,
         content: msg.content,
         in_reply_to: msg.in_reply_to,
+        thread_id: msg.thread_id ?? null,
       },
     });
     log.info('Agent message held for approval', {
@@ -334,7 +381,9 @@ async function performAgentRoute(
   targetAgentGroupId: string,
 ): Promise<void> {
   const targetSession = await resolveTargetSession(msg, session, targetAgentGroupId);
-  const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const a2aMsgId = `a2a-${createHash('sha256')
+    .update(JSON.stringify([session.id, msg.id]))
+    .digest('hex')}`;
 
   // If the source message references files (via `send_file`), forward the
   // bytes from the source's outbox into the target's inbox so the target
@@ -343,16 +392,32 @@ async function performAgentRoute(
   // read the bytes — they live in a session dir it doesn't mount.
   const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
 
-  await writeSessionMessage(targetAgentGroupId, targetSession.id, {
-    id: a2aMsgId,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: forwardedContent,
-    sourceSessionId: session.id,
-  });
+  const inboundPolicy = await getDestinationByTarget(targetAgentGroupId, 'agent', session.agent_group_id);
+  if (inboundPolicy?.inbound_untrusted === 1 && !inboundFraming) {
+    throw new OutboundRefusedError('agent-to-agent:framing', 'Untrusted inbound framing is not registered.');
+  }
+  const content =
+    inboundPolicy?.inbound_untrusted === 1 && inboundFraming
+      ? inboundFraming(forwardedContent, { sourceAgentGroupId: session.agent_group_id, targetAgentGroupId })
+      : forwardedContent;
+  try {
+    await writeSessionMessage(targetAgentGroupId, targetSession.id, {
+      id: a2aMsgId,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: targetSession.thread_id?.startsWith('system:a2a:') ? targetSession.thread_id : (msg.thread_id ?? null),
+      content,
+      sourceSessionId: session.id,
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const origin = await withExistingMailboxSession(targetAgentGroupId, targetSession.id, (db) =>
+      db.getInboundSourceSessionId(a2aMsgId),
+    );
+    if (origin !== session.id) throw error;
+  }
   log.info('Agent message routed', {
     from: session.agent_group_id,
     to: targetAgentGroupId,

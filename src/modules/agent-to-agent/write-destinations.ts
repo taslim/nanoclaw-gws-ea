@@ -40,6 +40,7 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
         channelType: null,
         platformId: null,
         agentGroupId: ag.id,
+        sessionMode: row.session_mode ?? 'agent-shared',
       });
     }
   }

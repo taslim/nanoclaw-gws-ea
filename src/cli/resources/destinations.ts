@@ -61,6 +61,12 @@ registerResource({
       type: 'string',
       description: "The target's ID — messaging_groups.id for channels, agent_groups.id for agents.",
     },
+    {
+      name: 'session_mode',
+      type: 'string',
+      enum: ['agent-shared', 'per-thread'],
+      description: 'Agent session routing: shared by default, or one explicit thread per errand.',
+    },
     { name: 'channel_type', type: 'string', description: 'Resolved channel type for channel destinations.' },
     { name: 'display_name', type: 'string', description: 'Resolved chat title or agent name.' },
     { name: 'created_at', type: 'string', description: 'Auto-set.' },
@@ -81,6 +87,7 @@ registerResource({
                ad.local_name,
                ad.target_type,
                ad.target_id,
+               ad.session_mode,
                CASE WHEN ad.target_type = 'channel' THEN mg.channel_type ELSE NULL END AS channel_type,
                CASE WHEN ad.target_type = 'channel' THEN mg.name ELSE ag.name END AS display_name,
                ad.created_at
@@ -107,16 +114,28 @@ registerResource({
           throw new Error('--target-type must be channel or agent');
         }
         if (!targetId) throw new Error('--target-id is required');
+        const sessionMode = args.session_mode ?? 'agent-shared';
+        if (sessionMode !== 'agent-shared' && sessionMode !== 'per-thread')
+          throw new Error('--session-mode must be agent-shared or per-thread');
+        if (targetType === 'channel' && sessionMode !== 'agent-shared')
+          throw new Error('--session-mode per-thread requires an agent target');
         // The module's writer, so the destination admission policies judge the row first.
         await createDestination({
           agent_group_id: agentGroupId,
           local_name: localName,
           target_type: targetType,
           target_id: targetId,
+          session_mode: sessionMode,
           created_at: new Date().toISOString(),
         });
         await projectDestinationsToSessions(agentGroupId);
-        return { agent_group_id: agentGroupId, local_name: localName, target_type: targetType, target_id: targetId };
+        return {
+          agent_group_id: agentGroupId,
+          local_name: localName,
+          target_type: targetType,
+          target_id: targetId,
+          session_mode: sessionMode,
+        };
       },
     },
     remove: {

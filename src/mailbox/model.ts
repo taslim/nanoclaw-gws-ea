@@ -124,6 +124,7 @@ export interface DeliveryRecord {
 interface DestinationRecordBase {
   name: string;
   displayName: string | null;
+  sessionMode?: 'agent-shared' | 'per-thread';
 }
 
 export type DestinationRecord =
@@ -487,10 +488,14 @@ export function parseDestinationRecord(value: unknown): DestinationRecord {
     'channelType',
     'platformId',
     'agentGroupId',
+    'sessionMode',
   ]);
   const common = {
     name: text(record, 'name'),
     displayName: nullableText(record, 'displayName'),
+    ...('sessionMode' in record
+      ? { sessionMode: oneOf(record, 'sessionMode', ['agent-shared', 'per-thread'] as const) }
+      : {}),
   };
   const type = oneOf(record, 'type', ['channel', 'agent'] as const);
   const channelType = nullableText(record, 'channelType');

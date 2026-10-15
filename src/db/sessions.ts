@@ -122,13 +122,17 @@ export async function getRecentConversationSessions(
   );
 }
 
-export async function findSystemSession(agentGroupId: string, threadId: string): Promise<Session | undefined> {
+export async function findSystemSession(
+  agentGroupId: string,
+  threadId: string,
+  includeClosed = false,
+): Promise<Session | undefined> {
   return getDb().get<Session>(
     `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND messaging_group_id IS NULL
          AND thread_id = ?
-         AND status = 'active'
+         ${includeClosed ? '' : "AND status = 'active'"}
        ORDER BY created_at DESC
        LIMIT 1`,
     agentGroupId,

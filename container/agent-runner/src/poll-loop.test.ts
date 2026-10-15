@@ -1049,3 +1049,102 @@ describe('the batch a turn answers', () => {
     expect(written()).toEqual([['chat', { text: 'Summarize the deck.' }]]);
   });
 });
+
+describe('per-thread A2A message blocks', () => {
+  const threadA = 'system:a2a:main:errand-a';
+  const threadB = 'system:a2a:main:errand-b';
+
+  function seedBrowser(): void {
+    getInboundDb()
+      .prepare(
+        "INSERT INTO destinations (name, type, agent_group_id, session_mode) VALUES ('browser', 'agent', 'ag-browser', 'per-thread')",
+      )
+      .run();
+  }
+
+  function browserBatch(threads: string[]) {
+    threads.forEach((thread, index) => {
+      insertMessage(`report-${index}`, 'chat', { text: 'report' });
+      getInboundDb()
+        .prepare(
+          "UPDATE messages_in SET channel_type = 'agent', platform_id = 'ag-browser', thread_id = ? WHERE id = ?",
+        )
+        .run(thread, `report-${index}`);
+    });
+    return extractRouting(getPendingMessages());
+  }
+
+  it('uses a thread only when every message from the destination agrees', async () => {
+    seedBrowser();
+    const routing = browserBatch([threadA]);
+    await dispatchResultText('<message to="browser">continue</message>', routing);
+    expect(getUndeliveredMessages()[0].thread_id).toBe(threadA);
+  });
+
+  it('refuses an ambiguous batch without falling back to the latest inbound thread', async () => {
+    seedBrowser();
+    const routing = browserBatch([threadA, threadB]);
+    const result = await dispatchResultText('<message to="browser">continue</message>', routing);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(result.refusedThreadBlocks).toEqual(['browser']);
+  });
+
+  it('delivers a mid-turn reply in the batch thread', async () => {
+    seedBrowser();
+    const routing = browserBatch([threadA]);
+    const query: AgentQuery = {
+      push() {},
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+          yield { type: 'text', text: '<message to="browser">continue</message>' };
+          yield { type: 'result', text: '' };
+        },
+      },
+    };
+    await processQuery(query, routing, ['report-0'], 'mock', undefined, 'prompt', undefined, true);
+    expect(getUndeliveredMessages()[0].thread_id).toBe(threadA);
+  });
+
+  it('nudges a refused mid-turn block even when the result has no text', async () => {
+    seedBrowser();
+    const pushes: string[] = [];
+    const query: AgentQuery = {
+      push(text) {
+        pushes.push(text);
+      },
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+          yield { type: 'text', text: '<message to="browser">new errand</message>' };
+          yield { type: 'result', text: '' };
+        },
+      },
+    };
+    await processQuery(query, { ...ERR_ROUTING, taskRun: false }, ['m1'], 'mock', undefined, 'prompt', undefined, true);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('send_message');
+    expect(pushes[0]).toContain('thread');
+  });
+
+  it('gives a same-turn tool notice even beside a delivered principal reply', async () => {
+    seedBrowser();
+    getInboundDb()
+      .prepare(
+        "INSERT INTO destinations (name, type, channel_type, platform_id) VALUES ('principal', 'channel', 'discord', 'chan-1')",
+      )
+      .run();
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: '<message to="principal">working</message><message to="browser">new errand</message>',
+    });
+    await processQuery(query, { ...ERR_ROUTING, taskRun: false }, ['m1'], 'mock', undefined, 'prompt');
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toHaveLength(1);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('send_message');
+    expect(pushes[0]).toContain('thread');
+  });
+});
