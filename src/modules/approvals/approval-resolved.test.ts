@@ -254,11 +254,23 @@ describe('approval lifecycle', () => {
     registerApprovalHandler('expires_action', async () => undefined);
     await seedApproval('appr-expired', 'expires_action');
     await seedApproval('appr-gateway', 'gateway_request');
+    await seedApproval('appr-already-approved', 'expires_action');
     await getDb().run('UPDATE pending_approvals SET expires_at = ?', new Date(Date.now() - 1_000).toISOString());
+    await transitionPendingApprovalStatus('appr-already-approved', 'pending', 'approved');
+    await seedApproval('appr-future', 'expires_action');
+    await getDb().run(
+      'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
+      new Date(Date.now() + 60_000).toISOString(),
+      'appr-future',
+    );
+    await seedApproval('appr-no-expiry', 'expires_action');
     await sweepExpiredApprovals();
     await sweepExpiredApprovals();
     expect(await getPendingApproval('appr-expired')).toBeUndefined();
     expect(await getPendingApproval('appr-gateway')).toBeDefined();
+    expect((await getPendingApproval('appr-already-approved'))?.status).toBe('approved');
+    expect(await getPendingApproval('appr-future')).toBeDefined();
+    expect(await getPendingApproval('appr-no-expiry')).toBeDefined();
     expect(events.map((event) => event.outcome)).toEqual(['expired']);
   });
 

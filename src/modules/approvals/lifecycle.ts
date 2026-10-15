@@ -1,10 +1,5 @@
 import { getDb } from '../../db/index.js';
-import {
-  deletePendingApproval,
-  getPendingApproval,
-  getPendingApprovalsByAction,
-  getSession,
-} from '../../db/sessions.js';
+import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import type { PendingApproval } from '../../types.js';
 import { getRegisteredApprovalActions, notifyApprovalResolved } from './primitive.js';
@@ -59,10 +54,11 @@ export async function expireApproval(approvalId: string, now = new Date().toISOS
 export async function sweepExpiredApprovals(): Promise<void> {
   const now = new Date().toISOString();
   for (const action of getRegisteredApprovalActions()) {
-    for (const row of await getPendingApprovalsByAction(action)) {
-      if (row.status === 'pending' && row.expires_at && row.expires_at <= now) {
-        await expireApproval(row.approval_id, now);
-      }
-    }
+    const expired = await getDb().all<PendingApproval>(
+      "SELECT * FROM pending_approvals WHERE action = ? AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?",
+      action,
+      now,
+    );
+    for (const row of expired) await expireApproval(row.approval_id, now);
   }
 }

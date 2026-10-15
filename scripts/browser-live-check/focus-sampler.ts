@@ -89,18 +89,28 @@ export function assessQuietOperation(observations: readonly DesktopObservation[]
 export class FocusSampler {
   readonly observations: DesktopObservation[] = [];
   private timer: ReturnType<typeof setInterval> | undefined;
-  private pending: Promise<void> = Promise.resolve();
+  private pending: Promise<void> | undefined;
 
   async start(): Promise<void> {
     await this.sample();
     this.timer = setInterval(() => {
-      // Serial sampling avoids overlapping osascript processes on a busy Mac.
-      this.pending = this.pending.then(() => this.sample());
+      // A slow macOS read skips ticks instead of retaining a backlog.
+      if (!this.pending) void this.sample();
     }, 750);
   }
 
   async sample(): Promise<void> {
-    this.observations.push(await readDesktop());
+    // Probe boundaries also wait for an in-flight read before sampling.
+    while (this.pending) await this.pending;
+    const pending = readDesktop().then((observation) => {
+      this.observations.push(observation);
+    });
+    this.pending = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.pending === pending) this.pending = undefined;
+    }
   }
 
   async runProbe(name: string, execute: () => Promise<Omit<ProbeResult, 'name'>>): Promise<ProbeResult> {
