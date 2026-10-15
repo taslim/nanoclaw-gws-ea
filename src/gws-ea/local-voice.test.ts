@@ -588,6 +588,12 @@ describe('native public capability journeys', () => {
               assets: { status: 'absent' },
               activation: { status: 'disabled' },
             },
+            {
+              name: 'browser',
+              scope: 'assistant',
+              actions: ['show', 'check', 'enable', 'disable'],
+              assistant_ids: [],
+            },
           ],
         },
       },

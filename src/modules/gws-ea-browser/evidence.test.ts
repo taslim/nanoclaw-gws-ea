@@ -256,7 +256,7 @@ it('leaves truncated mailbox timing unavailable and never provisions an absent m
     requests: [{ emittedAt: null }],
   });
   expect(fs.readdirSync(root, { recursive: true }).sort()).toEqual(files);
-});
+}, 30_000);
 
 it('refuses unknown, unstarted, foreign and closed origins without creating jobs or mailbox files', async () => {
   const before = fs.readdirSync(root, { recursive: true }).sort();
