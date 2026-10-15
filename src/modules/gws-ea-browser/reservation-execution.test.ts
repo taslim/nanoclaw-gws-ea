@@ -98,8 +98,10 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
   }
   beforeEach(async () => {
     if (!chromePath) throw new Error('Chrome required');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-15T12:00:00.000Z'));
     calendar.mockReset();
-    calendar.mockResolvedValue({ conflicts: [], conflicts_not_listed: false });
+    calendar.mockResolvedValue({ conflicts: [], conflicts_not_listed: 0 });
     await runMigrations(await initTestDb());
     for (const id of ['reservation-main', 'reservation-browser'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -158,6 +160,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     delete process.env.GWS_EA_BROWSER_POLICY_FILE;
     await closeDb();
     fs.rmSync(root, { recursive: true, force: true });
+    vi.useRealTimers();
   });
   it('books an explicitly free reservation exactly once without an invented payment card approval', async () => {
     expect(await purchase('first')).toMatchObject({ status: 'booked', order_number: '90123' });
@@ -177,11 +180,11 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
   });
   it('rereads native DOM after the last calendar wait and refuses a changed party', async () => {
-    calendar.mockResolvedValueOnce({ conflicts: [], conflicts_not_listed: false }).mockImplementationOnce(async () => {
+    calendar.mockResolvedValueOnce({ conflicts: [], conflicts_not_listed: 0 }).mockImplementationOnce(async () => {
       await fixture.page.locator('.ReservationSummary__row-text').evaluate((node) => {
         node.textContent = '3 Guests, Bar Counter';
       });
-      return { conflicts: [], conflicts_not_listed: false };
+      return { conflicts: [], conflicts_not_listed: 0 };
     });
     expect(await purchase('drift')).toMatchObject({ status: 'outside_bounds' });
     expect(fixture.submitted()).toBe(0);
