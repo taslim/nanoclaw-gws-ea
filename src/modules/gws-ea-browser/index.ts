@@ -15,6 +15,15 @@ import './executor.js';
 import './capability.js';
 import './fill.js';
 import { browserDiagnosticsUnsafe } from './onepassword.js';
+import './group.js';
+import './destination-policy.js';
+import './guidance.js';
+import {
+  configureBrowserCancellation,
+  registerBrowserCancellationDelivery,
+  sweepBrowserJobSessions,
+} from './cancel.js';
+import { reconcileBrowserGroup } from './reconcile.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
@@ -290,6 +299,11 @@ export function getBrowserRuntime(): BrowserRuntime {
 let reconcileTimer: NodeJS.Timeout | undefined;
 let reconciling = false;
 onHostStart(async ({ signal }) => {
+  const activeQueue = getBrowserQueue();
+  await activeQueue.start();
+  configureBrowserCancellation(activeQueue);
+  await reconcileBrowserGroup();
+  await sweepBrowserJobSessions();
   // Optional capability failures have a health outcome; other channels start.
   await runtime.reconcile().catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }));
   if (signal.aborted) {
@@ -300,9 +314,11 @@ onHostStart(async ({ signal }) => {
     if (reconciling) return;
     reconciling = true;
     void (async () => {
+      await reconcileBrowserGroup();
       await runtime.reconcile();
       await runtime.closeIdleWindows();
       await queue?.retryAnswers();
+      await sweepBrowserJobSessions();
     })()
       .catch(() => log.warn('Browser runtime unavailable', { reason: 'browser_unavailable' }))
       .finally(() => {
@@ -319,9 +335,7 @@ export function getBrowserQueue(): BrowserQueue {
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
 registerBrowserActionDelivery('fill_secret', getBrowserQueue);
-onHostStart(async () => {
-  await getBrowserQueue().start();
-});
+registerBrowserCancellationDelivery(getBrowserQueue);
 onHostShutdown(async () => {
   await queue?.stop();
   queue = undefined;

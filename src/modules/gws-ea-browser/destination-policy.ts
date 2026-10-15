@@ -1,5 +1,5 @@
 import { getDb } from '../../db/connection.js';
-import { registerDestinationAdmissionPolicy } from '../../db/wiring-admission.js';
+import { registerDestinationAdmissionPolicy, registerWiringAdmissionPolicy } from '../../db/wiring-admission.js';
 import type { AgentDestination } from '../../types.js';
 import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 
@@ -23,3 +23,8 @@ export async function browserDestinationViolation(row: AgentDestination): Promis
 registerDestinationAdmissionPolicy('gws-ea-browser:separation', ({ proposed }) =>
   browserDestinationViolation(proposed),
 );
+
+registerWiringAdmissionPolicy('gws-ea-browser:errands-only', async ({ proposed }) => {
+  if ((await getDb().hasTable('gws_ea_profile')) && proposed.agent_group_id === (await getBrowserAgentGroupId()))
+    throw new Error('browser takes work only in a main-owned errand, without a channel wiring');
+});

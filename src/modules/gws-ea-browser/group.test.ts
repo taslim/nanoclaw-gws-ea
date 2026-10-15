@@ -15,6 +15,8 @@ import { getContainerConfig, updateContainerConfigJson } from '../../db/containe
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { getDb } from '../../db/connection.js';
+import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import './guidance.js';
@@ -82,4 +84,35 @@ it('composes main delegation only with enabled policy and gives the disabled ope
   expect(guidance).toContain('no_item_for_site');
   expect(guidance).toContain('outcome_unknown');
   expect(guidance).toContain('password or token');
+});
+
+it('admits only canonical main errand sessions to the sealed browser group', async () => {
+  await createAgentGroup({
+    id: 'main',
+    name: 'main',
+    folder: 'main',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
+  const policy = `${ROOT}/browser/policy.json`;
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), {
+    mode: 0o600,
+  });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const id = await ensureBrowserGroup();
+  const own = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
+  await expect(
+    assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+  ).resolves.toBeUndefined();
+  for (const thread of ['system:a2a:external:errand', 'system:task:scheduled', 'system:channel:chat']) {
+    const foreign = (await resolveSystemSession(id, thread)).session;
+    await expect(
+      assertSessionAdmitted({
+        disposition: 'create',
+        key: { installSlug: 'test', agentGroupId: id, sessionId: foreign.id },
+      }),
+    ).rejects.toThrow('main-owned errand');
+  }
 });

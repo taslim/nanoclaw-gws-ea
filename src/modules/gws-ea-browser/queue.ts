@@ -21,6 +21,8 @@ import { BrowserStore, markBrowserRequestCommitStarted, type BrowserJob, type Br
 import type { BrowserRuntime } from './index.js';
 import { SiteLeaseStore } from './leases.js';
 import { sweepBrowserStartup } from './start-sweep.js';
+import { readBrowserPolicy } from './policy.js';
+import { reconcileBrowserGroup } from './reconcile.js';
 
 export const BROWSER_REQUEST_BUDGET_MS = 90_000;
 export const BROWSER_REQUEST_MAX_BUDGET_MS = 100_000;
@@ -59,6 +61,8 @@ export const browserRequestGuard = defineGuardedAction({
   action: 'gws_ea_browser.request',
   async decide({ actor }) {
     if (actor.kind !== 'agent' || !actor.sessionId) return DENY('Only a live browser job may use the host browser.');
+    if (!(await readBrowserPolicy()).enabled)
+      return DENY('The operator needs to enable the browser for this assistant.');
     const session = await getSession(actor.sessionId);
     if (
       !session ||
@@ -75,6 +79,7 @@ export function registerBrowserActionDelivery(name: string, queue: () => Browser
   registerDeliveryAction(
     name,
     answeringAction(name, async (content, session, requestId) => {
+      await reconcileBrowserGroup();
       await queue().accept(name, content, session, requestId);
       return ANSWER_LATER;
     }),

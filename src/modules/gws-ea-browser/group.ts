@@ -24,7 +24,7 @@ import { getProviderHostContract } from '../../provider-contracts/index.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
-import { getBrowserAgentGroupId, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId, getMainAgentGroupId, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const BROWSER_TEMPLATE = 'gws-ea/browser';
@@ -168,6 +168,14 @@ registerSessionAdmissionPolicy('gws-ea-browser:stamped-reach', async ({ key }) =
   if (!(await getDb().hasTable('gws_ea_profile')) || key.agentGroupId !== (await getBrowserAgentGroupId())) return;
   if (!(await readBrowserPolicy()).enabled) throw new Error('browser may not start: the operator must enable it');
   const session = await getSession(key.sessionId);
+  const main = await getMainAgentGroupId();
+  if (
+    !session ||
+    main === null ||
+    session.messaging_group_id !== null ||
+    !session.thread_id?.startsWith(`system:a2a:${main}:`)
+  )
+    throw new Error('browser may not start outside a main-owned errand');
   const problems = await browserGroupDrift(key.agentGroupId, { sessionProvider: session?.agent_provider ?? null });
   if (problems.length > 0) throw new Error(`browser may not start: ${problems.join('; ')}`);
 });

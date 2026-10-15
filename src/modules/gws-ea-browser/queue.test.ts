@@ -13,10 +13,11 @@ import { resolveSystemSession } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { forbidden } from '../../cli/delivery-action.js';
+import { guard } from '../../guard/index.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
-import { BrowserQueue, registerBrowserQueuedAction } from './queue.js';
+import { BrowserQueue, browserRequestGuard, registerBrowserQueuedAction } from './queue.js';
 
 let store: BrowserStore;
 let session: Session;
@@ -35,8 +36,23 @@ beforeEach(async () => {
   store = new BrowserStore();
 });
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+it('rechecks operator enablement for a previously live browser job', async () => {
+  const file = `${root}/browser/policy.json`;
+  fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+  const input = {
+    actor: { kind: 'agent' as const, agentGroupId: session.agent_group_id, sessionId: session.id },
+    payload: {},
+  };
+  expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'allow' });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
 });
 
 const runtime = {

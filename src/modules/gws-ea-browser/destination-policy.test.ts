@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
+import { assertWiringAdmitted } from '../../db/wiring-admission.js';
 import '../gws-ea-profile/index.js';
 import './destination-policy.js';
 
@@ -43,4 +44,24 @@ it('admits only the two sealed main/browser edges with per-thread untrusted dele
     'per-thread',
   );
   await expect(createDestination({ ...row, local_name: 'trusted', inbound_untrusted: 0 })).rejects.toThrow('untrusted');
+});
+
+it('refuses direct channel wiring to the browser even from a trusted host caller', async () => {
+  await expect(
+    assertWiringAdmitted({
+      operation: 'create',
+      proposed: {
+        id: 'browser-channel',
+        messaging_group_id: 'principal-chat',
+        agent_group_id: 'browser',
+        engage_mode: 'pattern',
+        engage_pattern: '.',
+        sender_scope: 'all',
+        ignored_message_policy: 'drop',
+        session_mode: 'per-thread',
+        priority: 0,
+        created_at: new Date().toISOString(),
+      },
+    }),
+  ).rejects.toThrow('main-owned errand');
 });
