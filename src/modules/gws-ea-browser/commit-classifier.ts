@@ -1,6 +1,12 @@
 import type { ElementHandle, Page } from 'playwright-core';
 import { SiteLeaseStore } from './leases.js';
 import type { BrowserExecutionContext } from './queue.js';
+import {
+  authenticationEndpoint,
+  inspectAuthenticationControl,
+  submitAuthenticationForm,
+  type AuthenticationFormSignature,
+} from './authentication-signatures.js';
 
 export type ActivationClass =
   | 'ordinary'
@@ -104,6 +110,7 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
   )
     return 'purchase_control';
   if (security.test(decoded)) return 'account_security';
+  if (speaking.test(decoded)) return 'speaks_as_principal';
   const flow = merchantFlows.find((candidate) => candidate.matches(url));
   if (flow) return flow.classifyNavigation(url);
   if (
@@ -169,9 +176,37 @@ export async function readControlFacts(page: Page, element: ElementHandle): Prom
 }
 
 export async function classifyActivation(page: Page, element: ElementHandle): Promise<ActivationClass> {
+  return (await activationDispatch(page, element)).classification;
+}
+
+async function activationDispatch(
+  page: Page,
+  element: ElementHandle,
+): Promise<{
+  classification: ActivationClass;
+  flow?: ReviewedMerchantFlow;
+  authentication?: AuthenticationFormSignature;
+}> {
   const facts = await readControlFacts(page, element);
+  const generic = classifyControlFacts(facts);
   const flow = merchantFlows.find((candidate) => candidate.matches(new URL(page.url())));
-  return flow ? flow.classifyControl(page, element, facts) : classifyControlFacts(facts);
+  // Explicit financial, speaking and security denials always outrank a site's sign-in claim.
+  if (['purchase_control', 'account_security', 'speaks_as_principal', 'blocked_address'].includes(generic))
+    return { classification: generic, flow };
+  if (facts.formAction) {
+    const destination = classifyNavigationUrl(facts.formAction);
+    if (['purchase_control', 'account_security', 'speaks_as_principal', 'blocked_address'].includes(destination))
+      return { classification: destination, flow };
+  }
+  if (flow) {
+    const classification = await flow.classifyControl(page, element, facts);
+    if (classification !== 'unsupported_merchant') return { classification, flow };
+  }
+  if (!facts.transaction && facts.formMethod?.toLowerCase() === 'post' && facts.formAction) {
+    const authentication = await inspectAuthenticationControl(element);
+    if (authentication) return { classification: 'ordinary', authentication };
+  }
+  return { classification: generic };
 }
 
 export class BrowserActivationError extends Error {
@@ -186,6 +221,8 @@ const approvedPresses = new WeakMap<Page, { origin: string; flow: ReviewedMercha
 export interface ActivationIntent {
   kind: 'click' | 'submit' | 'select' | 'download';
   value?: string;
+  /** Host-only cancellation/deadline check immediately before a native authentication submit. */
+  assertActive?: () => Promise<void>;
 }
 
 export async function activateControl(
@@ -195,10 +232,11 @@ export async function activateControl(
   authority?: { commitStarted(): Promise<void> },
   intent: ActivationIntent = { kind: 'click' },
 ): Promise<void> {
-  const classification = await classifyActivation(page, element);
+  const dispatch = await activationDispatch(page, element);
+  const { classification } = dispatch;
   if (classification === 'purchase_control' && authority) {
     const source = new URL(page.url());
-    const flow = merchantFlows.find((candidate) => candidate.matches(source));
+    const flow = dispatch.flow;
     if (!flow) throw new BrowserActivationError('unsupported_merchant');
     await authority.commitStarted();
     approvedPresses.set(page, { origin: source.origin, flow });
@@ -209,7 +247,32 @@ export async function activateControl(
     }
   }
   if (classification !== 'ordinary') throw new BrowserActivationError(classification);
-  if (merchantFlows.some((flow) => flow.matches(new URL(page.url())))) return operation();
+  if (dispatch.flow) return operation();
+  if (dispatch.authentication) {
+    const authentication = dispatch.authentication;
+    const guard = await ensureBrowserNavigationGuard(page);
+    await guard.runWithPolicy(
+      {
+        classify(url) {
+          const classification = classifyNavigationUrl(url.href);
+          return classification === 'unsupported_merchant' &&
+            url.origin === authentication.origin &&
+            authenticationEndpoint(url)
+            ? 'ordinary'
+            : classification;
+        },
+      },
+      async () => {
+        const arrived = page
+          .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
+          .catch(() => undefined);
+        if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
+          throw new BrowserActivationError('unsupported_merchant');
+        await arrived;
+      },
+    );
+    return;
+  }
   const facts = await readControlFacts(page, element);
   if (facts.tag === 'input' || facts.tag === 'textarea') {
     await element.focus();
@@ -217,38 +280,41 @@ export async function activateControl(
   }
   let url = facts.href;
   if (!url && facts.formMethod?.toLowerCase() === 'get' && facts.formAction) {
-    const controls = await element.evaluate((node, selection) => {
-      const target = node as unknown as {
-        name?: string;
-        form?: {
-          elements: ArrayLike<{
-            name?: string;
-            value?: string;
-            type?: string;
-            disabled?: boolean;
-            checked?: boolean;
-            getAttribute(name: string): string | null;
-          }>;
+    const controls = await element.evaluate(
+      (node, selection) => {
+        const target = node as unknown as {
+          name?: string;
+          form?: {
+            elements: ArrayLike<{
+              name?: string;
+              value?: string;
+              type?: string;
+              disabled?: boolean;
+              checked?: boolean;
+              getAttribute(name: string): string | null;
+            }>;
+          };
         };
-      };
-      return Array.from(target.form?.elements ?? [])
-        .filter(
-          (e) =>
-            e.name &&
-            !e.disabled &&
-            !['submit', 'button', 'reset', 'file'].includes(e.type ?? '') &&
-            (!['checkbox', 'radio'].includes(e.type ?? '') || e.checked),
-        )
-        .map((e) => ({
-          name: e.name ?? '',
-          value: selection.kind === 'select' && e.name === target.name ? (selection.value ?? '') : (e.value ?? ''),
-          secret:
-            e.type === 'password' ||
-            /(?:one-time-code|cc-|token|secret|password|credential|csrf)/iu.test(
-              (e.getAttribute('autocomplete') ?? '') + ' ' + (e.name ?? ''),
-            ),
-        }));
-    }, intent);
+        return Array.from(target.form?.elements ?? [])
+          .filter(
+            (e) =>
+              e.name &&
+              !e.disabled &&
+              !['submit', 'button', 'reset', 'file'].includes(e.type ?? '') &&
+              (!['checkbox', 'radio'].includes(e.type ?? '') || e.checked),
+          )
+          .map((e) => ({
+            name: e.name ?? '',
+            value: selection.kind === 'select' && e.name === target.name ? (selection.value ?? '') : (e.value ?? ''),
+            secret:
+              e.type === 'password' ||
+              /(?:one-time-code|cc-|token|secret|password|credential|csrf)/iu.test(
+                (e.getAttribute('autocomplete') ?? '') + ' ' + (e.name ?? ''),
+              ),
+          }));
+      },
+      { kind: intent.kind, value: intent.value },
+    );
     if (controls.some((control) => control.secret)) throw new BrowserActivationError('unsupported_merchant');
     const action = new URL(facts.formAction);
     action.search = new URLSearchParams(

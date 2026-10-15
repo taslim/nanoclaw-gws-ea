@@ -1,5 +1,11 @@
-import { expect, it } from 'vitest';
-import { classifyControlFacts, classifyNavigationUrl } from './commit-classifier.js';
+import { expect, it, vi } from 'vitest';
+import type { ElementHandle, Page } from 'playwright-core';
+import {
+  activateControl,
+  classifyControlFacts,
+  classifyNavigationUrl,
+  registerReviewedMerchantFlow,
+} from './commit-classifier.js';
 
 it('fails closed for unknown one-click controls without requiring visible money', () => {
   expect(
@@ -69,4 +75,54 @@ it('blocks commit URLs and external protocols before navigation', () => {
   expect(classifyNavigationUrl('https://shop.example/unknown-action')).toBe('unsupported_merchant');
   expect(classifyNavigationUrl('https://shop.example/search?q=restaurant')).toBe('ordinary');
   expect(classifyNavigationUrl('file:///etc/passwd')).toBe('blocked_address');
+});
+
+it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
+  registerReviewedMerchantFlow({
+    id: 'test-unhandled-auth-flow',
+    matches: (url) => url.hostname === 'auth-dispatch.example',
+    classifyControl: async () => 'unsupported_merchant',
+    classifyNavigation: () => 'unsupported_merchant',
+  });
+  const native = vi.fn();
+  const frame = { url: () => 'https://auth-dispatch.example/login' };
+  const form = {
+    action: 'https://auth-dispatch.example/login',
+    method: 'post',
+    target: '',
+    elements: [
+      { name: 'username', type: 'text', getAttribute: () => 'username' },
+      { name: 'password', type: 'password', getAttribute: () => 'current-password' },
+    ],
+    querySelector: () => true,
+  };
+  const node = {
+    tagName: 'BUTTON',
+    type: 'submit',
+    textContent: 'Sign in',
+    form,
+    getAttribute: (name: string) => (name === 'type' ? 'submit' : null),
+    ownerDocument: {
+      location: { origin: 'https://auth-dispatch.example' },
+      defaultView: { HTMLFormElement: { prototype: { submit: native } } },
+    },
+  };
+  const element = {
+    ownerFrame: async () => frame,
+    evaluate: async (fn: (node: unknown, argument: unknown) => unknown, argument: unknown) => fn(node, argument),
+  } as unknown as ElementHandle;
+  const page = {
+    url: () => frame.url(),
+    locator: () => ({ innerText: async () => '' }),
+    waitForEvent: async () => undefined,
+    once: () => undefined,
+    context: () => ({ newCDPSession: async () => ({ on: () => undefined, send: async () => undefined }) }),
+  } as unknown as Page;
+  const arbitraryCallback = vi.fn(async () => undefined);
+  await activateControl(page, element, arbitraryCallback);
+  expect(native).toHaveBeenCalledTimes(1);
+  expect(arbitraryCallback).not.toHaveBeenCalled();
+  form.action = 'https://auth-dispatch.example/place-order';
+  await expect(activateControl(page, element, arbitraryCallback)).rejects.toMatchObject({ reason: 'purchase_control' });
+  expect(arbitraryCallback).not.toHaveBeenCalled();
 });

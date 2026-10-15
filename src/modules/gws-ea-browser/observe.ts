@@ -1,10 +1,12 @@
-import type { ElementHandle, Frame, Page } from 'playwright-core';
+import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
+import { getDomain } from 'tldts';
 
 export interface BrowserObservation {
   generation: number;
   url: string;
   snapshot: string;
   delta?: { removed: string[]; added: string[] };
+  site?: { origin: string; untrusted: true; [key: string]: unknown };
 }
 export interface BrowserRef {
   ref: string;
@@ -20,16 +22,39 @@ interface PageObservationState {
   snapshot: string;
   secrets: Set<string>;
   activeSecrets: Set<string>;
+  observedSites: Set<string>;
+  unboundSecretDocuments: Set<string>;
+  secretDocumentLoaders: Set<string>;
 }
 const pages = new WeakMap<Page, PageObservationState>();
 
 function stateFor(page: Page): PageObservationState {
   let state = pages.get(page);
   if (!state) {
-    state = { generation: 0, url: '', snapshot: '', secrets: new Set(), activeSecrets: new Set() };
+    state = {
+      generation: 0,
+      url: '',
+      snapshot: '',
+      secrets: new Set(),
+      activeSecrets: new Set(),
+      observedSites: new Set(),
+      unboundSecretDocuments: new Set(),
+      secretDocumentLoaders: new Set(),
+    };
     pages.set(page, state);
   }
   return state;
+}
+
+type BrowserSiteInfoProvider = (
+  page: Page,
+  origin: string,
+  assertActive?: () => Promise<void>,
+) => Promise<Record<string, unknown>>;
+const siteInfoProviders: BrowserSiteInfoProvider[] = [];
+/** Host-owned optional enrichment. It receives an origin only and never page-authored instructions. */
+export function registerBrowserSiteInfoProvider(provider: BrowserSiteInfoProvider): void {
+  siteInfoProviders.push(provider);
 }
 
 /** Secret values stay host-only, including after a field was cleared or navigation completed. */
@@ -38,9 +63,47 @@ export function registerPageSecret(page: Page, value: string): void {
   const state = stateFor(page);
   state.secrets.add(value);
   state.activeSecrets.add(value);
+  state.unboundSecretDocuments.add(value);
 }
 export function releasePageSecret(page: Page, value: string): void {
   stateFor(page).activeSecrets.delete(value);
+}
+
+const documentSessions = new WeakMap<Page, Promise<CDPSession>>();
+interface DocumentTree {
+  frame: { loaderId: string };
+  childFrames?: DocumentTree[];
+}
+async function documentLoaders(page: Page): Promise<Set<string>> {
+  let attached = documentSessions.get(page);
+  if (!attached) {
+    attached = page.context().newCDPSession(page);
+    documentSessions.set(page, attached);
+    page.once('close', () => {
+      documentSessions.delete(page);
+      void attached?.then((session) => session.detach()).catch(() => undefined);
+    });
+  }
+  const session = await attached;
+  const tree = await session.send('Page.getFrameTree');
+  const loaders = new Set<string>();
+  const visit = (node: DocumentTree): void => {
+    if (node.frame.loaderId) loaders.add(node.frame.loaderId);
+    node.childFrames?.forEach(visit);
+  };
+  visit(tree.frameTree);
+  return loaders;
+}
+
+/** Bind taint to native document identities before inserting a value or consuming a bearer URL.
+ * All current frames are tainted: same-origin scripts and postMessage can copy a value into another frame's canvas.
+ * Loader IDs remain remembered for the page lifetime, including a back/forward-cache restoration.
+ */
+export async function bindPageSecretDocuments(page: Page, value: string): Promise<void> {
+  const state = stateFor(page);
+  const loaders = await documentLoaders(page);
+  for (const loader of loaders) state.secretDocumentLoaders.add(loader);
+  if (loaders.size) state.unboundSecretDocuments.delete(value);
 }
 export function redactPageText(page: Page, text: string): string {
   let result = text;
@@ -63,6 +126,7 @@ async function collectSecretFields(page: Page): Promise<boolean> {
     for (const value of values)
       if (typeof value === 'string' && value) {
         registerPageSecret(page, value);
+        await bindPageSecretDocuments(page, value);
         present = true;
       }
   }
@@ -70,10 +134,18 @@ async function collectSecretFields(page: Page): Promise<boolean> {
 }
 
 export async function pageHasSecret(page: Page): Promise<boolean> {
-  return (await collectSecretFields(page)) || stateFor(page).activeSecrets.size > 0;
+  const state = stateFor(page);
+  if ((await collectSecretFields(page)) || state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
+  if (!state.secretDocumentLoaders.size) return false;
+  try {
+    const loaders = await documentLoaders(page);
+    return !loaders.size || [...loaders].some((loader) => state.secretDocumentLoaders.has(loader));
+  } catch (_error) {
+    return true;
+  }
 }
 
-export async function observePage(page: Page): Promise<BrowserObservation> {
+export async function observePage(page: Page, assertActive?: () => Promise<void>): Promise<BrowserObservation> {
   await collectSecretFields(page);
   const state = stateFor(page);
   const url = redactPageText(page, page.url());
@@ -91,7 +163,20 @@ export async function observePage(page: Page): Promise<BrowserObservation> {
       : undefined;
   state.url = url;
   state.snapshot = snapshot;
-  return { generation: state.generation, url, snapshot, ...(delta ? { delta } : {}) };
+  let site: BrowserObservation['site'];
+  try {
+    const current = new URL(page.url());
+    const domain = getDomain(current.hostname, { allowPrivateDomains: true });
+    if (current.protocol === 'https:' && domain && !state.observedSites.has(domain) && siteInfoProviders.length) {
+      site = { origin: current.origin, untrusted: true };
+      for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
+      site = JSON.parse(redactPageText(page, JSON.stringify(site))) as BrowserObservation['site'];
+      state.observedSites.add(domain);
+    }
+  } catch (_error) {
+    /* Optional site metadata cannot prevent a redacted observation. */
+  }
+  return { generation: state.generation, url, snapshot, ...(delta ? { delta } : {}), ...(site ? { site } : {}) };
 }
 
 export class BrowserRefError extends Error {
