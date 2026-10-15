@@ -323,7 +323,13 @@ export async function inspectBrowserCapability(
         !['listening', 'stopped'].includes(String(health.proxy.state))
       )
         throw new Error('Invalid browser health');
-      if (health.proxy.state === 'listening') {
+      if (!health.enabled) {
+        isolation = {
+          status: 'not_run',
+          reason:
+            'The running host has not enabled this browser capability. Wait for policy reconciliation and check again.',
+        };
+      } else if (health.proxy.state === 'listening') {
         if (
           !Number.isSafeInteger(health.proxy.port) ||
           Number(health.proxy.port) < 1 ||
@@ -331,6 +337,14 @@ export async function inspectBrowserCapability(
         )
           throw new Error('Invalid proxy port');
         port = Number(health.proxy.port);
+      }
+      if (isRecord(health.chrome) && health.chrome.state === 'unavailable') {
+        chrome = {
+          ...chrome,
+          status: 'unavailable',
+          reason:
+            'The running host could not launch its owned Chrome. Check its browser diagnostics before trying another errand.',
+        };
       }
     } catch (_error) {
       isolation = {

@@ -255,6 +255,29 @@ describe('assistant browser capability', () => {
     }
   });
 
+  it.each(['disabled', 'unavailable'] as const)(
+    'does not report a host with %s browser runtime as ready',
+    async (state) => {
+      const f = await fixture();
+      await enableBrowserCapability(f.paths, f.instanceId);
+      const result = await inspectBrowserCapability(f.paths, f.instanceId, {
+        check: true,
+        ncl: async () => ({
+          schemaVersion: 1,
+          enabled: state !== 'disabled',
+          proxy: { state: 'listening', port: 41444 },
+          chrome: { state: state === 'unavailable' ? 'unavailable' : 'stopped' },
+        }),
+        runCommand: async (command) =>
+          command.command === 'docker' ? { stdout: '{"reachable":false}', stderr: '', exitCode: 0 } : chrome(command),
+      });
+      expect(result.ready).toBe(false);
+      if (state === 'disabled') expect(result.isolation.status).toBe('not_run');
+      else
+        expect(result.chrome).toMatchObject({ status: 'unavailable', reason: expect.stringContaining('running host') });
+    },
+  );
+
   it('never reports a failed probe launch as passed', async () => {
     const f = await fixture();
     await enableBrowserCapability(f.paths, f.instanceId);
