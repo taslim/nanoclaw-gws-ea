@@ -114,7 +114,13 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
   } catch (_error) {
     return 'blocked_address';
   }
-  if (security.test(decoded)) return 'account_security';
+  if (
+    security.test(decoded) ||
+    /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu.test(
+      decoded,
+    )
+  )
+    return 'account_security';
   if (speaking.test(decoded)) return 'speaks_as_principal';
   const reviewed = merchantFlows.find((candidate) => candidate.matches(url));
   if (
@@ -130,8 +136,6 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     )
   )
     return 'purchase_control';
-  if (security.test(decoded)) return 'account_security';
-  if (speaking.test(decoded)) return 'speaks_as_principal';
   if (authenticationEndpoint(url)) return 'ordinary';
   const flow = merchantFlows.find((candidate) => candidate.matches(url));
   if (flow) return flow.classifyNavigation(url);

@@ -23,6 +23,7 @@ import {
   emailToPrincipal,
   freeTime,
   tellMain,
+  signInReply,
 } from './gws-ea-email.js';
 import { requestStatus } from './request-status.js';
 import type { McpToolDefinition } from './types.js';
@@ -65,6 +66,14 @@ function text(result: { readonly content: readonly unknown[] }): string {
 }
 
 describe('the email tools', () => {
+  it('keeps sign-in replies typed and quiet without marking them as sent mail', async () => {
+    expect(signInReply.tool.inputSchema.required).toEqual(['kind']);
+    expect(signInReply.tool.inputSchema.properties).toMatchObject({ kind: { enum: ['code', 'link', 'unavailable'] } });
+    const { request, result } = await call(signInReply, { kind: 'code', value: '642981' });
+    expect(request).toMatchObject({ action: 'sign_in_reply', kind: 'code', value: '642981' });
+    expect(text(result)).not.toContain('642981');
+  });
+
   it('send each call as its host action, carried by its own outbound message, with exactly its fields', async () => {
     const cases: Array<[McpToolDefinition, string, Record<string, unknown>]> = [
       [
@@ -100,6 +109,9 @@ describe('the email tools', () => {
         },
       ],
       [emailToPrincipal, 'email_send', { thread_key: 'mail-inbound-2', text: 'Booked: Tuesday at 12:30.' }],
+      [signInReply, 'sign_in_reply', { kind: 'code', value: '642981' }],
+      [signInReply, 'sign_in_reply', { kind: 'link', value: 'https://shop.example/access?token=one' }],
+      [signInReply, 'sign_in_reply', { kind: 'unavailable' }],
       [emailSend, 'email_send', { text: 'Hi Remy, …', subject: 'Morgan and Remy — 30 minutes this week?' }],
       [emailSend, 'email_send', { text: 'Looping Jane in.', to: ['dana@acme.example'], cc: ['jane@acme.example'] }],
       [tellMain, 'tell_main', { account: 'Asked Acme for its pilot quote. Waiting on their reply.' }],

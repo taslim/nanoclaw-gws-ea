@@ -168,7 +168,7 @@ export const fillSecret = requestTool({
 export const signInCode = requestTool({
   name: 'sign_in_code',
   description:
-    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail the host consumes one qualifying code or magic link without exposing it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or awaiting_code. Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity or origin mismatch. ' +
+    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or awaiting_code. Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity or origin mismatch. ' +
     NO_REPEAT,
   properties: {
     from: {

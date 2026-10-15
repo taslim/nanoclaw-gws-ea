@@ -46,7 +46,15 @@ const ALL = [
 const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
-const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email_send', 'free_time', 'tell_main'];
+const EXTERNAL_EMAIL_TOOLS = [
+  'book',
+  'cancel_booking',
+  'change_booking',
+  'email_send',
+  'free_time',
+  'sign_in_reply',
+  'tell_main',
+];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];

@@ -27,6 +27,8 @@ export interface InboxRuntime {
   now(): Date;
   /** Wait between retries of a Gmail call. */
   sleep(ms: number): Promise<void>;
+  /** Wake the existing inbox loop after a sign-in claim changes. */
+  wakeSignIn(): void;
 }
 
 let active: InboxRuntime | undefined;

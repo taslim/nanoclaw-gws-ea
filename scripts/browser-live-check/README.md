@@ -141,7 +141,7 @@ its reference. Preserve the receipt and associated private source artifacts.
 | `same_site_serialized`         | A second job waits while the first owns that site, including a pending purchase card.                                                                                                              |
 | `restart_before_commit`        | Mid-batch restart answers once with `interrupted`; a fresh safe request continues; no automatic replay.                                                                                            |
 | `restart_after_commit`         | A marked purchase answers `outcome_unknown`, remains site-blocked across jobs/accounts and does not automatically retry. Reconciliation or an informed one-attempt approval is required.           |
-| `email_code_sign_in`           | Code/link sign-in succeeds without an external-email thread or a wake to main.                                                                                                                     |
+| `email_code_sign_in`           | Code/link sign-in uses an isolated external-email system task, with no ordinary email thread or wake to main.                                                                                      |
 | `vault_secret_confinement`     | Dedicated-vault fill succeeds, wrong/full-frame origins are refused, filled documents cannot be screenshotted and no agent output contains the canary.                                             |
 | `purchase_card_revalidation`   | Complete terms; higher totals/material changes withdraw the old card; an unchanged lower total inside approved bounds may proceed once. Use owned fixtures or explicit real authority for commits. |
 | `unsupported_purchase`         | Unsupported/drifted/no-visible-price flows refuse commits across generic activation and recipe/watch paths.                                                                                        |
@@ -164,6 +164,10 @@ checks stay `not-run`; a receipt with differing expected/observed facts fails.
 Keep real fixtures or records for native assertions in the source artifacts.
 
 ## Secret canary scan
+
+Vault and long-lived credential canaries must stay absent from all agent contexts.
+Temporary email sign-in credentials intentionally enter the isolated external-email
+system task; scan for those only in main/browser output and operator logs.
 
 Store dedicated test secrets in a local `0600` JSON array and a JSON array of
 agent-output/log file paths in another file. Supply paths, never secret values in

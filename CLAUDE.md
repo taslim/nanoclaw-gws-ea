@@ -181,7 +181,7 @@ Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer
 
 ## Secrets / Credentials / Gateways
 
-API keys, OAuth tokens, and auth credentials are managed by a **credential gateway** — never by NanoClaw and never by an agent. Secrets are injected at the network boundary at request time; none are passed in env vars or through chat context.
+Long-lived API keys, OAuth tokens, and API auth credentials are managed by a **credential gateway** — never by NanoClaw and never by an agent. Secrets are injected at the network boundary at request time; none are passed in env vars or through chat context.
 
 NanoClaw ships the seam, not a gateway. One gateway is installed per copy from its `/add-<gateway>` skill (`/add-onecli`, `/add-iron-proxy`), and `NANOCLAW_GATEWAY_PROVIDER` in `.env` names the one this copy runs. With none registered the host refuses to start — there is no implicit default and no open-egress fallback.
 
@@ -213,7 +213,9 @@ credential injection: its Chrome traffic uses a per-assistant public-only proxy,
 never the credential gateway. The host alone resolves optional 1Password secrets
 from a read-only service account for one dedicated vault and fills a validated
 HTTPS frame; the browser agent receives handles and outcomes only. Without a
-vault, assistant-owned accounts use emailed codes/magic links. Profile and
+vault, assistant-owned accounts use emailed codes/magic links. The existing isolated
+external-email agent interprets these temporary credentials in a per-claim system
+session; the host alone inserts codes or follows validated same-site links. Profile and
 staging data live under `<instance root>/browser/`, outside routine snapshot
 roots; the optional token lives in instance secrets. Disable/removal deletes
 local token material and tells the operator to revoke it in 1Password. There is

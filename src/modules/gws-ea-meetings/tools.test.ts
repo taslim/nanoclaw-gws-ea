@@ -71,7 +71,7 @@ import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrati
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { resolveSession } from '../../session-manager.js';
+import { resolveSession, resolveSystemSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -351,9 +351,18 @@ describe('the scheduling tools', () => {
     expect(refusal(fromMain)).toMatch(/Only external-email/u);
 
     const { session: noThread } = await resolveSession('ag-external', 'mg-inbox', 'mail-not-a-thread', 'per-thread');
-    expect(
-      refusal(await send(noThread, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
-    ).toBe('This conversation is not an email thread, so it has no times to offer or book.');
+    const { session: signIn } = await resolveSystemSession('ag-external', 'system:browser-sign-in:claim');
+    for (const caller of [noThread, signIn]) {
+      for (const [action, fields] of [
+        ['book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }],
+        ['change_booking', { booking: 'foreign', title: 'Changed' }],
+        ['cancel_booking', { booking: 'foreign' }],
+      ] as const) {
+        expect(refusal(await send(caller, action, fields))).toBe(
+          'This conversation is not an email thread, so it has no times to offer or book.',
+        );
+      }
+    }
     expect(calendar.writes).toEqual([]);
   });
 

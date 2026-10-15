@@ -63,7 +63,7 @@ export interface ParsedMail {
    * is none, with what the HTML quotes marked `> ` so it stays apart.
    */
   readonly text: string;
-  /** The HTML part as sent, for reading links; never shown to an agent. */
+  /** The HTML part as sent, for links; shown only in isolated host sign-in tasks. */
   readonly html: string | undefined;
   readonly attachments: readonly MailAttachment[];
   /** When Gmail received it, from `internalDate`; undefined when Gmail gave none. */
@@ -252,23 +252,44 @@ function walk(part: GmailMessagePart, visit: (part: GmailMessagePart) => void): 
 
 const ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/giu, (entity, code: string) => {
+    if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(parseInt(code.slice(2), 16));
+    if (code.startsWith('#')) return String.fromCodePoint(parseInt(code.slice(1), 10));
+    return ENTITIES[code.toLowerCase()] ?? entity;
+  });
+}
+
 /** The readable text of an HTML part: tags and scripts dropped, breaks kept, entities decoded. */
 export function htmlToText(html: string): string {
-  return html
-    .replace(/<(script|style|head)\b[^>]*>[\s\S]*?<\/\1\s*>/giu, '')
-    .replace(/<br\s*\/?>/giu, '\n')
-    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote)\s*>/giu, '\n')
-    .replace(/<[^>]*>/gu, '')
-    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/giu, (entity, code: string) => {
-      if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(parseInt(code.slice(2), 16));
-      if (code.startsWith('#')) return String.fromCodePoint(parseInt(code.slice(1), 10));
-      return ENTITIES[code.toLowerCase()] ?? entity;
-    })
+  return decodeHtmlEntities(
+    html
+      .replace(/<(script|style|head)\b[^>]*>[\s\S]*?<\/\1\s*>/giu, '')
+      .replace(/<br\s*\/?>/giu, '\n')
+      .replace(/<\/(p|div|li|tr|h[1-6]|blockquote)\s*>/giu, '\n')
+      .replace(/<[^>]*>/gu, ''),
+  )
     .split('\n')
     .map((line) => line.trim())
     .join('\n')
     .replace(/\n{3,}/gu, '\n\n')
     .trim();
+}
+
+/** Anchor labels and complete targets, decoded without interpreting what the links do. */
+export function htmlLinks(html: string): readonly { readonly label: string; readonly href: string }[] {
+  const links: { label: string; href: string }[] = [];
+  const markup = html.replace(/<!--[\s\S]*?-->/gu, '').replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/giu, '');
+  for (const anchor of markup.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/a\s*>/giu)) {
+    const attributes = anchor[1] ?? '';
+    for (const attribute of attributes.matchAll(/([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+)))?/gu)) {
+      if (attribute[1]?.toLowerCase() !== 'href') continue;
+      const href = attribute[2] ?? attribute[3] ?? attribute[4];
+      if (href !== undefined) links.push({ label: htmlToText(anchor[2] ?? ''), href: decodeHtmlEntities(href) });
+      break;
+    }
+  }
+  return links;
 }
 
 /**

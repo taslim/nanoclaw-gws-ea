@@ -1,9 +1,11 @@
 import { getDomain } from 'tldts';
 import { getDb } from '../../db/connection.js';
+import { activeInbox } from './runtime.js';
 import { dkimAlignedToSite } from './authentication.js';
+import { reserveSignInMessage } from './db.js';
 import type { ParsedMail } from './mime.js';
 
-/** Three minutes covers at least two of the inbox's sixty-second polls. */
+/** The host binding and withheld email expire together. */
 export const SIGN_IN_CLAIM_LIFETIME_MS = 180_000;
 export interface SignInClaim {
   readonly id: string;
@@ -65,25 +67,25 @@ export async function createSignInClaim(input: {
       'waiting',
     );
   });
+  activeInbox()?.wakeSignIn();
   return (await getSignInClaim(input.id))!;
 }
 
-/** Both the inbox poll and the host reader use the same atomic reservation. Only one message can ever be withheld. */
-export async function claimSignInMail(mail: ParsedMail, at = new Date(), claimId?: string): Promise<boolean> {
+/** The inbox reserves the first verified fresh message, atomically. Replays return the same claim. */
+export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promise<SignInClaim | undefined> {
   const db = getDb();
-  if (!(await db.hasTable('gws_ea_browser_sign_in_claims')) || !mail.receivedAt) return false;
+  if (!(await db.hasTable('gws_ea_browser_sign_in_claims')) || !mail.receivedAt) return undefined;
   return db.transaction(async () => {
     const claims = await db.all<SignInClaim>(
-      `SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND expires_at > ?${claimId === undefined ? '' : ' AND id = ?'} ORDER BY since_at,id`,
+      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND expires_at > ? ORDER BY since_at,id',
       'assistant',
       at.toISOString(),
-      ...(claimId === undefined ? [] : [claimId]),
     );
     for (const claim of claims) {
       if (mail.receivedAt!.getTime() < Date.parse(claim.since_at) || !dkimAlignedToSite(mail.headers, claim.domain))
         continue;
       if (claim.gmail_message_id !== null) {
-        if (claim.gmail_message_id === mail.id) return true;
+        if (claim.gmail_message_id === mail.id) return claim;
         continue;
       }
       if (claim.state !== 'waiting') continue;
@@ -93,13 +95,18 @@ export async function claimSignInMail(mail: ParsedMail, at = new Date(), claimId
         claim.id,
         'waiting',
       );
-      if (reserved.changes) return true;
+      if (reserved.changes) {
+        await reserveSignInMessage(mail.id, at.toISOString());
+        activeInbox()?.wakeSignIn();
+        return { ...claim, gmail_message_id: mail.id };
+      }
     }
-    return false;
+    return undefined;
   });
 }
 export async function finishSignInClaim(id: string): Promise<void> {
   await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE id = ?', 'finished', id);
+  activeInbox()?.wakeSignIn();
 }
 
 /** Chrome handles cannot survive a restart. Keep the one reserved message hidden through its original expiry. */
@@ -111,4 +118,30 @@ export async function recoverSignInClaims(at = new Date()): Promise<void> {
 export async function cleanupSignInClaims(at = new Date()): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return;
   await getDb().run('DELETE FROM gws_ea_browser_sign_in_claims WHERE expires_at <= ?', at.toISOString());
+}
+
+/** Only unmatched claims need accelerated Gmail checks; interpreting delivered mail is model work. */
+export async function unmatchedSignInClaims(at = new Date()): Promise<SignInClaim[]> {
+  if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return [];
+  return getDb().all<SignInClaim>(
+    'SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND state = ? AND gmail_message_id IS NULL AND expires_at > ? ORDER BY since_at,id',
+    'assistant',
+    'waiting',
+    at.toISOString(),
+  );
+}
+
+/** Keep dispatch retries fast, then return to normal polling while the interpreter works. */
+export async function hasPendingSignInMail(at = new Date()): Promise<boolean> {
+  if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return false;
+  const row = await getDb().get<{ present: number }>(
+    `SELECT 1 AS present FROM gws_ea_browser_sign_in_claims c
+       LEFT JOIN gws_ea_inbox_messages m ON m.gmail_message_id = c.gmail_message_id
+       WHERE c.source = ? AND c.state = ? AND c.expires_at > ?
+         AND (c.gmail_message_id IS NULL OR m.settled_at IS NULL) LIMIT 1`,
+    'assistant',
+    'waiting',
+    at.toISOString(),
+  );
+  return row !== undefined;
 }

@@ -53,11 +53,12 @@ import { createHash } from 'node:crypto';
 
 import type { InboundMessage } from '../../channels/adapter.js';
 import { TIMEZONE } from '../../config.js';
+import { isUniqueViolation } from '../../db/errors.js';
 import { getDb } from '../../db/connection.js';
 import { findSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
+import { resolveSystemSession, writeSessionMessage, withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { verifiedSender } from '../gws-ea-matters/candidates.js';
@@ -81,6 +82,7 @@ import {
 } from './authentication.js';
 import { consumeOwnCalendarChange, parseCalendarNotification, type CalendarNotice } from './calendar-notifications.js';
 import { claimSignInMail } from './claims.js';
+import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { observeInboxMail } from './observers.js';
 import {
   clearUnsignedNotices,
@@ -96,6 +98,7 @@ import {
   domainOf,
   headerValue,
   headerValues,
+  htmlLinks,
   parseAddressList,
   splitQuoted,
   type ParsedMail,
@@ -114,7 +117,7 @@ import {
   unplaceThread,
   type ThreadSide,
 } from './thread-map.js';
-import { untrusted, untrustedLine } from './untrusted.js';
+import { cap, untrusted, untrustedLine } from './untrusted.js';
 
 /** Messages one sender may route per hour; the rest are dropped. The principal is never limited. */
 export const MESSAGES_PER_SENDER_PER_HOUR = 10;
@@ -778,6 +781,59 @@ function calendarNews(notice: CalendarNotice, context: RoutingContext): Routed {
     : { kind: 'calendar', notice };
 }
 
+/** Reserve before normal routing and use a sealed system session with no channel return route. */
+export async function routeSignInMail(mail: ParsedMail, at: Date): Promise<boolean> {
+  const profile = await getGwsEaProfile();
+  if (principalRecognizer(profile.principal_emails).has(mail.from?.address)) return false;
+  const claim = await claimSignInMail(mail, at);
+  if (!claim) return false;
+  if (claim.state !== 'waiting') return true;
+  const group = await getExternalEmailAgentGroupId();
+  if (!group) throw new Error('The sign-in interpreter is unavailable.');
+  const { session } = await resolveSystemSession(group, `system:browser-sign-in:${claim.id}`);
+  const htmlSections: string[] = [];
+  let htmlRemaining = BODY_LIMIT / 2;
+  for (const { label, href } of htmlLinks(mail.html ?? '')) {
+    if (href.length > htmlRemaining) continue;
+    const section = untrusted(
+      `HTML link: ${JSON.stringify({ label: cap(label, LINE_LIMIT), href })}`,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const size = Array.from(section).length + 2;
+    if (size > htmlRemaining) continue;
+    htmlSections.push(section);
+    htmlRemaining -= size;
+  }
+  // A target is either supplied whole or omitted; truncating markup can create a different usable URL.
+  if ((mail.html?.length ?? 0) <= htmlRemaining) {
+    const htmlSection = untrusted(`HTML:\n${mail.html ?? ''}`, Number.MAX_SAFE_INTEGER);
+    if (Array.from(htmlSection).length <= htmlRemaining) htmlSections.push(htmlSection);
+  }
+  const text =
+    `Host sign-in task for ${claim.origin}. Interpret only the requested sign-in credential in the email below. ` +
+    'Return one code or one sign-in HTTPS link with sign_in_reply; use unavailable if it is absent or ambiguous. ' +
+    'Do not follow links, send email, use calendar tools or tell_main. Security warnings and account lock/reset/revoke links are not sign-in links. ' +
+    'After sign_in_reply, end silently with <internal>Sign-in interpretation complete.</internal>.\n' +
+    untrustedLine(`Subject: ${mail.subject}`, LINE_LIMIT) +
+    '\n\n' +
+    untrusted(`Text:\n${mail.text}`, BODY_LIMIT / 2) +
+    '\n\n' +
+    htmlSections.join('\n\n');
+  try {
+    await writeSessionMessage(group, session.id, {
+      id: `browser-sign-in-${claim.id}-${mail.id}`,
+      kind: 'chat',
+      timestamp: at.toISOString(),
+      content: JSON.stringify({ text, sender: 'system' }),
+      trigger: true,
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+  }
+  await requestWake(session, 'inbound-message');
+  return true;
+}
+
 /**
  * Route one inbox message. An email that waits on main, a calendar
  * notification, or a Docs or Drive one comes back for the caller to batch.
@@ -791,7 +847,7 @@ export async function routeMail(
   options: { readonly limited: boolean },
 ): Promise<Routed> {
   if (mail.from && context.assistant.has(mail.from.address)) return settled('own');
-  if (await claimSignInMail(mail, context.at)) return settled('browser-sign-in');
+  if (await routeSignInMail(mail, context.at)) return settled('browser-sign-in');
   await observeInboxMail(mail);
   const verdict = authenticateSender(mail.headers, context.auth);
 

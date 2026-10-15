@@ -161,6 +161,19 @@ export const emailToPrincipal = requestTool({
 // external-email's tools
 // ---------------------------------------------------------------------------
 
+export const signInReply = requestTool({
+  ...common,
+  name: 'sign_in_reply',
+  description:
+    'Answer only a host sign-in task in this isolated session. Return the one requested sign-in code or HTTPS sign-in link from its email, or unavailable if absent or ambiguous. Never return an account-security, lock, reset, revoke, footer or unsubscribe link. The host alone inserts or opens it. End silently after this tool; no email or tell_main.',
+  properties: {
+    kind: { type: 'string', enum: ['code', 'link', 'unavailable'] },
+    value: { type: 'string', description: 'The exact code or complete sign-in URL. Omit for unavailable.' },
+  },
+  required: ['kind'],
+  repeatable: false,
+});
+
 export const emailSend = requestTool({
   ...common,
   name: 'email_send',
@@ -276,4 +289,4 @@ export const cancelBooking = requestTool({
 });
 
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);
+registerTools([signInReply, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

@@ -50,7 +50,7 @@ import '../gws-ea-preferences/index.js';
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 /** The tools external-email holds: the only ones its guidance may name. */
-const ITS_TOOLS = ['free_time', 'book', 'change_booking', 'cancel_booking', 'email_send', 'tell_main'];
+const ITS_TOOLS = ['free_time', 'book', 'change_booking', 'cancel_booking', 'email_send', 'sign_in_reply', 'tell_main'];
 
 const GUIDANCE_TEXT = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8');
 

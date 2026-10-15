@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { setTimeout as pause } from 'node:timers/promises';
 import type { Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import {
@@ -12,15 +11,16 @@ import {
   writeActionResponse,
 } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
-import { isRecord } from '../../gws-ea/validation.js';
+import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { clearOutbox, withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
+import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
-  claimSignInMail,
   cleanupSignInClaims,
   createSignInClaim,
   finishSignInClaim,
@@ -29,7 +29,6 @@ import {
   waitingSignInClaim,
   type SignInClaim,
 } from '../gws-ea-inbox/claims.js';
-import { htmlToText, parseGmailMessage, type ParsedMail } from '../gws-ea-inbox/mime.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { authenticationFieldKind } from './authentication-signatures.js';
 import { browserDelegateGuard } from './cancel.js';
@@ -104,134 +103,113 @@ async function codeBinding(page: Page, binding: BoundBrowserSecretField): Promis
   return binding.field === 'otp' ? binding : discoverAuthenticationCodeField(page, binding);
 }
 
-type MailSecret =
-  | { kind: 'code'; value: string }
-  | { kind: 'link'; value: string }
-  | { kind: 'ambiguous' }
-  | { kind: 'link_refused' };
-
-function labelledMailCodes(text: string): Set<string> {
-  const codes = new Set<string>();
-  const add = (value: string): void => {
-    if (/^[A-Z\d]{4,12}$/iu.test(value) && (/\d/u.test(value) || /^[A-Z]+$/u.test(value))) codes.add(value);
-  };
-  for (const match of text.matchAll(
-    /\b(?:codes?|otp|passcode)\s*(?:(?:(?:is|are)\s+)?(?:shown\s+)?below(?:\s+to\s+(?:sign|log)\s+in)?\s*[:=.]?\s*|(?:is|are)\s*[:=]?\s*|[:=]\s*|to\s+(?:sign|log)\s+in\s*:?\s*)?([A-Z\d]{4,12})\b((?:\s*(?:,|and|or)\s+[A-Z\d]{4,12}\b)*)/giu,
-  )) {
-    if (/\b(?:zip|postal|area|country|promo|discount)\s+$/iu.test(text.slice(0, match.index))) continue;
-    add(match[1]);
-    for (const alternative of match[2].matchAll(/(?:,|and|or)\s+([A-Z\d]{4,12})\b/giu)) add(alternative[1]);
-    // Adjacent standalone codes under one label are alternatives, not footer numbers.
-    for (const line of text.slice(match.index + match[0].length).split('\n')) {
-      if (line.trim() === '') continue;
-      if (!/^[A-Z\d]{4,12}$/u.test(line.trim())) break;
-      add(line.trim());
-    }
-  }
-  for (const match of text.matchAll(
-    /\b([A-Z\d]{4,12})[ \t]+is[ \t]+(?:your[ \t]+)?((?:[\p{L}][\p{L}\d'’.-]{0,39}[ \t]+){0,4})(?:code|otp|passcode)\b((?:\s*(?:,|and|or)\s+[A-Z\d]{4,12}\b)*)/giu,
-  )) {
-    if (/\b(?:zip|postal|area|country|promo|discount)\b/iu.test(match[2])) continue;
-    add(match[1]);
-    for (const alternative of match[3].matchAll(/(?:,|and|or)\s+([A-Z\d]{4,12})\b/giu)) add(alternative[1]);
-  }
-  return codes;
+export type SignInReply = { readonly kind: 'code' | 'link'; readonly value: string } | { readonly kind: 'unavailable' };
+interface AssistantWait {
+  readonly jobId: string;
+  readonly assertActive: () => Promise<void>;
+  complete(reply?: SignInReply): void;
 }
+const assistantWaits = new Map<string, AssistantWait>();
 
-const SIGN_IN_LINK_LABEL =
-  /\b(?:sign[\s-]?in|log[\s-]?in|authenticate|verify\s+(?:your\s+)?(?:email|account)|magic[\s-]?link)\b/iu;
-
-function authenticationMailLink(raw: string, label: string): boolean {
-  if (!URL.canParse(raw)) return false;
-  const url = new URL(raw);
-  if (!['http:', 'https:'].includes(url.protocol)) return false;
-  if (
-    /\b(?:didn['’]t|did\s+not|wasn['’]t|was\s+not|not\s+you|secure|lock|report|suspicious|reset|revoke)\b/iu.test(label)
-  )
-    return false;
-  let pathname: string;
-  try {
-    pathname = decodeURIComponent(url.pathname);
-  } catch {
-    return false;
-  }
-  if (
-    /(?:^|[/_.-])(?:privacy|unsubscribe|preferences|terms|assets?|images?|security|secure|lock|report|reset|revoke)(?:[/_.-]|$)/iu.test(
-      pathname,
-    ) ||
-    /\.(?:png|jpe?g|gif|svg|webp|ico|css|js)$/iu.test(pathname)
-  )
-    return false;
-  return (
-    SIGN_IN_LINK_LABEL.test(label) ||
-    /(?:^|[/_.-])(?:sign[-_]?in|log[-_]?in|login|auth(?:enticate|entication)?|verify|verification|magic[-_]?link)(?:$|[/_.-])/iu.test(
-      pathname,
-    )
+/** Installed before sending the request, so an immediately arriving email cannot outrun the waiter. */
+function awaitAssistantReply(
+  context: BrowserExecutionContext,
+  claim: SignInClaim,
+): {
+  answer: Promise<SignInReply | undefined>;
+  dispose(): void;
+} {
+  let finish!: (reply?: SignInReply) => void;
+  const answer = new Promise<SignInReply | undefined>((resolve) => {
+    finish = resolve;
+  });
+  const aborted = (): void => complete();
+  const duration = Math.max(
+    0,
+    Math.min(90_000, context.remaining() - 1_000, Date.parse(claim.expires_at) - Date.now()),
   );
+  const timer = setTimeout(aborted, duration);
+  function complete(reply?: SignInReply): void {
+    if (assistantWaits.get(claim.id) !== wait) return;
+    assistantWaits.delete(claim.id);
+    clearTimeout(timer);
+    context.signal.removeEventListener('abort', aborted);
+    finish(reply);
+  }
+  const wait: AssistantWait = { jobId: context.job.id, assertActive: context.assertActive, complete };
+  assistantWaits.set(claim.id, wait);
+  context.signal.addEventListener('abort', aborted, { once: true });
+  if (context.signal.aborted || duration === 0) complete();
+  return { answer, dispose: complete };
 }
 
-function messageSecret(mail: ParsedMail, domain: string): MailSecret {
-  const urls = new Set<string>();
-  for (const match of mail.text.matchAll(/https?:\/\/[^\s<>"']+/giu)) {
-    const raw = match[0].replace(/[),.;]+$/u, '');
-    const prefix = (mail.text.slice(0, match.index).trimEnd().split('\n').at(-1) ?? '').replace(
-      /https?:\/\/[^\s<>"']+/giu,
-      '',
-    );
-    if (authenticationMailLink(raw, prefix)) urls.add(raw);
-  }
-  for (const match of (mail.html ?? '').matchAll(/<a\b([^>]*?)>([\s\S]*?)<\/a\s*>/giu)) {
-    const href = /\bhref\s*=\s*["']([^"']+)["']/iu.exec(match[1]);
-    if (!href) continue;
-    const raw = htmlToText(href[1]);
-    if (authenticationMailLink(raw, htmlToText(match[2]))) urls.add(raw);
-  }
-  const text = `${mail.subject}\n${mail.text}`.replace(/https?:\/\/[^\s<>"']+/giu, '');
-  const codes = labelledMailCodes(text);
-  if (codes.size > 1) return { kind: 'ambiguous' };
-  if (codes.size === 1) return { kind: 'code', value: [...codes][0] };
-  if (urls.size !== 1) return { kind: 'ambiguous' };
-  const url = httpsOrigin([...urls][0]);
-  return url && getDomain(url.hostname, { allowPrivateDomains: true }) === domain
-    ? { kind: 'link', value: url.href }
-    : { kind: 'link_refused' };
+function signInReply(content: Record<string, unknown>): SignInReply {
+  if (Object.keys(content).some((key) => !['action', 'requestId', 'kind', 'value'].includes(key)))
+    throw invalidArgs('Return one sign-in code, one link, or unavailable.');
+  if (content.kind === 'unavailable' && content.value === undefined) return { kind: 'unavailable' };
+  if (
+    (content.kind === 'code' || content.kind === 'link') &&
+    typeof content.value === 'string' &&
+    content.value.trim().length > 0 &&
+    content.value.length <= 8_192 &&
+    !hasControlCharacters(content.value)
+  )
+    return { kind: content.kind, value: content.value.trim() };
+  throw invalidArgs('Return one sign-in code, one link, or unavailable.');
 }
 
-/** The poll and reader reserve through one DB decision; mail contents never leave this host function. */
-async function readClaimedMail(context: BrowserExecutionContext, claim: SignInClaim): Promise<ParsedMail | undefined> {
-  const inbox = activeInbox();
-  if (!inbox) throw forbidden('The assistant inbox is unavailable.');
-  const waitUntil = Date.now() + Math.max(0, Math.min(90_000, context.remaining() - 1_000));
-  do {
-    await context.assertActive();
-    const current = await getSignInClaim(claim.id);
-    if (!current || current.state !== 'waiting' || Date.now() >= Date.parse(current.expires_at)) return undefined;
-    const references = current.gmail_message_id
-      ? [{ id: current.gmail_message_id }]
-      : await inbox.gmail.listMessages({
-          q: `in:anywhere after:${Math.floor(Date.parse(claim.since_at) / 1_000)}`,
-          includeSpamTrash: true,
-          maxResults: 500,
-        });
-    await context.assertActive();
-    const messages: ParsedMail[] = [];
-    for (const reference of references) {
-      const raw = await inbox.gmail.getMessage(reference.id);
-      await context.assertActive();
-      if (raw) messages.push(parseGmailMessage(raw));
-    }
-    messages.sort(
-      (left, right) =>
-        (left.receivedAt?.getTime() ?? 0) - (right.receivedAt?.getTime() ?? 0) || left.id.localeCompare(right.id),
-    );
-    for (const mail of messages) {
-      if (await claimSignInMail(mail, new Date(), claim.id)) return mail;
-    }
-    if (Date.now() >= waitUntil) return undefined;
-    await pause(Math.min(1_000, waitUntil - Date.now()), undefined, { signal: context.signal });
-  } while (Date.now() <= waitUntil);
-  return undefined;
+/** The session selects the claim. Delivery completes the original worker without acquiring its held job lock. */
+export async function answerSignInReply(
+  content: Record<string, unknown>,
+  session: Session,
+): Promise<{ status: 'accepted' | 'no_wait' }> {
+  if (session.agent_group_id !== (await getExternalEmailAgentGroupId()))
+    throw forbidden('Only the host sign-in interpreter may answer.');
+  const reply = signInReply(content);
+  const prefix = 'system:browser-sign-in:';
+  const claimId =
+    session.messaging_group_id === null && session.thread_id?.startsWith(prefix)
+      ? session.thread_id.slice(prefix.length)
+      : undefined;
+  const wait = claimId ? assistantWaits.get(claimId) : undefined;
+  const claim = claimId ? await getSignInClaim(claimId) : undefined;
+  const current = await getSession(session.id);
+  if (
+    !claim ||
+    !wait ||
+    claim.source !== 'assistant' ||
+    claim.state !== 'waiting' ||
+    claim.gmail_message_id === null ||
+    claim.job_id !== wait.jobId ||
+    Date.parse(claim.expires_at) <= Date.now() ||
+    current?.status !== 'active' ||
+    current.agent_group_id !== session.agent_group_id ||
+    current.messaging_group_id !== null ||
+    current.thread_id !== session.thread_id
+  )
+    return { status: 'no_wait' };
+  // A cancelled or timed-out browser request must never accept a late credential; errors carry no credential.
+  /* eslint-disable no-catch-all/no-catch-all -- inactive requests discard credentials and return only a constant outcome */
+  try {
+    await wait.assertActive();
+  } catch (_error) {
+    wait.complete();
+    return { status: 'no_wait' };
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  if (assistantWaits.get(claim.id) !== wait) return { status: 'no_wait' };
+  wait.complete(reply);
+  return { status: 'accepted' };
 }
+
+const signInReplyGuard = defineGuardedAction({
+  action: 'gws_ea_browser.sign_in_reply',
+  async decide({ actor }) {
+    return actor.kind === 'agent' && actor.agentGroupId === (await getExternalEmailAgentGroupId())
+      ? ALLOW('The sealed external-email interpreter answers its own host sign-in task.')
+      : DENY('Only the host sign-in interpreter may answer.');
+  },
+});
 
 /** Bearer navigation has no observation boundary until a fresh root document and empty history exist. */
 async function consumeMagicLink(
@@ -325,6 +303,7 @@ export async function executeSignInCode(
   content: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const payload = validateSignInCode(content);
+  if (payload.from === 'assistant' && !activeInbox()) throw forbidden('The assistant inbox is unavailable.');
   assertBrowserSecretDiagnosticsSafe();
   const page = await context.page();
   return withBrowserJobNavigation(context, page, async () => {
@@ -332,6 +311,7 @@ export async function executeSignInCode(
     let discovered: BoundBrowserSecretField | undefined;
     let claim: SignInClaim | undefined;
     let retained = false;
+    let assistantWait: ReturnType<typeof awaitAssistantReply> | undefined;
     try {
       await context.assertActive();
       refs = await pinBrowserRefs(page, [payload.target, payload.send, ...(payload.submit ? [payload.submit] : [])]);
@@ -375,6 +355,7 @@ export async function executeSignInCode(
           submit: payload.submit ?? payload.send,
         },
       });
+      if (payload.from === 'assistant') assistantWait = awaitAssistantReply(context, claim);
       await context.assertActive();
       if (kind === 'username') {
         const inbox = activeInbox();
@@ -407,13 +388,21 @@ export async function executeSignInCode(
         retained = true;
         return { status: 'awaiting_code', site: claim.domain, origin: claim.origin };
       }
-      const mail = await readClaimedMail(context, claim);
-      if (!mail) return { status: 'nothing_arrived' };
-      const secret = messageSecret(mail, claim.domain);
-      if (secret.kind === 'ambiguous') return { status: secret.kind };
-      if (secret.kind === 'link_refused') throw forbidden('The host refused an insecure or off-site sign-in link.');
+      const secret = await assistantWait!.answer;
+      await context.assertActive();
+      if (!secret) return { status: 'nothing_arrived' };
+      if (secret.kind === 'unavailable') return { status: 'ambiguous' };
       if (!sameOrigin(binding)) return { status: 'origin_mismatch' };
-      if (secret.kind === 'link') return await consumeMagicLink(context, binding, claim, secret.value);
+      if (secret.kind === 'link') {
+        const url = httpsOrigin(secret.value);
+        if (
+          !url ||
+          getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain ||
+          classifyNavigationUrl(url.href) === 'account_security'
+        )
+          throw forbidden('The host refused an insecure or off-site sign-in link.');
+        return await consumeMagicLink(context, binding, claim, secret.value);
+      }
       discovered = await codeBinding(page, binding);
       if (!discovered || !sameOrigin(discovered)) return { status: 'origin_mismatch' };
       const filled = await fillBoundBrowserSecret(context, discovered, async () => secret.value);
@@ -426,6 +415,7 @@ export async function executeSignInCode(
       if (error instanceof ActionRefusal) throw error;
       throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
     } finally {
+      assistantWait?.dispose();
       if (claim && !retained) await finishSignInClaim(claim.id);
       if (!retained) await disposeBrowserRefs(refs);
       if (discovered && ![...refs.values()].some((ref) => ref.element === discovered!.target.element)) {
@@ -553,6 +543,11 @@ async function executeRelayCode(
 /** Every main delivery only accepts durable references; the queue reads the original code under the job lock. */
 export function registerSignInMailDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
+    'sign_in_reply',
+    answeringAction('sign_in_reply', answerSignInReply),
+    answeredGuard(signInReplyGuard),
+  );
+  registerDeliveryAction(
     'relay_code',
     answeringAction('relay_code', (content, session, requestId) =>
       answerRelayCode(content, session, requestId, queue()),
@@ -596,12 +591,18 @@ async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame)
   clearOutbox(source.agent_group_id, source.id, payload.source_request_id);
 }
 export async function recoverBrowserSignInMail(): Promise<void> {
+  for (const wait of assistantWaits.values()) wait.complete();
   for (const id of bindings.keys()) await releaseBinding(id);
   await recoverSignInClaims();
 }
 export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
   if (jobId && (await getDb().hasTable('gws_ea_browser_sign_in_claims'))) {
     await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE job_id = ?', 'finished', jobId);
+  }
+  for (const [id, wait] of assistantWaits) {
+    const claim = await getSignInClaim(id);
+    if (!claim || claim.state !== 'waiting' || Date.parse(claim.expires_at) <= Date.now() || claim.job_id === jobId)
+      wait.complete();
   }
   for (const [id] of bindings) {
     const claim = await getSignInClaim(id);
