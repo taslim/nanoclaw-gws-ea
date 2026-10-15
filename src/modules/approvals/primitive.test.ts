@@ -18,6 +18,7 @@ import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
+import * as delivery from '../../delivery.js';
 import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -119,7 +120,7 @@ describe('requestApproval delivery failure', () => {
     };
     setDeliveryAdapter(failingAdapter);
 
-    await requestApproval({
+    const result = await requestApproval({
       session,
       agentName: 'Agent',
       action: 'test_action',
@@ -129,6 +130,7 @@ describe('requestApproval delivery failure', () => {
     });
 
     // No orphan: the row created before the delivery attempt is gone.
+    expect(result).toBeNull();
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(0);
     expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
   });
@@ -141,7 +143,7 @@ describe('requestApproval delivery failure', () => {
     };
     setDeliveryAdapter(okAdapter);
 
-    await requestApproval({
+    const result = await requestApproval({
       session,
       agentName: 'Agent',
       action: 'test_action',
@@ -150,7 +152,49 @@ describe('requestApproval delivery failure', () => {
       question: 'Approve the thing?',
     });
 
-    expect(await getPendingApprovalsByAction('test_action')).toHaveLength(1);
+    const [approval] = await getPendingApprovalsByAction('test_action');
+    expect(result).toBe(approval.approval_id);
+    expect(approval.platform_message_id).toBe('pm-1');
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+});
+
+describe('approval presentation and expiry', () => {
+  it('stores expiry and uses the caller origin instead of the unrelated default', async () => {
+    setDeliveryAdapter({
+      async deliver() {
+        return 'pm-origin';
+      },
+    });
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    const id = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'custom_origin',
+      payload: {},
+      title: 'Approval',
+      question: 'Approve?',
+      expiresAt,
+      originLine: 'This is for your Friday reservation.',
+    });
+    const [row] = await getPendingApprovalsByAction('custom_origin');
+    expect(id).toBe(row.approval_id);
+    expect(row.expires_at).toBe(expiresAt);
+    expect(row.question).toBe('Approve?\n\nThis is for your Friday reservation.');
+  });
+
+  it('does not leave a pending request when no delivery adapter exists', async () => {
+    const adapter = vi.spyOn(delivery, 'getDeliveryAdapter').mockReturnValue(null);
+    const id = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'no_adapter',
+      payload: {},
+      title: 'Approval',
+      question: 'Approve?',
+    });
+    expect(id).toBeNull();
+    expect(await getPendingApprovalsByAction('no_adapter')).toEqual([]);
+    adapter.mockRestore();
   });
 });
