@@ -81,7 +81,10 @@ afterEach(async () => {
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
-function receive(body: string, options: { spam?: boolean; signer?: string } = {}): void {
+function receive(
+  body: string,
+  options: { spam?: boolean; signer?: string; subject?: string; html?: string } = {},
+): void {
   const domain = options.signer ?? 'shop.example';
   messages.push({
     id: String(messages.length + 1),
@@ -89,12 +92,20 @@ function receive(body: string, options: { spam?: boolean; signer?: string } = {}
     labelIds: [options.spam ? 'SPAM' : 'INBOX'],
     internalDate: String(Date.now()),
     payload: {
-      mimeType: 'text/plain',
+      mimeType: options.html === undefined ? 'text/plain' : 'multipart/alternative',
       headers: [
         { name: 'Authentication-Results', value: `mx.google.com; dkim=pass header.d=${domain}` },
         { name: 'From', value: `login@${domain}` },
+        ...(options.subject === undefined ? [] : [{ name: 'Subject', value: options.subject }]),
       ],
-      body: { data: Buffer.from(body).toString('base64url') },
+      ...(options.html === undefined
+        ? { body: { data: Buffer.from(body).toString('base64url') } }
+        : {
+            parts: [
+              { mimeType: 'text/plain', body: { data: Buffer.from(body).toString('base64url') } },
+              { mimeType: 'text/html', body: { data: Buffer.from(options.html).toString('base64url') } },
+            ],
+          }),
     },
   });
 }
@@ -263,7 +274,7 @@ it.each(['Codes 642981 and 529106', 'Your Code is ABCD or EFGH'])(
   },
 );
 
-it.each(['ABCD12', 'ABCD'])('uses one explicitly labelled code with letters (%s)', async (code) => {
+it.each(['ABCD12', 'AbCd12', 'ABCD'])('uses one explicitly labelled code with letters (%s)', async (code) => {
   const f = fixture(true);
   await observePage(f.page);
   vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
@@ -274,6 +285,164 @@ it.each(['ABCD12', 'ABCD'])('uses one explicitly labelled code with letters (%s)
   expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
   expect(f.values).toEqual(['assistant@example.com', code]);
 });
+
+const mailFooter = `
+This code expires in 10 minutes. If you did not request it, ignore this email.
+Shop Example, 1234 Market Street, San Francisco, CA 94105
+Support: 800-555-1234
+© 2026 Shop Example
+Privacy: https://www.shop.example/privacy
+Unsubscribe: https://www.shop.example/unsubscribe?id=840132
+`;
+it.each([
+  { body: 'Your verification code is 642981.', code: '642981' },
+  { body: 'Your verification code is:\n642981', code: '642981' },
+  { body: 'Your verification code below:\n\n642981', code: '642981' },
+  { body: 'Your verification code is below:\n\n642981', code: '642981' },
+  { body: 'Your code is below.\n\n642981', code: '642981' },
+  { body: 'Use the code below to sign in:\n642981', code: '642981' },
+  { body: 'Your one-time code:\n\n642981', code: '642981' },
+  { body: 'Use this passcode to sign in:\n642981', code: '642981' },
+  { body: '642981 is your verification code.', code: '642981' },
+  { body: '642981 is your Instagram code.', code: '642981' },
+  { body: '642981 is your Shop Example verification code.', code: '642981' },
+  { body: 'Your code is ABCD12.', code: 'ABCD12' },
+  { body: 'Your code is 2026.', code: '2026' },
+  { subject: '642981 is your verification code', body: 'Sign in to continue.', code: '642981' },
+])(
+  'uses a labelled code from realistic mail with unrelated footer numbers ($body)',
+  async ({ body, code, subject }) => {
+    const f = fixture(true);
+    await observePage(f.page);
+    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
+      f.values.push(await resolve());
+      receive(`${body}\n${mailFooter}`, { subject });
+      return { status: 'submitted' };
+    });
+    const result = await executeSignInCode(f.context, payload);
+    expect(result).toEqual({ status: 'code_filled' });
+    expect(f.values).toEqual(['assistant@example.com', code]);
+    expect(JSON.stringify(result)).not.toContain(code);
+    expect(await getSignInClaim('signin-request')).toMatchObject({ state: 'finished', gmail_message_id: '1' });
+  },
+);
+
+it.each([
+  'Your verification code is 642981 or 529106.',
+  'Your code is ABCD12. Your other code is EFGH34.',
+  'Your verification code is 642981 or ABCD.',
+  '642981 is your verification code or 529106.',
+  'ABCD is your verification code or EFGH.',
+  'Your verification codes:\n642981\n529106',
+  'Your verification code is below:\n642981\n529106',
+  '642981 is your Shop Example code or 529106.',
+  '94105 is your ZIP code.',
+  'ZIP code: 94105\nSupport: 800-555-1234\n© 2026 Shop Example',
+])('fills nothing from ambiguous or absent authentication codes in realistic mail (%s)', async (body) => {
+  const f = fixture(true);
+  await observePage(f.page);
+  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
+    f.values.push(await resolve());
+    receive(`${body}\n${mailFooter}`);
+    return { status: 'submitted' };
+  });
+  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'ambiguous' });
+  expect(f.values).toEqual(['assistant@example.com']);
+  expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+it.each(['plain', 'plain-next-line', 'html'] as const)(
+  'uses one authentication link from realistic %s mail without following footer or asset links',
+  async (format) => {
+    const f = fixture(true);
+    await observePage(f.page);
+    const link = `https://www.shop.example/${format === 'plain' ? 'verify' : 'access'}?token=secret-bearer&source=email`;
+    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
+      f.values.push(await resolve());
+      receive(
+        `${format === 'html' ? 'Use the sign-in button in this message.' : `Sign in:${format === 'plain' ? ' ' : '\n'}${link}`}\n${mailFooter}`,
+        {
+          ...(format === 'html'
+            ? {
+                html: `<a href="https://www.shop.example/"><img src="https://assets.shop.example/logo.png"></a>
+                <p>Sign in to Shop Example.</p><a href="${link.replace(/&/gu, '&amp;')}">Sign in securely</a>
+                <p>© 2026 Shop Example, 1234 Market Street, CA 94105. Support 800-555-1234.</p>
+                <a href="https://www.shop.example/privacy">Privacy</a>
+                <a href="https://www.shop.example/unsubscribe">Unsubscribe</a>`,
+              }
+            : {}),
+        },
+      );
+      return { status: 'submitted' };
+    });
+    const result = await executeSignInCode(f.context, payload);
+    expect(result).toEqual({ status: 'link_opened' });
+    expect(f.values).toEqual(['assistant@example.com']);
+    expect(vi.mocked(f.page.goto).mock.calls.map(([url]) => url)).toEqual([link, 'https://www.shop.example/']);
+    expect(JSON.stringify(result) + JSON.stringify(await observePage(f.page))).not.toContain('secret-bearer');
+    expect(f.cdp.send).toHaveBeenCalledWith('Page.resetNavigationHistory');
+  },
+);
+
+it('keeps multiple authentication links ambiguous after ignoring realistic footer links', async () => {
+  const f = fixture(true);
+  await observePage(f.page);
+  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+    receive(`Sign in: https://www.shop.example/verify?token=first
+      Or sign in: https://www.shop.example/verify?token=second\n${mailFooter}`);
+    return { status: 'submitted' };
+  });
+  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'ambiguous' });
+  expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+it.each([
+  { label: "Didn't try to sign in? Secure your account:", path: '/access' },
+  { label: 'Did not request this sign-in? Report it:', path: '/verify' },
+  { label: 'Not you? Sign in to lock your account:', path: '/login' },
+  { label: 'Sign in:', path: '/security/lock' },
+  { label: 'Sign in:', path: '/reset-password' },
+  { label: 'Sign in:', path: '/auth/revoke' },
+  { label: 'Sign in:', path: '/%73ecurity/lock' },
+])('never navigates a security-response link ($label $path)', async ({ label, path }) => {
+  const f = fixture(true);
+  await observePage(f.page);
+  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+    receive(`${label} https://www.shop.example${path}?token=security-response\n${mailFooter}`);
+    return { status: 'submitted' };
+  });
+  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'ambiguous' });
+  expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+it('ignores an HTML security-response link while consuming its labelled OTP', async () => {
+  const f = fixture(true);
+  await observePage(f.page);
+  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
+    f.values.push(await resolve());
+    receive(`642981 is your Shop code.\n${mailFooter}`, {
+      html: '<p>642981 is your Shop code.</p><a href="https://www.shop.example/security/lock?token=security-response">Didn’t try to sign in? Secure your account</a>',
+    });
+    return { status: 'submitted' };
+  });
+  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
+  expect(f.values).toEqual(['assistant@example.com', '642981']);
+  expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+it.each(['http://www.shop.example', 'https://elsewhere.example'])(
+  'refuses an unsafe authentication link in realistic mail with unrelated safe links (%s)',
+  async (origin) => {
+    const f = fixture(true);
+    await observePage(f.page);
+    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+      receive(`Sign in: ${origin}/verify?token=secret-bearer\n${mailFooter}`);
+      return { status: 'submitted' };
+    });
+    await expect(executeSignInCode(f.context, payload)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(f.page.goto).not.toHaveBeenCalled();
+  },
+);
 it.each(['https://www.shop.example:8443/login', 'http://www.shop.example/login', 'https://other.shop.example/login'])(
   'refuses full-origin drift before releasing a mail code (%s)',
   async (next) => {

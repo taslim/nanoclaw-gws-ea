@@ -29,7 +29,7 @@ import {
   waitingSignInClaim,
   type SignInClaim,
 } from '../gws-ea-inbox/claims.js';
-import { parseGmailMessage, type ParsedMail } from '../gws-ea-inbox/mime.js';
+import { htmlToText, parseGmailMessage, type ParsedMail } from '../gws-ea-inbox/mime.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { authenticationFieldKind } from './authentication-signatures.js';
 import { browserDelegateGuard } from './cancel.js';
@@ -109,33 +109,89 @@ type MailSecret =
   | { kind: 'link'; value: string }
   | { kind: 'ambiguous' }
   | { kind: 'link_refused' };
+
+function labelledMailCodes(text: string): Set<string> {
+  const codes = new Set<string>();
+  const add = (value: string): void => {
+    if (/^[A-Z\d]{4,12}$/iu.test(value) && (/\d/u.test(value) || /^[A-Z]+$/u.test(value))) codes.add(value);
+  };
+  for (const match of text.matchAll(
+    /\b(?:codes?|otp|passcode)\s*(?:(?:(?:is|are)\s+)?(?:shown\s+)?below(?:\s+to\s+(?:sign|log)\s+in)?\s*[:=.]?\s*|(?:is|are)\s*[:=]?\s*|[:=]\s*|to\s+(?:sign|log)\s+in\s*:?\s*)?([A-Z\d]{4,12})\b((?:\s*(?:,|and|or)\s+[A-Z\d]{4,12}\b)*)/giu,
+  )) {
+    if (/\b(?:zip|postal|area|country|promo|discount)\s+$/iu.test(text.slice(0, match.index))) continue;
+    add(match[1]);
+    for (const alternative of match[2].matchAll(/(?:,|and|or)\s+([A-Z\d]{4,12})\b/giu)) add(alternative[1]);
+    // Adjacent standalone codes under one label are alternatives, not footer numbers.
+    for (const line of text.slice(match.index + match[0].length).split('\n')) {
+      if (line.trim() === '') continue;
+      if (!/^[A-Z\d]{4,12}$/u.test(line.trim())) break;
+      add(line.trim());
+    }
+  }
+  for (const match of text.matchAll(
+    /\b([A-Z\d]{4,12})[ \t]+is[ \t]+(?:your[ \t]+)?((?:[\p{L}][\p{L}\d'’.-]{0,39}[ \t]+){0,4})(?:code|otp|passcode)\b((?:\s*(?:,|and|or)\s+[A-Z\d]{4,12}\b)*)/giu,
+  )) {
+    if (/\b(?:zip|postal|area|country|promo|discount)\b/iu.test(match[2])) continue;
+    add(match[1]);
+    for (const alternative of match[3].matchAll(/(?:,|and|or)\s+([A-Z\d]{4,12})\b/giu)) add(alternative[1]);
+  }
+  return codes;
+}
+
+const SIGN_IN_LINK_LABEL =
+  /\b(?:sign[\s-]?in|log[\s-]?in|authenticate|verify\s+(?:your\s+)?(?:email|account)|magic[\s-]?link)\b/iu;
+
+function authenticationMailLink(raw: string, label: string): boolean {
+  if (!URL.canParse(raw)) return false;
+  const url = new URL(raw);
+  if (!['http:', 'https:'].includes(url.protocol)) return false;
+  if (
+    /\b(?:didn['’]t|did\s+not|wasn['’]t|was\s+not|not\s+you|secure|lock|report|suspicious|reset|revoke)\b/iu.test(label)
+  )
+    return false;
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return false;
+  }
+  if (
+    /(?:^|[/_.-])(?:privacy|unsubscribe|preferences|terms|assets?|images?|security|secure|lock|report|reset|revoke)(?:[/_.-]|$)/iu.test(
+      pathname,
+    ) ||
+    /\.(?:png|jpe?g|gif|svg|webp|ico|css|js)$/iu.test(pathname)
+  )
+    return false;
+  return (
+    SIGN_IN_LINK_LABEL.test(label) ||
+    /(?:^|[/_.-])(?:sign[-_]?in|log[-_]?in|login|auth(?:enticate|entication)?|verify|verification|magic[-_]?link)(?:$|[/_.-])/iu.test(
+      pathname,
+    )
+  );
+}
+
 function messageSecret(mail: ParsedMail, domain: string): MailSecret {
-  const urls = [
-    ...new Set(
-      [
-        ...[...mail.text.matchAll(/https?:\/\/[^\s<>"']+/giu)].map((match) => match[0].replace(/[),.;]+$/u, '')),
-        ...[...(mail.html ?? '').matchAll(/href\s*=\s*["']([^"']+)["']/giu)].map((match) =>
-          match[1]
-            .replace(/&amp;/giu, '&')
-            .replace(/&#(?:x([\da-f]+)|(\d+));/giu, (_all, hex: string | undefined, decimal: string | undefined) =>
-              String.fromCodePoint(Number.parseInt(hex ?? decimal ?? '0', hex ? 16 : 10)),
-            ),
-        ),
-      ].filter((url) => /^https?:/iu.test(url)),
-    ),
-  ];
+  const urls = new Set<string>();
+  for (const match of mail.text.matchAll(/https?:\/\/[^\s<>"']+/giu)) {
+    const raw = match[0].replace(/[),.;]+$/u, '');
+    const prefix = (mail.text.slice(0, match.index).trimEnd().split('\n').at(-1) ?? '').replace(
+      /https?:\/\/[^\s<>"']+/giu,
+      '',
+    );
+    if (authenticationMailLink(raw, prefix)) urls.add(raw);
+  }
+  for (const match of (mail.html ?? '').matchAll(/<a\b([^>]*?)>([\s\S]*?)<\/a\s*>/giu)) {
+    const href = /\bhref\s*=\s*["']([^"']+)["']/iu.exec(match[1]);
+    if (!href) continue;
+    const raw = htmlToText(href[1]);
+    if (authenticationMailLink(raw, htmlToText(match[2]))) urls.add(raw);
+  }
   const text = `${mail.subject}\n${mail.text}`.replace(/https?:\/\/[^\s<>"']+/giu, '');
-  const codes = new Set([...text.matchAll(/(?<![\p{L}\d])\d{4,10}(?![\p{L}\d])/gu)].map((match) => match[0]));
-  for (const match of text.matchAll(/\b(?:code|otp|passcode)\s*(?:is\s+|[:=]\s*)([A-Z\d]{4,12})\b/giu)) {
-    if (/\d/u.test(match[1]) || /^[A-Z]{4,12}$/u.test(match[1])) codes.add(match[1]);
-  }
-  if ([...codes].some((code) => /[A-Za-z]/u.test(code))) {
-    for (const match of text.matchAll(/\b(?:and|or)\s+([A-Z\d]{4,12})\b/gu)) codes.add(match[1]);
-  }
+  const codes = labelledMailCodes(text);
   if (codes.size > 1) return { kind: 'ambiguous' };
   if (codes.size === 1) return { kind: 'code', value: [...codes][0] };
-  if (urls.length !== 1) return { kind: 'ambiguous' };
-  const url = httpsOrigin(urls[0]);
+  if (urls.size !== 1) return { kind: 'ambiguous' };
+  const url = httpsOrigin([...urls][0]);
   return url && getDomain(url.hostname, { allowPrivateDomains: true }) === domain
     ? { kind: 'link', value: url.href }
     : { kind: 'link_refused' };
