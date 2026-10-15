@@ -17,14 +17,17 @@ vi.mock('./reconcile-session.js', () => ({
 }));
 vi.mock('./db/sessions.js', () => ({ getActiveSessions: vi.fn() }));
 vi.mock('./egress-lockdown.js', () => ({ ensureEgressNetwork: vi.fn() }));
-vi.mock('./modules/approvals/index.js', () => ({ sweepAwaitingReasonRejects: vi.fn() }));
+vi.mock('./modules/approvals/index.js', () => ({
+  sweepAwaitingReasonRejects: vi.fn(),
+  sweepExpiredApprovals: vi.fn(),
+}));
 vi.mock('./container-runner.js', () => ({ stopOrphanedSessions: vi.fn() }));
 
 import { stopOrphanedSessions } from './container-runner.js';
 import { getActiveSessions } from './db/sessions.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { RECONCILE_CONCURRENCY, startHostSweep, stopHostSweep } from './host-sweep.js';
-import { sweepAwaitingReasonRejects } from './modules/approvals/index.js';
+import { sweepAwaitingReasonRejects, sweepExpiredApprovals } from './modules/approvals/index.js';
 import { reconcileSession } from './reconcile-session.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
@@ -60,6 +63,11 @@ beforeEach(() => {
     .mockImplementation(async () => {
       order.push('approvals');
     });
+  vi.mocked(sweepExpiredApprovals)
+    .mockReset()
+    .mockImplementation(async () => {
+      order.push('expired-approvals');
+    });
   vi.mocked(stopOrphanedSessions)
     .mockReset()
     .mockImplementation(async () => {
@@ -90,7 +98,13 @@ describe('sweep over the workqueue', () => {
     await runSweepTick();
 
     expect(reconcileSession).toHaveBeenCalledTimes(2);
-    expect(order.filter((step) => step !== 'orphans')).toEqual(['egress', 'session:s-1', 'session:s-2', 'approvals']);
+    expect(order.filter((step) => step !== 'orphans')).toEqual([
+      'egress',
+      'session:s-1',
+      'session:s-2',
+      'approvals',
+      'expired-approvals',
+    ]);
     expect(order).toContain('orphans');
 
     await runSweepTick();
@@ -104,6 +118,7 @@ describe('sweep over the workqueue', () => {
     expect(reconcileSession).not.toHaveBeenCalled();
     expect(ensureEgressNetwork).toHaveBeenCalledTimes(1);
     expect(sweepAwaitingReasonRejects).toHaveBeenCalledTimes(1);
+    expect(sweepExpiredApprovals).toHaveBeenCalledTimes(1);
 
     // Next tick recovers.
     await runSweepTick();
@@ -142,7 +157,12 @@ describe('sweep over the workqueue', () => {
 
     await runSweepTick();
     // s-2 and the closing singleton still ran; the tick completed and re-armed.
-    expect(order.filter((step) => step !== 'orphans')).toEqual(['egress', 'session:s-2', 'approvals']);
+    expect(order.filter((step) => step !== 'orphans')).toEqual([
+      'egress',
+      'session:s-2',
+      'approvals',
+      'expired-approvals',
+    ]);
   });
 
   it('stops orphaned sessions once per tick, and a failure there still re-arms', async () => {

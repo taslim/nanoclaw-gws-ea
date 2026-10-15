@@ -2,6 +2,9 @@ import { beforeEach, expect, it, vi } from 'vitest';
 
 const runtime = vi.hoisted(() => ({ stop: vi.fn(async () => {}), start: vi.fn() }));
 vi.mock('./runtime.js', () => ({ startPortalRuntime: runtime.start }));
+// This module's lifecycle test supplies no database; the browser owns and tests
+// its database-backed lifecycle separately.
+vi.mock('../gws-ea-browser/index.js', () => ({}));
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
