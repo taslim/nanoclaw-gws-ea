@@ -183,6 +183,7 @@ it('uses each request’s own immutable outbound timestamp and projects metadata
     ],
     downloads: [{ id: 'download-1', filename: 'invoice.pdf', bytes: 1024, handedOffAt: at(7) }],
     purchase: { openCards: 1, committedAttempts: 1, unresolvedAttempts: 1 },
+    watchNextCheckAt: null,
     watchChecks: [],
   });
   expect(JSON.stringify(evidence)).not.toContain(canary);
@@ -333,4 +334,8 @@ it('attributes shared watch checks only to persisted consumer watches for this j
   expect((await readBrowserEvidence(thread)).watchChecks).toEqual([
     { id: 'shared', scheduledAt: at(1), startedAt: at(2), finishedAt: at(3), outcome: 'ready', nextCheckAt: at(9) },
   ]);
+  await getDb().run('UPDATE gws_ea_browser_watches SET next_check_at=? WHERE id=?', at(4), 'foreign-watch');
+  expect(await readBrowserEvidence(thread)).toMatchObject({ watchNextCheckAt: at(9) });
+  await getDb().run("UPDATE gws_ea_browser_watches SET status='cancelled' WHERE id=?", 'own-watch');
+  expect(await readBrowserEvidence(thread)).toMatchObject({ watchNextCheckAt: null });
 });

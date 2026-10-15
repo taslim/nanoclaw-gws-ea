@@ -30,6 +30,7 @@ export interface BrowserEvidence {
   }>;
   downloads: Array<{ id: string; filename: string; bytes: number; handedOffAt: string | null }>;
   purchase: { openCards: number; committedAttempts: number; unresolvedAttempts: number };
+  watchNextCheckAt: string | null;
   watchChecks: Array<{
     id: string;
     scheduledAt: string;
@@ -237,7 +238,7 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
   );
   if (!job || !job.thread_id.startsWith(`system:a2a:${job.source_agent_group_id}:`))
     throw new Error('Browser job not found');
-  const [requests, downloads, watchChecks, openCards, attempts] = await Promise.all([
+  const [requests, downloads, watchChecks, openCards, attempts, nextWatch] = await Promise.all([
     db.all<EvidenceRequest>(
       `SELECT id,request_id,action,accepted_at,started_at,commit_started_at,answered_at,delivered_at,answer_json
          FROM gws_ea_browser_requests WHERE job_id=? AND session_id=? ORDER BY accepted_at,id LIMIT ?`,
@@ -265,6 +266,10 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
     ),
     db.get<{ committed: number | null; unresolved: number | null }>(
       "SELECT SUM(CASE WHEN resolution='committed' THEN 1 ELSE 0 END) AS committed,SUM(CASE WHEN resolution IS NULL THEN 1 ELSE 0 END) AS unresolved FROM gws_ea_browser_purchase_attempts WHERE job_id=?",
+      job.id,
+    ),
+    db.get<{ due: string | null }>(
+      "SELECT MIN(next_check_at) AS due FROM gws_ea_browser_watches WHERE job_id=? AND status IN ('armed','checking')",
       job.id,
     ),
   ]);
@@ -308,6 +313,7 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
       committedAttempts: attempts?.committed ?? 0,
       unresolvedAttempts: attempts?.unresolved ?? 0,
     },
+    watchNextCheckAt: nextWatch?.due ?? null,
     watchChecks: watchChecks.map((check) => ({
       id: check.id,
       scheduledAt: check.scheduled_at,

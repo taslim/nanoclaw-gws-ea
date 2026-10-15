@@ -4,6 +4,8 @@ import { promisify } from 'node:util';
 import { runProbe, type ProbeResult, type ProbeStatus } from './evidence.js';
 
 const execFileAsync = promisify(execFile);
+export const DESKTOP_SAMPLE_INTERVAL_MS = 750;
+export const DESKTOP_READ_TIMEOUT_MS = 5_000;
 
 export interface DesktopObservation {
   sampledAt: string;
@@ -25,7 +27,7 @@ async function readDesktop(): Promise<DesktopObservation> {
         '-e',
         "ObjC.import('AppKit'); JSON.stringify({frontmostApp: $.NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier.js, clipboardChangeCount: Number($.NSPasteboard.generalPasteboard.changeCount)})",
       ],
-      { encoding: 'utf8', timeout: 5_000 },
+      { encoding: 'utf8', timeout: DESKTOP_READ_TIMEOUT_MS },
     );
     const value: unknown = JSON.parse(stdout);
     if (
@@ -96,7 +98,7 @@ export class FocusSampler {
     this.timer = setInterval(() => {
       // A slow macOS read skips ticks instead of retaining a backlog.
       if (!this.pending) void this.sample();
-    }, 750);
+    }, DESKTOP_SAMPLE_INTERVAL_MS);
   }
 
   async sample(): Promise<void> {

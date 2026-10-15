@@ -64,6 +64,7 @@ function nativeEvidence(): NativeBrowserEvidence {
     ],
     downloads: [{ id: 'download', filename: 'invoice.pdf', bytes: 7, handedOffAt: at(14) }],
     purchase: { openCards: 1, committedAttempts: 0, unresolvedAttempts: 0 },
+    watchNextCheckAt: null,
     watchChecks: [],
   };
 }
@@ -312,7 +313,19 @@ describe('post-deployment browser acceptance evidence', () => {
         nextCheckAt: null,
       },
     ];
-    expect(verifyWatchSoak({ startedAt: start, finishedAt: finish, checks, observedAt: [] }, null)).toMatchObject({
+    expect(
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks,
+          observedAt: [],
+        },
+        null,
+      ),
+    ).toMatchObject({
       status: 'not-run',
     });
     const receipt = {
@@ -321,12 +334,34 @@ describe('post-deployment browser acceptance evidence', () => {
       expected: { noSiteBlock: true, noAccountWarning: true, watchActiveThroughout: true, withinSitePolicy: true },
       observed: { noSiteBlock: true, noAccountWarning: true, watchActiveThroughout: true, withinSitePolicy: true },
     };
-    expect(verifyWatchSoak({ startedAt: start, finishedAt: finish, checks, observedAt: [] }, receipt)).toMatchObject({
+    expect(
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks,
+          observedAt: [],
+        },
+        receipt,
+      ),
+    ).toMatchObject({
       status: 'not-run',
       completedChecks: 2,
     });
     expect(
-      verifyWatchSoak({ startedAt: start, finishedAt: at(10), checks: [], observedAt: [] }, receipt),
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: at(10),
+          checks: [],
+          observedAt: [],
+        },
+        receipt,
+      ),
     ).toMatchObject({
       status: 'not-run',
     });
@@ -340,15 +375,186 @@ describe('post-deployment browser acceptance evidence', () => {
       nextCheckAt: at((index + 1) * 3_600),
     }));
     expect(
-      verifyWatchSoak({ startedAt: start, finishedAt: finish, checks: regularChecks, observedAt }, receipt),
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks: regularChecks,
+          observedAt,
+        },
+        receipt,
+      ),
     ).toMatchObject({ status: 'passed', completedChecks: 73 });
+    expect(
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: null,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks: regularChecks,
+          observedAt,
+        },
+        receipt,
+      ),
+    ).toMatchObject({ status: 'not-run' });
+    expect(
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: at(6 * 3_600),
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks: regularChecks.slice(6),
+          observedAt,
+        },
+        receipt,
+      ),
+    ).toMatchObject({ status: 'passed', completedChecks: 67 });
+    for (const [observed, status] of [
+      [60, 'passed'],
+      [6 * 3_600, 'not-run'],
+    ] as const)
+      expect(
+        verifyWatchSoak(
+          {
+            startedAt: start,
+            finishedAt: finish,
+            initialNextCheckAt: start,
+            scheduleChanges: [{ observedAt: at(observed), nextCheckAt: at(6 * 3_600) }],
+            checks: regularChecks.slice(6),
+            observedAt,
+          },
+          receipt,
+        ),
+      ).toMatchObject({ status });
+    expect
+      .soft(
+        verifyWatchSoak(
+          {
+            startedAt: start,
+            initialNextCheckAt: start,
+            scheduleChanges: [],
+            finishedAt: finish,
+            checks: regularChecks.slice(-2),
+            observedAt,
+          },
+          receipt,
+        ),
+      )
+      .toMatchObject({ status: 'not-run' });
+    expect
+      .soft(
+        verifyWatchSoak(
+          {
+            startedAt: start,
+            initialNextCheckAt: start,
+            scheduleChanges: [],
+            finishedAt: finish,
+            checks: [
+              ...regularChecks,
+              {
+                id: 'boundary-failure',
+                scheduledAt: at(-60),
+                startedAt: at(-60),
+                finishedAt: at(30),
+                outcome: 'failed',
+                nextCheckAt: at(90),
+              },
+            ],
+            observedAt,
+          },
+          receipt,
+        ),
+      )
+      .toMatchObject({ status: 'failed' });
     observedAt.splice(30, 10);
     expect(
-      verifyWatchSoak({ startedAt: start, finishedAt: finish, checks: regularChecks, observedAt }, receipt),
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks: regularChecks,
+          observedAt,
+        },
+        receipt,
+      ),
     ).toMatchObject({ status: 'not-run' });
     checks[1]!.outcome = 'blocked';
-    expect(verifyWatchSoak({ startedAt: start, finishedAt: finish, checks, observedAt: [] }, receipt)).toMatchObject({
+    expect(
+      verifyWatchSoak(
+        {
+          startedAt: start,
+          initialNextCheckAt: start,
+          scheduleChanges: [],
+          finishedAt: finish,
+          checks,
+          observedAt: [],
+        },
+        receipt,
+      ),
+    ).toMatchObject({
       status: 'failed',
     });
   });
+
+  it('requires uninterrupted monotonic desktop sampling across each measured errand', async () => {
+    const root = await temporaryRoot();
+    const execute = promisify(execFile);
+    const cases = [
+      { name: 'gap', seconds: [0, 7_200], quiet: 'not-run', coverage: false },
+      { name: 'changed', seconds: [0, 7_200], quiet: 'failed', coverage: false },
+      {
+        name: 'reversed',
+        seconds: [0, 2, 1, ...Array.from({ length: 29 }, (_, index) => index + 3)],
+        quiet: 'not-run',
+        coverage: false,
+      },
+      {
+        name: 'covered',
+        seconds: [-100, -1, ...Array.from({ length: 32 }, (_, index) => index)],
+        quiet: 'passed',
+        coverage: true,
+      },
+    ];
+    for (const entry of cases) {
+      const run = await beginAcceptance(root, entry.name);
+      const sample = timed('cold', 30);
+      await writeFile(join(run, 'samples', 'sample.json'), JSON.stringify(sample));
+      await writeFile(
+        join(run, 'desktop.ndjson'),
+        entry.seconds
+          .map((seconds) =>
+            JSON.stringify({
+              sampledAt: at(seconds),
+              frontmostApp: entry.name === 'changed' && seconds > 0 ? 'com.google.Chrome' : 'com.apple.TextEdit',
+              clipboardChangeCount: 7,
+              space: null,
+              errors: [],
+            }),
+          )
+          .join('\n') + '\n',
+      );
+      const { stdout } = await execute('pnpm', [
+        'exec',
+        'tsx',
+        'scripts/browser-live-check/acceptance.ts',
+        'summarize',
+        '--run',
+        run,
+      ]).catch((error: unknown) => {
+        expect(error).toMatchObject({ code: 1 });
+        return { stdout: (error as { stdout: string }).stdout };
+      });
+      const output = JSON.parse(stdout) as { report: string };
+      expect.soft(JSON.parse(await readFile(output.report, 'utf8'))).toMatchObject({
+        quiet: { status: entry.quiet },
+        observationCoverage: entry.coverage,
+      });
+    }
+  }, 15_000);
 });

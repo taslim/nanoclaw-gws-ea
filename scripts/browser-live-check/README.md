@@ -46,6 +46,11 @@ an intentional app switch is recorded as a change too. Test background windows,
 navigation, dialogs, downloads, popups, clipboard attempts and external app links.
 AppKit cannot passively identify the active Space: record the operator's separate
 `quiet_spaces` observation. Locked-desktop observations cannot prove active use.
+Every measured errand needs monotonic samples from before its start through its
+verification, with no gap over 6.5 seconds (the five-second desktop read timeout
+plus two sampling intervals). Stopping and restarting observation around an
+errand leaves it `not-run`; gaps between measured errands do not invalidate their
+coverage. An observed focus or clipboard change still fails quiet acceptance.
 
 ## Time a real errand
 
@@ -196,8 +201,10 @@ run. Connection failure preserves the journal; rerun in a fresh evidence run
 rather than treating missing observations as a clean soak. A saved soak alone
 never passes: it needs completed native checks, at least 72 elapsed hours, no
 blocked/failed/interrupted check, continuous host observations (no gap above two
-minutes), and a chain of checks following their recorded next-check schedule
-(with a five-minute scheduler allowance). Missing coverage remains `not-run`,
+minutes), and schedule coverage from the initial native watch due time through
+the end (with a five-minute scheduler allowance). Native quiet-hour and budget
+reschedules count only when observed before that allowance expires; a late
+reschedule cannot erase an outage. Missing coverage remains `not-run`,
 including two isolated checks separated by three days. It also needs an
 independently checked `watch_soak` receipt
 after the soak with matching facts including:

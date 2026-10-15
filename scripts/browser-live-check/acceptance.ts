@@ -8,7 +8,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
 import { SocketTransport } from '../../src/cli/socket-client.js';
-import { FocusSampler, type DesktopObservation } from './focus-sampler.js';
+import {
+  DESKTOP_READ_TIMEOUT_MS,
+  DESKTOP_SAMPLE_INTERVAL_MS,
+  FocusSampler,
+  type DesktopObservation,
+} from './focus-sampler.js';
 import type { JsonValue, ProbeStatus } from './evidence.js';
 
 type JsonObject = { [key: string]: JsonValue };
@@ -59,6 +64,7 @@ export interface NativeBrowserEvidence {
   }[];
   downloads: { id: string; filename: string; bytes: number; handedOffAt: string | null }[];
   purchase: { openCards: number; committedAttempts: number; unresolvedAttempts: number };
+  watchNextCheckAt: string | null;
   watchChecks: WatchCheck[];
 }
 interface WatchCheck {
@@ -112,6 +118,8 @@ interface SampleStart {
 interface Soak {
   startedAt: string;
   finishedAt: string;
+  initialNextCheckAt: string | null;
+  scheduleChanges: { observedAt: string; nextCheckAt: string | null }[];
   checks: WatchCheck[];
   observedAt: string[];
 }
@@ -285,6 +293,7 @@ export function parseNativeEvidence(raw: unknown): NativeBrowserEvidence {
       committedAttempts: nonnegative(purchase.committedAttempts),
       unresolvedAttempts: nonnegative(purchase.unresolvedAttempts),
     },
+    watchNextCheckAt: nullableTime(value.watchNextCheckAt),
     watchChecks: array(value.watchChecks).map((rawCheck) => {
       const check = object(rawCheck);
       return {
@@ -532,18 +541,46 @@ export function verifyWatchSoak(
     ) &&
     observations.at(-1)! >= Date.parse(soak.finishedAt) - 120_000;
   const ordered = [...completed].sort((a, b) => Date.parse(a.startedAt!) - Date.parse(b.startedAt!));
+  const changes = soak.scheduleChanges;
+  let due = Date.parse(soak.initialNextCheckAt ?? '');
+  let changeIndex = 0;
+  const scheduleMonotonic = changes.every(
+    (change, index) =>
+      Number.isFinite(Date.parse(change.observedAt)) &&
+      Date.parse(change.observedAt) >= Date.parse(soak.startedAt) &&
+      (index === 0 || Date.parse(change.observedAt) > Date.parse(changes[index - 1]!.observedAt)),
+  );
+  const advanceSchedule = (until: number): boolean => {
+    while (changeIndex < changes.length && Date.parse(changes[changeIndex]!.observedAt) <= until) {
+      const change = changes[changeIndex++]!;
+      // Only an observed, timely native reschedule can extend the current deadline.
+      if (Date.parse(change.observedAt) > due + 300_000 || change.nextCheckAt === null) return false;
+      due = Date.parse(change.nextCheckAt);
+    }
+    return Number.isFinite(due) && until <= due + 300_000;
+  };
   const scheduleCovered =
     ordered.length >= 2 &&
-    ordered.every(
-      (check, index) =>
-        index === 0 ||
-        (ordered[index - 1]!.nextCheckAt !== null &&
-          Date.parse(check.startedAt!) <= Date.parse(ordered[index - 1]!.nextCheckAt!) + 300_000),
-    ) &&
-    ordered.at(-1)!.nextCheckAt !== null &&
-    Date.parse(ordered.at(-1)!.nextCheckAt!) >= Date.parse(soak.finishedAt) - 300_000;
-  const failed = completed.some(
-    (check) => check.outcome !== null && ['blocked', 'failed', 'interrupted'].includes(check.outcome),
+    Number.isFinite(due) &&
+    scheduleMonotonic &&
+    ordered.every((check) => {
+      if (
+        !advanceSchedule(Date.parse(check.startedAt!)) ||
+        Date.parse(check.startedAt!) > Date.parse(check.scheduledAt) + 300_000 ||
+        check.nextCheckAt === null
+      )
+        return false;
+      due = Date.parse(check.nextCheckAt);
+      return Number.isFinite(due);
+    }) &&
+    advanceSchedule(Date.parse(soak.finishedAt));
+  const failed = soak.checks.some(
+    (check) =>
+      check.startedAt !== null &&
+      Date.parse(check.startedAt) <= Date.parse(soak.finishedAt) &&
+      (check.finishedAt === null || Date.parse(check.finishedAt) >= Date.parse(soak.startedAt)) &&
+      check.outcome !== null &&
+      ['blocked', 'failed', 'interrupted'].includes(check.outcome),
   );
   const corroborated =
     receipt?.verifiedSuccess === true &&
@@ -613,7 +650,10 @@ async function observe(run: string, signal: AbortSignal): Promise<void> {
       await appendPrivate(join(run, 'desktop.ndjson'), observation);
   }
 }
-async function quietSummary(run: string): Promise<{
+async function quietSummary(
+  run: string,
+  errands: readonly TimedErrand[],
+): Promise<{
   status: ProbeStatus;
   samples: number;
   firstAt: string | null;
@@ -621,6 +661,7 @@ async function quietSummary(run: string): Promise<{
   frontmostChanged: boolean;
   clipboardChanged: boolean;
   unavailable: boolean;
+  observationCoverage: boolean;
 }> {
   let samples = 0;
   let first: DesktopObservation | undefined;
@@ -628,6 +669,9 @@ async function quietSummary(run: string): Promise<{
   let frontmostChanged = false;
   let clipboardChanged = false;
   let unavailable = false;
+  let interrupted = false;
+  const intervals = errands.map((errand) => [Date.parse(errand.startedAt), Date.parse(errand.verifiedAt)] as const);
+  const maxGap = DESKTOP_READ_TIMEOUT_MS + 2 * DESKTOP_SAMPLE_INTERVAL_MS;
   const file = join(run, 'desktop.ndjson');
   try {
     await lstat(file);
@@ -640,6 +684,7 @@ async function quietSummary(run: string): Promise<{
       frontmostChanged,
       clipboardChanged,
       unavailable: true,
+      observationCoverage: false,
     };
   }
   const lines = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
@@ -647,6 +692,15 @@ async function quietSummary(run: string): Promise<{
     const entry = object(JSON.parse(line) as unknown);
     const observation = entry as unknown as DesktopObservation;
     timestamp(observation.sampledAt);
+    if (last) {
+      const previousAt = Date.parse(last.sampledAt);
+      const currentAt = Date.parse(observation.sampledAt);
+      if (
+        currentAt <= previousAt ||
+        (currentAt - previousAt > maxGap && intervals.some(([start, end]) => previousAt < end && currentAt > start))
+      )
+        interrupted = true;
+    }
     first ??= observation;
     samples++;
     if (
@@ -659,14 +713,33 @@ async function quietSummary(run: string): Promise<{
     clipboardChanged ||= observation.clipboardChangeCount !== first.clipboardChangeCount;
     last = observation;
   }
+  const observationCoverage =
+    intervals.length > 0 &&
+    !interrupted &&
+    first !== undefined &&
+    last !== undefined &&
+    intervals.every(
+      ([start, end]) =>
+        Number.isFinite(start) &&
+        Number.isFinite(end) &&
+        end >= start &&
+        Date.parse(first.sampledAt) <= start &&
+        Date.parse(last.sampledAt) >= end,
+    );
   return {
-    status: frontmostChanged || clipboardChanged ? 'failed' : samples < 2 || unavailable ? 'not-run' : 'passed',
+    status:
+      frontmostChanged || clipboardChanged
+        ? 'failed'
+        : samples < 2 || unavailable || !observationCoverage
+          ? 'not-run'
+          : 'passed',
     samples,
     firstAt: first?.sampledAt ?? null,
     lastAt: last?.sampledAt ?? null,
     frontmostChanged,
     clipboardChanged,
     unavailable,
+    observationCoverage,
   };
 }
 async function listJson(directory: string): Promise<unknown[]> {
@@ -682,16 +755,8 @@ async function summarize(run: string): Promise<void> {
     const entry = recordedScenarios.find((scenario) => scenario.name === name);
     return entry ?? { name, status: 'not-run' };
   });
-  const quiet = await quietSummary(run);
-  const observationCoverage =
-    samples.length > 0 &&
-    quiet.firstAt !== null &&
-    quiet.lastAt !== null &&
-    samples.every(
-      (sample) =>
-        Date.parse(quiet.firstAt!) <= Date.parse(sample.startedAt) &&
-        Date.parse(quiet.lastAt!) >= Date.parse(sample.verifiedAt),
-    );
+  const quiet = await quietSummary(run, samples);
+  const observationCoverage = quiet.observationCoverage;
   const timedErrands = summarizeTimedErrands(samples);
   const scans = (await readdir(run)).filter((name) => name.startsWith('canary-scan-') && name.endsWith('.json'));
   const scanResults = await Promise.all(scans.map(async (name) => object(await jsonFile(join(run, name)))));
@@ -853,17 +918,25 @@ async function main(): Promise<void> {
     const startedAt = new Date().toISOString();
     const until = Date.now() + hours * 3_600_000;
     const checks = new Map<string, WatchCheck>();
+    let initialNextCheckAt: string | null = null;
+    const scheduleChanges: Soak['scheduleChanges'] = [];
     const observedAt: string[] = [];
     const controller = new AbortController();
     process.once('SIGINT', () => controller.abort());
     process.once('SIGTERM', () => controller.abort());
     while (!controller.signal.aborted) {
       const native = await captureNative(requireFlag(flags, 'socket'), requireFlag(flags, 'job'));
+      if (observedAt.length === 0) initialNextCheckAt = native.watchNextCheckAt;
+      else if (
+        native.watchNextCheckAt !== (scheduleChanges.length ? scheduleChanges.at(-1)!.nextCheckAt : initialNextCheckAt)
+      )
+        scheduleChanges.push({ observedAt: native.capturedAt, nextCheckAt: native.watchNextCheckAt });
       for (const check of native.watchChecks) checks.set(check.id, check);
       observedAt.push(native.capturedAt);
       await appendPrivate(join(run, 'soak.ndjson'), {
         capturedAt: native.capturedAt,
         jobId: native.job.id,
+        watchNextCheckAt: native.watchNextCheckAt,
         watchChecks: native.watchChecks,
       });
       if (Date.now() >= until) break;
@@ -871,7 +944,14 @@ async function main(): Promise<void> {
         () => undefined,
       );
     }
-    const soak = { startedAt, finishedAt: new Date().toISOString(), checks: [...checks.values()], observedAt };
+    const soak = {
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      initialNextCheckAt,
+      scheduleChanges,
+      checks: [...checks.values()],
+      observedAt,
+    };
     await privateJson(join(run, 'soak.json'), {
       ...soak,
       ...verifyWatchSoak(soak, null),
