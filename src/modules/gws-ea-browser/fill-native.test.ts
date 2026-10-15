@@ -90,6 +90,11 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     proxy = createHttpServer((_request, response) => {
       response.writeHead(403).end();
     });
+    // CONNECT upgrades leave closeAllConnections; retain both ends for teardown.
+    proxy.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+    });
     proxy.on('connect', (request, socket, head) => {
       if (!['auth.example:443', 'parent.example:443', 'www.amazon.com:443'].includes(request.url ?? '')) {
         socket.destroy();

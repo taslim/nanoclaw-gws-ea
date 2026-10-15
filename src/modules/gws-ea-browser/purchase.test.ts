@@ -210,6 +210,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       response.writeHead(403);
       response.end();
     });
+    // CONNECT upgrades leave closeAllConnections; retain both ends for teardown.
+    fixtureProxy.on('connection', (socket) => {
+      transportSockets.add(socket);
+      socket.once('close', () => transportSockets.delete(socket));
+    });
     fixtureProxy.on('connect', (request, socket, head) => {
       if (request.url !== 'www.amazon.com:443') {
         socket.destroy();

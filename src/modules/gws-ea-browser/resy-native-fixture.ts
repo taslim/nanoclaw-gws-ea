@@ -90,6 +90,11 @@ export async function resyFixture(
     response.writeHead(403);
     response.end();
   });
+  // CONNECT upgrades leave closeAllConnections; retain both ends for teardown.
+  proxy.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
   proxy.on('connect', (request, socket, head) => {
     if (!['resy.com:443', 'widgets.resy.com:443', 'api.resy.com:443'].includes(request.url ?? '')) {
       socket.destroy();
