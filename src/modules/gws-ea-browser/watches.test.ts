@@ -72,6 +72,8 @@ function freeFacts(): PurchaseFacts {
 }
 let jobId: string;
 beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
   await runMigrations(await initTestDb());
   if (!(await getDb().hasTable('gws_ea_browser_watches'))) await browserWatchesMigration.up(getDb());
   for (const id of ['watch-main', 'watch-browser'])
@@ -92,6 +94,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   delete process.env.GWS_EA_BROWSER_POLICY_FILE;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
@@ -350,6 +353,41 @@ describe('native watch bounds and one booking claim', () => {
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
       state: 'available',
     });
+  });
+  it('refreshes an unspent child authority when a later hit moves to another approved window', async () => {
+    await seedWatch('friday');
+    const laterWindow = { start: '2026-10-17T19:00:00Z', end: '2026-10-17T21:00:00Z' };
+    await getDb().run(
+      'UPDATE gws_ea_browser_watches SET bounds_json=? WHERE id=?',
+      JSON.stringify({ ...bounds, windows: [...bounds.windows, laterWindow] }),
+      'friday',
+    );
+    vi.spyOn(calendarFacts, 'findPrincipalCalendarConflicts').mockResolvedValue({
+      conflicts: [],
+      conflicts_not_listed: 0,
+      message: 'Free',
+    });
+    const first = await prepareWatchPurchase((await executionContext('first-hit')).context, freeFacts());
+    expect(first?.status).toBe('ready');
+    if (first?.status !== 'ready') throw new Error('Expected first authority');
+    const laterFacts = {
+      ...freeFacts(),
+      reservation: { ...freeFacts().reservation!, at: '2026-10-17T19:30:00Z', endAt: '2026-10-17T21:00:00Z' },
+    };
+    const later = await prepareWatchPurchase((await executionContext('later-hit')).context, laterFacts);
+    expect(later?.status).toBe('ready');
+    if (later?.status !== 'ready') throw new Error('Expected later authority');
+    expect(later.authorityId).not.toBe(first.authorityId);
+    const authorities = new PurchaseAuthorityStore();
+    expect(await authorities.get(first.authorityId)).toMatchObject({ state: 'revoked' });
+    expect(await authorities.get(later.authorityId)).toMatchObject({
+      state: 'live',
+      facts_json: JSON.stringify(laterFacts),
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
+      state: 'available',
+    });
+    expect(await prepareWatchPurchase((await executionContext('same-hit')).context, laterFacts)).toEqual(later);
   });
   it('re-arms preparation before the marker, but recovers a marked attempt as unknown and site-blocked', async () => {
     await seedWatch('friday');

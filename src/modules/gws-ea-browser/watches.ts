@@ -27,6 +27,8 @@ import {
   amountMinor,
   completePurchaseFacts,
   formatMoney,
+  materialPurchaseChange,
+  type PurchaseBounds,
   type PurchaseFacts,
   type ReservationFacts,
 } from './fingerprint.js';
@@ -403,7 +405,21 @@ export async function prepareWatchPurchase(
   const store = new PurchaseAuthorityStore(db);
   if (watch.authority_id) {
     const existing = await store.get(watch.authority_id);
-    if (existing?.state === 'live') return { status: 'ready', watchId: watch.id, authorityId: existing.id };
+    if (existing?.state === 'live') {
+      if (
+        !materialPurchaseChange(
+          JSON.parse(existing.facts_json) as PurchaseFacts,
+          facts,
+          JSON.parse(existing.bounds_json) as PurchaseBounds,
+        )
+      )
+        return { status: 'ready', watchId: watch.id, authorityId: existing.id };
+      // The parent watch still covers these facts. Retire its unspent child before deriving another.
+      await db.run(
+        "UPDATE gws_ea_browser_authorities SET state = 'revoked' WHERE id = ? AND state = 'live'",
+        existing.id,
+      );
+    }
   }
   const id = `watch-authority-${digest(`${watch.id}\0${context.request.id}`)}`;
   const bounds = boundsOf(watch);
