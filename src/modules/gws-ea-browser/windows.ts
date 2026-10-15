@@ -1,6 +1,7 @@
 import type { Page } from 'playwright-core';
 
 import { secureJobPage, type ChromeConnection } from './connection.js';
+import { releaseBrowserUploads } from './files.js';
 
 export const BROWSER_WINDOW_IDLE_MS = 10 * 60 * 1000;
 
@@ -98,6 +99,7 @@ export class JobWindows {
     const existing = this.pages.get(jobId);
     this.pages.delete(jobId);
     await existing?.page.close().catch(() => undefined);
+    if (existing) await releaseBrowserUploads(existing.page);
   }
 
   async closeIdle(now = Date.now()): Promise<void> {

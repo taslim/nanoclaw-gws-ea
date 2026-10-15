@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import {
   ensureBrowserPaths,
+  clearBrowserUploadStaging,
   ensurePrivateDirectory,
   readPrivateFile,
   writePrivateFile,
@@ -64,6 +65,7 @@ function object(value: unknown): Record<string, unknown> {
 /** Only called while Chrome is stopped; retain cookies/site state and rewrite safety preferences. */
 export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
   await ensureBrowserPaths(paths);
+  await clearBrowserUploadStaging(paths);
   const defaultDir = path.join(paths.profileDir, 'Default');
   await ensurePrivateDirectory(defaultDir);
   const file = path.join(defaultDir, 'Preferences');

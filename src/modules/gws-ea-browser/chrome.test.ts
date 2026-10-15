@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -97,6 +97,20 @@ describe('dedicated Chrome profile and launch', () => {
     expect((await lstat(pref)).mode & 0o777).toBe(0o600);
     await symlink(path.join(root, 'elsewhere'), path.join(paths.stagingDir, 'escape'));
     await expect(ensureBrowserPaths(paths)).rejects.toThrow(/symbolic|symlink/i);
+  });
+
+  it('removes orphaned upload copies while retaining unhanded downloads before a fresh Chrome launch', async () => {
+    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    await ensureBrowserPaths(paths);
+    const upload = path.join(paths.stagingDir, 'uploads', 'orphan');
+    await mkdir(upload, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(upload, 'supporting.txt'), 'stale upload', { mode: 0o600 });
+    const download = path.join(paths.stagingDir, 'downloads', 'pending');
+    await mkdir(download, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(download, 'invoice.pdf'), 'only valid download', { mode: 0o600 });
+    await prepareChromeProfile(paths);
+    expect(await readdir(path.join(paths.stagingDir, 'uploads'))).toEqual([]);
+    expect(await readFile(path.join(download, 'invoice.pdf'), 'utf8')).toBe('only valid download');
   });
 
   it('reads required optional-capability policy on each use and never adopts configurable profiles', async () => {

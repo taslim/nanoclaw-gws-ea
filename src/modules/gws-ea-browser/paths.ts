@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readdir, rename, rm, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -65,6 +65,19 @@ export async function ensureBrowserPaths(paths: BrowserPaths): Promise<void> {
   await makeTreePrivate(paths.profileDir, true);
   await makeTreePrivate(paths.stagingDir);
   await ensurePrivateDirectory(paths.artifactsDir);
+}
+
+/** Called only after private-tree validation and while the owning Chrome is stopped. */
+export async function clearBrowserUploadStaging(paths: BrowserPaths): Promise<void> {
+  const directory = path.join(paths.stagingDir, 'uploads');
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) await rm(path.join(directory, entry), { recursive: true, force: true });
 }
 
 /** Atomic owner-only files, including policy and Preferences; never follows an existing symlink. */

@@ -13,7 +13,7 @@ import {
   withBrowserJobNavigation,
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
-import { captureBrowserDownload, stageBrowserUpload } from './files.js';
+import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import { SiteLeaseStore } from './leases.js';
 import {
   BrowserRefError,
@@ -440,11 +440,14 @@ async function executeBatch(
                 path.join(policy.paths.stagingDir, 'uploads'),
                 action.path,
               );
+              let retained = false;
               try {
                 await context.assertActive();
                 await target.element.setInputFiles(staged.path, { timeout: context.remaining() });
+                retainBrowserUpload(page, staged);
+                retained = true;
               } finally {
-                await staged.remove();
+                if (!retained) await staged.remove();
               }
             }
             break;

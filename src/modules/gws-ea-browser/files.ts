@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { chmod, link, lstat, open, readdir, realpath, unlink, type FileHandle } from 'node:fs/promises';
+import { chmod, link, lstat, open, readdir, realpath, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Download, Page } from 'playwright-core';
@@ -64,7 +64,9 @@ export async function stageBrowserUpload(
   if (!isPathInside(base, await realpath(source))) throw new Error('Upload escaped session');
   await ensurePrivateDirectory(stagingRoot);
   const input = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
-  const target = path.join(stagingRoot, `upload-${randomUUID()}`);
+  const directory = path.join(stagingRoot, `upload-${randomUUID()}`);
+  await ensurePrivateDirectory(directory);
+  const target = path.join(directory, path.basename(source));
   try {
     const stat = await input.stat();
     const pathStat = await lstat(source);
@@ -89,14 +91,44 @@ export async function stageBrowserUpload(
       path: target,
       async remove() {
         await unlink(target).catch(() => undefined);
+        await rmdir(directory).catch(() => undefined);
       },
     };
   } catch (error) {
     await unlink(target).catch(() => undefined);
+    await rmdir(directory).catch(() => undefined);
     throw error;
   } finally {
     await input.close();
   }
+}
+
+type StagedBrowserUpload = Awaited<ReturnType<typeof stageBrowserUpload>>;
+const pageUploads = new WeakMap<Page, Set<StagedBrowserUpload>>();
+const uploadCleanups = new WeakMap<Page, Promise<void>>();
+
+/** Chrome reads selected disk files lazily, so a successful selection does not finish their use. */
+export function retainBrowserUpload(page: Page, upload: StagedBrowserUpload): void {
+  if (page.isClosed()) throw new Error('Upload page closed');
+  let uploads = pageUploads.get(page);
+  if (!uploads) {
+    uploads = new Set();
+    pageUploads.set(page, uploads);
+    page.once('close', () => {
+      void releaseBrowserUploads(page).catch(() => undefined);
+    });
+  }
+  uploads.add(upload);
+}
+export function releaseBrowserUploads(page: Page): Promise<void> {
+  const existing = uploadCleanups.get(page);
+  if (existing) return existing;
+  const uploads = pageUploads.get(page);
+  if (!uploads) return Promise.resolve();
+  pageUploads.delete(page);
+  const cleanup = Promise.all([...uploads].map((upload) => upload.remove())).then(() => undefined);
+  uploadCleanups.set(page, cleanup);
+  return cleanup;
 }
 
 /** A failed copy retains the host original. An existing completed target is recognized on replay. */
@@ -195,6 +227,12 @@ async function stagingBytes(directory: string): Promise<number> {
   return total;
 }
 
+async function workspaceDownloadPath(sessionRoot: string, target: string): Promise<string> {
+  const base = await realpath(sessionRoot);
+  if (!isPathInside(base, target)) throw new Error('Download escaped its session');
+  return path.posix.join('/workspace', ...path.relative(base, target).split(path.sep));
+}
+
 export async function captureBrowserDownload(
   context: BrowserExecutionContext,
   page: Page,
@@ -213,7 +251,7 @@ export async function captureBrowserDownload(
   if (prior) {
     const target = await handoffBrowserDownload(prior.host_path, inboxRoot, id, prior.filename);
     return {
-      path: target.replace(sessionDir(context.session.agent_group_id, context.session.id), '/workspace'),
+      path: await workspaceDownloadPath(sessionDir(context.session.agent_group_id, context.session.id), target),
       filename: prior.filename,
       bytes: prior.bytes,
     };
@@ -256,10 +294,15 @@ export async function captureBrowserDownload(
       await activate();
       download = await event;
       if (overCap) await download.cancel();
-      const hostPath = await download.path();
+      // CDP reports Playwright's fixed artifacts directory, while allowAndName uses our request directory.
+      const guid = path.basename(await download.path());
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(guid))
+        throw new Error('Invalid native download identity');
+      const hostPath = path.join(directory, guid);
       const stat = await lstat(hostPath);
       if (overCap || !stat.isFile() || stat.size > cap) {
-        await download.delete();
+        overCap = true;
+        await unlink(hostPath);
         throw new Error('Download exceeds cap');
       }
       await chmod(hostPath, 0o600);
@@ -283,7 +326,7 @@ export async function captureBrowserDownload(
         id,
       );
       return {
-        path: target.replace(sessionDir(context.session.agent_group_id, context.session.id), '/workspace'),
+        path: await workspaceDownloadPath(sessionDir(context.session.agent_group_id, context.session.id), target),
         filename,
         bytes: stat.size,
       };
