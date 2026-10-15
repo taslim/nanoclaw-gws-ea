@@ -8,7 +8,14 @@ import { Readable, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-import { chromium, type Browser, type CDPSession, type ConnectOverCDPTransport, type Page } from 'playwright-core';
+import {
+  chromium,
+  errors,
+  type Browser,
+  type CDPSession,
+  type ConnectOverCDPTransport,
+  type Page,
+} from 'playwright-core';
 
 import { runProbe, type JsonValue, type ProbeResult } from './evidence.js';
 
@@ -347,7 +354,7 @@ export async function detectionSignals(page: Page): Promise<{ [key: string]: Jso
 
 /** Signed-out only; no account state or transaction controls are touched. */
 export async function publicSiteProbes(
-  probeBrowser: ProbeBrowser,
+  probeBrowser: Pick<ProbeBrowser, 'newPage'>,
   observedProbe: typeof runProbe = runProbe,
 ): Promise<ProbeResult[]> {
   const nextWeek = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
@@ -366,6 +373,22 @@ export async function publicSiteProbes(
         const page = await probeBrowser.newPage();
         try {
           await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          let ready = true;
+          try {
+            // These sites hydrate after DOMContentLoaded. An empty app shell
+            // is not evidence that a public search was blocked or succeeded.
+            await page.waitForFunction(
+              () =>
+                /restaurant|reservation|availability|search results|no (?:results|availability)|find a table|verify (?:you are|you're) human|unusual activity|access denied|captcha|attention required|checking your browser|security check|blocked/i.test(
+                  document.body?.innerText ?? '',
+                ),
+              undefined,
+              { timeout: 15_000 },
+            );
+          } catch (error) {
+            if (!(error instanceof errors.TimeoutError)) throw error;
+            ready = false;
+          }
           // A search URL is the first model-free flow step. Record what arrived,
           // rather than treating an HTTP 200 bot challenge as a successful flow.
           const snapshot = await page.locator('body').ariaSnapshot({ mode: 'ai' });
@@ -382,6 +405,7 @@ export async function publicSiteProbes(
               url: page.url(),
               title: await page.title(),
               challenge,
+              ready,
               searchResults,
               snapshot: snapshot.slice(0, 24_000),
               scope: 'signed-out search page; no login, booking, payment, or operator-profile comparison',
