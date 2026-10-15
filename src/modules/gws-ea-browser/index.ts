@@ -13,6 +13,8 @@ import { BrowserStore } from './db.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './capability.js';
+import './fill.js';
+import { browserDiagnosticsUnsafe } from './onepassword.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
@@ -69,6 +71,12 @@ export class BrowserRuntime {
     if (!current.enabled) {
       this.policy = current;
       await this.stopOwned();
+      return;
+    }
+    if (browserDiagnosticsUnsafe()) {
+      this.policy = current;
+      await this.stopOwned();
+      this.lastFailure = { reason: 'browser_unavailable', at: new Date().toISOString() };
       return;
     }
     if (
@@ -310,6 +318,7 @@ export function getBrowserQueue(): BrowserQueue {
   return queue;
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
+registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 onHostStart(async () => {
   await getBrowserQueue().start();
 });

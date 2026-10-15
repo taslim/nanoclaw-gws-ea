@@ -290,10 +290,16 @@ async function executeBatch(
           }
           case 'click':
             if (target)
-              await activateControl(page, target.element, async () => {
-                await context.assertActive();
-                await target.element.click({ timeout: context.remaining() });
-              });
+              await activateControl(
+                page,
+                target.element,
+                async () => {
+                  await context.assertActive();
+                  await target.element.click({ timeout: context.remaining() });
+                },
+                undefined,
+                { kind: 'click', assertActive: context.assertActive },
+              );
             break;
           case 'type':
             if (target) await fieldInput(context, target, action.text);
@@ -308,7 +314,7 @@ async function executeBatch(
                   await target.element.selectOption(action.value, { timeout: context.remaining() });
                 },
                 undefined,
-                { kind: 'select', value: action.value },
+                { kind: 'select', value: action.value, assertActive: context.assertActive },
               );
             break;
           case 'key':
@@ -328,11 +334,18 @@ async function executeBatch(
                 try {
                   const submit = formSubmit.asElement();
                   if (!submit) throw new BrowserBatchStop('unsupported_merchant');
-                  await activateControl(page, submit, press);
+                  await activateControl(page, submit, press, undefined, {
+                    kind: 'submit',
+                    assertActive: context.assertActive,
+                  });
                 } finally {
                   await formSubmit.dispose();
                 }
-              } else if (/^(?:Shift\+)?Space$/u.test(action.key)) await activateControl(page, target.element, press);
+              } else if (/^(?:Shift\+)?Space$/u.test(action.key))
+                await activateControl(page, target.element, press, undefined, {
+                  kind: 'click',
+                  assertActive: context.assertActive,
+                });
               else await press();
             }
             break;
@@ -360,10 +373,16 @@ async function executeBatch(
             for (const field of action.fields) await fieldInput(context, refs.get(field.ref)!, field.value);
             if (action.submit) {
               const submit = refs.get(action.submit.ref)!;
-              await activateControl(page, submit.element, async () => {
-                await context.assertActive();
-                await submit.element.click({ timeout: context.remaining() });
-              });
+              await activateControl(
+                page,
+                submit.element,
+                async () => {
+                  await context.assertActive();
+                  await submit.element.click({ timeout: context.remaining() });
+                },
+                undefined,
+                { kind: 'submit', assertActive: context.assertActive },
+              );
             }
             break;
           }
@@ -415,7 +434,7 @@ async function executeBatch(
                       await target.element.click({ timeout: context.remaining() });
                     },
                     undefined,
-                    { kind: 'download' },
+                    { kind: 'download', assertActive: context.assertActive },
                   ),
               );
             }
@@ -444,7 +463,7 @@ async function executeBatch(
   let observation;
   if (!page.isClosed()) {
     try {
-      observation = await observePage(page);
+      observation = await observePage(page, context.assertActive);
     } catch (_error) {
       reason ??= 'not_actionable';
     }

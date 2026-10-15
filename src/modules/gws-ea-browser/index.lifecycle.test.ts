@@ -22,6 +22,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await runtime.stop();
+  vi.unstubAllEnvs();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -40,6 +41,26 @@ async function listening(port: number): Promise<boolean> {
 }
 
 describe('optional host browser lifecycle', () => {
+  it('does not admit a browser while Playwright protocol diagnostics can expose credentials', async () => {
+    await ensureBrowserPaths(browserPaths(file));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    const spawn = vi.spyOn(chrome, 'spawnChrome').mockImplementation(() => {
+      throw new Error('Would spawn Chrome while protocol diagnostics are enabled');
+    });
+    vi.stubEnv('DEBUG', 'pw:protocol');
+    try {
+      await runtime.reconcile();
+      await expect(runtime.connection()).rejects.toMatchObject({ code: 'browser_unavailable' });
+      expect(spawn).not.toHaveBeenCalled();
+      expect(runtime.state()).toMatchObject({
+        enabled: true,
+        proxy: { state: 'stopped' },
+        lastFailure: { reason: 'browser_unavailable' },
+      });
+    } finally {
+      spawn.mockRestore();
+    }
+  });
   it('does no browser work without an enabled policy', async () => {
     await runtime.reconcile();
     expect(runtime.state()).toMatchObject({
