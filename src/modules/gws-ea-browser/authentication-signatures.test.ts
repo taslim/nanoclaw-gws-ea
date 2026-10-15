@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, it } from 'vitest';
 import { authenticationEndpoint, authenticationFieldKind } from './authentication-signatures.js';
 
@@ -30,4 +31,13 @@ it('uses positive native endpoints and refuses arbitrary JS-only, financial and 
     'https://shop.example/unreviewed-action',
   ])
     expect(authenticationEndpoint(new URL(url))).toBe(false);
+});
+
+it('keeps exact-node handoff in a fixed isolated selector and submission in public CDP', async () => {
+  const source = await readFile(new URL('./authentication-submit.ts', import.meta.url), 'utf8');
+  expect(source).toContain('selectors.register(name, selectorSource, { contentScript: true })');
+  expect(source).toContain("session.send('DOM.resolveNode'");
+  expect(source).toContain("session.send('Runtime.callFunctionOn'");
+  expect(source).not.toMatch(/\._(?:objectId|channel|connection|sessions)\b|\bFetch\./u);
+  expect(source).not.toMatch(/\belement\.evaluate\s*\(|\belement\.dispatchEvent\s*\(/u);
 });

@@ -1,5 +1,10 @@
 import type { ElementHandle, Frame } from 'playwright-core';
 import { httpsOrigin, type BrowserSecretField } from './onepassword.js';
+import {
+  inspectNativeAuthenticationControl,
+  submitNativeAuthenticationForm,
+  type NativeAuthenticationBinding,
+} from './authentication-submit.js';
 
 export interface AuthenticationFieldFacts {
   name: string;
@@ -11,6 +16,7 @@ export interface AuthenticationFormSignature {
   action: string;
   frame: Frame;
   element: ElementHandle;
+  native: NativeAuthenticationBinding;
 }
 
 export function authenticationFieldKind(facts: AuthenticationFieldFacts): BrowserSecretField | undefined {
@@ -70,37 +76,11 @@ export async function inspectAuthenticationControl(
   const frame = await element.ownerFrame();
   const origin = frame && httpsOrigin(frame.url());
   if (!frame || !origin) return undefined;
-  const authenticationSignature = await element.evaluate((node) => {
-    const e = node as unknown as {
-      tagName: string;
-      type?: string;
-      disabled?: boolean;
-      form?: {
-        action: string;
-        method: string;
-        target: string;
-        elements: ArrayLike<{ name?: string; type?: string; getAttribute(name: string): string | null }>;
-      };
-    };
-    const form = e.form;
-    return form
-      ? {
-          action: form.action,
-          method: form.method,
-          submit:
-            !e.disabled &&
-            (e.tagName === 'BUTTON' ? !e.type || e.type === 'submit' : e.tagName === 'INPUT' && e.type === 'submit') &&
-            (!form.target || form.target === '_self'),
-          fields: Array.from(form.elements).map((field) => ({
-            name: field.name ?? '',
-            type: field.type ?? '',
-            autocomplete: field.getAttribute('autocomplete') ?? '',
-          })),
-        }
-      : null;
-  });
+  const native = await inspectNativeAuthenticationControl(element, frame);
+  if (!native) return undefined;
+  const authenticationSignature = native.facts;
   if (
-    !authenticationSignature ||
+    authenticationSignature.origin !== origin.origin ||
     !authenticationSignature.submit ||
     authenticationSignature.method.toLowerCase() !== 'post'
   )
@@ -118,7 +98,7 @@ export async function inspectAuthenticationControl(
     )
   )
     return undefined;
-  return { origin: origin.origin, action: action.href, frame, element };
+  return { origin: origin.origin, action: action.href, frame, element, native };
 }
 
 /** Recheck the exact signature and invoke the browser's native submit, bypassing arbitrary onsubmit JS. */
@@ -127,38 +107,6 @@ export async function submitAuthenticationForm(
   assertActive?: () => Promise<void>,
 ): Promise<boolean> {
   if (httpsOrigin(signature.frame.url())?.origin !== signature.origin) return false;
-  const current = await inspectAuthenticationControl(signature.element);
-  if (
-    !current ||
-    current.frame !== signature.frame ||
-    current.origin !== signature.origin ||
-    current.action !== signature.action
-  )
-    return false;
-  await assertActive?.();
-  if (httpsOrigin(signature.frame.url())?.origin !== signature.origin) return false;
-  return signature.element.evaluate(
-    (node, expected) => {
-      const e = node as unknown as {
-        form?: { action: string; method: string; target: string };
-        ownerDocument: {
-          location: { origin: string };
-          defaultView: { HTMLFormElement: { prototype: { submit: { call(form: unknown): void } } } };
-        };
-      };
-      const form = e.form;
-      if (
-        !form ||
-        form.action !== expected.action ||
-        form.method.toLowerCase() !== 'post' ||
-        e.ownerDocument.location.origin !== expected.origin ||
-        (form.target && form.target !== '_self')
-      )
-        return false;
-      const nativeSubmit = e.ownerDocument.defaultView.HTMLFormElement.prototype.submit;
-      nativeSubmit.call(form);
-      return true;
-    },
-    { origin: signature.origin, action: signature.action },
-  );
+  if ((await signature.element.ownerFrame()) !== signature.frame) return false;
+  return submitNativeAuthenticationForm(signature.frame, signature.native, assertActive);
 }
