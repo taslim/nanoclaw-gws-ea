@@ -37,6 +37,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@1password/sdk": "0.5.0",
     "@chat-adapter/gchat": "4.40.0",
     "@clack/core": "^1.2.0",
     "@clack/prompts": "^1.2.0",
@@ -45,12 +46,15 @@
     "chat": "4.40.0",
     "cron-parser": "5.5.0",
     "google-auth-library": "10.5.0",
+    "ipaddr.js": "2.5.0",
     "kleur": "^4.1.5",
     "mdast-util-from-markdown": "2.0.3",
     "mdast-util-gfm": "3.1.0",
     "micromark": "4.0.2",
     "micromark-extension-gfm": "3.0.0",
     "micromark-util-sanitize-uri": "2.0.1",
+    "playwright-core": "1.64.0",
+    "tldts": "7.4.18",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
