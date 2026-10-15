@@ -139,6 +139,22 @@ export class BrowserStore {
         );
   }
 
+  nextPending(jobId: string): Promise<BrowserRequest | undefined> {
+    return this.db.get<BrowserRequest>(
+      'SELECT * FROM gws_ea_browser_requests WHERE job_id = ? AND answered_at IS NULL ORDER BY accepted_at,id LIMIT 1',
+      jobId,
+    );
+  }
+
+  async hasPending(jobId: string): Promise<boolean> {
+    return Boolean(
+      await this.db.get<{ present: number }>(
+        'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND answered_at IS NULL LIMIT 1',
+        jobId,
+      ),
+    );
+  }
+
   async start(id: string): Promise<BrowserRequest | undefined> {
     const changed = await this.db.run(
       'UPDATE gws_ea_browser_requests SET started_at = ? WHERE id = ? AND started_at IS NULL AND answered_at IS NULL',
@@ -157,10 +173,15 @@ export class BrowserStore {
     );
   }
 
-  undelivered(): Promise<BrowserRequest[]> {
-    return this.db.all<BrowserRequest>(
-      'SELECT * FROM gws_ea_browser_requests WHERE answer_json IS NOT NULL AND delivered_at IS NULL ORDER BY answered_at,id',
-    );
+  undelivered(jobId?: string): Promise<BrowserRequest[]> {
+    return jobId === undefined
+      ? this.db.all<BrowserRequest>(
+          'SELECT * FROM gws_ea_browser_requests WHERE answer_json IS NOT NULL AND delivered_at IS NULL ORDER BY answered_at,id',
+        )
+      : this.db.all<BrowserRequest>(
+          'SELECT * FROM gws_ea_browser_requests WHERE job_id = ? AND answer_json IS NOT NULL AND delivered_at IS NULL ORDER BY answered_at,id',
+          jobId,
+        );
   }
 
   async delivered(id: string): Promise<void> {

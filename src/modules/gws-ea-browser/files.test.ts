@@ -42,3 +42,22 @@ it('retains the only host download on failed handoff, then hands off once durabl
   expect(await handoffBrowserDownload(host, inbox, 'browser-safe', 'invoice.txt')).toBe(result);
   expect(fs.statSync(result).mode & 0o777).toBe(0o600);
 });
+
+it('compares every download byte on replay and retains a changed host original', async () => {
+  const host = path.join(root, 'download');
+  const inbox = path.join(root, 'session', 'inbox');
+  fs.mkdirSync(path.dirname(inbox));
+  const bytes = Buffer.alloc(200_003, 7);
+  fs.writeFileSync(host, bytes);
+  const result = await handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin');
+  fs.writeFileSync(host, bytes);
+  expect(await handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).toBe(result);
+  expect(fs.existsSync(host)).toBe(false);
+  bytes[bytes.length - 1] = 8;
+  fs.writeFileSync(host, bytes);
+  await expect(handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).rejects.toThrow(
+    'incomplete or changed',
+  );
+  expect(fs.readFileSync(host)).toEqual(bytes);
+  expect(fs.readFileSync(result).at(-1)).toBe(7);
+});

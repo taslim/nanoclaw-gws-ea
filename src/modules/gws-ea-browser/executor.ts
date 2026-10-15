@@ -3,6 +3,7 @@ import { errors, type Page } from 'playwright-core';
 
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { sessionDir } from '../../session-manager.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import {
   activateControl,
   BrowserActivationError,
@@ -10,6 +11,7 @@ import {
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   withBrowserJobNavigation,
+  type BrowserNavigationGuard,
 } from './commit-classifier.js';
 import { captureBrowserDownload, stageBrowserUpload } from './files.js';
 import { SiteLeaseStore } from './leases.js';
@@ -65,9 +67,8 @@ export interface BrowserActionResult {
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value))
-    throw invalidArgs('Each browser action must be an object.');
-  return value as Record<string, unknown>;
+  if (!isRecord(value)) throw invalidArgs('Each browser action must be an object.');
+  return value;
 }
 function keys(value: Record<string, unknown>, allowed: readonly string[]): void {
   if (Object.keys(value).some((key) => !allowed.includes(key))) throw invalidArgs('Unknown browser action field.');
@@ -213,6 +214,19 @@ class BrowserBatchStop extends Error {
   constructor(readonly reason: BrowserStopReason) {
     super(reason);
   }
+}
+
+function batchErrorReason(
+  error: unknown,
+  blocked: ReturnType<BrowserNavigationGuard['reason']>,
+  context: BrowserExecutionContext,
+  page: Page,
+): BrowserStopReason {
+  if (error instanceof BrowserBatchStop || error instanceof BrowserActivationError || error instanceof BrowserRefError)
+    return error.reason;
+  if (blocked && blocked !== 'ordinary') return blocked;
+  if (error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()) return 'timeout';
+  return page.isClosed() ? 'window_closed' : 'not_actionable';
 }
 
 export async function executeBrowserBatch(
@@ -415,18 +429,7 @@ async function executeBatch(
           break;
         }
       } catch (error) {
-        reason =
-          error instanceof BrowserBatchStop ||
-          error instanceof BrowserActivationError ||
-          error instanceof BrowserRefError
-            ? error.reason
-            : guard.reason() && guard.reason() !== 'ordinary'
-              ? (guard.reason() as BrowserStopReason)
-              : error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()
-                ? 'timeout'
-                : page.isClosed()
-                  ? 'window_closed'
-                  : 'not_actionable';
+        reason = batchErrorReason(error, guard.reason(), context, page);
         results[index] = { index, status: 'stopped', reason };
         break;
       }

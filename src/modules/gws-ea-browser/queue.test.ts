@@ -220,11 +220,11 @@ it('does not strand acceptance at the final empty-read boundary', async () => {
   });
   const queue = new BrowserQueue(store, runtime);
   await queue.start();
-  const pending = store.pending.bind(store);
+  const pending = store.nextPending.bind(store);
   let inserted = false;
-  vi.spyOn(store, 'pending').mockImplementation(async (jobId) => {
+  vi.spyOn(store, 'nextPending').mockImplementation(async (jobId) => {
     const result = await pending(jobId);
-    if (jobId && !result.length && !inserted) {
+    if (jobId && !result && !inserted) {
       inserted = true;
       await queue.accept('queue_boundary_fixture', {}, session, 'boundary-second');
     }
@@ -290,9 +290,9 @@ it('recovers orphaned started requests without executing them or spinning the dr
     await store.start(browserRequestId(session.id, id));
   }
   await markBrowserRequestCommitStarted(store.db, browserRequestId(session.id, 'orphan-marked'));
-  const pending = store.pending.bind(store);
+  const pending = store.nextPending.bind(store);
   let reads = 0;
-  vi.spyOn(store, 'pending').mockImplementation(async (jobId) => {
+  vi.spyOn(store, 'nextPending').mockImplementation(async (jobId) => {
     if (++reads > 8) throw new Error('Bounded test detected a spinning drain');
     return pending(jobId);
   });
@@ -330,9 +330,9 @@ it('defers a failed durable answer until the periodic retry instead of immediate
   });
   const queue = new BrowserQueue(store, runtime);
   await queue.start();
-  const pending = store.pending.bind(store);
+  const pending = store.nextPending.bind(store);
   let reads = 0;
-  const pendingSpy = vi.spyOn(store, 'pending').mockImplementation(async (jobId) => {
+  const pendingSpy = vi.spyOn(store, 'nextPending').mockImplementation(async (jobId) => {
     if (++reads > 8) throw new Error('Bounded test detected repeated immediate retries');
     return pending(jobId);
   });

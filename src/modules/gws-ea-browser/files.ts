@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { chmod, link, lstat, open, readdir, realpath, unlink } from 'node:fs/promises';
+import { chmod, link, lstat, open, readdir, realpath, unlink, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Download, Page } from 'playwright-core';
@@ -21,6 +21,27 @@ async function syncDirectory(directory: string): Promise<void> {
     await handle.sync();
   } finally {
     await handle.close();
+  }
+}
+
+async function readChunk(file: FileHandle, buffer: Buffer): Promise<number> {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, null);
+    if (!bytesRead) break;
+    offset += bytesRead;
+  }
+  return offset;
+}
+
+async function equalFiles(left: FileHandle, right: FileHandle): Promise<boolean> {
+  const leftBytes = Buffer.alloc(64 * 1024);
+  const rightBytes = Buffer.alloc(64 * 1024);
+  for (;;) {
+    const [leftCount, rightCount] = await Promise.all([readChunk(left, leftBytes), readChunk(right, rightBytes)]);
+    if (leftCount !== rightCount || !leftBytes.subarray(0, leftCount).equals(rightBytes.subarray(0, rightCount)))
+      return false;
+    if (!leftCount) return true;
   }
 }
 
@@ -122,7 +143,7 @@ export async function handoffBrowserDownload(
           !existingStat.isFile() ||
           existingStat.nlink !== 1 ||
           existingStat.size !== stat.size ||
-          !(await existing.readFile()).equals(await input.readFile())
+          !(await equalFiles(existing, input))
         )
           throw new Error('Download target is incomplete or changed');
       } finally {

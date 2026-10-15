@@ -181,7 +181,7 @@ export class BrowserQueue {
         this.drains.delete(jobId);
         // Only close the successful empty-read race here. Storage failures must
         // wait for the periodic sweep, rather than monopolizing the event loop.
-        if (completed && this.ready && !this.stopping && (await this.store.pending(jobId)).length) this.wake(jobId);
+        if (completed && this.ready && !this.stopping && (await this.store.hasPending(jobId))) this.wake(jobId);
       });
     this.drains.set(jobId, drain);
     // A durable row remains for startup recovery if the mailbox becomes unavailable.
@@ -243,9 +243,8 @@ export class BrowserQueue {
 
   private async drain(jobId: string): Promise<void> {
     while (this.ready && !this.stopping) {
-      for (const answered of await this.store.undelivered())
-        if (answered.job_id === jobId) await this.deliver(answered);
-      const next = (await this.store.pending(jobId))[0];
+      for (const answered of await this.store.undelivered(jobId)) await this.deliver(answered);
+      const next = await this.store.nextPending(jobId);
       if (!next) return;
       await this.withJobLock(jobId, () => this.execute(next));
     }
