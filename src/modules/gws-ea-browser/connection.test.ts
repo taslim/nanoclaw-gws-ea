@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import { PassThrough } from 'node:stream';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { chromium, type Browser, type ConnectOverCDPTransport } from 'playwright-core';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -55,7 +57,7 @@ it('lets a client install listeners after a reply before delivering a coalesced 
     await Promise.all([initialized, received]);
     return browser;
   });
-  const connected = await connectChromePipe(child, browserPaths('/private/tmp/browser-wire-fixture/policy.json'));
+  const connected = await connectChromePipe(child, browserPaths(join(tmpdir(), 'browser-wire-fixture/policy.json')));
   try {
     expect(seen).toEqual([true]);
   } finally {

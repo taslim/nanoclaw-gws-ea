@@ -3,9 +3,14 @@ import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ElementHandle, Frame, Page } from 'playwright-core';
+const root = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-sign-in-tests');
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  DATA_DIR: '/private/tmp/browser-sign-in-tests',
+  DATA_DIR: root,
 }));
 vi.mock('./commit-classifier.js', async (original) => ({
   ...(await original<typeof import('./commit-classifier.js')>()),
@@ -48,7 +53,7 @@ let messages: GmailMessage[];
 let read: ReturnType<typeof vi.fn>;
 let list: ReturnType<typeof vi.fn>;
 beforeEach(async () => {
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `/private/tmp/browser-sign-in-${randomUUID()}.json`);
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/missing-${randomUUID()}.json`);
   await runMigrations(await initTestDb());
   await browserSiteLeasesMigration.up(getDb());
   await browserQueueMigration.up(getDb());
@@ -74,7 +79,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await closeDb();
-  fs.rmSync('/private/tmp/browser-sign-in-tests', { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true });
 });
 function receive(body: string, options: { spam?: boolean; signer?: string } = {}): void {
   const domain = options.signer ?? 'shop.example';

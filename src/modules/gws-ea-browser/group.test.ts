@@ -1,11 +1,15 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
-const ROOT = '/private/tmp/browser-group-tests';
+const ROOT = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-group-tests');
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  GROUPS_DIR: '/private/tmp/browser-group-tests/groups',
-  DATA_DIR: '/private/tmp/browser-group-tests/data',
+  GROUPS_DIR: `${ROOT}/groups`,
+  DATA_DIR: `${ROOT}/data`,
   TEMPLATES_DIR: `${process.cwd()}/templates`,
 }));
 

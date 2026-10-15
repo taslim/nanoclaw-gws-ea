@@ -1,10 +1,14 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const ROOT = '/private/tmp/browser-reconcile-tests';
+const ROOT = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-reconcile-tests');
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  DATA_DIR: '/private/tmp/browser-reconcile-tests/data',
-  GROUPS_DIR: '/private/tmp/browser-reconcile-tests/groups',
+  DATA_DIR: `${ROOT}/data`,
+  GROUPS_DIR: `${ROOT}/groups`,
   TEMPLATES_DIR: `${process.cwd()}/templates`,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));

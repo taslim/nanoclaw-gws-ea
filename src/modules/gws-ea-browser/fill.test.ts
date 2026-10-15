@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
@@ -14,7 +16,7 @@ import * as nativeAuthentication from './authentication-submit.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `/private/tmp/browser-test-disabled-${randomUUID()}.json`);
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
 });
 afterEach(() => {
   vi.unstubAllEnvs();

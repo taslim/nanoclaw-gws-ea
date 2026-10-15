@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+const root = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-cancel-tests');
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  DATA_DIR: '/private/tmp/browser-cancel-tests',
+  DATA_DIR: root,
 }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resolveSystemSession } from '../../session-manager.js';
@@ -29,12 +34,12 @@ beforeEach(async () => {
 afterEach(async () => {
   delete process.env.GWS_EA_BROWSER_POLICY_FILE;
   await closeDb();
-  fs.rmSync('/private/tmp/browser-cancel-tests', { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 it('admits canonical main alone and denies browser delegation while the operator policy is disabled', async () => {
-  const file = '/private/tmp/browser-cancel-tests/browser/policy.json';
-  fs.mkdirSync('/private/tmp/browser-cancel-tests/browser', { recursive: true, mode: 0o700 });
+  const file = `${root}/browser/policy.json`;
+  fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
   expect(
