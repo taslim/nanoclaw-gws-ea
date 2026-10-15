@@ -64,6 +64,7 @@ export class BrowserWatchScheduler {
   private active: Promise<void> | undefined;
   private controller = new AbortController();
   private unobserve: (() => void) | undefined;
+  private unsubscribeAbort: (() => void) | undefined;
   private readonly deps: WatchSchedulerDeps;
   constructor(
     private readonly queue: BrowserQueue,
@@ -81,13 +82,13 @@ export class BrowserWatchScheduler {
   start(signal?: AbortSignal): void {
     if (this.timer || signal?.aborted) return;
     this.controller = new AbortController();
-    signal?.addEventListener(
-      'abort',
-      () => {
+    if (signal) {
+      const onAbort = (): void => {
         void this.stop();
-      },
-      { once: true },
-    );
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.unsubscribeAbort = () => signal.removeEventListener('abort', onAbort);
+    }
     this.unobserve = registerInboxObserver((mail) => this.notify(mail));
     this.timer = setInterval(() => {
       void this.tick().catch(() => undefined);
@@ -98,6 +99,8 @@ export class BrowserWatchScheduler {
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.unsubscribeAbort?.();
+    this.unsubscribeAbort = undefined;
     this.controller.abort();
     this.unobserve?.();
     this.unobserve = undefined;

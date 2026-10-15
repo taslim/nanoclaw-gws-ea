@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { getEventListeners } from 'node:events';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -115,6 +116,45 @@ function availability(partySize = 4): Extract<ReservationAvailability, { status:
   };
 }
 const freeCalendar = async () => ({ conflicts: [], conflicts_not_listed: 0, message: 'Free' });
+
+it('releases the host abort subscription when stopped and still honors host shutdown', async () => {
+  const host = new AbortController();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const scheduler = createBrowserWatchScheduler(queue);
+    scheduler.start(host.signal);
+    expect(getEventListeners(host.signal, 'abort')).toHaveLength(1);
+    await scheduler.stop();
+    expect(getEventListeners(host.signal, 'abort')).toHaveLength(0);
+  }
+  await arm('shutdown-watch', 'shutdown');
+  let checkStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    checkStarted = resolve;
+  });
+  let aborted = false;
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async (_queue, _input, signal) => {
+      checkStarted?.();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener(
+          'abort',
+          () => {
+            aborted = true;
+            resolve();
+          },
+          { once: true },
+        ),
+      );
+      return { status: 'failed' };
+    },
+  });
+  scheduler.start(host.signal);
+  await started;
+  host.abort();
+  await scheduler.stop();
+  expect(aborted).toBe(true);
+  expect(getEventListeners(host.signal, 'abort')).toHaveLength(0);
+});
 
 it('finishes another site while the first is pending and keeps checks within each site sequential', async () => {
   await arm('a', 'first');
