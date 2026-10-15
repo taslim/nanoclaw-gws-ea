@@ -1,6 +1,7 @@
 /** Native job reads and cancellation, shared by delegation, matters and policy reconciliation. */
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
+import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -63,6 +64,19 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
     'SELECT 1 FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     job.id,
   );
+  const hasWatches = await store.db.hasTable('gws_ea_browser_watches');
+  const watchCard = hasWatches
+    ? await store.db.get(
+        "SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status = 'awaiting_principal' LIMIT 1",
+        job.id,
+      )
+    : undefined;
+  const watch = hasWatches
+    ? await store.db.get(
+        "SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status IN ('armed','checking','preparing','booking') LIMIT 1",
+        job.id,
+      )
+    : undefined;
   const waitingSignIn = job.cancelled
     ? undefined
     : await (await import('./sign-in-mail.js')).readPendingSignInSite(job.id);
@@ -83,11 +97,15 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
     job,
     state: job.cancelled
       ? 'cancelled'
-      : card
+      : card || watchCard
         ? 'awaiting_principal'
-        : running || authority || leases.length > 0
+        : running || leases.length > 0
           ? 'working'
-          : 'idle',
+          : watch
+            ? 'watching'
+            : authority
+              ? 'working'
+              : 'idle',
     held_sites: leases.map((lease) => lease.site),
     ...(waitingSignIn ? { waiting_sign_in: waitingSignIn } : {}),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
@@ -117,8 +135,13 @@ export async function cancelBrowserJobInTransaction(
         job.id,
       )
     : undefined;
+  const watchCommitting = (await store.db.hasTable('gws_ea_browser_watches'))
+    ? await store.db.get("SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status = 'booking' LIMIT 1", job.id)
+    : undefined;
   const withdrawnCards = purchases ? await detachPurchaseCards(job.id, 'withdrawn') : [];
-  if (committing) {
+  if (await store.db.hasTable('gws_ea_browser_watches'))
+    withdrawnCards.push(...(await (await import('./watches.js')).detachBrowserWatchCards(job.id, 'cancelled')));
+  if (committing || watchCommitting) {
     await store.db.run(
       'UPDATE gws_ea_browser_jobs SET cancel_requested = 1,updated_at = ? WHERE id = ?',
       new Date().toISOString(),
@@ -148,6 +171,13 @@ export async function finishBrowserJobCancellation(
 ): Promise<void> {
   if (result.withdrawnCards)
     await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
+  if (result.withdrawnCards && (await getDb().hasTable('gws_ea_browser_watches')))
+    for (const card of result.withdrawnCards)
+      await getDb().run(
+        'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
+        new Date().toISOString(),
+        card.approval_id,
+      );
   if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
   await queue.interruptJob(result.job.id);
   await queue.runtime.closeJob(result.job.id);
@@ -229,7 +259,13 @@ export async function sweepBrowserJobSessions(
             "SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' LIMIT 1",
             job.id,
           )));
-      if (pending.length > 0 || lease || purchase) return;
+      const watch =
+        (await store.db.hasTable('gws_ea_browser_watches')) &&
+        (await store.db.get(
+          "SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status IN ('awaiting_principal','armed','checking','preparing','booking') LIMIT 1",
+          job.id,
+        ));
+      if (pending.length > 0 || lease || purchase || watch) return;
       await updateSession(session.id, { status: 'closed' });
     });
   }

@@ -16,8 +16,9 @@ import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { browserDelegateGuard } from './cancel.js';
 import {
   completePurchaseFacts,
+  amountMinor,
+  currencyExponent,
   formatMoney,
-  moneyMinor,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
@@ -226,11 +227,14 @@ export async function reservationGuaranteeRequest(
     const grant = await getDb().get<StandingGuarantee>(
       'SELECT * FROM gws_ea_browser_reservation_guarantees WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',
     );
+    if (!grant) return { status: 'not_configured' };
+    const precision = currencyExponent(grant.currency);
+    if (precision === undefined) throw forbidden('The standing guarantee currency is not supported.');
     return {
-      status: grant ? 'active' : 'not_configured',
-      ...(grant
-        ? { grant_id: grant.id, currency: grant.currency, max_total: (grant.max_total_minor / 100).toFixed(2) }
-        : {}),
+      status: 'active',
+      grant_id: grant.id,
+      currency: grant.currency,
+      max_total: (grant.max_total_minor / 10 ** precision).toFixed(precision),
     };
   }
   if (operation === 'revoke') {
@@ -258,10 +262,10 @@ export async function reservationGuaranteeRequest(
     typeof content.currency !== 'string' ||
     !/^[A-Z]{3}$/u.test(content.currency) ||
     typeof content.max_total !== 'string' ||
-    !/^\d+(?:\.\d{2})?$/u.test(content.max_total)
+    !/^\d+(?:\.\d{1,3})?$/u.test(content.max_total)
   )
     throw invalidArgs('Propose requires an explicit currency and max_total decimal string; no default applies.');
-  const maximum = moneyMinor(content.max_total);
+  const maximum = amountMinor(content.max_total, content.currency);
   if (maximum === undefined) throw invalidArgs('max_total must be a nonnegative exact decimal amount.');
   // Currency validity also protects the card's exact formatted amount.
   try {

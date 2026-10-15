@@ -37,7 +37,7 @@ export const reservationGuarantee = requestTool({
   properties: {
     operation: { type: 'string', enum: ['read', 'propose', 'revoke'] },
     currency: { type: 'string', pattern: '^[A-Z]{3}$' },
-    max_total: { type: 'string', pattern: '^\\d+(?:\\.\\d{2})?$' },
+    max_total: { type: 'string', pattern: '^\\d+(?:\\.\\d{1,3})?$' },
   },
   required: ['operation'],
   additionalProperties: false,
@@ -58,7 +58,7 @@ export const reservationGuarantee = requestTool({
       typeof fields.currency !== 'string' ||
       !/^[A-Z]{3}$/u.test(fields.currency) ||
       typeof fields.max_total !== 'string' ||
-      !/^\d+(?:\.\d{2})?$/u.test(fields.max_total)
+      !/^\d+(?:\.\d{1,3})?$/u.test(fields.max_total)
     )
       return 'Propose requires an explicit currency and maximum total decimal amount.';
     return fields;

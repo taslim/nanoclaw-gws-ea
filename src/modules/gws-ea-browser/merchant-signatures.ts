@@ -5,6 +5,9 @@
 import type { ElementHandle, Locator, Page } from 'playwright-core';
 import type { ActivationClass, ControlFacts, ReviewedMerchantFlow } from './commit-classifier.js';
 import { completePurchaseFacts, moneyMinor, type PurchaseFacts } from './fingerprint.js';
+import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
+import { resyReservationSignature } from './resy-signature.js';
+export type { MerchantPurchaseEvidence } from './merchant-contract.js';
 
 export const AMAZON_RETAIL = Object.freeze({
   id: 'amazon-us-retail-v1',
@@ -267,11 +270,11 @@ export const amazonRetailFlow: ReviewedMerchantFlow = {
 };
 
 export type MerchantPurchaseRead =
-  | { status: 'ready'; facts: PurchaseFacts; element: ElementHandle }
-  | { status: 'unsupported_merchant' | 'terms_unavailable' | 'checkout_lapsed' };
+  | (Extract<MerchantCheckoutRead, { status: 'ready' }> & { signature: MerchantSignature })
+  | Exclude<MerchantCheckoutRead, { status: 'ready' }>;
 
 /** Every value comes from visible host-selected DOM, and the activating element must match the signature. */
-export async function readMerchantPurchase(page: Page, target?: ElementHandle): Promise<MerchantPurchaseRead> {
+async function readAmazonPurchase(page: Page, target?: ElementHandle): Promise<MerchantCheckoutRead> {
   const url = new URL(page.url());
   if (!sameOrigin(url)) return { status: 'unsupported_merchant' };
   if (!review(url)) return { status: 'checkout_lapsed' };
@@ -285,7 +288,7 @@ export async function readMerchantPurchase(page: Page, target?: ElementHandle): 
     if (!target) await element?.dispose();
     return { status: 'unsupported_merchant' };
   }
-  const refuse = async (status: 'terms_unavailable'): Promise<MerchantPurchaseRead> => {
+  const refuse = async (status: 'terms_unavailable'): Promise<MerchantCheckoutRead> => {
     if (!target) await element.dispose();
     return { status };
   };
@@ -344,22 +347,8 @@ export async function readMerchantPurchase(page: Page, target?: ElementHandle): 
   return completePurchaseFacts(facts) ? { status: 'ready', facts, element } : refuse('terms_unavailable');
 }
 
-export interface MerchantPurchaseEvidence {
-  source: string;
-  recordId: string;
-  orderedAt: string;
-  resolution: 'committed' | 'not_committed';
-  account: string;
-  items: PurchaseFacts['items'];
-  totalMinor: number;
-  currency: string;
-  cardEnding: string;
-  address: string;
-  checkoutReference?: string;
-}
-
 /** Empty/stale history is never proof of absence. Only a complete merchant order-detail record is evidence. */
-export async function readMerchantPurchaseEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined> {
+async function readAmazonEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined> {
   const url = new URL(page.url());
   if (!sameOrigin(url) || !AMAZON_RETAIL.detailPaths.includes(url.pathname)) return undefined;
   const record = await oneText(page.locator(AMAZON_RETAIL.orderNumber));
@@ -392,6 +381,7 @@ export async function readMerchantPurchaseEvidence(page: Page): Promise<Merchant
   if (!resolution) return undefined;
   const checkoutReference = await optionalAttribute(page, '#orderDetails input[name="purchaseId"]', 'value');
   return {
+    flowId: AMAZON_RETAIL.id,
     source: url.href,
     recordId,
     orderedAt: new Date(when).toISOString(),
@@ -404,4 +394,52 @@ export async function readMerchantPurchaseEvidence(page: Page): Promise<Merchant
     address,
     ...(checkoutReference ? { checkoutReference } : {}),
   };
+}
+
+export const amazonRetailSignature: MerchantSignature = {
+  ...amazonRetailFlow,
+  evidenceOrigins: [AMAZON_RETAIL.origin],
+  readPurchase: readAmazonPurchase,
+  async waitForResult(page, timeoutMs) {
+    await page
+      .waitForURL(
+        (url) =>
+          url.origin === AMAZON_RETAIL.origin &&
+          (url.pathname === AMAZON_RETAIL.confirmationPath || AMAZON_RETAIL.detailPaths.includes(url.pathname)),
+        { waitUntil: 'domcontentloaded', timeout: timeoutMs },
+      )
+      .catch(() => undefined);
+    const url = new URL(page.url());
+    if (url.origin !== AMAZON_RETAIL.origin || url.pathname !== AMAZON_RETAIL.confirmationPath) return;
+    const links = page.locator('a[href*="/gp/your-account/order-details"]');
+    if ((await links.count()) !== 1) return;
+    const href = await links.getAttribute('href');
+    if (!href) return;
+    const detail = new URL(href, url);
+    if (detail.origin === AMAZON_RETAIL.origin && AMAZON_RETAIL.detailPaths.includes(detail.pathname))
+      await page.goto(detail.href, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 5000) });
+  },
+  readEvidence: readAmazonEvidence,
+};
+/** This closed list is host-reviewed code, never model or recipe registration. */
+export const merchantSignatures: readonly MerchantSignature[] = [amazonRetailSignature, resyReservationSignature];
+export function merchantSignatureFor(page: Page): MerchantSignature | undefined {
+  try {
+    const url = new URL(page.url());
+    return merchantSignatures.find((signature) => signature.matches(url));
+  } catch {
+    return undefined;
+  }
+}
+export async function prepareMerchantPage(page: Page): Promise<void> {
+  for (const signature of merchantSignatures) await signature.preparePage?.(page);
+}
+export async function readMerchantPurchase(page: Page, target?: ElementHandle): Promise<MerchantPurchaseRead> {
+  const signature = merchantSignatureFor(page);
+  if (!signature) return { status: 'unsupported_merchant' };
+  const read = await signature.readPurchase(page, target);
+  return read.status === 'ready' ? { ...read, signature } : read;
+}
+export async function readMerchantPurchaseEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined> {
+  return merchantSignatureFor(page)?.readEvidence(page);
 }

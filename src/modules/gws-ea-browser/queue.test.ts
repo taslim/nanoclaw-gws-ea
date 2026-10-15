@@ -459,3 +459,106 @@ it('defers a failed durable answer until the periodic retry instead of immediate
   ]);
   await queue.stop();
 });
+
+it('does not queue a signed-out check behind an active errand and acquires its job set atomically', async () => {
+  const queue = new BrowserQueue(store, runtime);
+  let release!: () => void;
+  const held = queue.withJobLock(
+    'checkout-owner',
+    () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+  );
+  await Promise.resolve();
+  const operation = vi.fn(async () => 'ran');
+  expect(await queue.tryWithJobLocks(['watch', 'checkout-owner'], operation)).toEqual({ acquired: false });
+  expect(operation).not.toHaveBeenCalled();
+  expect(await queue.tryWithJobLocks(['watch'], operation)).toEqual({ acquired: true, value: 'ran' });
+  release();
+  await held;
+  expect(await queue.tryWithJobLocks(['watch', 'checkout-owner'], operation)).toEqual({ acquired: true, value: 'ran' });
+});
+
+it('refuses ordinary site contention before creating a signed-out Chrome context', async () => {
+  const queue = new BrowserQueue(store, runtime);
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Missing native job');
+  const ownerSession = (await resolveSystemSession('browser-q', 'system:a2a:main-q:checkout')).session;
+  const owner = await store.jobForSession(ownerSession);
+  if (!owner) throw new Error('Missing native checkout job');
+  await queue.leases.acquire(owner.id, 'https://resy.com');
+  const { runBrowserWatchCheck } = await import('./watch-runtime.js');
+  expect(
+    await runBrowserWatchCheck(
+      queue,
+      {
+        id: 'check',
+        jobId: job.id,
+        site: 'resy.com',
+        recipeId: 'recipe',
+        parameters: {},
+        venueId: 'venue',
+        partySize: 2,
+      },
+      new AbortController().signal,
+    ),
+  ).toEqual({ status: 'site_busy' });
+  expect(await getDb().get('SELECT job_id,state FROM gws_ea_browser_site_leases WHERE site=?', 'resy.com')).toEqual({
+    job_id: owner.id,
+    state: 'active',
+  });
+});
+
+it('keeps a pending checkout exclusive while its owning job is executing', async () => {
+  const queue = new BrowserQueue(store, runtime);
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Missing native job');
+  const ownerSession = (await resolveSystemSession('browser-q', 'system:a2a:main-q:checkout')).session;
+  const owner = await store.jobForSession(ownerSession);
+  if (!owner) throw new Error('Missing native checkout job');
+  await queue.leases.acquire(owner.id, 'https://resy.com');
+  await queue.leases.holdForPurchase(owner.id, 'resy.com');
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_purchase_cards(id,job_id,request_id,status,facts_json,bounds_json,exception_ids_json,expires_at,created_at) VALUES('held-card',?,'card-request','open',?,'{}','[]',?,?)`,
+    owner.id,
+    JSON.stringify({ site: 'resy.com' }),
+    new Date(Date.now() + 60_000).toISOString(),
+    at,
+  );
+  let release!: () => void;
+  const held = queue.withJobLock(
+    owner.id,
+    () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+  );
+  await Promise.resolve();
+  try {
+    const { runBrowserWatchCheck } = await import('./watch-runtime.js');
+    expect(
+      await runBrowserWatchCheck(
+        queue,
+        {
+          id: 'check',
+          jobId: job.id,
+          site: 'resy.com',
+          recipeId: 'recipe',
+          parameters: {},
+          venueId: 'venue',
+          partySize: 2,
+        },
+        new AbortController().signal,
+      ),
+    ).toEqual({ status: 'site_busy' });
+    expect(await getDb().get('SELECT job_id,state FROM gws_ea_browser_site_leases WHERE site=?', 'resy.com')).toEqual({
+      job_id: owner.id,
+      state: 'purchase',
+    });
+  } finally {
+    release();
+    await held;
+  }
+});

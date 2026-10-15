@@ -1,7 +1,11 @@
 import type { Page } from 'playwright-core';
 import { PurchaseAuthorityStore } from './authority.js';
 import type { PurchaseFacts } from './fingerprint.js';
-import { readMerchantPurchaseEvidence, type MerchantPurchaseEvidence } from './merchant-signatures.js';
+import {
+  readMerchantPurchaseEvidence,
+  merchantSignatures,
+  type MerchantPurchaseEvidence,
+} from './merchant-signatures.js';
 
 export interface PurchaseAttempt {
   id: string;
@@ -20,8 +24,15 @@ export function evidenceMatchesAttempt(evidence: MerchantPurchaseEvidence, attem
   const ordered = Date.parse(evidence.orderedAt);
   const attempted = Date.parse(attempt.attempted_at);
   // A native purchase id, when the merchant exposes it, is stronger than a time window.
-  if (!Number.isFinite(ordered) || !Number.isFinite(attempted) || new URL(evidence.source).origin !== facts.origin)
+  const signature = merchantSignatures.find((candidate) => candidate.id === facts.flowId);
+  if (!signature || evidence.flowId !== facts.flowId || !Number.isFinite(ordered) || !Number.isFinite(attempted))
     return false;
+  try {
+    if (!signature.evidenceOrigins.includes(new URL(evidence.source).origin)) return false;
+  } catch {
+    return false;
+  }
+  if (JSON.stringify(evidence.reservation) !== JSON.stringify(facts.reservation)) return false;
   if (facts.checkoutReference && evidence.checkoutReference !== facts.checkoutReference) return false;
   if (ordered < attempted - 60_000 || ordered > attempted + 10 * 60_000) return false;
   return (

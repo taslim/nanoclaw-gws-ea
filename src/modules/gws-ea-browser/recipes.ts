@@ -538,6 +538,13 @@ export async function saveBrowserRecipe(
     );
     return { id, version };
   });
+  if (await context.store.db.hasTable('gws_ea_browser_watches')) {
+    const recipe = await loadRecipe(saved.id, context.store.db);
+    if (recipe) {
+      const { linkWatchBookingRecipe } = await import('./watches.js');
+      await linkWatchBookingRecipe(context, recipe);
+    }
+  }
   return {
     status: 'saved',
     recipe_id: saved.id,

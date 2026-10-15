@@ -29,7 +29,7 @@ export const BROWSER_REQUEST_MAX_BUDGET_MS = 100_000;
 
 export interface BrowserExecutionContext {
   readonly job: BrowserJob;
-  readonly request: BrowserRequest;
+  readonly request: Pick<BrowserRequest, 'id'>;
   readonly session: Session;
   readonly signal: AbortSignal;
   readonly deadline: number;
@@ -205,6 +205,23 @@ export class BrowserQueue {
       })
       .catch(() => undefined);
     return result;
+  }
+
+  /** A periodic read never queues behind an errand or a checkout-owning worker. */
+  tryWithJobLocks<T>(
+    jobIds: readonly string[],
+    operation: () => Promise<T>,
+  ): Promise<{ acquired: true; value: T } | { acquired: false }> {
+    const ids = [...new Set(jobIds)].sort();
+    if (ids.some((id) => this.locks.has(id))) return Promise.resolve({ acquired: false });
+    const result = Promise.resolve().then(operation);
+    for (const id of ids) this.locks.set(id, result);
+    void result
+      .finally(() => {
+        for (const id of ids) if (this.locks.get(id) === result) this.locks.delete(id);
+      })
+      .catch(() => undefined);
+    return result.then((value) => ({ acquired: true, value }));
   }
 
   async contextForRequest(

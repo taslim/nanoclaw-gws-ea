@@ -27,6 +27,7 @@ export type WakeReason =
   | 'approval-response'
   | 'adoption'
   | 'browser-purchase-outcome'
+  | 'browser-watch'
   | 'browser-purchase-card';
 
 export async function requestWake(session: Session, _reason: WakeReason): Promise<boolean> {

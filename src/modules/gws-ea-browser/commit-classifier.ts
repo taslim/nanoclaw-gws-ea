@@ -1,5 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
-import { amazonRetailFlow } from './merchant-signatures.js';
+import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
@@ -35,7 +35,7 @@ export interface ReviewedMerchantFlow {
   classifyNavigation(url: URL): ActivationClass;
   verifyPurchaseControl?(page: Page, element: ElementHandle): Promise<boolean>;
 }
-const merchantFlows: ReviewedMerchantFlow[] = [amazonRetailFlow];
+const merchantFlows: ReviewedMerchantFlow[] = [...merchantSignatures];
 
 /** Trusted source registrations only. Neither page prose nor stored recipes can register support. */
 export function registerReviewedMerchantFlow(flow: ReviewedMerchantFlow): void {
@@ -457,16 +457,21 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   };
 }
 
+export type BrowserSiteAccess = (url: URL) => Promise<'ordinary' | 'site_busy' | 'blocked_address'>;
+
 /** Use around every host browser executor; nested secret scopes share this same Fetch owner. */
 export async function withBrowserJobNavigation<T>(
   context: BrowserExecutionContext,
   page: Page,
   operation: () => Promise<T>,
+  siteAccess?: BrowserSiteAccess,
 ): Promise<T> {
   const guard = await ensureBrowserNavigationGuard(page);
   const leases = new SiteLeaseStore(context.store.db);
   if (/^https?:/u.test(page.url())) {
-    const lease = await leases.acquire(context.job.id, page.url());
+    const lease = siteAccess
+      ? { acquired: (await siteAccess(new URL(page.url()))) === 'ordinary', waitingJobs: [] }
+      : await leases.acquire(context.job.id, page.url());
     await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:lease-release`);
     if (!lease.acquired) {
       // A regular activation exception carries the same closed vocabulary as a tool stop.
@@ -477,6 +482,7 @@ export async function withBrowserJobNavigation<T>(
     {
       async beforeNavigate(url) {
         await context.assertActive();
+        if (siteAccess) return siteAccess(url);
         const lease = await leases.acquire(context.job.id, url.href);
         await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:redirect-release`);
         return lease.acquired ? 'ordinary' : 'site_busy';

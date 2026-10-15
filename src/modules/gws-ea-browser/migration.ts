@@ -1,5 +1,65 @@
 import type { ModuleMigrationName, PortableMigration } from '../../db/migrations/index.js';
 
+/** Watch grants and the one booking claim outlive queues and browser processes. */
+export const browserWatchesMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watches',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_watches (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id), site TEXT NOT NULL,
+        check_recipe_id TEXT NOT NULL, check_recipe_version INTEGER NOT NULL,
+        parameters_json TEXT NOT NULL, check_key TEXT NOT NULL, bounds_json TEXT NOT NULL,
+        approval_id TEXT UNIQUE, approval_json TEXT, approval_finished_at TEXT, authority_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('awaiting_principal','armed','checking','preparing','booking','booked','expired','cancelled','blocked','outcome_unknown')),
+        pending_request_id TEXT, booking_recipe_id TEXT, booking_recipe_version INTEGER,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, next_check_at TEXT NOT NULL
+      );
+      CREATE INDEX gws_ea_browser_watch_due ON gws_ea_browser_watches(status,next_check_at);
+      CREATE INDEX gws_ea_browser_watch_job ON gws_ea_browser_watches(job_id,status);
+      CREATE TABLE gws_ea_browser_watch_job_claims (
+        job_id TEXT PRIMARY KEY REFERENCES gws_ea_browser_jobs(id),
+        state TEXT NOT NULL CHECK(state IN ('available','committing','booked','unknown')),
+        watch_id TEXT, authority_id TEXT, attempt_id TEXT, request_id TEXT,
+        commit_started_at TEXT, finished_at TEXT, last_action_index INTEGER
+      );
+      CREATE TABLE gws_ea_browser_watch_recipe_links (
+        check_recipe_id TEXT NOT NULL, check_recipe_version INTEGER NOT NULL,
+        booking_recipe_id TEXT NOT NULL, booking_recipe_version INTEGER NOT NULL,
+        source_watch_id TEXT NOT NULL, source_attempt_id TEXT NOT NULL, verified_at TEXT NOT NULL,
+        PRIMARY KEY(check_recipe_id,check_recipe_version,booking_recipe_id,booking_recipe_version)
+      );
+      CREATE TABLE gws_ea_browser_watch_slot_claims (
+        site TEXT NOT NULL, slot_key TEXT NOT NULL, job_id TEXT NOT NULL,
+        watch_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+        PRIMARY KEY(site,slot_key)
+      );
+      CREATE TABLE gws_ea_browser_watch_checks (
+        id TEXT PRIMARY KEY, site TEXT NOT NULL, check_recipe_id TEXT NOT NULL,
+        check_recipe_version INTEGER NOT NULL, parameter_hash TEXT NOT NULL,
+        trigger TEXT NOT NULL CHECK(trigger IN ('timer','notify')),
+        scheduled_at TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+        outcome TEXT, next_check_at TEXT, backoff_until TEXT
+      );
+      CREATE INDEX gws_ea_browser_watch_check_budget ON gws_ea_browser_watch_checks(site,started_at);
+      CREATE TABLE gws_ea_browser_watch_site_state (
+        site TEXT PRIMARY KEY, last_check_at TEXT, last_interval_ms INTEGER,
+        next_allowed_at TEXT, backoff_until TEXT, consecutive_blocks INTEGER NOT NULL DEFAULT 0,
+        budget_scale REAL NOT NULL DEFAULT 1
+      );
+      CREATE TABLE gws_ea_browser_watch_notices (
+        watch_id TEXT NOT NULL, event_key TEXT NOT NULL, outcome_json TEXT NOT NULL,
+        created_at TEXT NOT NULL, delivered_at TEXT, PRIMARY KEY(watch_id,event_key)
+      );
+      CREATE TABLE gws_ea_browser_watch_notify (
+        site TEXT NOT NULL, message_id TEXT NOT NULL, received_at TEXT NOT NULL,
+        consumed_at TEXT, PRIMARY KEY(site,message_id)
+      );
+      ALTER TABLE gws_ea_browser_authorities ADD COLUMN watch_id TEXT REFERENCES gws_ea_browser_watches(id);
+    `);
+  },
+};
+
 /** A recipe id is immutable; saving the same task appends a version for future errands. */
 export const browserRecipesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,

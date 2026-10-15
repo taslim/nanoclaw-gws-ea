@@ -18,6 +18,7 @@ import { BrowserStore } from './db.js';
 import { browserDelegateGuard, cancelBrowserJob, readBrowserJob, sweepBrowserJobSessions } from './cancel.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
+import { browserWatchesMigration } from './migration.js';
 
 let session: Session;
 beforeEach(async () => {
@@ -144,4 +145,24 @@ it('keeps a session whose activity changed after inspection and never closes a p
   await updateSession(session.id, { last_active: old });
   await sweepBrowserJobSessions(new Date().toISOString(), store);
   expect((await getSession(session.id))?.status).toBe('active');
+});
+
+it('derives awaiting and watching state and cancels watches before a later tick can book', async () => {
+  if (!(await getDb().hasTable('gws_ea_browser_watches'))) await browserWatchesMigration.up(getDb());
+  const job = (await readBrowserJob(session.thread_id!))!.job;
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('watch',?,'resy.com','recipe',1,'{}','key','{}','awaiting_principal',?,?,?)`,
+    job.id,
+    at,
+    at,
+    at,
+  );
+  expect(await readBrowserJob(job.id)).toMatchObject({ state: 'awaiting_principal' });
+  await getDb().run("UPDATE gws_ea_browser_watches SET status='armed'");
+  expect(await readBrowserJob(job.id)).toMatchObject({ state: 'watching' });
+  await cancelBrowserJob(job.id);
+  expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'watch')).toEqual({
+    status: 'cancelled',
+  });
 });

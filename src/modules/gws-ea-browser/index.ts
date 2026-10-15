@@ -12,6 +12,7 @@ import {
   browserPurchaseMigration,
   browserQueueMigration,
   browserRecipesMigration,
+  browserWatchesMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
@@ -41,12 +42,15 @@ import {
   sweepBrowserPurchaseState,
 } from './purchase.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import './watches.js';
+import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 
 registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
 registerMigration(browserPurchaseMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
+registerMigration(browserWatchesMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -313,6 +317,7 @@ export function getBrowserRuntime(): BrowserRuntime {
   return runtime;
 }
 
+let watchScheduler: BrowserWatchScheduler | undefined;
 let reconcileTimer: NodeJS.Timeout | undefined;
 let reconciling = false;
 onHostStart(async ({ signal }) => {
@@ -329,6 +334,8 @@ onHostStart(async ({ signal }) => {
     await runtime.stop();
     return;
   }
+  watchScheduler = createBrowserWatchScheduler(activeQueue);
+  watchScheduler.start(signal);
   reconcileTimer = setInterval(() => {
     if (reconciling) return;
     reconciling = true;
@@ -359,6 +366,7 @@ registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
+for (const name of ['watch', 'list_watches', 'cancel_watch']) registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
@@ -399,6 +407,8 @@ export {
 onHostShutdown(async () => {
   if (reconcileTimer) clearInterval(reconcileTimer);
   reconcileTimer = undefined;
+  await watchScheduler?.stop();
+  watchScheduler = undefined;
   await queue?.stop();
   await recoverBrowserSignInMail();
   queue = undefined;

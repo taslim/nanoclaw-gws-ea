@@ -40,6 +40,7 @@ function fixture(injectPopup = false, failSetup = false) {
       setDefaultTimeout: vi.fn(),
       setDefaultNavigationTimeout: vi.fn(),
       viewportSize: () => null,
+      frames: () => [],
       isClosed: () => closed,
       on: pageEvents.on.bind(pageEvents),
       once: pageEvents.once.bind(pageEvents),

@@ -148,6 +148,7 @@ import {
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
 import { claimSignInMail, createSignInClaim, finishSignInClaim } from './claims.js';
 import { parseGmailMessage } from './mime.js';
+import { registerInboxObserver } from './observers.js';
 import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
 import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
@@ -849,6 +850,27 @@ it.each(['poll-first', 'reader-first'] as const)(
 );
 
 describe('the email channel', () => {
+  it('observes notify mail without claiming or changing routing, even if an observer fails', async () => {
+    const seen: string[] = [];
+    const remove = registerInboxObserver(async (mail) => {
+      seen.push(mail.id);
+    });
+    const removeFailure = registerInboxObserver(async () => {
+      throw new Error('Observer unavailable');
+    });
+    try {
+      const id = gmail.receive({ from: SAM, auth: 'dmarc-pass', body: 'A table is available.' });
+      await inbox.tick();
+      expect(seen).toEqual([id]);
+      expect(await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', id)).not.toEqual(
+        { outcome: 'browser-sign-in' },
+      );
+      expect(await getSessionsByAgentGroup('ag-external')).toHaveLength(1);
+    } finally {
+      remove();
+      removeFailure();
+    }
+  });
   it("is the inbox, wired to external-email per thread, and the principal's conversation, wired to main alone", async () => {
     await ensureInbox('ag-external');
     await ensurePrincipalConversation('ag-main');

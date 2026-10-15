@@ -57,7 +57,7 @@ import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import type { DetailedAttendee } from './calendar-api.js';
-import type { Conflict, PersonStats } from './calendar-facts.js';
+import { findPrincipalCalendarConflicts, type Conflict, type PersonStats } from './calendar-facts.js';
 import './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 
@@ -417,6 +417,18 @@ describe('find_conflicts', () => {
     expect(refusal(await send(main, 'find_conflicts', { start: at('10:00'), end: at('11:00') }))).toMatch(
       /None of the calendars you can see is the principal's/u,
     );
+  });
+
+  it('exposes the same complete conflict read to native browser watches and rejects failed calendars', async () => {
+    calendar.put(timed(WORK, at('10:00'), at('11:00'), { id: 'busy-native' }));
+    expect(await findPrincipalCalendarConflicts(at('10:15'), at('10:45'))).toMatchObject({
+      conflicts: [expect.objectContaining({ event_id: 'busy-native' })],
+      conflicts_not_listed: 0,
+    });
+    calendar.listEventDetails = async () => {
+      throw new GoogleApiError(403, 'Calendar unavailable');
+    };
+    await expect(findPrincipalCalendarConflicts(at('10:15'), at('10:45'))).rejects.toThrow('Calendar unavailable');
   });
 
   it('refuses a window that is not two times with offsets, in order, or longer than two weeks', async () => {

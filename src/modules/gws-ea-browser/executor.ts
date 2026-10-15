@@ -22,6 +22,7 @@ import {
   pageHasSecret,
   pinBrowserRefs,
   readBrowserRef,
+  hasBrowserChallenge,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
@@ -66,6 +67,7 @@ export interface BrowserBatchOptions {
   page?: Page;
   record?: boolean;
   readOnly?: boolean;
+  siteAccess?: import('./commit-classifier.js').BrowserSiteAccess;
 }
 export interface BrowserActionResult {
   index: number;
@@ -248,9 +250,16 @@ export async function executeBrowserBatch(
   payload: Record<string, unknown>,
   options: BrowserBatchOptions = {},
 ): Promise<Record<string, unknown>> {
+  if (options.siteAccess && (!options.page || !options.readOnly))
+    throw new Error('Signed-out site access requires an explicit read-only page');
   const page = options.page ?? (await context.page());
   try {
-    return await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page, options));
+    return await withBrowserJobNavigation(
+      context,
+      page,
+      () => executeBatch(context, payload, page, options),
+      options.siteAccess,
+    );
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
     throw error;
@@ -286,7 +295,9 @@ async function executeBatch(
       try {
         await context.assertActive();
         if (action.kind !== 'navigate' && /^https?:/u.test(page.url())) {
-          const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, page.url());
+          const lease = options.siteAccess
+            ? { acquired: (await options.siteAccess(new URL(page.url()))) === 'ordinary', waitingJobs: [] }
+            : await new SiteLeaseStore(context.store.db).acquire(context.job.id, page.url());
           await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:action-release`);
           if (!lease.acquired) throw new BrowserBatchStop('site_busy');
         }
@@ -306,7 +317,9 @@ async function executeBatch(
           case 'navigate': {
             const classification = classifyNavigationUrl(action.url);
             if (classification !== 'ordinary') throw new BrowserBatchStop(classification);
-            const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, action.url);
+            const lease = options.siteAccess
+              ? { acquired: (await options.siteAccess(new URL(action.url))) === 'ordinary', waitingJobs: [] }
+              : await new SiteLeaseStore(context.store.db).acquire(context.job.id, action.url);
             await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:navigate-release`);
             if (!lease.acquired) throw new BrowserBatchStop('site_busy');
             await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: context.remaining() });
@@ -489,14 +502,7 @@ async function executeBatch(
       reason ??= 'not_actionable';
     }
   }
-  if (
-    observation &&
-    !reason &&
-    /(?:captcha|verify (?:that )?you are human|access denied|unusual traffic|checking your browser)/iu.test(
-      observation.snapshot,
-    )
-  )
-    reason = 'challenge';
+  if (observation && !reason && hasBrowserChallenge(observation.snapshot)) reason = 'challenge';
   if (
     observation &&
     !reason &&

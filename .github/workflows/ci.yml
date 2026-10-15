@@ -57,7 +57,10 @@ jobs:
           xvfb-run --auto-servernum pnpm exec vitest run \
             src/modules/gws-ea-browser/authentication-submit.test.ts \
             src/modules/gws-ea-browser/purchase.test.ts \
-            src/modules/gws-ea-browser/recipes.test.ts
+            src/modules/gws-ea-browser/recipes.test.ts \
+            src/modules/gws-ea-browser/resy-signature.test.ts \
+            src/modules/gws-ea-browser/signed-out.test.ts \
+            src/modules/gws-ea-browser/reservation-execution.test.ts
 
       - name: Container tests
         working-directory: container/agent-runner

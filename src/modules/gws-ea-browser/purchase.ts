@@ -26,7 +26,7 @@ import { activateControl, BrowserSiteBusyError, withBrowserJobNavigation } from 
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
-import { readMerchantPurchase, readMerchantPurchaseEvidence, AMAZON_RETAIL } from './merchant-signatures.js';
+import { readMerchantPurchase, readMerchantPurchaseEvidence } from './merchant-signatures.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
 import {
@@ -366,26 +366,18 @@ async function verifyPlaced(
   authority: SpendingAuthority,
   store: PurchaseAuthorityStore,
 ): Promise<Record<string, unknown> | undefined> {
-  // The reviewed confirmation page may link to its authoritative order detail. Follow only that host-known same-origin read.
-  const url = new URL(page.url());
-  if (url.origin === AMAZON_RETAIL.origin && url.pathname === AMAZON_RETAIL.confirmationPath) {
-    const links = page.locator('a[href*="/gp/your-account/order-details"]');
-    if ((await links.count()) === 1) {
-      const href = await links.getAttribute('href');
-      if (href) {
-        const detail = new URL(href, url);
-        if (detail.origin === AMAZON_RETAIL.origin && AMAZON_RETAIL.detailPaths.includes(detail.pathname))
-          await page.goto(detail.href, { waitUntil: 'domcontentloaded', timeout: 5_000 });
-      }
-    }
-  }
   const evidence = await readMerchantPurchaseEvidence(page);
   const attempt = await store.db.get<PurchaseAttempt>(
     'SELECT * FROM gws_ea_browser_purchase_attempts WHERE authority_id = ?',
     authority.id,
   );
   return evidence?.resolution === 'committed' && attempt && evidenceMatchesAttempt(evidence, attempt)
-    ? { status: 'placed', order_number: evidence.recordId, evidence, repeat_safe: false }
+    ? {
+        status: evidence.reservation ? 'booked' : 'placed',
+        order_number: evidence.recordId,
+        evidence,
+        repeat_safe: false,
+      }
     : undefined;
 }
 
@@ -393,7 +385,7 @@ async function verifyPlaced(
 export async function executeAuthorizedPurchase(
   context: BrowserExecutionContext,
   authorityId: string,
-  claim?: (db: DbDriver, authority: SpendingAuthority) => Promise<void>,
+  claim?: (db: DbDriver, authority: SpendingAuthority, facts: PurchaseFacts) => Promise<void>,
 ): Promise<Record<string, unknown>> {
   const store = new PurchaseAuthorityStore(context.store.db);
   const authority = await store.get(authorityId);
@@ -411,21 +403,17 @@ export async function executeAuthorizedPurchase(
       };
     }
     let marked = false;
+    let watchRefusal: import('./watches.js').WatchPurchaseRefusal | undefined;
     try {
       const approved = JSON.parse(authority.facts_json) as PurchaseFacts;
       const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
       const change = materialPurchaseChange(approved, read.facts, bounds);
+      if (authority.kind === 'watch' && (change || authority.expires_at <= new Date().toISOString()))
+        return { status: 'outside_bounds', watchId: authority.watch_id, repeat_safe: false };
       if (change || authority.expires_at <= new Date().toISOString())
         return requestPurchaseCard(context, read.facts, bounds, change ?? 'The previous approval expired.');
       // Re-read once more inside the classifier's authority callback, immediately before its only native press.
-      const arrived = page
-        .waitForURL(
-          (url) =>
-            url.origin === AMAZON_RETAIL.origin &&
-            (url.pathname === AMAZON_RETAIL.confirmationPath || AMAZON_RETAIL.detailPaths.includes(url.pathname)),
-          { waitUntil: 'domcontentloaded', timeout: Math.min(10_000, context.remaining()) },
-        )
-        .catch(() => undefined);
+      const arrived = read.signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
       await activateControl(
         page,
         read.element,
@@ -439,7 +427,20 @@ export async function executeAuthorizedPurchase(
             const latest = await readMerchantPurchase(page, read.element);
             if (latest.status !== 'ready')
               throw new PurchaseAuthorityError('changed', 'The checkout is no longer readable.');
-            await store.begin(context, authority.id, latest.facts, claim);
+            let commitClaim = claim;
+            if (authority.kind === 'watch') {
+              const { prepareWatchCommit } = await import('./watches.js');
+              const checked = await prepareWatchCommit(context, authority, latest.facts);
+              if (typeof checked !== 'function') {
+                watchRefusal = checked;
+                throw new PurchaseAuthorityError('changed', checked.status);
+              }
+              commitClaim = checked;
+            }
+            await context.assertActive();
+            const immediate = await readMerchantPurchase(page, read.element);
+            if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
+            await store.begin(context, authority.id, immediate.facts, commitClaim);
             marked = true;
           },
         },
@@ -478,6 +479,14 @@ export async function executeAuthorizedPurchase(
         return outcome;
       }
       if (error instanceof PurchaseAuthorityError) {
+        if (authority.kind === 'watch' && watchRefusal) return { ...watchRefusal, repeat_safe: false };
+        if (authority.kind === 'watch')
+          return {
+            status: error.reason === 'purchase_blocked' ? 'site_purchase_blocked' : 'outside_bounds',
+            reason: error.message,
+            watchId: authority.watch_id,
+            repeat_safe: false,
+          };
         if (error.reason === 'changed' || error.reason === 'expired')
           return requestPurchaseCard(
             context,
@@ -498,7 +507,7 @@ export async function executeAuthorizedPurchase(
   });
 }
 
-async function executePurchase(
+export async function executeBrowserPurchase(
   context: BrowserExecutionContext,
   payload: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
@@ -520,6 +529,12 @@ async function executePurchase(
         if (read.status !== 'ready')
           return { status: read.status === 'checkout_lapsed' ? 'not_a_purchase' : read.status, repeat_safe: true };
         const store = new PurchaseAuthorityStore(context.store.db);
+        const { prepareWatchPurchase } = await import('./watches.js');
+        const watch = await prepareWatchPurchase(context, read.facts);
+        if (watch)
+          return watch.status === 'ready'
+            ? executeAuthorizedPurchase(context, watch.authorityId)
+            : { ...watch, repeat_safe: false };
         const live = await store.liveForJob(context.job.id);
         if (live) return executeAuthorizedPurchase(context, live.id);
         const child = await deriveReservationGuaranteeAuthority(
@@ -542,7 +557,7 @@ async function executePurchase(
   }
 }
 
-registerBrowserQueuedAction('purchase', { validate: validatePurchaseRequest, execute: executePurchase });
+registerBrowserQueuedAction('purchase', { validate: validatePurchaseRequest, execute: executeBrowserPurchase });
 registerBrowserQueuedAction('browser_purchase_commit', {
   validate(content) {
     if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');

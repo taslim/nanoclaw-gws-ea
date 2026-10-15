@@ -10,7 +10,22 @@ import {
   bindPageSecretDocuments,
   snapshotBrowserStructure,
   pinBrowserRefs,
+  registerPageRedaction,
 } from './observe.js';
+
+it('redacts public inventory bindings and encoded copies without inventing credential taint', async () => {
+  const page = { frames: () => [] } as unknown as Page;
+  const value = 'rgs://inventory/slot?binding=opaque';
+  registerPageRedaction(page, value);
+  expect(redactPageText(page, `${value} ${encodeURIComponent(value)}`)).toBe('[redacted] [redacted]');
+  expect(await pageHasSecret(page)).toBe(false);
+  for (const url of [
+    'https://widgets.resy.com/?resyToken=private',
+    'https://widgets.resy.com/?book_token=private',
+    'https://widgets.resy.com/?reservation=%7B%22config%22%3A%22private%22%7D',
+  ])
+    expect(redactPageText(page, url)).toBe('[redacted URL]');
+});
 
 it('invalidates earlier agent refs when the host captures a structured recipe checkpoint', async () => {
   const page = {

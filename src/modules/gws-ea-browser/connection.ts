@@ -11,6 +11,7 @@ import {
 } from 'playwright-core';
 
 import { stopChrome } from './chrome.js';
+import { prepareMerchantPage } from './merchant-signatures.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { ensurePrivateDirectory, type BrowserPaths } from './paths.js';
 
@@ -129,6 +130,7 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
 
 /** Install before exposing a job page. Native dialogs/choosers never reach the operator. */
 export async function secureJobPage(page: Page): Promise<void> {
+  await prepareMerchantPage(page);
   page.setDefaultTimeout(10_000);
   page.setDefaultNavigationTimeout(30_000);
   page.on('dialog', (dialog) => {

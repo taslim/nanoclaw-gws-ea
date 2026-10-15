@@ -14,6 +14,7 @@ import {
 } from './fingerprint.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserExecutionContext } from './queue.js';
+import type { WatchBounds } from './watches.js';
 
 export interface SpendingAuthority {
   id: string;
@@ -26,6 +27,7 @@ export interface SpendingAuthority {
   bounds_json: string;
   exception_ids_json: string;
   guarantee_id: string | null;
+  watch_id: string | null;
   attempt_id: string;
   expires_at: string;
   created_at: string;
@@ -46,7 +48,7 @@ interface NewSpendingAuthorityFacts {
 export type NewSpendingAuthority = NewSpendingAuthorityFacts &
   (
     | { kind: 'checkout'; approvalId: string; cardId: string; guaranteeId?: never }
-    | { kind: 'watch'; approvalId: string; cardId?: never; guaranteeId?: never }
+    | { kind: 'watch'; watchId: string; approvalId?: string; cardId?: never; guaranteeId?: never }
     | { kind: 'reservation_guarantee'; guaranteeId: string; approvalId?: never; cardId?: never }
   );
 export class PurchaseAuthorityError extends Error {
@@ -116,7 +118,46 @@ export class PurchaseAuthorityStore {
         )
           throw new PurchaseAuthorityError('authority_unavailable');
       } else if (input.kind === 'watch') {
-        if (!input.approvalId || !input.bounds.reservation) throw new PurchaseAuthorityError('authority_unavailable');
+        const { getBrowserWatch, compareWatchBounds } = await import('./watches.js');
+        const watch = await getBrowserWatch(input.watchId, this.db);
+        const bounds: unknown = watch ? JSON.parse(watch.bounds_json) : undefined;
+        if (
+          !watch ||
+          watch.job_id !== input.jobId ||
+          !['armed', 'preparing'].includes(watch.status) ||
+          !input.bounds.reservation ||
+          watch.approval_id !== (input.approvalId ?? null) ||
+          compareWatchBounds(JSON.parse(watch.bounds_json) as WatchBounds, input.facts, new Date().toISOString())
+            .status !== 'within_bounds'
+        )
+          throw new PurchaseAuthorityError('authority_unavailable');
+        if (input.approvalId) {
+          const approval: unknown = watch.approval_json ? JSON.parse(watch.approval_json) : undefined;
+          if (
+            !isRecord(approval) ||
+            approval.approval_id !== input.approvalId ||
+            approval.action !== 'browser_watch_setup' ||
+            typeof approval.payload !== 'string'
+          )
+            throw new PurchaseAuthorityError('authority_unavailable');
+          const payload: unknown = JSON.parse(approval.payload);
+          if (
+            !isRecord(payload) ||
+            payload.watchId !== watch.id ||
+            payload.jobId !== input.jobId ||
+            JSON.stringify(payload.bounds) !== JSON.stringify(bounds)
+          )
+            throw new PurchaseAuthorityError('authority_unavailable');
+        } else {
+          const { isFreeReservation } = await import('./fingerprint.js');
+          if (
+            !isFreeReservation(input.facts) ||
+            !isRecord(bounds) ||
+            !isRecord(bounds.financial) ||
+            bounds.financial.freeOnly !== true
+          )
+            throw new PurchaseAuthorityError('authority_unavailable');
+        }
       } else {
         const grant = await this.db.get<{ revoked_at: string | null }>(
           'SELECT revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
@@ -128,8 +169,8 @@ export class PurchaseAuthorityStore {
       if (input.expiresAt <= at) throw new PurchaseAuthorityError('expired');
       await this.db.run(
         `INSERT INTO gws_ea_browser_authorities
-        (id,job_id,approval_id,card_id,kind,state,facts_json,bounds_json,exception_ids_json,guarantee_id,attempt_id,expires_at,created_at)
-        VALUES(?,?,?,?,?,'live',?,?,?,?,?,?,?)`,
+        (id,job_id,approval_id,card_id,kind,state,facts_json,bounds_json,exception_ids_json,guarantee_id,watch_id,attempt_id,expires_at,created_at)
+        VALUES(?,?,?,?,?,'live',?,?,?,?,?,?,?,?)`,
         input.id,
         input.jobId,
         input.approvalId ?? null,
@@ -139,6 +180,7 @@ export class PurchaseAuthorityStore {
         JSON.stringify(input.bounds),
         JSON.stringify([...(input.exceptionIds ?? [])].sort()),
         input.guaranteeId ?? null,
+        input.kind === 'watch' ? input.watchId : null,
         input.attemptId,
         input.expiresAt,
         at,
@@ -153,7 +195,7 @@ export class PurchaseAuthorityStore {
     context: BrowserExecutionContext,
     authorityId: string,
     current: PurchaseFacts,
-    claim?: (db: DbDriver, authority: SpendingAuthority) => Promise<void>,
+    claim?: (db: DbDriver, authority: SpendingAuthority, immediatelyRereadFacts: PurchaseFacts) => Promise<void>,
   ): Promise<SpendingAuthority> {
     await context.assertActive();
     if (!(await readBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
@@ -202,7 +244,7 @@ export class PurchaseAuthorityStore {
         !context.remaining()
       )
         throw new PurchaseAuthorityError('authority_unavailable');
-      if (claim) await claim(this.db, authority);
+      if (claim) await claim(this.db, authority, current);
       const changed = await this.db.run(
         "UPDATE gws_ea_browser_authorities SET state = 'committing',commit_started_at = ?,commit_request_id = ? WHERE id = ? AND state = 'live'",
         at,
@@ -259,6 +301,10 @@ export class PurchaseAuthorityStore {
           at,
         );
       }
+      if (authority.watch_id) {
+        const { finishWatchPurchase } = await import('./watches.js');
+        await finishWatchPurchase(this.db, authority.watch_id, authority.attempt_id, outcome);
+      }
       await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', id);
       const committing = await this.db.get(
         "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
@@ -285,7 +331,13 @@ export async function notifyPurchaseOutcome(authorityId: string, store = new Pur
   const session = job ? await getSession(job.browser_session_id) : undefined;
   if (!session) return;
   const outcome = JSON.parse(authority.outcome_json) as Record<string, unknown>;
-  const status = typeof outcome.status === 'string' ? outcome.status : 'outcome_unknown';
+  const status =
+    authority.watch_id && outcome.status === 'placed'
+      ? 'booked'
+      : typeof outcome.status === 'string'
+        ? outcome.status
+        : 'outcome_unknown';
+  const facts = JSON.parse(authority.facts_json) as PurchaseFacts;
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
       id: `browser-purchase-${authority.id}-${status}`,
@@ -297,6 +349,15 @@ export async function notifyPurchaseOutcome(authorityId: string, store = new Pur
         job: authority.job_id,
         attempt_id: authority.attempt_id,
         ...outcome,
+        status,
+        ...(authority.watch_id
+          ? {
+              type: 'browser_watch_outcome',
+              watch_id: authority.watch_id,
+              reservation: facts.reservation,
+              commitments: facts.commitments,
+            }
+          : {}),
       }),
     });
   } catch (error) {

@@ -3,6 +3,13 @@ import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 
+/** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
+export function hasBrowserChallenge(snapshot: string): boolean {
+  return /(?:captcha|verify (?:that )?you are human|access denied|unusual traffic|checking your browser)/iu.test(
+    snapshot,
+  );
+}
+
 export interface BrowserObservation {
   generation: number;
   url: string;
@@ -74,11 +81,19 @@ export function registerBrowserSiteInfoProvider(provider: BrowserSiteInfoProvide
   siteInfoProviders.push(provider);
 }
 
+/** Public inventory bindings are redacted without claiming they are a filled credential. */
+export function registerPageRedaction(page: Page, value: string): void {
+  if (!value) return;
+  const secrets = stateFor(page).secrets;
+  secrets.add(value);
+  secrets.add(encodeURIComponent(value));
+}
+
 /** Secret values stay host-only, including after a field was cleared or navigation completed. */
 export function registerPageSecret(page: Page, value: string): void {
   if (!value) return;
   const state = stateFor(page);
-  state.secrets.add(value);
+  registerPageRedaction(page, value);
   state.activeSecrets.add(value);
   state.unboundSecretDocuments.add(value);
 }
@@ -127,7 +142,7 @@ export function redactPageText(page: Page, text: string): string {
   for (const value of [...stateFor(page).secrets].sort((a, b) => b.length - a.length))
     result = result.split(value).join('[redacted]');
   return result.replace(
-    /https?:\/\/[^\s"<>]*(?:[?&#](?:token|code|key|ticket|auth|secret|credential|signature|access_token|id_token)=)[^\s"<>]*/giu,
+    /https?:\/\/[^\s"<>]*(?:[?&#](?:[\w-]*token|code|key|ticket|auth|secret|credential|signature|reservation)=)[^\s"<>]*/giu,
     '[redacted URL]',
   );
 }

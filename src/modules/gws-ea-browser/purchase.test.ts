@@ -43,7 +43,7 @@ import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
-import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -615,6 +615,37 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await readBrowserJob(session.thread_id!)).toMatchObject({ state: 'idle' });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_purchase_cards')).toEqual({ status: 'expired' });
   });
+  it.each([
+    ['JPY', '100', 100],
+    ['KWD', '1.234', 1234],
+  ] as const)(
+    'preserves a principal-confirmed %s guarantee in its currency units',
+    async (currency, maximum, minor) => {
+      const handler = getDeliveryAction('reservation_guarantee')!;
+      await handler(
+        {
+          action: 'reservation_guarantee',
+          requestId: 'currency-proposal',
+          operation: 'propose',
+          currency,
+          max_total: maximum,
+        },
+        main,
+      );
+      const [row] = await approvals();
+      expect(row).toBeDefined();
+      await click(row);
+      expect(await getDb().get('SELECT currency,max_total_minor FROM gws_ea_browser_reservation_guarantees')).toEqual({
+        currency,
+        max_total_minor: minor,
+      });
+      expect(await reservationGuaranteeRequest({ operation: 'read' }, main, 'currency-read')).toMatchObject({
+        status: 'active',
+        currency,
+        max_total: maximum,
+      });
+    },
+  );
   it('returns in_progress for cancellation during the native press and completes cancellation after its verified outcome', async () => {
     let release!: () => void;
     holdPost = new Promise<void>((resolve) => {

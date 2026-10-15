@@ -19,13 +19,21 @@ const selectorSource = `(() => {
     }};
   })()`;
 const contextSelectors = new WeakMap<BrowserContext, Promise<string>>();
+let latestRegisteredSelector: Promise<string> | undefined;
 
 /** CDP default contexts need registration after connecting, before creating pages. */
-export async function prepareAuthenticationIsolation(context: BrowserContext): Promise<void> {
+export async function prepareAuthenticationIsolation(
+  context: BrowserContext,
+  inheritsRegisteredSelectors = false,
+): Promise<void> {
   let registered = contextSelectors.get(context);
   if (!registered) {
-    const name = `gws-ea-native-authentication-${randomUUID()}`;
-    registered = selectors.register(name, selectorSource, { contentScript: true }).then(() => name);
+    if (inheritsRegisteredSelectors && latestRegisteredSelector) registered = latestRegisteredSelector;
+    else {
+      const name = `gws-ea-native-authentication-${randomUUID()}`;
+      registered = selectors.register(name, selectorSource, { contentScript: true }).then(() => name);
+      latestRegisteredSelector = registered;
+    }
     contextSelectors.set(context, registered);
   }
   await registered;

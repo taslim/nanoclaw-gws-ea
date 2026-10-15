@@ -45,12 +45,34 @@ export interface PurchaseBounds {
   neededBy?: string;
 }
 
+const currencies = new Set(Intl.supportedValuesOf('currency'));
+const currencyPrecisions = new Map<string, number>();
+export function currencyExponent(currency: string): number | undefined {
+  if (!currencies.has(currency)) return undefined;
+  let precision = currencyPrecisions.get(currency);
+  if (precision === undefined) {
+    precision = new Intl.NumberFormat('en-US', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits;
+    if (precision === undefined) return undefined;
+    currencyPrecisions.set(currency, precision);
+  }
+  return precision;
+}
+
+/** Convert exact major units without rounding a financial permission. */
+export function amountMinor(value: string | number, currency: string): number | undefined {
+  const precision = currencyExponent(currency);
+  const match = /^(\d+)(?:\.(\d+))?$/u.exec(String(value).trim());
+  if (precision === undefined || !match) return undefined;
+  const fraction = match[2] ?? '';
+  if (/[^0]/u.test(fraction.slice(precision))) return undefined;
+  const minor = Number(match[1]) * 10 ** precision + Number(fraction.slice(0, precision).padEnd(precision, '0'));
+  return Number.isSafeInteger(minor) && minor >= 0 ? minor : undefined;
+}
+
 export function moneyMinor(value: string): number | undefined {
   const match = /^(?:USD\s*|\$)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?)$/u.exec(value.trim());
   if (!match) return undefined;
-  const [whole, fraction = '00'] = match[1].replaceAll(',', '').split('.');
-  const amount = Number(whole) * 100 + Number(fraction);
-  return Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
+  return amountMinor(match[1].replaceAll(',', ''), 'USD');
 }
 /** Compare material facts, never a byte hash: ordinary retail due-now tracks a falling total. */
 export function materialPurchaseChange(
@@ -72,6 +94,7 @@ export function materialPurchaseChange(
     ['cardEnding', 'card'],
     ['address', 'address'],
     ['commitments', 'financial terms'],
+    ['noCommitmentTerms', 'financial terms'],
   ] as const)
     if (!same(approved[key], current[key])) return `The ${label} changed.`;
   if (bounds.reservation) {
@@ -106,24 +129,58 @@ export function materialPurchaseChange(
   return undefined;
 }
 export function formatMoney(minor: number, currency: string): string {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(minor / 100);
+  const precision = currencyExponent(currency);
+  if (precision === undefined) throw new RangeError('Unsupported currency');
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(minor / 10 ** precision);
+}
+
+export function validReservationFacts(reservation: ReservationFacts): boolean {
+  if (
+    !reservation.venueId ||
+    !reservation.venueName ||
+    !Number.isSafeInteger(reservation.partySize) ||
+    reservation.partySize < 1
+  )
+    return false;
+  const start = Date.parse(reservation.at);
+  const end = Date.parse(reservation.endAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: reservation.timeZone });
+    return Boolean(reservation.timeZone);
+  } catch {
+    return false;
+  }
+}
+
+export function isFreeReservation(facts: PurchaseFacts): boolean {
+  return Boolean(
+    facts.reservation &&
+    validReservationFacts(facts.reservation) &&
+    facts.totalMinor === 0 &&
+    facts.dueNowMinor === 0 &&
+    facts.commitments.length === 0 &&
+    facts.cardEnding === null &&
+    facts.noCommitmentTerms?.trim(),
+  );
 }
 
 /** Complete host facts are mandatory even for a zero-due-now commitment. */
 export function completePurchaseFacts(facts: PurchaseFacts): boolean {
+  if (!facts.items.length || !facts.account || currencyExponent(facts.currency) === undefined) return false;
+  if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
+  if (!facts.control.label || !facts.control.selector || !facts.control.formAction) return false;
+  if (!facts.items.every((item) => item.id && item.title && Number.isSafeInteger(item.quantity) && item.quantity > 0))
+    return false;
+  if (facts.reservation && !validReservationFacts(facts.reservation)) return false;
+  if (isFreeReservation(facts)) return true;
   if (
-    !facts.items.length ||
-    !facts.account ||
-    !facts.address ||
+    (!facts.reservation && !facts.address) ||
     typeof facts.cardEnding !== 'string' ||
     !/^\d{4}$/u.test(facts.cardEnding) ||
-    !/^[A-Z]{3}$/u.test(facts.currency)
+    !facts.commitments.length ||
+    facts.noCommitmentTerms !== undefined
   )
-    return false;
-  if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
-  if (!facts.control.label || !facts.control.selector || !facts.control.formAction || !facts.commitments.length)
-    return false;
-  if (!facts.items.every((item) => item.id && item.title && Number.isSafeInteger(item.quantity) && item.quantity > 0))
     return false;
   return facts.commitments.every((term) => {
     if (!term.terms.trim()) return false;

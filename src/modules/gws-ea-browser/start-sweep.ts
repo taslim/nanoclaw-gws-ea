@@ -5,6 +5,8 @@ import { stopped } from './queue.js';
 export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
   const { recoverBrowserPurchases } = await import('./purchase.js');
   await recoverBrowserPurchases(queue);
+  const { recoverBrowserWatches } = await import('./watches.js');
+  await recoverBrowserWatches(queue);
   for (const request of await queue.store.pending()) {
     await queue.finish(
       request,

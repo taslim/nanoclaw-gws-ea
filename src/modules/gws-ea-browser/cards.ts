@@ -58,6 +58,14 @@ export function renderPurchaseCard(
     ),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
+    ...(facts.reservation
+      ? [
+          `Venue: ${quotePurchaseText(facts.reservation.venueName)}; merchant id ${quotePurchaseText(facts.reservation.venueId)}`,
+          `Party size: ${facts.reservation.partySize}`,
+          `Reservation time: ${formatLocalTime(facts.reservation.at, TIMEZONE)} through ${formatLocalTime(facts.reservation.endAt, TIMEZONE)}`,
+          `Venue timezone: ${quotePurchaseText(facts.reservation.timeZone)}`,
+        ]
+      : []),
     facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
     facts.address === null ? 'Address: not applicable' : `Address: ${quotePurchaseText(facts.address)}`,
     `Delivery: ${facts.delivery ? quotePurchaseText(facts.delivery.text) : 'Not applicable'}`,
@@ -81,7 +89,9 @@ export function renderPurchaseCard(
     if (term.conversionAt) lines.push(`Trial conversion: ${formatLocalTime(term.conversionAt, TIMEZONE)}`);
     if (term.frequency) lines.push(`Recurring frequency: ${quotePurchaseText(term.frequency)}`);
   }
-  if (facts.commitments.every((term) => term.kind === 'retail'))
+  if (facts.noCommitmentTerms)
+    lines.push(`No financial commitment: ${quotePurchaseText(facts.noCommitmentTerms, 1200)}`);
+  if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))
     lines.push('Due later: none. One-time retail purchase; no hold, deposit, conditional fee, trial or subscription.');
   return lines.join('\n');
 }
