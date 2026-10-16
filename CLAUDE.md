@@ -141,9 +141,11 @@ Native A2A destinations default to `agent-shared`; a `per-thread` destination
 requires a thread on every send path, including message/file tools and text
 blocks. Use `thread: "new"` for a new errand, then the returned thread for its
 follow-ups. The host refuses unknown, foreign and closed threads; it never
-chooses a tool job by peer affinity. `browser` is a sealed tool agent with one
-session per delegated errand. Its reports to `main` are untrusted information;
-normal worker-style subagents remain available for other work.
+chooses a tool job by peer affinity. A per-thread destination suits a tool
+agent that runs one session per delegated errand; its reports to the delegating
+agent are untrusted information, and worker-style subagents remain the normal
+pattern for other work. GWS-EA's `browser` is such a sealed tool agent; its
+reports to `main` are framed as untrusted.
 
 Key files: `src/modules/agent-to-agent/db/agent-destinations.ts`,
 `src/modules/agent-to-agent/db/threaded-destinations.ts`, and
