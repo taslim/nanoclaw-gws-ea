@@ -117,36 +117,23 @@ describe('dedicated Chrome profile and launch', () => {
     const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'disabled' });
     await ensureBrowserPaths(paths);
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }),
-    );
+    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }));
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({
       enabled: true,
       status: 'enabled',
-      credentialMode: 'email',
       paths,
     });
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: ['email'] }),
-    );
+    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: 'yes' }));
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }),
-    );
+    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }));
     await chmod(paths.policyFile, 0o644);
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
     expect((await lstat(paths.policyFile)).mode & 0o777).toBe(0o644);
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }),
-    );
+    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: false }));
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'disabled' });
     await writePrivateFile(
       paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email', profileDir: '/personal' }),
+      JSON.stringify({ schemaVersion: 1, enabled: true, profileDir: '/personal' }),
     );
     expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({
       enabled: false,

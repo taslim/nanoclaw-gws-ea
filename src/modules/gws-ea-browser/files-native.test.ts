@@ -52,10 +52,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
     await prepareChromeProfile(paths);
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email', chromePath }),
-    );
+    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true, chromePath }));
     server = createServer((request, response) => {
       if (request.method !== 'GET' || !request.url?.startsWith('http://fixture.example/')) {
         response.writeHead(403).end();

@@ -118,7 +118,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     jobId = job.id;
     fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
     const policyFile = `${root}/browser/policy.json`;
-    fs.writeFileSync(policyFile, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), {
+    fs.writeFileSync(policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }), {
       mode: 0o600,
     });
     process.env.GWS_EA_BROWSER_POLICY_FILE = policyFile;

@@ -1,4 +1,3 @@
-import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -11,9 +10,7 @@ import { runInstanceNclJson } from './ncl.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome, type SanitizedCommandOutcomeRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
-import { registerSecret } from './redact.js';
 import type { NextAction } from './result.js';
-import { readBrowserToken, removePrivateFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
@@ -24,8 +21,6 @@ export const BROWSER_CAPABILITY = {
   scope: 'assistant',
   summary: 'Run quiet host Chrome errands for one assistant.',
 } as const;
-export const BROWSER_REVOCATION_REMINDER =
-  'Revoke any configured browser service account/token in 1Password. Deleting the local token does not revoke the provider credential.';
 
 export interface BrowserCapabilityObservation {
   readonly name: 'browser';
@@ -35,7 +30,6 @@ export interface BrowserCapabilityObservation {
   readonly instance_id: string;
   readonly observed_at: string;
   readonly activation: 'enabled' | 'disabled' | 'unavailable';
-  readonly credential_mode: BrowserPolicyFile['credentialMode'];
   readonly policy_file: string;
   readonly chrome: {
     readonly path: string;
@@ -43,7 +37,6 @@ export interface BrowserCapabilityObservation {
     readonly version: string | null;
     readonly reason: string | null;
   };
-  readonly vault: { readonly status: 'not_configured' | 'configured' | 'unavailable'; readonly reason: string | null };
   readonly isolation: { readonly status: 'not_run' | 'passed' | 'failed' | 'unknown'; readonly reason: string | null };
   readonly ready: boolean;
 }
@@ -54,13 +47,9 @@ export interface BrowserOperationData {
   readonly scope: 'assistant';
   readonly instance_id: string;
   readonly enabled: boolean;
-  readonly credential_mode: BrowserPolicyFile['credentialMode'];
-  readonly provider_revocation_required: boolean;
   readonly changed: boolean;
 }
 export interface BrowserCapabilityDependencies {
-  readonly promptToken?: () => Promise<string>;
-  readonly stdin?: AsyncIterable<string | Uint8Array>;
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
 }
 export interface BrowserCapabilityInspection {
@@ -86,19 +75,13 @@ async function storedPolicy(file: string): Promise<BrowserPolicyFile | undefined
       'Browser policy is invalid or inaccessible. Restore its owner-only policy file before continuing.',
     );
   try {
-    // readBrowserPolicy validates the same owner-only file; retain the selected mode even while disabled.
+    // readBrowserPolicy validates the same owner-only file; retain its Chrome path even while disabled.
     const raw: unknown = JSON.parse(await readPrivateFile(file, 16 * 1024));
-    if (
-      !isRecord(raw) ||
-      raw.schemaVersion !== 1 ||
-      typeof raw.enabled !== 'boolean' ||
-      (raw.credentialMode !== 'email' && raw.credentialMode !== '1password')
-    )
+    if (!isRecord(raw) || raw.schemaVersion !== 1 || typeof raw.enabled !== 'boolean')
       throw new GwsEaError('invalid_browser_policy', 'Browser policy changed during inspection.');
     return {
       schemaVersion: 1,
       enabled: raw.enabled,
-      credentialMode: raw.credentialMode,
       ...(typeof raw.chromePath === 'string' ? { chromePath: raw.chromePath } : {}),
     };
   } catch (error) {
@@ -108,7 +91,7 @@ async function storedPolicy(file: string): Promise<BrowserPolicyFile | undefined
 }
 
 async function withAssistantLock<T>(paths: ControlPlanePaths, instanceId: string, work: () => Promise<T>): Promise<T> {
-  // Share removal/update's native lock so credentials cannot be republished after teardown.
+  // Share removal/update's native lock so a policy cannot be republished after teardown.
   await getInstanceReservation(paths, instanceId);
   await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
   const release = await processLock(paths.instanceLock(instanceId));
@@ -120,100 +103,27 @@ async function withAssistantLock<T>(paths: ControlPlanePaths, instanceId: string
   }
 }
 
-async function deleteBrowserToken(file: string, dependencies: BrowserCapabilityDependencies): Promise<boolean> {
-  try {
-    await lstat(file);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-  await dependencies.recordEffect?.(null);
-  await removePrivateFile(file);
-  await dependencies.recordEffect?.(true);
-  return true;
-}
-
 export async function enableBrowserCapability(
   paths: ControlPlanePaths,
   instanceId: string,
-  options: { readonly credentialMode?: BrowserPolicyFile['credentialMode']; readonly tokenStdin?: boolean } = {},
   dependencies: BrowserCapabilityDependencies = {},
 ): Promise<BrowserOperationData> {
   return withAssistantLock(paths, instanceId, async () => {
     const { files } = await target(paths, instanceId);
     const previous = await storedPolicy(files.policyFile);
-    const mode = options.credentialMode ?? previous?.credentialMode ?? 'email';
-    if (options.tokenStdin && mode !== '1password')
-      throw new GwsEaError('invalid_arguments', '--token-stdin requires --credential-mode 1password.');
-    let changed = false;
-    if (mode === '1password') {
-      let token: string | undefined;
-      if (options.tokenStdin) {
-        if (!dependencies.stdin && process.stdin.isTTY)
-          throw new GwsEaError(
-            'invalid_arguments',
-            'Pipe the token into --token-stdin; terminal keyboard input is not accepted.',
-          );
-        token = await readBrowserToken(dependencies.stdin ?? process.stdin);
-      } else {
-        try {
-          token = (await readPrivateFile(files.tokenFile, 16 * 1024)).trim() || undefined;
-        } catch (error) {
-          if (!isErrno(error, 'ENOENT'))
-            throw new GwsEaError(
-              'browser_token_unavailable',
-              'The configured browser token cannot be read safely. Repair its owner-only permissions or replace it using --token-stdin.',
-              { cause: error },
-            );
-        }
-        if (!token && dependencies.promptToken) token = (await dependencies.promptToken()).trim();
-      }
-      if (!token)
-        throw new GwsEaError(
-          'browser_token_required',
-          'Supply the read-only service account token for one dedicated vault at the hidden prompt, or pipe it with --token-stdin. Never put it in arguments, the environment, or chat.',
-        );
-      registerSecret(token);
-      if (/\s/u.test(token) || Buffer.byteLength(token) > 16 * 1024)
-        throw new GwsEaError('invalid_browser_token', 'Supply exactly one service account token, at most 16 KiB.');
-      let existing: string | undefined;
-      // Explicit replacement may repair an unsafe mode. The atomic writer still refuses foreign owners or links.
-      try {
-        existing = await readPrivateFile(files.tokenFile, 16 * 1024);
-        // eslint-disable-next-line no-catch-all/no-catch-all -- The private atomic writer independently refuses unsafe ownership and links before replacement.
-      } catch (_error) {
-        /* Replaced only after the writer checks the owned regular file. */
-      }
-      if (existing !== token) {
-        await dependencies.recordEffect?.(null);
-        await writePrivateFile(files.tokenFile, token);
-        changed = true;
-        await dependencies.recordEffect?.(true);
-      }
-    }
     const policy: BrowserPolicyFile = {
       schemaVersion: 1,
       enabled: true,
-      credentialMode: mode,
       ...(previous?.chromePath ? { chromePath: previous.chromePath } : {}),
     };
+    let changed = false;
     if (JSON.stringify(previous) !== JSON.stringify(policy)) {
       await dependencies.recordEffect?.(null);
       await writePrivateFile(files.policyFile, `${JSON.stringify(policy)}\n`);
       changed = true;
       await dependencies.recordEffect?.(true);
     }
-    // The email policy stops vault use before an old optional credential is removed.
-    const tokenRemoved = mode === 'email' && (await deleteBrowserToken(files.tokenFile, dependencies));
-    changed = changed || tokenRemoved;
-    return {
-      ...BROWSER_CAPABILITY,
-      instance_id: instanceId,
-      enabled: true,
-      credential_mode: mode,
-      provider_revocation_required: mode === 'email' && (previous?.credentialMode === '1password' || tokenRemoved),
-      changed,
-    };
+    return { ...BROWSER_CAPABILITY, instance_id: instanceId, enabled: true, changed };
   });
 }
 
@@ -225,28 +135,18 @@ export async function disableBrowserCapability(
   return withAssistantLock(paths, instanceId, async () => {
     const { files } = await target(paths, instanceId);
     const previous = await storedPolicy(files.policyFile);
-    const mode = previous?.credentialMode ?? 'email';
     let changed = false;
-    // Persist revocation intent first: even a stopped host must see disabled on its next start.
+    // Persist disabled intent: even a stopped host must see it on its next start.
     if (!previous || previous.enabled) {
       await dependencies.recordEffect?.(null);
       await writePrivateFile(
         files.policyFile,
-        `${JSON.stringify({ ...previous, schemaVersion: 1, enabled: false, credentialMode: mode })}\n`,
+        `${JSON.stringify({ ...previous, schemaVersion: 1, enabled: false })}\n`,
       );
       changed = true;
       await dependencies.recordEffect?.(true);
     }
-    const tokenPresent = await deleteBrowserToken(files.tokenFile, dependencies);
-    changed = changed || tokenPresent;
-    return {
-      ...BROWSER_CAPABILITY,
-      instance_id: instanceId,
-      enabled: false,
-      credential_mode: mode,
-      provider_revocation_required: mode === '1password' || tokenPresent,
-      changed,
-    };
+    return { ...BROWSER_CAPABILITY, instance_id: instanceId, enabled: false, changed };
   });
 }
 
@@ -265,26 +165,12 @@ export async function inspectBrowserCapability(
   } catch (_error) {
     /* Invalid optional policy stays unavailable below. */
   }
-  const mode = selected?.credentialMode ?? 'email';
   let chrome: BrowserCapabilityObservation['chrome'] = {
     path: selected?.chromePath ?? SYSTEM_CHROME,
     status: 'not_checked',
     version: null,
     reason: null,
   };
-  let vault: BrowserCapabilityObservation['vault'] = { status: 'not_configured', reason: null };
-  if (mode === '1password') {
-    try {
-      if (!(await readPrivateFile(files.tokenFile, 16 * 1024)).trim()) throw new Error('Empty token');
-      vault = { status: 'configured', reason: null };
-    } catch (_error) {
-      vault = {
-        status: 'unavailable',
-        reason:
-          'Configured 1Password token is missing, empty, or inaccessible. Restore its owner-only instance secret.',
-      };
-    }
-  }
   let isolation: BrowserCapabilityObservation['isolation'] = {
     status: 'not_run',
     reason: options.check
@@ -397,16 +283,10 @@ export async function inspectBrowserCapability(
     instance_id: instanceId,
     observed_at: new Date().toISOString(),
     activation: policy.status,
-    credential_mode: mode,
     policy_file: files.policyFile,
     chrome,
-    vault,
     isolation,
-    ready:
-      policy.enabled &&
-      chrome.status === 'available' &&
-      vault.status !== 'unavailable' &&
-      isolation.status === 'passed',
+    ready: policy.enabled && chrome.status === 'available' && isolation.status === 'passed',
   };
 }
 /* eslint-enable no-catch-all/no-catch-all */
@@ -429,11 +309,10 @@ export function browserCapabilityNextActions(capability: BrowserCapabilityObserv
 export function browserCapabilityLines(capability: BrowserCapabilityObservation): readonly string[] {
   return [
     `browser (assistant ${capability.instance_id}): ${capability.summary}`,
-    `  Activation: ${capability.activation}; credential mode: ${capability.credential_mode}`,
+    `  Activation: ${capability.activation}`,
     `  Chrome: ${capability.chrome.status}; path: ${capability.chrome.path}; version: ${capability.chrome.version ?? 'not checked'}`,
-    `  Vault: ${capability.vault.status}`,
     `  Isolation: ${capability.isolation.status}`,
-    ...[capability.chrome.reason, capability.vault.reason, capability.isolation.reason]
+    ...[capability.chrome.reason, capability.isolation.reason]
       .filter((reason): reason is string => reason !== null)
       .map((reason) => `  ${reason}`),
     `Observed: ${formatLocalTime(capability.observed_at, Intl.DateTimeFormat().resolvedOptions().timeZone)}`,

@@ -1,15 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { Readable } from 'node:stream';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { browserPaths } from '../modules/gws-ea-browser/paths.js';
 import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
-import { BrowserVault } from '../modules/gws-ea-browser/onepassword.js';
 import { enableBrowserCapability, disableBrowserCapability, inspectBrowserCapability } from './browser-capability.js';
 import { runCli } from './cli.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -19,7 +17,6 @@ import { resolveControlPlanePaths } from './paths.js';
 import { runSanitizedCommandOutcome, type SanitizedCommand } from './process.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import { expectResultContract } from './testing/result-contract.js';
-import { GwsEaError } from './types.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -72,99 +69,28 @@ const chrome = async (command: SanitizedCommand) => {
 };
 
 describe('assistant browser capability', () => {
-  it('enables email sign-in without a token, is idempotent, and leaves vault filling unavailable', async () => {
+  it('enables an owner-only policy idempotently', async () => {
     const f = await fixture();
-    const promptToken = vi.fn(async () => 'must-not-be-requested');
-    const first = await enableBrowserCapability(f.paths, f.instanceId, {}, { promptToken });
-    expect(first).toMatchObject({ enabled: true, credential_mode: 'email', changed: true });
-    expect(await readBrowserPolicy(f.browser.policyFile)).toMatchObject({ enabled: true, credentialMode: 'email' });
+    const first = await enableBrowserCapability(f.paths, f.instanceId);
+    expect(first).toMatchObject({ enabled: true, changed: true });
+    expect(await readBrowserPolicy(f.browser.policyFile)).toMatchObject({ enabled: true });
     expect((await stat(f.browser.root)).mode & 0o777).toBe(0o700);
     expect((await stat(f.browser.policyFile)).mode & 0o777).toBe(0o600);
-    await expect(stat(f.browser.tokenFile)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(await enableBrowserCapability(f.paths, f.instanceId, {}, { promptToken })).toMatchObject({ changed: false });
-    expect(promptToken).not.toHaveBeenCalled();
-    await expect(new BrowserVault(f.browser.policyFile).itemsForOrigin('https://example.com')).rejects.toMatchObject({
-      reason: 'vault_unavailable',
-    });
-    const shown = await inspectBrowserCapability(f.paths, f.instanceId);
-    expect(shown.vault).toMatchObject({ status: 'not_configured' });
+    expect(await enableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ changed: false });
   });
 
-  it('stores stdin tokens owner-only before publishing enabled policy, without returning the token', async () => {
+  it('persists disabled intent with its effect recorded and is idempotent', async () => {
     const f = await fixture();
-    const effects: unknown[] = [];
-    const token = 'op-service-account-secret-test';
-    const result = await enableBrowserCapability(
-      f.paths,
-      f.instanceId,
-      { credentialMode: '1password', tokenStdin: true },
-      {
-        stdin: Readable.from([token, '\n']),
-        recordEffect: async (changed) => {
-          if (changed)
-            effects.push({
-              token: await readFile(f.browser.tokenFile, 'utf8'),
-              policy: await readBrowserPolicy(f.browser.policyFile),
-            });
-        },
-      },
-    );
-    expect(effects[0]).toMatchObject({ token, policy: { enabled: false } });
-    expect((await stat(path.dirname(f.browser.tokenFile))).mode & 0o777).toBe(0o700);
-    expect((await stat(f.browser.tokenFile)).mode & 0o777).toBe(0o600);
-    expect(JSON.stringify(result)).not.toContain(token);
-    expect(await enableBrowserCapability(f.paths, f.instanceId)).toMatchObject({
-      credential_mode: '1password',
-      changed: false,
-    });
-  });
-
-  it('uses the hidden prompt only for selected 1Password and pauses without an input source', async () => {
-    const f = await fixture();
-    await expect(enableBrowserCapability(f.paths, f.instanceId, { credentialMode: '1password' })).rejects.toMatchObject(
-      { code: 'browser_token_required' },
-    );
-    await expect(stat(f.browser.policyFile)).rejects.toMatchObject({ code: 'ENOENT' });
-    const promptToken = vi.fn(async () => 'hidden-service-token');
-    await enableBrowserCapability(f.paths, f.instanceId, { credentialMode: '1password' }, { promptToken });
-    expect(promptToken).toHaveBeenCalledOnce();
-  });
-
-  it('disables policy before deleting the token and returns provider revocation guidance', async () => {
-    const f = await fixture();
-    await enableBrowserCapability(
-      f.paths,
-      f.instanceId,
-      { credentialMode: '1password' },
-      { promptToken: async () => 'hidden-service-token' },
-    );
+    await enableBrowserCapability(f.paths, f.instanceId);
     const seen: unknown[] = [];
     const result = await disableBrowserCapability(f.paths, f.instanceId, {
       recordEffect: async (changed) => {
-        if (changed)
-          seen.push({
-            policy: await readBrowserPolicy(f.browser.policyFile),
-            token: await readFile(f.browser.tokenFile, 'utf8').catch(() => null),
-          });
+        if (changed) seen.push(await readBrowserPolicy(f.browser.policyFile));
       },
     });
-    expect(seen[0]).toMatchObject({ policy: { enabled: false }, token: 'hidden-service-token' });
-    await expect(stat(f.browser.tokenFile)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(result.provider_revocation_required).toBe(true);
+    expect(result).toMatchObject({ enabled: false, changed: true });
+    expect(seen).toEqual([expect.objectContaining({ enabled: false })]);
     expect(await disableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ changed: false });
-  });
-
-  it('drops the optional token when switching to email and returns revocation guidance', async () => {
-    const f = await fixture();
-    await enableBrowserCapability(
-      f.paths,
-      f.instanceId,
-      { credentialMode: '1password' },
-      { promptToken: async () => 'switching-mode-service-token' },
-    );
-    const result = await enableBrowserCapability(f.paths, f.instanceId, { credentialMode: 'email' });
-    expect(result).toMatchObject({ enabled: true, credential_mode: 'email', provider_revocation_required: true });
-    await expect(stat(f.browser.tokenFile)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('reports Chrome missing and host-down isolation as not_run without writing anything', async () => {
@@ -184,20 +110,6 @@ describe('assistant browser capability', () => {
     expect(result.isolation.status).toBe('not_run');
     expect(result.ready).toBe(false);
     expect(await readFile(f.browser.policyFile, 'utf8')).toBe(before);
-  });
-
-  it('distinguishes an optional absent vault from a configured missing or inaccessible token', async () => {
-    const f = await fixture();
-    await enableBrowserCapability(
-      f.paths,
-      f.instanceId,
-      { credentialMode: '1password' },
-      { promptToken: async () => 'hidden-service-token' },
-    );
-    await chmod(f.browser.tokenFile, 0o644);
-    expect((await inspectBrowserCapability(f.paths, f.instanceId)).vault.status).toBe('unavailable');
-    await rm(f.browser.tokenFile);
-    expect((await inspectBrowserCapability(f.paths, f.instanceId)).vault.status).toBe('unavailable');
   });
 
   it.each([false, true])('probes the actual host gateway on the assistant network; reachable=%s', async (reachable) => {
@@ -235,7 +147,6 @@ describe('assistant browser capability', () => {
         },
       });
       expect(result.isolation.status).toBe(reachable ? 'failed' : 'passed');
-      expect(result.vault.status).toBe('not_configured');
       expect(result.ready).toBe(!reachable);
       const probe = commands.find((command) => command.command === 'docker');
       expect(probe?.args).toEqual(
@@ -289,56 +200,6 @@ describe('assistant browser capability', () => {
     });
     expect(result.isolation.status).toBe('unknown');
     expect(result.ready).toBe(false);
-  });
-
-  it('returns the native JSON outcome and never prompts in JSON mode', async () => {
-    const f = await fixture();
-    const stdout: string[] = [];
-    const promptBrowserToken = vi.fn(async () => 'never-read-this-token');
-    expect(
-      await runCli(
-        ['capabilities', 'enable', 'browser', '--id', f.instanceId, '--credential-mode', '1password', '--json'],
-        { paths: f.paths, stdout: (line) => stdout.push(line), stderr: () => undefined, promptBrowserToken },
-      ),
-    ).toBe(10);
-    expect(JSON.parse(stdout.join('\n'))).toMatchObject({
-      command: 'capabilities enable browser',
-      outcome: 'paused',
-      changed: false,
-      error: { code: 'browser_token_required' },
-    });
-    expect(promptBrowserToken).not.toHaveBeenCalled();
-    expectResultContract('capabilities enable browser', JSON.parse(stdout.join('\n')));
-  });
-
-  it('rejects token-stdin on a terminal without waiting for keyboard input', async () => {
-    const f = await fixture();
-    const descriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
-    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
-    try {
-      await expect(
-        enableBrowserCapability(f.paths, f.instanceId, { credentialMode: '1password', tokenStdin: true }),
-      ).rejects.toMatchObject({ code: 'invalid_arguments' });
-    } finally {
-      if (descriptor) Object.defineProperty(process.stdin, 'isTTY', descriptor);
-      else Reflect.deleteProperty(process.stdin, 'isTTY');
-    }
-  });
-
-  it('handles hidden-prompt cancellation as an unchanged decline', async () => {
-    const f = await fixture();
-    const stdout: string[] = [];
-    expect(
-      await runCli(['capabilities', 'enable', 'browser', '--id', f.instanceId, '--credential-mode', '1password'], {
-        paths: f.paths,
-        stdout: (line) => stdout.push(line),
-        stderr: () => undefined,
-        promptBrowserToken: async () => {
-          throw new GwsEaError('cancelled', 'Browser enablement cancelled.');
-        },
-      }),
-    ).toBe(0);
-    await expect(stat(f.browser.policyFile)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('publishes complete native result schemas for successful lifecycle and failed checks', async () => {

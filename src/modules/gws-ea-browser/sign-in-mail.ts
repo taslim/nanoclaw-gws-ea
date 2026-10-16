@@ -44,9 +44,10 @@ import {
   bindBrowserSecretField,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecret,
+  BrowserOriginMismatchError,
   type BoundBrowserSecretField,
 } from './fill.js';
-import { BrowserVaultError, httpsOrigin } from './onepassword.js';
+import { httpsOrigin } from './authentication-signatures.js';
 import {
   bindPageSecretDocuments,
   disposeBrowserRefs,
@@ -411,7 +412,7 @@ export async function executeSignInCode(
         throw forbidden('The host could not safely complete this sign-in.');
       return { status: 'code_filled' };
     } catch (error) {
-      if (error instanceof BrowserVaultError && error.reason === 'origin_mismatch') return { status: error.reason };
+      if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
       if (error instanceof ActionRefusal) throw error;
       throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
     } finally {

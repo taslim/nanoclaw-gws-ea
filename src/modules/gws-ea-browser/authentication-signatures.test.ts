@@ -1,6 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { expect, it } from 'vitest';
-import { authenticationEndpoint, authenticationFieldKind } from './authentication-signatures.js';
+import {
+  authenticationEndpoint,
+  authenticationFieldKind,
+  browserDiagnosticsUnsafe,
+  httpsOrigin,
+} from './authentication-signatures.js';
 
 it('recognizes credential fields without granting card, new-password or security fields authority', () => {
   expect(authenticationFieldKind({ name: 'username', type: 'text', autocomplete: 'username' })).toBe('username');
@@ -40,4 +45,17 @@ it('keeps exact-node handoff in a fixed isolated selector and submission in publ
   expect(source).toContain("session.send('Runtime.callFunctionOn'");
   expect(source).not.toMatch(/\._(?:objectId|channel|connection|sessions)\b|\bFetch\./u);
   expect(source).not.toMatch(/\belement\.evaluate\s*\(|\belement\.dispatchEvent\s*\(/u);
+});
+
+it('accepts only credential-free HTTPS origins', () => {
+  expect(httpsOrigin('https://shop.example/login')?.origin).toBe('https://shop.example');
+  for (const raw of ['http://shop.example/login', 'https://user:pass@shop.example/', 'not a url', 'data:text/html,x'])
+    expect(httpsOrigin(raw)).toBeUndefined();
+});
+
+it('treats Playwright protocol logging as unsafe for sign-in', () => {
+  expect(browserDiagnosticsUnsafe({})).toBe(false);
+  expect(browserDiagnosticsUnsafe({ PWDEBUG: '0', DEBUG: 'app:*,-pw:api' })).toBe(false);
+  for (const environment of [{ PWDEBUG: '1' }, { DEBUG: 'pw:protocol' }, { DEBUG: 'app pw:*' }, { DEBUG: '*' }])
+    expect(browserDiagnosticsUnsafe(environment)).toBe(true);
 });

@@ -1,35 +1,21 @@
 import type { ElementHandle, Page } from 'playwright-core';
-import { ActionRefusal, forbidden, invalidArgs } from '../../cli/delivery-action.js';
+import { forbidden } from '../../cli/delivery-action.js';
 import {
   authenticationFieldKind,
+  browserDiagnosticsUnsafe,
+  httpsOrigin,
   inspectAuthenticationControl,
   type AuthenticationFormSignature,
+  type BrowserSecretField,
 } from './authentication-signatures.js';
-import { activateControl, classifyActivation, withBrowserJobNavigation } from './commit-classifier.js';
+import { activateControl, classifyActivation } from './commit-classifier.js';
 import {
   fillNativeAuthenticationField,
   inspectNativeAuthenticationControl,
   type NativeAuthenticationBinding,
 } from './authentication-submit.js';
-import {
-  browserDiagnosticsUnsafe,
-  browserVault,
-  BrowserVaultError,
-  httpsOrigin,
-  type BrowserSecretField,
-} from './onepassword.js';
-import {
-  disposeBrowserRefs,
-  pinBrowserRefs,
-  readBrowserRef,
-  registerPageSecret,
-  bindPageSecretDocuments,
-  releasePageSecret,
-  registerBrowserSiteInfoProvider,
-  type BrowserRef,
-  type PinnedBrowserRef,
-} from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { registerPageSecret, bindPageSecretDocuments, releasePageSecret, type PinnedBrowserRef } from './observe.js';
+import type { BrowserExecutionContext } from './queue.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -40,15 +26,14 @@ export interface BoundBrowserSecretField {
   readonly authentication: AuthenticationFormSignature;
   readonly nativeField: NativeAuthenticationBinding;
 }
-export type BrowserSecretFillResult = {
-  status:
-    | 'submitted'
-    | 'cleared_after_submit'
-    | 'origin_mismatch'
-    | 'no_item_for_site'
-    | 'vault_unavailable'
-    | 'rate_limited';
-};
+export type BrowserSecretFillResult = { status: 'submitted' | 'cleared_after_submit' | 'origin_mismatch' };
+
+/** The bound field's frame no longer shows the exact HTTPS origin it was bound on. */
+export class BrowserOriginMismatchError extends Error {
+  constructor() {
+    super('origin_mismatch');
+  }
+}
 
 export function assertBrowserSecretDiagnosticsSafe(): void {
   if (browserDiagnosticsUnsafe())
@@ -77,7 +62,7 @@ export async function bindBrowserSecretField(
 ): Promise<BoundBrowserSecretField> {
   const origin = httpsOrigin(target.frame.url());
   if (!origin || target.frame !== submit.frame || httpsOrigin(submit.frame.url())?.origin !== origin.origin)
-    throw new BrowserVaultError('origin_mismatch');
+    throw new BrowserOriginMismatchError();
   if (
     (await target.element.ownerFrame()) !== target.frame ||
     (await submit.element.ownerFrame()) !== target.frame ||
@@ -208,8 +193,8 @@ export async function fillBoundBrowserSecret(
     await context.assertActive();
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
   } catch (error) {
-    if (error instanceof BrowserVaultError) return { status: error.reason };
-    // SDK and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
+    if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
+    // Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
@@ -260,78 +245,3 @@ export async function discoverAuthenticationCodeField(
     return undefined;
   }
 }
-
-interface FillSecretPayload extends Record<string, unknown> {
-  item_handle: string;
-  field: BrowserSecretField;
-  target: BrowserRef;
-  submit: BrowserRef;
-}
-export function validateFillSecret(content: Record<string, unknown>): FillSecretPayload {
-  if (
-    Object.keys(content).some(
-      (key) => !['action', 'requestId', 'budget_ms', 'item_handle', 'field', 'target', 'submit'].includes(key),
-    ) ||
-    typeof content.item_handle !== 'string' ||
-    !/^vault_[a-z\d_-]{1,100}$/iu.test(content.item_handle) ||
-    !['username', 'password', 'otp'].includes(String(content.field))
-  )
-    throw invalidArgs('Choose a listed vault item and a username, password or one-time-code field.');
-  const message = 'Choose a field and submit control from a fresh observation.';
-  return {
-    item_handle: content.item_handle,
-    field: content.field as BrowserSecretField,
-    target: readBrowserRef(content.target, message),
-    submit: readBrowserRef(content.submit, message),
-  };
-}
-
-export async function executeFillSecret(
-  context: BrowserExecutionContext,
-  content: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const payload = validateFillSecret(content);
-  const page = await context.page();
-  return withBrowserJobNavigation(context, page, async () => {
-    let refs = new Map<string, PinnedBrowserRef>();
-    try {
-      await context.assertActive();
-      refs = await pinBrowserRefs(page, [payload.target, payload.submit]);
-      const binding = await bindBrowserSecretField(
-        page,
-        refs.get(payload.target.ref)!,
-        refs.get(payload.submit.ref)!,
-        payload.field,
-      );
-      return await fillBoundBrowserSecret(context, binding, () =>
-        browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive),
-      );
-    } catch (error) {
-      if (error instanceof BrowserVaultError) return { status: error.reason };
-      if (error instanceof ActionRefusal) throw error;
-      throw forbidden('Choose a supported sign-in field and submit control from a fresh observation.');
-    } finally {
-      await disposeBrowserRefs(refs);
-    }
-  });
-}
-
-registerBrowserQueuedAction('fill_secret', { validate: validateFillSecret, execute: executeFillSecret });
-registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
-  try {
-    const origins = new Set([
-      origin,
-      ...page.frames().flatMap((frame) => {
-        const url = httpsOrigin(frame.url());
-        return url ? [url.origin] : [];
-      }),
-    ]);
-    const items = new Map<string, { item_handle: string; title: string }>();
-    for (const frameOrigin of origins)
-      for (const item of await browserVault.itemsForOrigin(frameOrigin, assertActive))
-        items.set(item.item_handle, item);
-    return { vault_items: [...items.values()] };
-  } catch (error) {
-    return { vault_status: error instanceof BrowserVaultError ? error.reason : 'vault_unavailable' };
-  }
-});

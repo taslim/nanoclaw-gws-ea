@@ -101,7 +101,7 @@ beforeEach(async () => {
   await new BrowserStore().jobForSession(browser);
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
   const policy = `${root}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), {
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
     mode: 0o600,
   });
   process.env.GWS_EA_BROWSER_POLICY_FILE = policy;

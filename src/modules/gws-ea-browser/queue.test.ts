@@ -50,7 +50,7 @@ afterEach(async () => {
 it('rechecks operator enablement for a previously live browser job', async () => {
   const file = `${root}/browser/policy.json`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
   setBrowserAdmissionReady(true);
   const input = {
@@ -61,7 +61,7 @@ it('rechecks operator enablement for a previously live browser job', async () =>
   setBrowserAdmissionReady(false);
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
   setBrowserAdmissionReady(true);
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
 });
 

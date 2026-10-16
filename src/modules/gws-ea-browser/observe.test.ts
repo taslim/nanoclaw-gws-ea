@@ -99,13 +99,13 @@ it('emits host site metadata for changed full origins and keeps titles untrusted
   } as unknown as Page;
   registerPageSecret(page, 'private-fixture-value');
   registerBrowserSiteInfoProvider(async () => ({
-    vault_items: [{ title: 'Login private-fixture-value', item_handle: 'vault_host-opaque' }],
+    recipes: [{ recipe_id: 'host-opaque', name: 'Login private-fixture-value' }],
   }));
   const first = await observePage(page);
   expect(first.site).toEqual({
     origin: 'https://alice.github.io',
     untrusted: true,
-    vault_items: [{ title: 'Login [redacted]', item_handle: 'vault_host-opaque' }],
+    recipes: [{ recipe_id: 'host-opaque', name: 'Login [redacted]' }],
   });
   expect((await observePage(page)).site).toBeUndefined();
   url = 'https://bob.github.io/login';

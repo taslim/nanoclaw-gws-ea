@@ -41,7 +41,7 @@ afterEach(async () => {
 it('admits canonical main alone and denies browser delegation while the operator policy is disabled', async () => {
   const file = `${root}/browser/policy.json`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
   expect(
     await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'main' }, payload: {} }),
@@ -50,7 +50,7 @@ it('admits canonical main alone and denies browser delegation while the operator
     expect(await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
       effect: 'deny',
     });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   expect(
     await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'main' }, payload: {} }),
   ).toMatchObject({ effect: 'deny' });

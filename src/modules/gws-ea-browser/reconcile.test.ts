@@ -52,7 +52,7 @@ afterEach(async () => {
 it('repairs active main destination projection after interrupted enable and disable', async () => {
   const main = (await resolveSystemSession('main', 'system:test:already-active')).session;
   const file = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   const projection = vi.spyOn(destinationProjection, 'writeDestinations');
   projection.mockRejectedValueOnce(new Error('EACCES: owned destination file'));
   await expect(reconcileBrowserGroup(file)).rejects.toThrow('EACCES');
@@ -67,7 +67,7 @@ it('repairs active main destination projection after interrupted enable and disa
     }
   };
   expect(names()).toContainEqual({ name: 'browser' });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   projection.mockRejectedValueOnce(new Error('EACCES: owned destination file'));
   await expect(reconcileBrowserGroup(file)).rejects.toThrow('EACCES');
   // The central edge is already gone; retry must still clear the active mailbox.
@@ -79,7 +79,7 @@ it('repairs active main destination projection after interrupted enable and disa
 
 it('creates the sealed per-thread edge and disables every delegated errand even before its first browser call', async () => {
   const file = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   await reconcileBrowserGroup(file);
   const browser = await getBrowserAgentGroupId();
   expect(await getDestinationByName('main', 'browser')).toMatchObject({
@@ -116,7 +116,7 @@ it('creates the sealed per-thread edge and disables every delegated errand even 
   expect(JSON.parse(report!.content)).toMatchObject({ text: expect.stringContaining('EXTERNAL_UNTRUSTED_CONTENT') });
   const thread = 'system:a2a:main:just-delegated';
   await resolveSystemSession(browser!, thread);
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   await reconcileBrowserGroup(file);
   expect(await getDestinationByName('main', 'browser')).toBeUndefined();
   expect(await readBrowserJob(thread)).toMatchObject({ state: 'cancelled' });

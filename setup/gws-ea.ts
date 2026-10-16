@@ -276,17 +276,6 @@ export async function main(argv: readonly string[], options: { readonly interact
     toolProviderSetup: providerSetup,
     toolCheckout: checkout,
     presenter: createTerminalPresenter(),
-    promptBrowserToken: async () => {
-      const token = await p.password({
-        message: '1Password read-only service account token for one dedicated vault',
-        output: process.stderr,
-        validate: (value) =>
-          !value?.trim() || /\s/u.test(value.trim()) ? 'Enter one service account token.' : undefined,
-      });
-      if (p.isCancel(token))
-        throw new GwsEaError('cancelled', 'Browser enablement cancelled before the token was stored.');
-      return token;
-    },
     prompts: terminalPrompts(providers),
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),

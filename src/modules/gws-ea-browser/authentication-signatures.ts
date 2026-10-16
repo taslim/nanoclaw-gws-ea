@@ -1,10 +1,34 @@
 import type { ElementHandle, Frame } from 'playwright-core';
-import { httpsOrigin, type BrowserSecretField } from './onepassword.js';
 import {
   inspectNativeAuthenticationControl,
   submitNativeAuthenticationForm,
   type NativeAuthenticationBinding,
 } from './authentication-submit.js';
+
+export type BrowserSecretField = 'username' | 'password' | 'otp';
+
+export function httpsOrigin(raw: string): URL | undefined {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && !url.username && !url.password ? url : undefined;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+/** Playwright protocol logging can contain cookies, field reads and native keyboard payloads. */
+export function browserDiagnosticsUnsafe(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  if (environment.PWDEBUG && environment.PWDEBUG !== '0') return true;
+  return (environment.DEBUG ?? '').split(/[\s,]+/u).some((pattern) => {
+    if (!pattern || pattern.startsWith('-')) return false;
+    const wildcard = pattern.indexOf('*');
+    if (wildcard === -1) return pattern === 'pw' || pattern.startsWith('pw:');
+    const prefix = pattern.slice(0, wildcard);
+    return 'pw:'.startsWith(prefix) || prefix.startsWith('pw:');
+  });
+}
 
 export interface AuthenticationFieldFacts {
   name: string;

@@ -41,7 +41,7 @@ afterEach(async () => {
 it('stamps the exact sealed composition once and refuses capability drift at admission', async () => {
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   const policy = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), {
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
     mode: 0o600,
   });
   process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
@@ -86,16 +86,16 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(initialGuidance).toContain('even if it was absent from your initial destination list');
   expect(initialGuidance).toMatch(/operator.*enable/i);
   expect(initialGuidance).toContain('thread: "new"');
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   const sections = await getRequiredProjectDocSections(main);
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
   expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('thread: "new"');
   expect(guidance).toContain('relay_code');
-  expect(guidance).toContain('no_item_for_site');
+  expect(guidance).toContain('cannot enter a password');
   expect(guidance).toContain('outcome_unknown');
   expect(guidance).toContain('password or token');
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   expect(
     (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,
   ).toBe(initialGuidance);
@@ -112,7 +112,7 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
   await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   const policy = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), {
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
     mode: 0o600,
   });
   process.env.GWS_EA_BROWSER_POLICY_FILE = policy;

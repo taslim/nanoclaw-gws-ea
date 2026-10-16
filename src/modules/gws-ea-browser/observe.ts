@@ -46,7 +46,7 @@ interface PageObservationState {
   snapshot: string;
   secrets: Set<string>;
   activeSecrets: Set<string>;
-  siteOriginsKey?: string;
+  siteOrigin?: string;
   unboundSecretDocuments: Set<string>;
   secretDocumentLoaders: Set<string>;
 }
@@ -198,17 +198,11 @@ export async function observePage(page: Page, assertActive?: () => Promise<void>
   try {
     const current = new URL(page.url());
     const domain = getDomain(current.hostname, { allowPrivateDomains: true });
-    const origins = new Set([current.origin]);
-    for (const frame of page.frames()) {
-      const origin = new URL(frame.url());
-      if (origin.protocol === 'https:' && !origin.username && !origin.password) origins.add(origin.origin);
-    }
-    const originsKey = JSON.stringify([current.origin, [...origins].sort()]);
-    if (current.protocol === 'https:' && domain && state.siteOriginsKey !== originsKey && siteInfoProviders.length) {
+    if (current.protocol === 'https:' && domain && state.siteOrigin !== current.origin && siteInfoProviders.length) {
       site = { origin: current.origin, untrusted: true };
       for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
       site = JSON.parse(redactPageText(page, JSON.stringify(site))) as BrowserObservation['site'];
-      state.siteOriginsKey = originsKey;
+      state.siteOrigin = current.origin;
     }
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */

@@ -16,7 +16,7 @@ import { executeBrowserBatch } from './executor.js';
 import { bindBrowserSecretField, fillBoundBrowserSecret } from './fill.js';
 import './merchant-signatures.js';
 import { browserSiteLeasesMigration } from './migration.js';
-import type { BrowserSecretField } from './onepassword.js';
+import type { BrowserSecretField } from './authentication-signatures.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './queue.js';

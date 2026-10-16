@@ -22,8 +22,7 @@ import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './recipes.js';
 import './capability.js';
-import './fill.js';
-import { browserDiagnosticsUnsafe } from './onepassword.js';
+import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
 import './guidance.js';
@@ -298,7 +297,6 @@ export class BrowserRuntime {
     enabled: boolean;
     ready: boolean;
     reason?: string;
-    credentialMode?: 'email' | '1password';
     proxy: { state: 'listening'; port: number } | { state: 'stopped' };
     chrome:
       | { state: 'running'; pid: number | undefined; version: string }
@@ -309,7 +307,7 @@ export class BrowserRuntime {
     return {
       enabled: this.policy.enabled,
       ready: this.admissionReady() && this.policy.enabled && this.proxy !== undefined && !this.stopped,
-      ...(this.policy.enabled ? { credentialMode: this.policy.credentialMode } : { reason: this.policy.reason }),
+      ...(this.policy.enabled ? {} : { reason: this.policy.reason }),
       proxy: this.proxy ? { state: 'listening', port: this.proxy.port } : { state: 'stopped' },
       chrome: this.attached
         ? { state: 'running', pid: this.attached.child.pid, version: this.attached.browser.version() }
@@ -406,7 +404,6 @@ export function getBrowserQueue(): BrowserQueue {
   return queue;
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
-registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);

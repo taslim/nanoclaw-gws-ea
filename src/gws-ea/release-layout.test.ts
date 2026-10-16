@@ -422,12 +422,10 @@ describe('snapshots', STAGING, () => {
     const { layout, a } = await fencedForUpdate();
     await mkdir(path.join(layout.root, 'browser', 'profile'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(layout.root, 'browser', 'staging'), { recursive: true, mode: 0o700 });
-    await mkdir(path.join(layout.root, 'secrets'), { recursive: true, mode: 0o700 });
     await writeFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'private browser cookies', {
       mode: 0o600,
     });
     await writeFile(path.join(layout.root, 'browser', 'staging', 'download'), 'private download', { mode: 0o600 });
-    await writeFile(path.join(layout.root, 'secrets', 'browser-1password'), 'private vault token', { mode: 0o600 });
 
     const snapshot = await takeSnapshot(layout, UPDATE, a);
     await writeFile(path.join(layout.state, 'data', 'v2.db'), 'central v2');
@@ -440,7 +438,6 @@ describe('snapshots', STAGING, () => {
     );
     expect(statSync(snapshot).mode & 0o777).toBe(0o700);
     await expect(lstat(path.join(snapshot, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(lstat(path.join(snapshot, 'secrets'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'utf8')).toBe(
       'private browser cookies',
     );

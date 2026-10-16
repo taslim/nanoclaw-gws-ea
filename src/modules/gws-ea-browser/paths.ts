@@ -9,7 +9,6 @@ export interface BrowserPaths {
   profileDir: string;
   stagingDir: string;
   artifactsDir: string;
-  tokenFile: string;
 }
 
 /** The policy owns a dedicated sibling profile; no foreign browser endpoint or profile is adopted. */
@@ -23,7 +22,6 @@ export function browserPaths(policyFile: string): BrowserPaths {
     profileDir: path.join(root, 'profile'),
     stagingDir,
     artifactsDir: path.join(stagingDir, 'artifacts'),
-    tokenFile: path.join(path.dirname(root), 'secrets', 'browser-1password'),
   };
 }
 

@@ -7,7 +7,6 @@ import {
   browserCapabilityCatalog,
 } from './capabilities.js';
 import {
-  BROWSER_REVOCATION_REMINDER,
   browserCapabilityLines,
   browserCapabilityNextActions,
   disableBrowserCapability,
@@ -232,10 +231,6 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
-  /** The launcher supplies a hidden prompt only during interactive operation. */
-  promptBrowserToken?: () => Promise<string>;
-  /** Explicit --token-stdin source; never used without that flag. */
-  browserTokenInput?: AsyncIterable<string | Uint8Array>;
   browserInspection?: BrowserCapabilityInspection;
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
@@ -711,8 +706,6 @@ class Cli {
     if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
     if (plan.options.yes === 'true') base.push('--yes');
     const actions: NextAction[] = [];
-    if (plan.command === 'remove' && state.data.removal)
-      actions.push({ kind: 'external', instruction: BROWSER_REVOCATION_REMINDER });
     if (pause?.actionUrl) actions.push({ kind: 'external', instruction: pause.message, url: pause.actionUrl });
     if (pause?.choices?.length && pause.resumeFlag)
       return [
@@ -1655,7 +1648,6 @@ class Cli {
         data: this.#data(state),
         next_actions: [
           ...(outcome.status === 'paused' ? this.#actions(plan, state, outcome.pause) : []),
-          ...(state.data.removal ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }] : []),
           ...(outcome.status === 'ready' && outcome.cancelled && state.instanceId
             ? [{ kind: 'command' as const, argv: ['gws-ea', 'status', '--id', state.instanceId] }]
             : []),
@@ -2108,7 +2100,6 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
       : []),
     ...(outcome?.abandoned.map(({ resource }) => leftBehind[resource]) ?? []),
-    ...(outcome ? [BROWSER_REVOCATION_REMINDER] : []),
     ...(outcome?.keyPolicyUnrestored
       ? [
           `The service-account key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
@@ -2165,7 +2156,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   if (json || outer.includes('--no-input')) {
     const {
       prompts: _prompts,
-      promptBrowserToken: _browserPrompt,
       onFailure: _failure,
       confirmRemoval: _remove,
       confirmUpdate: _update,
@@ -2273,8 +2263,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           const paths = runtime.paths ?? resolveControlPlanePaths();
           const instanceId = targetInstance(options);
           const dependencies = {
-            promptToken: runtime.promptBrowserToken,
-            stdin: runtime.browserTokenInput,
             recordEffect: (effect: true | null) => {
               changed = combineEffects(changed, effect);
             },
@@ -2307,27 +2295,14 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
           }
           if (command === 'enable') {
-            const mode = options['credential-mode'];
-            if (mode !== undefined && mode !== 'email' && mode !== '1password')
-              throw new GwsEaError('invalid_arguments', 'Credential mode must be email or 1password.');
-            data = await enableBrowserCapability(
-              paths,
-              instanceId,
-              { credentialMode: mode, tokenStdin: options['token-stdin'] === 'true' },
-              dependencies,
-            );
+            data = await enableBrowserCapability(paths, instanceId, dependencies);
           } else if (command === 'disable') {
             data = await disableBrowserCapability(paths, instanceId, dependencies);
           } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
-          actions = [
-            { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'browser', '--id', instanceId] },
-            ...(data.provider_revocation_required
-              ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }]
-              : []),
-          ];
+          actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'browser', '--id', instanceId] }];
           presenter.report({
             outcome: 'ready',
-            headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}; credential mode: ${data.credential_mode}.`,
+            headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
             details: nextActionLines(actions),
           });
           emitResult(
@@ -2346,33 +2321,26 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               ? cause
               : new GwsEaError(
                   'browser_operation_failed',
-                  'Browser operation failed. Inspect the instance policy and owner-only secret permissions before retrying.',
+                  'Browser operation failed. Inspect the instance policy and its owner-only permissions before retrying.',
                   { cause },
                 );
-          const paused = error.code === 'browser_token_required';
           const cancelled = error.code === 'cancelled';
           const actions: readonly NextAction[] = [
             {
               kind: 'external',
-              instruction: paused
-                ? error.message
-                : 'Inspect the named assistant’s browser policy, permissions, runtime, and service state before retrying.',
+              instruction:
+                'Inspect the named assistant’s browser policy, permissions, runtime, and service state before retrying.',
             },
-            ...(command === 'disable' ? [{ kind: 'external' as const, instruction: BROWSER_REVOCATION_REMINDER }] : []),
           ];
           emitResult(
             managedResult(invocation.definition.path.join(' '), {
-              outcome: cancelled ? 'cancelled' : paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
+              outcome: cancelled ? 'cancelled' : isBusy(error) ? 'busy' : 'failed',
               changed,
               data,
               error,
               next_actions: actions,
             }),
           );
-          if (paused) {
-            presenter.report({ outcome: 'paused', headline: error.message, details: [] });
-            return EXIT_CODES.paused;
-          }
           if (cancelled) {
             presenter.report({ outcome: 'ready', headline: error.message, details: [] });
             return EXIT_CODES.ready;

@@ -8,7 +8,6 @@ export const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Goo
 export interface BrowserPolicyFile {
   schemaVersion: 1;
   enabled: boolean;
-  credentialMode: 'email' | '1password';
   chromePath?: string;
 }
 export type BrowserPolicy =
@@ -16,7 +15,6 @@ export type BrowserPolicy =
       status: 'enabled';
       enabled: true;
       paths: BrowserPaths;
-      credentialMode: BrowserPolicyFile['credentialMode'];
       chromePath: string;
     }
   | { status: 'disabled'; enabled: false; reason: 'operator-enablement-required' }
@@ -40,10 +38,9 @@ export async function readBrowserPolicy(file = browserPolicyFile()): Promise<Bro
     if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Invalid browser policy');
     const record = value as Record<string, unknown>;
     if (
-      Object.keys(record).some((key) => !['schemaVersion', 'enabled', 'credentialMode', 'chromePath'].includes(key)) ||
+      Object.keys(record).some((key) => !['schemaVersion', 'enabled', 'chromePath'].includes(key)) ||
       record.schemaVersion !== 1 ||
       typeof record.enabled !== 'boolean' ||
-      (record.credentialMode !== 'email' && record.credentialMode !== '1password') ||
       (record.chromePath !== undefined &&
         (typeof record.chromePath !== 'string' || !path.isAbsolute(record.chromePath)))
     )
@@ -53,7 +50,6 @@ export async function readBrowserPolicy(file = browserPolicyFile()): Promise<Bro
       status: 'enabled',
       enabled: true,
       paths,
-      credentialMode: record.credentialMode,
       chromePath: typeof record.chromePath === 'string' ? record.chromePath : SYSTEM_CHROME,
     };
   } catch (error) {

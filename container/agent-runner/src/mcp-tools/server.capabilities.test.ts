@@ -63,7 +63,6 @@ const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'peop
 const BROWSER_TOOLS = [
   'browser',
   'cancel_watch',
-  'fill_secret',
   'list_watches',
   'purchase',
   'run_recipe',

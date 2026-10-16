@@ -54,7 +54,7 @@ beforeEach(async () => {
   });
   const file = `${root}/browser/policy.json`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
 });
 afterEach(async () => {

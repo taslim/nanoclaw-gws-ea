@@ -46,7 +46,6 @@ const fixture = vi.hoisted(() => {
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
     confirm: vi.fn(async (): Promise<boolean | symbol> => true),
-    password: vi.fn(async (): Promise<string | symbol> => 'hidden-browser-service-token'),
     /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
     cancel: Symbol('clack:cancel'),
     ensurePrerequisites: vi.fn(async () => ({ account: 'operator@example.com' })),
@@ -61,7 +60,6 @@ vi.mock('@clack/prompts', () => ({
   log: fixture.log,
   note: fixture.note,
   confirm: fixture.confirm,
-  password: fixture.password,
   spinner: () => fixture.spinner,
   isCancel: (value: unknown) => value === fixture.cancel,
 }));
@@ -213,26 +211,6 @@ describe('launcher interaction modes', () => {
 describe('GWS-EA driver', () => {
   afterEach(() => {
     vi.clearAllMocks();
-  });
-  it('supplies an interactive hidden browser token prompt on stderr, and omits it unattended', async () => {
-    const args = [
-      'capabilities',
-      'enable',
-      'browser',
-      '--id',
-      '11111111-1111-4111-8111-111111111111',
-      '--credential-mode',
-      '1password',
-    ];
-    await main(args, { interactive: true });
-    expect(await runtimeOf().promptBrowserToken?.()).toBe('hidden-browser-service-token');
-    expect(fixture.password).toHaveBeenCalledWith(
-      expect.objectContaining({ output: process.stderr, message: expect.stringContaining('one dedicated vault') }),
-    );
-    vi.clearAllMocks();
-    await main([...args, '--json'], { interactive: true });
-    expect(runtimeOf().promptBrowserToken).toBeUndefined();
-    expect(fixture.password).not.toHaveBeenCalled();
   });
 
   it('runs unattended without a TTY: no spinner, prompts, gcloud guidance, or failure loop', async () => {

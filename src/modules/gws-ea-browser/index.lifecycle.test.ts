@@ -145,7 +145,7 @@ describe('optional host browser lifecycle', () => {
   });
   it('does not admit a browser while Playwright protocol diagnostics can expose credentials', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
     const spawn = vi.spyOn(chrome, 'spawnChrome').mockImplementation(() => {
       throw new Error('Would spawn Chrome while protocol diagnostics are enabled');
     });
@@ -174,26 +174,25 @@ describe('optional host browser lifecycle', () => {
   });
   it('prewarms the public proxy with no job or token and stops it on policy disable', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
     await runtime.reconcile();
     const state = runtime.state();
     expect(state).toMatchObject({
       enabled: true,
-      credentialMode: 'email',
       proxy: { state: 'listening' },
       chrome: { state: 'stopped' },
       windows: 0,
     });
     if (state.proxy.state !== 'listening') throw new Error('Proxy not started');
     expect(await listening(state.proxy.port)).toBe(true);
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: false, credentialMode: 'email' }));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
     await runtime.reconcile();
     expect(await listening(state.proxy.port)).toBe(false);
     expect(runtime.state()).toMatchObject({ enabled: false, proxy: { state: 'stopped' } });
   });
   it('never reopens the proxy after host shutdown even while the policy stays enabled', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
     await runtime.reconcile();
     await runtime.shutdown();
     await runtime.reconcile();
@@ -207,7 +206,6 @@ describe('optional host browser lifecycle', () => {
       JSON.stringify({
         schemaVersion: 1,
         enabled: true,
-        credentialMode: 'email',
         chromePath: '/no-such-browser-runtime/chrome',
       }),
     );
@@ -223,7 +221,7 @@ describe('optional host browser lifecycle', () => {
   });
   it('bounds a stalled Chrome attachment and reports unavailable without retaining startup admission', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
     await runtime.reconcile();
     let entered!: () => void;
     const connecting = new Promise<void>((resolve) => {

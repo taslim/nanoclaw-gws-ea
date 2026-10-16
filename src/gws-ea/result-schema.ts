@@ -231,7 +231,6 @@ export const BROWSER_CAPABILITY_SCHEMA = object({
   instance_id: text,
   observed_at: time,
   activation: choices('enabled', 'disabled', 'unavailable'),
-  credential_mode: choices('email', '1password'),
   policy_file: text,
   chrome: object({
     path: text,
@@ -239,7 +238,6 @@ export const BROWSER_CAPABILITY_SCHEMA = object({
     version: nullable(text),
     reason: nullable(text),
   }),
-  vault: object({ status: choices('not_configured', 'configured', 'unavailable'), reason: nullable(text) }),
   isolation: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
   ready: bool,
 });
@@ -247,8 +245,6 @@ export const BROWSER_OPERATION_SCHEMA = object({
   ...browserMetadata,
   instance_id: text,
   enabled: bool,
-  credential_mode: choices('email', '1password'),
-  provider_revocation_required: bool,
   changed: bool,
 });
 export const CAPABILITY_LIST_SCHEMA = object({

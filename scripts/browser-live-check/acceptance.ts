@@ -24,7 +24,6 @@ export const acceptanceScenarios = [
   'restart_before_commit',
   'restart_after_commit',
   'email_code_sign_in',
-  'vault_secret_confinement',
   'purchase_card_revalidation',
   'unsupported_purchase',
   'standing_guarantee',

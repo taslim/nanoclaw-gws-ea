@@ -256,11 +256,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
   beforeEach(async () => {
     fs.rmSync(root, { recursive: true, force: true });
     fs.mkdirSync(`${root}/browser`, { recursive: true });
-    fs.writeFileSync(
-      `${root}/browser/policy.json`,
-      JSON.stringify({ schemaVersion: 1, enabled: true, credentialMode: 'email' }),
-      { mode: 0o600 },
-    );
+    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+      mode: 0o600,
+    });
     process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
     await runMigrations(await initTestDb());
     for (const id of ['main-p', 'browser-p'])

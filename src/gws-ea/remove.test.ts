@@ -824,11 +824,9 @@ describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
     await writeFile(voicePolicy, policy, { mode: 0o600 });
     await writeFile(voiceAssets, 'shared immutable model');
     const removal = world(input);
-    const browserFiles = [
-      'browser/profile/Cookies',
-      'browser/staging/private-download',
-      'secrets/browser-1password',
-    ].map((relative) => path.join(paths.instanceRoot(input.instance_id), relative));
+    const browserFiles = ['browser/profile/Cookies', 'browser/staging/private-download'].map((relative) =>
+      path.join(paths.instanceRoot(input.instance_id), relative),
+    );
     for (const file of browserFiles) {
       await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
       await writeFile(file, 'private browser material', { mode: 0o600 });
@@ -1817,19 +1815,6 @@ describe('removal command', () => {
     expect(output.join('\n')).toContain(
       `Left behind: Google Cloud project ${input.exclusive_resource_claims.gcp_project_id}`,
     );
-    expect(output.join('\n')).toContain('1Password');
-    const json: string[] = [];
-    expect(
-      await runCli(
-        ['remove', '--id', input.instance_id, '--yes', '--json'],
-        cliRuntime(paths, json, { removeAssistant: remove }),
-      ),
-    ).toBe(0);
-    expect(JSON.parse(json.join('\n'))).toMatchObject({
-      next_actions: expect.arrayContaining([
-        { kind: 'external', instruction: expect.stringContaining('does not revoke the provider credential') },
-      ]),
-    });
   });
 
   it('rejects an unknown resource to abandon before anything runs', async () => {

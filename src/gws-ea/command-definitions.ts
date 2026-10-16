@@ -497,29 +497,11 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         command === 'show'
           ? 'Show one assistant’s browser policy and prerequisites.'
           : command === 'check'
-            ? 'Check Chrome, optional vault, and agent-network isolation without changing state.'
+            ? 'Check Chrome and agent-network isolation without changing state.'
             : command === 'enable'
-              ? 'Enable one assistant’s host browser with email or optional 1Password sign-in.'
-              : 'Disable one assistant’s browser and delete its local vault token.',
-      options: [
-        id,
-        ...(command === 'enable'
-          ? [
-              {
-                ...value(
-                  'credential-mode',
-                  'email|1password',
-                  'Sign in with email codes/links (default), or a read-only service account for one dedicated 1Password vault.',
-                ),
-                choices: ['email', '1password'],
-              },
-              flag(
-                'token-stdin',
-                'Read the 1Password service account token from stdin; never from arguments or the environment.',
-              ),
-            ]
-          : []),
-      ],
+              ? 'Enable one assistant’s host browser with email code/link sign-in.'
+              : 'Disable one assistant’s browser.',
+      options: [id],
       effects:
         command === 'show' || command === 'check'
           ? [
@@ -531,30 +513,18 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
                 : []),
             ]
           : command === 'enable'
-            ? [
-                'Writes the optional owner-only token before the enabled instance policy; host reconciliation activates the browser.',
-                'Email code/link sign-in requires no token or token prompt.',
-              ]
+            ? ['Writes the enabled owner-only instance policy; host reconciliation activates the browser.']
             : [
-                'Writes disabled policy first, then deletes the local token; the host stops jobs and withdraws cards on reconciliation, including after restart.',
-                'The operator separately revokes any configured service account/token in 1Password.',
+                'Writes disabled policy; the host stops jobs and withdraws cards on reconciliation, including after restart.',
               ],
       prerequisites: [
         'An explicitly named managed assistant with a readable runtime record.',
         'Google Chrome at its absolute configured path on the host.',
       ],
       recovery: [
-        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, token, host or Docker prerequisite.',
+        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
       ],
-      examples: [
-        `gws-ea capabilities ${command} browser --id <instance_id>`,
-        ...(command === 'enable'
-          ? [
-              'gws-ea capabilities enable browser --id <instance_id> --credential-mode 1password',
-              'gws-ea capabilities enable browser --id <instance_id> --credential-mode 1password --token-stdin --no-input',
-            ]
-          : []),
-      ],
+      examples: [`gws-ea capabilities ${command} browser --id <instance_id>`],
       outputModes: managedModes,
       resultSchema: managedResultSchema(
         command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,

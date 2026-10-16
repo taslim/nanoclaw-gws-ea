@@ -16,4 +16,4 @@ After `outcome_unknown`, ask the job to inspect supported order or booking recor
 
 For a principal-mailbox sign-in code, name the site recorded by the host when asking the principal. Pass the received code only to `relay_code` with that job's thread; never put it in a message or file to the job. The host fills only the field and site it recorded. A `no_wait` answer means no eligible wait exists; do not send the code elsewhere.
 
-If principal-account sign-in returns `no_item_for_site` or `vault_unavailable`, tell the principal once that the login belongs in the vault they share with the assistant, or their operator can set that vault up with them. Never ask for or accept a password or token in chat.
+The browser signs in with emailed codes and links: on the assistant's own accounts, or on the principal's when they relay the code. It cannot enter a password. When a site needs the principal's password, use the assistant's own account if that serves the errand; otherwise tell the principal plainly. Never ask for or accept a password or token in chat.

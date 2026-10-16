@@ -212,16 +212,14 @@ resume an approved row at host start; they must make re-entry idempotent.
 
 The optional GWS-EA host browser has a separate sign-in boundary from API
 credential injection: its Chrome traffic uses a per-assistant public-only proxy,
-never the credential gateway. The host alone resolves optional 1Password secrets
-from a read-only service account for one dedicated vault and fills a validated
-HTTPS frame; the browser agent receives handles and outcomes only. Without a
-vault, assistant-owned accounts use emailed codes/magic links. The existing isolated
-external-email agent interprets these temporary credentials in a per-claim system
-session; the host alone inserts codes or follows validated same-site links. Profile and
+never the credential gateway. It signs in with emailed codes and magic links,
+including a code the principal relays through main. The existing isolated
+external-email agent interprets assistant-mail credentials in a per-claim system
+session; the host alone inserts codes or follows validated same-site links into a
+validated HTTPS frame, and the browser agent receives outcomes only. Profile and
 staging data live under `<instance root>/browser/`, outside routine snapshot
-roots; the optional token lives in instance secrets. Disable/removal deletes
-local token material and tells the operator to revoke it in 1Password. There is
-no Keychain credential store, debugging TCP endpoint or takeover portal.
+roots. There is no stored password, Keychain credential store, debugging TCP
+endpoint or takeover portal.
 
 ## Rebuild Workflow (Temporary)
 
