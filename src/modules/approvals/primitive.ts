@@ -45,6 +45,7 @@ import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permission
 import { ensureUserDm } from '../permissions/user-dm.js';
 import { combineDetails, recordRequestOutcome, recordRequestPosted, type RequestDetails } from './request-context.js';
 import { requestOrigin } from './request-text.js';
+import { detachApproval, finishApprovalWithdrawal } from './lifecycle.js';
 
 /**
  * Three-button approval UI. Plain Reject is the instant fast path; "Reject with
@@ -340,8 +341,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
+    let messageId: string | void;
     try {
-      const messageId = await adapter.deliver(
+      messageId = await adapter.deliver(
         target.messagingGroup.channel_type,
         target.messagingGroup.platform_id,
         null,
@@ -356,7 +358,6 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
         undefined,
         target.messagingGroup.instance,
       );
-      if (messageId) await bindPendingApprovalMessage(approvalId, messageId);
     } catch (err) {
       log.error('Failed to deliver approval card', { action, approvalId, err });
       // The single delivery target never saw the card — remove the row so it
@@ -364,6 +365,29 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
       await deletePendingApproval(approvalId);
       await notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
       return null;
+    }
+    if (messageId) {
+      try {
+        await bindPendingApprovalMessage(approvalId, messageId);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- binding is idempotent; retry a persistence failure once
+      } catch (err) {
+        log.warn('Retrying approval card binding', { action, approvalId, err });
+        try {
+          await bindPendingApprovalMessage(approvalId, messageId);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- retire the unanswered card if its durable binding cannot be saved
+        } catch (err) {
+          log.error('Failed to bind delivered approval card', { action, approvalId, err });
+          const approval = await detachApproval(approvalId);
+          // A response may already have claimed the row; its decision stands.
+          if (!approval) return approvalId;
+          await finishApprovalWithdrawal(
+            { ...approval, platform_message_id: messageId },
+            '⚠️ Canceled — approval request could not be recorded',
+          );
+          await notifyAgent(session, `${action} failed: could not record the delivered approval request.`);
+          return null;
+        }
+      }
     }
     await recordRequestPosted(
       {

@@ -6,13 +6,13 @@ import { getRegisteredApprovalActions, notifyApprovalResolved } from './primitiv
 import { editApprovalCard } from './terminal-card.js';
 
 /**
- * Remove a request without any channel or mailbox work. A caller can include
+ * Remove a pending request without any channel or mailbox work. A caller can include
  * this in its own transaction and finish the withdrawal after committing.
  */
 export async function detachApproval(approvalId: string): Promise<PendingApproval | null> {
   return getDb().transaction(async () => {
     const approval = await getPendingApproval(approvalId);
-    if (!approval) return null;
+    if (!approval || approval.status !== 'pending') return null;
     await deletePendingApproval(approvalId);
     return approval;
   });

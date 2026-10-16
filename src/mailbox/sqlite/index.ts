@@ -513,11 +513,11 @@ export class SqliteAgentMailbox implements AgentMailbox {
         ...wrapSqliteOutbound(readableOutbound, writableOutbound),
         getLatestDeliveredAgentReport: (targetAgentGroupId) => {
           const delivered = inbound.prepare(
-            "SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'",
+            "SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered' AND platform_message_id IS NOT NULL",
           );
           const rows = readableOutbound()
             .prepare(
-              "SELECT id, timestamp, kind, content FROM messages_out WHERE channel_type = 'agent' AND platform_id = ? AND kind NOT IN ('system', 'task_log') ORDER BY seq DESC",
+              "SELECT id, timestamp, kind, content FROM messages_out WHERE channel_type = 'agent' AND platform_id = ? AND kind = 'chat' ORDER BY seq DESC",
             )
             .iterate(targetAgentGroupId);
           // A for-of return closes the SQLite iterator before this session closes its DBs.

@@ -236,10 +236,10 @@ async function resolveTargetSession(
     const prefix = `system:a2a:${sourceSession.agent_group_id}:`;
     if (msg.thread_id === 'new') {
       const thread = `${prefix}${msg.id}`;
-      const existing = await findSystemSession(targetAgentGroupId, thread, true);
-      if (existing?.status === 'closed')
+      const { session } = await resolveSystemSession(targetAgentGroupId, thread, { includeClosed: true });
+      if (session.status === 'closed')
         throw new OutboundRefusedError('agent-to-agent:thread', 'Thread is closed. Open a new thread.');
-      return (await resolveSystemSession(targetAgentGroupId, thread)).session;
+      return session;
     }
     if (!msg.thread_id?.startsWith(prefix))
       throw new OutboundRefusedError(
@@ -427,6 +427,10 @@ async function performAgentRoute(
   });
   const fresh = await getSession(targetSession.id);
   if (fresh) await requestWake(fresh, 'inbound-message');
+  // A held row is consumed without a receipt; only the actual route can complete it.
+  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.markDelivered(msg.id, a2aMsgId),
+  );
 }
 
 /**

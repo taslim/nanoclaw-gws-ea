@@ -147,7 +147,7 @@ it('uses each request’s own immutable outbound timestamp and projects metadata
   vi.setSystemTime(new Date(at(8)));
   await outbound('delivered-report', JSON.stringify({ text: canary }), 'chat', 'evidence-main');
   await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-    mailbox.markDelivered('delivered-report', null),
+    mailbox.markDelivered('delivered-report', 'a2a-delivered-report'),
   );
   vi.setSystemTime(new Date(at(9)));
   await outbound('newer-unrelated', JSON.stringify({ action: 'browser', requestId: 'different', secret: canary }));

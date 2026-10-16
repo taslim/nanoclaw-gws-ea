@@ -302,7 +302,13 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
   db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', ?)",
+    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
+     VALUES (?, ?, 'delivered', ?)
+     ON CONFLICT(message_out_id) DO UPDATE SET
+       platform_message_id = excluded.platform_message_id,
+       delivered_at = excluded.delivered_at
+     WHERE delivered.status = 'delivered' AND delivered.platform_message_id IS NULL
+       AND excluded.platform_message_id IS NOT NULL`,
   ).run(messageOutId, platformMessageId ?? null, new Date().toISOString());
 }
 
