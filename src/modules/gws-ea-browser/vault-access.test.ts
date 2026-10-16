@@ -489,6 +489,16 @@ describe('the operator handoff', () => {
     expect(expectForwardable(data, PRINCIPAL_EMAIL)).toMatch(why);
   });
 
+  it('names neither a guest nor an Individual account when 1Password no longer knows the vault or user it is granting', async () => {
+    onePassword.users.set(PRINCIPAL_EMAIL, member(PRINCIPAL_EMAIL, PRINCIPAL_USER_ID, { type: 'guest' }));
+    onePassword.fail('grantVaultAccess', 'not_found');
+    const data = answer(await ask({ operation: 'share' }));
+    expect(data).toMatchObject({ reason: 'host_cannot_share', email: PRINCIPAL_EMAIL });
+    const message = expectForwardable(data, PRINCIPAL_EMAIL);
+    expect(message).toMatch(/shared in 1Password directly/u);
+    expect(message).not.toMatch(/guest|Individual account/u);
+  });
+
   it('hands off without any provider request when this host has no management service account', async () => {
     await writeHostPolicy(null);
     const data = answer(await ask({ operation: 'share' }));

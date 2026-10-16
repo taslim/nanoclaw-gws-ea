@@ -321,6 +321,19 @@ describe('bounded 1Password outcomes', () => {
     });
   });
 
+  it('treats a write whose CLI vanished after it resolved as failed, since nothing reached 1Password', async () => {
+    const { cli } = await openCli(() => {
+      throw new GwsEaError('executable_not_found', `${FAKE_OP} is not an executable file`);
+    });
+    expect(
+      await cli.grantVaultAccess(await managementIdentity(), {
+        vaultId: VAULT_ID,
+        userId: PRINCIPAL_USER_ID,
+        permissions: ['allow_viewing'],
+      }),
+    ).toEqual({ status: 'failed', reason: 'failed' });
+  });
+
   it.each([
     ['invalid JSON', '{"account_uuid": '],
     ['a missing user', JSON.stringify({ account_uuid: ACCOUNT_ID })],
@@ -784,6 +797,22 @@ describe('minting a service account token', () => {
     const request = { name: 'GWS-EA Juno Hale runtime', access: { kind: 'create_vaults' as const }, tokenFile: file };
 
     expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'failed', reason: 'rate_limited' });
+    expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'created' });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('lets a creation whose CLI vanished after it resolved be retried, since nothing ran', async () => {
+    const file = await tokenFile();
+    let vanished = true;
+    const { cli, calls } = await openCli(() => {
+      if (!vanished) return { stdout: `${token()}\n` };
+      vanished = false;
+      throw new GwsEaError('executable_not_found', `${FAKE_OP} is not an executable file`);
+    });
+    const request = { name: 'GWS-EA Juno Hale runtime', access: { kind: 'create_vaults' as const }, tokenFile: file };
+
+    expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'failed', reason: 'failed' });
+    expect(await serviceAccountCreationUnproven(file)).toBe(false);
     expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'created' });
     expect(calls).toHaveLength(2);
   });

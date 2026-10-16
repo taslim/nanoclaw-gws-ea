@@ -269,11 +269,10 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
     permissions: PRINCIPAL_GRANT,
   });
   if (granted.status !== 'ok') {
-    const kind = failureKind(granted.reason);
-    if (kind === 'rate_limited') return { status: 'rate_limited' };
-    if (kind === 'refused') return handoff('refused', user.type === 'guest');
-    if (kind === 'authority') return handoff('host_cannot_share');
+    // Only a refusal is about this user; a vault or user 1Password no longer knows ends like any other lookup.
+    if (granted.reason === 'forbidden') return handoff('refused', user.type === 'guest');
     // A grant that may have taken effect is observed, never repeated.
+    if (failureKind(granted.reason) !== 'unknown') return failure(granted.reason);
   }
   const after = await provider.listVaultUsers(management, vaultId);
   if (after.status !== 'ok')

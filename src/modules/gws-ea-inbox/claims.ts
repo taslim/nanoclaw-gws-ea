@@ -35,6 +35,13 @@ export async function waitingSignInClaim(
     new Date().toISOString(),
   );
 }
+/** A signup's verification claim is bound to its attempt, which alone ends it (`finishSignupVerification`). */
+function signupAttemptClaim(claim: SignInClaim): boolean {
+  const binding: unknown = JSON.parse(claim.binding_json);
+  return isRecord(binding) && typeof binding.attempt === 'string';
+}
+
+/** A new claim supersedes the job's waiting sign-in claims; every signup's verification claim stays waiting. */
 export async function createSignInClaim(input: {
   id: string;
   jobId: string;
@@ -48,12 +55,15 @@ export async function createSignInClaim(input: {
   if (origin.protocol !== 'https:' || origin.username || origin.password || !domain) throw new Error('origin_mismatch');
   const at = input.at ?? new Date();
   await getDb().transaction(async () => {
-    await getDb().run(
-      'UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE job_id = ? AND state = ?',
-      'finished',
+    const waiting = await getDb().all<SignInClaim>(
+      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE job_id = ? AND state = ?',
       input.jobId,
       'waiting',
     );
+    for (const claim of waiting) {
+      if (signupAttemptClaim(claim)) continue;
+      await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE id = ?', 'finished', claim.id);
+    }
     await getDb().run(
       `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
        VALUES(?,?,?,?,?,?,?,?,?)`,

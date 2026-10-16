@@ -48,7 +48,7 @@ const OUTPUT_LIMIT_BYTES = 1024 * 1024;
 const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._@+-]{0,99}$/u;
 const MAX_DISPLAY_CHARACTERS = 254;
 /** Runner failures that leave a provider call's effect unknown; anything else is this code's own fault. */
-const INTERRUPTIONS = new Set(['command_failed', 'command_timeout', 'command_output_limit', 'executable_not_found']);
+const INTERRUPTIONS = new Set(['command_failed', 'command_timeout', 'command_output_limit']);
 
 /** The operator's own desktop sign-in, in exactly this account; never a service-account or Connect credential. */
 export interface OperatorIdentity {
@@ -74,7 +74,7 @@ export type OnePasswordIdentity = OperatorIdentity | ServiceAccountIdentity;
  * - `rate_limited`: an hourly or account-wide daily request limit is spent; never retried here.
  * - `unexpected_output`: a read succeeded with output this release does not recognize.
  * - `outcome_unknown`: a write may have taken effect; observe before trying again.
- * - `failed`: a read failed for a reason this release does not recognize.
+ * - `failed`: a read failed for a reason this release does not recognize, or the CLI was gone, so no call ran.
  */
 export type OnePasswordFailureReason =
   | 'token_unavailable'
@@ -300,6 +300,9 @@ async function run(invocation: Invocation, command: SanitizedCommand): Promise<R
     return { kind: 'exited', exitCode: outcome.exitCode, stdout: outcome.stdout, stderr: outcome.stderr };
   } catch (error) {
     if (error instanceof GwsEaError && INTERRUPTIONS.has(error.code)) return { kind: 'interrupted' };
+    // The executable left its resolved path before anything was spawned, so the provider never saw the call.
+    if (error instanceof GwsEaError && error.code === 'executable_not_found')
+      return { kind: 'refused', failure: failed('failed') };
     throw error;
   }
 }

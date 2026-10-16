@@ -686,6 +686,28 @@ describe('a signup waiting for its email verification', () => {
     expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'finished' });
   });
 
+  it("keeps a signup's wait open when a second signup in the same job opens its own", async () => {
+    await openSignupVerification(signup);
+    await openSignupVerification({
+      ...signup,
+      claimId: 'signup-second',
+      attemptId: 'attempt-2',
+      username: 'assistant+second@example.com',
+    });
+    receive('Your verification code is 642981', { to: 'assistant@example.com' });
+    receive('Your verification code is 135790', { to: 'assistant+second@example.com' });
+    expect(await interpretFor('signup-request', { kind: 'code', value: '642981' })).toEqual({ status: 'accepted' });
+    expect(await interpretFor('signup-second', { kind: 'code', value: '135790' })).toEqual({ status: 'accepted' });
+    expect(await takeSignupVerification(context(), 'attempt-1')).toMatchObject({
+      status: 'arrived',
+      reply: { value: '642981' },
+    });
+    expect(await takeSignupVerification(context(), 'attempt-2')).toMatchObject({
+      status: 'arrived',
+      reply: { value: '135790' },
+    });
+  });
+
   it('wakes a verify step already waiting when the answer arrives, and reports an unreadable email', async () => {
     await openSignupVerification(signup);
     const waiting = takeSignupVerification(context('job', 5_000), 'attempt-1');
