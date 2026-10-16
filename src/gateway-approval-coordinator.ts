@@ -28,13 +28,9 @@ import {
 } from './gateway-providers/index.js';
 import { log } from './log.js';
 import { pickApprovalDelivery, pickApprover } from './modules/approvals/primitive.js';
-import {
-  combineDetails,
-  recordRequestOutcome,
-  recordRequestPosted,
-  type RequestDetails,
-} from './modules/approvals/request-context.js';
+import { combineDetails, recordRequestPosted, type RequestDetails } from './modules/approvals/request-context.js';
 import { requestOrigin } from './modules/approvals/request-text.js';
+import { editApprovalCard } from './modules/approvals/terminal-card.js';
 import { isAuthorizedApprovalClick } from './modules/approvals/response-handler.js';
 import { registerResponseHandler, type ResponsePayload } from './response-registry.js';
 import type { PendingApproval } from './types.js';
@@ -692,33 +688,11 @@ export async function editExpiredGatewayApprovalCard(
   await editGatewayApprovalCard(row, resolution);
 }
 
-/** Show a request's outcome in place, and note it in the conversation it was posted in (request-context.ts). */
+/** Show a gateway request through the shared terminal-card renderer. */
 async function editGatewayApprovalCard(row: PendingApproval, resolution: string): Promise<void> {
   if (!adapter || !row.platform_message_id || !row.channel_type || !row.platform_id) return;
   const threadId = (JSON.parse(row.payload) as { threadId?: string | null }).threadId ?? null;
-  await recordRequestOutcome(
-    { channelType: row.channel_type, platformId: row.platform_id, instance: row.instance, threadId },
-    { id: row.approval_id, about: row.action, title: row.title, outcome: resolution },
-  );
-  try {
-    await adapter.deliver(
-      row.channel_type,
-      row.platform_id,
-      threadId,
-      'chat-sdk',
-      JSON.stringify({
-        questionId: row.approval_id,
-        operation: 'edit',
-        messageId: row.platform_message_id,
-        text: [row.title, row.question, resolution].filter(Boolean).join('\n\n'),
-        terminalCard: { title: row.title, question: row.question, resolution },
-      }),
-      undefined,
-      row.instance ?? row.channel_type,
-    );
-  } catch (err) {
-    log.error('Failed to edit expired gateway approval card', { approvalId: row.approval_id, err });
-  }
+  await editApprovalCard(adapter, row, resolution, { threadId });
 }
 
 async function sweepStaleGatewayApprovals(legacyActions: readonly string[]): Promise<void> {

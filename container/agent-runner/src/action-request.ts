@@ -174,12 +174,44 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
 }
 
-/** An answer as a tool returns it: its `message` when it carries one, a refusal as an error. */
+/** Images in a host answer travel as MCP content, never as encoded text. */
+export interface ActionResponseImage {
+  readonly mime_type: string;
+  readonly data: string;
+}
+
+function responseImage(value: unknown): value is ActionResponseImage {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((key) => key === 'mime_type' || key === 'data') &&
+    typeof value.mime_type === 'string' &&
+    /^image\/[a-z0-9][a-z0-9.+-]*$/iu.test(value.mime_type) &&
+    typeof value.data === 'string' &&
+    value.data.length > 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value.data)
+  );
+}
+
+/** An answer as a tool returns it: its message or structured data, optional images, or a refusal. */
 export function answerResult(frame: ActionResponseFrame): CallToolResult {
   if (!frame.ok) return errorResult(frame.error.message);
-  const data = frame.data;
+  let data = frame.data;
+  let images: ActionResponseImage[] = [];
+  if (isRecord(data) && Object.hasOwn(data, 'images')) {
+    if (!Array.isArray(data.images) || !data.images.every(responseImage)) {
+      return errorResult("The host's image answer was unreadable.");
+    }
+    images = data.images;
+    const { images: _images, ...textData } = data;
+    data = textData;
+  }
   const message = isRecord(data) && typeof data.message === 'string' ? data.message : JSON.stringify(data);
-  return { content: [{ type: 'text', text: message }] };
+  return {
+    content: [
+      { type: 'text', text: message },
+      ...images.map((image) => ({ type: 'image' as const, mimeType: image.mime_type, data: image.data })),
+    ],
+  };
 }
 
 /** A tool that sends one host action, by default the one of its own name. */
@@ -192,6 +224,10 @@ export interface RequestToolSpec {
   /** The fields the tool takes; only these are sent. */
   readonly properties: Readonly<Record<string, object>>;
   readonly required: readonly string[];
+  /** Close a tool's JSON schema when its host action accepts only the named fields. */
+  readonly additionalProperties?: false;
+  /** Discriminated request shapes sharing one native host action. */
+  readonly oneOf?: readonly object[];
   /** Whether making the same call again is safe: a repeat changes nothing twice. */
   readonly repeatable: boolean;
   readonly timeoutMs: number;
@@ -228,7 +264,13 @@ export function requestTool(spec: RequestToolSpec): McpToolDefinition {
     tool: {
       name: spec.name,
       description: spec.description,
-      inputSchema: { type: 'object', properties: { ...spec.properties }, required: [...spec.required] },
+      inputSchema: {
+        type: 'object',
+        properties: { ...spec.properties },
+        required: [...spec.required],
+        ...(spec.additionalProperties === false ? { additionalProperties: false } : {}),
+        ...(spec.oneOf ? { oneOf: [...spec.oneOf] } : {}),
+      },
     },
     async handler(args, context) {
       const missing = spec.required.find((field) => args[field] === undefined || args[field] === null);

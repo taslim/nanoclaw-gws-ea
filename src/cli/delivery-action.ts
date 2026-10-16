@@ -86,6 +86,22 @@ export type ActionAnswer = (
   requestId: string,
 ) => Promise<Record<string, unknown>>;
 
+/**
+ * Returned by a deferred answer to leave its request unanswered for now. The
+ * worker that took the request over answers it later with `writeActionResponse`
+ * and then clears what the request staged with `clearOutbox`. A replayed
+ * delivery before that runs the deferred answer again, so it must be
+ * idempotent by request id.
+ */
+export const ANSWER_LATER: unique symbol = Symbol('answer-later');
+
+/** An `ActionAnswer` that may hand its request to a durable worker (`ANSWER_LATER`). */
+export type DeferredActionAnswer = (
+  content: Record<string, unknown>,
+  session: Session,
+  requestId: string,
+) => Promise<Record<string, unknown> | typeof ANSWER_LATER>;
+
 function errorFrame(requestId: string, error: unknown): ResponseFrame {
   if (error instanceof ActionRefusal) {
     return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
@@ -107,9 +123,10 @@ async function writeAnswer(session: Session, requestId: string, frame: ResponseF
  * A delivery action that answers each request once, a refusal or failure
  * included. A request already answered is a replay of work already done,
  * whatever its answer, so it is not done again. A request without a request
- * id has no tool waiting on it, so nothing answers it.
+ * id has no tool waiting on it, so nothing answers it. An answer returning
+ * `ANSWER_LATER` leaves the request to the worker that answers it later.
  */
-export function answeringAction(action: string, answer: ActionAnswer): GuardedDeliveryHandler {
+export function answeringAction(action: string, answer: DeferredActionAnswer): GuardedDeliveryHandler {
   return async (content, session) => {
     const requestId = requestIdOf(content);
     if (requestId === undefined) {
@@ -127,7 +144,9 @@ export function answeringAction(action: string, answer: ActionAnswer): GuardedDe
     let frame: ResponseFrame;
     /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
     try {
-      frame = { id: requestId, ok: true, data: await answer(content, session, requestId) };
+      const data = await answer(content, session, requestId);
+      if (data === ANSWER_LATER) return;
+      frame = { id: requestId, ok: true, data };
     } catch (error) {
       if (error instanceof ActionRefusal) {
         log.info('Action request refused', { action, requestId, sessionId: session.id, reason: error.message });

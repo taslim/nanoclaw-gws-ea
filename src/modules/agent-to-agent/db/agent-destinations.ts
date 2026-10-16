@@ -34,6 +34,7 @@
  *   - src/cli/resources/destinations.ts::add / remove (admin-time `ncl destinations`
  *     — iterates over `getSessionsByAgentGroup(agentGroupId)`)
  */
+import './threaded-destinations.js';
 import type { AgentDestination } from '../../../types.js';
 import { getDb } from '../../../db/connection.js';
 import { assertDestinationAdmitted } from '../../../db/wiring-admission.js';
@@ -53,9 +54,9 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
 export async function createDestination(row: AgentDestination): Promise<void> {
   await assertDestinationAdmitted({ proposed: row });
   await getDb().run(
-    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-     VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,
-    row,
+    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at, session_mode, inbound_untrusted)
+     VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at, @session_mode, @inbound_untrusted)`,
+    { ...row, session_mode: row.session_mode ?? 'agent-shared', inbound_untrusted: row.inbound_untrusted ?? 0 },
   );
 }
 

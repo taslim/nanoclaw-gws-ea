@@ -122,10 +122,11 @@ export function startHostSweep(): void {
       // MODULE-HOOK:approvals-reason-sweep:start
       'singleton:approvals-scan': async () => {
         try {
-          const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
+          const { sweepAwaitingReasonRejects, sweepExpiredApprovals } = await import('./modules/approvals/index.js');
           await sweepAwaitingReasonRejects();
+          await sweepExpiredApprovals();
         } catch (err) {
-          log.error('Reject-with-reason sweep failed', { err });
+          log.error('Approval sweep failed', { err });
         }
       },
       // MODULE-HOOK:approvals-reason-sweep:end

@@ -182,9 +182,21 @@ export async function resolveTaskSession(
   agentGroupId: string,
   seriesId: string,
 ): Promise<{ session: Session; created: boolean }> {
-  const threadId = taskThreadId(seriesId);
+  return resolveSystemSession(agentGroupId, taskThreadId(seriesId));
+}
+
+/**
+ * Find or create a host-owned system thread without a messaging group.
+ * With includeClosed, return closed sessions instead of creating replacements.
+ */
+export async function resolveSystemSession(
+  agentGroupId: string,
+  threadId: string,
+  options: { includeClosed?: boolean } = {},
+): Promise<{ session: Session; created: boolean }> {
+  if (!threadId.startsWith('system:')) throw new Error('System session requires a system: thread');
   return withSessionCreationLock(`system\0${agentGroupId}\0${threadId}`, async () => {
-    const existing = await findSystemSession(agentGroupId, threadId);
+    const existing = await findSystemSession(agentGroupId, threadId, options.includeClosed);
     if (existing) return { session: existing, created: false };
 
     const id = generateId();
@@ -204,12 +216,12 @@ export async function resolveTaskSession(
       await createSession(session);
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
-      const raced = await findSystemSession(agentGroupId, threadId);
+      const raced = await findSystemSession(agentGroupId, threadId, options.includeClosed);
       if (!raced) throw error;
       return { session: raced, created: false };
     }
     initSessionFolder(agentGroupId, id);
-    log.info('Task session created', { id, agentGroupId, seriesId });
+    log.info('System session created', { id, agentGroupId, threadId });
 
     return { session, created: true };
   });

@@ -62,6 +62,7 @@ import type {
   MailboxSessionKey,
   MailboxTimelineMessage,
   OutboundMailbox,
+  OutboundMessage,
   ProcessingAck,
   TaskRecord,
   TaskStats,
@@ -199,6 +200,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
             channel_type: record.channelType,
             platform_id: record.platformId,
             agent_group_id: record.agentGroupId,
+            session_mode: record.sessionMode ?? 'agent-shared',
           };
         }),
       ),
@@ -338,6 +340,10 @@ export function wrapSqliteOutbound(
 ): OutboundMailbox {
   const readable = () => (typeof source === 'function' ? source() : source);
   return {
+    getOutboundMessage: (id) => {
+      const row = readable().prepare('SELECT * FROM messages_out WHERE id = ?').get(id);
+      return row === undefined ? undefined : outboundMessage(row);
+    },
     getTerminalProcessingAcks: () =>
       (
         readable()
@@ -505,6 +511,23 @@ export class SqliteAgentMailbox implements AgentMailbox {
       return await action({
         ...wrapSqliteInbound(inbound),
         ...wrapSqliteOutbound(readableOutbound, writableOutbound),
+        getLatestDeliveredAgentReport: (targetAgentGroupId) => {
+          const delivered = inbound.prepare(
+            "SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered' AND platform_message_id IS NOT NULL",
+          );
+          const rows = readableOutbound()
+            .prepare(
+              "SELECT id, timestamp, kind, content FROM messages_out WHERE channel_type = 'agent' AND platform_id = ? AND kind = 'chat' ORDER BY seq DESC",
+            )
+            .iterate(targetAgentGroupId);
+          // A for-of return closes the SQLite iterator before this session closes its DBs.
+          for (const value of rows) {
+            const row = value as { id: string; timestamp: string; kind: string; content: string };
+            if (delivered.get(row.id))
+              return { timestamp: sqliteTimestamp(row.timestamp), kind: row.kind, content: row.content };
+          }
+          return undefined;
+        },
       });
     } finally {
       inbound.close();
@@ -512,6 +535,25 @@ export class SqliteAgentMailbox implements AgentMailbox {
       outboundWriter?.close();
     }
   }
+}
+
+function outboundMessage(value: unknown): OutboundMessage {
+  const row = value as Record<string, unknown>;
+  return outboundDelivery(
+    parseOutboundRecord({
+      id: row.id,
+      sequence: row.seq,
+      inReplyTo: row.in_reply_to,
+      timestamp: sqliteTimestamp(String(row.timestamp)),
+      deliverAfter: row.deliver_after === null ? null : sqliteTimestamp(String(row.deliver_after)),
+      recurrence: row.recurrence,
+      kind: row.kind,
+      platformId: row.platform_id,
+      channelType: row.channel_type,
+      threadId: row.thread_id,
+      content: row.content,
+    }),
+  );
 }
 
 function nextEvenAcross(inbound?: Database.Database, outbound?: Database.Database): number {

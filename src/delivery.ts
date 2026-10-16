@@ -639,6 +639,7 @@ async function deliverMessage(
         platform_id: msg.platformId,
         content: msg.content,
         in_reply_to: msg.inReplyTo,
+        thread_id: msg.threadId,
       },
       session,
     );

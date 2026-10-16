@@ -1,23 +1,13 @@
-/**
- * requestApproval delivery-failure cleanup.
- *
- * requestApproval records the pending_approvals row before delivering the
- * card to the single picked approver. If that delivery throws, the row used
- * to linger forever as an approval nobody ever saw (and so nobody could
- * act on). These tests pin the fix: a failed delivery removes the
- * just-created row and notifies the requesting agent; a successful delivery
- * keeps it.
- *
- * Setup mirrors reason-capture.test.ts: real central DB, fake delivery
- * adapter, writeSessionMessage mocked to read back agent-facing text.
- */
+/** Approval delivery and persistence against the real central DB. */
 import * as fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
+import * as approvalsDb from '../../db/sessions.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
+import * as delivery from '../../delivery.js';
 import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -99,6 +89,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
@@ -119,7 +110,7 @@ describe('requestApproval delivery failure', () => {
     };
     setDeliveryAdapter(failingAdapter);
 
-    await requestApproval({
+    const result = await requestApproval({
       session,
       agentName: 'Agent',
       action: 'test_action',
@@ -129,11 +120,13 @@ describe('requestApproval delivery failure', () => {
     });
 
     // No orphan: the row created before the delivery attempt is gone.
+    expect(result).toBeNull();
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(0);
     expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
   });
 
-  it('keeps the pending approval row when delivery succeeds', async () => {
+  it('keeps the delivered approval after a transient binding failure', async () => {
+    vi.spyOn(approvalsDb, 'bindPendingApprovalMessage').mockRejectedValueOnce(new Error('database busy'));
     const okAdapter: ChannelDeliveryAdapter = {
       async deliver() {
         return 'pm-1';
@@ -141,7 +134,7 @@ describe('requestApproval delivery failure', () => {
     };
     setDeliveryAdapter(okAdapter);
 
-    await requestApproval({
+    const result = await requestApproval({
       session,
       agentName: 'Agent',
       action: 'test_action',
@@ -150,7 +143,73 @@ describe('requestApproval delivery failure', () => {
       question: 'Approve the thing?',
     });
 
-    expect(await getPendingApprovalsByAction('test_action')).toHaveLength(1);
+    const [approval] = await getPendingApprovalsByAction('test_action');
+    expect(approval).toMatchObject({ approval_id: result, platform_message_id: 'pm-1' });
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+
+  it('retires the posted card when its message id cannot be persisted', async () => {
+    vi.spyOn(approvalsDb, 'bindPendingApprovalMessage').mockRejectedValue(new Error('binding unavailable'));
+    const deliver = vi.fn<ChannelDeliveryAdapter['deliver']>().mockResolvedValue('pm-unbound');
+    setDeliveryAdapter({ deliver });
+
+    const result = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'test_action',
+      payload: {},
+      title: 'Test Approval',
+      question: 'Approve the thing?',
+    });
+
+    expect(result).toBeNull();
+    expect(await getPendingApprovalsByAction('test_action')).toEqual([]);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(deliver.mock.calls[1][4])).toMatchObject({
+      operation: 'edit',
+      messageId: 'pm-unbound',
+      terminalCard: { resolution: '⚠️ Canceled — approval request could not be recorded' },
+    });
+    expect(lastNotifyText()).toMatch(/test_action failed: could not record the delivered approval request/);
+  });
+});
+
+describe('approval presentation and expiry', () => {
+  it('stores expiry and uses the caller origin instead of the unrelated default', async () => {
+    setDeliveryAdapter({
+      async deliver() {
+        return 'pm-origin';
+      },
+    });
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    const id = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'custom_origin',
+      payload: {},
+      title: 'Approval',
+      question: 'Approve?',
+      expiresAt,
+      originLine: 'This is for your Friday reservation.',
+    });
+    const [row] = await getPendingApprovalsByAction('custom_origin');
+    expect(id).toBe(row.approval_id);
+    expect(row.expires_at).toBe(expiresAt);
+    expect(row.question).toBe('Approve?\n\nThis is for your Friday reservation.');
+  });
+
+  it('does not leave a pending request when no delivery adapter exists', async () => {
+    const adapter = vi.spyOn(delivery, 'getDeliveryAdapter').mockReturnValue(null);
+    const id = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'no_adapter',
+      payload: {},
+      title: 'Approval',
+      question: 'Approve?',
+    });
+    expect(id).toBeNull();
+    expect(await getPendingApprovalsByAction('no_adapter')).toEqual([]);
+    adapter.mockRestore();
   });
 });

@@ -62,7 +62,10 @@ export const a2aSend = defineGuardedAction({
   // Bind an a2a grant to the exact held message target.
   grantCoversRequest: (grant, input) => {
     try {
-      return (JSON.parse(grant.payload) as { platform_id?: string }).platform_id === input.resource?.to;
+      const payload = JSON.parse(grant.payload) as { platform_id?: string; thread_id?: string | null };
+      return (
+        payload.platform_id === input.resource?.to && (payload.thread_id ?? null) === (input.payload.thread_id ?? null)
+      );
     } catch {
       return false;
     }

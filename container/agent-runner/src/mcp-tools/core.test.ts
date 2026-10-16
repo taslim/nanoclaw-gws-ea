@@ -15,6 +15,7 @@ import path from 'path';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
+import * as runnerConfig from '../config.js';
 import { addReaction, sendFile, sendMessage } from './core.js';
 
 /**
@@ -315,5 +316,35 @@ describe('add_reaction — the message the platform reacts on', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toContain('Message #41 not found');
     expect(getUndeliveredMessages()).toEqual([]);
+  });
+});
+
+describe('per-thread destinations', () => {
+  beforeEach(() => {
+    getInboundDb().prepare("UPDATE destinations SET session_mode = 'per-thread' WHERE name = 'peer'").run();
+  });
+
+  it('refuses send_message and send_file without an explicit thread before writing', async () => {
+    const message = await sendMessage.handler({ to: 'peer', text: 'errand' });
+    const file = await sendFile.handler({ to: 'peer', path: '/not-read-before-thread-validation' });
+    expect(message.isError).toBe(true);
+    expect(file.isError).toBe(true);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('returns a predicted thread for a new errand and uses explicit follow-up threads', async () => {
+    const configured = spyOn(runnerConfig, 'loadConfig').mockReturnValue({
+      ...runnerConfig.loadConfig(),
+      agentGroupId: 'ag-source',
+    });
+    const result = await sendMessage.handler({ to: 'peer', text: 'errand', thread: 'new' });
+    configured.mockRestore();
+    const first = getUndeliveredMessages()[0];
+    expect(first.thread_id).toBe('new');
+    expect(result.content[0].text).toContain(`system:a2a:ag-source:${first.id}`);
+    expect(result.content[0].text).toContain(`:${first.id}`);
+    const thread = 'system:a2a:source:errand-a';
+    await sendMessage.handler({ to: 'peer', text: 'follow-up', thread });
+    expect(getUndeliveredMessages()[1].thread_id).toBe(thread);
   });
 });

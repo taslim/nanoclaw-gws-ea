@@ -30,7 +30,12 @@ import {
   type RawOption,
 } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { createPendingApproval, deletePendingApproval, getSession } from '../../db/sessions.js';
+import {
+  bindPendingApprovalMessage,
+  createPendingApproval,
+  deletePendingApproval,
+  getSession,
+} from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
@@ -40,6 +45,7 @@ import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permission
 import { ensureUserDm } from '../permissions/user-dm.js';
 import { combineDetails, recordRequestOutcome, recordRequestPosted, type RequestDetails } from './request-context.js';
 import { requestOrigin } from './request-text.js';
+import { detachApproval, finishApprovalWithdrawal } from './lifecycle.js';
 
 /**
  * Three-button approval UI. Plain Reject is the instant fast path; "Reject with
@@ -78,17 +84,34 @@ export interface ApprovalHandlerContext {
 
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
 
-const approvalHandlers = new Map<string, ApprovalHandler>();
+export interface ApprovalHandlerOptions {
+  /** The handler is idempotent and may resume an approved row after a host restart. */
+  restartSafe?: boolean;
+}
 
-export function registerApprovalHandler(action: string, handler: ApprovalHandler): void {
+const approvalHandlers = new Map<string, { handler: ApprovalHandler; restartSafe: boolean }>();
+
+export function registerApprovalHandler(
+  action: string,
+  handler: ApprovalHandler,
+  options: ApprovalHandlerOptions = {},
+): void {
   if (approvalHandlers.has(action)) {
     log.warn('Approval handler re-registered (overwriting)', { action });
   }
-  approvalHandlers.set(action, handler);
+  approvalHandlers.set(action, { handler, restartSafe: options.restartSafe === true });
 }
 
 export function getApprovalHandler(action: string): ApprovalHandler | undefined {
-  return approvalHandlers.get(action);
+  return approvalHandlers.get(action)?.handler;
+}
+
+export function getRegisteredApprovalActions(): readonly string[] {
+  return [...approvalHandlers.keys()];
+}
+
+export function getRestartSafeApprovalActions(): readonly string[] {
+  return [...approvalHandlers].filter(([, registration]) => registration.restartSafe).map(([action]) => action);
 }
 
 // ── Approval-resolved callbacks ──
@@ -105,7 +128,7 @@ export function getApprovalHandler(action: string): ApprovalHandler | undefined 
 export interface ApprovalResolvedEvent {
   approval: PendingApproval;
   session: Session;
-  outcome: 'approve' | 'reject';
+  outcome: 'approve' | 'reject' | 'expired' | 'withdrawn';
   /** Namespaced user ID (`<channel>:<handle>`) of the resolving admin. Empty string if unknown. */
   userId: string;
   /** The reason given with a rejection. */
@@ -261,21 +284,26 @@ export interface RequestApprovalOptions {
   details?: RequestDetails;
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
+  /** ISO-8601 UTC deadline for answering this request. */
+  expiresAt?: string;
+  /** Host-authored context replacing the inferred conversation origin. */
+  originLine?: string;
 }
 
 /**
  * Queue an approval request. Picks an approver, delivers the card to their
  * DM, and records the pending_approvals row. Fire-and-forget from the
- * caller's perspective — the admin's response kicks off the registered
+ * caller's perspective beyond the returned durable id (or null on delivery
+ * failure) — the admin's response kicks off the registered
  * approval handler for this action via the response dispatcher.
  */
-export async function requestApproval(opts: RequestApprovalOptions): Promise<void> {
+export async function requestApproval(opts: RequestApprovalOptions): Promise<string | null> {
   const { session, action, payload, title, agentName, approverUserId } = opts;
 
   const approvers = approverUserId ? [approverUserId] : await pickApprover(session.agent_group_id);
   if (approvers.length === 0) {
     await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
-    return;
+    return null;
   }
 
   const origin = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
@@ -284,10 +312,10 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   const target = await pickApprovalDelivery(approvers, originChannelType, origin?.instance);
   if (!target) {
     await notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
-    return;
+    return null;
   }
 
-  const asking = await requestOrigin(session.agent_group_id, origin, target.messagingGroup);
+  const asking = await requestOrigin(session.agent_group_id, origin, target.messagingGroup, opts.originLine);
   const question = asking ? `${opts.question}\n\n${asking.line}` : opts.question;
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
@@ -308,12 +336,14 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     // The DM'd approver is the identity this card was routed to; recording it
     // makes resolution exact — only that user may decide the row.
     approver_user_id: approver,
+    expires_at: opts.expiresAt ?? null,
   });
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
+    let messageId: string | void;
     try {
-      await adapter.deliver(
+      messageId = await adapter.deliver(
         target.messagingGroup.channel_type,
         target.messagingGroup.platform_id,
         null,
@@ -334,7 +364,30 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
       // can't linger as a pending approval nobody can act on.
       await deletePendingApproval(approvalId);
       await notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
-      return;
+      return null;
+    }
+    if (messageId) {
+      try {
+        await bindPendingApprovalMessage(approvalId, messageId);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- binding is idempotent; retry a persistence failure once
+      } catch (err) {
+        log.warn('Retrying approval card binding', { action, approvalId, err });
+        try {
+          await bindPendingApprovalMessage(approvalId, messageId);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- retire the unanswered card if its durable binding cannot be saved
+        } catch (err) {
+          log.error('Failed to bind delivered approval card', { action, approvalId, err });
+          const approval = await detachApproval(approvalId);
+          // A response may already have claimed the row; its decision stands.
+          if (!approval) return approvalId;
+          await finishApprovalWithdrawal(
+            { ...approval, platform_message_id: messageId },
+            '⚠️ Canceled — approval request could not be recorded',
+          );
+          await notifyAgent(session, `${action} failed: could not record the delivered approval request.`);
+          return null;
+        }
+      }
     }
     await recordRequestPosted(
       {
@@ -352,7 +405,12 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
         details: combineDetails(opts.details, asking?.details),
       },
     );
+  } else {
+    await deletePendingApproval(approvalId);
+    await notifyAgent(session, `${action} failed: no delivery adapter is available.`);
+    return null;
   }
 
   log.info('Approval requested', { action, approvalId, agentName, approver: target.userId });
+  return approvalId;
 }

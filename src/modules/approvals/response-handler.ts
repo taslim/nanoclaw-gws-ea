@@ -18,6 +18,7 @@ import { requestWake } from '../../request-wake.js';
 import {
   deletePendingApproval,
   getPendingApproval,
+  getPendingApprovalsByAction,
   getSession,
   transitionPendingApprovalStatus,
 } from '../../db/sessions.js';
@@ -28,7 +29,8 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { finalizeReject } from './finalize.js';
-import { getApprovalHandler, notifyApprovalResolved } from './primitive.js';
+import { getApprovalHandler, getRestartSafeApprovalActions, notifyApprovalResolved } from './primitive.js';
+import { expireApproval } from './lifecycle.js';
 import { armReasonCapture, clampReason } from './reason-capture.js';
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
@@ -45,6 +47,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
+  if (await expireApproval(approval.approval_id)) return true;
   await handleRegisteredApproval(approval, payload, namespacedUserId(payload) ?? '');
   return true;
 }
@@ -95,6 +98,27 @@ async function handleRegisteredApproval(
   // Decided: its outcome shows now, while the action may still take a while to apply.
   await showOutcome(approval, answer);
 
+  await applyApprovedApproval(approval, userId);
+}
+
+/** Replay only opted-in, idempotent handlers; the durable row remains their grant. */
+export async function resumeApprovedApprovals(): Promise<void> {
+  for (const action of getRestartSafeApprovalActions()) {
+    for (const approval of await getPendingApprovalsByAction(action)) {
+      if (approval.status === 'approved') {
+        await applyApprovedApproval(approval, approval.approver_user_id ?? '');
+      }
+    }
+  }
+}
+
+async function applyApprovedApproval(approval: PendingApproval, userId: string): Promise<void> {
+  const session = approval.session_id ? await getSession(approval.session_id) : undefined;
+  if (!session) {
+    await deletePendingApproval(approval.approval_id);
+    return;
+  }
+
   // Approved — dispatch to the module that registered for this action.
   const notify = (text: string): Promise<void> =>
     writeSessionMessage(session.agent_group_id, session.id, {
@@ -120,7 +144,7 @@ async function handleRegisteredApproval(
     return;
   }
 
-  const payload = JSON.parse(approval.payload);
+  const payload = JSON.parse(approval.payload) as Record<string, unknown>;
   try {
     await handler({ session, payload, approval, userId, notify });
     log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });

@@ -71,7 +71,9 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/gateway-approval-coordinator.ts` | Core-owned human approval flow every gateway gets: request validation, approver routing, `pending_approvals`, terminal cards, and supervised reconnect of the provider's approval subscription |
 | `src/guard/` | Privileged-action decision seam: `guard(action, input)` → allow \| hold \| deny. Module-edge `guard.ts` adapters (cli, agent-to-agent, self-mod, permissions) define each action's decision; ncl commands + delivery actions demand a guard at registration; approved replays carry the approval row as a grant and re-run the checks. Conformance test: `src/guard/conformance.test.ts` |
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
-| `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
+| `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
+| `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
+| `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -132,6 +134,21 @@ Each `/add-<name>` skill is idempotent: `git fetch origin <branch>` → copy mod
 
 **Channel defaults.** Each adapter declares its wiring-time defaults (`ChannelDefaults`: per DM/group context — engage mode/pattern, thread policy, unknown-sender policy — plus mention signaling). Exactly two levels: the adapter declaration, and the per-wiring override chosen at creation — no per-instance DB config table. Undeclared (stale) adapters resolve through a behavior-faithful fallback, so a trunk update alone changes nothing. See [docs/api-details.md](docs/api-details.md#channel-defaults) and `src/channels/channel-defaults.ts`.
 
+## Tool-Agent Destinations
+
+Native A2A destinations default to `agent-shared`; a `per-thread` destination
+requires a thread on every send path, including message/file tools and text
+blocks. Use `thread: "new"` for a new errand, then the returned thread for its
+follow-ups. The host refuses unknown, foreign and closed threads; it never
+chooses a tool job by peer affinity. A per-thread destination suits a tool
+agent that runs one session per delegated errand; its reports to the delegating
+agent are untrusted information, and worker-style subagents remain the normal
+pattern for other work.
+
+Key files: `src/modules/agent-to-agent/db/agent-destinations.ts`,
+`src/modules/agent-to-agent/db/threaded-destinations.ts`, and
+`src/modules/agent-to-agent/agent-route.ts`.
+
 ## Self-Modification
 
 One tier of agent self-modification today:
@@ -180,6 +197,14 @@ Approval-gating a credentialed action is a **two-sided** flow:
 - **Host-side**: `src/gateway-approval-coordinator.ts` owns the human flow for every gateway — validation, approver resolution via `pickApprover` + `pickApprovalDelivery`, the `pending_approvals` row, the card, click authorization, expiry, and the sweep of rows a previous host left behind. Approvers come from the `user_roles` table: scoped admins for the agent group → global admins → owners. There is no env var like `NANOCLAW_ADMIN_USER_IDS`.
 
 The subscription is supervised: if the provider's bridge ends, holds are denied, running sessions stop, and session admission closes until a reconnect proves the bridge is back. If the gateway has no rule asking for approval, the host side never fires regardless of how it is wired.
+
+Module-owned approvals use `src/modules/approvals/index.ts`. `requestApproval`
+returns its id (or null), with optional `expiresAt` and `originLine`. For a larger
+transaction, call DB-only `detachApproval` inside it, then
+`finishApprovalWithdrawal` after commit so no channel work holds the DB lock;
+`withdrawApproval` handles the standalone case. Expiry uses the same terminal
+card/notification path. Only handlers registered with `{ restartSafe: true }`
+resume an approved row at host start; they must make re-entry idempotent.
 
 ## Rebuild Workflow (Temporary)
 

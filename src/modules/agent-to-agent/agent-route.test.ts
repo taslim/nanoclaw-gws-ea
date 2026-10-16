@@ -3,13 +3,26 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
+import {
+  forwardAttachedFiles,
+  isSafeAttachmentName,
+  registerA2aInboundFraming,
+  routeAgentMessage,
+} from './agent-route.js';
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
-import { createSession, updateSession } from '../../db/sessions.js';
+import {
+  createSession,
+  findSessionByAgentGroup,
+  findConversationSessions,
+  getSessionsByAgentGroup,
+  updateSession,
+} from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import * as sessionManager from '../../session-manager.js';
+import { getDb } from '../../db/connection.js';
 import type { Session } from '../../types.js';
 
 vi.mock('../../container-runner.js', () => ({
@@ -25,6 +38,10 @@ vi.mock('../../config.js', async () => {
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-a2a-route';
+registerA2aInboundFraming((content) => {
+  const parsed = JSON.parse(content) as { text: string };
+  return JSON.stringify({ ...parsed, text: `<untrusted>${parsed.text}</untrusted>` });
+});
 
 function now(): string {
   return new Date().toISOString();
@@ -33,11 +50,14 @@ function now(): string {
 function readInbound(agentGroupId: string, sessionId: string) {
   const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
   const rows = db
-    .prepare('SELECT id, platform_id, channel_type, content, source_session_id FROM messages_in ORDER BY seq')
+    .prepare(
+      'SELECT id, platform_id, channel_type, thread_id, content, source_session_id FROM messages_in ORDER BY seq',
+    )
     .all() as Array<{
     id: string;
     platform_id: string | null;
     channel_type: string | null;
+    thread_id: string | null;
     content: string;
     source_session_id: string | null;
   }>;
@@ -165,6 +185,105 @@ describe('routeAgentMessage return-path', () => {
   afterEach(async () => {
     await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('opens independent threads and replays each outbound only once', async () => {
+    await getDb().run(
+      "UPDATE agent_destinations SET session_mode = 'per-thread' WHERE agent_group_id = ? AND target_id = ?",
+      A,
+      B,
+    );
+    const send = {
+      id: 'errand-a',
+      platform_id: B,
+      content: JSON.stringify({ text: 'first errand' }),
+      in_reply_to: null,
+      thread_id: 'new',
+    };
+    await routeAgentMessage(send, S1);
+    await routeAgentMessage(send, S1);
+    const first = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:errand-a`);
+    expect(first).toBeDefined();
+    expect(readInbound(B, first!.id)).toHaveLength(1);
+    await routeAgentMessage({ ...send, id: 'errand-b', in_reply_to: 'some-other-report' }, S1);
+    const second = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:errand-b`);
+    expect(second).toBeDefined();
+    expect(second!.id).not.toBe(first!.id);
+    expect(readInbound(B, first!.id)).toHaveLength(1);
+    await routeAgentMessage({ ...send, id: 'followup-a', thread_id: first!.thread_id }, S1);
+    expect(readInbound(B, first!.id)).toHaveLength(2);
+    expect(readInbound(B, SB.id)).toHaveLength(0);
+  });
+
+  it('refuses missing, foreign, unknown and closing threads', async () => {
+    await getDb().run(
+      "UPDATE agent_destinations SET session_mode = 'per-thread' WHERE agent_group_id = ? AND target_id = ?",
+      A,
+      B,
+    );
+    const send = { id: 'threaded', platform_id: B, content: JSON.stringify({ text: 'errand' }), in_reply_to: null };
+    for (const thread_id of [null, 'system:a2a:other:thread', `system:a2a:${A}:missing`]) {
+      await expect(routeAgentMessage({ ...send, thread_id }, S1)).rejects.toMatchObject({
+        name: 'OutboundRefusedError',
+      });
+    }
+    await routeAgentMessage({ ...send, thread_id: 'new' }, S1);
+    const opened = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:threaded`)!;
+    const resolve = sessionManager.resolveSystemSession;
+    const closing = vi.spyOn(sessionManager, 'resolveSystemSession').mockImplementationOnce(async (...args) => {
+      await updateSession(opened.id, { status: 'closed' });
+      return resolve(...args);
+    });
+    try {
+      await expect(routeAgentMessage({ ...send, thread_id: 'new' }, S1)).rejects.toMatchObject({
+        name: 'OutboundRefusedError',
+        reason: 'Thread is closed. Open a new thread.',
+      });
+    } finally {
+      closing.mockRestore();
+    }
+    await expect(routeAgentMessage({ ...send, id: 'late', thread_id: opened.thread_id }, S1)).rejects.toMatchObject({
+      name: 'OutboundRefusedError',
+    });
+    expect((await getSessionsByAgentGroup(B)).filter((row) => row.thread_id === opened.thread_id)).toHaveLength(1);
+    expect(readInbound(B, opened.id)).toHaveLength(1);
+  });
+
+  it('returns reports through the originating session with their thread and registered framing', async () => {
+    await getDb().run(
+      "UPDATE agent_destinations SET session_mode = 'per-thread', inbound_untrusted = 1 WHERE agent_group_id = ? AND target_id = ?",
+      A,
+      B,
+    );
+    await routeAgentMessage(
+      {
+        id: 'book',
+        platform_id: B,
+        content: JSON.stringify({ text: 'book dinner' }),
+        in_reply_to: null,
+        thread_id: 'new',
+      },
+      S1,
+    );
+    const job = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:book`)!;
+    const request = readInbound(B, job.id)[0];
+    expect(JSON.parse(request.content).text).toBe('book dinner');
+    await routeAgentMessage(
+      {
+        id: 'report',
+        platform_id: A,
+        content: JSON.stringify({ text: 'found a table' }),
+        in_reply_to: request.id,
+        thread_id: job.thread_id,
+      },
+      job,
+    );
+    const report = readInbound(A, S1.id)[0];
+    expect(report.thread_id).toBe(job.thread_id);
+    expect(JSON.parse(report.content).text).toBe('<untrusted>found a table</untrusted>');
+    expect(readInbound(A, S2.id)).toHaveLength(0);
+    expect((await findSessionByAgentGroup(B))?.id).toBe(SB.id);
+    expect((await findConversationSessions(B)).map((row) => row.id)).toEqual([SB.id]);
   });
 
   it('forward direction: stamps source_session_id on the target inbound row', async () => {

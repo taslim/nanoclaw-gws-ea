@@ -20,6 +20,7 @@ export interface DestinationEntry {
   channelType?: string;
   platformId?: string;
   agentGroupId?: string;
+  sessionMode?: 'agent-shared' | 'per-thread';
 }
 
 export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
@@ -32,6 +33,7 @@ function destinationEntry(destination: Destination): DestinationEntry {
     channelType: destination.channelType ?? undefined,
     platformId: destination.platformId ?? undefined,
     agentGroupId: destination.agentGroupId ?? undefined,
+    sessionMode: destination.sessionMode ?? 'agent-shared',
   };
 }
 
@@ -64,7 +66,13 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   const sections: string[] = [];
 
   if (assistantName) {
-    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
+    sections.push(
+      [
+        '# You are ' + assistantName,
+        '',
+        `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
+      ].join('\n'),
+    );
   }
 
   sections.push(buildDestinationsSection(mode));
@@ -84,8 +92,8 @@ function buildReadingSection(): string {
     '',
     'Chat turns can include:',
     '',
-    '- `<message>` — the message you are answering. `<dm-history>` and `<channel-history>` are this thread\'s own earlier timeline.',
-    '- `<cross-session-context>` — a copy of something from elsewhere in this conversation: another thread, or a message you or a scheduled task posted here. Its `from` says which. If you can\'t tell whether the current message refers to it or to this thread, ask.',
+    "- `<message>` — the message you are answering. `<dm-history>` and `<channel-history>` are this thread's own earlier timeline.",
+    "- `<cross-session-context>` — a copy of something from elsewhere in this conversation: another thread, or a message you or a scheduled task posted here. Its `from` says which. If you can't tell whether the current message refers to it or to this thread, ask.",
     '- `<task>` — a scheduled task you set to come back to this conversation, carrying the instructions you wrote then. Answer it as a turn here: address a `<message>` block to whoever should hear, and when there is nothing to say, end the turn without a block.',
   ].join('\n');
 }
@@ -108,6 +116,12 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push('');
+  if (all.some((destination) => destination.sessionMode === 'per-thread')) {
+    lines.push(
+      'For a destination marked per-thread, start a separate errand with `send_message({ to: "name", thread: "new", text: "outcome, bounds, account" })`. The tool returns its thread. Every follow-up and file needs `thread` explicitly. A `<message to>` block may reply only when this batch has exactly one thread from that destination; otherwise use the tool with the thread. A closed thread cannot be reopened.',
+    );
+    lines.push('');
+  }
 
   if (mode.kind === 'task') {
     lines.push(
@@ -153,6 +167,7 @@ function buildDestinationsSection(mode: SessionMode): string {
 function destinationLabel(d: DestinationEntry): string {
   const parts: string[] = [];
   if (d.channelType) parts.push(d.channelType);
+  if (d.sessionMode === 'per-thread') parts.push('each errand needs an explicit thread');
   if (d.displayName && d.displayName !== d.name) parts.push(d.displayName);
   return parts.length > 0 ? ` (${parts.join(' · ')})` : '';
 }

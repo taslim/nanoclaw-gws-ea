@@ -20,13 +20,28 @@
  * + approval handlers via this module's public API.
  */
 import { registerResponseHandler } from '../../response-registry.js';
-import { handleApprovalsResponse } from './response-handler.js';
+import { onHostStart } from '../../host-lifecycle.js';
+import { sweepExpiredApprovals } from './lifecycle.js';
+import { handleApprovalsResponse, resumeApprovedApprovals } from './response-handler.js';
 
 // Public API re-exports so consumers import from the module root.
 export { requestApproval, registerApprovalHandler, notifyAgent } from './primitive.js';
-export type { ApprovalHandler, ApprovalHandlerContext, RequestApprovalOptions } from './primitive.js';
+export type {
+  ApprovalHandler,
+  ApprovalHandlerContext,
+  ApprovalHandlerOptions,
+  RequestApprovalOptions,
+} from './primitive.js';
 // Host-sweep hook for ghosted "Reject with reason…" holds. The re-export also
 // loads reason-capture.js, registering its message-interceptor on import.
 export { sweepAwaitingReasonRejects } from './reason-capture.js';
 
 registerResponseHandler(handleApprovalsResponse);
+
+export { detachApproval, finishApprovalWithdrawal, withdrawApproval, sweepExpiredApprovals } from './lifecycle.js';
+export { resumeApprovedApprovals } from './response-handler.js';
+
+onHostStart(async () => {
+  await sweepExpiredApprovals();
+  await resumeApprovedApprovals();
+});
