@@ -12,7 +12,7 @@ import {
 import { BrowserVault, websitePermitsOrigin } from './onepassword.js';
 import { writePrivateFile } from './paths.js';
 
-const sdk = vi.hoisted(() => ({ create: vi.fn(), list: vi.fn(), vaults: vi.fn(), resolve: vi.fn() }));
+const sdk = vi.hoisted(() => ({ create: vi.fn(), list: vi.fn(), vaults: vi.fn(), resolve: vi.fn(), get: vi.fn() }));
 vi.mock('@1password/sdk', () => ({
   createClient: sdk.create,
   RateLimitExceededError: class RateLimitExceededError extends Error {},
@@ -82,7 +82,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   sdk.create.mockResolvedValue({
     vaults: { list: sdk.vaults },
-    items: { list: sdk.list },
+    items: { list: sdk.list, get: sdk.get },
     secrets: { resolve: sdk.resolve },
   });
   sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
@@ -313,4 +313,28 @@ it('rejects unsafe token files before SDK initialization and ignores Never items
   sdk.list.mockResolvedValue([{ ...item, websites: [website('Never')] }]);
   expect(await vault().itemsForOrigin('https://shop.example')).toEqual([]);
   expect(sdk.resolve).not.toHaveBeenCalled();
+});
+
+it('leaves the host’s pending candidates out of ordinary suggestions', async () => {
+  sdk.list.mockResolvedValue([
+    item,
+    { ...item, id: 'item2', title: 'Pending signup', tags: ['gws-ea-pending/3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'] },
+    { ...item, id: 'item3', title: 'New password', category: 'Password', websites: [] },
+    { ...item, id: 'item4', title: 'Household', tags: ['household'] },
+  ]);
+  expect((await vault().itemsForOrigin('https://shop.example')).map((choice) => choice.title)).toEqual([
+    'Shop login',
+    'Household',
+  ]);
+});
+
+it('reads and writes only items in the recorded vault, under the read path’s binding', async () => {
+  const subject = vault();
+  await expect(subject.readItem(OTHER_VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_unavailable' });
+  expect(sdk.get).not.toHaveBeenCalled();
+  sdk.get.mockResolvedValue({ ...item, id: 'item1', vaultId: OTHER_VAULT_ID, fields: [], sections: [], version: 3 });
+  await expect(subject.readItem(VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_unavailable' });
+  await rm(tokenFile);
+  await expect(subject.readItem(VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_unavailable' });
+  expect(sdk.get).toHaveBeenCalledTimes(1);
 });

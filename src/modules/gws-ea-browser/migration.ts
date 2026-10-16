@@ -184,6 +184,49 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
   },
 };
 
+/**
+ * Host-generated credentials (KTD6): each operation's binding, candidate and
+ * source references and phase; never a value. A finalized row is the
+ * ownership record of the Login it names. Rows outlive jobs, so `job_id` is
+ * deliberately not a foreign key.
+ */
+export const browserCredentialAttemptsMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:credential-attempts',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_credential_attempts (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
+        job_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        vault_id TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        site TEXT NOT NULL,
+        username TEXT NOT NULL,
+        source_item_id TEXT,
+        source_version INTEGER,
+        candidate_item_id TEXT,
+        candidate_version INTEGER,
+        phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
+        save_started_at TEXT,
+        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','concurrent_edit','promotion_disabled')),
+        evidence_json TEXT,
+        owned_item_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        exposed_at TEXT,
+        finalized_at TEXT,
+        CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
+        CHECK(owned_item_id IS NULL OR phase = 'finalized')
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
+      CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;
+    `);
+  },
+};
+
 /** Spending state is independent of transient approval cards and session lifetime. */
 export const browserPurchaseMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 4,
