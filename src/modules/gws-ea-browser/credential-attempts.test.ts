@@ -5,7 +5,7 @@ import { AutofillBehavior, ItemCategory, ItemFieldType, RateLimitExceededError, 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
-import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
+import { CredentialAttempts, type CredentialAttempt, type CredentialPrepareResult } from './credential-attempts.js';
 import {
   onePasswordHostPaths,
   onePasswordInstancePaths,
@@ -29,6 +29,7 @@ const VAULT_ID = 'morganelleryvault000000001';
 const INSTANCE_ID = '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b';
 const TOKEN = 'ops_fixture-runtime-service-account-token';
 const JOB = 'system:a2a:main:credential-job';
+const OTHER_JOB = 'system:a2a:main:later-credential-job';
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
 const PRINCIPAL_PASSWORD = 'principal-chosen-password-1';
@@ -516,6 +517,53 @@ describe('password changes', () => {
     expect(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) })).toEqual({
       status: 'busy',
     });
+  });
+
+  it('lets a later job take over a change another job saved but never disclosed, whose late disclosure then loses', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const handle = await handleFor(itemId);
+    const idle = expectPrepared(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: handle }));
+    expect(await subject.save(idle.id)).toMatchObject({ status: 'saved' });
+    const candidateId = (await subject.get(idle.id))?.candidate_item_id;
+    if (!candidateId) throw new Error('no candidate');
+
+    // The later job takes over while the earlier one is between its checks and its compare-and-set.
+    const takeover: Promise<CredentialPrepareResult>[] = [];
+    const racing = async (): Promise<void> => {
+      if (takeover.length === 0)
+        takeover.push(subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: handle }));
+      await takeover[0];
+    };
+    expect(await subject.disclose(idle.id, { jobId: JOB, origin: ORIGIN }, racing)).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
+    });
+    expect(takeover).toHaveLength(1);
+    const next = expectPrepared(await takeover[0]);
+    expect(next).toMatchObject({ job_id: OTHER_JOB, phase: 'preparing', source_item_id: itemId });
+    expect(await phase(idle.id)).toBe('rejected');
+    expect(fake.archived.has(candidateId)).toBe(true);
+    expect(await subject.unresolved()).toEqual([expect.objectContaining({ id: next.id })]);
+  });
+
+  it('answers busy to every other job while a change may have reached the site', async () => {
+    const subject = service({ automaticPromotion: false });
+    const { itemId } = await ownedLogin(subject);
+    const change = await changedPassword(subject, itemId);
+    const other = async (): Promise<CredentialPrepareResult> =>
+      subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) });
+    expect(await other()).toEqual({ status: 'busy' });
+    await subject.markAwaitingVerification(change.attempt.id);
+    expect(await other()).toEqual({ status: 'busy' });
+    await subject.markUnknown(change.attempt.id);
+    expect(await other()).toEqual({ status: 'busy' });
+    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
+    expect(await other()).toEqual({ status: 'busy' });
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'conflict' });
+    expect(await other()).toEqual({ status: 'busy' });
+    expect(await phase(change.attempt.id)).toBe('conflict');
+    expect(fake.archived.has(change.candidateId)).toBe(false);
   });
 
   it('bounds a rate-limited update, reports a racing edit as a conflict, and promotes on explicit reconciliation', async () => {

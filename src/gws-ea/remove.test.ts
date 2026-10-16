@@ -9,6 +9,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { ASSISTANT_TOKEN, FakeGoogleEvents } from '../modules/gws-ea-chat/testing/fake-google-events.js';
 import { GOOGLE_GRANT_FILE_NAME, GOOGLE_SIGN_IN_SCOPES } from '../modules/gws-ea-google/grant.js';
+import { retireCapturedServiceAccount } from '../modules/gws-ea-browser/onepassword-cli.js';
 import {
   onePasswordHostPaths,
   onePasswordInstancePaths,
@@ -28,6 +29,7 @@ import {
   withInstanceOperation,
 } from './journal.js';
 import { ONECLI_INSTANCE_LABEL, ONECLI_RESOURCE_ROLE_LABEL } from './onecli-compose.js';
+import { vaultCreationRecord } from './onepassword.js';
 import {
   advanceOperation,
   beginOperation,
@@ -1795,12 +1797,21 @@ async function onePasswordHost(paths: ControlPlanePaths, provider: FakeOnePasswo
 
 let nextProviderId = 10;
 
-/** One assistant's vault and runtime service account, recorded in its instance as provisioning leaves them. */
+/**
+ * One assistant's vault and runtime service account, recorded in its instance
+ * as provisioning leaves them: `unverified` when its token was captured but
+ * never verified, `unproven` when no token was kept from its creation either.
+ */
 async function assistantVault(
   paths: ControlPlanePaths,
   input: InstanceReservationInput,
   provider: FakeOnePassword,
-  options: { readonly items?: number; readonly creator?: string | 'operator'; readonly accountId?: string } = {},
+  options: {
+    readonly items?: number;
+    readonly creator?: string | 'operator';
+    readonly accountId?: string;
+    readonly runtime?: 'recorded' | 'unverified' | 'unproven';
+  } = {},
 ) {
   const management = [...provider.serviceAccounts.values()].find((account) => account.access === 'create_vaults');
   const creator = options.creator ?? management?.id ?? providerId('MANAGEMENT', 1);
@@ -1818,6 +1829,8 @@ async function assistantVault(
   const files = onePasswordInstancePaths(paths.instanceRoot(input.instance_id));
   await mkdir(path.dirname(files.runtimeTokenFile), { recursive: true, mode: 0o700 });
   await writeFile(files.runtimeTokenFile, `${token}\n`, { mode: 0o600 });
+  const runtime = options.runtime ?? 'recorded';
+  if (runtime === 'unproven') await retireCapturedServiceAccount(files.runtimeTokenFile, 'GWS-EA runtime');
   await writeOnePasswordResources(files.resourceFile, {
     schemaVersion: 2,
     instanceId: input.instance_id,
@@ -1830,10 +1843,29 @@ async function assistantVault(
           : { kind: 'management_service_account', serviceAccountId: creator },
     },
     operatorGrant: null,
-    runtimeServiceAccountId: runtimeId,
+    runtimeServiceAccountId: runtime === 'recorded' ? runtimeId : null,
     retiredRuntimeServiceAccountIds: [],
   });
   return { vaultId, runtimeId, tokenFile: files.runtimeTokenFile, resourceFile: files.resourceFile };
+}
+
+/**
+ * A vault creation cut off before 1Password answered: the provider created
+ * the vault, and the instance holds only the intent, with no vault ID.
+ */
+async function unprovenVault(paths: ControlPlanePaths, input: InstanceReservationInput, provider: FakeOnePassword) {
+  const name = `Assistant ${input.exclusive_resource_claims.workspace_email}`;
+  const management = [...provider.serviceAccounts.values()].find((account) => account.access === 'create_vaults');
+  const vaultId = providerId('VAULT', (nextProviderId += 1));
+  provider.vaults.set(vaultId, { id: vaultId, name, creator: management!.id, grants: new Map(), items: 0 });
+  const files = onePasswordInstancePaths(paths.instanceRoot(input.instance_id));
+  await mkdir(path.dirname(files.resourceFile), { recursive: true, mode: 0o700 });
+  await writeFile(
+    vaultCreationRecord(files),
+    `${JSON.stringify({ schemaVersion: 1, instanceId: input.instance_id, accountId: ONEPASSWORD_ACCOUNT, vaultName: name, startedAt: new Date().toISOString() })}\n`,
+    { mode: 0o600 },
+  );
+  return { name, vaultId };
 }
 
 /** The 1Password requests that changed something, as `op` words. */
@@ -2112,6 +2144,83 @@ describe("removal of the assistant's 1Password resources (KTD9, AE5)", () => {
     expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
   });
 
+  it('names a vault whose creation was never proven, deletes nothing, and keeps the name until the operator closes it', async () => {
+    const paths = await testPaths();
+    const provider = new FakeOnePassword();
+    await onePasswordHost(paths, provider);
+    const input = await reserve(paths, reservationInput(), { started: STARTED });
+    const stray = await unprovenVault(paths, input, provider);
+    const scene = world(input);
+    const dependencies = { ...scene.dependencies, onePassword: provider.cli() };
+    const unproven = [{ kind: 'vault', name: stray.name }];
+
+    const preview = await describeRemoval(paths, input.instance_id, { onePassword: provider.cli() });
+    expect(preview.onepassword).toMatchObject({ vault_id: null, vault: 'unrecorded', unproven });
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
+
+    expect(outcome.onepassword).toMatchObject({
+      account_id: ONEPASSWORD_ACCOUNT,
+      vault_id: null,
+      vault: 'unrecorded',
+      unproven,
+      receipt_file: paths.removalFile(input.instance_id),
+    });
+    // Only its name finds it, so removal never looks for it or deletes it: that is the operator's.
+    expect(provider.calls).toEqual([]);
+    expect(provider.vaults.has(stray.vaultId)).toBe(true);
+    // The intent went with the instance; the receipt outside it still names the vault.
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(false);
+    const receipt = await receiptOf(paths, input);
+    expect(receipt.onepassword).toMatchObject({ account_id: ONEPASSWORD_ACCOUNT, vault_id: null, unproven });
+    expect(String(receipt.onepassword?.operator_action)).toContain(`"${stray.name}"`);
+
+    const again = await removeAssistant(paths, input.instance_id, dependencies);
+    expect(again.onepassword).toMatchObject({ unproven, receipt_file: paths.removalFile(input.instance_id) });
+    const closed = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      abandon: new Set(['onepassword']),
+    });
+    expect(closed.abandoned).toEqual([{ resource: 'onepassword', evidence: expect.stringContaining(stray.name) }]);
+    expect(closed.onepassword).toMatchObject({ receipt_file: null });
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+    expect(provider.vaults.has(stray.vaultId)).toBe(true);
+  });
+
+  it.each([
+    ['a runtime token it never verified', 'unverified'],
+    ['a runtime account whose creation was never proven', 'unproven'],
+  ] as const)('names %s, revokes nothing, and keeps the name until the operator closes it', async (_label, runtime) => {
+    const { paths, provider, input, vault, dependencies } = await setUp({ runtime });
+    const name = `GWS-EA ${input.instance_id.slice(0, 8)} ${input.exclusive_resource_claims.workspace_email}`;
+    const unproven = [{ kind: 'service_account', name }];
+
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
+
+    // The recorded vault settles as ever; the account 1Password may hold has no ID, so only its name is kept.
+    expect(outcome.onepassword).toMatchObject({
+      vault_id: vault.vaultId,
+      vault: 'deleted',
+      runtime_token: runtime === 'unverified' ? 'deleted' : 'absent',
+      revoke_service_account_ids: [],
+      unproven,
+      receipt_file: paths.removalFile(input.instance_id),
+    });
+    expect(provider.serviceAccounts.has(vault.runtimeId)).toBe(true);
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(false);
+    const receipt = await receiptOf(paths, input);
+    expect(receipt.onepassword).toMatchObject({ runtime_service_account_ids: [], unproven });
+    expect(String(receipt.onepassword?.operator_action)).toContain(`"${name}"`);
+    expect(JSON.stringify(receipt)).not.toContain('ops_');
+
+    const closed = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      abandon: new Set(['onepassword']),
+    });
+    expect(closed.abandoned).toEqual([{ resource: 'onepassword', evidence: expect.stringContaining(name) }]);
+    expect(closed.onepassword).toMatchObject({ receipt_file: null });
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+  });
+
   it('pauses before any change on a 1Password record it cannot read, and leaves it behind only on request', async () => {
     const { paths, input, vault, dependencies } = await setUp();
     await writeFile(vault.resourceFile, '{"schemaVersion": 2,', { mode: 0o600 });
@@ -2282,6 +2391,48 @@ describe('removal command', () => {
     expect(text).toContain(`Not revoked: service account ${vault.runtimeId}`);
     expect(text).not.toMatch(/\brevoked (?:it|them|service)/iu);
     expect(text).not.toContain('ops_');
+  });
+
+  it('names a creation never proven in the preview, the published contract and the text, with the step that closes it', async () => {
+    const paths = await testPaths();
+    const provider = new FakeOnePassword();
+    await onePasswordHost(paths, provider);
+    const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout', 'start_nanoclaw'] });
+    const stray = await unprovenVault(paths, input, provider);
+    const scene = world(input);
+    const output: string[] = [];
+    const removal = (args: readonly string[]) =>
+      runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
+        paths,
+        stdout: (line) => output.push(line),
+        stderr: () => undefined,
+        onePassword: provider.cli(),
+        removeAssistant: (removalPaths, id, options) =>
+          removeAssistant(removalPaths, id, { ...scene.dependencies, ...options, interaction: scene.interaction }),
+      });
+
+    expect(await removal(['--json'])).toBe(0);
+    const result = JSON.parse(output.join('\n')) as {
+      next_actions: unknown[];
+      data: { preview: { onepassword: Record<string, unknown> }; removal: { onepassword: Record<string, unknown> } };
+    };
+    expectResultContract('remove', result);
+    const unproven = [{ kind: 'vault', name: stray.name }];
+    expect(result.data.preview.onepassword).toMatchObject({ vault_id: null, vault: 'unrecorded', unproven });
+    expect(result.data.removal.onepassword).toMatchObject({ vault_id: null, vault: 'unrecorded', unproven });
+    expect(result.next_actions).toEqual([
+      { kind: 'external', instruction: expect.stringContaining(`"${stray.name}"`) },
+      { kind: 'command', argv: ['gws-ea', 'remove', '--id', input.instance_id, '--yes', '--abandon', 'onepassword'] },
+    ]);
+
+    output.length = 0;
+    expect(await removal([])).toBe(0);
+    const text = output.join('\n');
+    expect(text).toContain(`1Password account ${ONEPASSWORD_ACCOUNT}`);
+    expect(text).toContain(`1Password vault: none recorded in account ${ONEPASSWORD_ACCOUNT}.`);
+    expect(text).toContain(`Never proven: vault "${stray.name}" may exist`);
+    expect(text).toContain(`gws-ea remove --id ${input.instance_id} --yes --abandon onepassword`);
+    expect(provider.vaults.has(stray.vaultId)).toBe(true);
   });
 
   it('rejects an unknown resource to abandon before anything runs', async () => {

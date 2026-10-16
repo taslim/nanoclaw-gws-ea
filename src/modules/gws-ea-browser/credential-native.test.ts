@@ -89,14 +89,25 @@ const controlled = (submit: string, endpoint = '/api/signup'): string => `<div i
     .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
   ${submit}
 </script>`;
+const noFormSignup = `<h1>Join</h1><div>${field('Email', 'email', 'email', 'email')}${field('Password', 'password', 'password', 'new-password')}<div role="button" tabindex="0" id="go">Create account</div></div>${controlled(
+  "go.addEventListener('click', () => { if (go.getAttribute('aria-disabled') !== 'true') send(); });",
+)}`;
+/** A formless change page whose own handler sends every field on it, as a whole-page settings save does. */
+const noFormChange = (extra = ''): string =>
+  `<h1>Security</h1><div>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${extra}<div role="button" tabindex="0" id="go">Change password</div></div><div id="result"></div><script>
+  document.getElementById('go').addEventListener('click', () => {
+    const body = Object.fromEntries(Array.from(document.querySelectorAll('input'), (input) => [input.name, input.value]));
+    fetch('/api/change-password', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+  });
+</script>`;
 const PAGES: Record<string, string> = {
   '/native-signup': nativeForm('/signup'),
   '/js-signup': `<h1>Join</h1><form id="join">${signupFields}<button id="go" type="submit" disabled>Create account</button></form>${controlled(
     "document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });",
   )}`,
-  '/no-form-signup': `<h1>Join</h1><div>${field('Email', 'email', 'email', 'email')}${field('Password', 'password', 'password', 'new-password')}<div role="button" tabindex="0" id="go">Create account</div></div>${controlled(
-    "go.addEventListener('click', () => { if (go.getAttribute('aria-disabled') !== 'true') send(); });",
-  )}`,
+  '/no-form-signup': noFormSignup,
+  '/checkout/join': noFormSignup,
   '/multi-step': `<h1>Join</h1><form method="post" action="/signup/email">${field('Email', 'email', 'email', 'username')}<button type="submit">Continue</button></form>`,
   '/masking': `<h1>Join</h1><form id="join">${signupFields}<button id="go" type="submit">Create account</button></form><input name="notes" aria-label="Notes"><div id="echo"></div>${controlled(
     `document.querySelector('[name=password]').addEventListener('input', (event) => {
@@ -110,6 +121,8 @@ const PAGES: Record<string, string> = {
   '/change': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-shown-account': `<h1>Security</h1><form method="post" action="/account/change-password"><label>Account <input type="email" name="email" autocomplete="username" value="${USERNAME}" readonly></label>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-with-email': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Recovery email', 'recovery_email', 'email', 'email')}<button type="submit">Change password</button></form>`,
+  '/no-form-change': noFormChange(),
+  '/no-form-change-with-email': noFormChange(field('Recovery email', 'recovery_email', 'email', 'email')),
   '/change-email': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}<button type="submit">Update email</button></form>`,
   '/offsite-action': nativeForm('https://collector.example/signup'),
   '/http-action': nativeForm('http://accounts.shop.example/signup'),
@@ -229,13 +242,14 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
             html(
               `<h1>Choose a password</h1><form method="post" action="/signup/password">${field('Password', 'password', 'password', 'new-password')}${field('Confirm password', 'confirm', 'password', 'new-password')}<button type="submit">Create account</button></form>`,
             );
-          else if (path === '/account/change-password') {
-            const form = new URLSearchParams(body);
-            if (form.get('current_password') !== accountPassword)
-              html(`<p>Current password is incorrect.</p>${PAGES['/change']}`);
+          else if (path === '/account/change-password' || path === '/api/change-password') {
+            const native = path === '/account/change-password';
+            const sent = new URLSearchParams(native ? body : (JSON.parse(body) as Record<string, string>));
+            if (sent.get('current_password') !== accountPassword)
+              html(`<p>Current password is incorrect.</p>${native ? PAGES['/change'] : ''}`);
             else {
-              accountPassword = form.get('new_password') ?? undefined;
-              html('<h1>Your password has been changed.</h1>');
+              accountPassword = sent.get('new_password') ?? undefined;
+              html(responses.get(path) ?? '<h1>Your password has been changed.</h1>');
             }
           } else html(responses.get(path) ?? '<h1>Account created</h1><a href="/logout">Sign out</a>');
         });
@@ -482,6 +496,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       confirmation: 'Confirm new password',
       activate: 'Change password',
     };
+    const NO_FORM_CHANGE = {
+      current_password: 'Current password',
+      new_password: 'New password',
+      activate: 'Change password',
+    };
 
     it('fills current, new and confirmation from one saved candidate and keeps both credentials while promotion is off', async () => {
       const { itemId, handle } = await ownedAccount();
@@ -547,11 +566,44 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected' });
     }, 30_000);
 
+    it('changes the password on a formless page whose only editable fields are the bound ones', async () => {
+      const { handle } = await ownedAccount();
+      const original = accountPassword;
+      const authority = await changeAuthority(handle);
+      await page.goto(`${SITE}/no-form-change`);
+      expect(await fill(authority, await refs(NO_FORM_CHANGE))).toEqual({
+        status: 'password_changed',
+        vault: 'both_kept',
+      });
+      const next = await candidatePassword(authority.id);
+      expect(posts).toEqual([
+        {
+          host: 'accounts.shop.example',
+          path: '/api/change-password',
+          body: JSON.stringify({ current_password: original, new_password: next }),
+        },
+      ]);
+      expect(accountPassword).toBe(next);
+    }, 30_000);
+
+    it('reports a change the site confirms beside its notice that it emailed the account', async () => {
+      const { handle } = await ownedAccount();
+      const authority = await changeAuthority(handle);
+      responses.set(
+        '/account/change-password',
+        '<h1>Your password has been changed.</h1><p>We sent you an email to let you know.</p>',
+      );
+      await page.goto(`${SITE}/change`);
+      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'password_changed', vault: 'both_kept' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'conflict' });
+    }, 30_000);
+
     for (const [path, names] of [
       [
         '/change-with-email',
         { current_password: 'Current password', new_password: 'New password', activate: 'Change password' },
       ],
+      ['/no-form-change-with-email', NO_FORM_CHANGE],
       [
         '/change-email',
         { current_password: 'Current password', new_password: 'New password', activate: 'Update email' },
@@ -598,6 +650,16 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         status: 'refused',
         reason: 'unsupported_form',
       });
+      await unexposed(authority);
+      expect(fake.calls).not.toContain('create');
+    }, 30_000);
+
+    it("refuses a formless page whose own address is the site's checkout", async () => {
+      await page.goto(`${SITE}/checkout/join`);
+      const authority = await signupAuthority();
+      expect(
+        await fill(authority, await refs({ username: 'Email', new_password: 'Password', activate: 'Create account' })),
+      ).toEqual({ status: 'refused', reason: 'purchase_control' });
       await unexposed(authority);
       expect(fake.calls).not.toContain('create');
     }, 30_000);

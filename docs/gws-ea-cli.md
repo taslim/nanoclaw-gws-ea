@@ -155,8 +155,10 @@ stops, and deletes the vault only when this host's management service account
 created it and it is empty or `--delete-vault` was confirmed; never another
 vault. gws-ea never revokes a service account: revoke the ones disable and
 removal results name on 1Password.com under Developer > Directory. A removal
-receipt keeps their IDs after the assistant is gone; once they are revoked,
-close it with `gws-ea remove --id <full-id> --yes --abandon onepassword`.
+receipt keeps their IDs after the assistant is gone, and the names of any vault
+or runtime service account whose creation was never proven; once you have
+revoked or deleted them, close it with
+`gws-ea remove --id <full-id> --yes --abandon onepassword`.
 
 ## Automation and streams
 

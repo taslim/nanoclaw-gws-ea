@@ -327,11 +327,6 @@ export class BrowserQueue {
         return;
       }
       execution = action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>);
-      let answered = false;
-      const actionResult = execution.then((value) => {
-        answered = true;
-        return value;
-      });
       const aborted = new Promise<Record<string, unknown>>((resolve) =>
         controller.signal.addEventListener(
           'abort',
@@ -339,14 +334,20 @@ export class BrowserQueue {
           { once: true },
         ),
       );
-      const result = await Promise.race([actionResult, timeout, aborted]);
+      // Only the winner's value can answer: an action cut off by its timeout or
+      // abort reports its durable state, whatever it settles to while closing.
+      const { won, result } = await Promise.race([
+        execution.then((value) => ({ won: true, result: value })),
+        timeout.then((value) => ({ won: false, result: value })),
+        aborted.then((value) => ({ won: false, result: value })),
+      ]);
       if (controller.signal.aborted) await this.runtime.closeJob(request.job_id);
       const latest = await this.store.request(request.id);
       await this.finish(
         started,
         controller.signal.aborted && latest?.commit_started_at
           ? stopped('outcome_unknown', false)
-          : answered
+          : won
             ? result
             : ((await actions.get(request.action)?.recover?.(started)) ?? result),
       );

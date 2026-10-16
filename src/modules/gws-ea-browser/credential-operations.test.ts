@@ -38,6 +38,7 @@ import { CredentialAttempts, type CredentialAttempt } from './credential-attempt
 import {
   credentialAuthorityRequest,
   executeCredentialForm,
+  recoverCredentialAttempts,
   registerCredentialAuthorityDelivery,
   validateCredentialForm,
 } from './credential-operations.js';
@@ -45,6 +46,7 @@ import { BrowserStore } from './db.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword, FIXTURE_VAULT_ID, writeVaultFixture } from './onepassword-fixture.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { openSignupVerification } from './sign-in-mail.js';
 
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
@@ -227,15 +229,21 @@ describe("main's credential authority", () => {
       phase: 'preparing',
     });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual(recorded);
-    // One change per Login is open at a time, whichever errand asks.
+    // One change per Login is open at a time: a later errand takes over one that disclosed nothing,
+    // and one that may have reached the site keeps the Login busy for every other errand.
     const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;
-    expect(
-      await credentialAuthorityRequest(
-        { thread: other.thread_id, operation: 'change_password', site: ORIGIN, username: USERNAME },
-        main,
-        { attempts },
-      ),
-    ).toEqual({ status: 'busy' });
+    const taken = await credentialAuthorityRequest(
+      { thread: other.thread_id, operation: 'change_password', site: ORIGIN, username: USERNAME },
+      main,
+      { attempts },
+    );
+    expect(taken).toMatchObject({ status: 'recorded', operation: 'change_password', username: USERNAME });
+    expect(await attempts.get(String(recorded.authority))).toMatchObject({ phase: 'rejected' });
+    await getDb().run(
+      `UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed' WHERE id = ?`,
+      String(taken.authority),
+    );
+    expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
   });
 
   it('is main-only, needs a live job and an HTTPS site, and offers no other account-security change', async () => {
@@ -393,6 +401,29 @@ describe('the browser credential request', () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'conflict', conflict_reason: 'promotion_disabled' });
   });
 
+  it("answers not_watched from verify when the signup's email has no wait, and leaves it for the principal's release", async () => {
+    const id = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
+    await attempts.save(id);
+    // No inbox here, so the wait the submission opens before disclosure could not be opened.
+    expect(
+      await openSignupVerification({
+        jobId: job.thread_id!,
+        claimId: 'signup-request',
+        attemptId: id,
+        origin: ORIGIN,
+        username: USERNAME,
+      }),
+    ).toBe(false);
+    await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+    await attempts.markAwaitingVerification(id);
+    const { context: execution, page } = context();
+    expect(await executeCredentialForm(execution, { authority: id, operation: 'verify' }, { attempts })).toEqual({
+      status: 'not_watched',
+    });
+    expect(page).not.toHaveBeenCalled();
+    expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
+  });
+
   it('never accepts a terms checkbox for a password change', async () => {
     await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
@@ -492,6 +523,27 @@ describe('the browser credential request', () => {
       expect(await result).toEqual({ status: 'refused', reason: 'not_disclosed' });
       expect(page).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('restart recovery', () => {
+  it('makes an attempt a stopped host left exposed unknown, with no request left to settle it', async () => {
+    const exposed = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
+    await attempts.save(exposed);
+    await attempts.disclose(exposed, { jobId: job.thread_id!, origin: ORIGIN });
+    const waiting = String(
+      (await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).authority,
+    );
+    await attempts.save(waiting);
+    await attempts.disclose(waiting, { jobId: job.thread_id!, origin: ORIGIN });
+    await attempts.markAwaitingVerification(waiting);
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_requests')).toEqual([]);
+    await recoverCredentialAttempts(attempts);
+    const recovered = await attempts.get(exposed);
+    expect(recovered).toMatchObject({ phase: 'unknown' });
+    expect(JSON.parse(recovered!.evidence_json!)).toMatchObject({ signal: 'interrupted' });
+    // Only an exposed attempt had nothing to settle it; a verification wait keeps its own step.
+    expect(await attempts.get(waiting)).toMatchObject({ phase: 'awaiting_verification' });
   });
 });
 

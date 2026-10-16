@@ -53,6 +53,7 @@ import {
   activateNativeCredentialControl,
   fillNativeCredentialGroup,
   inspectNativeCredentialControl,
+  readNativeDocumentFields,
   type CredentialActivationResult,
   type NativeCredentialBinding,
   type NativeCredentialFacts,
@@ -625,10 +626,26 @@ function destination(action: string, kind: CredentialKind, site: string): void {
 const editable = (field: NativeFieldFacts): boolean => field.type !== 'hidden' && !field.readonly && !field.disabled;
 
 /**
- * The form the group submits: same-window, on its site, with no payment
- * field. A change form may hold no editable sign-in field at all: an email,
- * phone or code field there would change the account's security.
+ * The fields that may travel with the group: no payment or file field, and
+ * for a change no editable sign-in field at all, since an email, phone or
+ * code field there would change the account's security.
  */
+function checkFields(fields: readonly NativeFieldFacts[], kind: CredentialKind): void {
+  if (fields.some((field) => FINANCIAL_FIELD.test(`${field.name} ${field.autocomplete}`)))
+    throw new StepStop('purchase_control');
+  if (fields.some((field) => field.type === 'file')) throw new StepStop('unsupported_form');
+  if (
+    kind === 'rotation' &&
+    fields.some(
+      (field) =>
+        editable(field) &&
+        (['email', 'tel'].includes(field.type) || SECURITY_FIELD.test(`${field.name} ${field.autocomplete}`)),
+    )
+  )
+    throw new StepStop('account_security');
+}
+
+/** The form the group submits: same-window, on its site, with only fields `checkFields` allows. */
 function checkForm(facts: NativeCredentialFacts, group: Pick<CredentialGroup, 'kind' | 'site'>): void {
   const { form, override } = facts;
   for (const submission of [form, override])
@@ -636,19 +653,23 @@ function checkForm(facts: NativeCredentialFacts, group: Pick<CredentialGroup, 'k
       if (submission.target && submission.target !== '_self') throw new StepStop('unsupported_form');
       destination(submission.action, group.kind, group.site);
     }
-  if (!form) return;
-  if (form.fields.some((field) => FINANCIAL_FIELD.test(`${field.name} ${field.autocomplete}`)))
-    throw new StepStop('purchase_control');
-  if (form.fields.some((field) => field.type === 'file')) throw new StepStop('unsupported_form');
-  if (
-    group.kind === 'rotation' &&
-    form.fields.some(
-      (field) =>
-        editable(field) &&
-        (['email', 'tel'].includes(field.type) || SECURITY_FIELD.test(`${field.name} ${field.autocomplete}`)),
-    )
-  )
-    throw new StepStop('account_security');
+  if (form) checkFields(form.fields, group.kind);
+}
+
+/**
+ * A formless group has no form to bound what the site's handler sends: the
+ * document stands in for one. Its address must be an ordinary page of the
+ * operation's site, and every other field in it must pass `checkFields`.
+ */
+async function checkDocument(
+  frame: Frame,
+  group: Pick<CredentialGroup, 'kind' | 'site'>,
+  native: Pick<NativeCredentialGroup, 'fields' | 'control'>,
+): Promise<void> {
+  destination(frame.url(), group.kind, group.site);
+  const others = await readNativeDocumentFields(frame, native);
+  if (!others) throw new StepStop('unsupported_form');
+  checkFields(others, group.kind);
 }
 
 async function bindGroup(
@@ -703,6 +724,8 @@ async function bindGroup(
   const group = { kind: attempt.kind, site: attempt.site, frame, fields };
   checkForm(fields[0].binding.facts, group);
   checkForm(controlBinding.facts, group);
+  if (form === null)
+    await checkDocument(frame, group, { control: controlBinding, fields: fields.map((field) => field.binding) });
   // The Login is saved under the authority's username: a form that names the account must receive exactly that.
   if (
     scope.step === 'credentials' &&
@@ -834,13 +857,17 @@ type WebsiteResult =
 const freshSignal = (before: SiteState, now: SiteState, signal: Signal): boolean =>
   [...now.lines].some((line) => !before.lines.has(line) && SIGNALS[signal].test(line));
 
-/** The website's own response to one submission, from the lines it showed after it. */
+/**
+ * The website's own response to one submission, from the lines it showed
+ * after it. Only a signup is ever verified by email: a change's notice that
+ * the site emailed the account says nothing about whether it took.
+ */
 function websiteResult(kind: CredentialKind, before: SiteState, now: SiteState): WebsiteResult {
   const fresh = (signal: Signal): boolean => freshSignal(before, now, signal);
   if (kind === 'signup' && fresh('exists')) return 'account_exists';
   if (kind === 'rotation' && fresh('rejectedCurrent')) return 'current_password_rejected';
   if (fresh('rejectedPassword') && now.passwordForm) return 'password_rejected';
-  if (fresh('verification')) return 'verification_requested';
+  if (kind === 'signup' && fresh('verification')) return 'verification_requested';
   if (kind === 'signup' ? fresh('signupSuccess') || (fresh('signedIn') && !now.passwordForm) : fresh('changeSuccess'))
     return 'confirmed';
   return 'none';
@@ -1322,7 +1349,9 @@ const VERIFY_MARGIN_MS = 15_000;
  * Completes a signup the site asked to confirm by email. Only the answer the
  * isolated interpreter returned for this signup's own claim is used, and only
  * by the host: a link is opened on the site, a code goes into the field the
- * browser named. Success needs the site's own fresh confirmation.
+ * browser named. Success needs the site's own fresh confirmation. With no
+ * wait for this signup's mail, `not_watched`: the host cannot complete it,
+ * and the attempt stays for the principal's release.
  */
 async function verify(
   context: BrowserExecutionContext,
@@ -1333,7 +1362,7 @@ async function verify(
   if (attempt.phase !== 'awaiting_verification')
     return (await settledOutcome(attempt, attempts, context.assertActive)) ?? refused('not_disclosed');
   const arrived = await takeSignupVerification(context, attempt.id, context.remaining() - VERIFY_MARGIN_MS);
-  if (arrived.status === 'nothing_arrived') return { status: 'nothing_arrived' };
+  if (arrived.status === 'nothing_arrived' || arrived.status === 'not_watched') return { status: arrived.status };
   if (arrived.status === 'unavailable') {
     await finishSignupVerification(attempt.id);
     return { status: 'ambiguous' };

@@ -675,14 +675,14 @@ describe('a signup waiting for its email verification', () => {
     receive('Your verification code is 642981', { to: 'Assistant@example.com' });
     expect(await interpretFor('signup-request', { kind: 'code', value: '642981' })).toEqual({ status: 'accepted' });
     expect(await interpretFor('signup-request', { kind: 'code', value: '111111' })).toEqual({ status: 'no_wait' });
-    expect(await takeSignupVerification(context('another-job'), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
-    expect(await takeSignupVerification(context(), 'attempt-2')).toEqual({ status: 'nothing_arrived' });
+    expect(await takeSignupVerification(context('another-job'), 'attempt-1')).toEqual({ status: 'not_watched' });
+    expect(await takeSignupVerification(context(), 'attempt-2')).toEqual({ status: 'not_watched' });
     const taken = await takeSignupVerification(context(), 'attempt-1');
     expect(taken).toMatchObject({ status: 'arrived', reply: { kind: 'code', value: '642981' } });
     // Taking does not spend it: a step that cannot use it yet leaves it for the next.
     expect(await takeSignupVerification(context(), 'attempt-1')).toMatchObject({ status: 'arrived' });
     await finishSignupVerification('attempt-1');
-    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'not_watched' });
     expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'finished' });
   });
 
@@ -703,6 +703,8 @@ describe('a signup waiting for its email verification', () => {
     for (const message of messages) expect(await routeSignInMail(parseGmailMessage(message), new Date())).toBe(false);
     expect(await getSessionsByAgentGroup('external-email')).toEqual([]);
     expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'waiting', gmail_message_id: null });
+    // Still watched: nothing has arrived yet, which a later verify step may still find.
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
   });
 
   it("opens no wait for an account outside the assistant's mailbox, or without an inbox", async () => {
@@ -710,6 +712,8 @@ describe('a signup waiting for its email verification', () => {
     setActiveInbox(undefined);
     expect(await openSignupVerification(signup)).toBe(false);
     expect(await getSignInClaim('signup-request')).toBeUndefined();
+    // A verify step learns at once that nothing will arrive, rather than waiting forever.
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'not_watched' });
   });
 
   it.each(['cancellation', 'restart'] as const)('drops a held answer on %s', async (mode) => {
@@ -718,6 +722,6 @@ describe('a signup waiting for its email verification', () => {
     await interpretFor('signup-request', { kind: 'code', value: '642981' });
     if (mode === 'cancellation') await cleanupBrowserSignInMail('job');
     else await recoverBrowserSignInMail();
-    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'not_watched' });
   });
 });

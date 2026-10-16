@@ -382,6 +382,7 @@ const cleanup = object(
   ['checkout', 'removed'],
 );
 const vaultOutcome = ['deleted', 'retained', 'gone'] as const;
+const unprovenCreations = array(object({ kind: choices('vault', 'service_account'), name: text }));
 const removalPreview = object({
   instanceId: text,
   checkout: text,
@@ -391,12 +392,13 @@ const removalPreview = object({
   onepassword: nullable(
     object({
       account_id: text,
-      vault_id: text,
+      vault_id: nullable(text),
       owned: bool,
       item_count: nullable(count),
-      vault: choices('delete', 'retain', ...vaultOutcome),
+      vault: choices('delete', 'retain', ...vaultOutcome, 'unrecorded'),
       reason: text,
       runtime_service_account_ids: array(text),
+      unproven: unprovenCreations,
     }),
   ),
 });
@@ -408,12 +410,13 @@ const removal = object(
     memberPolicyUnrestored: text,
     onepassword: object({
       account_id: text,
-      vault_id: text,
-      vault: choices(...vaultOutcome, 'left_behind'),
+      vault_id: nullable(text),
+      vault: choices(...vaultOutcome, 'left_behind', 'unrecorded'),
       item_count: nullable(count),
       reason: text,
       runtime_token: choices('deleted', 'absent'),
       revoke_service_account_ids: array(text),
+      unproven: unprovenCreations,
       receipt_file: nullable(text),
     }),
   },

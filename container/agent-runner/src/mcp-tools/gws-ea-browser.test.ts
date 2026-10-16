@@ -178,6 +178,7 @@ describe('the browser tools', () => {
       'reconcile',
       'inconclusive',
       'nothing_arrived',
+      'not_watched',
       'ambiguous',
       'accept_terms',
     ])

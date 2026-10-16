@@ -23,6 +23,7 @@ import {
   onePasswordInstancePaths,
   readOnePasswordHostPolicy,
   readOnePasswordResources,
+  writeOnePasswordResources,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
@@ -51,7 +52,14 @@ import {
   type InstanceRuntimeConfig,
   type UpsertEnvVars,
 } from './service.js';
-import { ACCOUNT_ID, FakeOnePassword, OP, OPERATOR_USER_ID, OTHER_ACCOUNT_ID } from './testing/onepassword-fixture.js';
+import {
+  ACCOUNT_ID,
+  FakeOnePassword,
+  OP,
+  OPERATOR_USER_ID,
+  OTHER_ACCOUNT_ID,
+  providerId,
+} from './testing/onepassword-fixture.js';
 import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError } from './types.js';
 
@@ -594,6 +602,66 @@ describe('recovering an interrupted enable', () => {
       code: 'onepassword_nothing_unproven',
     });
     expect((await resourcesOf(runtime))?.runtimeServiceAccountId).not.toBeNull();
+  });
+});
+
+describe('pausing on an assistant record enable cannot build on', () => {
+  it('pauses on a recorded runtime account whose token is gone, never minting a replacement over it', async () => {
+    const runtime = await assistant();
+    await enable();
+    const recorded = await resourcesOf(runtime);
+    const accounts = provider.serviceAccounts.size;
+    // The token was lost after its account was recorded, as a crash or a restored backup can leave it.
+    await rm(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile);
+
+    const paused = await enable();
+
+    expect(paused.assistants[0]).toMatchObject({
+      outcome: 'pending',
+      reason: 'runtime_token_unavailable',
+      runtime_service_account_id: recorded?.runtimeServiceAccountId,
+    });
+    expect(paused.assistants[0].message).toContain(String(recorded?.runtimeServiceAccountId));
+    expect(provider.serviceAccounts.size).toBe(accounts);
+    expect(await resourcesOf(runtime)).toEqual(recorded);
+  });
+
+  it('never adopts a recorded vault that another management account created', async () => {
+    const runtime = await assistant();
+    const vaultId = providerId('VAULT', 90);
+    const creator = providerId('MANAGEMENTOLD', 2);
+    provider.vaults.set(vaultId, { id: vaultId, name: 'Assistant', creator, grants: new Map(), items: 0 });
+    const record = {
+      schemaVersion: 2,
+      instanceId: runtime.instance_id,
+      accountId: ACCOUNT_ID,
+      vault: { id: vaultId, createdBy: { kind: 'management_service_account', serviceAccountId: creator } },
+      operatorGrant: null,
+      runtimeServiceAccountId: null,
+      retiredRuntimeServiceAccountIds: [],
+    } as const;
+    await writeOnePasswordResources(onePasswordInstancePaths(runtime.instance_root).resourceFile, record);
+
+    const paused = await enable();
+
+    expect(paused.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'vault_not_owned', vault_id: vaultId });
+    // Nothing is granted on it and no runtime account is minted for it.
+    expect(provider.vaults.get(vaultId)?.grants.size).toBe(0);
+    expect([...provider.serviceAccounts.values()].map((account) => account.access)).toEqual(['create_vaults']);
+    expect(await resourcesOf(runtime)).toEqual(record);
+  });
+
+  it('pauses on a record it cannot read, creating nothing for it', async () => {
+    const runtime = await assistant();
+    const { resourceFile } = onePasswordInstancePaths(runtime.instance_root);
+    await writeFile(resourceFile, '{"schemaVersion": 2,', { mode: 0o600 });
+
+    const paused = await enable();
+
+    expect(paused.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'resources_invalid', vault_id: null });
+    expect(paused.assistants[0].message).toContain(resourceFile);
+    expect(provider.vaults.size).toBe(0);
+    expect(await readFile(resourceFile, 'utf8')).toBe('{"schemaVersion": 2,');
   });
 });
 

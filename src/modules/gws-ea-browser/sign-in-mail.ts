@@ -216,13 +216,17 @@ export async function openSignupVerification(input: {
 export type SignupVerificationReply =
   | { readonly status: 'arrived'; readonly reply: SignInCredential; readonly claim: SignInClaim }
   | { readonly status: 'unavailable' }
-  | { readonly status: 'nothing_arrived' };
+  | { readonly status: 'nothing_arrived' }
+  | { readonly status: 'not_watched' };
 
 /**
  * The verification email's answer for this job's signup, waiting at most
  * `waitMs` and the claim's life for it. Reading it does not spend it: a step
  * that cannot use it yet leaves it for the next, and `finishSignupVerification`
- * ends the wait once it is used.
+ * ends the wait once it is used. `not_watched` means no wait exists, or it
+ * ended: the account's mail does not reach the assistant's inbox, or the
+ * claim expired, was finished or was forgotten by a restart. Nothing later
+ * can arrive for it.
  */
 export async function takeSignupVerification(
   context: Pick<BrowserExecutionContext, 'job' | 'signal' | 'remaining'>,
@@ -232,7 +236,7 @@ export async function takeSignupVerification(
   const verification = [...signupVerifications.values()].find(
     (candidate) => candidate.attemptId === attemptId && candidate.jobId === context.job.id,
   );
-  if (!verification) return { status: 'nothing_arrived' };
+  if (!verification) return { status: 'not_watched' };
   if (verification.reply === undefined) {
     const duration = Math.max(0, Math.min(90_000, waitMs, verification.expiresAt - Date.now()));
     await new Promise<void>((resolve) => {
@@ -249,11 +253,11 @@ export async function takeSignupVerification(
     });
   }
   const { reply } = verification;
-  if (signupVerifications.get(verification.claimId) !== verification || reply === undefined)
-    return { status: 'nothing_arrived' };
+  if (signupVerifications.get(verification.claimId) !== verification) return { status: 'not_watched' };
+  if (reply === undefined) return { status: 'nothing_arrived' };
   if (reply.kind === 'unavailable') return { status: 'unavailable' };
   const claim = await getSignInClaim(verification.claimId);
-  return claim ? { status: 'arrived', reply, claim } : { status: 'nothing_arrived' };
+  return claim ? { status: 'arrived', reply, claim } : { status: 'not_watched' };
 }
 
 /** Ends a signup's verification wait: its answer is dropped and its claim finished. */

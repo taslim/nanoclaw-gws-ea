@@ -465,6 +465,54 @@ export async function activateNativeCredentialControl(
   });
 }
 
+/**
+ * Every other field in a formless group's document, open shadow roots
+ * included, as the isolated world reads it: with no form to bound it, the
+ * site's own handler may read and send any of them with the group. The bound
+ * nodes are left out. Undefined when the bound document or a node is gone.
+ */
+export async function readNativeDocumentFields(
+  frame: Frame,
+  group: Pick<NativeCredentialGroup, 'fields' | 'control'>,
+): Promise<NativeFieldFacts[] | undefined> {
+  const bound = [group.control, ...group.fields];
+  if (bound.some((node) => node.frameId !== group.control.frameId || node.loaderId !== group.control.loaderId))
+    return undefined;
+  return withBoundNodes<NativeFieldFacts[] | undefined>(
+    frame,
+    group.control,
+    bound.map((node) => node.controlBackendNodeId),
+    undefined,
+    async (session, objects) => {
+      try {
+        const result = await session.send('Runtime.callFunctionOn', {
+          objectId: objects[0],
+          returnByValue: true,
+          arguments: objects.map((objectId) => ({ objectId })),
+          functionDeclaration: `function (...bound) {
+            if (bound.some((node) => node.ownerDocument !== document || !node.isConnected)) return null;
+            const roots = [document];
+            for (let index = 0; index < roots.length; index++)
+              for (const node of roots[index].querySelectorAll('*'))
+                if (node.shadowRoot) roots.push(node.shadowRoot);
+            return roots.flatMap((root) => Array.from(root.querySelectorAll('input, select, textarea')))
+              .filter((field) => !bound.includes(field))
+              .map((field) => ({
+                name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || '',
+                readonly: field.readOnly === true, disabled: field.matches(':disabled')
+              }));
+          }`,
+        });
+        const value: unknown = result.result.value;
+        return !result.exceptionDetails && Array.isArray(value) ? (value as NativeFieldFacts[]) : undefined;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- A vanished document refuses without exposing renderer prose.
+      } catch (_error) {
+        return undefined;
+      }
+    },
+  );
+}
+
 function chosenFrame(tree: NativeFrameTree, frame: Frame, owner: Frame): NativeFrameTree | undefined {
   const path: string[] = [];
   let current: Frame | null = frame;

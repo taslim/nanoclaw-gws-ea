@@ -194,14 +194,14 @@ async function mintsFresh(tokenFile: string): Promise<boolean> {
 }
 
 /** A service-account creation was attempted here and is neither proven nor discarded. */
-async function creationAttempted(tokenFile: string): Promise<boolean> {
+export async function creationAttempted(tokenFile: string): Promise<boolean> {
   return (
     (await serviceAccountCreationUnproven(tokenFile)) || (await readOnePasswordToken(tokenFile)).status !== 'absent'
   );
 }
 
 /** Where an assistant's vault creation is recorded while the provider has not answered with its ID. */
-function vaultCreationRecord(files: OnePasswordInstancePaths): string {
+export function vaultCreationRecord(files: OnePasswordInstancePaths): string {
   return `${files.resourceFile}.pending`;
 }
 
@@ -213,7 +213,7 @@ interface ResourceNames {
 }
 
 /** Names from the assistant's own address, which never changes; a rename never touches them. */
-function resourceNames(workspaceEmail: string, instanceId: string): ResourceNames {
+export function resourceNames(workspaceEmail: string, instanceId: string): ResourceNames {
   const short = instanceId.slice(0, 8);
   const label = NAMEABLE_EMAIL.test(workspaceEmail) ? workspaceEmail : short;
   return { vault: `Assistant ${label}`, runtimeServiceAccount: `GWS-EA ${short} ${label}` };

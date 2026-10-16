@@ -371,7 +371,9 @@ export class CredentialAttempts {
   /**
    * Records an authorized change of a listed Login's password, which needs an
    * ownership record for this origin's site (R18). One change per Login is
-   * open at a time. The Login's current state is checked fresh when the
+   * open at a time: another job's change that disclosed nothing gives way and
+   * its candidate is retired, while one that may have reached the site keeps
+   * the Login busy. The Login's current state is checked fresh when the
    * candidate is saved and again right before disclosure.
    */
   async prepareRotation(
@@ -386,6 +388,21 @@ export class CredentialAttempts {
     if (item.vaultId !== availability.binding.vaultId) return { status: 'vault_unavailable' };
     const record = await this.record(item.vaultId, item.itemId);
     if (!record || record.site !== target.site) return { status: 'not_owned' };
+    const open = await this.db.get<CredentialAttempt>(
+      `SELECT * FROM ${TABLE} WHERE vault_id = ? AND source_item_id = ? AND phase NOT IN ('rejected','finalized')`,
+      item.vaultId,
+      item.itemId,
+    );
+    if (open) {
+      // An idle job's unused authority would otherwise hold the Login forever: the sweep never abandons it.
+      const abandoned =
+        open.job_id !== input.jobId && (open.phase === 'preparing' || open.phase === 'saved')
+          ? await this.undisclosed(open.id)
+          : undefined;
+      if (!abandoned) return { status: 'busy' };
+      log.info('Credential change gave way to a later job', { attemptId: open.id });
+      await this.retire(abandoned, assertActive);
+    }
     try {
       return {
         status: 'prepared',
@@ -733,14 +750,22 @@ export class CredentialAttempts {
     for (const { id } of await this.db.all<{ id: string }>(
       `SELECT id FROM ${TABLE} WHERE job_id = ? AND phase IN ('preparing','saved') ORDER BY created_at, id`,
       jobId,
-    ))
-      try {
-        abandoned.push(await this.move(id, ['preparing', 'saved'], 'rejected'));
-      } catch (error) {
-        // Its disclosure won the race: it is settled through the job like any other disclosed attempt.
-        if (!(error instanceof CredentialAttemptError)) throw error;
-      }
+    )) {
+      const attempt = await this.undisclosed(id);
+      if (attempt) abandoned.push(attempt);
+    }
     return abandoned;
+  }
+
+  /** Ends one attempt that disclosed nothing, DB-only; undefined when it no longer can. */
+  private async undisclosed(id: string): Promise<CredentialAttempt | undefined> {
+    try {
+      return await this.move(id, ['preparing', 'saved'], 'rejected');
+    } catch (error) {
+      // Its disclosure won the race: it is settled through its job like any other disclosed attempt.
+      if (!(error instanceof CredentialAttemptError)) throw error;
+      return undefined;
+    }
   }
 
   /** Archives abandoned attempts' unused candidates, outside any transaction; a failure leaves them hidden. */

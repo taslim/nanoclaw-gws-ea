@@ -15,7 +15,8 @@
  * subscriber account with it (KTD13). The assistant's 1Password resources
  * go after the host too, once nothing can use them: their IDs are copied into
  * the receipt before anything changes, and the receipt outlives the instance
- * while a service account remains for the operator to revoke (KTD9).
+ * while a service account remains for the operator to revoke, or a creation
+ * never proven for them to find by name and delete or revoke (KTD9).
  * An unfinished update or rollback never stops it: its releases, what is
  * kept with them, its snapshots, and its quarantined state all sit under the
  * instance root, and go with it. So does every image the assistant's
@@ -57,6 +58,7 @@ import { readProvisionJournal } from './journal.js';
 import type { OnePasswordCliSeams } from './onepassword.js';
 import {
   captureOnePasswordCleanup,
+  onePasswordCleanupOwed,
   onePasswordDeletionBlock,
   onePasswordEvidence,
   onePasswordRemovalOutcome,
@@ -133,7 +135,7 @@ const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
   'chat-subscription':
     'Leaving it behind is safe: once the project is deleted it delivers nowhere, and Google deletes it within 7 days; removal records this evidence.',
   onepassword:
-    'Leaving it behind keeps the vault and its items in 1Password and stops tracking its service accounts; removal records their IDs as evidence, so you can delete or revoke them yourself on 1Password.com.',
+    'Leaving it behind keeps the vault and its items in 1Password and stops tracking its service accounts and any creation never proven; removal records their IDs and names as evidence, so you can delete or revoke them yourself on 1Password.com.',
 };
 
 function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
@@ -729,14 +731,14 @@ async function removeOnecli(
  */
 async function onePasswordCapture(
   paths: ControlPlanePaths,
-  instanceId: string,
+  reservation: InstanceReservation,
   receipt: RemovalReceipt | undefined,
   deleteVault: boolean | undefined,
 ): Promise<OnePasswordCapture> {
   const selection = deleteVault ? 'delete' : 'retain';
   return receipt?.onepassword
     ? { status: 'captured', cleanup: withSelection(receipt.onepassword, selection) }
-    : captureOnePasswordCleanup(paths, instanceId, selection);
+    : captureOnePasswordCleanup(paths, reservation, selection);
 }
 
 /** The terminal confirmation: a vault deletion is named in the same question that confirms the removal. */
@@ -764,7 +766,7 @@ export async function describeRemoval(
   const reservation =
     registry.instances[instanceId] ?? receipt?.reservation ?? (await getInstanceReservation(paths, instanceId));
   const claims = reservation.exclusive_resource_claims;
-  const captured = await onePasswordCapture(paths, instanceId, receipt, options.deleteVault);
+  const captured = await onePasswordCapture(paths, reservation, receipt, options.deleteVault);
   return {
     instanceId,
     checkout: paths.checkoutRoot(instanceId),
@@ -824,7 +826,7 @@ async function removeLocked(
   await assertStateConsistent(paths, reservation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
-  const onePassword = await onePasswordCapture(paths, instanceId, existing, dependencies.deleteVault);
+  const onePassword = await onePasswordCapture(paths, reservation, existing, dependencies.deleteVault);
   if (onePassword.status === 'captured') receipt = { ...receipt, onepassword: onePassword.cleanup };
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
@@ -1039,9 +1041,10 @@ async function removeLocked(
     );
   }
   await releaseInstanceReservation(paths, reservation);
-  // Local removal is complete. A service account left to revoke keeps the receipt, and its IDs, until the operator closes it.
+  // Local removal is complete. A service account left to revoke, or a creation never proven, keeps the receipt until the operator closes it.
   const cleanup = receipt.onepassword;
-  if (cleanup?.runtime_service_account_ids.length && !receipt.abandoned.onepassword && abandon.has('onepassword'))
+  const owed = cleanup !== undefined && onePasswordCleanupOwed(cleanup);
+  if (cleanup && owed && !receipt.abandoned.onepassword && abandon.has('onepassword'))
     await record((current) => ({
       ...current,
       abandoned: {
@@ -1050,12 +1053,12 @@ async function removeLocked(
           at: new Date().toISOString(),
           evidence: onePasswordEvidence(
             cleanup,
-            'The operator closed this record: revoking these service accounts on 1Password.com is theirs.',
+            'The operator closed this record: revoking or deleting what it names on 1Password.com is theirs.',
           ),
         },
       },
     }));
-  const retained = Boolean(cleanup?.runtime_service_account_ids.length) && !receipt.abandoned.onepassword;
+  const retained = owed && !receipt.abandoned.onepassword;
   if (!retained) await removePrivateFile(file);
 
   return {

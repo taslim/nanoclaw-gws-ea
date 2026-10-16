@@ -730,6 +730,44 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await queue.stop();
   });
 
+  it('answers from the attempt, not the timeout, when the operation settles while its page is closing', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    registerBrowserQueuedAction('credential_late_settle_fixture', {
+      validate: (content) => ({ authority: content.authority }),
+      async execute() {
+        await store.db.run(
+          "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
+          new Date().toISOString(),
+          AUTHORITY,
+        );
+        await held;
+        return { status: 'account_created', vault: 'saved' };
+      },
+      recover: recoverCredentialRequest,
+    });
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Expected browser job');
+    await attempt(job, 'saved', null);
+    // Closing the timed-out page ends the cut-off operation, which settles before the answer is recorded.
+    const queue = new BrowserQueue(store, {
+      ...runtime,
+      async closeJob() {
+        release();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      },
+    });
+    await queue.start();
+    await queue.accept('credential_late_settle_fixture', { authority: AUTHORITY, budget_ms: 20 }, session, 'late');
+    await queue.idle();
+    expect(answer('late')).toMatchObject({ status: 'outcome_unknown' });
+    expect(await read()).toMatchObject({ phase: 'unknown' });
+    expect(responses()).toHaveLength(1);
+    await queue.stop();
+  });
+
   it('leaves an attempt another request disclosed, such as one awaiting email verification, as it was', async () => {
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');

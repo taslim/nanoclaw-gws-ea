@@ -28,7 +28,6 @@ import {
   onePasswordErrorPauses,
   onePasswordCapabilityNextActions,
   onePasswordRecovery,
-  onePasswordRevocation,
   type OnePasswordCapabilityObservation,
   type OnePasswordCliSeams,
   type OnePasswordDependencies,
@@ -133,7 +132,12 @@ import {
   type RemovalOutcome,
   type RemovalPreview,
 } from './remove.js';
-import type { OnePasswordRemovalOutcome, OnePasswordRemovalPreview } from './onepassword-removal.js';
+import {
+  onePasswordOperatorActions,
+  type OnePasswordRemovalOutcome,
+  type OnePasswordRemovalPreview,
+  type OnePasswordUnprovenCreation,
+} from './onepassword-removal.js';
 import {
   localTimezone,
   rollBack,
@@ -1021,18 +1025,18 @@ class Cli {
       removed ? removed.removed.length > 0 || removed.abandoned.length > 0 : null,
     );
     state.data = { ...state.data, ...(removed ? { removal: removed } : {}) };
-    // Revoking a service account is the operator's, on 1Password.com; then they close the receipt that names it.
+    // Revoking a service account, or settling a creation never proven, is the operator's, on 1Password.com; then they close the receipt that names it.
     const left = removed?.onepassword;
-    const revocation = left?.receipt_file
-      ? onePasswordRevocation([{ instanceId, serviceAccountIds: left.revoke_service_account_ids }])
-      : undefined;
+    const owed = left?.receipt_file
+      ? onePasswordOperatorActions(instanceId, left.revoke_service_account_ids, left.unproven)
+      : [];
     return {
       status: 'ready',
       message: `Assistant ${instanceId} was removed.`,
       details: removalSummary(preview, removed),
-      actions: revocation
+      actions: owed.length
         ? [
-            revocation,
+            ...owed,
             { kind: 'command', argv: ['gws-ea', 'remove', '--id', instanceId, '--yes', '--abandon', 'onepassword'] },
           ]
         : [],
@@ -2142,6 +2146,15 @@ function serviceAccountLine(ids: readonly string[], prefix: string): string[] {
   ];
 }
 
+/** What 1Password may hold with no ID recorded: removal cannot find it, so only the operator can delete or revoke it. */
+function unprovenLines(unproven: readonly OnePasswordUnprovenCreation[], prefix: string): string[] {
+  return unproven.map(({ kind, name }) =>
+    kind === 'vault'
+      ? `${prefix}vault "${name}" may exist; removal cannot find it, so delete it yourself on 1Password.com if it is listed.`
+      : `${prefix}runtime service account "${name}" may exist; removal cannot find it, so revoke it yourself on 1Password.com (Developer > Directory) if it is listed.`,
+  );
+}
+
 function onePasswordPreviewLines(preview: OnePasswordRemovalPreview): string[] {
   const count = preview.item_count;
   const effect = ((): string => {
@@ -2156,13 +2169,18 @@ function onePasswordPreviewLines(preview: OnePasswordRemovalPreview): string[] {
         return `Already kept: ${preview.reason}`;
       case 'gone':
         return `Already gone: ${preview.reason}`;
+      case 'unrecorded':
+        return preview.reason;
     }
   })();
   return [
-    `1Password vault ${preview.vault_id} in account ${preview.account_id}`,
+    preview.vault_id === null
+      ? `1Password account ${preview.account_id}`
+      : `1Password vault ${preview.vault_id} in account ${preview.account_id}`,
     `  ${effect}`,
     '  Runtime token: deleted from this host with the assistant.',
     ...serviceAccountLine(preview.runtime_service_account_ids, '  Not revoked by removal: '),
+    ...unprovenLines(preview.unproven, '  Never proven: '),
   ];
 }
 
@@ -2190,17 +2208,20 @@ function onePasswordOutcomeLines(instanceId: string, outcome: OnePasswordRemoval
         return `already gone from account ${outcome.account_id}.`;
       case 'left_behind':
         return `left behind in account ${outcome.account_id}, unsettled; delete it yourself on 1Password.com if you no longer need it.`;
+      case 'unrecorded':
+        return `none recorded in account ${outcome.account_id}.`;
     }
   })();
   return [
-    `1Password vault ${outcome.vault_id}: ${vault}`,
+    `1Password vault${outcome.vault_id === null ? '' : ` ${outcome.vault_id}`}: ${vault}`,
     outcome.runtime_token === 'deleted'
       ? 'Runtime token: deleted from this host.'
       : 'Runtime token: none was on this host.',
     ...serviceAccountLine(outcome.revoke_service_account_ids, 'Not revoked: '),
+    ...unprovenLines(outcome.unproven, 'Never proven: '),
     ...(outcome.receipt_file
       ? [
-          `Their IDs stay in ${outcome.receipt_file} until you close it, after revoking them: gws-ea remove --id ${instanceId} --yes --abandon onepassword.`,
+          `They stay named in ${outcome.receipt_file} until you close it, after revoking or deleting them: gws-ea remove --id ${instanceId} --yes --abandon onepassword.`,
         ]
       : []),
   ];

@@ -2,12 +2,15 @@
  * An assistant's 1Password resources at its removal (KTD9, R14, R15). Before
  * anything changes, the IDs cleanup needs are copied from the instance into
  * its removal receipt, which lives outside the instance and so outlives its
- * files. Once the host has stopped, the local runtime token goes. The vault is
- * deleted only when this host's management service account created it and it
- * is empty, or the operator chose its deletion in the removal's confirmation,
- * and only through that same account: any other vault is kept. Revoking a
- * service account is the operator's, on 1Password.com; the receipt names each
- * one until the operator closes it.
+ * files. So is the name of each creation never proven, a vault or runtime
+ * service account 1Password may hold with no recorded ID: its intent record
+ * goes with the instance. Once the host has stopped, the local runtime token
+ * goes. The vault is deleted only when this host's management service account
+ * created it and it is empty, or the operator chose its deletion in the
+ * removal's confirmation, and only through that same account: any other vault
+ * is kept. Revoking a service account, and deleting or revoking an unproven
+ * creation, is the operator's, on 1Password.com; the receipt names each one
+ * until the operator closes it.
  */
 import { lstat, rm } from 'node:fs/promises';
 
@@ -21,28 +24,42 @@ import {
   readOnePasswordResources,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import {
+  creationAttempted,
   isManagementUnavailable,
   managementUnavailable,
   onePasswordRevocation,
+  resourceNames,
+  vaultCreationRecord,
   type OnePasswordCliSeams,
 } from './onepassword.js';
 import type { ControlPlanePaths } from './paths.js';
+import type { NextAction } from './result.js';
+import type { InstanceReservation } from './types.js';
 import { canonicalTimestamp, isRecord } from './validation.js';
 
 /** The operator's choice, in the removal's confirmation, for a vault that still holds items. */
 export type OnePasswordVaultSelection = 'retain' | 'delete';
 export type OnePasswordVaultOutcome = 'deleted' | 'retained' | 'gone';
 
+/** A creation 1Password may have completed with no ID recorded: only its deterministic name finds it. */
+export interface OnePasswordUnprovenCreation {
+  readonly kind: 'vault' | 'service_account';
+  readonly name: string;
+}
+
 /** What removal keeps in its receipt of an assistant's 1Password resources: identifiers and outcomes, never a token. */
 export interface OnePasswordCleanup {
   readonly account_id: string;
-  readonly vault_id: string;
+  /** Null when no vault was recorded; one whose creation was never proven is named in `unproven`. */
+  readonly vault_id: string | null;
   /** The management service account that created the vault, the only identity that may delete it; null for any other creator. */
   readonly vault_creator: string | null;
   /** Every runtime service account the assistant held, current and retired: only the operator can revoke them. */
   readonly runtime_service_account_ids: readonly string[];
+  /** Creations never proven: removal cannot find them, so only the operator can delete or revoke them. */
+  readonly unproven: readonly OnePasswordUnprovenCreation[];
   readonly selection: OnePasswordVaultSelection;
-  /** What only the operator can do on 1Password.com; null when there is nothing to revoke. */
+  /** What only the operator can do on 1Password.com; null when there is nothing to revoke or delete. */
   readonly operator_action: string | null;
   readonly runtime_token?: { readonly outcome: 'deleted' | 'absent'; readonly at: string };
   /** Recorded before the deletion request, so a later run tells its own deletion from a vault already gone. */
@@ -63,27 +80,32 @@ export type OnePasswordCapture =
 /** What removal will do with the vault, or did; shown before the operator confirms. */
 export interface OnePasswordRemovalPreview {
   readonly account_id: string;
-  readonly vault_id: string;
+  /** Null, with `unrecorded`, when no vault was recorded. */
+  readonly vault_id: string | null;
   /** Created by this host's management service account, so removal may delete it. */
   readonly owned: boolean;
   /** Null when it could not be read: never counted as empty. */
   readonly item_count: number | null;
-  readonly vault: 'delete' | 'retain' | OnePasswordVaultOutcome;
+  readonly vault: 'delete' | 'retain' | OnePasswordVaultOutcome | 'unrecorded';
   readonly reason: string;
   readonly runtime_service_account_ids: readonly string[];
+  readonly unproven: readonly OnePasswordUnprovenCreation[];
 }
 
 /** What removal did, and what it leaves to the operator. */
 export interface OnePasswordRemovalOutcome {
   readonly account_id: string;
-  readonly vault_id: string;
-  readonly vault: OnePasswordVaultOutcome | 'left_behind';
+  /** Null, with `unrecorded`, when no vault was recorded. */
+  readonly vault_id: string | null;
+  readonly vault: OnePasswordVaultOutcome | 'left_behind' | 'unrecorded';
   readonly item_count: number | null;
   readonly reason: string;
   readonly runtime_token: 'deleted' | 'absent';
   /** Runtime service accounts removal did not revoke: revoking is the operator's, on 1Password.com. */
   readonly revoke_service_account_ids: readonly string[];
-  /** The receipt that keeps these IDs until the operator closes it; null once nothing is tracked. */
+  /** Creations never proven, which removal cannot find: deleting or revoking them is the operator's. */
+  readonly unproven: readonly OnePasswordUnprovenCreation[];
+  /** The receipt that keeps these until the operator closes it; null once nothing is tracked. */
   readonly receipt_file: string | null;
 }
 
@@ -94,42 +116,125 @@ export interface OnePasswordBlock {
 }
 
 const now = (): string => new Date().toISOString();
+const UNRECORDED = 'No vault was recorded for this assistant, so removal deletes none.';
 
-function revocationText(ids: readonly string[], instanceId: string): string | null {
-  return onePasswordRevocation([{ instanceId, serviceAccountIds: ids }])?.instruction ?? null;
+/**
+ * What only the operator can do on 1Password.com: revoke each runtime service
+ * account, and find each unproven creation by its name to delete or revoke it.
+ */
+export function onePasswordOperatorActions(
+  instanceId: string,
+  serviceAccountIds: readonly string[],
+  unproven: readonly OnePasswordUnprovenCreation[],
+): Extract<NextAction, { readonly kind: 'external' }>[] {
+  const revocation = onePasswordRevocation([{ instanceId, serviceAccountIds }]);
+  return [
+    ...(revocation ? [revocation] : []),
+    ...unproven.map(({ kind, name }) => ({
+      kind: 'external' as const,
+      instruction:
+        kind === 'vault'
+          ? `Assistant ${instanceId}: 1Password may hold a vault named "${name}" that gws-ea never recorded. Delete it on 1Password.com if it is listed.`
+          : `Assistant ${instanceId}: 1Password may hold a runtime service account named "${name}" that gws-ea never verified. Revoke it on 1Password.com under Developer > Directory if it is listed.`,
+    })),
+  ];
 }
 
-/** The facts a pause or abandonment records: every ID the operator may need on 1Password.com. */
+function operatorAction(
+  instanceId: string,
+  ids: readonly string[],
+  unproven: readonly OnePasswordUnprovenCreation[],
+): string | null {
+  return (
+    onePasswordOperatorActions(instanceId, ids, unproven)
+      .map((action) => action.instruction)
+      .join(' ') || null
+  );
+}
+
+/** The receipt still names something only the operator can settle on 1Password.com, so it stays until they close it. */
+export function onePasswordCleanupOwed(cleanup: OnePasswordCleanup): boolean {
+  return cleanup.runtime_service_account_ids.length > 0 || cleanup.unproven.length > 0;
+}
+
+/** The facts a pause or abandonment records: every ID and unproven name the operator may need on 1Password.com. */
 export function onePasswordEvidence(cleanup: OnePasswordCleanup, reason: string): string {
   return [
-    `Vault: ${cleanup.vault_id} in account ${cleanup.account_id}`,
-    `Created by: ${cleanup.vault_creator ?? 'not this host'}`,
+    ...(cleanup.vault_id === null
+      ? [`Vault: none recorded, in account ${cleanup.account_id}`]
+      : [
+          `Vault: ${cleanup.vault_id} in account ${cleanup.account_id}`,
+          `Created by: ${cleanup.vault_creator ?? 'not this host'}`,
+        ]),
     `Runtime service accounts to revoke: ${cleanup.runtime_service_account_ids.join(', ') || 'none'}`,
+    ...(cleanup.unproven.length
+      ? [
+          `Never proven, to delete or revoke if listed: ${cleanup.unproven
+            .map(({ kind, name }) => `${kind === 'vault' ? 'vault' : 'runtime service account'} "${name}"`)
+            .join(', ')}`,
+        ]
+      : []),
     reason,
   ].join('\n');
 }
 
-/** Copy the IDs removal needs from the assistant's own record, before anything changes. */
+/**
+ * Copy what removal needs from the assistant's own records, before anything
+ * changes: each recorded ID, and the name of each creation never proven,
+ * whose intent record goes with the instance.
+ */
 export async function captureOnePasswordCleanup(
   paths: ControlPlanePaths,
-  instanceId: string,
+  reservation: InstanceReservation,
   selection: OnePasswordVaultSelection,
 ): Promise<OnePasswordCapture> {
-  const { resourceFile } = onePasswordInstancePaths(paths.instanceRoot(instanceId));
-  const read = await readOnePasswordResources(resourceFile, { instanceId });
-  if (read.status === 'absent') return { status: 'none' };
+  const instanceId = reservation.instance_id;
+  const files = onePasswordInstancePaths(paths.instanceRoot(instanceId));
+  const names = resourceNames(reservation.exclusive_resource_claims.workspace_email, instanceId);
+  const read = await readOnePasswordResources(files.resourceFile, { instanceId });
   if (read.status === 'invalid')
     return {
       status: 'unreadable',
       reason:
         "The assistant's 1Password record cannot be read safely, so removal cannot keep the vault and service account IDs it would need.",
-      evidence: `Record: ${resourceFile} (${read.problem})`,
+      evidence: `Record: ${files.resourceFile} (${read.problem})`,
     };
+  if (read.status === 'absent') {
+    // An interrupted vault creation leaves only its intent: a vault 1Password may hold that only its name finds.
+    if (!(await exists(vaultCreationRecord(files)))) return { status: 'none' };
+    const { policyFile } = onePasswordHostPaths(paths.configRoot);
+    const host = await readOnePasswordHostPolicy(policyFile);
+    if (host.status !== 'ready')
+      return {
+        status: 'unreadable',
+        reason:
+          "1Password may hold a vault whose creation was never proven, and this host's 1Password policy, which names its account, cannot be read safely.",
+        evidence: `Never proven, to delete if listed: vault "${names.vault}"\nPolicy: ${policyFile} (${host.status === 'absent' ? 'absent' : host.problem})`,
+      };
+    const unproven: OnePasswordUnprovenCreation[] = [{ kind: 'vault', name: names.vault }];
+    return {
+      status: 'captured',
+      cleanup: {
+        account_id: host.policy.accountId,
+        vault_id: null,
+        vault_creator: null,
+        runtime_service_account_ids: [],
+        unproven,
+        selection,
+        operator_action: operatorAction(instanceId, [], unproven),
+      },
+    };
+  }
   const { resources } = read;
   const ids = [
     ...resources.retiredRuntimeServiceAccountIds,
     ...(resources.runtimeServiceAccountId === null ? [] : [resources.runtimeServiceAccountId]),
   ];
+  // A runtime account minted but never verified, or whose minting was cut off, has no recorded ID either.
+  const unproven: OnePasswordUnprovenCreation[] =
+    resources.runtimeServiceAccountId === null && (await creationAttempted(files.runtimeTokenFile))
+      ? [{ kind: 'service_account', name: names.runtimeServiceAccount }]
+      : [];
   return {
     status: 'captured',
     cleanup: {
@@ -140,8 +245,9 @@ export async function captureOnePasswordCleanup(
           ? resources.vault.createdBy.serviceAccountId
           : null,
       runtime_service_account_ids: ids,
+      unproven,
       selection,
-      operator_action: revocationText(ids, instanceId),
+      operator_action: operatorAction(instanceId, ids, unproven),
     },
   };
 }
@@ -163,15 +269,31 @@ function isVaultOutcome(value: unknown): value is OnePasswordVaultOutcome {
   return value === 'deleted' || value === 'retained' || value === 'gone';
 }
 
+function parseUnproven(value: unknown): OnePasswordUnprovenCreation[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries: unknown[] = value;
+  const parsed: OnePasswordUnprovenCreation[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) return undefined;
+    const { kind, name } = entry;
+    if ((kind !== 'vault' && kind !== 'service_account') || typeof name !== 'string' || !name) return undefined;
+    parsed.push({ kind, name });
+  }
+  return parsed;
+}
+
 /** The receipt's record, or undefined when any part is malformed: its IDs are then never assumed. */
 export function parseOnePasswordCleanup(value: unknown): OnePasswordCleanup | undefined {
   if (!isRecord(value)) return undefined;
   const { account_id, vault_id, vault_creator, runtime_service_account_ids, selection, operator_action } = value;
+  const unproven = parseUnproven(value.unproven);
   if (
     !isOnePasswordId(account_id) ||
-    !isOnePasswordId(vault_id) ||
-    (vault_creator !== null && !isOnePasswordId(vault_creator)) ||
+    (vault_id !== null && !isOnePasswordId(vault_id)) ||
+    // Only a recorded vault has a creator.
+    (vault_creator !== null && (vault_id === null || !isOnePasswordId(vault_creator))) ||
     !isIdList(runtime_service_account_ids) ||
+    !unproven ||
     (selection !== 'retain' && selection !== 'delete') ||
     (operator_action !== null && typeof operator_action !== 'string')
   )
@@ -181,6 +303,7 @@ export function parseOnePasswordCleanup(value: unknown): OnePasswordCleanup | un
     vault_id,
     vault_creator,
     runtime_service_account_ids,
+    unproven,
     selection,
     operator_action,
   };
@@ -194,7 +317,7 @@ export function parseOnePasswordCleanup(value: unknown): OnePasswordCleanup | un
   }
   if (value.deletion_requested_at !== undefined) {
     const at = canonicalTimestamp(value.deletion_requested_at);
-    if (!at) return undefined;
+    if (!at || vault_id === null) return undefined;
     cleanup = { ...cleanup, deletion_requested_at: at };
   }
   if (value.vault !== undefined) {
@@ -202,7 +325,8 @@ export function parseOnePasswordCleanup(value: unknown): OnePasswordCleanup | un
     if (!isRecord(vault)) return undefined;
     const { outcome, item_count, reason } = vault;
     const at = canonicalTimestamp(vault.at);
-    if (!at || !isVaultOutcome(outcome) || !isCount(item_count) || typeof reason !== 'string') return undefined;
+    if (!at || vault_id === null || !isVaultOutcome(outcome) || !isCount(item_count) || typeof reason !== 'string')
+      return undefined;
     cleanup = { ...cleanup, vault: { outcome, item_count, reason, at } };
   }
   return cleanup;
@@ -305,12 +429,15 @@ export async function previewOnePasswordCleanup(
   cleanup: OnePasswordCleanup,
   seams: OnePasswordCliSeams | undefined,
 ): Promise<OnePasswordRemovalPreview> {
-  const base = {
+  const vaultId = cleanup.vault_id;
+  const facts = {
     account_id: cleanup.account_id,
-    vault_id: cleanup.vault_id,
-    owned: (await localOwnership(paths, cleanup)).status === 'owned',
+    vault_id: vaultId,
     runtime_service_account_ids: cleanup.runtime_service_account_ids,
+    unproven: cleanup.unproven,
   };
+  if (vaultId === null) return { ...facts, owned: false, item_count: null, vault: 'unrecorded', reason: UNRECORDED };
+  const base = { ...facts, owned: (await localOwnership(paths, cleanup)).status === 'owned' };
   if (cleanup.vault)
     return {
       ...base,
@@ -330,7 +457,7 @@ export async function previewOnePasswordCleanup(
         }
       : { ...base, item_count: null, vault: 'retain', reason: `${keptReason(null)} ${why}` };
   if (owner.status === 'unavailable') return unreadable(owner.reason);
-  const got = await owner.cli.getVault(owner.management, cleanup.vault_id);
+  const got = await owner.cli.getVault(owner.management, vaultId);
   if (got.status === 'failed')
     return got.reason === 'not_found'
       ? { ...base, item_count: null, vault: 'gone', reason: 'It is already gone from 1Password.' }
@@ -354,7 +481,7 @@ export async function onePasswordDeletionBlock(
   cleanup: OnePasswordCleanup,
   seams: OnePasswordCliSeams | undefined,
 ): Promise<OnePasswordBlock | undefined> {
-  if (cleanup.vault || cleanup.selection !== 'delete') return undefined;
+  if (cleanup.vault || cleanup.vault_id === null || cleanup.selection !== 'delete') return undefined;
   const owner = await ownership(paths, cleanup, seams);
   return owner.status === 'unavailable'
     ? { reason: owner.reason, evidence: onePasswordEvidence(cleanup, 'The vault was chosen for deletion.') }
@@ -399,7 +526,8 @@ export async function settleOnePasswordCleanup(
     if (present) await rm(runtimeTokenFile, { force: true });
     await save({ ...current, runtime_token: { outcome: present ? 'deleted' : 'absent', at: now() } });
   }
-  if (current.vault) return undefined;
+  const vaultId = current.vault_id;
+  if (current.vault || vaultId === null) return undefined;
   const settle = async (outcome: OnePasswordVaultOutcome, itemCount: number | null, reason: string) => {
     await save({ ...current, vault: { outcome, item_count: itemCount, reason, at: now() } });
     return undefined;
@@ -413,7 +541,7 @@ export async function settleOnePasswordCleanup(
     return settle('retained', null, `${keptReason(null)} ${owner.reason}`);
   }
   const { cli, management } = owner;
-  const got = await cli.getVault(management, current.vault_id);
+  const got = await cli.getVault(management, vaultId);
   if (got.status === 'failed') {
     if (got.reason === 'not_found')
       return current.deletion_requested_at
@@ -427,9 +555,9 @@ export async function settleOnePasswordCleanup(
   if (!deletes(count, current.selection)) return settle('retained', count, keptReason(count));
 
   if (!current.deletion_requested_at) await save({ ...current, deletion_requested_at: now() });
-  const deleted = await cli.deleteVault(management, current.vault_id);
+  const deleted = await cli.deleteVault(management, vaultId);
   // Whatever the request answered, only an observed absence counts as deleted.
-  const after = await cli.getVault(management, current.vault_id);
+  const after = await cli.getVault(management, vaultId);
   if (after.status === 'failed' && after.reason === 'not_found')
     return settle(
       'deleted',
@@ -438,8 +566,8 @@ export async function settleOnePasswordCleanup(
     );
   return blocked(
     after.status === 'ok'
-      ? `1Password did not delete vault ${current.vault_id}${deleted.status === 'failed' ? ` (it answered ${deleted.reason.replaceAll('_', ' ')})` : ''}; it is still there.`
-      : `Whether 1Password deleted vault ${current.vault_id} is unknown: it answered ${after.reason.replaceAll('_', ' ')} when removal looked again. A retry looks before deleting anything.`,
+      ? `1Password did not delete vault ${vaultId}${deleted.status === 'failed' ? ` (it answered ${deleted.reason.replaceAll('_', ' ')})` : ''}; it is still there.`
+      : `Whether 1Password deleted vault ${vaultId} is unknown: it answered ${after.reason.replaceAll('_', ' ')} when removal looked again. A retry looks before deleting anything.`,
   );
 }
 
@@ -449,14 +577,18 @@ export function onePasswordRemovalOutcome(
   leftBehind: string | undefined,
   receiptFile: string | null,
 ): OnePasswordRemovalOutcome {
+  const unrecorded = cleanup.vault_id === null;
   return {
     account_id: cleanup.account_id,
     vault_id: cleanup.vault_id,
-    vault: cleanup.vault?.outcome ?? 'left_behind',
+    vault: unrecorded ? 'unrecorded' : (cleanup.vault?.outcome ?? 'left_behind'),
     item_count: cleanup.vault?.item_count ?? null,
-    reason: cleanup.vault?.reason ?? leftBehind?.split('\n').at(-1) ?? 'Removal could not settle it.',
+    reason: unrecorded
+      ? UNRECORDED
+      : (cleanup.vault?.reason ?? leftBehind?.split('\n').at(-1) ?? 'Removal could not settle it.'),
     runtime_token: cleanup.runtime_token?.outcome ?? 'absent',
     revoke_service_account_ids: cleanup.runtime_service_account_ids,
+    unproven: cleanup.unproven,
     receipt_file: receiptFile,
   };
 }
