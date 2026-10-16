@@ -55,6 +55,33 @@ export interface NativeAuthenticationBinding {
   formBackendNodeId: number;
   facts: NativeAuthenticationFacts;
 }
+export interface NativeFieldFacts {
+  name: string;
+  type: string;
+  autocomplete: string;
+  /** Neither can be changed by a fill: a read-only or disabled field only displays what the account already is. */
+  readonly: boolean;
+  disabled: boolean;
+}
+/** A credential-form node as the isolated world reads it: the node itself, its form if any, and any submitter override. */
+export interface NativeCredentialFacts {
+  origin: string;
+  tag: string;
+  id: string;
+  name: string;
+  type: string;
+  autocomplete: string;
+  override: { action: string; method: string; target: string } | null;
+  form: { action: string; method: string; target: string; fields: NativeFieldFacts[] } | null;
+}
+export interface NativeCredentialBinding {
+  frameId: string;
+  loaderId: string;
+  controlBackendNodeId: number;
+  /** Null for a field or control outside any form: a JS-controlled, no-form flow. */
+  formBackendNodeId: number | null;
+  facts: NativeCredentialFacts;
+}
 interface NativeFrameTree {
   frame: { id: string; loaderId: string; url: string };
   childFrames?: NativeFrameTree[];
@@ -83,6 +110,24 @@ const readControlSource = `
         name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || ''
       }))
     };
+  };
+  const readCredentialNode = (node) => {
+    const form = formFor(node);
+    if (!node.isConnected || (form && !(form instanceof HTMLFormElement && form.isConnected))) return null;
+    const overridden = ['formaction', 'formmethod', 'formtarget'].some(name => node.hasAttribute(name));
+    return {
+      origin: location.origin,
+      tag: node.tagName, id: node.id || '', name: typeof node.name === 'string' ? node.name : '',
+      type: typeof node.type === 'string' ? node.type : '', autocomplete: node.getAttribute('autocomplete') || '',
+      override: overridden ? { action: node.formAction, method: node.formMethod, target: node.formTarget } : null,
+      form: form ? {
+        action: formProperty(form, 'action'), method: formProperty(form, 'method'), target: formProperty(form, 'target'),
+        fields: Array.from(formProperty(form, 'elements'), field => ({
+          name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || '',
+          readonly: field.readOnly === true, disabled: field.matches(':disabled')
+        }))
+      } : null
+    };
   };`;
 
 async function attachFrameSession(frame: Frame): Promise<{ session: CDPSession; owner: Frame }> {
@@ -97,6 +142,55 @@ async function attachFrameSession(frame: Frame): Promise<{ session: CDPSession; 
       // In-process frames belong to their nearest independently targeted ancestor.
       owner = parent;
     }
+  }
+}
+
+/**
+ * Every native write and activation runs here: a CDP session on the frame's
+ * own target, the bound document still loaded, and the bound nodes resolved
+ * by backend identity into this module's isolated world, where page scripts
+ * cannot reach the prototypes the operation calls. Any failure before the
+ * operation runs refuses with `refused`; the operation owns its own errors.
+ */
+async function withBoundNodes<T>(
+  frame: Frame,
+  document: { readonly frameId: string; readonly loaderId: string },
+  backendNodeIds: readonly number[],
+  refused: T,
+  operation: (session: CDPSession, objectIds: readonly string[]) => Promise<T>,
+): Promise<T> {
+  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  try {
+    attached = await attachFrameSession(frame);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Renderer errors refuse the operation without exposing protocol prose.
+  } catch (_error) {
+    return refused;
+  }
+  const { session } = attached;
+  const objectGroup = `gws-ea-auth-${randomUUID()}`;
+  try {
+    const objectIds: string[] = [];
+    try {
+      const { frameTree } = await session.send('Page.getFrameTree');
+      const selected = findFrame(frameTree, document.frameId);
+      if (!selected || selected.frame.loaderId !== document.loaderId) return refused;
+      const { executionContextId } = await session.send('Page.createIsolatedWorld', {
+        frameId: document.frameId,
+        worldName,
+      });
+      for (const backendNodeId of backendNodeIds) {
+        const resolved = await session.send('DOM.resolveNode', { backendNodeId, executionContextId, objectGroup });
+        if (!resolved.object.objectId) return refused;
+        objectIds.push(resolved.object.objectId);
+      }
+      // eslint-disable-next-line no-catch-all/no-catch-all -- A vanished frame or node must refuse without exposing protocol prose.
+    } catch (_error) {
+      return refused;
+    }
+    return await operation(session, objectIds);
+  } finally {
+    await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
+    await session.detach().catch(() => undefined);
   }
 }
 
@@ -118,41 +212,25 @@ export async function fillNativeAuthenticationField(
     field.facts.origin !== submit.facts.origin
   )
     return false;
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
-  try {
-    attached = await attachFrameSession(frame);
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Renderer errors refuse the write without exposing protocol prose.
-  } catch (_error) {
-    return false;
-  }
-  const { session } = attached;
-  const objectGroup = `gws-ea-auth-${randomUUID()}`;
-  try {
-    const { frameTree } = await session.send('Page.getFrameTree');
-    const selected = findFrame(frameTree, field.frameId);
-    if (!selected || selected.frame.loaderId !== field.loaderId) return false;
-    const { executionContextId } = await session.send('Page.createIsolatedWorld', {
-      frameId: field.frameId,
-      worldName,
-    });
-    const objects: string[] = [];
-    for (const backendNodeId of [field.controlBackendNodeId, field.formBackendNodeId, submit.controlBackendNodeId]) {
-      const resolved = await session.send('DOM.resolveNode', { backendNodeId, executionContextId, objectGroup });
-      if (!resolved.object.objectId) return false;
-      objects.push(resolved.object.objectId);
-    }
-    await assertActive();
-    const result = await session.send('Runtime.callFunctionOn', {
-      objectId: objects[0],
-      returnByValue: true,
-      arguments: [
-        { objectId: objects[1] },
-        { objectId: objects[2] },
-        { value: field.facts },
-        { value: submit.facts },
-        { value },
-      ],
-      functionDeclaration: `function (form, submit, expectedField, expectedSubmit, value) {
+  return withBoundNodes(
+    frame,
+    field,
+    [field.controlBackendNodeId, field.formBackendNodeId, submit.controlBackendNodeId],
+    false,
+    async (session, objects) => {
+      try {
+        await assertActive();
+        const result = await session.send('Runtime.callFunctionOn', {
+          objectId: objects[0],
+          returnByValue: true,
+          arguments: [
+            { objectId: objects[1] },
+            { objectId: objects[2] },
+            { value: field.facts },
+            { value: submit.facts },
+            { value },
+          ],
+          functionDeclaration: `function (form, submit, expectedField, expectedSubmit, value) {
         ${readControlSource}
         if (location.protocol !== 'https:' || location.origin !== expectedField.origin ||
             !(this instanceof HTMLInputElement) || this.ownerDocument !== document ||
@@ -165,15 +243,173 @@ export async function fillNativeAuthenticationField(
         descriptor.set.call(this, value);
         return descriptor.get.call(this) === value;
       }`,
-    });
-    return !result.exceptionDetails && result.result.value === true;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a sign-in value.
-  } catch (_error) {
-    return false;
-  } finally {
-    await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
-    await session.detach().catch(() => undefined);
-  }
+        });
+        return !result.exceptionDetails && result.result.value === true;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a sign-in value.
+      } catch (_error) {
+        return false;
+      }
+    },
+  );
+}
+
+export type CredentialFillResult = 'filled' | 'not_inserted' | 'changed';
+export type CredentialActivationResult = 'activated' | 'disabled' | 'changed' | 'uncertain';
+
+/** The credential group the browser chose: its fields, in value order, and the control that activates them. */
+export interface NativeCredentialGroup {
+  readonly fields: readonly NativeCredentialBinding[];
+  readonly control: NativeCredentialBinding;
+}
+
+/** Shared by the fill and the activation: the bound document, origin, nodes and facts, all unchanged. */
+const credentialGroupSource = `
+  ${readControlSource}
+  // A show-password toggle turns a password field into text and back, and a controlled form enables its
+  // controls as it fills: neither changes what the group binds.
+  const shape = (facts) => JSON.stringify(facts, (key, value) =>
+    key === 'readonly' || key === 'disabled' ? undefined : key === 'type' && value === 'text' ? 'password' : value);
+  const same = (left, right) => shape(left) === shape(right);
+  const valueOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+  const bound = (control, expectedControl, expectedFields, form, fields) =>
+    location.protocol === 'https:' && control.ownerDocument === document &&
+    same(readCredentialNode(control), expectedControl) &&
+    fields.length === expectedFields.length &&
+    fields.every((field, index) => field instanceof HTMLInputElement && field.ownerDocument === document &&
+      !field.matches(':disabled') && !field.readOnly && formFor(field) === form &&
+      same(readCredentialNode(field), expectedFields[index]));
+  const holds = (fields, values) => fields.every((field, index) => valueOf.get.call(field) === values[index]);`;
+
+/** Resolved as `credentialNodes` orders them: the control, the shared form when there is one, then each field. */
+function credentialArguments(group: NativeCredentialGroup, values: readonly string[], objects: readonly string[]) {
+  const formless = group.fields[0].formBackendNodeId === null;
+  return [
+    { value: group.control.facts },
+    { value: group.fields.map((field) => field.facts) },
+    { value: values },
+    formless ? { value: null } : { objectId: objects[1] },
+    ...objects.slice(formless ? 1 : 2).map((objectId) => ({ objectId })),
+  ];
+}
+
+function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
+  const [first] = group.fields;
+  if (
+    !first ||
+    group.fields.some(
+      (field) =>
+        field.frameId !== group.control.frameId ||
+        field.loaderId !== group.control.loaderId ||
+        field.formBackendNodeId !== first.formBackendNodeId ||
+        field.facts.origin !== group.control.facts.origin,
+    ) ||
+    (group.control.formBackendNodeId !== null && group.control.formBackendNodeId !== first.formBackendNodeId)
+  )
+    return undefined;
+  return [
+    group.control.controlBackendNodeId,
+    ...(first.formBackendNodeId === null ? [] : [first.formBackendNodeId]),
+    ...group.fields.map((field) => field.controlBackendNodeId),
+  ];
+}
+
+/**
+ * Inserts one credential group atomically: every node, the document, origin
+ * and form are revalidated and every value is set through the native setter
+ * in one synchronous renderer call, before any page callback can run. Only
+ * then are input and change events dispatched, so controlled (JS) forms see
+ * the values; their callbacks may run arbitrary site code (KTD7). Focus is
+ * irrelevant throughout. `not_inserted` means nothing reached the page.
+ */
+export async function fillNativeCredentialGroup(
+  frame: Frame,
+  group: NativeCredentialGroup,
+  values: readonly string[],
+  assertActive: () => Promise<void>,
+): Promise<CredentialFillResult> {
+  const nodes = credentialNodes(group);
+  if (!nodes || values.length !== group.fields.length) return 'not_inserted';
+  return withBoundNodes(frame, group.control, nodes, 'not_inserted', async (session, objects) => {
+    let started = false;
+    try {
+      await assertActive();
+      started = true;
+      const result = await session.send('Runtime.callFunctionOn', {
+        objectId: objects[0],
+        returnByValue: true,
+        arguments: credentialArguments(group, values, objects),
+        functionDeclaration: `function (expectedControl, expectedFields, values, form, ...fields) {
+          ${credentialGroupSource}
+          if (!bound(this, expectedControl, expectedFields, form, fields)) return 'not_inserted';
+          fields.forEach((field, index) => valueOf.set.call(field, values[index]));
+          if (!holds(fields, values)) return 'changed';
+          for (const field of fields) {
+            EventTarget.prototype.dispatchEvent.call(field, new InputEvent('input', {
+              bubbles: true, composed: true, inputType: 'insertReplacementText'
+            }));
+            EventTarget.prototype.dispatchEvent.call(field, new Event('change', { bubbles: true }));
+          }
+          return bound(this, expectedControl, expectedFields, form, fields) && holds(fields, values) ? 'filled' : 'changed';
+        }`,
+      });
+      const value: unknown = result.result.value;
+      if (result.exceptionDetails) return 'changed';
+      return value === 'filled' || value === 'not_inserted' || value === 'changed' ? value : 'changed';
+      // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a credential value.
+    } catch (_error) {
+      // Once the call may have started, values may be in the page.
+      return started ? 'changed' : 'not_inserted';
+    }
+  });
+}
+
+/**
+ * Activates the bound control exactly once, by its own node and through the
+ * isolated world's click, after revalidating the group and that every field
+ * still holds its value. A native form submits natively; a JS-controlled or
+ * no-form control runs its own handlers. `uncertain` means the click may have
+ * run; `disabled` and `changed` mean it did not.
+ */
+export async function activateNativeCredentialControl(
+  frame: Frame,
+  group: NativeCredentialGroup,
+  values: readonly string[],
+  assertActive: () => Promise<void>,
+): Promise<CredentialActivationResult> {
+  const nodes = credentialNodes(group);
+  if (!nodes || values.length !== group.fields.length) return 'changed';
+  return withBoundNodes(frame, group.control, nodes, 'changed', async (session, objects) => {
+    await assertActive();
+    try {
+      const result = await session.send('Runtime.callFunctionOn', {
+        objectId: objects[0],
+        returnByValue: true,
+        arguments: credentialArguments(group, values, objects),
+        functionDeclaration: `function (expectedControl, expectedFields, values, form, ...fields) {
+          ${credentialGroupSource}
+          if (!bound(this, expectedControl, expectedFields, form, fields) || !holds(fields, values)) return 'changed';
+          if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true') return 'disabled';
+          // A native GET submission would carry the values in its address; one no page handler took over is cancelled.
+          const address = (event) => {
+            if (form && event.target === form && formProperty(form, 'method') === 'get') event.preventDefault();
+          };
+          addEventListener('submit', address);
+          try {
+            HTMLElement.prototype.click.call(this);
+          } finally {
+            removeEventListener('submit', address);
+          }
+          return 'activated';
+        }`,
+      });
+      const value: unknown = result.result.value;
+      if (result.exceptionDetails) return 'uncertain';
+      return value === 'activated' || value === 'disabled' || value === 'changed' ? value : 'uncertain';
+      // eslint-disable-next-line no-catch-all/no-catch-all -- The click may have run; never expose renderer prose.
+    } catch (_error) {
+      return 'uncertain';
+    }
+  });
 }
 
 function chosenFrame(tree: NativeFrameTree, frame: Frame, owner: Frame): NativeFrameTree | undefined {
@@ -201,11 +437,20 @@ function findFrame(tree: NativeFrameTree, id: string): NativeFrameTree | undefin
   return undefined;
 }
 
+interface InspectedNode<Facts> {
+  frameId: string;
+  loaderId: string;
+  controlBackendNodeId: number;
+  formBackendNodeId: number | null;
+  facts: Facts;
+}
+
 /** Transfer exact DOM identity between public APIs without mutable DOM markers. */
-export async function inspectNativeAuthenticationControl(
+async function inspectNativeNode<Facts>(
   element: ElementHandle,
   frame: Frame,
-): Promise<NativeAuthenticationBinding | undefined> {
+  reader: 'readControl' | 'readCredentialNode',
+): Promise<InspectedNode<Facts> | undefined> {
   const registered = contextSelectors.get(frame.page().context());
   if (!registered) return undefined;
   const selectorName = await registered;
@@ -251,22 +496,28 @@ export async function inspectNativeAuthenticationControl(
       expression: `(() => {
         ${readControlSource}
         const slot = globalThis[${JSON.stringify(eventName)}];
-        return slot.count === 1 && slot.control ? readControl(slot.control) : null;
+        return slot.count === 1 && slot.control ? ${reader}(slot.control) : null;
       })()`,
     });
-    const facts = factsResult.result.value as NativeAuthenticationFacts | null | undefined;
+    const facts = factsResult.result.value as Facts | null | undefined;
     if (factsResult.exceptionDetails || !facts) return undefined;
-    const ids: number[] = [];
+    const ids: Array<number | null> = [];
     for (const name of ['control', 'form'] as const) {
       const captured = await session.send('Runtime.evaluate', {
         contextId,
         objectGroup: eventName,
         expression: `globalThis[${JSON.stringify(eventName)}].${name}`,
       });
+      // Only a credential node may stand outside any form.
+      if (name === 'form' && reader === 'readCredentialNode' && captured.result.subtype === 'null') {
+        ids.push(null);
+        continue;
+      }
       if (!captured.result.objectId) return undefined;
       const { node } = await session.send('DOM.describeNode', { objectId: captured.result.objectId });
       ids.push(node.backendNodeId);
     }
+    if (ids[0] === null) return undefined;
     return {
       frameId: selected.frame.id,
       loaderId: selected.frame.loaderId,
@@ -294,56 +545,42 @@ export async function inspectNativeAuthenticationControl(
   }
 }
 
+export async function inspectNativeAuthenticationControl(
+  element: ElementHandle,
+  frame: Frame,
+): Promise<NativeAuthenticationBinding | undefined> {
+  const inspected = await inspectNativeNode<NativeAuthenticationFacts>(element, frame, 'readControl');
+  if (!inspected || inspected.formBackendNodeId === null) return undefined;
+  return { ...inspected, formBackendNodeId: inspected.formBackendNodeId };
+}
+
+/** The same exact-node handoff for a credential field or control, which may stand outside any form. */
+export function inspectNativeCredentialControl(
+  element: ElementHandle,
+  frame: Frame,
+): Promise<NativeCredentialBinding | undefined> {
+  return inspectNativeNode<NativeCredentialFacts>(element, frame, 'readCredentialNode');
+}
+
 /** Resolve native identities into an isolated world; revalidate and submit in one synchronous call. */
 export async function submitNativeAuthenticationForm(
   frame: Frame,
   binding: NativeAuthenticationBinding,
   assertActive?: () => Promise<void>,
 ): Promise<boolean> {
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
-  try {
-    attached = await attachFrameSession(frame);
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Protocol errors refuse authentication without exposing page prose.
-  } catch (_error) {
-    return false;
-  }
-  const { session } = attached;
-  const objectGroup = `gws-ea-auth-${randomUUID()}`;
-  try {
-    let controlObjectId: string | undefined;
-    let formObjectId: string | undefined;
-    try {
-      const { frameTree } = await session.send('Page.getFrameTree');
-      const selected = findFrame(frameTree, binding.frameId);
-      if (!selected || selected.frame.loaderId !== binding.loaderId) return false;
-      const { executionContextId } = await session.send('Page.createIsolatedWorld', {
-        frameId: binding.frameId,
-        worldName,
-      });
-      const control = await session.send('DOM.resolveNode', {
-        backendNodeId: binding.controlBackendNodeId,
-        executionContextId,
-        objectGroup,
-      });
-      const form = await session.send('DOM.resolveNode', {
-        backendNodeId: binding.formBackendNodeId,
-        executionContextId,
-        objectGroup,
-      });
-      controlObjectId = control.object.objectId;
-      formObjectId = form.object.objectId;
-      if (!controlObjectId || !formObjectId) return false;
-      // eslint-disable-next-line no-catch-all/no-catch-all -- A vanished frame or node must refuse submission without exposing protocol prose.
-    } catch (_error) {
-      return false;
-    }
-    await assertActive?.();
-    try {
-      const result = await session.send('Runtime.callFunctionOn', {
-        objectId: controlObjectId,
-        returnByValue: true,
-        arguments: [{ objectId: formObjectId }, { value: binding.facts }],
-        functionDeclaration: `function (form, expected) {
+  return withBoundNodes(
+    frame,
+    binding,
+    [binding.controlBackendNodeId, binding.formBackendNodeId],
+    false,
+    async (session, [controlObjectId, formObjectId]) => {
+      await assertActive?.();
+      try {
+        const result = await session.send('Runtime.callFunctionOn', {
+          objectId: controlObjectId,
+          returnByValue: true,
+          arguments: [{ objectId: formObjectId }, { value: binding.facts }],
+          functionDeclaration: `function (form, expected) {
           ${readControlSource}
           const facts = readControl(this);
           if (!facts || !facts.submit || formFor(this) !== form ||
@@ -351,14 +588,12 @@ export async function submitNativeAuthenticationForm(
           HTMLFormElement.prototype.submit.call(form);
           return true;
         }`,
-      });
-      return !result.exceptionDetails && result.result.value === true;
-      // eslint-disable-next-line no-catch-all/no-catch-all -- Native submission errors are a refusal, never agent-visible page prose.
-    } catch (_error) {
-      return false;
-    }
-  } finally {
-    await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
-    await session.detach().catch(() => undefined);
-  }
+        });
+        return !result.exceptionDetails && result.result.value === true;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Native submission errors are a refusal, never agent-visible page prose.
+      } catch (_error) {
+        return false;
+      }
+    },
+  );
 }

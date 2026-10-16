@@ -148,6 +148,22 @@ async function clearValueEverywhere(page: Page, value: string): Promise<boolean>
   return complete;
 }
 
+/**
+ * After a host fill: clear every field still holding one of the values, then
+ * release their active taint. Redaction and document taint stay for the
+ * page's lifetime. A page that cannot be cleared is closed instead.
+ */
+export async function settleFilledSecrets(
+  context: BrowserExecutionContext,
+  page: Page,
+  values: readonly string[],
+): Promise<void> {
+  let cleared = true;
+  for (const value of values) if (!(await clearValueEverywhere(page, value))) cleared = false;
+  if (!cleared && !page.isClosed()) await context.runtime.closeJob(context.job.id).catch(() => undefined);
+  if (cleared || page.isClosed()) for (const value of values) releasePageSecret(page, value);
+}
+
 /** Caller owns the queue's exclusive job lock; resolve remains lazy until the pinned HTTPS checks pass. */
 export async function fillBoundBrowserSecret(
   context: BrowserExecutionContext,
@@ -218,11 +234,7 @@ export async function fillBoundBrowserSecret(
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
-    if (value) {
-      const cleared = await clearValueEverywhere(page, value);
-      if (!cleared && !page.isClosed()) await context.runtime.closeJob(context.job.id).catch(() => undefined);
-      if (cleared || page.isClosed()) releasePageSecret(page, value);
-    }
+    if (value) await settleFilledSecrets(context, page, [value]);
   }
 }
 

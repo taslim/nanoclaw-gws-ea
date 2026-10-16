@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import type { Page } from 'playwright-core';
-import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
+import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from './executor.js';
+import type { PinnedBrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 import { registerPageSecret } from './observe.js';
 
@@ -68,4 +69,27 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
   expect(refused.images).toBeUndefined();
   expect(screenshots).toBe(2);
+});
+
+it('refuses ordinary typing into new, confirming and show-password-toggled credential fields', async () => {
+  const field = (attributes: Record<string, string>) =>
+    ({
+      element: {
+        evaluate: async (read: (node: unknown) => unknown) =>
+          read({ getAttribute: (name: string) => attributes[name] ?? null }),
+      },
+    }) as unknown as Pick<PinnedBrowserRef, 'element'>;
+  const secret: ReadonlyArray<Record<string, string>> = [
+    { type: 'text', name: 'password', autocomplete: 'new-password' },
+    { type: 'text', name: 'confirm_password' },
+    { type: 'text', id: 'currentPassword', autocomplete: 'current-password' },
+    { type: 'text', 'aria-label': 'Repeat password' },
+    { type: 'password', name: 'pin' },
+  ];
+  const ordinary: ReadonlyArray<Record<string, string>> = [
+    { type: 'email', name: 'email', autocomplete: 'email' },
+    { type: 'text', name: 'passenger_name' },
+  ];
+  for (const attributes of secret) expect(await isSecretBrowserField(field(attributes))).toBe(true);
+  for (const attributes of ordinary) expect(await isSecretBrowserField(field(attributes))).toBe(false);
 });

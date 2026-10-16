@@ -1,12 +1,15 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
 import * as nativeAuthentication from './authentication-submit.js';
 afterEach(() => vi.restoreAllMocks());
 import {
   activateControl,
   classifyControlFacts,
+  classifyCredentialControlFacts,
+  classifyCredentialNavigation,
   classifyNavigationUrl,
   registerReviewedMerchantFlow,
+  type ControlFacts,
 } from './commit-classifier.js';
 
 it('fails closed for unknown one-click controls without requiring visible money', () => {
@@ -176,4 +179,80 @@ it('recognizes the reviewed read-only Amazon review URL and refuses unknown acti
     expect(
       classifyControlFacts({ name, tag: 'button', type: 'submit', role: 'button', href: null, transaction: true }),
     ).toBe(reason);
+});
+
+describe('the credential activation scope', () => {
+  const control = (name: string, changes: Partial<ControlFacts> = {}): ControlFacts => ({
+    name,
+    visibleLabel: name,
+    role: 'button',
+    tag: 'button',
+    type: 'submit',
+    href: null,
+    transaction: false,
+    formMethod: 'post',
+    formAction: 'https://accounts.shop.example/signup',
+    ...changes,
+  });
+
+  it('activates only a positively named signup or password-change control on the operation’s own site', () => {
+    for (const name of ['Create account', 'Sign up', 'Continue', 'Register', 'Next'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('ordinary');
+    for (const name of ['Change password', 'Update password', 'Save changes', 'Save new password'])
+      expect(
+        classifyCredentialControlFacts(
+          control(name, { formAction: 'https://www.shop.example/account/change-password' }),
+          'rotation',
+          'shop.example',
+        ),
+      ).toBe('ordinary');
+    // The same password-change control is still account security outside its own authorized scope.
+    expect(classifyCredentialControlFacts(control('Change password'), 'signup', 'shop.example')).toBe(
+      'account_security',
+    );
+    expect(classifyControlFacts(control('Change password'))).toBe('account_security');
+  });
+
+  it('refuses financial, unrelated security, speaking, ambiguous and off-site activation even when authorized', () => {
+    const refusals: Array<[ControlFacts, string]> = [
+      [control('Start free trial'), 'purchase_control'],
+      [control('Subscribe'), 'purchase_control'],
+      [control('Create account', { transaction: true }), 'unsupported_merchant'],
+      [control('Change email'), 'account_security'],
+      [control('Update password and phone', { visibleLabel: 'Update phone' }), 'account_security'],
+      [control('Manage two-factor'), 'account_security'],
+      [control('Delete account'), 'account_security'],
+      [control('Post review'), 'speaks_as_principal'],
+      [control('Do it'), 'unsupported_merchant'],
+      [control('Create account', { visibleLabel: 'Buy now' }), 'purchase_control'],
+      [control('Create account', { formAction: 'https://collector.example/signup' }), 'unsupported_merchant'],
+      [control('Create account', { formAction: 'http://accounts.shop.example/signup' }), 'blocked_address'],
+      [control('Create account', { formAction: 'https://www.shop.example/checkout/subscribe' }), 'purchase_control'],
+      [control('Create account', { tag: 'a', href: 'https://www.shop.example/signup' }), 'unsupported_merchant'],
+    ];
+    for (const [facts, reason] of refusals)
+      expect(
+        classifyCredentialControlFacts(facts, facts.name.includes('password') ? 'rotation' : 'signup', 'shop.example'),
+      ).toBe(reason);
+  });
+
+  it('lets a change navigate only to its own site’s password routes, never to other security or financial routes', () => {
+    expect(
+      classifyCredentialNavigation('https://www.shop.example/account/change-password', 'rotation', 'shop.example'),
+    ).toBe('ordinary');
+    expect(classifyCredentialNavigation('https://www.shop.example/welcome', 'signup', 'shop.example')).toBe('ordinary');
+    expect(classifyNavigationUrl('https://www.shop.example/account/change-password')).toBe('account_security');
+    for (const [url, reason] of [
+      ['https://www.shop.example/account/change-password', 'account_security'],
+      ['https://www.shop.example/account/change-email', 'account_security'],
+      ['https://www.shop.example/account/delete-account', 'account_security'],
+      ['https://www.shop.example/checkout', 'purchase_control'],
+      ['http://www.shop.example/welcome', 'blocked_address'],
+    ] as const)
+      expect(
+        classifyCredentialNavigation(url, url.includes('change-password') ? 'signup' : 'rotation', 'shop.example'),
+      ).toBe(reason);
+    // Another site keeps the generic rules: the scope says nothing about it.
+    expect(classifyCredentialNavigation('https://collector.example/welcome', 'signup', 'shop.example')).toBeUndefined();
+  });
 });

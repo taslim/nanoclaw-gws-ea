@@ -1,4 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
+import { getDomain } from 'tldts';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import type { BrowserExecutionContext } from './queue.js';
@@ -7,6 +8,7 @@ import {
   inspectAuthenticationControl,
   submitAuthenticationForm,
   type AuthenticationFormSignature,
+  type CredentialKind,
 } from './authentication-signatures.js';
 
 export type ActivationClass =
@@ -49,18 +51,18 @@ const security =
   /\b(?:change|reset|delete|remove|update|manage)\s+(?:password|security|account|payment\s+method|credit\s+card)|\b(?:sign\s*out|log\s*out|delete\s+account)\b/iu;
 const speaking =
   /\b(?:send\s+(?:message|email)|publish|post\s+(?:review|comment)|submit\s+(?:review|comment)|agree\s+on\s+behalf)\b/iu;
+const unrelatedSecurity =
+  /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu;
+const securityRoute =
+  /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu;
+const purchaseRoute =
+  /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu;
 const ordinaryName =
   /^(?:search|find(?:\s+(?:a\s+)?(?:table|restaurant|time|availability))?|check\s+availability|view(?:\s+(?:details|menu|availability|more|results|cart|basket))?|show\s+more|load\s+more|learn\s+more|details|next|previous|back|close|cancel|dismiss|continue\s+(?:shopping|browsing)|add\s+to\s+(?:cart|basket)|sign\s*in|log\s*in|continue\s+with\s+email|send\s+(?:(?:sign.?in|verification|login|one.?time)\s+)?(?:code|link)|verify\s+(?:code|email)|submit\s+code|accept\s+(?:all\s+)?cookies|reject\s+(?:all\s+)?cookies|(?:cookie\s+)?preferences)$/iu;
 
 export function classifyControlFacts(facts: ControlFacts): ActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
-  if (
-    security.test(evidence) ||
-    /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu.test(
-      evidence,
-    )
-  )
-    return 'account_security';
+  if (security.test(evidence) || unrelatedSecurity.test(evidence)) return 'account_security';
   if (
     speaking.test(evidence) ||
     /\b(?:write a review|message (?:the |a )?(?:restaurant|seller|host))\b/iu.test(evidence)
@@ -97,6 +99,18 @@ export function classifyControlFacts(facts: ControlFacts): ActivationClass {
   return 'unsupported_merchant';
 }
 
+/** A navigation's path and action parameters as words, for the host's own route signatures. */
+function navigationEvidence(url: URL): string | undefined {
+  try {
+    const actionParameters = [...url.searchParams]
+      .map(([name, value]) => (/^(?:action|operation|intent|command|do)$/iu.test(name) ? `${name} ${value}` : name))
+      .join(' ');
+    return decodeURIComponent(`${url.pathname} ${actionParameters}`).replace(/[_/-]+/gu, ' ');
+  } catch (_error) {
+    return undefined;
+  }
+}
+
 export function classifyNavigationUrl(raw: string): ActivationClass {
   let url: URL;
   try {
@@ -105,22 +119,9 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     return 'blocked_address';
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return 'blocked_address';
-  let decoded: string;
-  try {
-    const actionParameters = [...url.searchParams]
-      .map(([name, value]) => (/^(?:action|operation|intent|command|do)$/iu.test(name) ? `${name} ${value}` : name))
-      .join(' ');
-    decoded = decodeURIComponent(`${url.pathname} ${actionParameters}`).replace(/[_/-]+/gu, ' ');
-  } catch (_error) {
-    return 'blocked_address';
-  }
-  if (
-    security.test(decoded) ||
-    /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu.test(
-      decoded,
-    )
-  )
-    return 'account_security';
+  const decoded = navigationEvidence(url);
+  if (decoded === undefined) return 'blocked_address';
+  if (security.test(decoded) || securityRoute.test(decoded)) return 'account_security';
   if (speaking.test(decoded)) return 'speaks_as_principal';
   const reviewed = merchantFlows.find((candidate) => candidate.matches(url));
   if (
@@ -129,13 +130,7 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     ![...url.searchParams.keys()].some((name) => /^(?:action|operation|intent|command|do)$/iu.test(name))
   )
     return 'ordinary';
-  if (
-    purchase.test(decoded) ||
-    /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu.test(
-      decoded,
-    )
-  )
-    return 'purchase_control';
+  if (purchase.test(decoded) || purchaseRoute.test(decoded)) return 'purchase_control';
   if (authenticationEndpoint(url)) return 'ordinary';
   const flow = merchantFlows.find((candidate) => candidate.matches(url));
   if (flow) return flow.classifyNavigation(url);
@@ -147,6 +142,96 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
   )
     return 'ordinary';
   return 'unsupported_merchant';
+}
+
+/**
+ * The words an authorized password change may use (KTD7, R18). Only within a
+ * change's own scope are they set aside before the security checks; every
+ * other account-security change stays refused there too.
+ */
+const passwordChange = /\b(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password\b/giu;
+const credentialSecurity =
+  /\b(?:change|update|add|remove|manage|edit|replace|reset|delete)\s+(?:(?:your|my|sign.?in|login)\s+)?(?:e-?mail(?:\s+address)?|phone(?:\s+number)?|mobile|two.?factor|2fa|mfa|totp|authenticator|passkeys?|security\s+(?:keys?|questions?)|payment(?:\s+methods?)?|billing|cards?)\b/iu;
+/** Inside the widened scope, any money route is refused, not merely the generic commit signatures. */
+const credentialFinancial =
+  /\b(?:checkout|cart|basket|billing|payments?|orders?|subscriptions?|subscribe|trials?|donate|donations?|purchase|upgrade|plans?|pricing)\b/iu;
+const credentialActivation: Record<CredentialKind, RegExp> = {
+  signup:
+    /^(?:sign\s*up(?:\s+with\s+email)?|create\s+(?:(?:an|your|my|new)\s+)?account|register|join(?:\s+now)?|get\s+started|continue(?:\s+with\s+email)?|next|submit|done|finish|save|create)$/iu,
+  rotation:
+    /^(?:(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password|save(?:\s+changes)?|submit|continue|next|done|confirm|update)$/iu,
+};
+
+function credentialSecurityClass(evidence: string, kind: CredentialKind): ActivationClass | undefined {
+  const remaining = kind === 'rotation' ? evidence.replace(passwordChange, ' ') : evidence;
+  if (
+    security.test(remaining) ||
+    securityRoute.test(remaining) ||
+    unrelatedSecurity.test(remaining) ||
+    credentialSecurity.test(remaining)
+  )
+    return 'account_security';
+  if (speaking.test(evidence)) return 'speaks_as_principal';
+  return undefined;
+}
+
+/**
+ * A credential operation's own classification of a document address on its
+ * site: HTTPS only, with financial, speaking and every security route other
+ * than a change's own password route refused. Another site is left to the
+ * generic rules (undefined).
+ */
+export function classifyCredentialNavigation(
+  raw: string,
+  kind: CredentialKind,
+  site: string,
+): ActivationClass | undefined {
+  if (!URL.canParse(raw)) return 'blocked_address';
+  const url = new URL(raw);
+  if (url.protocol !== 'https:' || url.username || url.password) return 'blocked_address';
+  if (getDomain(url.hostname, { allowPrivateDomains: true }) !== site) return undefined;
+  const decoded = navigationEvidence(url);
+  if (decoded === undefined) return 'blocked_address';
+  const refused = credentialSecurityClass(decoded, kind);
+  if (refused) return refused;
+  if (purchase.test(decoded) || purchaseRoute.test(decoded) || credentialFinancial.test(decoded))
+    return 'purchase_control';
+  return 'ordinary';
+}
+
+/**
+ * Whether an authorized signup or password change may activate this control.
+ * Visible money terms, purchase or subscription wording, unrelated security,
+ * speaking and links are refused; so is any name outside the operation's own
+ * vocabulary, as ambiguous. The form's destination must stay on the site.
+ */
+export function classifyCredentialControlFacts(
+  facts: ControlFacts,
+  kind: CredentialKind,
+  site: string,
+): ActivationClass {
+  const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
+  const refused = credentialSecurityClass(evidence, kind);
+  if (refused) return refused;
+  if (purchase.test(evidence)) return 'purchase_control';
+  if (facts.transaction || facts.tag === 'a' || facts.href) return 'unsupported_merchant';
+  if (facts.formAction) {
+    const destination = classifyCredentialNavigation(facts.formAction, kind, site);
+    if (destination !== 'ordinary') return destination ?? 'unsupported_merchant';
+  }
+  const names = [facts.name.trim(), facts.visibleLabel?.trim() ?? ''].filter(Boolean);
+  return names.length > 0 && names.every((name) => credentialActivation[kind].test(name))
+    ? 'ordinary'
+    : 'unsupported_merchant';
+}
+
+export async function classifyCredentialActivation(
+  page: Page,
+  element: ElementHandle,
+  kind: CredentialKind,
+  site: string,
+): Promise<ActivationClass> {
+  return classifyCredentialControlFacts(await readControlFacts(page, element), kind, site);
 }
 
 export async function readControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
@@ -359,6 +444,12 @@ export async function activateControl(
 }
 
 export interface BrowserNavigationPolicy {
+  /**
+   * A host-owned operation's own complete classification of a document on its
+   * site, replacing the generic one; undefined leaves the generic rules. Only
+   * an authorized credential operation installs one, for its activation.
+   */
+  decide?(url: URL): ActivationClass | undefined;
   /** A host-owned sign-in scope may recognize an otherwise unsupported bearer-link route. */
   classify?(url: URL): ActivationClass;
   stripReferrer?: boolean;
@@ -408,6 +499,17 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
           classification = known === 'purchase_control' ? 'ordinary' : known;
         }
       }
+      if (event.resourceType === 'Document')
+        for (const policy of scopes) {
+          let decided: ActivationClass | undefined;
+          try {
+            decided = policy.decide?.(new URL(event.request.url));
+            // eslint-disable-next-line no-catch-all/no-catch-all -- a scope that cannot classify a document blocks it
+          } catch (_error) {
+            decided = 'blocked_address';
+          }
+          if (decided) classification = decided;
+        }
       if (event.resourceType === 'Document')
         for (const policy of scopes) {
           if (policy.classify) {

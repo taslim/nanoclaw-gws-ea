@@ -2,7 +2,7 @@ import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
-import { httpsOrigin } from './authentication-signatures.js';
+import { httpsOrigin, SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -147,13 +147,17 @@ export function redactPageText(page: Page, text: string): string {
   );
 }
 
+/** A text field a show-password toggle produced still holds a password, so the scan never trusts the type alone. */
+const SECRET_FIELD_VALUES = `Array.from(document.querySelectorAll('input')).filter(e => e.type === 'password' ||
+  new RegExp(${JSON.stringify(SECRET_AUTOCOMPLETE.source)}, 'iu').test(e.getAttribute('autocomplete') || '') ||
+  new RegExp(${JSON.stringify(SECRET_DESCRIPTION.source)}, 'iu').test([e.name, e.id, e.getAttribute('aria-label') || '', e.getAttribute('placeholder') || ''].join(' '))
+).map(e => e.value).filter(Boolean)`;
+
 /** Host-owned inspection, never an agent-supplied expression or field-read tool. */
 async function collectSecretFields(page: Page): Promise<boolean> {
   let present = false;
   for (const frame of page.frames()) {
-    const values: unknown = await frame.evaluate(
-      `Array.from(document.querySelectorAll('input')).filter(e => e.type === 'password' || /(?:one-time-code|cc-|credit-card)/i.test(e.autocomplete || '') || /(?:otp|verification.?code|security.?code)/i.test(e.name + ' ' + e.id)).map(e => e.value).filter(Boolean)`,
-    );
+    const values: unknown = await frame.evaluate(SECRET_FIELD_VALUES);
     if (!Array.isArray(values)) continue;
     for (const value of values)
       if (typeof value === 'string' && value) {

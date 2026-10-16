@@ -13,6 +13,7 @@ import {
   withBrowserJobNavigation,
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
+import { isSensitiveField } from './authentication-signatures.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import { SiteLeaseStore } from './leases.js';
 import {
@@ -195,19 +196,19 @@ export function browserActionRefs(action: BrowserAction): BrowserRef[] {
 }
 
 export async function isSecretBrowserField(target: Pick<PinnedBrowserRef, 'element'>): Promise<boolean> {
-  return target.element.evaluate((node) => {
+  const facts = await target.element.evaluate((node) => {
     const e = node as unknown as { getAttribute(name: string): string | null };
-    const type = e.getAttribute('type') ?? '';
-    const description = ['autocomplete', 'name', 'id', 'aria-label', 'placeholder']
-      .map((key) => e.getAttribute(key) ?? '')
-      .join(' ');
-    return (
-      type === 'password' ||
-      /(?:one-time-code|(?:^|\s)cc-|credit.?card|card.?number|cvc|cvv|otp|one.?time|verification.?code|security.?code)/iu.test(
-        description,
-      )
-    );
+    const read = (name: string): string => e.getAttribute(name) ?? '';
+    return {
+      type: read('type'),
+      autocomplete: read('autocomplete'),
+      name: read('name'),
+      id: read('id'),
+      label: read('aria-label'),
+      placeholder: read('placeholder'),
+    };
   });
+  return isSensitiveField(facts);
 }
 
 async function fieldInput(context: BrowserExecutionContext, target: PinnedBrowserRef, value: string): Promise<void> {

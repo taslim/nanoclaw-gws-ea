@@ -4,6 +4,7 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 import Ajv from 'ajv';
 import {
   cancelJob,
+  credentialAuthority,
   relayCode,
   reservationGuarantee,
   reservationBounds,
@@ -207,4 +208,43 @@ it('shares or refreshes the 1Password vault through the native host request, nev
   // main reads the status beside the message it forwards as written.
   expect(JSON.stringify(result)).toContain('operator_needed');
   expect(JSON.stringify(result)).toContain(message);
+});
+
+it('records signup or password-change authority through the native host request, never another security change or a value', async () => {
+  const validate = new Ajv().compile(credentialAuthority.tool.inputSchema);
+  const fields = {
+    thread: 'system:a2a:main:join',
+    operation: 'signup',
+    site: 'https://accounts.shop.example/join',
+    username: 'morgan.ellery@example.com',
+  };
+  expect(validate(fields)).toBe(true);
+  expect(validate({ ...fields, operation: 'change_password' })).toBe(true);
+  for (const changed of [
+    { ...fields, operation: 'change_email' },
+    { ...fields, operation: 'disable_two_factor' },
+    { ...fields, password: 'chosen-by-main' },
+    { ...fields, approved: true },
+    { thread: fields.thread, operation: 'signup', site: fields.site },
+  ])
+    expect(validate(changed)).toBe(false);
+  const waiting = credentialAuthority.handler({ ...fields, password: 'chosen-by-main' });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'credential_authority', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'not_owned', reason: 'no_record' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('not_owned');
+  for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable', 'rate_limited'])
+    expect(credentialAuthority.tool.description).toContain(outcome);
 });

@@ -24,6 +24,7 @@ import './executor.js';
 import './recipes.js';
 import './capability.js';
 import './fill.js';
+import { registerCredentialAuthorityDelivery } from './credential-operations.js';
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
@@ -409,6 +410,7 @@ export function getBrowserQueue(): BrowserQueue {
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
 registerBrowserActionDelivery('fill_secret', getBrowserQueue);
+registerBrowserActionDelivery('credential_form', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
@@ -418,6 +420,7 @@ registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerVaultAccessDelivery();
+registerCredentialAuthorityDelivery();
 
 export {
   BrowserStore,

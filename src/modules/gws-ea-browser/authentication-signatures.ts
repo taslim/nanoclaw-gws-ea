@@ -64,6 +64,84 @@ export function authenticationFieldKind(facts: AuthenticationFieldFacts): Browse
   return undefined;
 }
 
+/**
+ * What marks a field's value as a credential, code or payment secret. Both
+ * survive a show-password toggle, which only turns a password field's type to
+ * text. The page-side scan in observe.ts builds its filter from these sources.
+ */
+export const SECRET_AUTOCOMPLETE = /(?:current-password|new-password|one-time-code|cc-)/iu;
+export const SECRET_DESCRIPTION =
+  /(?:pass(?:word|wd|phrase|code)|pwd|one-time-code|(?:^|\s)cc-|credit.?card|card.?number|cvc|cvv|otp|one.?time|verification.?code|security.?code)/iu;
+
+export interface SensitiveFieldFacts {
+  type: string;
+  autocomplete: string;
+  name: string;
+  id?: string;
+  label?: string;
+  placeholder?: string;
+}
+
+/** Ordinary text input refuses these; only the host's bound fills may write them. */
+export function isSensitiveField(facts: SensitiveFieldFacts): boolean {
+  if (facts.type === 'password' || SECRET_AUTOCOMPLETE.test(facts.autocomplete)) return true;
+  return SECRET_DESCRIPTION.test(
+    [facts.autocomplete, facts.name, facts.id ?? '', facts.label ?? '', facts.placeholder ?? ''].join(' '),
+  );
+}
+
+/** The fields an authorized signup or password change fills, each with the value the host chose for it. */
+export type CredentialFormField = 'username' | 'current_password' | 'new_password' | 'confirmation';
+export type CredentialKind = 'signup' | 'rotation';
+export interface CredentialFieldFacts {
+  name: string;
+  id: string;
+  type: string;
+  autocomplete: string;
+}
+
+const CURRENT_HINT = /(?:current|old|existing).?pass/iu;
+const NEW_HINT = /new.?pass|pass(?:word)?.?new/iu;
+const CONFIRM_HINT =
+  /(?:confirm|repeat|retype|re-?enter|verify|again).?pass|pass(?:word)?.?(?:confirm|repeat|again|verify|2)/iu;
+const NOT_CREDENTIAL = /(?:cc-|credit.?card|card.?number|cvc|cvv|security.?question|one-time-code)/iu;
+const USERNAME_HINT = /(?:^|[^a-z])(?:user.?name|user|e-?mail|login)(?:[^a-z]|$)/iu;
+
+/**
+ * Whether a field's structure supports a credential role. The current and the
+ * new password are never interchangeable: putting the old password into a new
+ * field would leave the website and the vault disagreeing. A change form's
+ * unmarked password field is new only beside a bound current-password field.
+ */
+export function credentialFieldFits(
+  role: CredentialFormField,
+  facts: CredentialFieldFacts,
+  kind: CredentialKind,
+  currentBound: boolean,
+): boolean {
+  const autocomplete = facts.autocomplete.toLowerCase().split(/\s+/u);
+  const description = `${facts.name} ${facts.id}`;
+  if (NOT_CREDENTIAL.test(`${description} ${facts.autocomplete}`)) return false;
+  if (role === 'username')
+    return (
+      ['email', 'text', ''].includes(facts.type) &&
+      (autocomplete.includes('username') ||
+        autocomplete.includes('email') ||
+        facts.type === 'email' ||
+        USERNAME_HINT.test(description))
+    );
+  const evidenced =
+    autocomplete.includes('new-password') ||
+    autocomplete.includes('current-password') ||
+    /pass(?:word|wd)|pwd/iu.test(description);
+  // A show-password toggle leaves a text field that still says what it holds.
+  if (facts.type !== 'password' && !(facts.type === 'text' && evidenced)) return false;
+  const current = autocomplete.includes('current-password') || CURRENT_HINT.test(description);
+  const fresh = autocomplete.includes('new-password') || NEW_HINT.test(description) || CONFIRM_HINT.test(description);
+  if (role === 'current_password') return kind === 'rotation' && current && !fresh;
+  return !current && (fresh || kind === 'signup' || currentBound);
+}
+
 /** Endpoint signatures are host source, never model or site-authored prose. */
 export function authenticationEndpoint(url: URL): boolean {
   if (!httpsOrigin(url.href)) return false;

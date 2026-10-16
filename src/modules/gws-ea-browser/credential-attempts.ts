@@ -280,6 +280,31 @@ export class CredentialAttempts {
     return ownershipHolds(record, read.value) ? { status: 'owned' } : { status: 'not_owned', reason: 'changed' };
   }
 
+  /**
+   * Main's delegation names an account, not a handle: the listed Login this
+   * host saved for the origin's site under that username, found from the
+   * listing and local records alone. `ownership` then checks it fresh.
+   */
+  async ownedHandle(
+    origin: string,
+    username: string,
+    assertActive = active,
+  ): Promise<
+    { readonly status: 'found'; readonly itemHandle: string } | { readonly status: 'not_owned' } | VaultFailure
+  > {
+    const site = registrableDomain(origin);
+    if (!site) return { status: 'not_owned' };
+    const listed = await provider(this.vault.itemsForOrigin(origin, assertActive));
+    if (!('value' in listed)) return listed;
+    for (const { item_handle: itemHandle } of listed.value) {
+      const item = await this.listedItem(itemHandle, origin, assertActive);
+      if ('status' in item) continue;
+      const record = await this.record(item.vaultId, item.itemId);
+      if (record?.site === site && record.username === username) return { status: 'found', itemHandle };
+    }
+    return { status: 'not_owned' };
+  }
+
   private target(jobId: string, origin: string): { readonly origin: string; readonly site: string } {
     const url = httpsOrigin(origin);
     const site = url && registrableDomain(url.origin);

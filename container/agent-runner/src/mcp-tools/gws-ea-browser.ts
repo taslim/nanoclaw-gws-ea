@@ -45,7 +45,7 @@ function action(kind: string, properties: Record<string, object> = {}, required:
 export const browser = requestTool({
   name: 'browser',
   description:
-    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in. ' +
+    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
     'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main. An unknown commit must be reconciled, never retried. ' +
     NO_REPEAT,
   properties: {
@@ -161,6 +161,45 @@ export const fillSecret = requestTool({
   },
   required: ['item_handle', 'field', 'target', 'submit'],
   additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const credentialForm = requestTool({
+  name: 'credential_form',
+  description:
+    'Fill and submit a signup or password-change form with a password the host generates and saves in 1Password first, under the credential authority main recorded for this job. Give fresh refs for the fields the form has (a signup’s username, new_password and confirmation; a change’s current_password, new_password and confirmation) and the control that submits them. A multi-step signup sends username alone first, then the password step. The host refuses before revealing anything when the frame, origin, form or control is unexpected, financial or another security change; no value reaches you. ' +
+    'Outcomes: continued (observe the next step), account_created or password_changed with vault saved, updated, both_kept (the original login and the new password are both kept in 1Password) or pending; account_exists, password_rejected, current_password_rejected, verification_requested, outcome_unknown, not_owned, refused with a reason, vault_unavailable or rate_limited. The authority is used once: report every outcome but continued to main, and never repeat after outcome_unknown or verification_requested. ' +
+    NO_REPEAT,
+  properties: {
+    authority: { type: 'string', description: 'The credential authority id main gave this job.' },
+    username: REF,
+    current_password: REF,
+    new_password: REF,
+    confirmation: REF,
+    activate: { ...REF, description: 'The control that submits these fields.' },
+  },
+  required: ['authority', 'activate'],
+  additionalProperties: false,
+  oneOf: [
+    {
+      required: ['username'],
+      not: {
+        anyOf: [{ required: ['new_password'] }, { required: ['confirmation'] }, { required: ['current_password'] }],
+      },
+    },
+    { required: ['new_password'] },
+  ],
+  prepare(fields) {
+    if (fields.new_password === undefined && fields.username === undefined)
+      return 'Name the username field, or the new password field with any confirmation and current password.';
+    if (
+      fields.new_password === undefined &&
+      (fields.confirmation !== undefined || fields.current_password !== undefined)
+    )
+      return 'A confirmation or current password goes with the new password field.';
+    return fields;
+  },
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
 });
@@ -339,6 +378,6 @@ export const cancelWatch = requestTool({
 });
 
 registerTools(
-  [browser, fillSecret, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch],
+  [browser, fillSecret, credentialForm, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch],
   'browser',
 );

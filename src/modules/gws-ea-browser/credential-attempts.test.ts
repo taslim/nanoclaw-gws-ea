@@ -1,16 +1,7 @@
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {
-  AutofillBehavior,
-  ItemCategory,
-  ItemFieldType,
-  ItemState,
-  RateLimitExceededError,
-  type Item,
-  type ItemCreateParams,
-  type ItemOverview,
-} from '@1password/sdk';
+import { AutofillBehavior, ItemCategory, ItemFieldType, RateLimitExceededError, type Item } from '@1password/sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
@@ -23,6 +14,7 @@ import {
 } from './onepassword-policy.js';
 import { browserCredentialAttemptsMigration } from './migration.js';
 import { BrowserVault } from './onepassword.js';
+import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
 
 const sdk = vi.hoisted(() => ({ create: vi.fn() }));
@@ -40,163 +32,6 @@ const JOB = 'system:a2a:main:credential-job';
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
 const PRINCIPAL_PASSWORD = 'principal-chosen-password-1';
-
-type Operation = 'vaults' | 'list' | 'get' | 'create' | 'put' | 'archive' | 'resolve';
-interface Fault {
-  readonly error: Error;
-  readonly applied: boolean | 'later';
-}
-const fail = (): never => {
-  throw new Error('no such item');
-};
-
-/**
- * The provider as the SDK presents it: item versions, the optimistic lock on
- * put, active listings, and faults that can land a write before failing, as a
- * lost response does.
- */
-class FakeOnePassword {
-  readonly items = new Map<string, Item>();
-  readonly archived = new Set<string>();
-  readonly calls: Operation[] = [];
-  beforePut: (() => void) | undefined;
-  private count = 0;
-  private readonly faults = new Map<Operation, Fault>();
-  private readonly late: ItemCreateParams[] = [];
-
-  /** The next call fails; its write lands first (`true`), never (`false`), or once `landLate` runs. */
-  failNext(operation: Operation, error: Error, applied: Fault['applied'] = false): void {
-    this.faults.set(operation, { error, applied });
-  }
-
-  landLate(): void {
-    for (const params of this.late.splice(0)) this.store(params);
-  }
-
-  private take(operation: Operation): Fault | undefined {
-    this.calls.push(operation);
-    const fault = this.faults.get(operation);
-    this.faults.delete(operation);
-    return fault;
-  }
-
-  store(params: ItemCreateParams): Item {
-    this.count += 1;
-    const at = new Date();
-    const item: Item = {
-      id: `fakeitem${String(this.count).padStart(18, '0')}`,
-      title: params.title,
-      category: params.category,
-      vaultId: params.vaultId,
-      fields: params.fields ?? [],
-      sections: params.sections ?? [],
-      notes: params.notes ?? '',
-      tags: params.tags ?? [],
-      websites: params.websites ?? [],
-      version: 1,
-      files: [],
-      createdAt: at,
-      updatedAt: at,
-    };
-    this.items.set(item.id, structuredClone(item));
-    return item;
-  }
-
-  /** The 1Password app's "Duplicate": a new item with the same content, tags included. */
-  duplicate(id: string, title: string): Item {
-    const { category, vaultId, fields, sections, notes, tags, websites } = structuredClone(
-      this.items.get(id) ?? fail(),
-    );
-    return this.store({ category, vaultId, title, fields, sections, notes, tags, websites });
-  }
-
-  /** A principal's edit in the 1Password app: a new version, whatever changed. */
-  edit(id: string, change: (item: Item) => Item): void {
-    const current = this.items.get(id);
-    if (!current) throw new Error('no such item');
-    this.items.set(id, { ...change(structuredClone(current)), id, version: current.version + 1 });
-  }
-
-  value(id: string, fieldId: string): string | undefined {
-    return this.items.get(id)?.fields.find((field) => field.id === fieldId)?.value;
-  }
-
-  concealed(): string[] {
-    return [...this.items.values()].flatMap((item) =>
-      item.fields.filter((field) => field.fieldType === ItemFieldType.Concealed).map((field) => field.value),
-    );
-  }
-
-  client(): unknown {
-    return {
-      vaults: {
-        list: async () => {
-          this.take('vaults');
-          return [{ id: VAULT_ID }];
-        },
-      },
-      items: {
-        create: async (params: ItemCreateParams) => {
-          const fault = this.take('create');
-          if (fault?.applied === true) this.store(params);
-          if (fault?.applied === 'later') this.late.push(structuredClone(params));
-          if (fault) throw fault.error;
-          return this.store(params);
-        },
-        get: async (vaultId: string, itemId: string) => {
-          const fault = this.take('get');
-          if (fault) throw fault.error;
-          const item = this.items.get(itemId);
-          if (!item || item.vaultId !== vaultId || this.archived.has(itemId)) throw new Error('item not found');
-          return structuredClone(item);
-        },
-        put: async (item: Item) => {
-          const fault = this.take('put');
-          const edit = this.beforePut;
-          this.beforePut = undefined;
-          edit?.();
-          if (fault && fault.applied !== true) throw fault.error;
-          const current = this.items.get(item.id);
-          if (!current || current.version !== item.version) throw new Error('item version is out of date');
-          const next: Item = { ...structuredClone(item), version: current.version + 1, updatedAt: new Date() };
-          this.items.set(item.id, next);
-          if (fault) throw fault.error;
-          return structuredClone(next);
-        },
-        list: async (vaultId: string) => {
-          this.take('list');
-          return [...this.items.values()]
-            .filter((item) => item.vaultId === vaultId && !this.archived.has(item.id))
-            .map(
-              (item): ItemOverview => ({
-                id: item.id,
-                title: item.title,
-                category: item.category,
-                vaultId: item.vaultId,
-                websites: item.websites,
-                tags: item.tags,
-                createdAt: item.createdAt,
-                updatedAt: item.updatedAt,
-                state: ItemState.Active,
-              }),
-            );
-        },
-        archive: async (_vaultId: string, itemId: string) => {
-          const fault = this.take('archive');
-          if (fault) throw fault.error;
-          this.archived.add(itemId);
-        },
-      },
-      secrets: {
-        resolve: async (reference: string) => {
-          this.take('resolve');
-          const [, , , itemId, field] = reference.split('/');
-          return this.value(itemId, field) ?? '';
-        },
-      },
-    };
-  }
-}
 
 let directory: string;
 let tokenFile: string;
@@ -522,6 +357,25 @@ describe('suggestions and ownership', () => {
     expect((await rows()).filter((row) => row.owned_item_id !== null)).toEqual([
       expect.objectContaining({ id: attempt.id, owned_item_id: itemId }),
     ]);
+  });
+});
+
+describe('naming the account to change', () => {
+  it('finds the Login the host saved for a site and username from local records, never a principal-added one', async () => {
+    const subject = service();
+    expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'not_owned' });
+    principalLogin(USERNAME);
+    expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'not_owned' });
+    const { itemId } = await ownedLogin(subject);
+    const reads = fake.calls.filter((call) => call === 'get').length;
+    const found = await subject.ownedHandle(ORIGIN, USERNAME);
+    expect(found).toEqual({ status: 'found', itemHandle: await handleFor(itemId) });
+    // The record names the account: no fresh read is spent finding it.
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads);
+    expect(await subject.ownedHandle(ORIGIN, 'remy.vance@example.com')).toEqual({ status: 'not_owned' });
+    expect(await subject.ownedHandle('https://shop.example.net', USERNAME)).toEqual({ status: 'not_owned' });
+    await rm(tokenFile);
+    expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_unavailable' });
   });
 });
 

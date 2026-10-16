@@ -8,6 +8,7 @@ import {
   browser,
   BROWSER_REQUEST_TIMEOUT_MS,
   cancelWatch,
+  credentialForm,
   fillSecret,
   listWatches,
   purchase,
@@ -50,6 +51,16 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
   [browser, { actions: [{ kind: 'observe' }], budget_ms: 90_000 }],
   [fillSecret, { item_handle: 'login-1', field: 'password', target, submit: { ref: 'e2', generation: 1 } }],
   [signInCode, { from: 'principal', target, send: { ref: 'e2', generation: 1 } }],
+  [
+    credentialForm,
+    {
+      authority: '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+      username: target,
+      new_password: { ref: 'e2', generation: 1 },
+      confirmation: { ref: 'e3', generation: 1 },
+      activate: { ref: 'e4', generation: 1 },
+    },
+  ],
   [purchase, { target }],
   [purchase, { operation: 'reconcile', attempt_id: 'attempt-1', target }],
   [
@@ -139,6 +150,21 @@ describe('the browser tools', () => {
     }
     expect(purchase.tool.description).toContain('confirmed_not_placed');
     expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty('password');
+    for (const value of ['password', 'value', 'text', 'item_handle'])
+      expect(credentialForm.tool.inputSchema.properties).not.toHaveProperty(value);
+    for (const outcome of [
+      'continued',
+      'account_created',
+      'password_changed',
+      'both_kept',
+      'account_exists',
+      'password_rejected',
+      'current_password_rejected',
+      'verification_requested',
+      'outcome_unknown',
+      'not_owned',
+    ])
+      expect(credentialForm.tool.description).toContain(outcome);
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 
