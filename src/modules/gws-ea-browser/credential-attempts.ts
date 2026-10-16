@@ -28,6 +28,7 @@ import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import {
+  active,
   browserVault,
   BrowserVaultError,
   credentialCandidateTag,
@@ -38,6 +39,7 @@ import {
   type BrowserVaultReason,
   type VaultCandidateSpec,
   type VaultItemRead,
+  vaultFailureStatus,
 } from './onepassword.js';
 
 /**
@@ -167,8 +169,7 @@ const EVIDENCE_KEY = /^[a-z][a-z0-9_]{0,63}$/u;
 const MAX_EVIDENCE_ENTRIES = 16;
 const MAX_EVIDENCE_TEXT = 200;
 const MAX_JOB_ID = 512;
-const MAX_USERNAME = 256;
-const active = async (): Promise<void> => undefined;
+export const MAX_USERNAME = 256;
 const now = (): string => new Date().toISOString();
 const refused = <Reason extends string>(reason: Reason): Refused<Reason> => ({ status: 'refused', reason });
 
@@ -178,12 +179,12 @@ async function provider<T>(step: Promise<T>): Promise<{ readonly value: T } | Va
     return { value: await step };
   } catch (error) {
     if (!(error instanceof BrowserVaultError)) throw error;
-    return { status: error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable' };
+    return { status: vaultFailureStatus(error) };
   }
 }
 
 /** One plain line: non-empty, bounded, with no surrounding whitespace or control characters. */
-function line(value: unknown, max: number): value is string {
+export function line(value: unknown, max: number): value is string {
   return (
     typeof value === 'string' &&
     value.length > 0 &&
@@ -463,7 +464,7 @@ export class CredentialAttempts {
       created = await this.vault.createCandidate(spec, claim, assertActive);
     } catch (error) {
       if (!(error instanceof BrowserVaultError)) throw error;
-      const status = error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable';
+      const status = vaultFailureStatus(error);
       if (!issued) return { status };
       log.warn('Credential candidate save has an unknown outcome', { attemptId: id, reason: status });
       return status === 'rate_limited' ? { status } : { status: 'outcome_unknown' };

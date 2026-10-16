@@ -20,7 +20,12 @@ import {
   readOnePasswordHostPolicy,
   readOnePasswordResources,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
-import { managementUnavailable, onePasswordRevocation, type OnePasswordCliSeams } from './onepassword.js';
+import {
+  isManagementUnavailable,
+  managementUnavailable,
+  onePasswordRevocation,
+  type OnePasswordCliSeams,
+} from './onepassword.js';
 import type { ControlPlanePaths } from './paths.js';
 import { canonicalTimestamp, isRecord } from './validation.js';
 
@@ -271,7 +276,7 @@ async function ownership(
   if (who.status === 'failed')
     return {
       status: 'unavailable',
-      reason: ['not_signed_in', 'token_unavailable', 'not_found'].includes(who.reason)
+      reason: isManagementUnavailable(who.reason)
         ? managementUnavailable(creator, local.management.tokenFile).message
         : `1Password answered ${who.reason.replaceAll('_', ' ')} for the host management service account ${creator}.`,
     };

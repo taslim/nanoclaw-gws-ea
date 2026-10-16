@@ -21,6 +21,7 @@ import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { httpsOrigin, type BrowserSecretField } from './authentication-signatures.js';
 import {
+  isNormalizedAbsolute,
   ONEPASSWORD_POLICY_FILE_ENV,
   onePasswordInstancePaths,
   readOnePasswordHostPolicy,
@@ -35,6 +36,11 @@ export class BrowserVaultError extends Error {
   constructor(readonly reason: BrowserVaultReason) {
     super(reason);
   }
+}
+
+/** A write or refresh failure as the agent sees it: a rate limit it can wait out, or an unavailable vault. */
+export function vaultFailureStatus(error: BrowserVaultError): 'rate_limited' | 'vault_unavailable' {
+  return error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable';
 }
 
 export interface BrowserVaultItem {
@@ -87,7 +93,7 @@ const unavailable = (reason: BrowserVaultUnavailableReason): RuntimeAccess => ({
 
 /** The instance root a browser policy path names, only where provisioning puts that policy. */
 function instanceRootOf(policyFile: string): string | undefined {
-  if (!path.isAbsolute(policyFile) || path.normalize(policyFile) !== policyFile) return undefined;
+  if (!isNormalizedAbsolute(policyFile)) return undefined;
   const { root } = browserPaths(policyFile);
   return path.basename(policyFile) === 'policy.json' && path.basename(root) === 'browser'
     ? path.dirname(root)
@@ -244,7 +250,8 @@ let sdkModule: Promise<typeof import('@1password/sdk')> | undefined;
 const sdk = (): Promise<typeof import('@1password/sdk')> => (sdkModule ??= import('@1password/sdk'));
 const RATE_LIMIT_BACKOFF_MS = 60_000;
 const ITEM_ID = /^[a-z\d_-]+$/iu;
-const active = async (): Promise<void> => undefined;
+/** The default activity check: a caller without a cancellable job is always active. */
+export const active = async (): Promise<void> => undefined;
 
 /** 1Password's own generator, run in this process: it spends no provider request, and its result stays in memory. */
 export async function generateCandidatePassword(): Promise<string> {

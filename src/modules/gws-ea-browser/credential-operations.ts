@@ -35,7 +35,7 @@ import type { Frame, Page } from 'playwright-core';
 import { ActionRefusal, answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
-import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../guard/index.js';
@@ -76,6 +76,8 @@ import {
   CredentialAttemptError,
   RELEASABLE_PHASES,
   credentialAttempts,
+  line,
+  MAX_USERNAME,
   type CandidateCredential,
   type CredentialAttempt,
   type CredentialAttempts,
@@ -122,14 +124,6 @@ const AUTHORITY_FIELDS: ReadonlySet<string> = new Set([
   'username',
   'authority',
 ]);
-const MAX_USERNAME = 256;
-
-const isAccount = (value: unknown): value is string =>
-  typeof value === 'string' &&
-  value.length > 0 &&
-  value.length <= MAX_USERNAME &&
-  value.trim() === value &&
-  !hasControlCharacters(value);
 
 function recorded(attempt: CredentialAttempt, thread: string): Outcome {
   return {
@@ -172,7 +166,7 @@ export async function credentialAuthorityRequest(
     typeof thread !== 'string' ||
     (operation !== 'signup' && operation !== 'change_password') ||
     typeof site !== 'string' ||
-    !isAccount(username)
+    !line(username, MAX_USERNAME)
   )
     throw invalidArgs(
       'credential_authority needs the job thread, signup or change_password, the HTTPS site and the exact account username.',
@@ -494,6 +488,15 @@ const vaultState = (status: CredentialFinalizeResult['status']): VaultState =>
  * both credentials, the original Login and the saved candidate; anything not
  * yet finalized is pending.
  */
+/** Finalize a confirmed attempt and report its website outcome with the vault's resulting state. */
+async function finalizedOutcome(
+  attempt: Pick<CredentialAttempt, 'id' | 'kind'>,
+  attempts: CredentialAttempts,
+  assertActive: () => Promise<void>,
+): Promise<Outcome> {
+  return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, assertActive)).status));
+}
+
 function websiteOutcome(kind: CredentialKind, vault: VaultState): Outcome {
   const status = kind === 'signup' ? 'account_created' : 'password_changed';
   if (vault === 'finalized') return { status, vault: kind === 'signup' ? 'saved' : 'updated' };
@@ -518,7 +521,7 @@ async function settledOutcome(
     case 'rejected':
       return refused('no_authority');
     case 'confirmed':
-      return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, assertActive)).status));
+      return await finalizedOutcome(attempt, attempts, assertActive);
     case 'conflict':
     case 'finalized':
       return websiteOutcome(attempt.kind, attempt.phase);
@@ -1066,6 +1069,12 @@ async function settle(move: () => Promise<unknown>): Promise<void> {
   }
 }
 
+/** An exposed attempt rejects only through unknown: a disclosure never moves straight to rejected. */
+async function rejectExposed(attempts: CredentialAttempts, id: string, proof: CredentialEvidence): Promise<void> {
+  await settle(() => attempts.markUnknown(id, proof));
+  await settle(() => attempts.markRejected(id, proof));
+}
+
 async function disclosingStep(
   context: BrowserExecutionContext,
   page: Page,
@@ -1144,8 +1153,7 @@ async function disclosingStep(
     const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
     if (filled === 'not_inserted') {
       // Proven: nothing reached the page, so no website could have acted on it.
-      await settle(() => attempts.markUnknown(saved.id, evidence('none', filled, 'none')));
-      await settle(() => attempts.markRejected(saved.id, evidence('none', filled, 'none')));
+      await rejectExposed(attempts, saved.id, evidence('none', filled, 'none'));
       return refused('form_changed');
     }
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
@@ -1155,8 +1163,7 @@ async function disclosingStep(
       if (activation !== 'activated') {
         // The site refused the value itself, before any submission this host made.
         if (result === 'password_rejected') {
-          await settle(() => attempts.markUnknown(saved.id, proof));
-          await settle(() => attempts.markRejected(saved.id, proof));
+          await rejectExposed(attempts, saved.id, proof);
           return { status: 'password_rejected' };
         }
         if (activation === 'uncertain') return unknownAfterActivation(proof);
@@ -1173,10 +1180,7 @@ async function disclosingStep(
           return { status: 'verification_requested' };
         case 'confirmed':
           await attempts.markConfirmed(saved.id, proof);
-          return websiteOutcome(
-            saved.kind,
-            vaultState((await attempts.finalize(saved.id, context.assertActive)).status),
-          );
+          return await finalizedOutcome(saved, attempts, context.assertActive);
         case 'none':
           return unknownAfterActivation(proof);
       }
@@ -1271,10 +1275,7 @@ async function reconcile(
       return refused('not_disclosed');
     case 'confirmed':
     case 'conflict':
-      return websiteOutcome(
-        attempt.kind,
-        vaultState((await attempts.finalize(attempt.id, context.assertActive)).status),
-      );
+      return await finalizedOutcome(attempt, attempts, context.assertActive);
     case 'unknown': {
       const watched = watchedResponses.get(attempt.id);
       if (!watched || !(await attributable(context, watched))) return { status: 'inconclusive' };
@@ -1308,10 +1309,7 @@ async function reconcileResponse(
       return { status: 'verification_requested' };
     case 'confirmed':
       await attempts.markConfirmed(attempt.id, proof);
-      return websiteOutcome(
-        attempt.kind,
-        vaultState((await attempts.finalize(attempt.id, context.assertActive)).status),
-      );
+      return await finalizedOutcome(attempt, attempts, context.assertActive);
   }
 }
 
@@ -1412,7 +1410,7 @@ async function confirmVerified(
   via: 'code' | 'link',
 ): Promise<Outcome> {
   await attempts.markConfirmed(attempt.id, { signal: 'verified', via });
-  return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, context.assertActive)).status));
+  return await finalizedOutcome(attempt, attempts, context.assertActive);
 }
 
 // ---------------------------------------------------------------- recovery

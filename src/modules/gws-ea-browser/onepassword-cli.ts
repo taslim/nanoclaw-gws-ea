@@ -26,14 +26,14 @@ import { removePrivateFile, writeOwnerOnlyFileExclusive } from '../../gws-ea/sec
 import { GwsEaError } from '../../gws-ea/types.js';
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import {
+  isNormalizedAbsolute,
   isOnePasswordId,
   ONEPASSWORD_RUNTIME_GRANT,
+  parseText,
   ONEPASSWORD_VAULT_PERMISSIONS,
   readOnePasswordToken,
   type OnePasswordVaultPermission,
 } from './onepassword-policy.js';
-
-export { ONEPASSWORD_VAULT_PERMISSIONS, type OnePasswordVaultPermission };
 
 /** Delegated service-account creation by a vault manager arrived in 2.29.0. */
 export const ONEPASSWORD_CLI_MINIMUM_VERSION = '2.29.0';
@@ -304,15 +304,6 @@ async function run(invocation: Invocation, command: SanitizedCommand): Promise<R
   }
 }
 
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError) return undefined;
-    throw error;
-  }
-}
-
 function isDisplayText(value: unknown): value is string {
   return (
     typeof value === 'string' &&
@@ -503,7 +494,7 @@ export class OnePasswordCli {
   async listAccounts(): Promise<OnePasswordResult<{ readonly accounts: readonly OnePasswordAccount[] }>> {
     const result = await this.#read(undefined, ['account', 'list', '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const accounts = parseAccounts(parseJson(result.stdout));
+    const accounts = parseAccounts(parseText(result.stdout));
     return accounts ? { status: 'ok', accounts } : failed('unexpected_output');
   }
 
@@ -513,7 +504,7 @@ export class OnePasswordCli {
   ): Promise<OnePasswordResult<{ readonly accountId: string; readonly userId: string }>> {
     const result = await this.#read(identity, ['whoami', '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     if (
       !isRecord(value) ||
       !isOnePasswordId(value.account_uuid) ||
@@ -539,7 +530,7 @@ export class OnePasswordCli {
     assertName(name);
     const result = await this.#write(identity, ['vault', 'create', name, '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     return isRecord(value) && value.name === name && isOnePasswordId(value.id)
       ? { status: 'ok', vaultId: value.id }
       : failed('outcome_unknown');
@@ -603,7 +594,7 @@ export class OnePasswordCli {
     assertId(vaultId, 'The vault');
     const result = await this.#read(identity, ['vault', 'get', vaultId, '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     if (!isRecord(value) || value.id !== vaultId) return failed('unexpected_output');
     const { items } = value;
     return {
@@ -621,7 +612,7 @@ export class OnePasswordCli {
     assertEmail(email);
     const result = await this.#read(identity, ['user', 'get', email, '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     if (
       !isRecord(value) ||
       !isOnePasswordId(value.id) ||
@@ -649,7 +640,7 @@ export class OnePasswordCli {
     assertId(vaultId, 'The vault');
     const result = await this.#read(identity, ['user', 'list', '--vault', vaultId, '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     if (!Array.isArray(value)) return failed('unexpected_output');
     const userIds: string[] = [];
     for (const entry of value) {
@@ -665,7 +656,7 @@ export class OnePasswordCli {
   ): Promise<OnePasswordResult<{ readonly accountType: OnePasswordAccountType }>> {
     const result = await this.#read(identity, ['account', 'get', '--format', 'json']);
     if (result.status !== 'ok') return result;
-    const value = parseJson(result.stdout);
+    const value = parseText(result.stdout);
     if (!isRecord(value) || value.id !== identity.accountId) return failed('unexpected_output');
     const accountType = typeof value.type === 'string' ? ACCOUNT_TYPES.get(value.type.toUpperCase()) : undefined;
     return accountType ? { status: 'ok', accountType } : failed('unexpected_output');
@@ -695,7 +686,7 @@ export class OnePasswordCli {
     // Every refusal of the request comes before its creation record exists.
     assertId(operator.accountId, 'The account');
     assertName(request.name);
-    if (!path.isAbsolute(request.tokenFile) || path.normalize(request.tokenFile) !== request.tokenFile)
+    if (!isNormalizedAbsolute(request.tokenFile))
       throw invalidRequest('The token file must be a normalized absolute path');
     if (request.access.kind === 'vault_items') assertId(request.access.vaultId, 'The vault');
     const access =

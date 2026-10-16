@@ -26,7 +26,7 @@ import {
   onePasswordDisableReport,
   onePasswordEnableNextActions,
   onePasswordErrorPauses,
-  onePasswordNextActions,
+  onePasswordCapabilityNextActions,
   onePasswordRecovery,
   onePasswordRevocation,
   type OnePasswordCapabilityObservation,
@@ -986,11 +986,7 @@ class Cli {
     abandon: ReadonlySet<AbandonableResource>,
   ): Promise<Outcome> {
     const environment = this.#runtime.environment ?? process.env;
-    const onePassword: OnePasswordCliSeams = {
-      ...(environment.PATH ? { searchPath: environment.PATH } : {}),
-      ambient: environment,
-      ...this.#runtime.onePassword,
-    };
+    const onePassword = onePasswordSeams(environment, this.#runtime.onePassword);
     const deleteVault = options['delete-vault'] === 'true';
     const preview = await runStep(reporter, { id: 'inspect' }, () =>
       (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId, { deleteVault, onePassword }),
@@ -2210,6 +2206,18 @@ function onePasswordOutcomeLines(instanceId: string, outcome: OnePasswordRemoval
   ];
 }
 
+/** The 1Password CLI hooks for this process: its PATH and environment, with any test overrides on top. */
+function onePasswordSeams(
+  environment: NodeJS.ProcessEnv,
+  overrides: OnePasswordCliSeams | undefined,
+): OnePasswordCliSeams {
+  return {
+    ...(environment.PATH ? { searchPath: environment.PATH } : {}),
+    ambient: environment,
+    ...overrides,
+  };
+}
+
 /** What the operator must know after removal: the project deletion, the 1Password outcome, and anything left behind. */
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
   const project = `Google Cloud project ${preview.gcpProject}`;
@@ -2493,15 +2501,11 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         try {
           const paths = runtime.paths ?? resolveControlPlanePaths();
           registerErrorSecrets();
-          const cli: OnePasswordCliSeams = {
-            ...(environment.PATH ? { searchPath: environment.PATH } : {}),
-            ambient: environment,
-            ...runtime.onePassword,
-          };
+          const cli = onePasswordSeams(environment, runtime.onePassword);
           if (command === 'show' || command === 'check') {
             const observation = await inspectOnePasswordCapability(paths, { check: command === 'check', cli });
             data = observation;
-            const actions = onePasswordNextActions(observation, command === 'check');
+            const actions = onePasswordCapabilityNextActions(observation, command === 'check');
             if (!json)
               for (const line of [...onePasswordCapabilityLines(observation, true), ...nextActionLines(actions)])
                 output(line);

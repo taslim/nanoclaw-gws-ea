@@ -46,7 +46,13 @@ import {
   type OnePasswordVaultPermission,
 } from './onepassword-policy.js';
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
-import { browserVault, BrowserVaultError, onePasswordPolicyFile, type BrowserVault } from './onepassword.js';
+import {
+  browserVault,
+  BrowserVaultError,
+  onePasswordPolicyFile,
+  vaultFailureStatus,
+  type BrowserVault,
+} from './onepassword.js';
 
 /** The provider operations sharing needs, each made as the host management service account. */
 export interface VaultSharingProvider {
@@ -285,7 +291,7 @@ async function refreshVault(dependencies: VaultAccessDependencies): Promise<Reco
     await dependencies.vault.refresh();
   } catch (error) {
     if (!(error instanceof BrowserVaultError)) throw error;
-    return { status: error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable' };
+    return { status: vaultFailureStatus(error) };
   }
   await (dependencies.attempts ?? credentialAttempts).reconcileConflicts();
   return { status: 'usable' };

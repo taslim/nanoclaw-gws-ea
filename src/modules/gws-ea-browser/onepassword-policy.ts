@@ -194,7 +194,7 @@ export function onePasswordManagementIdentity(
     : { kind: 'service_account', accountId: policy.accountId, tokenFile: paths.managementTokenFile };
 }
 
-function isNormalizedAbsolute(file: string): boolean {
+export function isNormalizedAbsolute(file: string): boolean {
   return path.isAbsolute(file) && path.normalize(file) === file && !file.includes('\0');
 }
 
@@ -323,7 +323,8 @@ async function readPrivateState(file: string): Promise<{ readonly text: string }
   }
 }
 
-function parseText(text: string): unknown {
+/** Parsed JSON, or undefined for text that is not JSON; any other failure is thrown. */
+export function parseText(text: string): unknown {
   try {
     return JSON.parse(text) as unknown;
   } catch (error) {

@@ -35,7 +35,7 @@ import {
   onePasswordEnabled,
   onePasswordCapabilityLines,
   onePasswordEnableNextActions,
-  onePasswordNextActions,
+  onePasswordCapabilityNextActions,
   onePasswordRecovery,
   onePasswordReleaseCompatibility,
   ONEPASSWORD_CONTRACT,
@@ -664,7 +664,7 @@ describe('disabling and re-enabling 1Password (R13, AE5)', () => {
     expect(shown.assistants.map((entry) => entry.retired_service_account_ids)).toEqual(
       records.map((record) => [record.runtimeServiceAccountId]),
     );
-    expect(onePasswordNextActions(shown, false)).toEqual([
+    expect(onePasswordCapabilityNextActions(shown, false)).toEqual([
       { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
     ]);
     const again = await disableOnePassword(paths);
@@ -887,7 +887,7 @@ describe('1Password readiness (AE8)', () => {
         provisioning: 'absent',
       }),
     ]);
-    expect(onePasswordNextActions(before, false)).toEqual([
+    expect(onePasswordCapabilityNextActions(before, false)).toEqual([
       { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
     ]);
 
@@ -975,7 +975,7 @@ describe('1Password readiness (AE8)', () => {
     });
     expect(checked.cli).toMatchObject({ status: 'unavailable' });
     expect(checked.quota).toMatchObject({ status: 'unknown', daily: null });
-    expect(onePasswordNextActions(checked, true)).toContainEqual({
+    expect(onePasswordCapabilityNextActions(checked, true)).toContainEqual({
       kind: 'command',
       argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
     });

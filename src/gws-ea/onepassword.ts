@@ -11,7 +11,7 @@
  * A creation whose outcome is unknown pauses for the operator rather than
  * creating again. Tokens stay in their owner-only files; results carry IDs.
  */
-import { lstat, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -49,6 +49,7 @@ import { formatLocalTime } from '../timezone.js';
 import { withAssistantLock } from './browser-capability.js';
 import type { InstanceOperation } from './journal.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { exists } from './release-layout.js';
 import { getInstanceReservation, readRegistry } from './registry.js';
 import type { Changed, NextAction } from './result.js';
 import { removePrivateFile, writeOwnerOnlyFileExclusive } from './secrets.js';
@@ -185,14 +186,18 @@ function invalidArguments(message: string): GwsEaError {
   return new GwsEaError('invalid_arguments', message);
 }
 
-async function exists(file: string): Promise<boolean> {
-  try {
-    await lstat(file);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
+/** No token is captured and no unproven attempt waits for recovery: a creation would start fresh. */
+async function mintsFresh(tokenFile: string): Promise<boolean> {
+  return (
+    (await readOnePasswordToken(tokenFile)).status !== 'ready' && !(await serviceAccountCreationUnproven(tokenFile))
+  );
+}
+
+/** A service-account creation was attempted here and is neither proven nor discarded. */
+async function creationAttempted(tokenFile: string): Promise<boolean> {
+  return (
+    (await serviceAccountCreationUnproven(tokenFile)) || (await readOnePasswordToken(tokenFile)).status !== 'absent'
+  );
 }
 
 /** Where an assistant's vault creation is recorded while the provider has not answered with its ID. */
@@ -484,8 +489,7 @@ async function reconcileAssistant(
   }
 
   await preparePrivateDirectory(path.dirname(files.runtimeTokenFile));
-  const captured = (await readOnePasswordToken(files.runtimeTokenFile)).status === 'ready';
-  if (!captured && !(await serviceAccountCreationUnproven(files.runtimeTokenFile))) effects.starting();
+  if (await mintsFresh(files.runtimeTokenFile)) effects.starting();
   const minted = await cli.createServiceAccount(operator, {
     name: names.runtimeServiceAccount,
     access: { kind: 'vault_items', vaultId: resources.vault.id },
@@ -646,6 +650,17 @@ async function verifyOperator(cli: OnePasswordCli, operator: OperatorIdentity): 
  * may administer the vaults it created, so the recovery is its own token,
  * never a new management account.
  */
+const MANAGEMENT_UNAVAILABLE: ReadonlySet<OnePasswordFailureReason> = new Set([
+  'not_signed_in',
+  'token_unavailable',
+  'not_found',
+]);
+
+/** The management account's token is missing, expired or revoked, as opposed to another refusal. */
+export function isManagementUnavailable(reason: OnePasswordFailureReason): boolean {
+  return MANAGEMENT_UNAVAILABLE.has(reason);
+}
+
 export function managementUnavailable(serviceAccountId: string, tokenFile: string): GwsEaError {
   return new GwsEaError(
     'onepassword_management_unavailable',
@@ -661,7 +676,7 @@ async function verifyManagement(
   expected: string,
 ): Promise<void> {
   const who = await cli.whoami(identity);
-  if (who.status === 'failed' && ['not_signed_in', 'token_unavailable', 'not_found'].includes(who.reason))
+  if (who.status === 'failed' && isManagementUnavailable(who.reason))
     throw managementUnavailable(expected, identity.tokenFile);
   if (who.status !== 'ok') throw hostProviderError(who.reason, 'management');
   if (who.userId !== expected)
@@ -681,8 +696,7 @@ async function bootstrapManagement(
   effects: Effects,
 ): Promise<string> {
   await preparePrivateDirectory(hostPaths.directory);
-  const captured = (await readOnePasswordToken(hostPaths.managementTokenFile)).status === 'ready';
-  if (!captured && !(await serviceAccountCreationUnproven(hostPaths.managementTokenFile))) effects.starting();
+  if (await mintsFresh(hostPaths.managementTokenFile)) effects.starting();
   const minted = await cli.createServiceAccount(operator, {
     name: MANAGEMENT_NAME,
     access: { kind: 'create_vaults' },
@@ -714,10 +728,7 @@ async function discardManagementAttempt(
   effects: Effects,
 ): Promise<void> {
   // Without a recorded policy, any captured or attempted management account is unrecorded.
-  const unproven =
-    !recorded &&
-    ((await serviceAccountCreationUnproven(hostPaths.managementTokenFile)) ||
-      (await readOnePasswordToken(hostPaths.managementTokenFile)).status !== 'absent');
+  const unproven = !recorded && (await creationAttempted(hostPaths.managementTokenFile));
   if (!unproven) throw nothingUnproven(MANAGEMENT_TARGET);
   effects.starting();
   await discardServiceAccountCreation(hostPaths.managementTokenFile);
@@ -745,8 +756,7 @@ async function discardAssistantAttempt(paths: ControlPlanePaths, instanceId: str
     const minting =
       read.status === 'ready' &&
       read.resources.runtimeServiceAccountId === null &&
-      ((await serviceAccountCreationUnproven(files.runtimeTokenFile)) ||
-        (await readOnePasswordToken(files.runtimeTokenFile)).status !== 'absent');
+      (await creationAttempted(files.runtimeTokenFile));
     if (!minting) throw nothingUnproven(`assistant ${instanceId}`);
     effects.starting();
     await discardServiceAccountCreation(files.runtimeTokenFile);
@@ -1273,6 +1283,54 @@ function checkReason(reason: OnePasswordFailureReason): string {
   return `1Password answered ${reason.replaceAll('_', ' ')}.`;
 }
 
+type WhoAmI = Awaited<ReturnType<OnePasswordCli['whoami']>>;
+type VaultRead = Awaited<ReturnType<OnePasswordCli['getVault']>>;
+
+function hostActivation(
+  read: Awaited<ReturnType<typeof readOnePasswordHostPolicy>>,
+  policyFile: string,
+): OnePasswordCapabilityObservation['activation'] {
+  if (read.status === 'invalid')
+    return {
+      status: 'unknown',
+      reason: `The 1Password host policy cannot be used safely (${read.problem}). Inspect ${policyFile}.`,
+    };
+  if (read.status === 'absent') return { status: 'disabled', reason: null };
+  return read.policy.enabled ? { status: 'enabled', reason: null } : { status: 'disabled', reason: DISABLED_REASON };
+}
+
+/** The management check's outcome; `who` is undefined when the request limit stopped the check. */
+function checkedManagement(
+  management: OnePasswordCapabilityObservation['management'],
+  who: WhoAmI | undefined,
+  expected: string | null,
+): OnePasswordCapabilityObservation['management'] {
+  if (!who) return { ...management, reason: LIMIT_SPENT };
+  if (who.status !== 'ok') return { ...management, status: 'failed', reason: checkReason(who.reason) };
+  if (who.userId !== expected)
+    return {
+      ...management,
+      status: 'failed',
+      reason: 'The management token authenticates as another service account.',
+    };
+  return { ...management, status: 'verified' };
+}
+
+/** A runtime account's access; undefined checks were stopped by the request limit. */
+function runtimeAccess(
+  who: WhoAmI | undefined,
+  vault: VaultRead | undefined,
+  expected: string | null,
+): OnePasswordAssistantReadiness['access'] {
+  if (!who) return { status: 'not_checked', reason: LIMIT_SPENT };
+  if (who.status !== 'ok') return { status: 'failed', reason: checkReason(who.reason) };
+  if (who.userId !== expected)
+    return { status: 'failed', reason: 'The runtime token authenticates as another service account.' };
+  if (!vault) return { status: 'not_checked', reason: LIMIT_SPENT };
+  if (vault.status !== 'ok') return { status: 'failed', reason: checkReason(vault.reason) };
+  return { status: 'verified', reason: null };
+}
+
 /**
  * Local facts, plus service-account requests only for an explicit check:
  * never the operator's desktop sign-in, never a write, never a repair.
@@ -1285,17 +1343,7 @@ export async function inspectOnePasswordCapability(
   const hostPaths = onePasswordHostPaths(paths.configRoot);
   const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
   const policy = read.status === 'ready' ? read.policy : undefined;
-  const activation: OnePasswordCapabilityObservation['activation'] =
-    read.status === 'invalid'
-      ? {
-          status: 'unknown',
-          reason: `The 1Password host policy cannot be used safely (${read.problem}). Inspect ${hostPaths.policyFile}.`,
-        }
-      : read.status === 'absent'
-        ? { status: 'disabled', reason: null }
-        : read.policy.enabled
-          ? { status: 'enabled', reason: null }
-          : { status: 'disabled', reason: DISABLED_REASON };
+  const activation = hostActivation(read, hostPaths.policyFile);
   const ids = Object.keys((await readRegistry(paths)).instances).sort();
   const locals = [];
   for (const id of ids) locals.push({ id, ...(await localReadiness(paths, id, policy?.accountId)) });
@@ -1354,17 +1402,7 @@ export async function inspectOnePasswordCapability(
         tokenFile: hostPaths.managementTokenFile,
       };
       const who = await ask((provider) => provider.whoami(identity));
-      management = !who
-        ? { ...management, reason: LIMIT_SPENT }
-        : who.status !== 'ok'
-          ? { ...management, status: 'failed', reason: checkReason(who.reason) }
-          : who.userId !== policy.managementServiceAccountId
-            ? {
-                ...management,
-                status: 'failed',
-                reason: 'The management token authenticates as another service account.',
-              }
-            : { ...management, status: 'verified' };
+      management = checkedManagement(management, who, policy.managementServiceAccountId);
       const type = await ask((provider) => provider.accountType(identity));
       const limits = await ask((provider) => provider.rateLimits(identity));
       const accountType = type?.status === 'ok' ? type.accountType : null;
@@ -1403,17 +1441,7 @@ export async function inspectOnePasswordCapability(
             : undefined;
         assistants[index] = {
           ...local.readiness,
-          access: !runtimeWho
-            ? { status: 'not_checked', reason: LIMIT_SPENT }
-            : runtimeWho.status !== 'ok'
-              ? { status: 'failed', reason: checkReason(runtimeWho.reason) }
-              : runtimeWho.userId !== expected.runtimeServiceAccountId
-                ? { status: 'failed', reason: 'The runtime token authenticates as another service account.' }
-                : !vault
-                  ? { status: 'not_checked', reason: LIMIT_SPENT }
-                  : vault.status !== 'ok'
-                    ? { status: 'failed', reason: checkReason(vault.reason) }
-                    : { status: 'verified', reason: null },
+          access: runtimeAccess(runtimeWho, vault, expected.runtimeServiceAccountId),
         };
       }
     }
@@ -1599,7 +1627,7 @@ export function onePasswordProvisioningDetails(entry: OnePasswordAssistantProvis
 }
 
 /** Handoffs follow observed facts; an unchecked or unknown fact is never evidence of readiness. */
-export function onePasswordNextActions(
+export function onePasswordCapabilityNextActions(
   observation: OnePasswordCapabilityObservation,
   checked: boolean,
 ): readonly NextAction[] {

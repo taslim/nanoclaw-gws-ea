@@ -14,6 +14,8 @@ import {
   writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from './onepassword-policy.js';
+import { instanceMarkerFile } from '../../gws-ea/paths.js';
+import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { writePrivateFile } from './paths.js';
 
 export const FIXTURE_ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
@@ -208,7 +210,7 @@ export async function writeVaultFixture(directory: string): Promise<VaultFixture
   const instanceRoot = path.join(directory, FIXTURE_INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
   await writePrivateFile(
-    path.join(instanceRoot, 'state', 'data', 'gws-ea', 'instance.json'),
+    instanceMarkerFile(instanceLayout(instanceRoot).state),
     JSON.stringify({ schema_version: 1, instance_id: FIXTURE_INSTANCE_ID }),
   );
   const files = onePasswordInstancePaths(instanceRoot);

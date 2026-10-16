@@ -9,6 +9,7 @@ import {
   submitAuthenticationForm,
   type AuthenticationFormSignature,
   type CredentialKind,
+  httpsOrigin,
 } from './authentication-signatures.js';
 
 export type ActivationClass =
@@ -224,9 +225,8 @@ export function classifyCredentialNavigation(
   kind: CredentialKind,
   site: string,
 ): ActivationClass | undefined {
-  if (!URL.canParse(raw)) return 'blocked_address';
-  const url = new URL(raw);
-  if (url.protocol !== 'https:' || url.username || url.password) return 'blocked_address';
+  const url = httpsOrigin(raw);
+  if (!url) return 'blocked_address';
   if (getDomain(url.hostname, { allowPrivateDomains: true }) !== site) return undefined;
   const decoded = navigationEvidence(url);
   if (decoded === undefined) return 'blocked_address';
