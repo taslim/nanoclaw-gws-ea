@@ -21,6 +21,7 @@ import {
 } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import * as sessionManager from '../../session-manager.js';
 import { getDb } from '../../db/connection.js';
 import type { Session } from '../../types.js';
 
@@ -214,7 +215,7 @@ describe('routeAgentMessage return-path', () => {
     expect(readInbound(B, SB.id)).toHaveLength(0);
   });
 
-  it('refuses missing, foreign, unknown and closed threads', async () => {
+  it('refuses missing, foreign, unknown and closing threads', async () => {
     await getDb().run(
       "UPDATE agent_destinations SET session_mode = 'per-thread' WHERE agent_group_id = ? AND target_id = ?",
       A,
@@ -228,10 +229,23 @@ describe('routeAgentMessage return-path', () => {
     }
     await routeAgentMessage({ ...send, thread_id: 'new' }, S1);
     const opened = (await getSessionsByAgentGroup(B)).find((row) => row.thread_id === `system:a2a:${A}:threaded`)!;
-    await updateSession(opened.id, { status: 'closed' });
+    const resolve = sessionManager.resolveSystemSession;
+    const closing = vi.spyOn(sessionManager, 'resolveSystemSession').mockImplementationOnce(async (...args) => {
+      await updateSession(opened.id, { status: 'closed' });
+      return resolve(...args);
+    });
+    try {
+      await expect(routeAgentMessage({ ...send, thread_id: 'new' }, S1)).rejects.toMatchObject({
+        name: 'OutboundRefusedError',
+        reason: 'Thread is closed. Open a new thread.',
+      });
+    } finally {
+      closing.mockRestore();
+    }
     await expect(routeAgentMessage({ ...send, id: 'late', thread_id: opened.thread_id }, S1)).rejects.toMatchObject({
       name: 'OutboundRefusedError',
     });
+    expect((await getSessionsByAgentGroup(B)).filter((row) => row.thread_id === opened.thread_id)).toHaveLength(1);
     expect(readInbound(B, opened.id)).toHaveLength(1);
   });
 

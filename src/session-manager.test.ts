@@ -20,6 +20,7 @@ vi.mock('./config.js', async () => {
 import {
   destroySessionMailbox,
   initSessionFolder,
+  resolveTaskSession,
   sessionContextPath,
   sessionDir,
   withMailboxSession,
@@ -29,7 +30,7 @@ import {
 } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
-import { createSession } from './db/sessions.js';
+import { createSession, updateSession } from './db/sessions.js';
 import type { Session } from './types.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
@@ -263,4 +264,27 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       db.close();
     }
   });
+});
+
+it('recreates a closed scheduled-task session', async () => {
+  const db = await initTestDb();
+  try {
+    await runMigrations(db);
+    await createAgentGroup({
+      id: AG,
+      name: 'Tasks',
+      folder: 'tasks',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const first = await resolveTaskSession(AG, 'daily-digest');
+    await updateSession(first.session.id, { status: 'closed' });
+
+    const next = await resolveTaskSession(AG, 'daily-digest');
+    expect(next.created).toBe(true);
+    expect(next.session.id).not.toBe(first.session.id);
+    expect(next.session).toMatchObject({ status: 'active', thread_id: 'system:tasks:daily-digest' });
+  } finally {
+    await closeDb();
+  }
 });

@@ -34,21 +34,22 @@ describe('SQLite mailbox canonical serialization', () => {
     expect(outbound.getOutboundMessage('missing')).toBeUndefined();
   });
 
-  it('reads the latest delivered agent report and excludes newer failed, pending and foreign reports', async () => {
+  it('reads the latest delivered chat to the requested agent', async () => {
     const mailbox = new SqliteAgentMailbox();
     const key = { agentGroupId: 'mailbox-browser-report-test', sessionId: 'job' };
     mailbox.prepare(key);
     try {
       await mailbox.session(key, async (session) => {
-        for (const [id, target] of [
-          ['delivered', 'main'],
-          ['failed', 'main'],
-          ['pending', 'main'],
-          ['foreign', 'other'],
+        for (const [id, target, kind] of [
+          ['delivered', 'main', 'chat'],
+          ['failed', 'main', 'chat'],
+          ['pending', 'main', 'chat'],
+          ['foreign', 'other', 'chat'],
+          ['non-chat', 'main', 'chat-sdk'],
         ] as const) {
           await session.writeDirect({
             id,
-            kind: 'chat',
+            kind,
             channelType: 'agent',
             platformId: target,
             threadId: 'system:a2a:main:test',
@@ -58,6 +59,7 @@ describe('SQLite mailbox canonical serialization', () => {
         session.markDelivered('delivered', null);
         session.markDeliveryFailed('failed');
         session.markDelivered('foreign', null);
+        session.markDelivered('non-chat', null);
         expect(session.getLatestDeliveredAgentReport('main')).toMatchObject({ content: '{"text":"delivered"}' });
       });
     } finally {

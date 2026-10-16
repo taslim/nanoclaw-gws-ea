@@ -117,10 +117,11 @@ describe('approval-resolved callbacks', () => {
     expect(events[0].userId).toBe('slack:admin-1');
   });
 
-  it('fires registered callbacks on approve after the action handler ran', async () => {
+  it('keeps an approved grant live during its handler and emits only approve', async () => {
     const calls: string[] = [];
-    registerApprovalHandler('test_approve_action', async () => {
-      calls.push('handler');
+    registerApprovalHandler('test_approve_action', async ({ approval }) => {
+      calls.push(`withdraw:${await withdrawApproval(approval.approval_id, 'Cancelled')}`);
+      calls.push(`grant:${(await getPendingApproval(approval.approval_id))?.status}`);
     });
     registerApprovalResolvedHandler(({ outcome }) => {
       calls.push(`resolved:${outcome}`);
@@ -136,7 +137,7 @@ describe('approval-resolved callbacks', () => {
       threadId: null,
     });
 
-    expect(calls).toEqual(['handler', 'resolved:approve']);
+    expect(calls).toEqual(['withdraw:false', 'grant:approved', 'resolved:approve']);
   });
 
   it('isolates a throwing callback so later callbacks still fire', async () => {
