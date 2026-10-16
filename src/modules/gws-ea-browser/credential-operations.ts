@@ -38,7 +38,10 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../guard/index.js';
+import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import type { ApprovalHandlerContext } from '../approvals/primitive.js';
+import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   credentialFieldFits,
   httpsOrigin,
@@ -56,7 +59,8 @@ import {
   type NativeCredentialGroup,
   type NativeFieldFacts,
 } from './authentication-submit.js';
-import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
+import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
+import { quotePurchaseText } from './cards.js';
 import {
   BrowserSiteBusyError,
   classifyCredentialActivation,
@@ -70,6 +74,7 @@ import {
 import type { BrowserRequest } from './db.js';
 import {
   CredentialAttemptError,
+  RELEASABLE_PHASES,
   credentialAttempts,
   type CandidateCredential,
   type CredentialAttempt,
@@ -90,7 +95,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registrableDomain, type BrowserVaultReason } from './onepassword.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
 import {
   finishSignupVerification,
   openSignupVerification,
@@ -115,6 +120,7 @@ const AUTHORITY_FIELDS: ReadonlySet<string> = new Set([
   'operation',
   'site',
   'username',
+  'authority',
 ]);
 const MAX_USERNAME = 256;
 
@@ -159,8 +165,10 @@ export async function credentialAuthorityRequest(
     throw forbidden('Only main may delegate an account signup or password change.');
   if (Object.keys(content).some((key) => !AUTHORITY_FIELDS.has(key)))
     throw invalidArgs('Unknown credential_authority field.');
+  if (content.operation === 'release') return credentialReleaseRequest(content, session, dependencies);
   const { thread, operation, site, username } = content;
   if (
+    content.authority !== undefined ||
     typeof thread !== 'string' ||
     (operation !== 'signup' && operation !== 'change_password') ||
     typeof site !== 'string' ||
@@ -220,11 +228,175 @@ export async function credentialAuthorityRequest(
   return prepared.status === 'busy' ? { status: 'busy' } : vaultOutcome(prepared.status);
 }
 
-export function registerCredentialAuthorityDelivery(): void {
+// ---------------------------------------------------------------- the principal's release
+
+/** The `pending_approvals.action` a principal's release resolves through. */
+export const CREDENTIAL_RELEASE_APPROVAL = 'browser_credential_release';
+
+const agentActor = (session: Session): GuardActor => ({
+  kind: 'agent',
+  agentGroupId: session.agent_group_id,
+  sessionId: session.id,
+});
+
+/**
+ * An attempt the host cannot settle ends only on the principal's informed
+ * decision, as an inconclusive purchase does: main asks, and the principal
+ * confirms on their own card, knowing what may have happened (KTD8).
+ */
+export const credentialReleaseGuard = defineGuardedAction({
+  action: 'gws_ea_browser.credential_release',
+  grantActionName: CREDENTIAL_RELEASE_APPROVAL,
+  grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
+  async decide({ actor, payload }) {
+    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
+      return DENY('Only main may ask the principal to release a credential attempt.');
+    const attempt = typeof payload.attemptId === 'string' ? await credentialAttempts.get(payload.attemptId) : undefined;
+    if (!attempt || attempt.job_id !== payload.jobId || !RELEASABLE_PHASES.includes(attempt.phase))
+      return DENY('That credential attempt is settled, or its own step settles it.');
+    const principal = await principalApproverUserId();
+    return principal
+      ? HOLD('Only the principal may end an attempt whose outcome the host cannot establish.', principal)
+      : DENY('No verified principal can decide this.');
+  },
+});
+
+/** What the principal reads on the card: what is not known, what 1Password keeps, and what releasing means. */
+function releaseQuestion(attempt: CredentialAttempt): string {
+  const account = `${quotePurchaseText(attempt.username, 256)} on ${attempt.site}`;
+  if (attempt.kind === 'signup')
+    return [
+      attempt.phase === 'conflict'
+        ? `The site created the account ${account}, but I couldn't save its login in my 1Password vault as I recorded it.`
+        : attempt.phase === 'awaiting_verification'
+          ? `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`
+          : `I tried to create the account ${account}, but I can't tell whether the account was created.`,
+      'The password I generated for it is kept in my 1Password vault.',
+      'If you release it, I stop waiting on it and free the site, and I change nothing in 1Password. Trying again could create a second account.',
+    ].join('\n');
+  return [
+    attempt.phase === 'conflict'
+      ? `The site took a new password for ${account}, but the login in my 1Password vault still has the original one.`
+      : `I tried to change the password of ${account}, but I can't tell whether the password changed.`,
+    'Both the original and the new password are kept in my 1Password vault.',
+    'If you release it, I stop waiting on it and free the site and the login, and I change nothing in 1Password. Trying again could change the password a second time.',
+  ].join('\n');
+}
+
+/** Main asks for the principal's decision on an attempt only they can now end; never a release by itself. */
+async function credentialReleaseRequest(
+  content: Record<string, unknown>,
+  session: Session,
+  { attempts }: CredentialOperationDependencies,
+): Promise<Outcome> {
+  const { thread, authority } = content;
+  if (
+    typeof thread !== 'string' ||
+    typeof authority !== 'string' ||
+    !AUTHORITY_ID.test(authority) ||
+    content.site !== undefined ||
+    content.username !== undefined
+  )
+    throw invalidArgs('release needs only the job thread and the credential authority it recorded.');
+  const job = await resolveBrowserJob(thread);
+  if (!job) throw forbidden('No main-owned browser job exists for that thread.');
+  const attempt = await attempts.get(authority);
+  if (!attempt || attempt.job_id !== job.id || !RELEASABLE_PHASES.includes(attempt.phase))
+    return { status: 'not_releasable' };
+  const payload = { attemptId: attempt.id, jobId: job.id };
+  const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload });
+  if (decision.effect !== 'hold') throw forbidden(decision.reason);
+  const open = await getDb().get<{ present: number }>(
+    'SELECT 1 AS present FROM pending_approvals WHERE action = ? AND payload = ? LIMIT 1',
+    CREDENTIAL_RELEASE_APPROVAL,
+    JSON.stringify(payload),
+  );
+  if (open) return { status: 'awaiting_principal' };
+  const approvalId = await requestApproval({
+    session,
+    agentName: 'main',
+    action: CREDENTIAL_RELEASE_APPROVAL,
+    payload,
+    title: attempt.kind === 'signup' ? 'Stop waiting on this account signup?' : 'Stop waiting on this password change?',
+    question: releaseQuestion(attempt),
+    approverUserId: decision.approverUserId,
+    details: { facts: { site: attempt.site, account: attempt.username } },
+  });
+  if (approvalId === null) throw forbidden('The principal could not be asked right now.');
+  return { status: 'awaiting_principal' };
+}
+
+/** Whether this approval already released the attempt, as a resumed approval finds it. */
+function releasedBy(attempt: CredentialAttempt, approvalId: string): boolean {
+  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+  return attempt.phase === 'rejected' && isRecord(evidence) && evidence.approval === approvalId;
+}
+
+/**
+ * The principal's approval: re-checked live with the card as its grant, then
+ * the attempt ends and everything held for it lifts. Nothing in 1Password is
+ * touched, and nothing is finalized, published, promoted or owned.
+ */
+async function applyCredentialRelease(
+  { session, payload, approval, userId, notify }: ApprovalHandlerContext,
+  queue: BrowserQueue,
+  attempts: CredentialAttempts,
+): Promise<void> {
+  if (!(await isVerifiedPrincipalUser(userId)) || approval.approver_user_id !== userId) {
+    await notify('The credential attempt was not released: only the principal can decide that.');
+    return;
+  }
+  const current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
+  if (!current || !releasedBy(current, approval.approval_id)) {
+    const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload, grant: approval });
+    if (decision.effect !== 'allow' || !current) {
+      await notify(`The credential attempt was not released: ${decision.reason}`);
+      return;
+    }
+    try {
+      await attempts.release(current.id, approval.approval_id);
+    } catch (error) {
+      if (!(error instanceof CredentialAttemptError)) throw error;
+      await notify('The credential attempt was not released: another step settled it first.');
+      return;
+    }
+  }
+  watchedResponses.delete(current.id);
+  await finishSignupVerification(current.id);
+  // The site goes to its waiters now, unless the job is mid-request: that request's end releases it.
+  const running = await queue.store.db.get<{ present: number }>(
+    'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
+    current.job_id,
+  );
+  if (!running)
+    await queue.wakeWaiters(
+      await queue.leases.release(current.job_id, current.site),
+      `credential-release-${current.id}`,
+    );
+  await finishRequestedCancellation(current.job_id, queue);
+  const what =
+    current.kind === 'signup'
+      ? `the unresolved signup for ${current.username} on ${current.site}. The password generated for it stays in the assistant's 1Password vault, not saved as its login`
+      : `the unresolved password change for ${current.username} on ${current.site}. Both the original and the new password stay in the assistant's 1Password vault; the login was not updated`;
+  await notify(`The principal released ${what}. The site is free again, and nothing in 1Password changed.`);
+}
+
+export function registerCredentialAuthorityDelivery(
+  queue: () => BrowserQueue,
+  dependencies: CredentialOperationDependencies = DEFAULT_DEPENDENCIES,
+): void {
   registerDeliveryAction(
     'credential_authority',
-    answeringAction('credential_authority', (content, session) => credentialAuthorityRequest(content, session)),
+    answeringAction('credential_authority', (content, session) =>
+      credentialAuthorityRequest(content, session, dependencies),
+    ),
     answeredGuard(browserDelegateGuard),
+  );
+  // Releasing is idempotent and re-checked live, so an approved row resumes safely after a restart.
+  registerApprovalHandler(
+    CREDENTIAL_RELEASE_APPROVAL,
+    (context) => applyCredentialRelease(context, queue(), dependencies.attempts),
+    { restartSafe: true },
   );
 }
 

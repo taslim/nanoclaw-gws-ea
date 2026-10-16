@@ -91,15 +91,38 @@ export const reservationBounds = requestTool({
 export const credentialAuthority = requestTool({
   name: 'credential_authority',
   description:
-    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when an earlier signup or change of that account is still open or unsettled, vault_unavailable or rate_limited. Repeating the same request returns the same authority.",
+    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when an earlier signup or change of that account is still open or unsettled, vault_unavailable or rate_limited. Repeating the same request returns the same authority. " +
+    "release, with the job's thread and the authority it recorded, asks the principal directly to end an attempt the job could not settle (its outcome unknown, its email verification never completed, or both credentials kept). It returns awaiting_principal, or not_releasable when the attempt is settled or its own step settles it; the principal's decision reaches you as a note. Release changes nothing in 1Password.",
   properties: {
     thread: THREAD,
-    operation: { type: 'string', enum: ['signup', 'change_password'] },
+    operation: { type: 'string', enum: ['signup', 'change_password', 'release'] },
     site: { type: 'string', description: 'The HTTPS address of the site the account belongs to.' },
     username: { type: 'string', description: 'The exact account username or email on that site.' },
+    authority: { type: 'string', description: 'For release: the credential authority id this job recorded.' },
   },
-  required: ['thread', 'operation', 'site', 'username'],
+  required: ['thread', 'operation'],
   additionalProperties: false,
+  oneOf: [
+    {
+      properties: { operation: { enum: ['signup', 'change_password'] } },
+      required: ['site', 'username'],
+      not: { required: ['authority'] },
+    },
+    {
+      properties: { operation: { const: 'release' } },
+      required: ['authority'],
+      not: { anyOf: [{ required: ['site'] }, { required: ['username'] }] },
+    },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'release')
+      return fields.authority === undefined || fields.site !== undefined || fields.username !== undefined
+        ? 'release takes only the job thread and the authority it recorded.'
+        : fields;
+    return fields.site === undefined || fields.username === undefined || fields.authority !== undefined
+      ? 'signup and change_password take the job thread, the site and the exact account username.'
+      : fields;
+  },
   repeatable: true,
   timeoutMs: 120_000,
 });

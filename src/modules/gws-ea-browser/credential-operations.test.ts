@@ -14,22 +14,37 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
 }));
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
 const sdk = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('@1password/sdk', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@1password/sdk')>()),
   createClient: sdk.create,
 }));
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import Database from 'better-sqlite3';
+
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { setDeliveryAdapter } from '../../delivery.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
-import type { Session } from '../../types.js';
+import type { PendingApproval, Session } from '../../types.js';
+import { handleApprovalsResponse } from '../approvals/response-handler.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
+import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
-import { credentialAuthorityRequest, executeCredentialForm, validateCredentialForm } from './credential-operations.js';
+import {
+  credentialAuthorityRequest,
+  executeCredentialForm,
+  registerCredentialAuthorityDelivery,
+  validateCredentialForm,
+} from './credential-operations.js';
+import { BrowserStore } from './db.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword, FIXTURE_VAULT_ID, writeVaultFixture } from './onepassword-fixture.js';
-import type { BrowserExecutionContext } from './queue.js';
+import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
@@ -476,6 +491,220 @@ describe('the browser credential request', () => {
       const { page, result } = reconcile(String(recorded.authority));
       expect(await result).toEqual({ status: 'refused', reason: 'not_disclosed' });
       expect(page).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("the principal's release of an attempt the host cannot settle", () => {
+  const PRINCIPAL = 'gchat:principal-morgan';
+  const DM = { channelType: 'gchat', platformId: 'gchat:dm:principal-morgan' };
+  let cards: string[];
+  let closed: string[];
+
+  beforeEach(async () => {
+    cards = [];
+    closed = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        cards.push(content);
+        return 'platform-message';
+      },
+    });
+    const at = new Date().toISOString();
+    await createMessagingGroup({
+      id: 'mg-principal-dm',
+      channel_type: DM.channelType,
+      platform_id: DM.platformId,
+      name: 'Morgan',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: at,
+    });
+    await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: at });
+    await bindVerifiedPrincipalUser(PRINCIPAL, at);
+    await upsertUserDm({
+      user_id: PRINCIPAL,
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-principal-dm',
+      resolved_at: at,
+    });
+    const queue = new BrowserQueue(new BrowserStore(), {
+      pageForJob: async () => {
+        throw new Error('A release never opens a page');
+      },
+      connection: async () => {
+        throw new Error('A release never launches Chrome');
+      },
+      closeJob: async (jobId: string) => {
+        closed.push(jobId);
+      },
+      onDisconnected: () => () => undefined,
+    });
+    registerCredentialAuthorityDelivery(() => queue, { attempts });
+  });
+
+  const release = (authority: string, caller: Session = main) =>
+    credentialAuthorityRequest(
+      { action: 'credential_authority', requestId: 'release', thread: job.thread_id, operation: 'release', authority },
+      caller,
+      { attempts },
+    );
+  const pending = () =>
+    getDb().all<PendingApproval>("SELECT * FROM pending_approvals WHERE action = 'browser_credential_release'");
+  const click = async (value: 'approve' | 'reject'): Promise<void> => {
+    const [approval] = await pending();
+    if (!approval) throw new Error('No card');
+    await handleApprovalsResponse({
+      questionId: approval.approval_id,
+      value,
+      userId: PRINCIPAL,
+      channelType: DM.channelType,
+      platformId: DM.platformId,
+      threadId: null,
+    });
+  };
+  /** What the host told main as a system note. */
+  const notes = (): string[] => {
+    const file = inboundDbPath(main.agent_group_id, main.id);
+    if (!fs.existsSync(file)) return [];
+    const db = new Database(file, { readonly: true });
+    try {
+      return (db.prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{ content: string }>)
+        .map((row) => JSON.parse(row.content) as { sender?: string; text?: string })
+        .filter((content) => content.sender === 'system')
+        .map((content) => content.text ?? '');
+    } finally {
+      db.close();
+    }
+  };
+  const holdSite = () =>
+    getDb().run(
+      "INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)",
+      job.thread_id,
+      new Date().toISOString(),
+    );
+  const lease = () =>
+    getDb().get<{ job_id: string }>("SELECT job_id FROM gws_ea_browser_site_leases WHERE site = 'shop.example'");
+  /** 1Password as the principal sees it: every item, version and field, and nothing archived. */
+  const vaultState = () => JSON.stringify([[...fake.items.entries()], [...fake.archived]]);
+
+  /** A signup the website may or may not have taken. */
+  async function disclosedSignup(username = USERNAME): Promise<string> {
+    const id = String((await ask({ operation: 'signup', site: ORIGIN, username })).authority);
+    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
+    await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+    return id;
+  }
+  /** A change on the assistant's own Login that the website may or may not have taken. */
+  async function disclosedChange(): Promise<{ id: string; itemId: string }> {
+    const itemId = await assistantLogin();
+    const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
+    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
+    await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+    return { id, itemId };
+  }
+
+  it('refuses attempts that are settled or never reached the site, other jobs, and every caller but main', async () => {
+    const preparing = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
+    await attempts.save(preparing);
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
+    await attempts.disclose(preparing, { jobId: job.thread_id!, origin: ORIGIN });
+    // Exposed is still in flight: its own step settles it.
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
+    await attempts.markAwaitingVerification(preparing);
+    await attempts.markConfirmed(preparing, { signal: 'success_text' });
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
+    await attempts.finalize(preparing);
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
+    const other = await attempts.prepareSignup({ jobId: 'system:a2a:main:other', origin: ORIGIN, username: USERNAME });
+    if (other.status !== 'prepared') throw new Error(other.status);
+    expect(await release(other.attempt.id)).toEqual({ status: 'not_releasable' });
+    const unknown = await disclosedSignup('juno.hale@example.com');
+    await attempts.markUnknown(unknown, { signal: 'interrupted' });
+    await expect(release(unknown, job)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(
+      credentialAuthorityRequest(
+        { thread: job.thread_id, operation: 'release', authority: unknown, site: ORIGIN },
+        main,
+        { attempts },
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-args' });
+    expect(await pending()).toEqual([]);
+    expect(cards).toEqual([]);
+  });
+
+  it('asks the principal plainly, once, and a rejection leaves the change unresolved and its site held', async () => {
+    const { id } = await disclosedChange();
+    await attempts.markUnknown(id, { signal: 'interrupted' });
+    await holdSite();
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    expect(await pending()).toHaveLength(1);
+    expect(cards).toHaveLength(1);
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain("I can't tell whether the password changed");
+    expect(card.question).toContain('Both the original and the new password are kept in my 1Password vault');
+    await click('reject');
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
+  });
+
+  it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, leaving 1Password untouched', async () => {
+    const id = await disclosedSignup();
+    await attempts.markAwaitingVerification(id);
+    await holdSite();
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
+    const { cancelBrowserJob } = await import('./cancel.js');
+    expect(await cancelBrowserJob(job.thread_id!)).toMatchObject({ status: 'in_progress' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    expect((JSON.parse(cards[0]) as { question: string }).question).toContain(
+      "I can't tell whether the account was created",
+    );
+    // Asking changes nothing: only the principal's decision does.
+    expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    const before = vaultState();
+    const calls = fake.calls.length;
+    await click('approve');
+    const released = await attempts.get(id);
+    expect(released).toMatchObject({ phase: 'rejected', owned_item_id: null, finalized_at: null });
+    expect(JSON.parse(released!.evidence_json!)).toMatchObject({ release: 'principal' });
+    expect(await lease()).toBeUndefined();
+    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.thread_id)).toEqual({
+      cancelled: 1,
+    });
+    expect(closed).toContain(job.thread_id);
+    // Nothing in 1Password was read, archived, published or changed: the candidate stays where the principal can see it.
+    expect(fake.calls).toHaveLength(calls);
+    expect(vaultState()).toBe(before);
+    expect(fake.items.get(released!.candidate_item_id!)?.tags).toContain(`gws-ea-pending/${id}`);
+    expect(notes().at(-1)).toContain('released');
+    // The account is no longer busy: a new errand may sign up for it.
+    const next = (await resolveSystemSession('browser', 'system:a2a:main:next-errand')).session;
+    expect(
+      await credentialAuthorityRequest(
+        { thread: next.thread_id, operation: 'signup', site: ORIGIN, username: USERNAME },
+        main,
+        { attempts },
+      ),
+    ).toMatchObject({ status: 'recorded' });
+  });
+
+  it('releases a change that kept both credentials without promoting it, so the login can be changed again', async () => {
+    const { id, itemId } = await disclosedChange();
+    await attempts.markAwaitingVerification(id);
+    await attempts.markConfirmed(id, { signal: 'success_text' });
+    expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict' });
+    const original = fake.value(itemId, 'password');
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    await click('approve');
+    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
+    expect(fake.value(itemId, 'password')).toBe(original);
+    expect(fake.archived.size).toBe(0);
+    expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
+      status: 'recorded',
     });
   });
 });

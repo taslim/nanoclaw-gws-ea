@@ -420,7 +420,7 @@ registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerVaultAccessDelivery();
-registerCredentialAuthorityDelivery();
+registerCredentialAuthorityDelivery(getBrowserQueue);
 
 export {
   BrowserStore,

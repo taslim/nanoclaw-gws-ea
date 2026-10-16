@@ -10,6 +10,7 @@
  *   unknown → awaiting_verification, when the site's late response asks for email verification
  *   awaiting_verification → rejected;  confirmed → conflict → finalized
  *   preparing | saved → rejected, when abandoned before any disclosure
+ *   unknown | awaiting_verification | conflict → rejected, when the principal releases it
  *
  * Passwords live only in 1Password and this process's memory: rows, results,
  * errors and logs carry identifiers and constant reasons. Each operation
@@ -64,6 +65,14 @@ export type CredentialConflictReason =
   | 'password_changed'
   | 'concurrent_edit'
   | 'promotion_disabled';
+
+/**
+ * The phases only the principal's informed decision can end once the host
+ * cannot settle them: whether the website took the credential is unknown, its
+ * email verification never completed, or the vault could not take over a
+ * change the website confirmed.
+ */
+export const RELEASABLE_PHASES: readonly CredentialAttemptPhase[] = ['unknown', 'awaiting_verification', 'conflict'];
 
 /** One operation's durable record: identifiers, references and phase, never a value. */
 export interface CredentialAttempt {
@@ -682,6 +691,25 @@ export class CredentialAttempts {
     const attempt = await this.move(id, ['preparing', 'saved'], 'rejected');
     await this.retire(attempt, assertActive);
     return attempt;
+  }
+
+  /**
+   * Ends an attempt the principal released on their approval card: it becomes
+   * rejected, with the release and the approval added to its evidence. It
+   * never touches 1Password: no candidate is archived, published or promoted,
+   * and no ownership is recorded, so both credentials stay where the principal
+   * can see them.
+   */
+  async release(id: string, approvalId: string): Promise<CredentialAttempt> {
+    const attempt = await this.require(id);
+    const recorded: unknown = attempt.evidence_json === null ? {} : JSON.parse(attempt.evidence_json);
+    const evidence = Object.fromEntries(
+      Object.entries(isRecord(recorded) ? recorded : {}).filter(
+        (entry): entry is [string, string | number | boolean | null] =>
+          entry[1] === null || ['string', 'number', 'boolean'].includes(typeof entry[1]),
+      ),
+    );
+    return this.move(id, RELEASABLE_PHASES, 'rejected', { ...evidence, release: 'principal', approval: approvalId });
   }
 
   /**

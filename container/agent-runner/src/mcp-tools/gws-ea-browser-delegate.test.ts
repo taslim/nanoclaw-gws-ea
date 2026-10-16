@@ -248,3 +248,48 @@ it('records signup or password-change authority through the native host request,
   for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable', 'rate_limited'])
     expect(credentialAuthority.tool.description).toContain(outcome);
 });
+
+it("asks for the principal's release of an unresolved credential attempt by its job and authority alone", async () => {
+  const validate = new Ajv().compile(credentialAuthority.tool.inputSchema);
+  const fields = {
+    thread: 'system:a2a:main:join',
+    operation: 'release',
+    authority: '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+  };
+  expect(validate(fields)).toBe(true);
+  for (const changed of [
+    { thread: fields.thread, operation: 'release' },
+    { ...fields, site: 'https://accounts.shop.example' },
+    { ...fields, username: 'morgan.ellery@example.com' },
+    { ...fields, approved: true },
+    {
+      thread: fields.thread,
+      operation: 'signup',
+      site: 'https://accounts.shop.example',
+      username: 'morgan.ellery@example.com',
+      authority: fields.authority,
+    },
+  ])
+    expect(validate(changed)).toBe(false);
+  expect((await credentialAuthority.handler({ thread: fields.thread, operation: 'release' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  const waiting = credentialAuthority.handler({ ...fields, approved: true });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'credential_authority', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'awaiting_principal' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('awaiting_principal');
+  for (const outcome of ['release', 'awaiting_principal', 'not_releasable'])
+    expect(credentialAuthority.tool.description).toContain(outcome);
+});
