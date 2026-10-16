@@ -52,6 +52,43 @@ describe('local CLI discovery and grammar', () => {
     expect(await runCli(['capabilities', 'check', 'browser', '--id', 'partial', '--json'], invalid.runtime)).toBe(2);
     expect(JSON.parse(invalid.stdout.join('\n')).command).toBe('capabilities check browser');
   });
+  it('declares the host-wide 1Password actions, naming the account and an unproven attempt only on enable', async () => {
+    const io = capture();
+    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
+    const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
+      JSON.parse(io.stdout.join('\n'));
+    const onepassword = schema.commands.filter((command) => command.path[2] === 'onepassword');
+    expect(onepassword.map((command) => command.path[1])).toEqual(['show', 'check', 'enable']);
+    expect(onepassword.every((command) => command.scope === 'host')).toBe(true);
+    const own = (action: string) =>
+      onepassword
+        .find((command) => command.path[1] === action)
+        ?.options.filter((option) => !['help', 'json', 'no-input', 'quiet'].includes(option.name))
+        .map((option) => [option.name, option.required]);
+    expect(own('show')).toEqual([]);
+    expect(own('check')).toEqual([]);
+    expect(own('enable')).toEqual([
+      ['account', false],
+      ['discard-unproven', false],
+    ]);
+    const scoped = capture();
+    expect(
+      await runCli(
+        ['capabilities', 'enable', 'onepassword', '--id', '00000000-0000-4000-8000-000000000001'],
+        scoped.runtime,
+      ),
+    ).toBe(2);
+    expect(scoped.stderr.join('\n')).toContain('Unknown option --id');
+    for (const action of ['install', 'uninstall']) {
+      const unsupported = capture();
+      expect(await runCli(['capabilities', action, 'onepassword', '--json'], unsupported.runtime)).toBe(2);
+    }
+    const help = capture();
+    expect(await runCli(['help', 'capabilities', 'enable', 'onepassword'], help.runtime)).toBe(0);
+    expect(help.stdout.join('\n')).toContain('--account <account_id>');
+    expect(help.stdout.join('\n')).toContain('Scope: host');
+    expect(help.runtime.checkPrerequisites).not.toHaveBeenCalled();
+  });
   it.each([
     ['help', 'update'],
     ['update', '--help'],
@@ -187,6 +224,9 @@ describe('local CLI discovery and grammar', () => {
       'capabilities check browser',
       'capabilities enable browser',
       'capabilities disable browser',
+      'capabilities show onepassword',
+      'capabilities check onepassword',
+      'capabilities enable onepassword',
     ]);
     expect(schema.commands.slice(1, 7).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
     for (const command of ['install-voice', 'enable-voice', 'disable-voice', 'uninstall-voice']) {

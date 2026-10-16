@@ -428,10 +428,62 @@ describe('1Password actions', () => {
     ]);
   });
 
+  it('names a vault after an email address', async () => {
+    const { cli, calls } = await openCli(() => ({
+      stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant aya+ea@example.test' }),
+    }));
+    expect(await cli.createVault(await managementIdentity(), 'Assistant aya+ea@example.test')).toEqual({
+      status: 'ok',
+      vaultId: VAULT_ID,
+    });
+    expect(calls[0].args).toEqual(['vault', 'create', 'Assistant aya+ea@example.test', '--format', 'json']);
+  });
+
   it('deletes exactly one vault by its ID', async () => {
     const { cli, calls } = await openCli(succeed);
     expect(await cli.deleteVault(await managementIdentity(), VAULT_ID)).toEqual({ status: 'ok' });
     expect(calls[0].args).toEqual(['vault', 'delete', VAULT_ID]);
+  });
+
+  it('reads exactly one vault, succeeding only for the vault the provider returns', async () => {
+    const runtime = await managementIdentity();
+    const { cli, calls } = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant' }) }));
+    expect(await cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID });
+    expect(calls[0].args).toEqual(['vault', 'get', VAULT_ID, '--format', 'json']);
+
+    const other = await openCli(() => ({ stdout: JSON.stringify({ id: 'othervault0000000000000001' }) }));
+    expect(await other.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'failed', reason: 'unexpected_output' });
+    const missing = await openCli(() => ({
+      exitCode: 1,
+      stderr: `[ERROR] "${VAULT_ID}" isn't a vault in this account`,
+    }));
+    expect(await missing.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'failed', reason: 'not_found' });
+    await expect(missing.cli.getVault(runtime, 'Private')).rejects.toMatchObject({
+      code: 'invalid_onepassword_request',
+    });
+  });
+
+  it.each([
+    ['BUSINESS', 'business'],
+    ['TEAM', 'teams'],
+    ['FAMILY', 'families'],
+    ['INDIVIDUAL', 'individual'],
+  ])('reads a %s account as %s', async (type, accountType) => {
+    const { cli, calls } = await openCli(() => ({ stdout: JSON.stringify({ id: ACCOUNT_ID, type, name: 'Hale' }) }));
+    expect(await cli.accountType(await managementIdentity())).toEqual({ status: 'ok', accountType });
+    expect(calls[0].args).toEqual(['account', 'get', '--format', 'json']);
+  });
+
+  it.each([
+    ['an unknown plan', JSON.stringify({ id: ACCOUNT_ID, type: 'ENTERPRISE_PLUS' })],
+    ['another account', JSON.stringify({ id: OTHER_ACCOUNT_ID, type: 'BUSINESS' })],
+    ['no JSON', 'Business'],
+  ])('reports an account with %s as unexpected output', async (_label, stdout) => {
+    const { cli } = await openCli(() => ({ stdout }));
+    expect(await cli.accountType(await managementIdentity())).toEqual({
+      status: 'failed',
+      reason: 'unexpected_output',
+    });
   });
 
   it('refuses requests no fixed action allows', async () => {

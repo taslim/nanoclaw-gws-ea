@@ -1,5 +1,6 @@
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
+import { MANAGEMENT_TARGET, ONEPASSWORD_CAPABILITY } from './onepassword.js';
 import {
   managedResultSchema,
   operationDataSchema,
@@ -10,6 +11,8 @@ import {
   VOICE_OPERATION_SCHEMA,
   BROWSER_CAPABILITY_SCHEMA,
   BROWSER_OPERATION_SCHEMA,
+  ONEPASSWORD_CAPABILITY_SCHEMA,
+  ONEPASSWORD_OPERATION_SCHEMA,
 } from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
@@ -31,7 +34,7 @@ export type CommandHandler =
   | {
       readonly kind: 'capability';
       readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
-      readonly name?: 'browser';
+      readonly name?: 'browser' | 'onepassword';
     }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
@@ -528,6 +531,65 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       outputModes: managedModes,
       resultSchema: managedResultSchema(
         command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,
+      ),
+    }),
+  ),
+  ...ONEPASSWORD_CAPABILITY.actions.map(
+    (command): CommandDefinition => ({
+      path: ['capabilities', command, 'onepassword'],
+      group: 'Capabilities',
+      handler: { kind: 'capability', command, name: 'onepassword' },
+      scope: 'host',
+      summary:
+        command === 'show'
+          ? 'Show the 1Password account, management identity and each assistant’s recorded vault.'
+          : command === 'check'
+            ? 'Verify each assistant’s vault access and the account’s shared request usage.'
+            : 'Provision one vault and runtime service account for every compatible current and future assistant.',
+      options:
+        command === 'enable'
+          ? [
+              value(
+                'account',
+                'account_id',
+                'The exact 1Password account assistants use; needed only before the host has one.',
+              ),
+              value(
+                'discard-unproven',
+                `instance_id|${MANAGEMENT_TARGET}`,
+                'After deleting or revoking what an interrupted creation may have left in 1Password, forget that attempt.',
+              ),
+            ]
+          : [],
+      effects:
+        command === 'show'
+          ? ['Read-only local records; no 1Password request, prompt or repair.']
+          : command === 'check'
+            ? [
+                'Read-only service-account requests: identities, one vault read per assistant and the shared usage; each counts against the account limit.',
+                'Never prompts the operator, writes to a vault or repairs anything.',
+              ]
+            : [
+                "Verifies the operator's 1Password desktop sign-in, which may ask for approval in the app.",
+                'Creates or reuses the host management service account and records the host policy.',
+                'Creates a vault for each compatible assistant, running or stopped, and mints its runtime service account; never starts Chrome or a service.',
+                'Keeps finished assistants on a partial run; a retry continues only what is incomplete.',
+              ],
+      prerequisites:
+        command === 'enable'
+          ? [...ONEPASSWORD_CAPABILITY.prerequisites]
+          : ['A readable managed registry; check also needs the CLI the host recorded.'],
+      recovery: [
+        'Follow the reported per-assistant cause; rerun capabilities enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
+      ],
+      examples: [
+        command === 'enable'
+          ? 'gws-ea capabilities enable onepassword --account <account_id>'
+          : `gws-ea capabilities ${command} onepassword --json`,
+      ],
+      outputModes: managedModes,
+      resultSchema: managedResultSchema(
+        command === 'enable' ? ONEPASSWORD_OPERATION_SCHEMA : ONEPASSWORD_CAPABILITY_SCHEMA,
       ),
     }),
   ),

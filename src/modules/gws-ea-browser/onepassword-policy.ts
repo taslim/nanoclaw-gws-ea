@@ -36,6 +36,42 @@ export function isOnePasswordId(value: unknown): value is string {
   return typeof value === 'string' && ONEPASSWORD_ID.test(value);
 }
 
+/**
+ * Every vault permission the CLI documents: the first three on Teams and
+ * Families; on Business they group the granular permissions that follow.
+ */
+export const ONEPASSWORD_VAULT_PERMISSIONS = [
+  'allow_viewing',
+  'allow_editing',
+  'allow_managing',
+  'view_items',
+  'view_and_copy_passwords',
+  'view_item_history',
+  'create_items',
+  'edit_items',
+  'archive_items',
+  'delete_items',
+  'import_items',
+  'export_items',
+  'copy_and_share_items',
+  'print_items',
+  'manage_vault',
+] as const;
+export type OnePasswordVaultPermission = (typeof ONEPASSWORD_VAULT_PERMISSIONS)[number];
+
+/** What an assistant's runtime service account may do in its one vault: read and save logins, nothing else. */
+export const ONEPASSWORD_RUNTIME_GRANT = ['read_items', 'write_items'] as const;
+
+function isVaultPermissionList(value: unknown): value is OnePasswordVaultPermission[] {
+  const known: readonly unknown[] = ONEPASSWORD_VAULT_PERMISSIONS;
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    new Set(value).size === value.length &&
+    value.every((permission) => known.includes(permission))
+  );
+}
+
 /** Why a private file was refused; never its contents. */
 export type OnePasswordStateProblem = 'unsafe' | 'malformed' | 'wrong_instance' | 'wrong_account';
 
@@ -77,6 +113,13 @@ export type OnePasswordVaultCreator =
   | { readonly kind: 'management_service_account'; readonly serviceAccountId: string }
   | { readonly kind: 'operator' };
 
+/** Access the management service account granted a person on a vault it created, as the provider accepted it. */
+export interface OnePasswordUserGrant {
+  /** The exact provider user. */
+  readonly userId: string;
+  readonly permissions: readonly OnePasswordVaultPermission[];
+}
+
 export interface OnePasswordResources {
   readonly schemaVersion: 1;
   /** The assistant these resources belong to; immutable, and matching the record's location. */
@@ -84,7 +127,17 @@ export interface OnePasswordResources {
   readonly accountId: string;
   /** Only a vault the app created is ever recorded: no vault is adopted. */
   readonly vault: { readonly id: string; readonly createdBy: OnePasswordVaultCreator };
-  /** Null while the vault exists and its runtime service account is not minted yet. */
+  /**
+   * The operator's management rights on a vault the management service
+   * account created, which minting its runtime service account needs; null
+   * until the provider accepts the grant, and for a vault the operator created.
+   */
+  readonly operatorGrant: OnePasswordUserGrant | null;
+  /**
+   * Null while the vault exists and its runtime service account is not minted
+   * yet. Once set, that account holds exactly `ONEPASSWORD_RUNTIME_GRANT` on
+   * the vault, and its token is in the instance's runtime token file.
+   */
   readonly runtimeServiceAccountId: string | null;
 }
 
@@ -172,10 +225,29 @@ function parseVaultCreator(value: unknown): OnePasswordVaultCreator | undefined 
   return undefined;
 }
 
+function parseUserGrant(value: unknown): OnePasswordUserGrant | null | undefined {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['userId', 'permissions']) ||
+    !isOnePasswordId(value.userId) ||
+    !isVaultPermissionList(value.permissions)
+  )
+    return undefined;
+  return { userId: value.userId, permissions: [...value.permissions] };
+}
+
 function parseResources(value: unknown): OnePasswordResources | undefined {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ['schemaVersion', 'instanceId', 'accountId', 'vault', 'runtimeServiceAccountId'])
+    !hasExactKeys(value, [
+      'schemaVersion',
+      'instanceId',
+      'accountId',
+      'vault',
+      'operatorGrant',
+      'runtimeServiceAccountId',
+    ])
   )
     return undefined;
   const { schemaVersion, instanceId, accountId, vault, runtimeServiceAccountId } = value;
@@ -191,8 +263,16 @@ function parseResources(value: unknown): OnePasswordResources | undefined {
   )
     return undefined;
   const createdBy = parseVaultCreator(vault.createdBy);
-  if (!createdBy) return undefined;
-  return { schemaVersion, instanceId, accountId, vault: { id: vault.id, createdBy }, runtimeServiceAccountId };
+  const operatorGrant = parseUserGrant(value.operatorGrant);
+  if (!createdBy || operatorGrant === undefined) return undefined;
+  return {
+    schemaVersion,
+    instanceId,
+    accountId,
+    vault: { id: vault.id, createdBy },
+    operatorGrant,
+    runtimeServiceAccountId,
+  };
 }
 
 /**

@@ -24,6 +24,7 @@ const ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
 const OTHER_ACCOUNT_ID = 'REMYVANCEACCOUNT0000000002';
 const MANAGEMENT_ID = 'MANAGEMENTSERVICEACCOUNT01';
 const RUNTIME_ID = 'RUNTIMESERVICEACCOUNT00001';
+const OPERATOR_USER_ID = 'MORGANELLERYUSER0000000001';
 const VAULT_ID = 'morganelleryvault000000001';
 const INSTANCE_ID = '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b';
 const OTHER_INSTANCE_ID = '7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d';
@@ -56,6 +57,7 @@ function resources(overrides: Partial<OnePasswordResources> = {}): OnePasswordRe
     instanceId: INSTANCE_ID,
     accountId: ACCOUNT_ID,
     vault: { id: VAULT_ID, createdBy: { kind: 'management_service_account', serviceAccountId: MANAGEMENT_ID } },
+    operatorGrant: { userId: OPERATOR_USER_ID, permissions: ['allow_managing'] },
     runtimeServiceAccountId: RUNTIME_ID,
     ...overrides,
   };
@@ -217,6 +219,7 @@ describe("an assistant's 1Password resource record", () => {
     const { resourceFile } = onePasswordInstancePaths(instanceRoot);
     const staged = resources({
       vault: { id: VAULT_ID, createdBy: { kind: 'operator' } },
+      operatorGrant: null,
       runtimeServiceAccountId: null,
     });
     await writeOnePasswordResources(resourceFile, staged);
@@ -277,6 +280,22 @@ describe("an assistant's 1Password resource record", () => {
     const file = await writtenResources();
     const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
     await writeFile(file, JSON.stringify({ ...raw, vault: { id: VAULT_ID, createdBy } }));
+    expect(await readOnePasswordResources(file, { instanceId: INSTANCE_ID })).toEqual({
+      status: 'invalid',
+      problem: 'malformed',
+    });
+  });
+
+  it.each([
+    ['a grant without permissions', { userId: OPERATOR_USER_ID, permissions: [] }],
+    ['an undocumented permission', { userId: OPERATOR_USER_ID, permissions: ['administer'] }],
+    ['a repeated permission', { userId: OPERATOR_USER_ID, permissions: ['allow_managing', 'allow_managing'] }],
+    ['a grant to an email address', { userId: 'morgan.ellery@example.test', permissions: ['allow_managing'] }],
+    ['a missing grant', undefined],
+  ])('fails closed on %s', async (_label, operatorGrant) => {
+    const file = await writtenResources();
+    const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify({ ...raw, operatorGrant }));
     expect(await readOnePasswordResources(file, { instanceId: INSTANCE_ID })).toEqual({
       status: 'invalid',
       problem: 'malformed',

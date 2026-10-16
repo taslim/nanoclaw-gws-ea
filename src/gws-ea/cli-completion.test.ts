@@ -29,6 +29,9 @@ const scenarios = [
   { words: ['gws-ea', 'capabilities', 'install', 'voice', ''], includes: '--model', excludes: 'voice' },
   { words: ['gws-ea', 'capabilities', 'enable', 'browser', ''], includes: '--id', excludes: '--model' },
   { words: ['gws-ea', 'capabilities', 'check', 'browser', ''], includes: '--id', excludes: '--model' },
+  { words: ['gws-ea', 'capabilities', 'enable', ''], includes: 'onepassword', excludes: '--id' },
+  { words: ['gws-ea', 'capabilities', 'enable', 'onepassword', ''], includes: '--account', excludes: '--id' },
+  { words: ['gws-ea', 'capabilities', 'check', 'onepassword', ''], includes: '--json', excludes: '--account' },
   {
     words: ['gws-ea', 'capabilities', 'install', 'voice', '--model', '=', 'sm'],
     includes: 'small',

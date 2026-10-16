@@ -16,6 +16,20 @@ import {
   type BrowserCapabilityObservation,
   type BrowserOperationData,
 } from './browser-capability.js';
+import {
+  enableOnePassword,
+  inspectOnePasswordCapability,
+  onePasswordCapabilityCatalog,
+  onePasswordCapabilityLines,
+  onePasswordEnableNextActions,
+  onePasswordErrorPauses,
+  onePasswordNextActions,
+  onePasswordRecovery,
+  type OnePasswordCapabilityObservation,
+  type OnePasswordCliSeams,
+  type OnePasswordDependencies,
+  type OnePasswordEnableData,
+} from './onepassword.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -232,6 +246,10 @@ type RemoveAssistantRunner = (
 
 export interface CliRuntime {
   browserInspection?: BrowserCapabilityInspection;
+  /** How the 1Password CLI is found and run; tests substitute the runner. */
+  onePassword?: OnePasswordCliSeams;
+  /** A terminal's choice among the operator's 1Password accounts; absent, enable requires --account. */
+  chooseOnePasswordAccount?: OnePasswordDependencies['chooseAccount'];
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
@@ -342,7 +360,10 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 function isBusy(error: unknown): boolean {
   return (
     error instanceof GwsEaError &&
-    (error.code === 'instance_busy' || error.code === 'voice_busy' || error.code === 'registry_busy')
+    (error.code === 'instance_busy' ||
+      error.code === 'voice_busy' ||
+      error.code === 'registry_busy' ||
+      error.code === 'onepassword_busy')
   );
 }
 
@@ -783,6 +804,7 @@ class Cli {
       serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
+      onePassword: { cli: { ambient: this.#runtime.environment ?? process.env, ...this.#runtime.onePassword } },
     });
   }
 
@@ -2161,6 +2183,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       confirmUpdate: _update,
       confirmUpdateAll: _all,
       confirmRollback: _rollback,
+      chooseOnePasswordAccount: _account,
       presenter: _presenter,
       ...safe
     } = runtime;
@@ -2350,6 +2373,117 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           stop();
         }
       }
+      if (handler.name === 'onepassword') {
+        let changed: Changed = false;
+        let data: OnePasswordCapabilityObservation | OnePasswordEnableData | null = null;
+        let run: RunLog | undefined;
+        const stop = observeInterruption(() => ({ changed, data }));
+        const commandPath = invocation.definition.path.join(' ');
+        try {
+          const paths = runtime.paths ?? resolveControlPlanePaths();
+          registerErrorSecrets();
+          const cli: OnePasswordCliSeams = {
+            ...(environment.PATH ? { searchPath: environment.PATH } : {}),
+            ambient: environment,
+            ...runtime.onePassword,
+          };
+          if (command === 'show' || command === 'check') {
+            const observation = await inspectOnePasswordCapability(paths, { check: command === 'check', cli });
+            data = observation;
+            const actions = onePasswordNextActions(observation, command === 'check');
+            if (!json)
+              for (const line of [...onePasswordCapabilityLines(observation, true), ...nextActionLines(actions)])
+                output(line);
+            emitResult(managedResult(commandPath, { outcome: 'succeeded', changed, data, next_actions: actions }));
+            return EXIT_CODES.ready;
+          }
+          if (command !== 'enable') throw new GwsEaError('invalid_arguments', `1Password does not support ${command}.`);
+          run = await startRunLog({ paths, command: commandPath });
+          const enabled = await run.step('enable onepassword', () =>
+            enableOnePassword(
+              paths,
+              {
+                ...(options.account === undefined ? {} : { accountId: options.account }),
+                ...(options['discard-unproven'] === undefined ? {} : { discardUnproven: options['discard-unproven'] }),
+              },
+              {
+                cli,
+                ...(runtime.upsertEnvVars ? { upsertEnvVars: runtime.upsertEnvVars } : {}),
+                ...(runtime.chooseOnePasswordAccount ? { chooseAccount: runtime.chooseOnePasswordAccount } : {}),
+                recordEffect: (effect) => {
+                  changed = combineEffects(changed, effect);
+                },
+                progress: (line) => presenter.line(line),
+              },
+            ),
+          );
+          data = enabled;
+          run.complete();
+          const waiting = enabled.assistants.filter((assistant) => assistant.outcome === 'pending');
+          const actions = onePasswordEnableNextActions(enabled);
+          presenter.report({
+            outcome: waiting.length ? 'paused' : 'ready',
+            headline: waiting.length
+              ? `1Password is enabled in account ${enabled.account_id}; ${waiting.length} assistant${waiting.length === 1 ? '' : 's'} still wait${waiting.length === 1 ? 's' : ''}.`
+              : `1Password is enabled in account ${enabled.account_id} for every compatible current and future assistant.`,
+            details: [
+              ...enabled.assistants.map(
+                (assistant) =>
+                  `Assistant ${assistant.instance_id}: ${assistant.outcome}${assistant.vault_id ? `, vault ${assistant.vault_id}` : ''}${assistant.message ? `. ${assistant.message}` : ''}`,
+              ),
+              ...nextActionLines(actions),
+              `Log: ${run.progressLog}`,
+            ],
+          });
+          emitResult(
+            managedResult(commandPath, {
+              outcome: waiting.length ? 'paused' : 'succeeded',
+              changed,
+              data,
+              next_actions: actions,
+              diagnostics: { run_log: run.progressLog },
+            }),
+          );
+          return waiting.length ? EXIT_CODES.paused : EXIT_CODES.ready;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Every 1Password operation retains its observed effects in the managed boundary.
+        } catch (cause) {
+          const error =
+            cause instanceof GwsEaError
+              ? cause
+              : new GwsEaError(
+                  'onepassword_operation_failed',
+                  `1Password ${command} failed (${errorCode(cause)}). Inspect the host's 1Password files and permissions, and the retained log if present, before retrying.`,
+                  { cause },
+                );
+          try {
+            run?.abort(cause);
+            // eslint-disable-next-line no-catch-all/no-catch-all -- A full or unavailable log must not suppress the managed result.
+          } catch (_logError) {
+            /* The managed result below still reports the failure. */
+          }
+          registerErrorSecrets();
+          const actions = onePasswordRecovery(error);
+          const paused = onePasswordErrorPauses(error);
+          const details = [...nextActionLines(actions), ...(run ? [`Log: ${run.progressLog}`] : [])];
+          emitResult(
+            managedResult(commandPath, {
+              outcome: paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
+              changed,
+              data,
+              error,
+              next_actions: actions,
+              diagnostics: run ? { run_log: run.progressLog } : {},
+            }),
+          );
+          if (paused) {
+            presenter.report({ outcome: 'paused', headline: safeErrorMessage(error), details });
+            return EXIT_CODES.paused;
+          }
+          return reportStop(presenter, error, details);
+        } finally {
+          stop();
+        }
+      }
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
@@ -2379,13 +2513,21 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
             actions = voiceCapabilityNextActions(capability, command === 'check');
             const browser = command === 'list' ? await browserCapabilityCatalog(paths) : undefined;
-            data = command === 'list' && browser ? { capabilities: [capability, browser] } : capability;
+            const onePassword = command === 'list' ? await onePasswordCapabilityCatalog(paths) : undefined;
+            data =
+              command === 'list' && browser && onePassword
+                ? { capabilities: [capability, browser, onePassword] }
+                : capability;
             if (!json)
               for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
                 output(line);
             if (!json && browser)
               output(
                 `browser (assistant): ${browser.summary} Actions: ${browser.actions.join(', ')}. Assistants: ${browser.assistant_ids.join(', ') || 'none'}.`,
+              );
+            if (!json && onePassword)
+              output(
+                `onepassword (host): ${onePassword.summary} Actions: ${onePassword.actions.join(', ')}. Activation: ${onePassword.activation}.`,
               );
             break;
           }

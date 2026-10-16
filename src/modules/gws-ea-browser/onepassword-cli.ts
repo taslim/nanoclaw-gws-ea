@@ -25,7 +25,15 @@ import { registerSecret } from '../../gws-ea/redact.js';
 import { removePrivateFile, writeOwnerOnlyFileExclusive } from '../../gws-ea/secrets.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
-import { isOnePasswordId, readOnePasswordToken } from './onepassword-policy.js';
+import {
+  isOnePasswordId,
+  ONEPASSWORD_RUNTIME_GRANT,
+  ONEPASSWORD_VAULT_PERMISSIONS,
+  readOnePasswordToken,
+  type OnePasswordVaultPermission,
+} from './onepassword-policy.js';
+
+export { ONEPASSWORD_VAULT_PERMISSIONS, type OnePasswordVaultPermission };
 
 /** Delegated service-account creation by a vault manager arrived in 2.29.0. */
 export const ONEPASSWORD_CLI_MINIMUM_VERSION = '2.29.0';
@@ -36,34 +44,11 @@ const VERSION_TIMEOUT_MS = 15_000;
 const OPERATOR_TIMEOUT_MS = 120_000;
 const SERVICE_ACCOUNT_TIMEOUT_MS = 60_000;
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
-/** A vault or service account name: never empty, never read as a flag. */
-const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,99}$/u;
+/** A vault or service account name, which may hold an email address: never empty, never read as a flag. */
+const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._@+-]{0,99}$/u;
 const MAX_DISPLAY_CHARACTERS = 254;
 /** Runner failures that leave a provider call's effect unknown; anything else is this code's own fault. */
 const INTERRUPTIONS = new Set(['command_failed', 'command_timeout', 'command_output_limit', 'executable_not_found']);
-
-/**
- * Every vault permission the CLI documents: the first three on Teams and
- * Families; on Business they group the granular permissions that follow.
- */
-export const ONEPASSWORD_VAULT_PERMISSIONS = [
-  'allow_viewing',
-  'allow_editing',
-  'allow_managing',
-  'view_items',
-  'view_and_copy_passwords',
-  'view_item_history',
-  'create_items',
-  'edit_items',
-  'archive_items',
-  'delete_items',
-  'import_items',
-  'export_items',
-  'copy_and_share_items',
-  'print_items',
-  'manage_vault',
-] as const;
-export type OnePasswordVaultPermission = (typeof ONEPASSWORD_VAULT_PERMISSIONS)[number];
 
 /** The operator's own desktop sign-in, in exactly this account; never a service-account or Connect credential. */
 export interface OperatorIdentity {
@@ -143,6 +128,17 @@ export interface OnePasswordRateLimit {
   readonly used: number;
   readonly remaining: number;
 }
+
+/** The plan an account is on, which sets the daily request limit every service account in it shares (KTD11). */
+export type OnePasswordAccountType = 'individual' | 'families' | 'teams' | 'business';
+
+/** The CLI's account types, as `op account get` reports them. */
+const ACCOUNT_TYPES: ReadonlyMap<string, OnePasswordAccountType> = new Map([
+  ['INDIVIDUAL', 'individual'],
+  ['FAMILY', 'families'],
+  ['TEAM', 'teams'],
+  ['BUSINESS', 'business'],
+]);
 
 export interface VaultAccessRequest {
   readonly vaultId: string;
@@ -368,6 +364,11 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
+/** Whether an attempt to mint the token for `tokenFile` is recorded, its outcome not yet proven. */
+export function serviceAccountCreationUnproven(tokenFile: string): Promise<boolean> {
+  return exists(creationRecord(tokenFile));
+}
+
 /** After the operator has revoked an unproven service account on 1Password.com: forget the attempt and its capture. */
 export async function discardServiceAccountCreation(tokenFile: string): Promise<void> {
   await removePrivateFile(creationRecord(tokenFile));
@@ -547,6 +548,30 @@ export class OnePasswordCli {
     return result.status === 'ok' ? { status: 'ok' } : result;
   }
 
+  /** Whether `identity` can read exactly this vault: success names the vault the provider returned. */
+  async getVault(
+    identity: OnePasswordIdentity,
+    vaultId: string,
+  ): Promise<OnePasswordResult<{ readonly vaultId: string }>> {
+    assertId(vaultId, 'The vault');
+    const result = await this.#read(identity, ['vault', 'get', vaultId, '--format', 'json']);
+    if (result.status !== 'ok') return result;
+    const value = parseJson(result.stdout);
+    return isRecord(value) && value.id === vaultId ? { status: 'ok', vaultId } : failed('unexpected_output');
+  }
+
+  /** The plan of the account `identity` authenticates to. */
+  async accountType(
+    identity: OnePasswordIdentity,
+  ): Promise<OnePasswordResult<{ readonly accountType: OnePasswordAccountType }>> {
+    const result = await this.#read(identity, ['account', 'get', '--format', 'json']);
+    if (result.status !== 'ok') return result;
+    const value = parseJson(result.stdout);
+    if (!isRecord(value) || value.id !== identity.accountId) return failed('unexpected_output');
+    const accountType = typeof value.type === 'string' ? ACCOUNT_TYPES.get(value.type.toUpperCase()) : undefined;
+    return accountType ? { status: 'ok', accountType } : failed('unexpected_output');
+  }
+
   /** The service account's hourly usage and its account's shared daily usage (KTD11). */
   async rateLimits(
     identity: ServiceAccountIdentity,
@@ -577,7 +602,7 @@ export class OnePasswordCli {
     const access =
       request.access.kind === 'create_vaults'
         ? ['--can-create-vaults']
-        : ['--vault', `${request.access.vaultId}:read_items,write_items`];
+        : ['--vault', `${request.access.vaultId}:${ONEPASSWORD_RUNTIME_GRANT.join(',')}`];
     await assertPrivateDirectory(path.dirname(request.tokenFile));
     const record = creationRecord(request.tokenFile);
     const captured = await readOnePasswordToken(request.tokenFile);

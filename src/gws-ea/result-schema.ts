@@ -3,6 +3,7 @@ import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { OPERATION_PHASES } from './operation.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
+import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
 /** Native protocol text shares the published string shape, but retains its producer semantics. */
@@ -247,8 +248,88 @@ export const BROWSER_OPERATION_SCHEMA = object({
   enabled: bool,
   changed: bool,
 });
+const onePasswordMetadata = {
+  name: { const: 'onepassword' },
+  scope: { const: 'host' },
+  actions: array(choices(...ONEPASSWORD_CAPABILITY.actions)),
+  summary: text,
+};
+const onePasswordCheck = choices('not_checked', 'verified', 'failed');
+const onePasswordToken = choices('present', 'absent', 'invalid');
+export const ONEPASSWORD_CAPABILITY_SCHEMA = object({
+  ...onePasswordMetadata,
+  observed_at: time,
+  activation: object({ status: choices('enabled', 'disabled', 'unknown'), reason: nullable(text) }),
+  account_id: nullable(text),
+  cli: object({
+    path: nullable(text),
+    status: choices('not_checked', 'available', 'unavailable'),
+    version: nullable(text),
+    reason: nullable(text),
+  }),
+  management: object({
+    service_account_id: nullable(text),
+    token: onePasswordToken,
+    status: onePasswordCheck,
+    reason: nullable(text),
+  }),
+  quota: object({
+    status: choices('not_checked', 'observed', 'unknown'),
+    account_type: nullable(choices('individual', 'families', 'teams', 'business')),
+    sharing_assistant_ids: array(text),
+    daily: nullable(object({ limit: count, used: count, remaining: count })),
+    hourly_per_token: nullable(object({ read: nullable(count), write: nullable(count) })),
+    reason: nullable(text),
+  }),
+  assistants: array(
+    object({
+      instance_id: text,
+      compatibility: choices('compatible', 'unsupported', 'unknown'),
+      provisioning: choices('ready', 'incomplete', 'absent', 'invalid', 'not_applicable'),
+      vault_id: nullable(text),
+      runtime_service_account_id: nullable(text),
+      recorded_grants: object({
+        operator: nullable(object({ user_id: text, permissions: array(text) })),
+        runtime: nullable(array(text)),
+      }),
+      runtime_token: onePasswordToken,
+      unproven_creation: nullable(choices('vault', 'service_account')),
+      access: object({ status: onePasswordCheck, reason: nullable(text) }),
+      write: { const: 'untested' },
+      reason: nullable(text),
+    }),
+  ),
+  prerequisites: array(text),
+  readiness_limits: array(text),
+  future_compatible_assistants: { const: true },
+});
+export const ONEPASSWORD_OPERATION_SCHEMA = object({
+  name: { const: 'onepassword' },
+  scope: { const: 'host' },
+  enabled: { const: true },
+  account_id: text,
+  management_service_account_id: text,
+  assistants: array(
+    object({
+      instance_id: text,
+      outcome: choices('ready', 'pending', 'skipped'),
+      reason: nullable(choices(...ONEPASSWORD_PENDING_REASONS, ...ONEPASSWORD_SKIP_REASONS)),
+      message: nullable(text),
+      changed: effect,
+      vault_id: nullable(text),
+      runtime_service_account_id: nullable(text),
+    }),
+  ),
+  future_compatible_assistants: { const: true },
+});
 export const CAPABILITY_LIST_SCHEMA = object({
-  capabilities: array({ oneOf: [VOICE_CAPABILITY_SCHEMA, object({ ...browserMetadata, assistant_ids: array(text) })] }),
+  capabilities: array({
+    oneOf: [
+      VOICE_CAPABILITY_SCHEMA,
+      object({ ...browserMetadata, assistant_ids: array(text) }),
+      object({ ...onePasswordMetadata, activation: choices('enabled', 'disabled', 'unknown') }),
+    ],
+  }),
 });
 export const VOICE_OPERATION_SCHEMA = object(
   {

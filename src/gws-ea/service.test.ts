@@ -123,21 +123,26 @@ describe('GWS-EA instance runtime', () => {
       (await readFile(path.join(config.state_root, '.env'), 'utf8')).match(/GWS_EA_BROWSER_POLICY_FILE=/gu),
     ).toHaveLength(1);
   });
-  it('binds the custom-root shared voice locator without adding per-assistant runtime state', async () => {
+  it("binds the custom root's shared host policy locators, voice and 1Password, without adding per-assistant runtime state", async () => {
     const { config } = await fixture();
-    const locator = path.join(config.home_directory, 'custom-control-root', 'voice.json');
-    await persistInstanceRuntime(config, upsertEnvVars, locator);
-    expect(await readFile(path.join(config.state_root, '.env'), 'utf8')).toContain(
-      `GWS_EA_VOICE_POLICY_FILE=${locator}`,
+    const configRoot = path.join(config.home_directory, 'custom-control-root');
+    await persistInstanceRuntime(config, upsertEnvVars, configRoot);
+    const environment = await readFile(path.join(config.state_root, '.env'), 'utf8');
+    expect(environment).toContain(`GWS_EA_VOICE_POLICY_FILE=${path.join(configRoot, 'voice.json')}\n`);
+    expect(environment).toContain(
+      `GWS_EA_ONEPASSWORD_POLICY_FILE=${path.join(configRoot, 'onepassword', 'policy.json')}\n`,
     );
+    // A locator names the shared policy; the management token beside it is never bound to an assistant.
+    expect(environment).not.toContain('management-token');
     const persisted = JSON.parse(
       await readFile(path.join(config.state_root, 'data/gws-ea/runtime.json'), 'utf8'),
     ) as Record<string, unknown>;
-    expect(Object.keys(persisted).filter((key) => key.includes('voice'))).toEqual([]);
-    await persistInstanceRuntime(config, upsertEnvVars, locator);
-    expect(
-      (await readFile(path.join(config.state_root, '.env'), 'utf8')).match(/GWS_EA_VOICE_POLICY_FILE=/gu),
-    ).toHaveLength(1);
+    expect(Object.keys(persisted).filter((key) => /voice|onepassword/u.test(key))).toEqual([]);
+    expect(JSON.stringify(persisted)).not.toContain('custom-control-root');
+    await persistInstanceRuntime(config, upsertEnvVars, configRoot);
+    const again = await readFile(path.join(config.state_root, '.env'), 'utf8');
+    expect(again.match(/GWS_EA_VOICE_POLICY_FILE=/gu)).toHaveLength(1);
+    expect(again.match(/GWS_EA_ONEPASSWORD_POLICY_FILE=/gu)).toHaveLength(1);
   });
   it("persists only independent values and the Docker endpoint, in the assistant's physical state, and derives every instance target", async () => {
     const { config, release } = await fixture();
