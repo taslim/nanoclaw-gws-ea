@@ -137,7 +137,12 @@ function attachmentsOf(files: readonly OutboundFile[] = []): { readonly attachme
   };
 }
 
-const PIECE_WORDS: Readonly<Record<PieceKind, string>> = { thread: 'Thread', event: 'Event', file: 'File' };
+const PIECE_WORDS: Readonly<Record<PieceKind, string>> = {
+  thread: 'Thread',
+  event: 'Event',
+  file: 'File',
+  job: 'Browser job',
+};
 
 /** `work`'s answer, or `fallback` once why it failed is logged: a note never waits on what it carries beside its text. */
 async function bestEffort<T>(what: string, work: () => Promise<T>, fallback: T): Promise<T> {

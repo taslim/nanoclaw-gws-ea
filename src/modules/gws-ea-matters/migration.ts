@@ -65,3 +65,29 @@ export const gwsEaMattersMigration: ModuleMigration = {
     `);
   },
 };
+
+/** Job references join the native piece store; existing matter and link history is preserved. */
+export const gwsEaMatterJobsMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:browser-jobs',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_matter_links_with_jobs (
+        matter_id TEXT NOT NULL REFERENCES gws_ea_matters(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('thread', 'event', 'file', 'person', 'memory', 'job')),
+        reference TEXT NOT NULL CHECK (reference <> ''),
+        handler TEXT CHECK (handler <> ''),
+        matter_open INTEGER NOT NULL CHECK (matter_open IN (0, 1)),
+        linked_at TEXT NOT NULL,
+        PRIMARY KEY (matter_id, kind, reference)
+      );
+      INSERT INTO gws_ea_matter_links_with_jobs SELECT * FROM gws_ea_matter_links;
+      DROP TABLE gws_ea_matter_links;
+      ALTER TABLE gws_ea_matter_links_with_jobs RENAME TO gws_ea_matter_links;
+      CREATE INDEX idx_gws_ea_matter_links_reference ON gws_ea_matter_links (kind, reference);
+      CREATE UNIQUE INDEX idx_gws_ea_matter_links_one_open_matter
+        ON gws_ea_matter_links (kind, reference)
+        WHERE matter_open = 1 AND kind IN ('thread', 'event', 'file', 'job');
+    `);
+  },
+};

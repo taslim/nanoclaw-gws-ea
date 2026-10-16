@@ -38,6 +38,7 @@ import {
 import { escapeMarkdownInline } from './markdown.js';
 import {
   gwsEaExternalEmailPointerMigration,
+  gwsEaBrowserPointerMigration,
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
 } from './migration.js';
@@ -47,6 +48,7 @@ import './wiring-policy.js';
 registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
 registerMigration(gwsEaExternalEmailPointerMigration);
+registerMigration(gwsEaBrowserPointerMigration);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.

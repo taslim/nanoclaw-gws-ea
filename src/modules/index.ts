@@ -43,3 +43,4 @@ import './gws-ea-inbox/index.js';
 import './gws-ea-meetings/index.js';
 import './gws-ea-matters/index.js';
 import './community-portal/index.js';
+import './gws-ea-browser/index.js';

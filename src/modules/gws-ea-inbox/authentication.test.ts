@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { principalRecognizer } from '../gws-ea-profile/db.js';
 import {
   authenticateSender,
+  dkimAlignedToSite,
   refusedPrincipalAddress,
   signedByGoogle,
   type AuthContext,
@@ -25,6 +26,54 @@ const CONTEXT: AuthContext = {
     'pat@outlook.com',
   ]),
 };
+
+describe('browser sign-in mail authentication', () => {
+  it('requires Gmail-verified DKIM for the claimed registrable domain, including private domains', () => {
+    expect(
+      dkimAlignedToSite(
+        message({ from: 'login@mail.shop.example', results: results('shop.example', 's1') }),
+        'shop.example',
+      ),
+    ).toBe(true);
+    expect(
+      dkimAlignedToSite(
+        message({ from: 'login@shop.example', results: results('elsewhere.example', 's1') }),
+        'shop.example',
+      ),
+    ).toBe(false);
+    expect(
+      dkimAlignedToSite(
+        message({ from: 'login@shop.example', results: results('shop.example', 's1', 'pass', 'fail') }),
+        'shop.example',
+      ),
+    ).toBe(false);
+    expect(
+      dkimAlignedToSite(
+        message({ from: 'login@lookalike-shop.example', results: results('lookalike-shop.example', 's1') }),
+        'shop.example',
+      ),
+    ).toBe(false);
+    expect(
+      dkimAlignedToSite(
+        message({ from: 'login@other.github.io', results: results('other.github.io', 's1') }),
+        'mine.github.io',
+      ),
+    ).toBe(false);
+    expect(
+      dkimAlignedToSite(
+        message({
+          from: 'login@shop.example',
+          senderHeaders: [
+            { name: 'From', value: 'login@shop.example' },
+            { name: 'Authentication-Results', value: results('shop.example', 's1') },
+          ],
+          withoutGmailResults: true,
+        }),
+        'shop.example',
+      ),
+    ).toBe(false);
+  });
+});
 
 interface MessageOptions {
   readonly from?: string;

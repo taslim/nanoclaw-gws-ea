@@ -74,6 +74,7 @@ import { markLookFailed } from '../gws-ea-matters/db.js';
 import { lookSeries } from '../gws-ea-matters/looks.js';
 import {
   getExternalEmailAgentGroupId,
+  getBrowserAgentGroupId,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
   principalContact,
@@ -153,9 +154,19 @@ async function deliverToPrincipal(text: string, route: Route | undefined, notice
  * of `external-email`'s, or no one's (any other session, a task session
  * included).
  */
-async function conversationOf(session: Session): Promise<'main' | { readonly thread: string } | undefined> {
+async function conversationOf(
+  session: Session,
+): Promise<'main' | { readonly thread: string } | { readonly job: string } | undefined> {
+  const main = await getMainAgentGroupId();
+  if (
+    session.messaging_group_id === null &&
+    main !== null &&
+    session.agent_group_id === (await getBrowserAgentGroupId()) &&
+    session.thread_id?.startsWith(`system:a2a:${main}:`)
+  )
+    return { job: session.thread_id };
   if (session.messaging_group_id === null) return undefined;
-  if (session.agent_group_id === (await getMainAgentGroupId())) return 'main';
+  if (session.agent_group_id === main) return 'main';
   if (session.thread_id === null || session.agent_group_id !== (await getExternalEmailAgentGroupId())) return undefined;
   return { thread: session.thread_id };
 }
@@ -299,6 +310,23 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
   }
 }
 
+async function tellMainOfBrowserJob(cause: Cause, thread: string, failed: readonly string[]): Promise<void> {
+  const words: Record<Cause, string> = {
+    'delivery-failed': 'its report could not be delivered, even after retrying.',
+    'inbound-failed': 'a delegated message could not be processed, even after retrying.',
+    'turn-failed': 'its turn failed before it finished, so the errand may be left undone.',
+  };
+  const result = await writeNoteForMain({
+    id: factId(`browser-${cause}`, [thread, ...[...failed].sort()]),
+    timestamp: new Date().toISOString(),
+    text: `Browser job ${thread}: ${words[cause]}`,
+    wake: true,
+    pieces: [{ kind: 'job', reference: thread }],
+  });
+  if (result === 'no-main' || result === 'no-principal')
+    log.warn('Nobody to tell of a browser job failure', { thread, cause, result });
+}
+
 /** What main reads of a failure in its own conversation that the principal has nothing to resend for. */
 function whatYouLeft(cause: Cause): string {
   switch (cause) {
@@ -315,7 +343,12 @@ function whatYouLeft(cause: Cause): string {
   }
 }
 
-const PIECE_WORDS: Readonly<Record<NotePiece['kind'], string>> = { thread: 'thread', event: 'event', file: 'file' };
+const PIECE_WORDS: Readonly<Record<NotePiece['kind'], string>> = {
+  thread: 'thread',
+  event: 'event',
+  file: 'file',
+  job: 'job',
+};
 
 /**
  * What `messages` carried for main: the pieces and matters each note named,
@@ -384,10 +417,28 @@ function answeredBy(post: OutboundMessage): string[] {
 
 // Delivery may report a give-up again after a stop: whoever hears of a failed message hears of it once.
 registerDeliveryFailedHook(async (failed, session) => {
+  const route = await conversationOf(session);
+  if (route !== undefined && route !== 'main' && 'job' in route) {
+    const reports = failed.filter(
+      (post) =>
+        post.channelType === 'agent' &&
+        post.kind !== 'system' &&
+        post.kind !== 'task_log' &&
+        contentOf(post.content)?.operation !== 'reaction',
+    );
+    if (reports.length > 0)
+      await tellMainOfBrowserJob(
+        'delivery-failed',
+        route.job,
+        reports.map((post) => post.id),
+      );
+    return;
+  }
   const posts = failed.filter(isPersonFacingPost);
-  const conversation = posts.length === 0 ? undefined : await conversationOf(session);
+  const conversation = posts.length === 0 ? undefined : route;
   if (conversation === undefined) return;
   if (conversation !== 'main') {
+    if ('job' in conversation) return;
     await tellMain(
       'delivery-failed',
       conversation.thread,
@@ -414,6 +465,10 @@ registerInboundFailedHook(async (failed, session) => {
   if (conversation === undefined) return;
   const ids = failed.map((message) => message.id);
   if (conversation !== 'main') {
+    if ('job' in conversation) {
+      await tellMainOfBrowserJob('inbound-failed', conversation.job, ids);
+      return;
+    }
     await tellMain('inbound-failed', conversation.thread, ids);
     return;
   }
@@ -461,6 +516,10 @@ registerDeliveryAction(
     if (conversation === undefined) return;
     const batch = idsOf(content.batch);
     if (conversation !== 'main') {
+      if ('job' in conversation) {
+        await tellMainOfBrowserJob('turn-failed', conversation.job, batch);
+        return;
+      }
       // A turn answering another agent is no one's to hear of: a failure never answers a failure.
       if (isPersonRoute(route)) await tellMain('turn-failed', conversation.thread, batch);
       return;

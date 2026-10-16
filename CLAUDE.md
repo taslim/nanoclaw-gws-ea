@@ -74,6 +74,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
+| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, private Chrome pipe, public-only proxy, job queue, sign-in, purchase authority, recipes and watches |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -143,7 +144,8 @@ follow-ups. The host refuses unknown, foreign and closed threads; it never
 chooses a tool job by peer affinity. A per-thread destination suits a tool
 agent that runs one session per delegated errand; its reports to the delegating
 agent are untrusted information, and worker-style subagents remain the normal
-pattern for other work.
+pattern for other work. GWS-EA's `browser` is such a sealed tool agent; its
+reports to `main` are framed as untrusted.
 
 Key files: `src/modules/agent-to-agent/db/agent-destinations.ts`,
 `src/modules/agent-to-agent/db/threaded-destinations.ts`, and
@@ -181,7 +183,7 @@ Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer
 
 ## Secrets / Credentials / Gateways
 
-API keys, OAuth tokens, and auth credentials are managed by a **credential gateway** — never by NanoClaw and never by an agent. Secrets are injected at the network boundary at request time; none are passed in env vars or through chat context.
+Long-lived API keys, OAuth tokens, and API auth credentials are managed by a **credential gateway** — never by NanoClaw and never by an agent. Secrets are injected at the network boundary at request time; none are passed in env vars or through chat context.
 
 NanoClaw ships the seam, not a gateway. One gateway is installed per copy from its `/add-<gateway>` skill (`/add-onecli`, `/add-iron-proxy`), and `NANOCLAW_GATEWAY_PROVIDER` in `.env` names the one this copy runs. With none registered the host refuses to start — there is no implicit default and no open-egress fallback.
 
@@ -205,6 +207,19 @@ transaction, call DB-only `detachApproval` inside it, then
 `withdrawApproval` handles the standalone case. Expiry uses the same terminal
 card/notification path. Only handlers registered with `{ restartSafe: true }`
 resume an approved row at host start; they must make re-entry idempotent.
+
+### Host browser credentials
+
+The optional GWS-EA host browser has a separate sign-in boundary from API
+credential injection: its Chrome traffic uses a per-assistant public-only proxy,
+never the credential gateway. It signs in with emailed codes and magic links,
+including a code the principal relays through main. The existing isolated
+external-email agent interprets assistant-mail credentials in a per-claim system
+session; the host alone inserts codes or follows validated same-site links into a
+validated HTTPS frame, and the browser agent receives outcomes only. Profile and
+staging data live under `<instance root>/browser/`, outside routine snapshot
+roots. There is no stored password, Keychain credential store, debugging TCP
+endpoint or takeover portal.
 
 ## Rebuild Workflow (Temporary)
 

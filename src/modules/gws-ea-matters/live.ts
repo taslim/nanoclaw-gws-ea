@@ -41,6 +41,7 @@ import {
 import { assistantAddressesOf } from '../gws-ea-inbox/runtime.js';
 import { getThread, THREAD_ACCOUNT_MAX, threadAccount, type ThreadAccount } from '../gws-ea-inbox/thread-map.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { readBrowserJob } from '../gws-ea-browser/cancel.js';
 import {
   createMeetingsCalendarApi,
   type EventAttendee,
@@ -356,6 +357,23 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
     return state.ok ? state.value : { line: UNREAD };
   };
   switch (link.kind) {
+    case 'job':
+      return settled(async () => {
+        const view = await readBrowserJob(link.reference);
+        if (!view) return { line: 'no such browser job' };
+        const held = view.held_sites.length === 0 ? '' : `; sites: ${view.held_sites.join(', ')}`;
+        const signIn = view.waiting_sign_in
+          ? `; waiting for a principal sign-in code for ${view.waiting_sign_in.site} (${view.waiting_sign_in.origin})`
+          : '';
+        return {
+          line: `${view.state}${held}${signIn}`,
+          ...(view.last_report
+            ? {
+                framed: `  Last report ${formatLocalTime(view.last_report.at, lens.timezone)}:\n${untrusted(view.last_report.text, FRAME_LIMIT, 'browser')}`,
+              }
+            : {}),
+        };
+      });
     case 'thread':
       return settled(() => threadState(link.reference, sources.gmail, lens));
     case 'event':

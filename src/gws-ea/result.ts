@@ -1,4 +1,5 @@
 import type { CapabilityList, VoiceCapabilityObservation } from './capabilities.js';
+import type { BrowserCapabilityObservation, BrowserOperationData } from './browser-capability.js';
 import {
   COMMAND_DEFINITIONS,
   findCommand,
@@ -64,6 +65,8 @@ export type CommandData =
   | VoiceOperationData
   | CapabilityList
   | VoiceCapabilityObservation
+  | BrowserCapabilityObservation
+  | BrowserOperationData
   | AssistantListing
   | AssistantStatus;
 export interface ManagedResult<T = CommandData> {
@@ -151,7 +154,9 @@ function redactArguments(argv: readonly string[], command: CommandDefinition, pl
 function redactCommandArgv(argv: readonly string[]): readonly string[] {
   const command =
     argv[0] === 'gws-ea'
-      ? COMMAND_DEFINITIONS.find((definition) => definition.path.every((part, index) => argv[index + 1] === part))
+      ? COMMAND_DEFINITIONS.filter((definition) =>
+          definition.path.every((part, index) => argv[index + 1] === part),
+        ).sort((left, right) => right.path.length - left.path.length)[0]
       : undefined;
   if (!command) return argv.map(redact);
   const offset = command.path.length + 1;

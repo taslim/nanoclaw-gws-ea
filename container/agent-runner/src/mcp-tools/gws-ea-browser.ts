@@ -1,0 +1,320 @@
+/** The sealed browser agent's native, mailbox-backed host requests. */
+import { requestTool } from '../action-request.js';
+import { registerTools } from './server.js';
+
+export const BROWSER_REQUEST_TIMEOUT_MS = 120_000;
+
+const REF_FIELDS = {
+  ref: { type: 'string', pattern: '^(?:f\\d+)?e\\d+$', description: 'The element ref from the latest observation.' },
+  generation: { type: 'integer', minimum: 1, description: 'The generation of that observation.' },
+} as const;
+const REF = {
+  type: 'object',
+  properties: REF_FIELDS,
+  required: ['ref', 'generation'],
+  additionalProperties: false,
+} as const;
+const PARAMETERS = {
+  type: 'object',
+  additionalProperties: { type: 'string' },
+  description: 'Values for the recipe’s named inputs; these are ordinary text, never secrets.',
+} as const;
+const DATE_TIME = {
+  type: 'string',
+  format: 'date-time',
+  description: 'An ISO date and time with a UTC offset.',
+} as const;
+const WINDOW = {
+  type: 'object',
+  properties: { start: DATE_TIME, end: DATE_TIME },
+  required: ['start', 'end'],
+  additionalProperties: false,
+} as const;
+const NO_REPEAT =
+  'After a timeout, check request_status before doing anything else; do not repeat this call because the first may still act.';
+
+function action(kind: string, properties: Record<string, object> = {}, required: readonly string[] = []) {
+  return {
+    type: 'object',
+    properties: { kind: { const: kind }, ...properties },
+    required: ['kind', ...required],
+    additionalProperties: false,
+  };
+}
+
+export const browser = requestTool({
+  name: 'browser',
+  description:
+    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use sign_in_code for sign-in. ' +
+    'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main. An unknown commit must be reconciled, never retried. ' +
+    NO_REPEAT,
+  properties: {
+    actions: {
+      type: 'array',
+      minItems: 1,
+      description: 'Actions run in order in this one request; later actions are not executed after a stop.',
+      items: {
+        oneOf: [
+          action(
+            'navigate',
+            { url: { type: 'string', format: 'uri', description: 'The public HTTP or HTTPS URL to open.' } },
+            ['url'],
+          ),
+          action('observe'),
+          action('screenshot'),
+          action('click', REF_FIELDS, ['ref', 'generation']),
+          action(
+            'type',
+            { ...REF_FIELDS, text: { type: 'string', description: 'Ordinary text to put in this field.' } },
+            ['ref', 'generation', 'text'],
+          ),
+          action('select', { ...REF_FIELDS, value: { type: 'string', description: 'The option value to choose.' } }, [
+            'ref',
+            'generation',
+            'value',
+          ]),
+          action(
+            'key',
+            {
+              ...REF_FIELDS,
+              key: {
+                type: 'string',
+                pattern:
+                  '^(?:(?:Shift\\+)?(?:Enter|Space|Tab|Escape|Backspace|Delete|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|Home|End|PageUp|PageDown)|(?:Control|Meta)\\+[aA])$',
+                description: 'One allowed navigation or editing key; copy, cut and paste shortcuts are refused.',
+              },
+            },
+            ['ref', 'generation', 'key'],
+          ),
+          action(
+            'scroll',
+            {
+              direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+              amount: { type: 'number', exclusiveMinimum: 0, description: 'Distance in pixels; 600 when omitted.' },
+            },
+            ['direction'],
+          ),
+          action('wait_for', {
+            text: { type: 'string', description: 'Visible text to wait for; without it, wait for document load.' },
+            timeout_ms: { type: 'integer', minimum: 1, description: 'Maximum wait within the remaining host budget.' },
+          }),
+          action(
+            'form_input',
+            {
+              fields: {
+                type: 'array',
+                minItems: 1,
+                items: {
+                  type: 'object',
+                  properties: { ...REF_FIELDS, value: { type: 'string' } },
+                  required: ['ref', 'generation', 'value'],
+                  additionalProperties: false,
+                },
+              },
+              submit: REF,
+            },
+            ['fields'],
+          ),
+          action(
+            'upload',
+            {
+              ...REF_FIELDS,
+              path: {
+                type: 'string',
+                description: 'A regular file in this errand’s own session inbox; the host stages its own copy.',
+              },
+            },
+            ['ref', 'generation', 'path'],
+          ),
+          action('download', REF_FIELDS, ['ref', 'generation']),
+        ],
+      },
+    },
+    budget_ms: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 100_000,
+      default: 90_000,
+      description: 'Host budget from acceptance, including queue wait; shorter than this tool’s 120-second timeout.',
+    },
+  },
+  required: ['actions'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const signInCode = requestTool({
+  name: 'sign_in_code',
+  description:
+    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or awaiting_code. Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity or origin mismatch. ' +
+    NO_REPEAT,
+  properties: {
+    from: {
+      type: 'string',
+      enum: ['assistant', 'principal'],
+      default: 'assistant',
+      description: 'Whose mailbox receives the sign-in message.',
+    },
+    target: REF,
+    send: REF,
+    submit: REF,
+  },
+  required: ['target', 'send'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const purchase = requestTool({
+  name: 'purchase',
+  description:
+    'Request a supported merchant commit under principal-approved authority, or read-only reconciliation of an unresolved attempt. The host reads all checkout facts and financial terms; your words never verify a purchase. Commit outcomes: awaiting_principal, not_a_purchase, unsupported_merchant, terms_unavailable or site_purchase_blocked. Later notices: placed, changed, checkout_lapsed, rejected, expired, withdrawn or outcome_unknown. Wait for the notice when awaiting_principal; use a fresh observation for changed or checkout_lapsed. For outcome_unknown use operation=reconcile with the attempt id and a page ref: confirmed_placed or confirmed_not_placed establishes the host-recorded result; inconclusive keeps purchases blocked and requires main’s informed principal decision. Never automatically retry an uncertain commit. ' +
+    NO_REPEAT,
+  properties: {
+    operation: {
+      type: 'string',
+      enum: ['commit', 'reconcile'],
+      default: 'commit',
+      description: 'commit requests authority; reconcile only reads supported evidence.',
+    },
+    target: REF,
+    attempt_id: { type: 'string', description: 'The unresolved attempt’s id; required only for reconcile.' },
+    delivery_window: {
+      ...WINDOW,
+      description:
+        'The principal’s explicitly allowed delivery window, when the errand specifies one. Only each bound’s calendar date counts.',
+    },
+    needed_by: { ...DATE_TIME, description: 'The principal’s latest acceptable delivery time, when specified.' },
+  },
+  required: ['target'],
+  additionalProperties: false,
+  oneOf: [
+    { properties: { operation: { const: 'commit' } }, not: { required: ['attempt_id'] } },
+    {
+      properties: { operation: { const: 'reconcile' } },
+      required: ['operation', 'attempt_id'],
+      not: { anyOf: [{ required: ['delivery_window'] }, { required: ['needed_by'] }] },
+    },
+  ],
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const saveRecipe = requestTool({
+  name: 'save_recipe',
+  description:
+    'Save a range of this errand’s recorded actions as a named recipe. Bind ordinary type/select values, a single-field form_input value, or a click target’s exact accessible name. Indices are global across this job’s requests, zero-based and inclusive. The host records locators and checkpoints; no executable code is accepted. Returns saved with the recipe id, name and parameters; use that id with run_recipe. ' +
+    NO_REPEAT,
+  properties: {
+    name: { type: 'string', description: 'A short task name for the path.' },
+    first_action: { type: 'integer', minimum: 0, description: 'First recorded action’s global job index, inclusive.' },
+    last_action: { type: 'integer', minimum: 0, description: 'Last recorded action’s global job index, inclusive.' },
+    parameters: {
+      type: 'array',
+      description: 'Named inputs and the recorded actions whose values they replace.',
+      items: {
+        type: 'object',
+        properties: { name: { type: 'string' }, action_index: { type: 'integer', minimum: 0 } },
+        required: ['name', 'action_index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['name', 'first_action', 'last_action', 'parameters'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const runRecipe = requestTool({
+  name: 'run_recipe',
+  description:
+    'Replay a host-recorded recipe with named ordinary inputs, checking the page between steps and stopping before any commit. Returns completed when every step finishes without a commit, reached_commit_point with its ref before a purchase, or checkpoint_failed with the failed step, expected and found state, and current observation. Use purchase at the commit point; repair a failed checkpoint with browser and save_recipe. ' +
+    NO_REPEAT,
+  properties: {
+    recipe_id: { type: 'string', description: 'A saved recipe id listed for this site.' },
+    parameters: PARAMETERS,
+  },
+  required: ['recipe_id', 'parameters'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const watch = requestTool({
+  name: 'watch',
+  description:
+    'Set a host watch using a read-only availability recipe and exact booking bounds. The host checks without model polling; all watches in this job may book only once, within bounds and after a successful calendar check. Financial commitments require the principal’s approval; requested terms are bounds, never merchant facts, and the host re-reads complete terms. Returns armed, awaiting_principal or refused. Wait after arming or approval; wakes report booked, outside_bounds, calendar_conflict, calendar_unavailable, expired, blocked or outcome_unknown. Report a conflict, unavailable calendar, block or uncertain result to main; never retry a possibly completed booking. ' +
+    NO_REPEAT,
+  properties: {
+    site: {
+      type: 'string',
+      format: 'uri',
+      description: 'The public site URL, matching the saved availability recipe.',
+    },
+    recipe_id: { type: 'string', description: 'The read-only availability recipe to check.' },
+    parameters: PARAMETERS,
+    venue: {
+      type: 'object',
+      properties: { id: { type: 'string' }, name: { type: 'string' } },
+      required: ['id', 'name'],
+      additionalProperties: false,
+    },
+    party_size: { type: 'integer', minimum: 1, description: 'The exact number of guests.' },
+    windows: {
+      type: 'array',
+      minItems: 1,
+      items: WINDOW,
+      description: 'Allowed booking windows with explicit UTC offsets.',
+    },
+    financial: {
+      type: 'object',
+      properties: {
+        currency: { type: 'string', pattern: '^[A-Z]{3}$', description: 'The approved currency.' },
+        max_total: {
+          type: 'string',
+          pattern: '^\\d+(?:\\.\\d{1,3})?$',
+          description: 'Maximum total exposure per reservation in major currency units, including all guests and fees.',
+        },
+        terms: {
+          type: 'string',
+          description:
+            'Requested limits on financial commitments, including fee triggers and cancellation deadlines; the host verifies actual merchant terms.',
+        },
+      },
+      required: ['currency', 'max_total', 'terms'],
+      additionalProperties: false,
+    },
+    until: { ...DATE_TIME, description: 'The deadline at which checking ends and the job is notified.' },
+  },
+  required: ['site', 'recipe_id', 'parameters', 'venue', 'party_size', 'windows', 'financial', 'until'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const listWatches = requestTool({
+  name: 'list_watches',
+  description:
+    'Read this job’s watches, their bounds and current states. Returns listed with the watches; inspect these before setting or cancelling a watch. After a timeout use request_status or repeat this read-only call; a repeat changes nothing.',
+  properties: {},
+  required: [],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const cancelWatch = requestTool({
+  name: 'cancel_watch',
+  description:
+    'Cancel one of this job’s watches and revoke its unused booking authority. Returns cancelled, already_ended or in_progress; an in-progress commit finishes and reports before cancellation completes. Wait for that report instead of starting another booking. ' +
+    NO_REPEAT,
+  properties: { watch_id: { type: 'string', description: 'The watch id returned by watch or list_watches.' } },
+  required: ['watch_id'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+registerTools([browser, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch], 'browser');

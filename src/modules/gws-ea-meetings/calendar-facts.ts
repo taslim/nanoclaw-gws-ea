@@ -42,7 +42,14 @@ import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
-import type { DetailedAttendee, DetailedEvent, EventTime, MeetingsCalendarApi } from './calendar-api.js';
+import {
+  createMeetingsCalendarApi,
+  type DetailedAttendee,
+  type DetailedEvent,
+  type EventTime,
+  type MeetingsCalendarApi,
+} from './calendar-api.js';
+import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { dayLabel, spanLabel } from './calendar-actions.js';
 import { addressesOf, instantOf, lineOf } from './fields.js';
 import {
@@ -125,6 +132,21 @@ export interface PeopleCounts {
 export interface CalendarFactsDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
+}
+
+export interface CalendarConflictResult extends Record<string, unknown> {
+  conflicts: Conflict[];
+  conflicts_not_listed: number;
+  message: string;
+}
+
+/** Native host callers share the same complete principal-calendar conflict read as the tool. */
+export function findPrincipalCalendarConflicts(
+  start: string,
+  end: string,
+  calendar: MeetingsCalendarApi = createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }),
+): Promise<CalendarConflictResult> {
+  return createCalendarFactTools({ calendar: () => calendar }).findConflicts({ start, end });
 }
 
 /** One copy of an event, on the calendar it was read from. */
@@ -215,7 +237,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
    * Every meeting that takes the principal's time over a candidate, by the
    * rule free time and booking read; the candidate's own copies never count.
    */
-  const findConflicts: ActionAnswer = async (content) => {
+  const findConflicts = async (content: Record<string, unknown>): Promise<CalendarConflictResult> => {
     const start = instantOf(content.start, 'start');
     const end = instantOf(content.end, 'end');
     if (end <= start) throw invalidArgs('end must come after start');

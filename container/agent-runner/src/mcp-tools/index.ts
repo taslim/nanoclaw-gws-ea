@@ -24,6 +24,8 @@ await loadToolModule('time', () => import('./time.js'));
 await import('./gws-ea-email.js');
 await import('./calendar-write.js');
 await import('./request-status.js');
+await import('./gws-ea-browser.js');
+await import('./gws-ea-browser-delegate.js');
 // Module barrel — loads registration modules, including the singular mailbox
 // slot. A module registering tools passes its own capability key.
 await import('../modules/index.js');

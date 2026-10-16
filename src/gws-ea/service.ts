@@ -37,6 +37,7 @@ import { assertInstanceId } from './registry.js';
 import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
+import { BROWSER_POLICY_FILE_ENV } from '../modules/gws-ea-browser/policy.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
@@ -304,6 +305,7 @@ export const INSTANCE_HOST_ENV_KEYS = [
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
   'ONECLI_URL',
+  BROWSER_POLICY_FILE_ENV,
 ] as const;
 
 type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
@@ -318,6 +320,7 @@ export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readon
     NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
     ONECLI_URL: config.onecli_app_url,
+    [BROWSER_POLICY_FILE_ENV]: path.join(config.instance_root, 'browser', 'policy.json'),
   };
 }
 

@@ -35,6 +35,7 @@ const ALL = [
   'time',
   'request-status',
   'gws-ea-email',
+  'browser-delegate',
   'google-calendar',
   'google-mail-read',
   'google-directory',
@@ -45,12 +46,30 @@ const ALL = [
 const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
-const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email_send', 'free_time', 'tell_main'];
+const EXTERNAL_EMAIL_TOOLS = [
+  'book',
+  'cancel_booking',
+  'change_booking',
+  'email_send',
+  'free_time',
+  'sign_in_reply',
+  'tell_main',
+];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
 const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats'];
+const BROWSER_TOOLS = [
+  'browser',
+  'cancel_watch',
+  'list_watches',
+  'purchase',
+  'run_recipe',
+  'save_recipe',
+  'sign_in_code',
+  'watch',
+];
 
 /** Every tool of the default-on keys. */
 const DEFAULT_ON_TOOLS = [
@@ -58,9 +77,13 @@ const DEFAULT_ON_TOOLS = [
   'add_reaction',
   'ask_user_question',
   'create_agent',
+  'cancel_job',
   'edit_message',
   'install_packages',
   'request_status',
+  'relay_code',
+  'reservation_guarantee',
+  'reservation_bounds',
   'send_card',
   'send_file',
   'send_message',
@@ -110,6 +133,12 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
+    ['browser', ['browser'], BROWSER_TOOLS],
+    [
+      'browser-delegate',
+      ['browser-delegate'],
+      ['cancel_job', 'relay_code', 'reservation_bounds', 'reservation_guarantee'],
+    ],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
     ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],

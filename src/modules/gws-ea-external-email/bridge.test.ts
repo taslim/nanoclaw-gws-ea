@@ -81,7 +81,7 @@ import { findSessionForAgent } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
-import { resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { resolveSystemSession, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
@@ -1377,9 +1377,12 @@ describe('the bridge', () => {
       );
     }
     const { session: noThread } = await resolveSession('ag-external', inbox, 'mail-not-a-thread', 'per-thread');
-    expect(refusal(await request(noThread, 'tell_main', { account: 'Hello.', wake: true }))).toMatch(
-      /not an email thread/u,
-    );
+    const { session: signIn } = await resolveSystemSession('ag-external', 'system:browser-sign-in:claim');
+    for (const caller of [noThread, signIn]) {
+      expect(refusal(await request(caller, 'tell_main', { account: 'Hello.', wake: true }))).toMatch(
+        /not an email thread/u,
+      );
+    }
 
     expect(await count('gws_ea_threads')).toBe(1);
     expect(await count('gws_ea_thread_addresses')).toBe(1);

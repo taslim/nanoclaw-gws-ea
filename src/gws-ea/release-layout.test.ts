@@ -8,7 +8,7 @@
  */
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, lstatSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -420,6 +420,12 @@ describe('snapshots', STAGING, () => {
 
   it('takes a copy that later writes never reach', async () => {
     const { layout, a } = await fencedForUpdate();
+    await mkdir(path.join(layout.root, 'browser', 'profile'), { recursive: true, mode: 0o700 });
+    await mkdir(path.join(layout.root, 'browser', 'staging'), { recursive: true, mode: 0o700 });
+    await writeFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'private browser cookies', {
+      mode: 0o600,
+    });
+    await writeFile(path.join(layout.root, 'browser', 'staging', 'download'), 'private download', { mode: 0o600 });
 
     const snapshot = await takeSnapshot(layout, UPDATE, a);
     await writeFile(path.join(layout.state, 'data', 'v2.db'), 'central v2');
@@ -431,6 +437,10 @@ describe('snapshots', STAGING, () => {
       statSync(path.join(layout.state, '.env')).mode & 0o777,
     );
     expect(statSync(snapshot).mode & 0o777).toBe(0o700);
+    await expect(lstat(path.join(snapshot, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'utf8')).toBe(
+      'private browser cookies',
+    );
   });
 
   it('takes no snapshot while a release is live', async () => {

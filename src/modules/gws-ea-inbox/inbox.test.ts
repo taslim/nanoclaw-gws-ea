@@ -61,6 +61,19 @@ vi.mock('../../session-manager.js', async () => {
   };
 });
 
+/** Gmail message ids listed here stand in for mail the parser cannot read. */
+const unparseable = new Set<string>();
+vi.mock('./mime.js', async () => {
+  const actual = await vi.importActual<typeof import('./mime.js')>('./mime.js');
+  return {
+    ...actual,
+    parseGmailMessage: vi.fn((...args: Parameters<typeof actual.parseGmailMessage>) => {
+      if (unparseable.has(args[0].id)) throw new Error('unreadable message');
+      return actual.parseGmailMessage(...args);
+    }),
+  };
+});
+
 import type { ChannelAdapter, ChannelSetup } from '../../channels/adapter.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import {
@@ -91,7 +104,13 @@ import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { requestWake } from '../../request-wake.js';
 import { registerInboundDelay, routeInbound } from '../../router.js';
-import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import {
+  resolveSystemSession,
+  resolveSession,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 // As in production, each group's capability list is stored, so a group holds only what it was stamped with.
@@ -146,6 +165,9 @@ import {
   type Inbox,
 } from './index.js';
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
+import { createSignInClaim, getSignInClaim, recoverSignInClaims } from './claims.js';
+import { registerInboxObserver } from './observers.js';
+import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
 import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
@@ -742,6 +764,7 @@ beforeEach(async () => {
   vi.mocked(requestWake).mockClear();
   poisoned.clear();
   poisonedPrefixes.clear();
+  unparseable.clear();
   chatSends = [];
   clockOffsetMs = 0;
 
@@ -807,7 +830,334 @@ afterEach(async () => {
 // The channel's two messaging groups
 // ---------------------------------------------------------------------------
 
+it('hands matching sign-in mail and HTML only to one isolated system session, once', async () => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'browser-claim',
+    jobId: 'browser-job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: { frame: 0, field: 'e1' },
+    at: new Date(now()),
+  });
+  const id = gmail.receive({
+    from: 'login@shop.example',
+    auth: 'dmarc-pass',
+    subject: 'Sign in 642981',
+    body: 'Your code is 642981',
+    extra: [{ name: 'Auto-Submitted', value: 'auto-generated' }],
+  });
+  const received = gmail.messages.get(id)!;
+  gmail.messages.set(id, {
+    ...received,
+    payload: {
+      ...received.payload,
+      parts: [
+        ...received.payload!.parts!,
+        {
+          mimeType: 'text/html',
+          body: { data: b64('<a href="https://shop.example/access?token=one-secret">Continue</a>') },
+        },
+      ],
+    },
+  });
+  await inbox.tick();
+  const sessions = await getSessionsByAgentGroup('ag-external');
+  expect(sessions).toHaveLength(1);
+  const session = sessions[0];
+  expect(session).toMatchObject({ thread_id: 'system:browser-sign-in:browser-claim', messaging_group_id: null });
+  const messages = rows(session);
+  expect(messages).toHaveLength(1);
+  expect(messages[0].row).toMatchObject({ channel_type: null, platform_id: null });
+  expect(messages[0].text).toContain('642981');
+  expect(messages[0].text).toContain('https://shop.example/access?token=one-secret');
+  expect(hostText(messages[0].text)).not.toContain('642981');
+  expect(hostText(messages[0].text)).not.toContain('one-secret');
+  expect(rows(main)).toEqual([]);
+  expect(await getDb().all('SELECT * FROM gws_ea_thread_messages')).toEqual([]);
+  expect(vi.mocked(requestWake).mock.calls.every(([woken]) => woken.id === session.id)).toBe(true);
+  await inbox.tick();
+  expect(rows(session)).toHaveLength(1);
+  expect(await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', id)).toEqual({
+    outcome: 'browser-sign-in',
+  });
+});
+
+it('refuses system sign-in sessions both typed email and ordinary automatic replies before Gmail', async () => {
+  const { session } = await resolveSystemSession('ag-external', 'system:browser-sign-in:claim');
+  const handler = getDeliveryAction('email_send')!;
+  await handler({ action: 'email_send', requestId: 'forbidden-sign-in-email', text: '642981' }, session);
+  const answers = rows(session).map((row) => row as unknown as { frame?: ResponseFrame });
+  expect(answers).toEqual([expect.objectContaining({ frame: expect.objectContaining({ ok: false }) })]);
+  await expect(
+    inbox.adapter.deliver!(INBOX_PLATFORM_ID, session.thread_id, { kind: 'chat', content: { text: '642981' } }),
+  ).rejects.toThrow('Outbound send refused by gws-ea-inbox:outside-email');
+  expect(gmail.sent).toEqual([]);
+  expect(rows(main)).toEqual([]);
+});
+
+it('retries a reserved Spam message after transient dispatch failure without leaking unrelated Spam', async () => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'spam-claim',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  const matching = gmail.receive({ from: 'login@shop.example', body: 'Code 642981', inHistory: false });
+  const other = gmail.receive({ from: SAM, body: 'Unrelated spam', inHistory: false });
+  for (const id of [matching, other]) gmail.messages.set(id, { ...gmail.messages.get(id)!, labelIds: ['SPAM'] });
+  poisonedPrefixes.add('browser-sign-in-');
+  await inbox.tick();
+  expect(await getDb().get('SELECT attempts FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', matching)).toEqual({
+    attempts: 1,
+  });
+  expect(rows(main)).toEqual([]);
+  poisonedPrefixes.clear();
+  await inbox.tick();
+  const [session] = await getSessionsByAgentGroup('ag-external');
+  expect(rows(session)).toHaveLength(1);
+  expect(rows(session)[0].text).toContain('642981');
+  expect(await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', matching)).toEqual({
+    outcome: 'browser-sign-in',
+  });
+  expect(await getDb().get('SELECT * FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', other)).toBeUndefined();
+  expect(await getDb().all('SELECT * FROM gws_ea_threads')).toEqual([]);
+});
+
+it.each(['expiry', 'recovery'] as const)('keeps failed reserved credentials isolated after %s', async (mode) => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'ended-claim',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  gmail.receive({
+    from: 'login@shop.example',
+    subject: 'Sign in 642981',
+    body: 'Private link https://shop.example/access?token=one-secret',
+  });
+  poisonedPrefixes.add('browser-sign-in-');
+  await inbox.tick();
+  poisonedPrefixes.clear();
+  clockOffsetMs += 181_000;
+  if (mode === 'recovery') await recoverSignInClaims(new Date(now()));
+  await inbox.tick();
+  expect(rows(main)).toEqual([]);
+  expect(await outsideMail()).toEqual([]);
+  expect(chatSends).toEqual([]);
+  expect(await getDb().all('SELECT * FROM gws_ea_threads')).toEqual([]);
+});
+
+it('exhausts sign-in dispatch retries quietly while ordinary principal mail progresses', async () => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'failed-claim',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  const id = gmail.receive({ from: 'login@shop.example', subject: 'Sign in 642981', body: 'Code 642981' });
+  gmail.receive({ from: 'pat@principal.example', body: 'Please process my ordinary email.' });
+  poisonedPrefixes.add('browser-sign-in-');
+  await inbox.tick();
+  expect(
+    principalMail()
+      .map((mail) => mail.text)
+      .join('\n'),
+  ).toContain('Please process my ordinary email.');
+  for (let attempt = 1; attempt < MAX_ROUTING_ATTEMPTS; attempt += 1) await inbox.tick();
+  expect(chatSends).toEqual([]);
+  expect(
+    rows(main)
+      .map((mail) => mail.text)
+      .join('\n'),
+  ).not.toContain('642981');
+  expect(await outsideMail()).toEqual([]);
+  expect(
+    await getDb().get('SELECT outcome, settled_at FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', id),
+  ).toMatchObject({ outcome: 'browser-sign-in', settled_at: expect.any(String) });
+});
+
+it('retries reserved dispatch within one second in the real loop without extra calendar refresh', async () => {
+  await browserSignInMigration.up(getDb());
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const calendarLists = vi.spyOn(calendar, 'list');
+  const running = inbox.run(controller.signal);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    await createSignInClaim({
+      id: 'retry-claim',
+      jobId: 'job',
+      source: 'assistant',
+      origin: 'https://shop.example',
+      binding: {},
+      at: new Date(now()),
+    });
+    gmail.receive({ from: 'login@shop.example', body: 'Code 642981' });
+    poisonedPrefixes.add('browser-sign-in-');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await outsideMail()).toEqual([]);
+    poisonedPrefixes.clear();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await outsideMail()).toHaveLength(1);
+    expect(calendarLists).toHaveBeenCalledTimes(1);
+  } finally {
+    controller.abort();
+    await running;
+    vi.useRealTimers();
+  }
+});
+
+it('keeps a principal-only message private when its domain matches a sign-in claim', async () => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'principal-domain',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://portal.principal.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  gmail.receive({ from: 'pat@principal.example', body: 'Private principal-only message.' });
+  await inbox.tick();
+  expect(await getSignInClaim('principal-domain')).toMatchObject({ gmail_message_id: null });
+  expect(await outsideMail()).toEqual([]);
+  expect(
+    principalMail()
+      .map((mail) => mail.text)
+      .join('\n'),
+  ).toContain('Private principal-only message.');
+});
+
+it('preserves a complete HTML magic-link target after a large email template', async () => {
+  await browserSignInMigration.up(getDb());
+  await createSignInClaim({
+    id: 'template-claim',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  const id = gmail.receive({ from: 'login@shop.example', body: 'Continue using the button.' });
+  const message = gmail.messages.get(id)!;
+  gmail.messages.set(id, {
+    ...message,
+    payload: {
+      ...message.payload,
+      parts: [
+        {
+          mimeType: 'text/html',
+          body: {
+            data: b64(
+              `<html><head><style>${'x'.repeat(15_000)}</style></head><body><a href="https://shop.example/access?token=complete-secret&amp;source=email">Continue securely</a></body></html>`,
+            ),
+          },
+        },
+      ],
+    },
+  });
+  await inbox.tick();
+  const mail = (await outsideMail())[0];
+  expect(mail.text).toContain('https://shop.example/access?token=complete-secret&source=email');
+  expect(mail.text).toContain('Continue securely');
+  expect(hostText(mail.text)).not.toContain('complete-secret');
+});
+
+it('stops fetching full messages once every pending sign-in has matched', async () => {
+  await browserSignInMigration.up(getDb());
+  await inbox.tick();
+  await createSignInClaim({
+    id: 'bounded-claim',
+    jobId: 'job',
+    source: 'assistant',
+    origin: 'https://shop.example',
+    binding: {},
+    at: new Date(now()),
+  });
+  const matching = gmail.receive({ from: 'login@shop.example', body: 'Code 642981', inHistory: false });
+  gmail.messages.set(matching, { ...gmail.messages.get(matching)!, labelIds: ['SPAM'] });
+  for (let i = 0; i < 20; i += 1) {
+    const id = gmail.receive({ from: SAM, body: `Unrelated Spam ${i}`, inHistory: false });
+    gmail.messages.set(id, { ...gmail.messages.get(id)!, labelIds: ['SPAM'] });
+  }
+  const fetched = vi.spyOn(gmail, 'getMessage');
+  await inbox.tick();
+  expect(fetched.mock.calls.map(([id]) => id)).toEqual([matching]);
+  expect((await getSessionsByAgentGroup('ag-external')).flatMap(rows)).toHaveLength(1);
+});
+
+it('wakes one inbox loop promptly, polls pending mail quickly, and retains the calendar cadence', async () => {
+  await browserSignInMigration.up(getDb());
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const calendarLists = vi.spyOn(calendar, 'list');
+  const searches = vi.spyOn(gmail, 'listMessages');
+  const running = inbox.run(controller.signal);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calendarLists).toHaveBeenCalledTimes(1);
+    await createSignInClaim({
+      id: 'fast-claim',
+      jobId: 'job',
+      source: 'assistant',
+      origin: 'https://shop.example',
+      binding: {},
+      at: new Date(now()),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(searches).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(searches).toHaveBeenCalledTimes(2);
+    expect(calendarLists).toHaveBeenCalledTimes(1);
+    const id = gmail.receive({ from: 'login@shop.example', body: 'Code 642981', inHistory: false });
+    gmail.messages.set(id, { ...gmail.messages.get(id)!, labelIds: ['SPAM'] });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect((await getSessionsByAgentGroup('ag-external')).flatMap(rows)).toHaveLength(1);
+    const count = searches.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(searches).toHaveBeenCalledTimes(count);
+    expect(calendarLists).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(38_000);
+    expect(calendarLists).toHaveBeenCalledTimes(2);
+  } finally {
+    controller.abort();
+    await running;
+    vi.useRealTimers();
+  }
+});
+
 describe('the email channel', () => {
+  it('observes notify mail without claiming or changing routing, even if an observer fails', async () => {
+    const seen: string[] = [];
+    const remove = registerInboxObserver(async (mail) => {
+      seen.push(mail.id);
+    });
+    const removeFailure = registerInboxObserver(async () => {
+      throw new Error('Observer unavailable');
+    });
+    try {
+      const id = gmail.receive({ from: SAM, auth: 'dmarc-pass', body: 'A table is available.' });
+      await inbox.tick();
+      expect(seen).toEqual([id]);
+      expect(await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', id)).not.toEqual(
+        { outcome: 'browser-sign-in' },
+      );
+      expect(await getSessionsByAgentGroup('ag-external')).toHaveLength(1);
+    } finally {
+      remove();
+      removeFailure();
+    }
+  });
   it("is the inbox, wired to external-email per thread, and the principal's conversation, wired to main alone", async () => {
     await ensureInbox('ag-external');
     await ensurePrincipalConversation('ag-main');
@@ -2789,6 +3139,20 @@ describe('polling', () => {
     expect(
       await getDb().get('SELECT SUM(count) AS count FROM gws_ea_inbox_sender_counts WHERE sender = ?', flood),
     ).toEqual({ count: MESSAGES_PER_SENDER_PER_HOUR + 1 });
+  });
+
+  it('retries then sets aside a message the parser cannot read, without blocking later mail', async () => {
+    const bad = gmail.receive({ from: 'Stranger <stranger@else.example>', subject: 'Unreadable' });
+    unparseable.add(bad);
+    gmail.receive({ from: 'other@else.example', subject: 'Readable' });
+    for (let i = 0; i < MAX_ROUTING_ATTEMPTS + 1; i += 1) await inbox.tick();
+
+    expect((await outsideMail()).map((row) => row.text).join('\n')).toContain('Readable');
+    expect(
+      await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', bad),
+    ).toMatchObject({ outcome: 'set-aside' });
+    expect(chatSends).toHaveLength(1);
+    expect(gmail.historyRequests.at(-1)?.startHistoryId).toBe(String(gmail.historyId));
   });
 
   it('sets aside a message that keeps failing, moves on, and tells the principal once', async () => {

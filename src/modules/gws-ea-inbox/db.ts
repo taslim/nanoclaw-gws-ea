@@ -68,20 +68,51 @@ export async function isSettled(gmailMessageId: string): Promise<boolean> {
 }
 
 /**
- * Known messages routing has not settled: each failed an attempt, or an
+ * Ordinary messages routing has not settled: each failed an attempt, or an
  * update left it to route again. Oldest first.
  */
 export async function unsettledMessages(): Promise<string[]> {
   const rows = await getDb().all<{ gmail_message_id: string }>(
     `SELECT gmail_message_id FROM gws_ea_inbox_messages
-      WHERE settled_at IS NULL ORDER BY first_seen_at, gmail_message_id`,
+      WHERE settled_at IS NULL AND (outcome IS NULL OR outcome <> ?)
+      ORDER BY first_seen_at, gmail_message_id`,
+    'browser-sign-in',
   );
   return rows.map((row) => row.gmail_message_id);
+}
+
+/** Persist ownership before dispatch, so claim expiry or restart cannot turn credentials into ordinary mail. */
+export async function reserveSignInMessage(gmailMessageId: string, at: string): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_inbox_messages (gmail_message_id, outcome, attempts, first_seen_at, settled_at)
+       VALUES (?, ?, 0, ?, NULL)
+       ON CONFLICT (gmail_message_id) DO UPDATE SET outcome = excluded.outcome`,
+    gmailMessageId,
+    'browser-sign-in',
+    at,
+  );
+}
+
+export async function reservedSignInMailIds(): Promise<string[]> {
+  const rows = await getDb().all<{ gmail_message_id: string }>(
+    'SELECT gmail_message_id FROM gws_ea_inbox_messages WHERE outcome = ? AND settled_at IS NULL ORDER BY first_seen_at, gmail_message_id',
+    'browser-sign-in',
+  );
+  return rows.map((row) => row.gmail_message_id);
+}
+
+export async function isReservedSignInMail(gmailMessageId: string): Promise<boolean> {
+  const row = await getDb().get<{ outcome: string | null }>(
+    'SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?',
+    gmailMessageId,
+  );
+  return row?.outcome === 'browser-sign-in';
 }
 
 /** Where routing left a message, as its settled record names it. */
 export type RouteOutcome =
   | 'own'
+  | 'browser-sign-in'
   | 'calendar-unreadable'
   | 'calendar-not-principal'
   | 'calendar-own-change'

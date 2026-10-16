@@ -59,6 +59,14 @@ const THREAD = {
   ],
 };
 
+it('searches Spam and the inbox only when the native caller asks for both', async () => {
+  const { api, requests } = stubGmail(() => ({ status: 200, body: { messages: [] } }));
+  await api.listMessages({ q: 'in:anywhere after:1792047600', maxResults: 100, includeSpamTrash: true });
+  expect(requests[0].url.searchParams.get('includeSpamTrash')).toBe('true');
+  await api.listMessages({ maxResults: 100 });
+  expect(requests[1].url.searchParams.has('includeSpamTrash')).toBe(false);
+});
+
 describe('the Gmail client reading a thread', () => {
   it("asks only for each message's headers: who, when, what about, and the ones a send is found by", async () => {
     const { api, requests } = stubGmail(() => ({ status: 200, body: THREAD }));

@@ -4,7 +4,18 @@ import {
   inspectVoiceConsumers,
   voiceCapabilityRecovery,
   voiceCapabilityNextActions,
+  browserCapabilityCatalog,
 } from './capabilities.js';
+import {
+  browserCapabilityLines,
+  browserCapabilityNextActions,
+  disableBrowserCapability,
+  enableBrowserCapability,
+  inspectBrowserCapability,
+  type BrowserCapabilityInspection,
+  type BrowserCapabilityObservation,
+  type BrowserOperationData,
+} from './browser-capability.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -220,6 +231,7 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
+  browserInspection?: BrowserCapabilityInspection;
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
@@ -2243,6 +2255,101 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   switch (handler.kind) {
     case 'capability': {
       const command = handler.command;
+      if (handler.name === 'browser') {
+        let changed: Changed = false;
+        let data: BrowserCapabilityObservation | BrowserOperationData | null = null;
+        const stop = observeInterruption(() => ({ changed, data }));
+        try {
+          const paths = runtime.paths ?? resolveControlPlanePaths();
+          const instanceId = targetInstance(options);
+          const dependencies = {
+            recordEffect: (effect: true | null) => {
+              changed = combineEffects(changed, effect);
+            },
+          };
+          let actions: readonly NextAction[] = [];
+          if (command === 'show' || command === 'check') {
+            data = await inspectBrowserCapability(paths, instanceId, {
+              ...runtime.browserInspection,
+              check: command === 'check',
+            });
+            actions = browserCapabilityNextActions(data);
+            const failed = command === 'check' && !data.ready;
+            if (!json) for (const line of [...browserCapabilityLines(data), ...nextActionLines(actions)]) output(line);
+            emitResult(
+              managedResult(invocation.definition.path.join(' '), {
+                outcome: failed ? 'failed' : 'succeeded',
+                changed,
+                data,
+                next_actions: actions,
+                ...(failed
+                  ? {
+                      error: new GwsEaError(
+                        'browser_check_failed',
+                        'Browser readiness was not established. Inspect the reported prerequisite and isolation facts.',
+                      ),
+                    }
+                  : {}),
+              }),
+            );
+            return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
+          }
+          if (command === 'enable') {
+            data = await enableBrowserCapability(paths, instanceId, dependencies);
+          } else if (command === 'disable') {
+            data = await disableBrowserCapability(paths, instanceId, dependencies);
+          } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
+          actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'browser', '--id', instanceId] }];
+          presenter.report({
+            outcome: 'ready',
+            headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
+            details: nextActionLines(actions),
+          });
+          emitResult(
+            managedResult(invocation.definition.path.join(' '), {
+              outcome: 'succeeded',
+              changed,
+              data,
+              next_actions: actions,
+            }),
+          );
+          return EXIT_CODES.ready;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Every browser operation retains its observed effects in the managed boundary.
+        } catch (cause) {
+          const error =
+            cause instanceof GwsEaError
+              ? cause
+              : new GwsEaError(
+                  'browser_operation_failed',
+                  'Browser operation failed. Inspect the instance policy and its owner-only permissions before retrying.',
+                  { cause },
+                );
+          const cancelled = error.code === 'cancelled';
+          const actions: readonly NextAction[] = [
+            {
+              kind: 'external',
+              instruction:
+                'Inspect the named assistant’s browser policy, permissions, runtime, and service state before retrying.',
+            },
+          ];
+          emitResult(
+            managedResult(invocation.definition.path.join(' '), {
+              outcome: cancelled ? 'cancelled' : isBusy(error) ? 'busy' : 'failed',
+              changed,
+              data,
+              error,
+              next_actions: actions,
+            }),
+          );
+          if (cancelled) {
+            presenter.report({ outcome: 'ready', headline: error.message, details: [] });
+            return EXIT_CODES.ready;
+          }
+          return reportStop(presenter, error, nextActionLines(actions));
+        } finally {
+          stop();
+        }
+      }
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
@@ -2271,10 +2378,15 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           case 'check': {
             const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
             actions = voiceCapabilityNextActions(capability, command === 'check');
-            data = command === 'list' ? { capabilities: [capability] } : capability;
+            const browser = command === 'list' ? await browserCapabilityCatalog(paths) : undefined;
+            data = command === 'list' && browser ? { capabilities: [capability, browser] } : capability;
             if (!json)
               for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
                 output(line);
+            if (!json && browser)
+              output(
+                `browser (assistant): ${browser.summary} Actions: ${browser.actions.join(', ')}. Assistants: ${browser.assistant_ids.join(', ') || 'none'}.`,
+              );
             break;
           }
           case 'install': {

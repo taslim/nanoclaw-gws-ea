@@ -36,9 +36,11 @@ import { syncCalendarList, type CalendarListApi, type CalendarNotice } from './c
 import {
   getInboxState,
   isSettled,
+  isReservedSignInMail,
   pruneSenderCounts,
   pruneSettledMessages,
   recordFailedAttempt,
+  reservedSignInMailIds,
   settleMessage,
   unsettledMessages,
   updateInboxState,
@@ -46,6 +48,7 @@ import {
 } from './db.js';
 import { GoogleApiError, type GmailApi, type GmailHistoryRecord } from './gmail-api.js';
 import { recordPollFailure, recordPollSuccess } from './health.js';
+import { hasPendingSignInMail, unmatchedSignInClaims } from './claims.js';
 import { parseGmailMessage, type ParsedMail } from './mime.js';
 import { noticeSetAside } from './notices.js';
 import { sendToOutside } from './outbound.js';
@@ -53,6 +56,7 @@ import { sendToPrincipal } from './principal-reply.js';
 import {
   loadRoutingContext,
   routeMail,
+  routeSignInMail,
   writeCalendarNote,
   writeHeldNote,
   type HeldMail,
@@ -108,6 +112,8 @@ export interface Inbox {
   readonly adapter: ChannelAdapter;
   /** One poll: the calendar list, then mail. Never throws. */
   tick(): Promise<void>;
+  /** One serialized Gmail loop, with prompt mail-only checks for waiting sign-ins. */
+  run(signal: AbortSignal): Promise<void>;
 }
 
 function reasonOf(error: unknown): string {
@@ -133,6 +139,8 @@ export function createInbox(deps: InboxDeps): Inbox {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let setup: ChannelSetup | undefined;
   let gmailAddress: string | undefined;
+  let wakeRevision = 0;
+  let wake: (() => void) | undefined;
 
   const runtime: InboxRuntime = {
     gmail: deps.gmail,
@@ -144,14 +152,24 @@ export function createInbox(deps: InboxDeps): Inbox {
     knownGmailAddress: () => gmailAddress,
     now,
     sleep,
+    wakeSignIn() {
+      wakeRevision += 1;
+      wake?.();
+    },
   };
 
   /**
    * Route messages in order; true when every one settled or was set aside.
    * `limited` counts each sender against the hourly limit.
    */
-  async function routeBatch(ids: readonly string[], context: RoutingContext, limited: boolean): Promise<boolean> {
+  async function routeBatch(
+    ids: readonly string[],
+    context: RoutingContext,
+    limited: boolean,
+    signInMode?: 'retry' | 'search',
+  ): Promise<boolean> {
     const at = context.at.toISOString();
+    const reserved = signInMode ? undefined : new Set(await reservedSignInMailIds());
     const held: { gmailMessageId: string; held: HeldMail }[] = [];
     const calendar: { gmailMessageId: string; notice: CalendarNotice }[] = [];
     const workspace: { gmailMessageId: string; notice: WorkspaceNotice }[] = [];
@@ -170,24 +188,36 @@ export function createInbox(deps: InboxDeps): Inbox {
         return 'retry';
       }
       log.error('An inbox message kept failing to route; set aside', { gmailMessageId, attempts, error });
-      await settleMessage(gmailMessageId, 'set-aside', at);
-      setAside.push(mail);
+      const signIn = await isReservedSignInMail(gmailMessageId);
+      await settleMessage(gmailMessageId, signIn ? 'browser-sign-in' : 'set-aside', at);
+      if (!signIn) setAside.push(mail);
       return 'set-aside';
     };
 
     for (const id of ids) {
+      if (reserved?.has(id)) continue;
       if (await isSettled(id)) continue;
       const message = await deps.gmail.getMessage(id, 'full');
       if (!message) {
         await settleMessage(id, 'gone', at);
         continue;
       }
-      const mail = parseGmailMessage(message);
-      if (!mail.labelIds.includes('INBOX')) {
-        await settleMessage(id, 'not-in-inbox', at);
-        continue;
-      }
+      let mail: ParsedMail | undefined;
       try {
+        // Parsing is part of routing: a message the parser cannot read is retried, then set aside.
+        mail = parseGmailMessage(message);
+        if (!signInMode && !mail.labelIds.includes('INBOX')) {
+          const claimed = await routeSignInMail(mail, context.at);
+          await settleMessage(id, claimed ? 'browser-sign-in' : 'not-in-inbox', at);
+          continue;
+        }
+        if (signInMode) {
+          if (await routeSignInMail(mail, context.at)) {
+            await settleMessage(id, 'browser-sign-in', at);
+            if (signInMode === 'search' && (await unmatchedSignInClaims(context.at)).length === 0) break;
+          } else if (signInMode === 'retry') await settleMessage(id, 'browser-sign-in', at);
+          continue;
+        }
         const routed = await routeMail(mail, runtime, context, { limited });
         if (routed.kind === 'held') held.push({ gmailMessageId: id, held: routed.held });
         else if (routed.kind === 'calendar') calendar.push({ gmailMessageId: id, notice: routed.notice });
@@ -274,29 +304,93 @@ export function createInbox(deps: InboxDeps): Inbox {
     if (await routeBatch(inboxAdditions(records), context, true)) await updateInboxState({ history_id: next });
   }
 
-  async function tick(): Promise<void> {
+  async function pollSignInMail(context: RoutingContext): Promise<void> {
+    const reserved = await reservedSignInMailIds();
+    if (reserved.length > 0) await routeBatch(reserved, context, false, 'retry');
+    const claims = await unmatchedSignInClaims(context.at);
+    if (claims.length === 0) return;
+    const refs = await deps.gmail.listMessages({
+      q: `in:anywhere after:${Math.floor(Date.parse(claims[0].since_at) / 1_000)}`,
+      includeSpamTrash: true,
+      maxResults: 500,
+    });
+    // Gmail lists newest first; reserve the earliest eligible message just as ordinary history does.
+    const retried = new Set(reserved);
+    await routeBatch(
+      refs
+        .map((ref) => ref.id)
+        .reverse()
+        .filter((id) => !retried.has(id)),
+      context,
+      false,
+      'search',
+    );
+  }
+
+  async function poll(mailOnly: boolean): Promise<void> {
     const at = now();
     /* eslint-disable no-catch-all/no-catch-all -- the poll loop never stops: each failure is recorded and the next poll retries */
     try {
       const { auth } = await loadRoutingContext(await assistantAddresses(), at);
-      await syncCalendarList(deps.calendar, auth.principalAddresses, at.toISOString());
+      if (!mailOnly) await syncCalendarList(deps.calendar, auth.principalAddresses, at.toISOString());
       try {
         // The assistant's own Gmail address is never "someone else" on a message.
         await runtime.gmailAddress();
         // Read after the sync, so a calendar added this minute already counts as the principal's.
-        await pollMail(await loadRoutingContext(await assistantAddresses(), at));
+        const context = await loadRoutingContext(await assistantAddresses(), at);
+        await pollSignInMail(context);
+        if (!mailOnly) await pollMail(context);
         await recordPollSuccess(at.toISOString());
       } catch (error) {
         log.warn('The inbox poll failed', { reason: reasonOf(error) });
         await recordPollFailure(reasonOf(error), at.toISOString());
         return;
       }
+      if (mailOnly) return;
       await pruneSettledMessages(new Date(at.getTime() - SETTLED_RETENTION_MS).toISOString());
       await pruneSenderCounts(new Date(at.getTime() - SENDER_COUNT_RETENTION_MS).toISOString());
     } catch (error) {
       log.error('The inbox poll could not finish', { reason: reasonOf(error) });
     }
     /* eslint-enable no-catch-all/no-catch-all */
+  }
+
+  let ticking = Promise.resolve();
+  const tick = (mailOnly = false): Promise<void> => {
+    const next = ticking.then(() => poll(mailOnly));
+    ticking = next;
+    return next;
+  };
+
+  async function run(signal: AbortSignal): Promise<void> {
+    let nextRegular = 0;
+    while (!signal.aborted) {
+      const regular = now().getTime() >= nextRegular;
+      if (regular) nextRegular = now().getTime() + 60_000;
+      await tick(!regular);
+      const revision = wakeRevision;
+      let pending = false;
+      /* eslint-disable no-catch-all/no-catch-all -- temporary claim-read failures must not stop ordinary inbox polling */
+      try {
+        pending = await hasPendingSignInMail(now());
+      } catch (_error) {
+        log.warn('The inbox could not read pending sign-in claims; retrying at its normal cadence.');
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+      const duration = Math.max(0, Math.min(nextRegular - now().getTime(), pending ? 1_000 : 60_000));
+      await new Promise<void>((resolve) => {
+        const done = (): void => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', done);
+          if (wake === done) wake = undefined;
+          resolve();
+        };
+        const timer = setTimeout(done, duration);
+        wake = done;
+        signal.addEventListener('abort', done, { once: true });
+        if (signal.aborted || wakeRevision !== revision) done();
+      });
+    }
   }
 
   const adapter: ChannelAdapter = {
@@ -319,5 +413,5 @@ export function createInbox(deps: InboxDeps): Inbox {
         : sendToOutside(runtime, platformId, threadId, message),
   };
 
-  return { adapter, tick };
+  return { adapter, tick, run };
 }

@@ -1,0 +1,142 @@
+import fs from 'node:fs';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+
+const ROOT = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(tmpdir(), 'browser-group-tests');
+});
+vi.mock('../../config.js', async (original) => ({
+  ...(await original<typeof import('../../config.js')>()),
+  GROUPS_DIR: `${ROOT}/groups`,
+  DATA_DIR: `${ROOT}/data`,
+  TEMPLATES_DIR: `${process.cwd()}/templates`,
+}));
+
+import { resolveCapabilities } from '../../capabilities.js';
+import { assertSessionAdmitted } from '../../container-runner.js';
+import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { getDb } from '../../db/connection.js';
+import { resolveSystemSession } from '../../session-manager.js';
+import '../gws-ea-profile/index.js';
+import './index.js';
+import './guidance.js';
+import { browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
+
+beforeEach(async () => {
+  setBrowserAdmissionReady(true);
+  fs.rmSync(ROOT, { recursive: true, force: true });
+  await runMigrations(await initTestDb());
+});
+afterEach(async () => {
+  setBrowserAdmissionReady(false);
+  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  await closeDb();
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+it('stamps the exact sealed composition once and refuses capability drift at admission', async () => {
+  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
+  const policy = `${ROOT}/browser/policy.json`;
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+    mode: 0o600,
+  });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const id = await ensureBrowserGroup();
+  expect(await ensureBrowserGroup()).toBe(id);
+  expect(await getBrowserAgentGroupId()).toBe(id);
+  expect(await getContainerConfig(id)).toMatchObject({
+    model: 'claude-sonnet-5-5',
+    cli_scope: 'disabled',
+    skills: '[]',
+    capabilities: JSON.stringify(['browser', 'reply', 'files-send', 'files-read', 'time', 'request-status']),
+  });
+  expect(await browserGroupDrift(id)).toEqual([]);
+  await updateContainerConfigJson(id, 'capabilities', [
+    'browser',
+    'reply',
+    'files-send',
+    'files-read',
+    'time',
+    'request-status',
+    'shell',
+  ]);
+  expect(await browserGroupDrift(id)).toEqual([expect.stringContaining('capabilities')]);
+  await expect(
+    assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: 'job' } }),
+  ).rejects.toThrow('browser may not start');
+  expect(resolveCapabilities('all', 'main')).toContain('browser-delegate');
+  expect(resolveCapabilities('all', 'main')).not.toContain('browser');
+});
+
+it('keeps active main guidance conditional so enablement changes need no container restart', async () => {
+  const main = { id: 'main', name: 'main', folder: 'main', agent_provider: null, created_at: new Date().toISOString() };
+  await createAgentGroup(main);
+  const { getDb } = await import('../../db/connection.js');
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', main.id);
+  const file = `${ROOT}/browser/policy.json`;
+  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+  const original = await getRequiredProjectDocSections(main);
+  const initialGuidance = original.find((section) => section.name === 'Browser delegation')?.body;
+  expect(initialGuidance).toContain('available destinations');
+  expect(initialGuidance).toContain('even if it was absent from your initial destination list');
+  expect(initialGuidance).toMatch(/operator.*enable/i);
+  expect(initialGuidance).toContain('thread: "new"');
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
+  const sections = await getRequiredProjectDocSections(main);
+  const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
+  expect(guidance).toBe(initialGuidance);
+  expect(guidance).toContain('thread: "new"');
+  expect(guidance).toContain('relay_code');
+  expect(guidance).toContain('cannot enter a password');
+  expect(guidance).toContain('outcome_unknown');
+  expect(guidance).toContain('password or token');
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+  expect(
+    (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,
+  ).toBe(initialGuidance);
+});
+
+it('admits only canonical main errand sessions to the sealed browser group', async () => {
+  await createAgentGroup({
+    id: 'main',
+    name: 'main',
+    folder: 'main',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
+  const policy = `${ROOT}/browser/policy.json`;
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+    mode: 0o600,
+  });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const id = await ensureBrowserGroup();
+  const own = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
+  await expect(
+    assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+  ).resolves.toBeUndefined();
+  setBrowserAdmissionReady(false);
+  for (const disposition of ['create', 'adopt'] as const)
+    await expect(
+      assertSessionAdmitted({ disposition, key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+    ).rejects.toThrow('host browser recovery is unavailable');
+  setBrowserAdmissionReady(true);
+  await expect(
+    assertSessionAdmitted({ disposition: 'adopt', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
+  ).resolves.toBeUndefined();
+  for (const thread of ['system:a2a:external:errand', 'system:task:scheduled', 'system:channel:chat']) {
+    const foreign = (await resolveSystemSession(id, thread)).session;
+    await expect(
+      assertSessionAdmitted({
+        disposition: 'create',
+        key: { installSlug: 'test', agentGroupId: id, sessionId: foreign.id },
+      }),
+    ).rejects.toThrow('main-owned errand');
+  }
+});

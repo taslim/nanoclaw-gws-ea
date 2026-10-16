@@ -119,7 +119,13 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
         `Unknown command ${JSON.stringify(path.join(' '))}.${path[0] === 'capabilities' ? ' Run gws-ea help capabilities for supported actions.' : ''}`,
       );
     definition = candidates.find((command) => command.path.length === path.length);
-    if (definition) break;
+    // A capability-specific native leaf owns its scope/options; existing voice leaves keep their grammar.
+    const next = own[index];
+    if (
+      definition &&
+      !candidates.some((command) => command.path.length > path.length && command.path[path.length] === next)
+    )
+      break;
   }
   const namespace = !definition ? findNamespace(path) : undefined;
   if (!definition) {
@@ -202,7 +208,16 @@ export function requestedCommandPath(args: readonly string[]): string {
       continue;
     }
     path.push(token);
-    if (findCommand(path)) break;
+    if (
+      findCommand(path) &&
+      !COMMAND_DEFINITIONS.some(
+        (command) =>
+          command.path.length > path.length &&
+          path.every((part, offset) => command.path[offset] === part) &&
+          command.path[path.length] === outer[index + 1],
+      )
+    )
+      break;
   }
   return path.join(' ');
 }

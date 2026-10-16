@@ -26,7 +26,6 @@
  * step with the principal's addresses, then polls each minute.
  */
 import fs from 'node:fs';
-import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
@@ -87,9 +86,6 @@ registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
 registerMigration(gwsEaInboxThreadAccountsMigration);
 registerMigration(gwsEaInboxThreadPlacementMigration);
-
-/** How often the inbox polls Gmail. */
-const POLL_INTERVAL_MS = 60_000;
 
 let live: Inbox | undefined;
 
@@ -251,12 +247,7 @@ onHostStart(async ({ signal }) => {
     return;
   }
   // Started, not awaited: host startup never waits on Gmail.
-  void (async () => {
-    while (!signal.aborted) {
-      await inbox.tick();
-      await delay(POLL_INTERVAL_MS, undefined, { signal }).catch(() => undefined);
-    }
-  })();
+  void inbox.run(signal);
 });
 
 export { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox, type InboxDeps } from './adapter.js';

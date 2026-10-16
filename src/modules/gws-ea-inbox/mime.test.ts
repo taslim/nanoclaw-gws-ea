@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest';
 import {
   buildMime,
   decodeEncodedWords,
+  htmlLinks,
+  htmlToText,
   parseAddressList,
   parseGmailMessage,
   splitQuoted,
@@ -55,6 +57,44 @@ describe('quoted text', () => {
     const split = splitQuoted('FYI\n---------- Forwarded message ---------\nFrom: x');
     expect(split.own).toBe('FYI');
     expect(split.quoted).toContain('Forwarded message');
+  });
+});
+
+describe('HTML links', () => {
+  it.each([
+    ['double quoted', '"https://portal.example/access?token=one&amp;next=two"'],
+    ['single quoted', "'https://portal.example/access?token=one&amp;next=two'"],
+    ['unquoted', 'https://portal.example/access?token=one&amp;next=two'],
+  ])('keeps the complete decoded target of a %s href beside its label', (_name, href) => {
+    expect(htmlLinks(`<a href=${href}><span>Continue &amp; confirm &#x1f600;</span></a>`)).toEqual([
+      { label: 'Continue & confirm 😀', href: 'https://portal.example/access?token=one&next=two' },
+    ]);
+  });
+
+  it('reads the href attribute rather than similarly named attributes or text in another attribute', () => {
+    expect(
+      htmlLinks(
+        '<a data-href="https://wrong.example/" title=" href=https://also-wrong.example/ >" HREF="https://right.example/?x=1&#38;y=2">Go</a>',
+      ),
+    ).toEqual([{ label: 'Go', href: 'https://right.example/?x=1&y=2' }]);
+  });
+
+  it('keeps numeric entities outside Unicode as written instead of failing the message', () => {
+    expect(htmlToText('<p>Code &#x110000; and &#99999999999999999999; &#x41;</p>')).toBe(
+      'Code &#x110000; and &#99999999999999999999; A',
+    );
+    expect(htmlLinks('<a href="https://portal.example/?x=&#x110000;">Go &#1114112;</a>')).toEqual([
+      { label: 'Go &#1114112;', href: 'https://portal.example/?x=&#x110000;' },
+    ]);
+  });
+
+  it('finds anchors after long template markup without changing ordinary readable text', () => {
+    const html =
+      `<head><style>${'.template { color: red; }'.repeat(600)}</style></head>` +
+      '<!-- <a href="https://comment.example/">Hidden</a> -->' +
+      '<a href="https://portal.example/access?token=complete">Continue</a>';
+    expect(htmlLinks(html)).toEqual([{ label: 'Continue', href: 'https://portal.example/access?token=complete' }]);
+    expect(htmlToText('<p>Continue <a href="https://portal.example/">here</a></p>')).toBe('Continue here');
   });
 });
 

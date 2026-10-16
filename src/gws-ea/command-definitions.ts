@@ -1,4 +1,5 @@
 import { VOICE_CAPABILITY } from './capabilities.js';
+import { BROWSER_CAPABILITY } from './browser-capability.js';
 import {
   managedResultSchema,
   operationDataSchema,
@@ -7,6 +8,8 @@ import {
   CAPABILITY_LIST_SCHEMA,
   VOICE_CAPABILITY_SCHEMA,
   VOICE_OPERATION_SCHEMA,
+  BROWSER_CAPABILITY_SCHEMA,
+  BROWSER_OPERATION_SCHEMA,
 } from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
@@ -28,6 +31,7 @@ export type CommandHandler =
   | {
       readonly kind: 'capability';
       readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
+      readonly name?: 'browser';
     }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
@@ -375,7 +379,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         handler: { kind: 'capability', command },
         summary:
           command === 'list'
-            ? 'List supported optional host capabilities and their installed and enabled state.'
+            ? 'List optional capabilities, their ownership, and observed state.'
             : command === 'show'
               ? 'Show voice scope, assets, compatibility, prerequisites, and readiness limits.'
               : 'Verify selected voice assets and observe managed consumers without changing state.',
@@ -483,6 +487,50 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
     };
   }),
+  ...BROWSER_CAPABILITY.actions.map(
+    (command): CommandDefinition => ({
+      path: ['capabilities', command, 'browser'],
+      group: 'Capabilities',
+      handler: { kind: 'capability', command, name: 'browser' },
+      scope: 'assistant',
+      summary:
+        command === 'show'
+          ? 'Show one assistant’s browser policy and prerequisites.'
+          : command === 'check'
+            ? 'Check Chrome and agent-network isolation without changing state.'
+            : command === 'enable'
+              ? 'Enable one assistant’s host browser with email code/link sign-in.'
+              : 'Disable one assistant’s browser.',
+      options: [id],
+      effects:
+        command === 'show' || command === 'check'
+          ? [
+              'Read-only observation; no policy writes, downloads, service changes, or host reconciliation.',
+              ...(command === 'check'
+                ? [
+                    'Runs a bounded temporary container on the assistant network using its existing release image; never pulls an image.',
+                  ]
+                : []),
+            ]
+          : command === 'enable'
+            ? ['Writes the enabled owner-only instance policy; host reconciliation activates the browser.']
+            : [
+                'Writes disabled policy; the host stops jobs and withdraws cards on reconciliation, including after restart.',
+              ],
+      prerequisites: [
+        'An explicitly named managed assistant with a readable runtime record.',
+        'Google Chrome at its absolute configured path on the host.',
+      ],
+      recovery: [
+        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
+      ],
+      examples: [`gws-ea capabilities ${command} browser --id <instance_id>`],
+      outputModes: managedModes,
+      resultSchema: managedResultSchema(
+        command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,
+      ),
+    }),
+  ),
   ...(['help', 'schema'] as const).map(
     (command): CommandDefinition => ({
       path: [command],

@@ -49,6 +49,21 @@ jobs:
           GWS_EA_FISH_TEST_BINARY: /usr/bin/fish
         run: pnpm exec vitest run
 
+      - name: Native browser fixtures
+        env:
+          GWS_EA_BROWSER_TEST_CHROME: /usr/bin/google-chrome
+        run: |
+          test -x "$GWS_EA_BROWSER_TEST_CHROME"
+          xvfb-run --auto-servernum pnpm exec vitest run \
+            src/modules/gws-ea-browser/authentication-submit.test.ts \
+            src/modules/gws-ea-browser/fill-native.test.ts \
+            src/modules/gws-ea-browser/purchase.test.ts \
+            src/modules/gws-ea-browser/recipes.test.ts \
+            src/modules/gws-ea-browser/resy-signature.test.ts \
+            src/modules/gws-ea-browser/signed-out.test.ts \
+            src/modules/gws-ea-browser/reservation-execution.test.ts \
+            src/modules/gws-ea-browser/files-native.test.ts
+
       - name: Container tests
         working-directory: container/agent-runner
         run: bun run test
