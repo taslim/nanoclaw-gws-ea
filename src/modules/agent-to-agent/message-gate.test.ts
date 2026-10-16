@@ -18,7 +18,8 @@ import {
 } from '../../db/sessions.js';
 import { requestApproval } from '../approvals/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { initSessionFolder } from '../../session-manager.js';
+import { initSessionFolder, withMailboxSession } from '../../session-manager.js';
+import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
 import type { PendingApproval, Session } from '../../types.js';
 
 vi.mock('../../container-runner.js', () => ({
@@ -232,6 +233,18 @@ describe('agent message policies', () => {
       A,
       B,
     );
+    setDeliveryAdapter({ deliver: async () => undefined });
+    await withMailboxSession(A, SA.id, (mailbox) =>
+      mailbox.writeDirect({
+        id: 'previous-report',
+        kind: 'chat',
+        channelType: 'agent',
+        platformId: B,
+        threadId: 'new',
+        content: JSON.stringify({ text: 'previous report' }),
+      }),
+    );
+    await deliverSessionMessages(SA);
     await setMessagePolicy(A, B, 'telegram:dana', now());
     const payload = {
       id: 'held-thread',
@@ -240,7 +253,22 @@ describe('agent message policies', () => {
       in_reply_to: null,
       thread_id: 'new',
     };
-    await routeAgentMessage(payload, SA);
+    await withMailboxSession(A, SA.id, (mailbox) =>
+      mailbox.writeDirect({
+        id: payload.id,
+        kind: 'chat',
+        channelType: 'agent',
+        platformId: B,
+        threadId: payload.thread_id,
+        content: payload.content,
+      }),
+    );
+    await deliverSessionMessages(SA);
+    await deliverSessionMessages(SA);
+    expect(requestApproval).toHaveBeenCalledTimes(1);
+    expect(await withMailboxSession(A, SA.id, (mailbox) => mailbox.getLatestDeliveredAgentReport(B))).toMatchObject({
+      content: JSON.stringify({ text: 'previous report' }),
+    });
     expect(vi.mocked(requestApproval).mock.calls[0][0].payload).toEqual(payload);
     const approval = await seedA2aHold('appr-thread', payload);
     const notify = vi.fn();
@@ -249,6 +277,12 @@ describe('agent message policies', () => {
     expect(threaded).toBeDefined();
     expect(readInbound(B, threaded.id)).toHaveLength(1);
     expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(await withMailboxSession(A, SA.id, (mailbox) => mailbox.getLatestDeliveredAgentReport(B))).toMatchObject({
+      content: payload.content,
+    });
+    await deliverSessionMessages(SA);
+    expect(requestApproval).toHaveBeenCalledTimes(1);
+    expect(readInbound(B, threaded.id)).toHaveLength(1);
   });
 
   it('applyA2aMessageGate delivers the held message to the target (valid grant)', async () => {
@@ -270,6 +304,18 @@ describe('agent message policies', () => {
   it('destination revoked between hold and approve → refused cleanly, requester told, nothing delivered', async () => {
     await setMessagePolicy(A, B, 'telegram:dana', now());
     const payload = { id: 'held-2', platform_id: B, content: JSON.stringify({ text: 'stale' }), in_reply_to: null };
+    setDeliveryAdapter({ deliver: async () => undefined });
+    await withMailboxSession(A, SA.id, (mailbox) =>
+      mailbox.writeDirect({
+        id: payload.id,
+        kind: 'chat',
+        channelType: 'agent',
+        platformId: B,
+        threadId: null,
+        content: payload.content,
+      }),
+    );
+    await deliverSessionMessages(SA);
     const approval = await seedA2aHold('appr-a2a-2', payload);
 
     await deleteDestination(A, 'b'); // revoke A→B while the card is pending
@@ -281,6 +327,7 @@ describe('agent message policies', () => {
 
     expect(readInbound(B, SB.id)).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith(expect.stringMatching(/not delivered.*no destination for/));
+    expect(await withMailboxSession(A, SA.id, (mailbox) => mailbox.getLatestDeliveredAgentReport(B))).toBeUndefined();
   });
 
   it('mismatched grant (held for another target) refuses the replay cleanly', async () => {

@@ -427,6 +427,10 @@ async function performAgentRoute(
   });
   const fresh = await getSession(targetSession.id);
   if (fresh) await requestWake(fresh, 'inbound-message');
+  // A held row is consumed without a receipt; only the actual route can complete it.
+  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.markDelivered(msg.id, a2aMsgId),
+  );
 }
 
 /**

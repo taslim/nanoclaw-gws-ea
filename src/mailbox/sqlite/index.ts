@@ -513,7 +513,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
         ...wrapSqliteOutbound(readableOutbound, writableOutbound),
         getLatestDeliveredAgentReport: (targetAgentGroupId) => {
           const delivered = inbound.prepare(
-            "SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'",
+            "SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered' AND platform_message_id IS NOT NULL",
           );
           const rows = readableOutbound()
             .prepare(

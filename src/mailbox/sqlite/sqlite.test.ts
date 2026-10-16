@@ -56,10 +56,12 @@ describe('SQLite mailbox canonical serialization', () => {
             content: JSON.stringify({ text: id }),
           });
         }
+        session.markDelivered('delivered', 'a2a-delivered');
         session.markDelivered('delivered', null);
         session.markDeliveryFailed('failed');
-        session.markDelivered('foreign', null);
-        session.markDelivered('non-chat', null);
+        session.markDelivered('failed', 'a2a-failed');
+        session.markDelivered('foreign', 'a2a-foreign');
+        session.markDelivered('non-chat', 'a2a-non-chat');
         expect(session.getLatestDeliveredAgentReport('main')).toMatchObject({ content: '{"text":"delivered"}' });
       });
     } finally {
