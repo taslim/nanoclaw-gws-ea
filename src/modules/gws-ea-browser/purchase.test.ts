@@ -41,7 +41,7 @@ import { BrowserQueue } from './queue.js';
 import { readMerchantPurchase, AMAZON_RETAIL } from './merchant-signatures.js';
 import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
-import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
+import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits, validatePurchaseRequest } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
 import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 import { setBrowserAdmissionReady } from './group.js';
@@ -140,6 +140,32 @@ async function grant(): Promise<SpendingAuthority> {
   if (!rows[0]) throw new Error('Authority missing');
   return rows[0];
 }
+
+it('accepts delivery bounds with UTC offsets, keeping window dates as written and the deadline in UTC', () => {
+  const target = { ref: 'e1', generation: 1 };
+  expect(
+    validatePurchaseRequest({
+      target,
+      delivery_window: { start: '2026-10-12T00:00:00-07:00', end: '2026-10-14T23:59:59-07:00' },
+      needed_by: '2026-10-14T17:00:00-07:00',
+    }),
+  ).toMatchObject({
+    delivery_window: { start: '2026-10-12', end: '2026-10-14' },
+    needed_by: '2026-10-15T00:00:00.000Z',
+  });
+  expect(validatePurchaseRequest({ target, needed_by: '2026-10-14' })).toMatchObject({ needed_by: '2026-10-14' });
+  expect(validatePurchaseRequest({ target, needed_by: '2026-10-14T17:00:00Z' })).toMatchObject({
+    needed_by: '2026-10-14T17:00:00.000Z',
+  });
+  for (const needed_by of ['2026-10-14T17:00:00', '2026-10-14T17:00-07:00', 'next friday'])
+    expect(() => validatePurchaseRequest({ target, needed_by })).toThrow('UTC offset');
+  expect(() =>
+    validatePurchaseRequest({
+      target,
+      delivery_window: { start: '2026-10-14T00:00:00Z', end: '2026-10-12T00:00:00Z' },
+    }),
+  ).toThrow('ordered');
+});
 
 describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', () => {
   beforeAll(async () => {

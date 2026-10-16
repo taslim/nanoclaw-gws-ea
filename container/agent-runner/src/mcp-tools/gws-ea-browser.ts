@@ -182,7 +182,8 @@ export const purchase = requestTool({
     attempt_id: { type: 'string', description: 'The unresolved attempt’s id; required only for reconcile.' },
     delivery_window: {
       ...WINDOW,
-      description: 'The principal’s explicitly allowed delivery window, when the errand specifies one.',
+      description:
+        'The principal’s explicitly allowed delivery window, when the errand specifies one. Only each bound’s calendar date counts.',
     },
     needed_by: { ...DATE_TIME, description: 'The principal’s latest acceptable delivery time, when specified.' },
   },

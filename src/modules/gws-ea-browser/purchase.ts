@@ -86,14 +86,20 @@ function stableId(prefix: string, value: string): string {
   return `${prefix}-${createHash('sha256').update(value).digest('hex')}`;
 }
 
+/** A calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
 function iso(value: unknown): string {
   if (
     typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z)?$/u.test(value) ||
+    !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2}))?$/u.test(value) ||
     !Number.isFinite(Date.parse(value))
   )
-    throw invalidArgs('Use an ISO date or UTC timestamp.');
-  return value;
+    throw invalidArgs('Use an ISO date, or a date and time with a UTC offset.');
+  return value.length === 10 ? value : new Date(value).toISOString();
+}
+/** Merchants quote delivery as calendar dates, so a window bound is the date it names in its own offset. */
+function calendarDate(value: unknown): string {
+  iso(value);
+  return (value as string).slice(0, 10);
 }
 export function validatePurchaseRequest(content: Record<string, unknown>): Record<string, unknown> {
   if (
@@ -133,7 +139,10 @@ export function validatePurchaseRequest(content: Record<string, unknown>): Recor
       Object.keys(content.delivery_window).some((key) => !['start', 'end'].includes(key))
     )
       throw invalidArgs('delivery_window needs start and end.');
-    deliveryWindow = { start: iso(content.delivery_window.start), end: iso(content.delivery_window.end) };
+    deliveryWindow = {
+      start: calendarDate(content.delivery_window.start),
+      end: calendarDate(content.delivery_window.end),
+    };
     if (deliveryWindow.start > deliveryWindow.end) throw invalidArgs('The delivery window must be ordered.');
   }
   const neededBy = content.needed_by === undefined ? undefined : iso(content.needed_by);
