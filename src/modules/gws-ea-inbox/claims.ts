@@ -1,5 +1,6 @@
 import { getDomain } from 'tldts';
 import { getDb } from '../../db/connection.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { activeInbox } from './runtime.js';
 import { dkimAlignedToSite } from './authentication.js';
 import { reserveSignInMessage } from './db.js';
@@ -71,6 +72,14 @@ export async function createSignInClaim(input: {
   return (await getSignInClaim(input.id))!;
 }
 
+/** A signup's verification claim names the account it created: it takes only mail addressed to that account. */
+function addressedTo(claim: SignInClaim, mail: ParsedMail): boolean {
+  const binding: unknown = JSON.parse(claim.binding_json);
+  if (!isRecord(binding) || typeof binding.username !== 'string') return true;
+  const account = binding.username.toLowerCase();
+  return [...mail.to, ...mail.cc].some((mailbox) => mailbox.address.toLowerCase() === account);
+}
+
 /** The inbox reserves the first verified fresh message, atomically. Replays return the same claim. */
 export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promise<SignInClaim | undefined> {
   const db = getDb();
@@ -82,7 +91,11 @@ export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promis
       at.toISOString(),
     );
     for (const claim of claims) {
-      if (mail.receivedAt!.getTime() < Date.parse(claim.since_at) || !dkimAlignedToSite(mail.headers, claim.domain))
+      if (
+        mail.receivedAt!.getTime() < Date.parse(claim.since_at) ||
+        !dkimAlignedToSite(mail.headers, claim.domain) ||
+        !addressedTo(claim, mail)
+      )
         continue;
       if (claim.gmail_message_id !== null) {
         if (claim.gmail_message_id === mail.id) return claim;

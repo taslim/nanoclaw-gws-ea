@@ -45,6 +45,7 @@ import {
   type OnePasswordHostPolicy,
   type OnePasswordVaultPermission,
 } from './onepassword-policy.js';
+import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import { browserVault, BrowserVaultError, onePasswordPolicyFile, type BrowserVault } from './onepassword.js';
 
 /** The provider operations sharing needs, each made as the host management service account. */
@@ -65,6 +66,8 @@ export interface VaultSharingProvider {
 export interface VaultAccessDependencies {
   /** The assistant's vault: its binding from local records, and the principal's explicit refresh. */
   readonly vault: Pick<BrowserVault, 'availability' | 'refresh'>;
+  /** Password changes that kept both credentials, reconciled on that refresh; defaults to the host's. */
+  readonly attempts?: Pick<CredentialAttempts, 'reconcileConflicts'>;
   /** Where the 1Password host policy is, located for every use. */
   readonly onePasswordPolicyFile: () => string | undefined;
   /** The provider through the CLI the host policy recorded; undefined when this host cannot share. */
@@ -270,15 +273,20 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
   return after.userIds.includes(user.userId) ? shared : handoff('unconfirmed');
 }
 
-/** AE6: list the vault again now, so a login the principal just added is usable. */
-async function refreshVault(vault: VaultAccessDependencies['vault']): Promise<Record<string, unknown>> {
+/**
+ * AE6: list the vault again now, so a login the principal just added is
+ * usable. A password change that kept both credentials is recorded once the
+ * principal's edit put the new password into the original login (KTD8).
+ */
+async function refreshVault(dependencies: VaultAccessDependencies): Promise<Record<string, unknown>> {
   try {
-    await vault.refresh();
-    return { status: 'usable' };
+    await dependencies.vault.refresh();
   } catch (error) {
     if (!(error instanceof BrowserVaultError)) throw error;
     return { status: error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable' };
   }
+  await (dependencies.attempts ?? credentialAttempts).reconcileConflicts();
+  return { status: 'usable' };
 }
 
 type Recipient = { readonly kind: 'principal' | 'other'; readonly email: string };
@@ -337,7 +345,7 @@ async function vaultAccessRequest(
     throw invalidArgs('vault_access takes only operation, and an email to share with.');
   if (content.operation === 'refresh') {
     if (content.email !== undefined) throw invalidArgs('Only share takes an email.');
-    return refreshVault(dependencies.vault);
+    return refreshVault(dependencies);
   }
   if (content.operation !== 'share') throw invalidArgs('operation must be share or refresh.');
   const to = await recipient(content.email);

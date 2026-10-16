@@ -29,6 +29,8 @@ export interface ControlFacts {
   type: string;
   href: string | null;
   transaction: boolean;
+  /** Prices, recurring charges, trials or billing anywhere on the page, read by the host. */
+  moneyTerms?: boolean;
 }
 export interface ReviewedMerchantFlow {
   readonly id: string;
@@ -155,12 +157,48 @@ const credentialSecurity =
 /** Inside the widened scope, any money route is refused, not merely the generic commit signatures. */
 const credentialFinancial =
   /\b(?:checkout|cart|basket|billing|payments?|orders?|subscriptions?|subscribe|trials?|donate|donations?|purchase|upgrade|plans?|pricing)\b/iu;
+const signupActivation =
+  'sign\\s*up(?:\\s+with\\s+email)?|create\\s+(?:(?:an|your|my|new)\\s+)?account|register|join(?:\\s+now)?|get\\s+started|continue(?:\\s+with\\s+email)?|next|submit|done|finish|save|create';
 const credentialActivation: Record<CredentialKind, RegExp> = {
-  signup:
-    /^(?:sign\s*up(?:\s+with\s+email)?|create\s+(?:(?:an|your|my|new)\s+)?account|register|join(?:\s+now)?|get\s+started|continue(?:\s+with\s+email)?|next|submit|done|finish|save|create)$/iu,
+  signup: new RegExp(`^(?:${signupActivation})$`, 'iu'),
   rotation:
     /^(?:(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password|save(?:\s+changes)?|submit|continue|next|done|confirm|update)$/iu,
 };
+/**
+ * A signup form's own submit control that accepts the site's terms as it
+ * creates the account ("Agree and create account", "Agree & Join"). Only the
+ * bound form's control may carry it, with no money terms on the page.
+ */
+const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(?:${signupActivation})$`, 'iu');
+/** The control that submits a signup's emailed verification code. */
+const verificationActivation =
+  /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
+const moneyTerms =
+  /(?:[$€£¥]\s?\d|\b\d+(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|dollars?|euros?|pounds?)\b|\bper\s+(?:month|year|week|day)\b|\/\s?(?:mo|month|yr|year)\b|\b(?:subscriptions?|free\s+trial|trial\s+period|billing|billed|recurring|auto-?renew\w*|membership\s+fees?)\b)/iu;
+
+/** The site terms a delegated signup accepts with the account, and what never rides along with them. */
+const siteTerms =
+  /\b(?:terms(?:\s+(?:of\s+(?:service|use)|(?:and|&)\s+conditions))?|user\s+agreement|privacy\s+(?:policy|notice|statement))\b/iu;
+const notSiteTerms =
+  /\b(?:marketing|newsletters?|news|offers?|promotions?|promotional|partners?|third[\s-]+part(?:y|ies)|shar(?:e|ing)|advertis\w*|sponsors?|surveys?|updates|e-?mails?|sms|texts?|pay(?:ment|ments|ing)?|billing|billed|charges?|fees?|prices?|pricing|purchases?|orders?|sales?|trials?|subscri\w*|renew\w*|recurring|memberships?|plans?|cards?|credit|refunds?)\b|[$€£¥]/iu;
+
+/**
+ * Whether a checkbox's label accepts only the site's terms of service, terms
+ * and conditions, user agreement or privacy policy, the terms a delegated
+ * signup accepts with the account. Marketing, data sharing and every money
+ * term keep their own authority.
+ */
+export function termsConsentLabel(label: string): boolean {
+  return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
+}
+
+/** Where a credential operation's control sits: the bound form's own control, or the step it submits. */
+export interface CredentialControlScope {
+  /** The control belongs to the bound form, or both stand outside any form. */
+  readonly formControl?: boolean;
+  /** `verification` submits a signup's emailed code; otherwise the operation's own fields. */
+  readonly step?: 'credentials' | 'verification';
+}
 
 function credentialSecurityClass(evidence: string, kind: CredentialKind): ActivationClass | undefined {
   const remaining = kind === 'rotation' ? evidence.replace(passwordChange, ' ') : evidence;
@@ -209,6 +247,7 @@ export function classifyCredentialControlFacts(
   facts: ControlFacts,
   kind: CredentialKind,
   site: string,
+  scope: CredentialControlScope = {},
 ): ActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
   const refused = credentialSecurityClass(evidence, kind);
@@ -219,10 +258,13 @@ export function classifyCredentialControlFacts(
     const destination = classifyCredentialNavigation(facts.formAction, kind, site);
     if (destination !== 'ordinary') return destination ?? 'unsupported_merchant';
   }
+  const fits = (name: string): boolean => {
+    if (scope.step === 'verification') return kind === 'signup' && verificationActivation.test(name);
+    if (credentialActivation[kind].test(name)) return true;
+    return kind === 'signup' && scope.formControl === true && !facts.moneyTerms && agreeingSignup.test(name);
+  };
   const names = [facts.name.trim(), facts.visibleLabel?.trim() ?? ''].filter(Boolean);
-  return names.length > 0 && names.every((name) => credentialActivation[kind].test(name))
-    ? 'ordinary'
-    : 'unsupported_merchant';
+  return names.length > 0 && names.every(fits) ? 'ordinary' : 'unsupported_merchant';
 }
 
 export async function classifyCredentialActivation(
@@ -230,8 +272,9 @@ export async function classifyCredentialActivation(
   element: ElementHandle,
   kind: CredentialKind,
   site: string,
+  scope: CredentialControlScope = {},
 ): Promise<ActivationClass> {
-  return classifyCredentialControlFacts(await readControlFacts(page, element), kind, site);
+  return classifyCredentialControlFacts(await readControlFacts(page, element), kind, site, scope);
 }
 
 export async function readControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
@@ -283,7 +326,12 @@ export async function readControlFacts(page: Page, element: ElementHandle): Prom
       text,
     );
   const frame = await element.ownerFrame();
-  return { ...facts, href: facts.href ? new URL(facts.href, frame?.url() ?? page.url()).href : null, transaction };
+  return {
+    ...facts,
+    href: facts.href ? new URL(facts.href, frame?.url() ?? page.url()).href : null,
+    transaction,
+    moneyTerms: moneyTerms.test(text),
+  };
 }
 
 export async function classifyActivation(page: Page, element: ElementHandle): Promise<ActivationClass> {

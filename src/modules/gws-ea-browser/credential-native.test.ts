@@ -18,21 +18,42 @@ vi.mock('@1password/sdk', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@1password/sdk')>()),
   createClient: sdk.create,
 }));
+const dataRoot = await vi.hoisted(async () => {
+  const { tmpdir: temporary } = await import('node:os');
+  const { join: joined } = await import('node:path');
+  return joined(temporary(), 'browser-credential-native-data');
+});
+vi.mock('../../config.js', async (original) => ({
+  ...(await original<typeof import('../../config.js')>()),
+  DATA_DIR: dataRoot,
+}));
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
 import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
+import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import '../gws-ea-profile/index.js';
+import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
+import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
+import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
+import { setActiveInbox, type InboxRuntime } from '../gws-ea-inbox/runtime.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { executeCredentialForm } from './credential-operations.js';
 import { executeBrowserBatch } from './executor.js';
-import './merchant-signatures.js';
+import './index.js';
 import { browserCredentialAttemptsMigration, browserSiteLeasesMigration } from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword, writeVaultFixture } from './onepassword-fixture.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './queue.js';
+import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
+
+registerMigration(gwsEaInboxMigration);
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const JOB = 'system:a2a:main:native-credential-job';
@@ -44,8 +65,10 @@ const field = (label: string, name: string, type: string, autocomplete: string):
 const signupFields = `${field('Email', 'email', 'email', 'email')}${field('Password', 'password', 'password', 'new-password')}${field('Confirm password', 'password_confirmation', 'password', 'new-password')}`;
 const nativeForm = (action: string, button = 'Create account', extra = ''): string =>
   `<h1>Join</h1><form method="post" action="${action}">${signupFields}${extra}<button type="submit">${button}</button></form><p>Password must be at least 12 characters.</p>`;
+const checkbox = (name: string, label: string, required: string): string =>
+  `<label><input type="checkbox" name="${name}"${required}> ${label}</label>`;
 /** A React-like controlled form: state changes only on input events whose value its own tracker has not seen. */
-const controlled = (submit: string): string => `<div id="result"></div><script>
+const controlled = (submit: string, endpoint = '/api/signup'): string => `<div id="result"></div><script>
   const state = {};
   const proto = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
   const go = document.getElementById('go');
@@ -62,7 +85,7 @@ const controlled = (submit: string): string => `<div id="result"></div><script>
       setTimeout(() => { go.disabled = !(state.email && state.password); go.setAttribute('aria-disabled', String(go.disabled)); }, 150);
     });
   }
-  const send = () => fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(state) })
+  const send = () => fetch('${endpoint}', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(state) })
     .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
   ${submit}
 </script>`;
@@ -95,6 +118,46 @@ const PAGES: Record<string, string> = {
   '/order-total': `${nativeForm('/signup')}<p>Order total $10.00 due today, charged to your Visa card ending 4242.</p>`,
   '/ambiguous': nativeForm('/signup', 'Go'),
   '/get-signup': nativeForm('/signup').replace('method="post"', 'method="get"'),
+  '/terms-signup': nativeForm(
+    '/signup',
+    'Create account',
+    `${checkbox('terms', 'I agree to the Terms of Service', ' required')}${checkbox('news', 'Send me news and special offers', '')}`,
+  ),
+  '/marketing-terms': nativeForm(
+    '/signup',
+    'Create account',
+    checkbox('consent', 'I agree to the Terms and to receive marketing emails', ' required'),
+  ),
+  '/paid-terms': nativeForm(
+    '/signup',
+    'Create account',
+    checkbox('member', 'I accept the membership terms and recurring billing', ' required'),
+  ),
+  '/optional-terms': nativeForm('/signup', 'Create account', checkbox('terms', 'I agree to the Terms of Service', '')),
+  '/js-terms': `<h1>Join</h1><form id="join">${signupFields}${checkbox('terms', 'I agree to the Terms of Service', ' aria-required="true"')}<button id="go" type="submit" disabled>Create account</button></form><div id="result"></div><script>
+    const state = {};
+    const go = document.getElementById('go');
+    const refresh = () => setTimeout(() => { go.disabled = !(state.email && state.password && state.terms); }, 100);
+    for (const input of document.querySelectorAll('input:not([type=checkbox])'))
+      input.addEventListener('input', () => { state[input.name] = input.value; refresh(); });
+    const terms = document.querySelector('[name=terms]');
+    terms.addEventListener('change', () => { state.terms = terms.checked; refresh(); });
+    document.getElementById('join').addEventListener('submit', (event) => {
+      event.preventDefault();
+      fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(state) })
+        .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+    });
+  </script>`,
+  '/agree-signup': nativeForm('/signup', 'Agree and create account'),
+  '/agree-money': `${nativeForm('/signup', 'Agree and create account')}<p>Premium is $9.99 per month after you join.</p>`,
+  '/agree-outside': `<h1>Join</h1><form method="post" action="/signup">${signupFields}</form><div role="button" tabindex="0" id="go">Agree and create account</div><script>
+    document.getElementById('go').addEventListener('click', () => document.querySelector('form').requestSubmit());
+  </script>`,
+  '/slow-js-signup': `<h1>Join</h1><form id="join">${signupFields}<button id="go" type="submit" disabled>Create account</button></form>${controlled(
+    "document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });",
+    '/api/slow-signup',
+  )}`,
+  '/verify-email': '<h1>Your email has been verified.</h1><p>Your account is ready.</p>',
 };
 
 describe.skipIf(!chromePath)('native authorized signup and password change', () => {
@@ -160,7 +223,9 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         });
         request.on('end', () => {
           posts.push({ host, path, body });
-          if (path === '/signup/email')
+          if (path.startsWith('/api/slow-'))
+            setTimeout(() => html(responses.get(path) ?? '<h1>Account created</h1>'), 3_000).unref();
+          else if (path === '/signup/email')
             html(
               `<h1>Choose a password</h1><form method="post" action="/signup/password">${field('Password', 'password', 'password', 'new-password')}${field('Confirm password', 'confirm', 'password', 'new-password')}<button type="submit">Create account</button></form>`,
             );
@@ -671,6 +736,234 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         stopped('unsupported_merchant'),
       );
       expect(posts).toEqual([]);
+    }, 30_000);
+  });
+
+  describe('accepting the site terms during signup', () => {
+    const TERMS = { ...SIGNUP, accept_terms: 'I agree to the Terms of Service' };
+    const anyChecked = async (): Promise<unknown> =>
+      page.evaluate("Array.from(document.querySelectorAll('input[type=checkbox]')).some((box) => box.checked)");
+
+    it('checks the required terms box of the bound form just before activation, and no other box', async () => {
+      const { result, password } = await signUp('/terms-signup', TERMS);
+      expect(result).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts).toEqual([
+        {
+          host: 'accounts.shop.example',
+          path: '/signup',
+          body: new URLSearchParams({
+            email: USERNAME,
+            password: password!,
+            password_confirmation: password!,
+            terms: 'on',
+          }).toString(),
+        },
+      ]);
+    }, 30_000);
+
+    it('checks it in a controlled JS form whose submit control waits for it', async () => {
+      const { result, password } = await signUp('/js-terms', TERMS);
+      expect(result).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts).toEqual([
+        {
+          host: 'accounts.shop.example',
+          path: '/api/signup',
+          body: JSON.stringify({ email: USERNAME, password, password_confirmation: password, terms: true }),
+        },
+      ]);
+    }, 30_000);
+
+    for (const [path, label] of [
+      ['/marketing-terms', 'I agree to the Terms and to receive marketing emails'],
+      ['/paid-terms', 'I accept the membership terms and recurring billing'],
+      ['/optional-terms', 'I agree to the Terms of Service'],
+      ['/terms-signup', 'Send me news and special offers'],
+    ] as const)
+      it(`refuses "${label}" on ${path} before anything is saved or disclosed`, async () => {
+        await page.goto(`${SITE}${path}`);
+        const authority = await signupAuthority();
+        expect(await fill(authority, await refs({ ...SIGNUP, accept_terms: label }))).toEqual({
+          status: 'refused',
+          reason: 'unsupported_terms',
+        });
+        expect(posts).toEqual([]);
+        expect(fake.calls).not.toContain('create');
+        expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
+        expect(await anyChecked()).toBe(false);
+      }, 30_000);
+
+    it("takes a signup form's own agree-and-create control as its activation", async () => {
+      const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });
+      expect(result).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts.map((post) => post.path)).toEqual(['/signup']);
+    }, 30_000);
+
+    for (const path of ['/agree-money', '/agree-outside'] as const)
+      it(`refuses the agree-and-create control on ${path} before disclosure`, async () => {
+        await page.goto(`${SITE}${path}`);
+        const authority = await signupAuthority();
+        expect(await fill(authority, await refs({ ...SIGNUP, activate: 'Agree and create account' }))).toEqual({
+          status: 'refused',
+          reason: 'unsupported_control',
+        });
+        expect(posts).toEqual([]);
+        expect(await attempts.get(authority.id)).toMatchObject({ exposed_at: null });
+      }, 30_000);
+  });
+
+  describe('recovering a cut-off disclosure', () => {
+    it('covers AE3: a crash in the first input callback leaves the same candidate unknown, and a retry after restart never submits', async () => {
+      let crashed = false;
+      await page.exposeFunction('credentialCallback', () => {
+        crashed = true;
+      });
+      await page.goto(`${SITE}/js-signup`);
+      const authority = await signupAuthority();
+      const crashing = {
+        ...context(),
+        assertActive: async () => {
+          if (crashed) throw new Error('The host stopped');
+        },
+      } as BrowserExecutionContext;
+      expect(
+        await executeCredentialForm(crashing, { authority: authority.id, ...(await refs(SIGNUP)) }, { attempts }),
+      ).toEqual({ status: 'outcome_unknown' });
+      const unknown = await attempts.get(authority.id);
+      expect(unknown).toMatchObject({ phase: 'unknown', exposed_at: expect.any(String) });
+      const password = await candidatePassword(authority.id);
+
+      // A fresh process knows only the durable record and 1Password.
+      const restarted = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      expect(
+        await executeCredentialForm(
+          context(),
+          { authority: authority.id, ...(await refs(SIGNUP)) },
+          { attempts: restarted },
+        ),
+      ).toEqual({ status: 'outcome_unknown' });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(posts).toEqual([]);
+      expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
+      expect(await attempts.get(authority.id)).toMatchObject({
+        phase: 'unknown',
+        candidate_item_id: unknown?.candidate_item_id,
+      });
+      expect(await candidatePassword(authority.id)).toBe(password);
+    }, 30_000);
+
+    for (const [response, expected, phase] of [
+      ['<h1>Account created</h1>', { status: 'account_created', vault: 'saved' }, 'finalized'],
+      ['<p>An account with this email already exists.</p>', { status: 'account_exists' }, 'rejected'],
+      ['<h1>Thanks!</h1>', { status: 'inconclusive' }, 'unknown'],
+    ] as const)
+      it(`reconciles a late response read-only to ${expected.status}`, async () => {
+        responses.set('/api/slow-signup', response);
+        remaining = 4_000;
+        const { authority, result } = await signUp('/slow-js-signup', SIGNUP);
+        expect(result).toEqual({ status: 'outcome_unknown' });
+        await page.locator('#result > *').waitFor();
+        remaining = 20_000;
+        const reconcile = () =>
+          executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts });
+        expect(await reconcile()).toEqual(expected);
+        expect(await attempts.get(authority.id)).toMatchObject({ phase });
+        expect(posts).toHaveLength(1);
+      }, 30_000);
+  });
+
+  describe('verifying a new account by email', () => {
+    let delivered = 0;
+    beforeEach(async () => {
+      await runMigrations(await initTestDb());
+      attempts = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      await createAgentGroup({
+        id: 'external-email',
+        name: 'external-email',
+        folder: 'external-email',
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      });
+      await getDb().run(
+        'UPDATE gws_ea_profile SET external_email_agent_group_id = ?, assistant_workspace_email = ? WHERE singleton = 1',
+        'external-email',
+        USERNAME,
+      );
+      setActiveInbox({
+        gmailAddress: async () => USERNAME,
+        knownGmailAddress: () => USERNAME,
+        wakeSignIn: () => undefined,
+      } as unknown as InboxRuntime);
+    });
+    afterEach(async () => {
+      await recoverBrowserSignInMail();
+      setActiveInbox(undefined);
+    });
+
+    /** The site's email reaches the assistant inbox, and the isolated interpreter answers its host task. */
+    async function deliver(reply: { kind: 'code' | 'link'; value: string }): Promise<void> {
+      delivered++;
+      const mail = parseGmailMessage({
+        id: `verification-${delivered}`,
+        threadId: `verification-${delivered}`,
+        labelIds: ['INBOX'],
+        internalDate: String(Date.now()),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'Authentication-Results', value: 'mx.google.com; dkim=pass header.d=shop.example' },
+            { name: 'From', value: 'accounts@shop.example' },
+            { name: 'To', value: USERNAME },
+            { name: 'Subject', value: 'Verify your email' },
+          ],
+          body: { data: Buffer.from(`Verify your email: ${reply.value}`).toString('base64url') },
+        },
+      });
+      expect(await routeSignInMail(mail, new Date())).toBe(true);
+      const [interpreter] = await getSessionsByAgentGroup('external-email');
+      expect(await answerSignInReply({ ...reply }, interpreter)).toEqual({ status: 'accepted' });
+    }
+    const verify = (authority: CredentialAttempt, fields: Record<string, BrowserRef> = {}) =>
+      executeCredentialForm(context(), { authority: authority.id, operation: 'verify', ...fields }, { attempts });
+
+    it('opens the bound verification link through the host, then saves the confirmed account', async () => {
+      responses.set('/signup', '<p>Check your email to verify your account.</p>');
+      const { authority, result } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'verification_requested' });
+      const token = 'verification-bearer-5519';
+      await deliver({ kind: 'link', value: `${SITE}/verify-email?token=${token}` });
+      const verified = await verify(authority);
+      expect(verified).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
+      expect(page.url()).toBe(`${SITE}/`);
+      expect(addresses).toContain(`accounts.shop.example/verify-email?token=${token}`);
+      for (const record of [verified, await attempts.get(authority.id), await observePage(page)])
+        expect(JSON.stringify(record)).not.toContain(token);
+    }, 30_000);
+
+    it('enters the bound verification code in the fields the browser names', async () => {
+      responses.set(
+        '/signup',
+        '<p>Check your email to verify your account.</p><form method="post" action="/verify-code"><label>Verification code <input name="code" autocomplete="one-time-code"></label><button type="submit">Verify</button></form>',
+      );
+      responses.set('/verify-code', '<h1>Your email has been verified.</h1>');
+      const { authority, result } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'verification_requested' });
+      await deliver({ kind: 'code', value: '482913' });
+      // A code needs its field: the answer waits for a step that names it.
+      expect(await verify(authority)).toEqual({ status: 'refused', reason: 'code_field_needed' });
+      const verified = await verify(authority, await refs({ code_field: 'Verification code', activate: 'Verify' }));
+      expect(verified).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts.at(-1)).toEqual({ host: 'accounts.shop.example', path: '/verify-code', body: 'code=482913' });
+      expect(JSON.stringify(verified)).not.toContain('482913');
+      expect(JSON.stringify(await observePage(page))).not.toContain('482913');
+    }, 30_000);
+
+    it('reports a signup the site already confirmed without waiting for mail', async () => {
+      const { authority } = await signUp('/native-signup', SIGNUP);
+      expect(await verify(authority)).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(await getSessionsByAgentGroup('external-email')).toEqual([]);
+      // The wait opened before activation closed with the site's own confirmation.
+      expect(await getDb().all('SELECT state FROM gws_ea_browser_sign_in_claims')).toEqual([{ state: 'finished' }]);
     }, 30_000);
   });
 });

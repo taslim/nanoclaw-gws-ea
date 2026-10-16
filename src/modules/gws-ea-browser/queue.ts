@@ -50,6 +50,12 @@ export interface BrowserQueuedAction {
   execute(context: BrowserExecutionContext, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   /** Host-only deferred callers receive every durable terminal outcome, including recovery and timeout. */
   deliverAnswer?(request: BrowserRequest, frame: ResponseFrame): Promise<void>;
+  /**
+   * The durable outcome of a request its worker cannot answer from its own
+   * result (a crash, interruption, timeout or failure), recorded before the
+   * answer. Undefined leaves the generic stop. Never a reason to run again.
+   */
+  recover?(request: BrowserRequest): Promise<Record<string, unknown> | undefined>;
   budgetMs?: number;
 }
 
@@ -285,8 +291,8 @@ export class BrowserQueue {
       if (!current || current.answered_at) return;
       if (this.running.has(request.id)) throw new Error('Browser request is already running');
       // A prior worker started this row but failed before recording its answer.
-      // Re-running it could repeat an action; only the durable marker determines uncertainty.
-      await this.finish(current, stopped(current.commit_started_at ? 'outcome_unknown' : 'interrupted', false));
+      // Re-running it could repeat an action; only durable records determine uncertainty.
+      await this.finish(current, await this.interruptedAnswer(current, false));
       await this.releaseJobLeases(current.job_id, current.id);
       return;
     }
@@ -321,6 +327,11 @@ export class BrowserQueue {
         return;
       }
       execution = action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>);
+      let answered = false;
+      const actionResult = execution.then((value) => {
+        answered = true;
+        return value;
+      });
       const aborted = new Promise<Record<string, unknown>>((resolve) =>
         controller.signal.addEventListener(
           'abort',
@@ -328,12 +339,16 @@ export class BrowserQueue {
           { once: true },
         ),
       );
-      const result = await Promise.race([execution, timeout, aborted]);
+      const result = await Promise.race([actionResult, timeout, aborted]);
       if (controller.signal.aborted) await this.runtime.closeJob(request.job_id);
       const latest = await this.store.request(request.id);
       await this.finish(
         started,
-        controller.signal.aborted && latest?.commit_started_at ? stopped('outcome_unknown', false) : result,
+        controller.signal.aborted && latest?.commit_started_at
+          ? stopped('outcome_unknown', false)
+          : answered
+            ? result
+            : ((await actions.get(request.action)?.recover?.(started)) ?? result),
       );
     } catch (error) {
       const latest = await this.store.request(request.id);
@@ -343,7 +358,7 @@ export class BrowserQueue {
           ? stopped('outcome_unknown', false)
           : error instanceof ActionRefusal
             ? error
-            : stopped('browser_unavailable', false),
+            : ((await actions.get(request.action)?.recover?.(started)) ?? stopped('browser_unavailable', false)),
       );
     } finally {
       if (timer) clearTimeout(timer);
@@ -355,6 +370,7 @@ export class BrowserQueue {
     }
   }
 
+  /** After each request: sites it no longer holds go to their waiters, and a cancellation waiting on it completes. */
   private async releaseJobLeases(jobId: string, eventId: string): Promise<void> {
     await this.wakeWaiters(await this.leases.releaseUnheldPurchases(jobId), `${eventId}:purchase-holds`);
     const leases = await this.store.db.all<{ site: string }>(
@@ -363,6 +379,18 @@ export class BrowserQueue {
     );
     for (const lease of leases)
       await this.wakeWaiters(await this.leases.release(jobId, lease.site), `${eventId}:${lease.site}`);
+    const { finishRequestedCancellation } = await import('./cancel.js');
+    await finishRequestedCancellation(jobId, this);
+  }
+
+  /**
+   * The answer for a request its worker can no longer answer from its own
+   * result: uncertain after a purchase commit marker, else the action's own
+   * recorded outcome, else interrupted.
+   */
+  async interruptedAnswer(request: BrowserRequest, repeatSafe: boolean): Promise<Record<string, unknown>> {
+    if (request.commit_started_at) return stopped('outcome_unknown', false);
+    return (await actions.get(request.action)?.recover?.(request)) ?? stopped('interrupted', repeatSafe);
   }
 
   async wakeWaiters(jobIds: readonly string[], eventId: string): Promise<void> {
@@ -445,13 +473,7 @@ export class BrowserQueue {
     for (const request of await this.store.pending(jobId)) {
       this.running.get(request.id)?.abort('interrupted');
       await this.runtime.closeJob(jobId).catch(() => undefined);
-      await this.finish(
-        request,
-        stopped(
-          request.commit_started_at ? 'outcome_unknown' : 'interrupted',
-          !request.commit_started_at && !request.started_at,
-        ),
-      );
+      await this.finish(request, await this.interruptedAnswer(request, !request.started_at));
     }
   }
 
@@ -461,7 +483,7 @@ export class BrowserQueue {
       const request = await this.store.request(id);
       if (!request) continue;
       await this.runtime.closeJob(request.job_id).catch(() => undefined);
-      await this.finish(request, stopped(request.commit_started_at ? 'outcome_unknown' : 'interrupted', false));
+      await this.finish(request, await this.interruptedAnswer(request, false));
     }
   }
 }

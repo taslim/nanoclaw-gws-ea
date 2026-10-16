@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -15,7 +15,14 @@ import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import { browserDelegateGuard, cancelBrowserJob, readBrowserJob, sweepBrowserJobSessions } from './cancel.js';
+import {
+  browserDelegateGuard,
+  cancelBrowserJob,
+  finishRequestedCancellation,
+  readBrowserJob,
+  sweepBrowserJobSessions,
+} from './cancel.js';
+import { BrowserQueue } from './queue.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
@@ -164,5 +171,99 @@ it('derives awaiting and watching state and cancels watches before a later tick 
   await cancelBrowserJob(job.id);
   expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'watch')).toEqual({
     status: 'cancelled',
+  });
+});
+
+describe('cancelling a job with credential attempts', () => {
+  const insert = async (id: string, jobId: string, phase: string, exposedAt: string | null): Promise<void> => {
+    const at = new Date().toISOString();
+    await getDb().run(
+      `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,phase,created_at,updated_at,exposed_at)
+       VALUES(?,'signup',?,'instance','account','vault','https://accounts.shop.example','shop.example',?,?,?,?,?)`,
+      id,
+      jobId,
+      `${id}@example.com`,
+      phase,
+      at,
+      at,
+      exposedAt,
+    );
+  };
+  const phases = async () =>
+    Object.fromEntries(
+      (
+        await getDb().all<{ id: string; phase: string }>(
+          'SELECT id, phase FROM gws_ea_browser_credential_attempts ORDER BY id',
+        )
+      ).map((row) => [row.id, row.phase]),
+    );
+  const closed: string[] = [];
+  const queue = () =>
+    new BrowserQueue(new BrowserStore(), {
+      pageForJob: async () => {
+        throw new Error('This test must not open a page');
+      },
+      connection: async () => {
+        throw new Error('This test must not launch Chrome');
+      },
+      closeJob: async (jobId: string) => {
+        closed.push(jobId);
+      },
+      onDisconnected: () => () => undefined,
+    });
+
+  it('abandons every attempt nothing was disclosed for, and cancels at once', async () => {
+    const job = (await readBrowserJob(session.thread_id!))!.job;
+    await insert('preparing', job.id, 'preparing', null);
+    await insert('saved', job.id, 'saved', null);
+    await insert('finished', job.id, 'finalized', new Date().toISOString());
+    expect(await cancelBrowserJob(job.thread_id)).toMatchObject({ status: 'cancelled' });
+    expect(await phases()).toEqual({ finished: 'finalized', preparing: 'rejected', saved: 'rejected' });
+  });
+
+  it.each(['exposed', 'awaiting_verification', 'unknown', 'confirmed'])(
+    'answers in_progress while a disclosed attempt is %s, keeps its site, and finishes once it settles',
+    async (phase) => {
+      const job = (await readBrowserJob(session.thread_id!))!.job;
+      await getDb().run(
+        "INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)",
+        job.id,
+        new Date().toISOString(),
+      );
+      await insert('disclosed', job.id, phase, new Date().toISOString());
+      await insert('unused', job.id, 'saved', null);
+      expect(await cancelBrowserJob(job.thread_id)).toMatchObject({ status: 'in_progress' });
+      expect(
+        await getDb().get('SELECT cancelled, cancel_requested FROM gws_ea_browser_jobs WHERE id = ?', job.id),
+      ).toEqual({ cancelled: 0, cancel_requested: 1 });
+      expect(await phases()).toEqual({ disclosed: phase, unused: 'rejected' });
+      expect(await readBrowserJob(job.thread_id)).toMatchObject({ state: 'working', held_sites: ['shop.example'] });
+      // Still held: nothing finishes the cancellation yet.
+      await finishRequestedCancellation(job.id, queue());
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
+        cancelled: 0,
+      });
+      await getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'rejected' WHERE id = 'disclosed'");
+      await finishRequestedCancellation(job.id, queue());
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
+        cancelled: 1,
+      });
+      expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toEqual([]);
+      expect(closed).toContain(job.id);
+      expect(await cancelBrowserJob(job.thread_id)).toMatchObject({ status: 'already_cancelled' });
+    },
+  );
+
+  it('never closes the session of a job whose credential attempt is unresolved', async () => {
+    const old = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    const job = (await readBrowserJob(session.thread_id!))!.job;
+    await insert('unresolved', job.id, 'unknown', old);
+    await getDb().run('UPDATE gws_ea_browser_jobs SET created_at = ?, updated_at = ? WHERE id = ?', old, old, job.id);
+    await getDb().run('UPDATE sessions SET created_at = ?, last_active = ? WHERE id = ?', old, old, session.id);
+    await sweepBrowserJobSessions(new Date().toISOString());
+    expect((await getSession(session.id))?.status).toBe('active');
+    await getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'rejected'");
+    await sweepBrowserJobSessions(new Date().toISOString());
+    expect((await getSession(session.id))?.status).toBe('closed');
   });
 });

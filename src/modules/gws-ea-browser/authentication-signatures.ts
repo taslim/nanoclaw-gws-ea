@@ -142,6 +142,27 @@ export function credentialFieldFits(
   return !current && (fresh || kind === 'signup' || currentBound);
 }
 
+const VERIFICATION_CODE =
+  /(?:^|[^a-z])(?:otp|one.?time|verif[a-z]*|confirm[a-z]*|activation|e-?mail.?code)(?:[^a-z]|$)|^(?:code|pin|token)$/iu;
+const NOT_VERIFICATION_CODE =
+  /(?:cc-|card|cvc|cvv|zip|postal|promo|coupon|discount|gift|referral|invite|voucher|security.?code|pass(?:word|wd))/iu;
+
+/**
+ * A field for the code a new account's verification email carries: a short
+ * text field marked as a one-time or verification code, never a payment,
+ * address, promotion or password field.
+ */
+export function verificationCodeFits(facts: CredentialFieldFacts): boolean {
+  const description = `${facts.name} ${facts.id}`;
+  return (
+    ['text', 'tel', 'number', ''].includes(facts.type) &&
+    !NOT_VERIFICATION_CODE.test(`${description} ${facts.autocomplete}`) &&
+    (facts.autocomplete.toLowerCase().split(/\s+/u).includes('one-time-code') ||
+      VERIFICATION_CODE.test(facts.name) ||
+      VERIFICATION_CODE.test(facts.id))
+  );
+}
+
 /** Endpoint signatures are host source, never model or site-authored prose. */
 export function authenticationEndpoint(url: URL): boolean {
   if (!httpsOrigin(url.href)) return false;

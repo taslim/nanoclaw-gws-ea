@@ -71,6 +71,8 @@ export interface NativeCredentialFacts {
   name: string;
   type: string;
   autocomplete: string;
+  /** The site marks the node required (`required` or `aria-required`), as read in the isolated world. */
+  required: boolean;
   override: { action: string; method: string; target: string } | null;
   form: { action: string; method: string; target: string; fields: NativeFieldFacts[] } | null;
 }
@@ -119,6 +121,7 @@ const readControlSource = `
       origin: location.origin,
       tag: node.tagName, id: node.id || '', name: typeof node.name === 'string' ? node.name : '',
       type: typeof node.type === 'string' ? node.type : '', autocomplete: node.getAttribute('autocomplete') || '',
+      required: node.required === true || node.getAttribute('aria-required') === 'true',
       override: overridden ? { action: node.formAction, method: node.formMethod, target: node.formTarget } : null,
       form: form ? {
         action: formProperty(form, 'action'), method: formProperty(form, 'method'), target: formProperty(form, 'target'),
@@ -260,35 +263,48 @@ export type CredentialActivationResult = 'activated' | 'disabled' | 'changed' | 
 export interface NativeCredentialGroup {
   readonly fields: readonly NativeCredentialBinding[];
   readonly control: NativeCredentialBinding;
+  /** A signup's required terms checkbox in the same form, checked just before activation. */
+  readonly terms?: NativeCredentialBinding;
 }
 
 /** Shared by the fill and the activation: the bound document, origin, nodes and facts, all unchanged. */
 const credentialGroupSource = `
   ${readControlSource}
   // A show-password toggle turns a password field into text and back, and a controlled form enables its
-  // controls as it fills: neither changes what the group binds.
+  // controls and marks them required as it fills: none of that changes what the group binds.
   const shape = (facts) => JSON.stringify(facts, (key, value) =>
-    key === 'readonly' || key === 'disabled' ? undefined : key === 'type' && value === 'text' ? 'password' : value);
+    key === 'readonly' || key === 'disabled' || key === 'required' ? undefined
+      : key === 'type' && value === 'text' ? 'password' : value);
   const same = (left, right) => shape(left) === shape(right);
   const valueOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-  const bound = (control, expectedControl, expectedFields, form, fields) =>
+  const checkedOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+  const bound = (control, expectedControl, expectedFields, form, fields, expectedTerms, terms) =>
     location.protocol === 'https:' && control.ownerDocument === document &&
     same(readCredentialNode(control), expectedControl) &&
     fields.length === expectedFields.length &&
     fields.every((field, index) => field instanceof HTMLInputElement && field.ownerDocument === document &&
       !field.matches(':disabled') && !field.readOnly && formFor(field) === form &&
-      same(readCredentialNode(field), expectedFields[index]));
+      same(readCredentialNode(field), expectedFields[index])) &&
+    (expectedTerms === null ? terms === null
+      : terms instanceof HTMLInputElement && terms.ownerDocument === document && terms.type === 'checkbox' &&
+        !terms.matches(':disabled') && formFor(terms) === form && same(readCredentialNode(terms), expectedTerms));
   const holds = (fields, values) => fields.every((field, index) => valueOf.get.call(field) === values[index]);`;
+const credentialParameters = 'expectedControl, expectedFields, values, expectedTerms, form, terms, ...fields';
 
-/** Resolved as `credentialNodes` orders them: the control, the shared form when there is one, then each field. */
+/** Resolved as `credentialNodes` orders them: the control, the shared form and terms box when there are any, then each field. */
 function credentialArguments(group: NativeCredentialGroup, values: readonly string[], objects: readonly string[]) {
   const formless = group.fields[0].formBackendNodeId === null;
+  let next = 1;
+  const form = formless ? { value: null } : { objectId: objects[next++] };
+  const terms = group.terms ? { objectId: objects[next++] } : { value: null };
   return [
     { value: group.control.facts },
     { value: group.fields.map((field) => field.facts) },
     { value: values },
-    formless ? { value: null } : { objectId: objects[1] },
-    ...objects.slice(formless ? 1 : 2).map((objectId) => ({ objectId })),
+    { value: group.terms?.facts ?? null },
+    form,
+    terms,
+    ...objects.slice(next).map((objectId) => ({ objectId })),
   ];
 }
 
@@ -296,7 +312,7 @@ function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
   const [first] = group.fields;
   if (
     !first ||
-    group.fields.some(
+    [...group.fields, ...(group.terms ? [group.terms] : [])].some(
       (field) =>
         field.frameId !== group.control.frameId ||
         field.loaderId !== group.control.loaderId ||
@@ -309,6 +325,7 @@ function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
   return [
     group.control.controlBackendNodeId,
     ...(first.formBackendNodeId === null ? [] : [first.formBackendNodeId]),
+    ...(group.terms ? [group.terms.controlBackendNodeId] : []),
     ...group.fields.map((field) => field.controlBackendNodeId),
   ];
 }
@@ -338,9 +355,10 @@ export async function fillNativeCredentialGroup(
         objectId: objects[0],
         returnByValue: true,
         arguments: credentialArguments(group, values, objects),
-        functionDeclaration: `function (expectedControl, expectedFields, values, form, ...fields) {
+        functionDeclaration: `function (${credentialParameters}) {
           ${credentialGroupSource}
-          if (!bound(this, expectedControl, expectedFields, form, fields)) return 'not_inserted';
+          const intact = () => bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms);
+          if (!intact()) return 'not_inserted';
           fields.forEach((field, index) => valueOf.set.call(field, values[index]));
           if (!holds(fields, values)) return 'changed';
           for (const field of fields) {
@@ -349,7 +367,7 @@ export async function fillNativeCredentialGroup(
             }));
             EventTarget.prototype.dispatchEvent.call(field, new Event('change', { bubbles: true }));
           }
-          return bound(this, expectedControl, expectedFields, form, fields) && holds(fields, values) ? 'filled' : 'changed';
+          return intact() && holds(fields, values) ? 'filled' : 'changed';
         }`,
       });
       const value: unknown = result.result.value;
@@ -364,11 +382,43 @@ export async function fillNativeCredentialGroup(
 }
 
 /**
+ * Checks a signup's bound terms box through its own click, once, when it is
+ * not already checked, so the site's handlers see the acceptance; then
+ * verifies the box holds it. Any other box is never touched.
+ */
+async function checkTermsBox(
+  session: CDPSession,
+  group: NativeCredentialGroup,
+  values: readonly string[],
+  objects: readonly string[],
+): Promise<boolean> {
+  try {
+    const result = await session.send('Runtime.callFunctionOn', {
+      objectId: objects[0],
+      returnByValue: true,
+      arguments: credentialArguments(group, values, objects),
+      functionDeclaration: `function (${credentialParameters}) {
+        ${credentialGroupSource}
+        if (!terms || !bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms) ||
+            !holds(fields, values)) return false;
+        if (!checkedOf.get.call(terms)) HTMLElement.prototype.click.call(terms);
+        return checkedOf.get.call(terms) === true;
+      }`,
+    });
+    return !result.exceptionDetails && result.result.value === true;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a credential value.
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
  * Activates the bound control exactly once, by its own node and through the
  * isolated world's click, after revalidating the group and that every field
- * still holds its value. A native form submits natively; a JS-controlled or
- * no-form control runs its own handlers. `uncertain` means the click may have
- * run; `disabled` and `changed` mean it did not.
+ * still holds its value; a bound terms box is checked just before, in its own
+ * call, so the site sees it first. A native form submits natively; a
+ * JS-controlled or no-form control runs its own handlers. `uncertain` means
+ * the click may have run; `disabled` and `changed` mean it did not.
  */
 export async function activateNativeCredentialControl(
   frame: Frame,
@@ -380,14 +430,17 @@ export async function activateNativeCredentialControl(
   if (!nodes || values.length !== group.fields.length) return 'changed';
   return withBoundNodes(frame, group.control, nodes, 'changed', async (session, objects) => {
     await assertActive();
+    if (group.terms && !(await checkTermsBox(session, group, values, objects))) return 'changed';
+    await assertActive();
     try {
       const result = await session.send('Runtime.callFunctionOn', {
         objectId: objects[0],
         returnByValue: true,
         arguments: credentialArguments(group, values, objects),
-        functionDeclaration: `function (expectedControl, expectedFields, values, form, ...fields) {
+        functionDeclaration: `function (${credentialParameters}) {
           ${credentialGroupSource}
-          if (!bound(this, expectedControl, expectedFields, form, fields) || !holds(fields, values)) return 'changed';
+          if (!bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms) || !holds(fields, values) ||
+              (terms && checkedOf.get.call(terms) !== true)) return 'changed';
           if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true') return 'disabled';
           // A native GET submission would carry the values in its address; one no page handler took over is cancelled.
           const address = (event) => {

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -21,9 +21,10 @@ import { forbidden } from '../../cli/delivery-action.js';
 import { guard } from '../../guard/index.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
+import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted, type BrowserJob } from './db.js';
 import { BrowserQueue, browserRequestGuard, registerBrowserQueuedAction } from './queue.js';
 import { setBrowserAdmissionReady } from './group.js';
+import { recoverCredentialRequest } from './credential-operations.js';
 
 let store: BrowserStore;
 let session: Session;
@@ -613,4 +614,132 @@ it('keeps a pending checkout exclusive while its owning job is executing', async
     release();
     await held;
   }
+});
+
+describe('an authorized credential operation cut off after disclosure', () => {
+  const AUTHORITY = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b';
+  const ref = (n: number) => ({ ref: `e${n}`, generation: 2 });
+  const form = { authority: AUTHORITY, username: ref(1), new_password: ref(2), activate: ref(3) };
+
+  async function attempt(job: BrowserJob, phase: string, exposedAt: string | null): Promise<void> {
+    const at = new Date(Date.now() - 60_000).toISOString();
+    await store.db.run(
+      `INSERT INTO gws_ea_browser_credential_attempts
+       (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,candidate_item_id,candidate_version,phase,save_started_at,created_at,updated_at,exposed_at)
+       VALUES(?,'signup',?,'instance','account','vault','https://accounts.shop.example','shop.example','morgan.ellery@example.com','candidate-1',1,?,?,?,?,?)`,
+      AUTHORITY,
+      job.id,
+      phase,
+      at,
+      at,
+      at,
+      exposedAt,
+    );
+  }
+  const read = () =>
+    store.db.get<{ phase: string; candidate_item_id: string; exposed_at: string }>(
+      'SELECT phase, candidate_item_id, exposed_at FROM gws_ea_browser_credential_attempts WHERE id = ?',
+      AUTHORITY,
+    );
+  const answer = (requestId: string) =>
+    (responses() as Array<{ requestId: string; frame: { data?: Record<string, unknown> } }>).find(
+      (response) => response.requestId === requestId,
+    )?.frame.data;
+  async function noPurchaseRecords(): Promise<void> {
+    for (const table of [
+      'gws_ea_browser_authorities',
+      'gws_ea_browser_purchase_attempts',
+      'gws_ea_browser_purchase_blocks',
+      'gws_ea_browser_pending_commits',
+    ])
+      expect(await store.db.all(`SELECT * FROM ${table}`)).toEqual([]);
+  }
+
+  it('covers AE3: answers it outcome_unknown on restart, keeps the same candidate and site held, and never submits again', async () => {
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Expected browser job');
+    await store.db.run(
+      "INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)",
+      job.id,
+      new Date().toISOString(),
+    );
+    await store.accept(job, session, 'credential-crash', 'credential_form', form, 90_000);
+    await store.start(browserRequestId(session.id, 'credential-crash'));
+    // The crash came during the first input callback: the attempt was recorded exposed, then nothing answered.
+    await attempt(job, 'exposed', new Date(Date.now() + 1_000).toISOString());
+
+    const queue = new BrowserQueue(store, runtime);
+    await queue.start();
+    expect(answer('credential-crash')).toMatchObject({ status: 'outcome_unknown' });
+    expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
+    await noPurchaseRecords();
+
+    // A retry, by the browser or after another restart, reports the recorded outcome without touching the page.
+    await queue.accept('credential_form', form, session, 'credential-retry');
+    await queue.idle();
+    expect(answer('credential-retry')).toEqual(expect.objectContaining({ status: 'outcome_unknown' }));
+    await queue.stop();
+    const restarted = new BrowserQueue(store, runtime);
+    await restarted.start();
+    expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
+    await noPurchaseRecords();
+
+    // The site stays held by this job; every other site is free for other errands.
+    const other = await store.jobForSession(
+      (await resolveSystemSession('browser-q', 'system:a2a:main-q:unrelated')).session,
+    );
+    if (!other) throw new Error('Expected another browser job');
+    expect(await restarted.leases.acquire(other.id, 'https://www.shop.example/')).toMatchObject({ acquired: false });
+    expect(await restarted.leases.acquire(other.id, 'https://news.example/')).toMatchObject({ acquired: true });
+    expect(await store.db.get("SELECT job_id FROM gws_ea_browser_site_leases WHERE site = 'shop.example'")).toEqual({
+      job_id: job.id,
+    });
+    await restarted.stop();
+  });
+
+  it('answers a timed-out operation outcome_unknown and leaves the attempt for reconciliation', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    registerBrowserQueuedAction('credential_timeout_fixture', {
+      validate: (content) => ({ authority: content.authority }),
+      async execute() {
+        await store.db.run(
+          "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
+          new Date().toISOString(),
+          AUTHORITY,
+        );
+        await held;
+        return { status: 'account_created', vault: 'saved' };
+      },
+      recover: recoverCredentialRequest,
+    });
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Expected browser job');
+    await attempt(job, 'saved', null);
+    const queue = new BrowserQueue(store, runtime);
+    await queue.start();
+    await queue.accept('credential_timeout_fixture', { authority: AUTHORITY, budget_ms: 50 }, session, 'timed-out');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(answer('timed-out')).toMatchObject({ status: 'outcome_unknown' });
+    expect(await read()).toMatchObject({ phase: 'unknown' });
+    release();
+    await queue.idle();
+    await noPurchaseRecords();
+    await queue.stop();
+  });
+
+  it('leaves an attempt another request disclosed, such as one awaiting email verification, as it was', async () => {
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Expected browser job');
+    await attempt(job, 'awaiting_verification', new Date(Date.now() - 30_000).toISOString());
+    await store.accept(job, session, 'later-step', 'credential_form', form, 90_000);
+    await store.start(browserRequestId(session.id, 'later-step'));
+    const queue = new BrowserQueue(store, runtime);
+    await queue.start();
+    expect(answer('later-step')).toMatchObject({ status: 'stopped', reason: 'interrupted' });
+    expect(await read()).toMatchObject({ phase: 'awaiting_verification' });
+    await queue.stop();
+  });
 });

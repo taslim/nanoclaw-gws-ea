@@ -7,6 +7,7 @@
  *
  *   preparing → saved → exposed → awaiting_verification → confirmed → finalized
  *   exposed | awaiting_verification → unknown → confirmed | rejected
+ *   unknown → awaiting_verification, when the site's late response asks for email verification
  *   awaiting_verification → rejected;  confirmed → conflict → finalized
  *   preparing | saved → rejected, when abandoned before any disclosure
  *
@@ -643,6 +644,11 @@ export class CredentialAttempts {
     return this.move(id, ['exposed'], 'awaiting_verification');
   }
 
+  /** Reconciliation read the site's late response to an unknown signup: it asks for email verification. */
+  markVerificationRequested(id: string, evidence: CredentialEvidence): Promise<CredentialAttempt> {
+    return this.move(id, ['unknown'], 'awaiting_verification', evidence);
+  }
+
   /** A crash, cancellation, timeout or inconclusive evidence: only reconciliation may resolve it. */
   markUnknown(id: string, evidence?: CredentialEvidence): Promise<CredentialAttempt> {
     return this.move(id, ['exposed', 'awaiting_verification'], 'unknown', evidence);
@@ -676,6 +682,49 @@ export class CredentialAttempts {
     const attempt = await this.move(id, ['preparing', 'saved'], 'rejected');
     await this.retire(attempt, assertActive);
     return attempt;
+  }
+
+  /**
+   * A cancelled job's half of `abandon`, DB-only so it joins the cancellation
+   * transaction: every attempt of the job that disclosed nothing ends.
+   * `retireCandidates` archives their candidates once that commits.
+   */
+  async abandonForJob(jobId: string): Promise<CredentialAttempt[]> {
+    const abandoned: CredentialAttempt[] = [];
+    for (const { id } of await this.db.all<{ id: string }>(
+      `SELECT id FROM ${TABLE} WHERE job_id = ? AND phase IN ('preparing','saved') ORDER BY created_at, id`,
+      jobId,
+    ))
+      try {
+        abandoned.push(await this.move(id, ['preparing', 'saved'], 'rejected'));
+      } catch (error) {
+        // Its disclosure won the race: it is settled through the job like any other disclosed attempt.
+        if (!(error instanceof CredentialAttemptError)) throw error;
+      }
+    return abandoned;
+  }
+
+  /** Archives abandoned attempts' unused candidates, outside any transaction; a failure leaves them hidden. */
+  async retireCandidates(abandoned: readonly CredentialAttempt[], assertActive = active): Promise<void> {
+    for (const attempt of abandoned) await this.retire(attempt, assertActive);
+  }
+
+  /**
+   * The explicit reconciliation of every conflict, run when main refreshes
+   * the vault after the principal's edits: each is re-read fresh and
+   * finalizes once its original Login holds the new password. A spent
+   * request budget or an unusable vault stops it; nothing is retried.
+   */
+  async reconcileConflicts(assertActive = active): Promise<{ readonly finalized: number }> {
+    let finalized = 0;
+    for (const { id } of await this.db.all<{ id: string }>(
+      `SELECT id FROM ${TABLE} WHERE phase = 'conflict' ORDER BY updated_at, id`,
+    )) {
+      const result = await this.finalize(id, assertActive);
+      if (result.status === 'finalized') finalized++;
+      if (result.status === 'rate_limited' || result.status === 'vault_unavailable') break;
+    }
+    return { finalized };
   }
 
   /**

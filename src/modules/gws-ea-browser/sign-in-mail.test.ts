@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Frame, Page } from 'playwright-core';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -34,7 +34,10 @@ import {
   type SignInReply,
   cleanupBrowserSignInMail,
   executeSignInCode,
+  finishSignupVerification,
+  openSignupVerification,
   recoverBrowserSignInMail,
+  takeSignupVerification,
   validateSignInCode,
 } from './sign-in-mail.js';
 import {
@@ -58,6 +61,7 @@ import { getSignInClaim } from '../gws-ea-inbox/claims.js';
 import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import '../gws-ea-profile/index.js';
+import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 
 registerMigration(gwsEaInboxMigration);
 registerSignInMailDelivery(() => {
@@ -112,7 +116,7 @@ afterEach(async () => {
 });
 function receive(
   body: string,
-  options: { spam?: boolean; signer?: string; subject?: string; html?: string } = {},
+  options: { spam?: boolean; signer?: string; subject?: string; html?: string; to?: string; from?: string } = {},
 ): void {
   const domain = options.signer ?? 'shop.example';
   messages.push({
@@ -124,7 +128,8 @@ function receive(
       mimeType: options.html === undefined ? 'text/plain' : 'multipart/alternative',
       headers: [
         { name: 'Authentication-Results', value: `mx.google.com; dkim=pass header.d=${domain}` },
-        { name: 'From', value: `login@${domain}` },
+        { name: 'From', value: options.from ?? `login@${domain}` },
+        ...(options.to === undefined ? [] : [{ name: 'To', value: options.to }]),
         ...(options.subject === undefined ? [] : [{ name: 'Subject', value: options.subject }]),
       ],
       ...(options.html === undefined
@@ -639,4 +644,80 @@ it('refuses a relay after cancellation cleanup instead of reusing its pinned fie
     ),
   ).toEqual({ status: 'no_wait' });
   expect(f.values).toEqual([]);
+});
+
+describe('a signup waiting for its email verification', () => {
+  const signup = {
+    jobId: 'job',
+    claimId: 'signup-request',
+    attemptId: 'attempt-1',
+    origin: 'https://www.shop.example',
+    username: 'assistant@example.com',
+  };
+  const context = (jobId = 'job', remaining = 200) =>
+    ({
+      job: { id: jobId },
+      signal: new AbortController().signal,
+      remaining: () => remaining,
+      assertActive: async () => undefined,
+    }) as unknown as BrowserExecutionContext;
+  /** Route everything received, then answer as the isolated interpreter of that claim's session, if it got the mail. */
+  async function interpretFor(claimId: string, reply: SignInReply): Promise<unknown> {
+    for (const message of messages) await routeSignInMail(parseGmailMessage(message), new Date());
+    const session = (await getSessionsByAgentGroup('external-email')).find(
+      (candidate) => candidate.thread_id === `system:browser-sign-in:${claimId}`,
+    );
+    return session ? answerSignInReply({ ...reply }, session) : undefined;
+  }
+
+  it('holds the interpreter answer for that signup alone until its verify step takes it, once', async () => {
+    expect(await openSignupVerification(signup)).toBe(true);
+    receive('Your verification code is 642981', { to: 'Assistant@example.com' });
+    expect(await interpretFor('signup-request', { kind: 'code', value: '642981' })).toEqual({ status: 'accepted' });
+    expect(await interpretFor('signup-request', { kind: 'code', value: '111111' })).toEqual({ status: 'no_wait' });
+    expect(await takeSignupVerification(context('another-job'), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+    expect(await takeSignupVerification(context(), 'attempt-2')).toEqual({ status: 'nothing_arrived' });
+    const taken = await takeSignupVerification(context(), 'attempt-1');
+    expect(taken).toMatchObject({ status: 'arrived', reply: { kind: 'code', value: '642981' } });
+    // Taking does not spend it: a step that cannot use it yet leaves it for the next.
+    expect(await takeSignupVerification(context(), 'attempt-1')).toMatchObject({ status: 'arrived' });
+    await finishSignupVerification('attempt-1');
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+    expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'finished' });
+  });
+
+  it('wakes a verify step already waiting when the answer arrives, and reports an unreadable email', async () => {
+    await openSignupVerification(signup);
+    const waiting = takeSignupVerification(context('job', 5_000), 'attempt-1');
+    receive('Welcome aboard!', { to: 'assistant@example.com' });
+    await interpretFor('signup-request', { kind: 'unavailable' });
+    expect(await waiting).toEqual({ status: 'unavailable' });
+  });
+
+  it('leaves principal mail, other senders and mail to another account to their ordinary routing', async () => {
+    await addPrincipalAddress('remy.vance@example.com');
+    await openSignupVerification(signup);
+    receive('Code 111111 from the principal', { to: 'assistant@example.com', from: 'remy.vance@example.com' });
+    receive('Code 222222 from elsewhere', { to: 'assistant@example.com', signer: 'other.example' });
+    receive('Code 333333 for someone else', { to: 'juno.hale@example.com' });
+    for (const message of messages) expect(await routeSignInMail(parseGmailMessage(message), new Date())).toBe(false);
+    expect(await getSessionsByAgentGroup('external-email')).toEqual([]);
+    expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'waiting', gmail_message_id: null });
+  });
+
+  it("opens no wait for an account outside the assistant's mailbox, or without an inbox", async () => {
+    expect(await openSignupVerification({ ...signup, username: 'morgan.ellery@elsewhere.example' })).toBe(false);
+    setActiveInbox(undefined);
+    expect(await openSignupVerification(signup)).toBe(false);
+    expect(await getSignInClaim('signup-request')).toBeUndefined();
+  });
+
+  it.each(['cancellation', 'restart'] as const)('drops a held answer on %s', async (mode) => {
+    await openSignupVerification(signup);
+    receive('Your verification code is 642981', { to: 'assistant@example.com' });
+    await interpretFor('signup-request', { kind: 'code', value: '642981' });
+    if (mode === 'cancellation') await cleanupBrowserSignInMail('job');
+    else await recoverBrowserSignInMail();
+    expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+  });
 });

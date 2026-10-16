@@ -6,6 +6,7 @@ import {
   activateControl,
   classifyControlFacts,
   classifyCredentialControlFacts,
+  termsConsentLabel,
   classifyCredentialNavigation,
   classifyNavigationUrl,
   registerReviewedMerchantFlow,
@@ -234,6 +235,87 @@ describe('the credential activation scope', () => {
       expect(
         classifyCredentialControlFacts(facts, facts.name.includes('password') ? 'rotation' : 'signup', 'shop.example'),
       ).toBe(reason);
+  });
+
+  it('takes a signup form’s own agree-and-create control as its activation, and refuses those words everywhere else', () => {
+    const agreeing = [
+      'Agree and create account',
+      'Accept and sign up',
+      'Agree & continue',
+      'I agree and continue',
+      'Agree & Join',
+    ];
+    for (const name of agreeing) {
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', { formControl: true })).toBe(
+        'ordinary',
+      );
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('unsupported_merchant');
+      expect(
+        classifyCredentialControlFacts(
+          control(name, { formAction: 'https://www.shop.example/account/change-password' }),
+          'rotation',
+          'shop.example',
+          { formControl: true },
+        ),
+      ).toBe('unsupported_merchant');
+      expect(classifyControlFacts(control(name))).toBe('unsupported_merchant');
+    }
+    const inForm = { formControl: true } as const;
+    expect(
+      classifyCredentialControlFacts(
+        control('Agree and create account', { moneyTerms: true }),
+        'signup',
+        'shop.example',
+        inForm,
+      ),
+    ).toBe('unsupported_merchant');
+    expect(classifyCredentialControlFacts(control('Agree and subscribe'), 'signup', 'shop.example', inForm)).toBe(
+      'purchase_control',
+    );
+    expect(
+      classifyCredentialControlFacts(control('Agree and start free trial'), 'signup', 'shop.example', inForm),
+    ).toBe('purchase_control');
+    expect(classifyCredentialControlFacts(control('Agree and pay'), 'signup', 'shop.example', inForm)).toBe(
+      'purchase_control',
+    );
+  });
+
+  it('accepts a checkbox named only for the site’s terms, never for marketing, data sharing or money', () => {
+    for (const label of [
+      'I agree to the Terms of Service',
+      'I accept the Terms and Conditions and the Privacy Policy',
+      'I have read and agree to the User Agreement',
+      'I agree to the Terms & Conditions',
+      'I agree to the terms of use',
+    ])
+      expect(termsConsentLabel(label)).toBe(true);
+    for (const label of [
+      'Send me marketing emails',
+      'I agree to the Terms of Service and to receive newsletters',
+      'I agree to the Terms and to special offers',
+      'Share my data with partners',
+      'I agree to the Privacy Policy and data sharing with third parties',
+      'I agree to the subscription terms',
+      'I agree to the Terms and authorize recurring billing',
+      'I accept the membership terms',
+      'I agree to the payment terms',
+      'I agree to the Terms of Service and the free trial',
+      'I agree to the Terms; my plan renews automatically at $10/month',
+      'Remember me',
+      'Keep me signed in',
+      '',
+    ])
+      expect(termsConsentLabel(label)).toBe(false);
+  });
+
+  it('activates a signup’s verification code only through a verification control', () => {
+    const verification = { step: 'verification' } as const;
+    for (const name of ['Verify', 'Verify email', 'Confirm', 'Submit code', 'Continue', 'Activate account'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).toBe('ordinary');
+    for (const name of ['Create account', 'Resend code', 'Change email', 'Subscribe'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).not.toBe(
+        'ordinary',
+      );
   });
 
   it('lets a change navigate only to its own site’s password routes, never to other security or financial routes', () => {

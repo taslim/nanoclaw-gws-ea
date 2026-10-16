@@ -641,6 +641,22 @@ describe("the principal's retry after adding a login (AE6)", () => {
     }
   });
 
+  it('records password changes that kept both credentials once the principal updated the original login', async () => {
+    const reconcileConflicts = vi.fn(async () => ({ finalized: 1 }));
+    registerVaultAccessDelivery({
+      vault,
+      onePasswordPolicyFile: () => onePasswordPolicyFile,
+      openProvider: async () => onePassword,
+      attempts: { reconcileConflicts },
+    });
+    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'usable' });
+    expect(reconcileConflicts).toHaveBeenCalledOnce();
+    const { RateLimitExceededError } = await import('@1password/sdk');
+    sdk.list.mockRejectedValueOnce(new RateLimitExceededError('limited'));
+    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'rate_limited' });
+    expect(reconcileConflicts).toHaveBeenCalledOnce();
+  });
+
   it('reports a spent request limit or an unusable vault, without secrets', async () => {
     const { RateLimitExceededError } = await import('@1password/sdk');
     sdk.list.mockRejectedValueOnce(new RateLimitExceededError('limited'));

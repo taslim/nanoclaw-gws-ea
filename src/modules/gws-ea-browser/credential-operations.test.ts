@@ -173,6 +173,35 @@ describe("main's credential authority", () => {
     ).toEqual([]);
   });
 
+  it('never records a second signup for an account whose first may have reached the site', async () => {
+    const first = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
+    expect(await attempts.save(first)).toMatchObject({ status: 'saved' });
+    await attempts.disclose(first, { jobId: job.thread_id!, origin: ORIGIN });
+    await attempts.markUnknown(first, { signal: 'interrupted' });
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
+    const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;
+    expect(
+      await credentialAuthorityRequest(
+        { thread: other.thread_id, operation: 'signup', site: `${ORIGIN}/join`, username: USERNAME },
+        main,
+        { attempts },
+      ),
+    ).toEqual({ status: 'busy' });
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).toMatchObject({
+      status: 'recorded',
+    });
+    await attempts.markRejected(first, { signal: 'reconciled' });
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toMatchObject({ status: 'recorded' });
+  });
+
+  it('records no new authority on a job whose cancellation is waiting for an unresolved change', async () => {
+    await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
+    await getDb().run('UPDATE gws_ea_browser_jobs SET cancel_requested = 1 WHERE id = ?', job.thread_id);
+    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+  });
+
   it('records a change on an unedited assistant-created Login, bound to that Login, and repeats safely', async () => {
     const itemId = await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
@@ -230,7 +259,36 @@ describe('the browser credential request', () => {
         activate: ref(4),
       }),
     ).toEqual({ authority, username: ref(1), new_password: ref(2), confirmation: ref(3), activate: ref(4) });
+    expect(validateCredentialForm({ authority, operation: 'reconcile' })).toEqual({
+      authority,
+      operation: 'reconcile',
+    });
+    expect(validateCredentialForm({ authority, operation: 'verify' })).toEqual({ authority, operation: 'verify' });
+    expect(validateCredentialForm({ authority, operation: 'verify', code_field: ref(5), activate: ref(6) })).toEqual({
+      authority,
+      operation: 'verify',
+      code_field: ref(5),
+      activate: ref(6),
+    });
+    expect(
+      validateCredentialForm({
+        authority,
+        username: ref(1),
+        new_password: ref(2),
+        accept_terms: ref(3),
+        activate: ref(4),
+      }),
+    ).toMatchObject({ accept_terms: ref(3) });
     for (const content of [
+      { authority, operation: 'reconcile', activate: ref(4) },
+      { authority, operation: 'reconcile', new_password: ref(2), activate: ref(4) },
+      { authority, operation: 'verify', code_field: ref(5) },
+      { authority, operation: 'verify', activate: ref(6) },
+      { authority, operation: 'verify', new_password: ref(2), activate: ref(4) },
+      { authority, operation: 'verify', accept_terms: ref(3) },
+      { authority, operation: 'retry', new_password: ref(2), activate: ref(4) },
+      { authority, new_password: ref(2), accept_terms: ref(2), activate: ref(4) },
+      { authority, new_password: ref(2), code_field: ref(5), activate: ref(4) },
       { authority, activate: ref(4) },
       { authority, new_password: ref(2) },
       { authority, confirmation: ref(3), activate: ref(4) },
@@ -318,5 +376,106 @@ describe('the browser credential request', () => {
     expect(await result).toEqual({ status: 'password_changed', vault: 'both_kept' });
     expect(page).not.toHaveBeenCalled();
     expect(await attempts.get(id)).toMatchObject({ phase: 'conflict', conflict_reason: 'promotion_disabled' });
+  });
+
+  it('never accepts a terms checkbox for a password change', async () => {
+    await assistantLogin();
+    const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
+    const { page, result } = run(String(recorded.authority), {
+      current_password: ref(1),
+      new_password: ref(2),
+      accept_terms: ref(3),
+    });
+    await expect(result).rejects.toMatchObject({ code: 'invalid-args' });
+    expect(page).not.toHaveBeenCalled();
+  });
+
+  describe('reconciliation', () => {
+    const reconcile = (authority: string, given = attempts) => {
+      const { context: execution, page } = context();
+      return {
+        page,
+        result: executeCredentialForm(execution, { authority, operation: 'reconcile' }, { attempts: given }),
+      };
+    };
+
+    /** A confirmed change that kept both credentials, as every change does while automatic promotion is off. */
+    async function keptBoth(): Promise<{ id: string; itemId: string }> {
+      const itemId = await assistantLogin();
+      const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
+      const id = String(recorded.authority);
+      await attempts.save(id);
+      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+      await attempts.markAwaitingVerification(id);
+      await attempts.markConfirmed(id, { signal: 'success_text' });
+      expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict', reason: 'promotion_disabled' });
+      return { id, itemId };
+    }
+
+    it('finalizes from conflict once the original Login holds the new password, and keeps both until then', async () => {
+      const { id, itemId } = await keptBoth();
+      const first = reconcile(id);
+      expect(await first.result).toEqual({ status: 'password_changed', vault: 'both_kept' });
+      expect(await attempts.get(id)).toMatchObject({ phase: 'conflict' });
+      const attempt = await attempts.get(id);
+      const next = fake.value(attempt!.candidate_item_id!, 'password')!;
+      fake.edit(itemId, (item) => ({
+        ...item,
+        fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: next } : field)),
+      }));
+      const second = reconcile(id);
+      expect(await second.result).toEqual({ status: 'password_changed', vault: 'updated' });
+      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+      for (const { page, result } of [first, second]) {
+        expect(page).not.toHaveBeenCalled();
+        expect(JSON.stringify(await result)).not.toContain(next);
+      }
+    });
+
+    it("finalizes a conflict when main refreshes the vault after the principal's edit", async () => {
+      const { id, itemId } = await keptBoth();
+      const attempt = await attempts.get(id);
+      const next = fake.value(attempt!.candidate_item_id!, 'password')!;
+      expect(await attempts.reconcileConflicts()).toEqual({ finalized: 0 });
+      fake.edit(itemId, (item) => ({
+        ...item,
+        fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: next } : field)),
+      }));
+      expect(await attempts.reconcileConflicts()).toEqual({ finalized: 1 });
+      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized' });
+    });
+
+    it('finalizes a confirmed attempt whose vault update was cut short', async () => {
+      const recorded = await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
+      const id = String(recorded.authority);
+      await attempts.save(id);
+      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+      await attempts.markAwaitingVerification(id);
+      await attempts.markConfirmed(id, { signal: 'success_text' });
+      const { page, result } = reconcile(id);
+      expect(await result).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(page).not.toHaveBeenCalled();
+    });
+
+    it('stays inconclusive from unknown without host evidence, never deciding from the page alone after a restart', async () => {
+      const recorded = await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
+      const id = String(recorded.authority);
+      await attempts.save(id);
+      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+      await attempts.markUnknown(id, { signal: 'interrupted' });
+      const restarted = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      const { page, result } = reconcile(id, restarted);
+      expect(await result).toEqual({ status: 'inconclusive' });
+      expect(page).not.toHaveBeenCalled();
+      expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+      expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
+    });
+
+    it('reports an attempt nothing was disclosed for as having nothing to reconcile', async () => {
+      const recorded = await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
+      const { page, result } = reconcile(String(recorded.authority));
+      expect(await result).toEqual({ status: 'refused', reason: 'not_disclosed' });
+      expect(page).not.toHaveBeenCalled();
+    });
   });
 });

@@ -810,8 +810,8 @@ export async function routeSignInMail(mail: ParsedMail, at: Date): Promise<boole
     if (Array.from(htmlSection).length <= htmlRemaining) htmlSections.push(htmlSection);
   }
   const text =
-    `Host sign-in task for ${claim.origin}. Interpret only the requested sign-in credential in the email below. ` +
-    'Return one code or one sign-in HTTPS link with sign_in_reply; use unavailable if it is absent or ambiguous. ' +
+    `Host sign-in task for ${claim.origin}. Interpret only the requested sign-in or new-account email-verification credential in the email below. ` +
+    'Return one code or one sign-in or verification HTTPS link with sign_in_reply; use unavailable if it is absent or ambiguous. ' +
     'Do not follow links, send email, use calendar tools or tell_main. Security warnings and account lock/reset/revoke links are not sign-in links. ' +
     'After sign_in_reply, end silently with <internal>Sign-in interpretation complete.</internal>.\n' +
     untrustedLine(`Subject: ${mail.subject}`, LINE_LIMIT) +

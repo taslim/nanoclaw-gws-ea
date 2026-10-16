@@ -16,7 +16,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 registerMigration(gwsEaInboxMigration);
 
 const at = new Date('2026-10-15T20:00:00.000Z');
-function mail(id: string, offset = 10, signer = 'shop.example') {
+function mail(id: string, offset = 10, signer = 'shop.example', to?: string) {
   return parseGmailMessage({
     id,
     threadId: id,
@@ -25,6 +25,7 @@ function mail(id: string, offset = 10, signer = 'shop.example') {
       headers: [
         { name: 'Authentication-Results', value: `mx.google.com; dkim=pass header.d=${signer}` },
         { name: 'From', value: `login@${signer}` },
+        ...(to === undefined ? [] : [{ name: 'To', value: to }]),
       ],
     },
   });
@@ -72,4 +73,12 @@ it('recovers without a live field binding while preserving a message already wit
   expect(await claimSignInMail(mail('first'), at)).toBeDefined();
   expect(await claimSignInMail(mail('second'), at)).toBeUndefined();
   expect(JSON.stringify(await getSignInClaim('claim'))).not.toContain('code');
+});
+it("binds a signup's verification claim to its account: mail to any other address keeps its ordinary routing", async () => {
+  await createSignInClaim({ ...input, binding: { attempt: 'attempt-1', username: 'morgan.ellery@example.com' } });
+  expect(await claimSignInMail(mail('unaddressed'), at)).toBeUndefined();
+  expect(await claimSignInMail(mail('other', 10, 'shop.example', 'juno.hale@example.com'), at)).toBeUndefined();
+  expect(
+    await claimSignInMail(mail('bound', 20, 'shop.example', 'Morgan Ellery <Morgan.Ellery@example.com>'), at),
+  ).toMatchObject({ id: 'claim', gmail_message_id: 'bound' });
 });

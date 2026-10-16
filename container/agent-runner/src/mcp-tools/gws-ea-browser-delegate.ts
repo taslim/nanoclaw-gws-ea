@@ -91,7 +91,7 @@ export const reservationBounds = requestTool({
 export const credentialAuthority = requestTool({
   name: 'credential_authority',
   description:
-    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when another change on that login is open, vault_unavailable or rate_limited. Repeating the same request returns the same authority.",
+    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when an earlier signup or change of that account is still open or unsettled, vault_unavailable or rate_limited. Repeating the same request returns the same authority.",
   properties: {
     thread: THREAD,
     operation: { type: 'string', enum: ['signup', 'change_password'] },
