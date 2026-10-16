@@ -1,11 +1,12 @@
 /**
- * Email that reads like a person's (R61, KTD6). The agent writes markdown and
- * a closing; the email carries it as minimal HTML and as plain text, signed
- * once by the host, with a reply's quote below the way Gmail quotes.
+ * Email that reads like a person's (R61, KTD6). The agent writes markdown, its
+ * sign-off included; the email carries it as minimal HTML and as plain text,
+ * with a reply's quote below the way Gmail quotes.
  *
  * The HTML is micromark's, with GFM and with raw HTML escaped, inside one
  * `<div dir="ltr">`. A line break the writer made inside a paragraph stays a
- * line break, as in any mail client, so an address keeps its lines.
+ * line break, as in any mail client, so an address keeps its lines and a
+ * closing its signature directly under it.
  * The output is then narrowed: an image gives way to its words, and a link
  * whose target is not http(s) or mailto keeps only its words. With raw HTML
  * escaped, every tag in micromark's output is one micromark wrote, in a fixed
@@ -17,11 +18,6 @@
  * a link as "words (address)" for the links the HTML keeps, a list with "- "
  * or "1. " bullets, a quote with "> ", and every paragraph and line break
  * where the writer put it.
- *
- * The signature is the host's one line, the assistant's name and whose
- * assistant it is, directly under the agent's closing: the last line of the
- * email's last paragraph, or a paragraph of its own when the email ends in
- * anything else. It comes before the quote, as Gmail places it.
  */
 import type { FootnoteDefinition, Nodes, RootContent } from 'mdast';
 import { fromMarkdown } from 'mdast-util-from-markdown';
@@ -32,7 +28,6 @@ import { normalizeUri } from 'micromark-util-sanitize-uri';
 
 import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
-import type { GwsEaProfile } from '../gws-ea-profile/db.js';
 import { oneLine, type Mailbox } from './mime.js';
 
 /** The message a reply answers, as its readers received it. */
@@ -44,10 +39,8 @@ export interface QuotedMessage {
 }
 
 export interface EmailContent {
-  /** What the agent wrote, in markdown, its closing included. */
+  /** What the agent wrote, in markdown, its sign-off included. */
   readonly markdown: string;
-  /** The line `emailSignature` gives. */
-  readonly signature: string;
   /** The message a reply answers, quoted below it. */
   readonly quote?: QuotedMessage;
 }
@@ -65,15 +58,6 @@ const LINK = /<a href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gu;
 const LINK_TARGET = /^(?:https?|mailto):/iu;
 
 type MarkdownEvent = ReturnType<typeof postprocess>[number];
-
-/** The assistant's signature: its name, then whose assistant it is, in one line. */
-export function emailSignature(
-  profile: Pick<GwsEaProfile, 'assistant_display_name' | 'principal_display_name'>,
-): string {
-  const { assistant_display_name: assistant, principal_display_name: principal } = profile;
-  if (!assistant || !principal) throw new Error("The signature needs the assistant's and the principal's names");
-  return `${assistant} | EA to ${principal}`;
-}
 
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"]/gu, (character) =>
@@ -258,17 +242,13 @@ export function quotedBy(quote: QuotedMessage): string {
   return `On ${formatLocalTime(quote.sentAt.toISOString(), TIMEZONE)}, ${writer} wrote:`;
 }
 
-/** The email's text and HTML: the body, the signature, and a reply's quote. */
+/** The email's text and HTML: the body, as the agent wrote it, and a reply's quote. */
 export function renderEmail(content: EmailContent): RenderedEmail {
   const markdown = content.markdown.replace(/\r\n?/gu, '\n').trim();
   // micromark leaves a line ending after a trailing link definition, which writes nothing.
   const body = markdownHtml(markdown).trimEnd();
-  // Raw HTML is escaped, so a closing `</p>` is micromark's: the email ends in a paragraph.
-  const closed = body.endsWith('</p>');
-  const signature = escapeHtml(content.signature);
-  const text = [plainText(markdown), ...(closed ? [] : ['']), content.signature];
-  const signed = closed ? `${body.slice(0, -'</p>'.length)}<br />\n${signature}</p>` : `${body}\n<p>${signature}</p>`;
-  let html = `<div dir="ltr">\n${signed}\n</div>`;
+  const text = [plainText(markdown)];
+  let html = `<div dir="ltr">\n${body}\n</div>`;
   if (content.quote !== undefined) {
     const said = quotedBy(content.quote);
     const lines = quotedLines(content.quote.text);

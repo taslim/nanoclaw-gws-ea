@@ -7,9 +7,8 @@
  * that the principal wrote, which Gmail must still verify as theirs now. It
  * goes to that message's From address alone, never to its Reply-To, To, or
  * Cc, nor to the principal's other addresses, in that message's Gmail
- * thread, quoting it, and signed by the host (render.ts), with any files
- * `main` sent: the principal may receive anything. A thread with no such
- * message refuses it.
+ * thread, quoting it (render.ts), with any files `main` sent: the principal
+ * may receive anything. A thread with no such message refuses it.
  *
  * The audience check resolves the same address (`principalRecipients`), so a
  * send clears the private-values check only because every recipient is one
@@ -22,7 +21,7 @@ import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
 import { getGwsEaProfile, loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { authenticateSender } from './authentication.js';
 import { buildMime, encodeRaw, parseGmailMessage, type Mailbox, type ParsedMail } from './mime.js';
-import { emailSignature, renderEmail } from './render.js';
+import { renderEmail } from './render.js';
 import { activeInbox, assistantAddresses, type InboxRuntime } from './runtime.js';
 import { assistantMailbox, emailWords, MAX_REFERENCES, sendExactlyOnce, sendKey } from './send.js';
 import { threadMessages, visibleMessageIds } from './thread-map.js';
@@ -81,9 +80,8 @@ export async function sendToPrincipal(
     throw new OutboundRefusedError(REFUSED_BY, 'An email to the principal carries words, as text.');
   return sendExactlyOnce(runtime, { threadKey, side: 'principal' }, sendKey(threadKey, words), async () => {
     const anchor = await principalAnchor(runtime, threadKey);
-    const profile = await getGwsEaProfile();
     if (anchor === undefined) {
-      const principal = profile.principal_display_name ?? 'the principal';
+      const principal = (await getGwsEaProfile()).principal_display_name ?? 'the principal';
       throw new OutboundRefusedError(
         REFUSED_BY,
         `there is no email from ${principal} in that thread for you to answer. (thread ${threadKey})`,
@@ -91,7 +89,6 @@ export async function sendToPrincipal(
     }
     const body = renderEmail({
       markdown: words.text,
-      signature: emailSignature(profile),
       quote: { from: anchor.from, sentAt: anchor.mail.receivedAt ?? runtime.now(), text: anchor.mail.text },
     });
     const from = await assistantMailbox(runtime);

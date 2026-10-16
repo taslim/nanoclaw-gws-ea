@@ -230,7 +230,8 @@ describe("external-email's project document", () => {
       '# NanoClaw Module: time',
     ]);
     expect(composed.get('# Assistant Identity')).toBe(
-      'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
+      'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
+        '\n\nYour email signature:\n\nAya | EA to Morgan',
     );
     // Said once here, so no email it reads repeats it.
     expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');

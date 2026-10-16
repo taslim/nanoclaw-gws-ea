@@ -88,9 +88,10 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
 /**
  * Who the assistant and the principal are, for each audience (KTD14). Main
  * reads the principal's addresses live. `external-email` writes to people
- * other than the principal, so it gets the two names and no address of
- * either. Any other group gets the addresses as of its container's start:
- * the default `group` CLI scope leaves the live list out of its reach.
+ * other than the principal, so it gets the two names, the signature it signs
+ * its email with, and no address of either. Any other group gets the
+ * addresses as of its container's start: the default `group` CLI scope
+ * leaves the live list out of its reach.
  */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
@@ -100,7 +101,12 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const principal = escapeMarkdownInline(profile.principal_display_name);
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
-  if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
+  if (audience === 'external-email') {
+    return {
+      name: 'Assistant Identity',
+      body: `${names}\n\nYour email signature:\n\n${assistant} | EA to ${principal}`,
+    };
+  }
   const addresses =
     audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
@@ -434,9 +440,9 @@ function receiptText(changes: readonly ProfileChange[]): string {
   return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
-/** What follows the change, and when: the host's readers now, main's own copies on its next start. */
+/** What follows the change, and when: the host's readers now, each agent's own copy on its next start. */
 const TAKES_EFFECT =
-  "The host's email signatures and free_time use the new values now; your own clock and the identity text in your instructions follow on your next start.";
+  "free_time uses the new values now. Your own clock and the identity text in your instructions follow on your next start, and the signature on external-email's email on its next start.";
 
 async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMainCaller(ctx, NAME_AND_TIMEZONE);

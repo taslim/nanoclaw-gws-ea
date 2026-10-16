@@ -1,6 +1,7 @@
 /**
- * Email that reads like a person's (R61, KTD6): the agent's markdown as
- * minimal HTML and as the text it wrote, signed once, with a reply's quote.
+ * Email that reads like a person's (R61, KTD6): the agent's markdown, its
+ * sign-off included, as minimal HTML and as the text it wrote, with a reply's
+ * quote.
  */
 import { describe, expect, it, vi } from 'vitest';
 
@@ -9,9 +10,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
   TIMEZONE: 'America/New_York',
 }));
 
-import { emailSignature, renderEmail } from './render.js';
-
-const signature = emailSignature({ assistant_display_name: 'Juno Hale', principal_display_name: 'Morgan Ellery' });
+import { renderEmail } from './render.js';
 
 function tags(html: string): Set<string> {
   return new Set([...html.matchAll(/<\/?([a-z][a-z0-9]*)/gu)].map((match) => match[1]));
@@ -26,24 +25,20 @@ function hrefs(html: string): string[] {
   return [...html.matchAll(/<a href="([^"]*)">/gu)].map((match) => match[1]);
 }
 
-function count(haystack: string, needle: string): number {
-  return haystack.split(needle).length - 1;
-}
-
 describe('the body', () => {
   it('renders a paragraph, a short list, and a link as minimal HTML, and the same words as plain text', () => {
     const markdown =
       'Hi Remy,\n\nMorgan asked me to find 30 minutes with you. Would either of these work?\n\n' +
       '- Tuesday at 10:00\n- Wednesday at 14:00\n\nThe [agenda](https://example.com/agenda?week=41&day=2) is attached.';
-    const email = renderEmail({ markdown, signature });
+    const email = renderEmail({ markdown });
 
     expect(email.html).toMatch(/^<div dir="ltr">/u);
     expect(email.html).toContain('<p>Hi Remy,</p>');
     expect(email.html).toContain('<ul>\n<li>Tuesday at 10:00</li>\n<li>Wednesday at 14:00</li>\n</ul>');
     expect(email.html).toContain('<a href="https://example.com/agenda?week=41&amp;day=2">agenda</a>');
-    expect([...tags(email.html)].sort()).toEqual(['a', 'br', 'div', 'li', 'p', 'ul']);
+    expect([...tags(email.html)].sort()).toEqual(['a', 'div', 'li', 'p', 'ul']);
     expect([...attributes(email.html)].sort()).toEqual(['dir', 'href']);
-    expect(email.text.slice(0, email.text.indexOf(signature)).trimEnd()).toBe(
+    expect(email.text).toBe(
       'Hi Remy,\n\nMorgan asked me to find 30 minutes with you. Would either of these work?\n\n' +
         '- Tuesday at 10:00\n- Wednesday at 14:00\n\n' +
         'The agenda (https://example.com/agenda?week=41&day=2) is attached.',
@@ -66,7 +61,6 @@ describe('the body', () => {
         '',
         'Best,',
       ].join('\n'),
-      signature,
     });
 
     expect(email.text).toBe(
@@ -83,7 +77,6 @@ describe('the body', () => {
         '> Pat said: keep it short.',
         '',
         'Best,',
-        'Juno Hale | EA to Morgan Ellery',
       ].join('\n'),
     );
     // The HTML part is markdown's, as before.
@@ -92,9 +85,9 @@ describe('the body', () => {
   });
 
   it('keeps a line break the writer made, as in an address', () => {
-    const email = renderEmail({ markdown: 'We meet at:\n4 Harbour Lane\nSuite 2\n\nBest,', signature });
+    const email = renderEmail({ markdown: 'We meet at:\n4 Harbour Lane\nSuite 2\n\nBest,' });
     expect(email.html).toContain('<p>We meet at:<br />\n4 Harbour Lane<br />\nSuite 2</p>');
-    expect(email.text.startsWith('We meet at:\n4 Harbour Lane\nSuite 2\n\nBest,\n')).toBe(true);
+    expect(email.text).toBe('We meet at:\n4 Harbour Lane\nSuite 2\n\nBest,');
   });
 
   it('escapes raw HTML and strips images, keeping their words', () => {
@@ -102,7 +95,6 @@ describe('the body', () => {
       markdown:
         'Before <script>alert(1)</script> after.\n\n<img src="https://x.example/p.png" onerror="steal()">\n\n' +
         'Here is ![the floor plan](https://x.example/plan.png).',
-      signature,
     });
     expect(email.html).not.toMatch(/<(script|img)\b/u);
     expect(email.html).toContain('Before &lt;script&gt;alert(1)&lt;/script&gt; after.');
@@ -128,7 +120,7 @@ describe('the body', () => {
       '[r]: https://r.example/remy',
       '[^1]: Notes are at <https://n.example/1>.',
     ].join('\n');
-    const email = renderEmail({ markdown, signature });
+    const email = renderEmail({ markdown });
     const shown = email.html
       .replace(/<[^>]+>/gu, ' ')
       .replace(
@@ -152,7 +144,6 @@ describe('the body', () => {
       markdown:
         '[safe](https://ok.example/path) [plain](http://ok.example) [mail](mailto:sam@acme.example) ' +
         '[bad](javascript:alert(1)) [data](data:text/html,hi) [relative](/inbox) [chat](irc://x.example)',
-      signature,
     });
     expect(hrefs(email.html)).toEqual(['https://ok.example/path', 'http://ok.example', 'mailto:sam@acme.example']);
     expect(email.html).toContain('</a> bad data relative chat<');
@@ -168,7 +159,7 @@ describe('a reply', () => {
   };
 
   it("quotes only the anchor's sanitized text, under an On <date>, <name> wrote: line in the install timezone", () => {
-    const email = renderEmail({ markdown: 'Tuesday works.\n\nBest,', signature, quote });
+    const email = renderEmail({ markdown: 'Tuesday works.\n\nBest,', quote });
 
     const attribution = /On Oct 7, 2026, 10:00\sAM, Sam Lee <sam@acme\.example> wrote:/u;
     const textQuote = email.text.slice(email.text.indexOf('\nOn ') + 1);
@@ -190,60 +181,32 @@ describe('a reply', () => {
   it('names the writer by address alone when its From gave no name', () => {
     const email = renderEmail({
       markdown: 'Yes.',
-      signature,
       quote: { ...quote, from: { address: 'sam@acme.example' } },
     });
     expect(email.text).toMatch(/, sam@acme\.example wrote:\n/u);
   });
 });
 
-describe('the signature', () => {
-  it("is the assistant's name, then whose assistant it is, in one line", () => {
-    expect(signature).toBe('Juno Hale | EA to Morgan Ellery');
-  });
-
-  it('cannot be built without both names', () => {
-    expect(() => emailSignature({ assistant_display_name: 'Juno Hale', principal_display_name: null })).toThrow(
-      /names/u,
-    );
-  });
-
-  it('appears exactly once in each part, directly under the closing and before the quote', () => {
+describe('the sign-off', () => {
+  it('is what the agent wrote: a signature under its closing is one paragraph, before the quote', () => {
     const email = renderEmail({
-      markdown: 'Tuesday works.\n\nBest,',
-      signature,
+      markdown: 'Tuesday works.\n\nBest,\nJuno Hale | EA to Morgan Ellery',
       quote: { from: { address: 'sam@acme.example' }, sentAt: new Date('2026-10-07T14:00:00.000Z'), text: 'Hi' },
     });
-    expect(count(email.text, 'Juno Hale')).toBe(1);
-    expect(count(email.html, 'Juno Hale')).toBe(1);
-    expect(email.text).toContain('Tuesday works.\n\nBest,\nJuno Hale | EA to Morgan Ellery\n\nOn ');
+    expect(email.text).toMatch(
+      /^Tuesday works\.\n\nBest,\nJuno Hale \| EA to Morgan Ellery\n\nOn [^\n]+ wrote:\n\n> Hi$/u,
+    );
     expect(email.html).toContain(
-      '<p>Best,<br />\nJuno Hale | EA to Morgan Ellery</p>\n</div>\n<br>\n<div class="gmail_quote">',
+      '<p>Tuesday works.</p>\n<p>Best,<br />\nJuno Hale | EA to Morgan Ellery</p>\n</div>\n<br>\n<div class="gmail_quote">',
     );
+    expect(tags(email.html)).not.toContain('table');
   });
 
-  it('stays directly under the closing when a link definition follows it', () => {
-    const email = renderEmail({ markdown: 'See the [agenda][a].\n\nBest,\n\n[a]: https://example.com/a', signature });
-    expect(email.text).toContain('Best,\nJuno Hale | EA to Morgan Ellery');
-    expect(email.html).toContain('<p>Best,<br />\nJuno Hale | EA to Morgan Ellery</p>\n</div>');
-  });
-
-  it('is a paragraph of its own after an email that ends in anything but a paragraph', () => {
-    const email = renderEmail({
-      markdown: 'Would either work?\n\n- Tuesday at 10:00\n- Wednesday at 14:00',
-      signature,
+  it('adds nothing to an email the agent left unsigned', () => {
+    const email = renderEmail({ markdown: 'Done: your 3pm is now Thursday.' });
+    expect(email).toEqual({
+      text: 'Done: your 3pm is now Thursday.',
+      html: '<div dir="ltr">\n<p>Done: your 3pm is now Thursday.</p>\n</div>',
     });
-    expect(email.text).toBe(
-      'Would either work?\n\n- Tuesday at 10:00\n- Wednesday at 14:00\n\nJuno Hale | EA to Morgan Ellery',
-    );
-    expect(email.html).toContain('</ul>\n<p>Juno Hale | EA to Morgan Ellery</p>\n</div>');
-  });
-
-  it('is escaped in HTML', () => {
-    const email = renderEmail({
-      markdown: 'Hi',
-      signature: emailSignature({ assistant_display_name: 'R & D <Bot>', principal_display_name: 'Pat' }),
-    });
-    expect(email.html).toContain('<p>Hi<br />\nR &amp; D &lt;Bot&gt; | EA to Pat</p>');
   });
 });
