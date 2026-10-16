@@ -54,7 +54,9 @@ jobs:
           GWS_EA_BROWSER_TEST_CHROME: /usr/bin/google-chrome
         run: |
           test -x "$GWS_EA_BROWSER_TEST_CHROME"
-          xvfb-run --auto-servernum pnpm exec vitest run \
+          # One suite at a time: each owns a real Chrome, and parallel Chromes on a
+          # shared runner push startup and navigation past the fixtures' time budgets.
+          xvfb-run --auto-servernum pnpm exec vitest run --no-file-parallelism \
             src/modules/gws-ea-browser/authentication-submit.test.ts \
             src/modules/gws-ea-browser/fill-native.test.ts \
             src/modules/gws-ea-browser/purchase.test.ts \
