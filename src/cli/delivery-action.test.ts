@@ -21,7 +21,7 @@ import { resolveSession, sessionDir } from '../session-manager.js';
 import type { Session } from '../types.js';
 import { runGuarded } from '../delivery-guard.js';
 import { ALLOW, DENY, defineGuardedAction, HOLD } from '../guard/index.js';
-import { ActionRefusal, answeredGuard, answeringAction, writeActionResponse } from './delivery-action.js';
+import { ANSWER_LATER, ActionRefusal, answeredGuard, answeringAction, writeActionResponse } from './delivery-action.js';
 
 let session: Session;
 
@@ -96,6 +96,15 @@ describe('action_response', () => {
 
 describe('an answering action', () => {
   const frameOf = (requestId: string): unknown => answers(requestId).map((row) => row.content.frame);
+
+  it('leaves a durable asynchronous request unanswered until its worker answers', async () => {
+    const handler = answeringAction('fixture', async () => ANSWER_LATER);
+    await handler({ requestId: 'later-1' }, session);
+    expect(frameOf('later-1')).toEqual([]);
+    await writeActionResponse(session, 'later-1', { id: 'later-1', ok: true, data: { finished: true } });
+    await handler({ requestId: 'later-1' }, session);
+    expect(frameOf('later-1')).toEqual([{ id: 'later-1', ok: true, data: { finished: true } }]);
+  });
 
   it('answers with what it returns, once, however often its request is delivered', async () => {
     let runs = 0;
