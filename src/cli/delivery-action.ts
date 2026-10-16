@@ -80,14 +80,22 @@ export function requestIdOf(content: Record<string, unknown>): string | undefine
 }
 
 /** What an answering action does with a request: the answer's data, or an `ActionRefusal` or failure thrown. */
-export const ANSWER_LATER: unique symbol = Symbol('answer-later');
-
 export type ActionAnswer = (
   content: Record<string, unknown>,
   session: Session,
   requestId: string,
 ) => Promise<Record<string, unknown>>;
 
+/**
+ * Returned by a deferred answer to leave its request unanswered for now. The
+ * worker that took the request over answers it later with `writeActionResponse`
+ * and then clears what the request staged with `clearOutbox`. A replayed
+ * delivery before that runs the deferred answer again, so it must be
+ * idempotent by request id.
+ */
+export const ANSWER_LATER: unique symbol = Symbol('answer-later');
+
+/** An `ActionAnswer` that may hand its request to a durable worker (`ANSWER_LATER`). */
 export type DeferredActionAnswer = (
   content: Record<string, unknown>,
   session: Session,
@@ -115,7 +123,8 @@ async function writeAnswer(session: Session, requestId: string, frame: ResponseF
  * A delivery action that answers each request once, a refusal or failure
  * included. A request already answered is a replay of work already done,
  * whatever its answer, so it is not done again. A request without a request
- * id has no tool waiting on it, so nothing answers it.
+ * id has no tool waiting on it, so nothing answers it. An answer returning
+ * `ANSWER_LATER` leaves the request to the worker that answers it later.
  */
 export function answeringAction(action: string, answer: DeferredActionAnswer): GuardedDeliveryHandler {
   return async (content, session) => {
