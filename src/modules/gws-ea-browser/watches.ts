@@ -21,6 +21,7 @@ import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-facts.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
+import { readIsoTime } from './iso-time.js';
 import { quotePurchaseText } from './cards.js';
 import { browserSite } from './leases.js';
 import {
@@ -583,9 +584,9 @@ interface WatchInput extends Record<string, unknown> {
   until: string;
 }
 function offsetInstant(value: unknown): string {
-  if (typeof value !== 'string' || !/(?:Z|[+-]\d{2}:\d{2})$/u.test(value) || !Number.isFinite(Date.parse(value)))
-    throw invalidArgs('Watch times need explicit UTC offsets.');
-  return new Date(value).toISOString();
+  const parsed = readIsoTime(value, 'required');
+  if (!parsed) throw invalidArgs('Watch times need real ISO dates and times with explicit UTC offsets.');
+  return parsed;
 }
 export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
   if (

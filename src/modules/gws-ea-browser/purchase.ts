@@ -29,6 +29,7 @@ import { activateControl, BrowserSiteBusyError, withBrowserJobNavigation } from 
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import { readIsoTime } from './iso-time.js';
 import { readMerchantPurchase, readMerchantPurchaseEvidence } from './merchant-signatures.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
@@ -86,15 +87,11 @@ function stableId(prefix: string, value: string): string {
   return `${prefix}-${createHash('sha256').update(value).digest('hex')}`;
 }
 
-/** A calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
+/** A real calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
 function iso(value: unknown): string {
-  if (
-    typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2}))?$/u.test(value) ||
-    !Number.isFinite(Date.parse(value))
-  )
-    throw invalidArgs('Use an ISO date, or a date and time with a UTC offset.');
-  return value.length === 10 ? value : new Date(value).toISOString();
+  const parsed = readIsoTime(value, 'optional');
+  if (!parsed) throw invalidArgs('Use a real ISO date, or a date and time with a UTC offset.');
+  return parsed;
 }
 /** Merchants quote delivery as calendar dates, so a window bound is the date it names in its own offset. */
 function calendarDate(value: unknown): string {

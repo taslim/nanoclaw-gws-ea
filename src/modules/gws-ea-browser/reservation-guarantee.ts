@@ -14,6 +14,7 @@ import {
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
+import { readIsoTime } from './iso-time.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
 import {
   completePurchaseFacts,
@@ -169,13 +170,9 @@ async function reservationBoundsRequest(
   )
     throw invalidArgs('Reservation bounds require a job thread, venue_id and positive party_size.');
   const stamp = (value: unknown): string => {
-    if (
-      typeof value !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value) ||
-      !Number.isFinite(Date.parse(value))
-    )
-      throw invalidArgs('Reservation bounds require ISO timestamps with an explicit timezone.');
-    return new Date(value).toISOString();
+    const parsed = readIsoTime(value, 'required');
+    if (!parsed) throw invalidArgs('Reservation bounds require real ISO timestamps with an explicit timezone.');
+    return parsed;
   };
   const bounds = {
     venueId: content.venue_id.trim(),
