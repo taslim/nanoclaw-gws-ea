@@ -44,6 +44,7 @@ import {
   sweepBrowserPurchaseState,
 } from './purchase.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import { registerVaultAccessDelivery } from './vault-access.js';
 import './watches.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 
@@ -414,6 +415,7 @@ registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
+registerVaultAccessDelivery();
 
 export {
   BrowserStore,

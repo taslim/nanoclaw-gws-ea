@@ -2,7 +2,13 @@ import { afterEach, beforeEach, expect, it } from 'bun:test';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import Ajv from 'ajv';
-import { cancelJob, relayCode, reservationGuarantee, reservationBounds } from './gws-ea-browser-delegate.js';
+import {
+  cancelJob,
+  relayCode,
+  reservationGuarantee,
+  reservationBounds,
+  vaultAccess,
+} from './gws-ea-browser-delegate.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -136,4 +142,69 @@ it('sends only the explicit guarantee proposal fields through the native request
       }),
     );
   expect(JSON.stringify(await waiting)).toContain('awaiting_principal');
+});
+
+it('shares or refreshes the 1Password vault through the native host request, never with a chosen vault, account or permission', async () => {
+  const validate = new Ajv().compile(vaultAccess.tool.inputSchema);
+  for (const fields of [
+    { operation: 'share' },
+    { operation: 'share', email: 'morgan@example.test' },
+    { operation: 'refresh' },
+  ])
+    expect(validate(fields)).toBe(true);
+  for (const fields of [
+    {},
+    { operation: 'grant' },
+    { operation: 'refresh', email: 'morgan@example.test' },
+    { operation: 'share', vault_id: 'remyvancevault000000000002' },
+    { operation: 'share', account_id: 'REMYVANCEACCOUNT0000000002' },
+    { operation: 'share', permissions: ['allow_managing'] },
+    { operation: 'share', email: 'morgan@example.test', principal_confirmed: true },
+  ])
+    expect(validate(fields)).toBe(false);
+
+  expect((await vaultAccess.handler({ operation: 'refresh', email: 'morgan@example.test' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+
+  const message = 'Could you give morgan@example.test view and edit access to the 1Password vault my assistant keeps?';
+  const waiting = vaultAccess.handler({
+    operation: 'share',
+    email: 'morgan@example.test',
+    vault_id: 'remyvancevault000000000002',
+    permissions: ['allow_managing'],
+  });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({
+    action: 'vault_access',
+    requestId: row.id,
+    operation: 'share',
+    email: 'morgan@example.test',
+  });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: {
+          id: row.id,
+          ok: true,
+          data: {
+            status: 'operator_needed',
+            email: 'morgan@example.test',
+            reason: 'not_a_member',
+            operator_message: message,
+          },
+        },
+      }),
+    );
+  const result = await waiting;
+  expect(result.isError).not.toBe(true);
+  // main reads the status beside the message it forwards as written.
+  expect(JSON.stringify(result)).toContain('operator_needed');
+  expect(JSON.stringify(result)).toContain(message);
 });

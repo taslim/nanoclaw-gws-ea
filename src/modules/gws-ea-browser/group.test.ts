@@ -96,6 +96,11 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).toContain('vault_unavailable');
   expect(guidance).toContain('outcome_unknown');
   expect(guidance).toContain('password or token');
+  expect(guidance).toContain('vault_access');
+  expect(guidance).toContain('operator_message');
+  expect(guidance).toMatch(/exactly as written/u);
+  expect(guidance).toMatch(/never promise an invitation/iu);
+  expect(guidance).toMatch(/refresh/u);
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   expect(
     (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,

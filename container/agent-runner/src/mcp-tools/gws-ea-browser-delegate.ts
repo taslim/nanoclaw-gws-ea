@@ -88,4 +88,30 @@ export const reservationBounds = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
-registerTools([cancelJob, relayCode, reservationGuarantee, reservationBounds], 'browser-delegate');
+export const vaultAccess = requestTool({
+  name: 'vault_access',
+  description:
+    "Share the assistant's 1Password vault with the principal, or check it again after they add or change a login. share gives view and edit access to the principal's 1Password account under their only email address, or under email: one of their addresses, or another email their 1Password account uses, which first waits for the principal to confirm it. It returns shared once 1Password shows their access, awaiting_principal, operator_needed with an operator_message for the principal to forward exactly as written, rate_limited or vault_unavailable. refresh lists the vault's logins again now and returns usable, rate_limited or vault_unavailable. Repeating either is safe: the host reads actual access before it grants anything.",
+  properties: {
+    operation: { type: 'string', enum: ['share', 'refresh'] },
+    email: {
+      type: 'string',
+      description:
+        "For share only: the email the principal's 1Password account uses. Omit it when they have a single address.",
+    },
+  },
+  required: ['operation'],
+  additionalProperties: false,
+  oneOf: [
+    { properties: { operation: { const: 'share' } } },
+    { properties: { operation: { const: 'refresh' } }, not: { required: ['email'] } },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'refresh') return fields.email === undefined ? fields : 'Only share takes an email.';
+    if (fields.operation !== 'share') return 'operation must be share or refresh.';
+    return fields.email === undefined || typeof fields.email === 'string' ? fields : 'email must be one email address.';
+  },
+  repeatable: true,
+  timeoutMs: 120_000,
+});
+registerTools([cancelJob, relayCode, reservationGuarantee, reservationBounds, vaultAccess], 'browser-delegate');

@@ -88,6 +88,7 @@ const DEFAULT_ON_TOOLS = [
   'send_card',
   'send_file',
   'send_message',
+  'vault_access',
   ...MAIN_EMAIL_TOOLS,
   ...CALENDAR_TOOLS,
   ...TIME_TOOLS,
@@ -138,7 +139,7 @@ describe('NanoClaw tool server capabilities', () => {
     [
       'browser-delegate',
       ['browser-delegate'],
-      ['cancel_job', 'relay_code', 'reservation_bounds', 'reservation_guarantee'],
+      ['cancel_job', 'relay_code', 'reservation_bounds', 'reservation_guarantee', 'vault_access'],
     ],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
