@@ -81,6 +81,7 @@ const HISTORY_LIMIT = 2_000;
 const RECORD_LIMIT = 25_000;
 const ACTIONS = new Set([
   'browser',
+  'fill_secret',
   'sign_in_code',
   'save_recipe',
   'run_recipe',
@@ -136,6 +137,9 @@ const OPERATIONAL_CODES = new Set([
   'submitted',
   'cleared_after_submit',
   'origin_mismatch',
+  'no_item_for_site',
+  'vault_unavailable',
+  'rate_limited',
   'awaiting_code',
   'nothing_arrived',
   'ambiguous',

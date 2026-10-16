@@ -8,6 +8,7 @@ import {
   browser,
   BROWSER_REQUEST_TIMEOUT_MS,
   cancelWatch,
+  fillSecret,
   listWatches,
   purchase,
   runRecipe,
@@ -47,6 +48,7 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, data
 const target = { ref: 'e1', generation: 1 };
 const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]> = [
   [browser, { actions: [{ kind: 'observe' }], budget_ms: 90_000 }],
+  [fillSecret, { item_handle: 'login-1', field: 'password', target, submit: { ref: 'e2', generation: 1 } }],
   [signInCode, { from: 'principal', target, send: { ref: 'e2', generation: 1 } }],
   [purchase, { target }],
   [purchase, { operation: 'reconcile', attempt_id: 'attempt-1', target }],
@@ -136,6 +138,7 @@ describe('the browser tools', () => {
       expect(tool.tool.description).toMatch(/repeat/iu);
     }
     expect(purchase.tool.description).toContain('confirmed_not_placed');
+    expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty('password');
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 

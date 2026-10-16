@@ -22,6 +22,7 @@ import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './recipes.js';
 import './capability.js';
+import './fill.js';
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
@@ -404,6 +405,7 @@ export function getBrowserQueue(): BrowserQueue {
   return queue;
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
+registerBrowserActionDelivery('fill_secret', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);

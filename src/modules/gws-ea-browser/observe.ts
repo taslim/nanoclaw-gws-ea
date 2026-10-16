@@ -2,6 +2,7 @@ import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { httpsOrigin } from './authentication-signatures.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -46,7 +47,7 @@ interface PageObservationState {
   snapshot: string;
   secrets: Set<string>;
   activeSecrets: Set<string>;
-  siteOrigin?: string;
+  siteOriginsKey?: string;
   unboundSecretDocuments: Set<string>;
   secretDocumentLoaders: Set<string>;
 }
@@ -198,11 +199,18 @@ export async function observePage(page: Page, assertActive?: () => Promise<void>
   try {
     const current = new URL(page.url());
     const domain = getDomain(current.hostname, { allowPrivateDomains: true });
-    if (current.protocol === 'https:' && domain && state.siteOrigin !== current.origin && siteInfoProviders.length) {
+    // A login iframe attached after the page's first observation brings its own origin's vault items.
+    const origins = new Set([current.origin]);
+    for (const frame of page.frames()) {
+      const origin = httpsOrigin(frame.url());
+      if (origin) origins.add(origin.origin);
+    }
+    const originsKey = JSON.stringify([current.origin, [...origins].sort()]);
+    if (current.protocol === 'https:' && domain && state.siteOriginsKey !== originsKey && siteInfoProviders.length) {
       site = { origin: current.origin, untrusted: true };
       for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
       site = JSON.parse(redactPageText(page, JSON.stringify(site))) as BrowserObservation['site'];
-      state.siteOrigin = current.origin;
+      state.siteOriginsKey = originsKey;
     }
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */

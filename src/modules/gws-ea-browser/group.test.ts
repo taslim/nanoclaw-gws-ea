@@ -92,7 +92,8 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('thread: "new"');
   expect(guidance).toContain('relay_code');
-  expect(guidance).toContain('cannot enter a password');
+  expect(guidance).toContain('no_item_for_site');
+  expect(guidance).toContain('vault_unavailable');
   expect(guidance).toContain('outcome_unknown');
   expect(guidance).toContain('password or token');
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));

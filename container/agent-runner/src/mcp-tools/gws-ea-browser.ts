@@ -45,7 +45,7 @@ function action(kind: string, properties: Record<string, object> = {}, required:
 export const browser = requestTool({
   name: 'browser',
   description:
-    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use sign_in_code for sign-in. ' +
+    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in. ' +
     'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main. An unknown commit must be reconciled, never retried. ' +
     NO_REPEAT,
   properties: {
@@ -139,6 +139,27 @@ export const browser = requestTool({
     },
   },
   required: ['actions'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const fillSecret = requestTool({
+  name: 'fill_secret',
+  description:
+    'Ask the host to fill a 1Password login by handle and submit it. The host validates the complete HTTPS frame origin before resolving and again before insertion; no secret value reaches you. Outcomes: submitted, no_item_for_site, origin_mismatch, cleared_after_submit, vault_unavailable or rate_limited. Continue from a fresh observation after submission; report a missing item, unavailable vault or mismatched origin to main. ' +
+    NO_REPEAT,
+  properties: {
+    item_handle: { type: 'string', description: 'The opaque login handle the host listed for this site.' },
+    field: {
+      type: 'string',
+      enum: ['username', 'password', 'otp'],
+      description: 'Which login field the host should resolve.',
+    },
+    target: REF,
+    submit: REF,
+  },
+  required: ['item_handle', 'field', 'target', 'submit'],
   additionalProperties: false,
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
@@ -317,4 +338,7 @@ export const cancelWatch = requestTool({
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
 });
 
-registerTools([browser, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch], 'browser');
+registerTools(
+  [browser, fillSecret, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch],
+  'browser',
+);
