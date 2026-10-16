@@ -79,6 +79,15 @@ describe('HTML links', () => {
     ).toEqual([{ label: 'Go', href: 'https://right.example/?x=1&y=2' }]);
   });
 
+  it('keeps numeric entities outside Unicode as written instead of failing the message', () => {
+    expect(htmlToText('<p>Code &#x110000; and &#99999999999999999999; &#x41;</p>')).toBe(
+      'Code &#x110000; and &#99999999999999999999; A',
+    );
+    expect(htmlLinks('<a href="https://portal.example/?x=&#x110000;">Go &#1114112;</a>')).toEqual([
+      { label: 'Go &#1114112;', href: 'https://portal.example/?x=&#x110000;' },
+    ]);
+  });
+
   it('finds anchors after long template markup without changing ordinary readable text', () => {
     const html =
       `<head><style>${'.template { color: red; }'.repeat(600)}</style></head>` +

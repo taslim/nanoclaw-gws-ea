@@ -61,6 +61,19 @@ vi.mock('../../session-manager.js', async () => {
   };
 });
 
+/** Gmail message ids listed here stand in for mail the parser cannot read. */
+const unparseable = new Set<string>();
+vi.mock('./mime.js', async () => {
+  const actual = await vi.importActual<typeof import('./mime.js')>('./mime.js');
+  return {
+    ...actual,
+    parseGmailMessage: vi.fn((...args: Parameters<typeof actual.parseGmailMessage>) => {
+      if (unparseable.has(args[0].id)) throw new Error('unreadable message');
+      return actual.parseGmailMessage(...args);
+    }),
+  };
+});
+
 import type { ChannelAdapter, ChannelSetup } from '../../channels/adapter.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import {
@@ -751,6 +764,7 @@ beforeEach(async () => {
   vi.mocked(requestWake).mockClear();
   poisoned.clear();
   poisonedPrefixes.clear();
+  unparseable.clear();
   chatSends = [];
   clockOffsetMs = 0;
 
@@ -3125,6 +3139,20 @@ describe('polling', () => {
     expect(
       await getDb().get('SELECT SUM(count) AS count FROM gws_ea_inbox_sender_counts WHERE sender = ?', flood),
     ).toEqual({ count: MESSAGES_PER_SENDER_PER_HOUR + 1 });
+  });
+
+  it('retries then sets aside a message the parser cannot read, without blocking later mail', async () => {
+    const bad = gmail.receive({ from: 'Stranger <stranger@else.example>', subject: 'Unreadable' });
+    unparseable.add(bad);
+    gmail.receive({ from: 'other@else.example', subject: 'Readable' });
+    for (let i = 0; i < MAX_ROUTING_ATTEMPTS + 1; i += 1) await inbox.tick();
+
+    expect((await outsideMail()).map((row) => row.text).join('\n')).toContain('Readable');
+    expect(
+      await getDb().get('SELECT outcome FROM gws_ea_inbox_messages WHERE gmail_message_id = ?', bad),
+    ).toMatchObject({ outcome: 'set-aside' });
+    expect(chatSends).toHaveLength(1);
+    expect(gmail.historyRequests.at(-1)?.startHistoryId).toBe(String(gmail.historyId));
   });
 
   it('sets aside a message that keeps failing, moves on, and tells the principal once', async () => {

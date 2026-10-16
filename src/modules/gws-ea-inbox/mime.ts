@@ -253,9 +253,12 @@ function walk(part: GmailMessagePart, visit: (part: GmailMessagePart) => void): 
 const ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
 function decodeHtmlEntities(text: string): string {
+  // Mail is untrusted: a numeric entity outside Unicode stays as written instead of throwing.
+  const point = (value: number, entity: string): string =>
+    Number.isSafeInteger(value) && value <= 0x10ffff ? String.fromCodePoint(value) : entity;
   return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/giu, (entity, code: string) => {
-    if (code.startsWith('#x') || code.startsWith('#X')) return String.fromCodePoint(parseInt(code.slice(2), 16));
-    if (code.startsWith('#')) return String.fromCodePoint(parseInt(code.slice(1), 10));
+    if (code.startsWith('#x') || code.startsWith('#X')) return point(parseInt(code.slice(2), 16), entity);
+    if (code.startsWith('#')) return point(parseInt(code.slice(1), 10), entity);
     return ENTITIES[code.toLowerCase()] ?? entity;
   });
 }

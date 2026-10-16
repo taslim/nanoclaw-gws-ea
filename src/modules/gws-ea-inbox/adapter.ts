@@ -202,8 +202,10 @@ export function createInbox(deps: InboxDeps): Inbox {
         await settleMessage(id, 'gone', at);
         continue;
       }
-      const mail = parseGmailMessage(message);
+      let mail: ParsedMail | undefined;
       try {
+        // Parsing is part of routing: a message the parser cannot read is retried, then set aside.
+        mail = parseGmailMessage(message);
         if (!signInMode && !mail.labelIds.includes('INBOX')) {
           const claimed = await routeSignInMail(mail, context.at);
           await settleMessage(id, claimed ? 'browser-sign-in' : 'not-in-inbox', at);
