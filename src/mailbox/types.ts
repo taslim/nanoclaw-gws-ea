@@ -182,6 +182,8 @@ export interface InboundMailbox {
 
 /** Host-visible outbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface OutboundMailbox {
+  /** Read one immutable container request by its exact outbound id. Host only. */
+  getOutboundMessage(id: string): OutboundMessage | undefined;
   getTerminalProcessingAcks(): ProcessingAck[];
   getProcessingClaims(): ProcessingClaim[];
   deleteOrphanProcessingClaims(): number;
@@ -192,7 +194,10 @@ export interface OutboundMailbox {
   getTopLevelOutbound(limit: number): MailboxTimelineMessage[];
 }
 
-export interface MailboxSession extends InboundMailbox, OutboundMailbox {}
+export interface MailboxSession extends InboundMailbox, OutboundMailbox {
+  /** Latest successful delivered chat to this agent; failed and pending rows do not count. */
+  getLatestDeliveredAgentReport(targetAgentGroupId: string): MailboxHistoryMessage | undefined;
+}
 
 export interface AgentMailbox {
   /** True only when this implementation already owns storage for the key. Must not provision it. */
