@@ -561,7 +561,9 @@ export class CredentialAttempts {
    * disclosure (`exposed`) before returning anything, so the caller may insert
    * the value only after this resolves. A change also returns the original
    * Login's current password, read fresh and refused if it no longer matches
-   * its ownership record or the password the candidate replaces.
+   * its ownership record or the password the candidate replaces. While the
+   * operator has 1Password disabled nothing is disclosed: the attempt stays
+   * saved, its candidate kept for when it is enabled again.
    */
   async disclose(
     id: string,
@@ -582,6 +584,14 @@ export class CredentialAttempts {
       if (owned.password !== candidate.secret.previousPassword) return refused('source_changed');
       currentPassword = owned.password;
     }
+    // A remembered value needs no provider request, so only the operator's published disable can stop it here.
+    const availability = await this.vault.availability();
+    if (
+      availability.status !== 'available' ||
+      availability.binding.vaultId !== attempt.vault_id ||
+      availability.binding.accountId !== attempt.account_id
+    )
+      return { status: 'vault_unavailable' };
     await assertActive();
     const at = now();
     const changed = await this.db.run(

@@ -12,6 +12,8 @@ import { GwsEaError } from '../../gws-ea/types.js';
 import {
   discardServiceAccountCreation,
   OnePasswordCli,
+  retireCapturedServiceAccount,
+  serviceAccountCreationUnproven,
   type OnePasswordCliOptions,
   type OperatorIdentity,
   type ServiceAccountIdentity,
@@ -516,8 +518,19 @@ describe('1Password actions', () => {
   it('reads exactly one vault, succeeding only for the vault the provider returns', async () => {
     const runtime = await managementIdentity();
     const { cli, calls } = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant' }) }));
-    expect(await cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID });
+    // A reply without an item count reads as an unknown count, never as an empty vault.
+    expect(await cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID, itemCount: null });
     expect(calls[0].args).toEqual(['vault', 'get', VAULT_ID, '--format', 'json']);
+    for (const [items, itemCount] of [
+      [0, 0],
+      [12, 12],
+      [-1, null],
+      [1.5, null],
+      ['3', null],
+    ] as const) {
+      const counted = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant', items }) }));
+      expect(await counted.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID, itemCount });
+    }
 
     const other = await openCli(() => ({ stdout: JSON.stringify({ id: 'othervault0000000000000001' }) }));
     expect(await other.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'failed', reason: 'unexpected_output' });
@@ -698,6 +711,23 @@ describe('minting a service account token', () => {
     expect(await readdir(path.dirname(file))).toEqual([]);
     expect(await cli.createServiceAccount(OPERATOR, request)).toMatchObject({ status: 'failed' });
     expect(calls).toHaveLength(2);
+  });
+
+  it('retires a captured token whose account was never verified, keeping its creation unproven so nothing mints over it', async () => {
+    const minted = token();
+    const file = await tokenFile();
+    const { cli, calls } = await openCli(() => ({ stdout: `${minted}\n` }));
+    const request = { name: 'GWS-EA Juno Hale runtime', access: { kind: 'create_vaults' as const }, tokenFile: file };
+    expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'created' });
+
+    await retireCapturedServiceAccount(file, request.name);
+    await retireCapturedServiceAccount(file, request.name);
+
+    expect(await serviceAccountCreationUnproven(file)).toBe(true);
+    expect(await readdir(path.dirname(file))).toEqual([`${path.basename(file)}.pending`]);
+    expect(await readFile(`${file}.pending`, 'utf8')).not.toContain(minted);
+    expect(await cli.createServiceAccount(OPERATOR, request)).toEqual({ status: 'failed', reason: 'outcome_unknown' });
+    expect(calls).toHaveLength(1);
   });
 
   it('reports a token it could not persist as unknown and never mints again', async () => {

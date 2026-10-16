@@ -58,7 +58,7 @@ describe('local CLI discovery and grammar', () => {
     const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
       JSON.parse(io.stdout.join('\n'));
     const onepassword = schema.commands.filter((command) => command.path[2] === 'onepassword');
-    expect(onepassword.map((command) => command.path[1])).toEqual(['show', 'check', 'enable']);
+    expect(onepassword.map((command) => command.path[1])).toEqual(['show', 'check', 'enable', 'disable']);
     expect(onepassword.every((command) => command.scope === 'host')).toBe(true);
     const own = (action: string) =>
       onepassword
@@ -67,6 +67,7 @@ describe('local CLI discovery and grammar', () => {
         .map((option) => [option.name, option.required]);
     expect(own('show')).toEqual([]);
     expect(own('check')).toEqual([]);
+    expect(own('disable')).toEqual([]);
     expect(own('enable')).toEqual([
       ['account', false],
       ['discard-unproven', false],
@@ -227,6 +228,7 @@ describe('local CLI discovery and grammar', () => {
       'capabilities show onepassword',
       'capabilities check onepassword',
       'capabilities enable onepassword',
+      'capabilities disable onepassword',
     ]);
     expect(schema.commands.slice(1, 7).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
     for (const command of ['install-voice', 'enable-voice', 'disable-voice', 'uninstall-voice']) {

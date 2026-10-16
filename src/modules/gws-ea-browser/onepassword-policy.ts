@@ -83,7 +83,14 @@ export interface OnePasswordHostPaths {
 }
 
 export interface OnePasswordHostPolicy {
-  readonly schemaVersion: 1;
+  /** 2 added the disabled intent; a policy of any other version is refused. */
+  readonly schemaVersion: 2;
+  /**
+   * The operator's intent, re-read by the host before every vault use. False
+   * stops every fill, disclosure, write and share while the account, the
+   * management identity and every assistant's records are kept.
+   */
+  readonly enabled: boolean;
   /** The one account every assistant on this host uses, by its exact ID: never a shorthand, URL or name. */
   readonly accountId: string;
   /** The `op` the operator enabled, re-checked before each use: assistant services run with a PATH that may not reach it. */
@@ -121,7 +128,8 @@ export interface OnePasswordUserGrant {
 }
 
 export interface OnePasswordResources {
-  readonly schemaVersion: 1;
+  /** 2 added the retired runtime service accounts; a record of any other version is refused. */
+  readonly schemaVersion: 2;
   /** The assistant these resources belong to; immutable, and matching the record's location. */
   readonly instanceId: string;
   readonly accountId: string;
@@ -139,6 +147,12 @@ export interface OnePasswordResources {
    * the vault, and its token is in the instance's runtime token file.
    */
   readonly runtimeServiceAccountId: string | null;
+  /**
+   * Runtime service accounts whose local tokens were deleted when 1Password
+   * was disabled, oldest first. Only the operator can revoke them, on
+   * 1Password.com, so they stay named here until the assistant is removed.
+   */
+  readonly retiredRuntimeServiceAccountIds: readonly string[];
 }
 
 export type OnePasswordResourcesRead =
@@ -197,11 +211,15 @@ function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]):
 }
 
 function parseHostPolicy(value: unknown): OnePasswordHostPolicy | undefined {
-  if (!isRecord(value) || !hasExactKeys(value, ['schemaVersion', 'accountId', 'cliPath', 'managementServiceAccountId']))
-    return undefined;
-  const { schemaVersion, accountId, cliPath, managementServiceAccountId } = value;
   if (
-    schemaVersion !== 1 ||
+    !isRecord(value) ||
+    !hasExactKeys(value, ['schemaVersion', 'enabled', 'accountId', 'cliPath', 'managementServiceAccountId'])
+  )
+    return undefined;
+  const { schemaVersion, enabled, accountId, cliPath, managementServiceAccountId } = value;
+  if (
+    schemaVersion !== 2 ||
+    typeof enabled !== 'boolean' ||
     !isOnePasswordId(accountId) ||
     typeof cliPath !== 'string' ||
     cliPath.length > MAX_CLI_PATH_CHARACTERS ||
@@ -210,7 +228,7 @@ function parseHostPolicy(value: unknown): OnePasswordHostPolicy | undefined {
     (managementServiceAccountId !== null && !isOnePasswordId(managementServiceAccountId))
   )
     return undefined;
-  return { schemaVersion, accountId, cliPath, managementServiceAccountId };
+  return { schemaVersion, enabled, accountId, cliPath, managementServiceAccountId };
 }
 
 function parseVaultCreator(value: unknown): OnePasswordVaultCreator | undefined {
@@ -237,6 +255,17 @@ function parseUserGrant(value: unknown): OnePasswordUserGrant | null | undefined
   return { userId: value.userId, permissions: [...value.permissions] };
 }
 
+/** Distinct service account IDs, none of them the current runtime account. */
+function parseRetired(value: unknown, current: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids: string[] = [];
+  for (const id of value) {
+    if (!isOnePasswordId(id) || id === current || ids.includes(id)) return undefined;
+    ids.push(id);
+  }
+  return ids;
+}
+
 function parseResources(value: unknown): OnePasswordResources | undefined {
   if (
     !isRecord(value) ||
@@ -247,12 +276,13 @@ function parseResources(value: unknown): OnePasswordResources | undefined {
       'vault',
       'operatorGrant',
       'runtimeServiceAccountId',
+      'retiredRuntimeServiceAccountIds',
     ])
   )
     return undefined;
   const { schemaVersion, instanceId, accountId, vault, runtimeServiceAccountId } = value;
   if (
-    schemaVersion !== 1 ||
+    schemaVersion !== 2 ||
     typeof instanceId !== 'string' ||
     !INSTANCE_ID_PATTERN.test(instanceId) ||
     !isOnePasswordId(accountId) ||
@@ -264,7 +294,8 @@ function parseResources(value: unknown): OnePasswordResources | undefined {
     return undefined;
   const createdBy = parseVaultCreator(vault.createdBy);
   const operatorGrant = parseUserGrant(value.operatorGrant);
-  if (!createdBy || operatorGrant === undefined) return undefined;
+  const retiredRuntimeServiceAccountIds = parseRetired(value.retiredRuntimeServiceAccountIds, runtimeServiceAccountId);
+  if (!createdBy || operatorGrant === undefined || !retiredRuntimeServiceAccountIds) return undefined;
   return {
     schemaVersion,
     instanceId,
@@ -272,6 +303,7 @@ function parseResources(value: unknown): OnePasswordResources | undefined {
     vault: { id: vault.id, createdBy },
     operatorGrant,
     runtimeServiceAccountId,
+    retiredRuntimeServiceAccountIds,
   };
 }
 

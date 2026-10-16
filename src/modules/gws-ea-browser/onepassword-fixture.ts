@@ -199,7 +199,8 @@ export async function writeVaultFixture(directory: string): Promise<VaultFixture
   await mkdir(configRoot, { mode: 0o700 });
   const onePasswordPolicyFile = onePasswordHostPaths(configRoot).policyFile;
   await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    enabled: true,
     accountId: FIXTURE_ACCOUNT_ID,
     cliPath: '/opt/homebrew/bin/op',
     managementServiceAccountId: null,
@@ -212,12 +213,13 @@ export async function writeVaultFixture(directory: string): Promise<VaultFixture
   );
   const files = onePasswordInstancePaths(instanceRoot);
   await writeOnePasswordResources(files.resourceFile, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     instanceId: FIXTURE_INSTANCE_ID,
     accountId: FIXTURE_ACCOUNT_ID,
     vault: { id: FIXTURE_VAULT_ID, createdBy: { kind: 'operator' } },
     operatorGrant: null,
     runtimeServiceAccountId: FIXTURE_RUNTIME_ID,
+    retiredRuntimeServiceAccountIds: [],
   });
   await writePrivateFile(files.runtimeTokenFile, FIXTURE_TOKEN);
   return {

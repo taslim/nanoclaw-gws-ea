@@ -400,6 +400,21 @@ export async function discardServiceAccountCreation(tokenFile: string): Promise<
   await removePrivateFile(tokenFile);
 }
 
+/**
+ * Disabling's half of a capture no one verified: the token goes, and its
+ * creation stays unproven, so no retry mints over an account that may exist
+ * until the operator revokes it on 1Password.com and discards the attempt.
+ */
+export async function retireCapturedServiceAccount(tokenFile: string, name: string): Promise<void> {
+  const record = creationRecord(tokenFile);
+  if (!(await exists(record)))
+    await writeOwnerOnlyFileExclusive(
+      record,
+      `${JSON.stringify({ schemaVersion: 1, name, tokenDeletedAt: new Date().toISOString() })}\n`,
+    );
+  await removePrivateFile(tokenFile);
+}
+
 export class OnePasswordCli {
   readonly #invocation: Invocation;
   /** At least `ONEPASSWORD_CLI_MINIMUM_VERSION`. */
@@ -576,16 +591,26 @@ export class OnePasswordCli {
     return result.status === 'ok' ? { status: 'ok' } : result;
   }
 
-  /** Whether `identity` can read exactly this vault: success names the vault the provider returned. */
+  /**
+   * Whether `identity` can read exactly this vault: success names the vault
+   * the provider returned and the item count it reports, null when it reports
+   * none: an unknown count is never an empty vault.
+   */
   async getVault(
     identity: OnePasswordIdentity,
     vaultId: string,
-  ): Promise<OnePasswordResult<{ readonly vaultId: string }>> {
+  ): Promise<OnePasswordResult<{ readonly vaultId: string; readonly itemCount: number | null }>> {
     assertId(vaultId, 'The vault');
     const result = await this.#read(identity, ['vault', 'get', vaultId, '--format', 'json']);
     if (result.status !== 'ok') return result;
     const value = parseJson(result.stdout);
-    return isRecord(value) && value.id === vaultId ? { status: 'ok', vaultId } : failed('unexpected_output');
+    if (!isRecord(value) || value.id !== vaultId) return failed('unexpected_output');
+    const { items } = value;
+    return {
+      status: 'ok',
+      vaultId,
+      itemCount: typeof items === 'number' && Number.isSafeInteger(items) && items >= 0 ? items : null,
+    };
   }
 
   /** The user 1Password holds under exactly this email; matching it to a request is the caller's. */

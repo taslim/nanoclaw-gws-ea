@@ -41,6 +41,17 @@ let browserPolicyFile: string;
 let onePasswordPolicyFile: string;
 const output: string[] = [];
 
+/** The operator's host policy; `enabled: false` is the published disable. */
+async function writeHostPolicy(enabled: boolean): Promise<void> {
+  await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
+    schemaVersion: 2,
+    enabled,
+    accountId: ACCOUNT_ID,
+    cliPath: '/opt/homebrew/bin/op',
+    managementServiceAccountId: null,
+  });
+}
+
 const newVault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
 const service = (options: { automaticPromotion?: boolean; vault?: BrowserVault } = {}): CredentialAttempts =>
   new CredentialAttempts({ db: getDb(), vault: options.vault ?? vault, automaticPromotion: true, ...options });
@@ -117,12 +128,7 @@ beforeEach(async () => {
   const configRoot = path.join(directory, 'config');
   await mkdir(configRoot, { mode: 0o700 });
   onePasswordPolicyFile = onePasswordHostPaths(configRoot).policyFile;
-  await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
-    schemaVersion: 1,
-    accountId: ACCOUNT_ID,
-    cliPath: '/opt/homebrew/bin/op',
-    managementServiceAccountId: null,
-  });
+  await writeHostPolicy(true);
   const instanceRoot = path.join(directory, INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
   browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
@@ -133,12 +139,13 @@ beforeEach(async () => {
   const files = onePasswordInstancePaths(instanceRoot);
   tokenFile = files.runtimeTokenFile;
   await writeOnePasswordResources(files.resourceFile, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     instanceId: INSTANCE_ID,
     accountId: ACCOUNT_ID,
     vault: { id: VAULT_ID, createdBy: { kind: 'operator' } },
     operatorGrant: null,
     runtimeServiceAccountId: RUNTIME_ID,
+    retiredRuntimeServiceAccountIds: [],
   });
   await writePrivateFile(tokenFile, TOKEN);
   fake = new FakeOnePassword();
@@ -282,6 +289,31 @@ describe('saving before disclosure', () => {
     expect(await subject.reconcileSave(late.id)).toMatchObject({ status: 'saved' });
     expect(fake.calls.filter((call) => call === 'create')).toHaveLength(2);
     expect(await subject.disclose(late.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
+  });
+  it('stops a disclosure in flight once the operator disables 1Password, keeping the saved candidate to resume', async () => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
+    const [candidateId] = fake.items.keys();
+    const calls = fake.calls.length;
+    // The candidate's value is in this process's memory: nothing but the published intent can stop its disclosure.
+    await writeHostPolicy(false);
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'vault_unavailable',
+    });
+    expect(fake.calls).toHaveLength(calls);
+    expect(await subject.get(attempt.id)).toMatchObject({
+      phase: 'saved',
+      exposed_at: null,
+      candidate_item_id: candidateId,
+    });
+    expect(await subject.unresolved()).toEqual([expect.objectContaining({ id: attempt.id })]);
+    expect(fake.items.has(candidateId)).toBe(true);
+    for (const value of fake.concealed()) expect(output.join('\n')).not.toContain(value);
+
+    // Re-enabled, the same attempt resumes from its saved candidate.
+    await writeHostPolicy(true);
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
   });
 });
 

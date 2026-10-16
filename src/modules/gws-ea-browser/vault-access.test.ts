@@ -150,9 +150,13 @@ function member(email: string, userId: string, changes: Partial<OnePasswordUser>
   return { userId, email, type: 'member', active: true, ...changes };
 }
 
-async function writeHostPolicy(managementServiceAccountId: string | null = MANAGEMENT_ID): Promise<void> {
+async function writeHostPolicy(
+  managementServiceAccountId: string | null = MANAGEMENT_ID,
+  enabled = true,
+): Promise<void> {
   await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    enabled,
     accountId: ACCOUNT_ID,
     cliPath: '/nonexistent-onepassword-cli/op',
     managementServiceAccountId,
@@ -254,12 +258,13 @@ beforeEach(async () => {
   const files = onePasswordInstancePaths(instanceRoot);
   resourceFile = files.resourceFile;
   await writeOnePasswordResources(resourceFile, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     instanceId: INSTANCE_ID,
     accountId: ACCOUNT_ID,
     vault: { id: VAULT_ID, createdBy: { kind: 'management_service_account', serviceAccountId: MANAGEMENT_ID } },
     operatorGrant: null,
     runtimeServiceAccountId: RUNTIME_ID,
+    retiredRuntimeServiceAccountIds: [],
   });
   await writePrivateFile(files.runtimeTokenFile, RUNTIME_TOKEN);
   vault = new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
@@ -403,6 +408,15 @@ describe('sharing with the principal', () => {
     fs.rmSync(resourceFile);
     expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_unavailable' });
     expect(providerOpened).toBe(false);
+  });
+
+  it('shares nothing and lists nothing while the operator has disabled 1Password, though its management account remains', async () => {
+    await writeHostPolicy(MANAGEMENT_ID, false);
+    expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_unavailable' });
+    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'vault_unavailable' });
+    expect(providerOpened).toBe(false);
+    expect(onePassword.calls).toEqual([]);
+    expect(sdk.create).not.toHaveBeenCalled();
   });
 });
 

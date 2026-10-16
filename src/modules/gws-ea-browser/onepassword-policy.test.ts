@@ -43,7 +43,8 @@ async function temporaryRoot(): Promise<string> {
 
 function hostPolicy(overrides: Partial<OnePasswordHostPolicy> = {}): OnePasswordHostPolicy {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    enabled: true,
     accountId: ACCOUNT_ID,
     cliPath: '/opt/homebrew/bin/op',
     managementServiceAccountId: MANAGEMENT_ID,
@@ -53,12 +54,13 @@ function hostPolicy(overrides: Partial<OnePasswordHostPolicy> = {}): OnePassword
 
 function resources(overrides: Partial<OnePasswordResources> = {}): OnePasswordResources {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     instanceId: INSTANCE_ID,
     accountId: ACCOUNT_ID,
     vault: { id: VAULT_ID, createdBy: { kind: 'management_service_account', serviceAccountId: MANAGEMENT_ID } },
     operatorGrant: { userId: OPERATOR_USER_ID, permissions: ['allow_managing'] },
     runtimeServiceAccountId: RUNTIME_ID,
+    retiredRuntimeServiceAccountIds: [],
     ...overrides,
   };
 }
@@ -141,6 +143,13 @@ describe('the host 1Password policy', () => {
     });
   });
 
+  it('records the disabled intent beside the account and management identity it keeps', async () => {
+    const paths = onePasswordHostPaths(await temporaryRoot());
+    const disabled = hostPolicy({ enabled: false });
+    await writeOnePasswordHostPolicy(paths.policyFile, disabled);
+    expect(await readOnePasswordHostPolicy(paths.policyFile)).toMatchObject({ status: 'ready', policy: disabled });
+  });
+
   it('is absent when neither its directory nor its file exists', async () => {
     const paths = onePasswordHostPaths(await temporaryRoot());
     expect(await readOnePasswordHostPolicy(paths.policyFile)).toEqual({ status: 'absent' });
@@ -168,7 +177,13 @@ describe('the host 1Password policy', () => {
   it.each([
     ['invalid JSON', () => '{"schemaVersion": 1,'],
     ['an unknown field', (raw: Record<string, unknown>) => ({ ...raw, tokenFile: '/tmp/token' })],
-    ['a newer schema', (raw: Record<string, unknown>) => ({ ...raw, schemaVersion: 2 })],
+    ['a newer schema', (raw: Record<string, unknown>) => ({ ...raw, schemaVersion: 3 })],
+    [
+      'the first schema, which had no disabled intent',
+      ({ enabled: _omitted, ...raw }: Record<string, unknown>) => ({ ...raw, schemaVersion: 1 }),
+    ],
+    ['a missing disabled intent', ({ enabled: _omitted, ...raw }: Record<string, unknown>) => raw],
+    ['a disabled intent that is not a boolean', (raw: Record<string, unknown>) => ({ ...raw, enabled: 'no' })],
     ['an account shorthand instead of its ID', (raw: Record<string, unknown>) => ({ ...raw, accountId: 'my' })],
     ['a relative CLI path', (raw: Record<string, unknown>) => ({ ...raw, cliPath: 'bin/op' })],
     ['an unnormalized CLI path', (raw: Record<string, unknown>) => ({ ...raw, cliPath: '/opt/homebrew/../bin/op' })],
@@ -226,6 +241,21 @@ describe("an assistant's 1Password resource record", () => {
     expect(await readOnePasswordResources(resourceFile, { instanceId: INSTANCE_ID })).toEqual({
       status: 'ready',
       resources: staged,
+    });
+  });
+
+  it('keeps the runtime service accounts whose local tokens were deleted, until the assistant is removed', async () => {
+    const instanceRoot = path.join(await temporaryRoot(), INSTANCE_ID.slice(0, 8));
+    await mkdir(instanceRoot, { mode: 0o700 });
+    const { resourceFile } = onePasswordInstancePaths(instanceRoot);
+    const retired = resources({
+      runtimeServiceAccountId: null,
+      retiredRuntimeServiceAccountIds: [RUNTIME_ID, 'RUNTIMESERVICEACCOUNT00002'],
+    });
+    await writeOnePasswordResources(resourceFile, retired);
+    expect(await readOnePasswordResources(resourceFile, { instanceId: INSTANCE_ID })).toEqual({
+      status: 'ready',
+      resources: retired,
     });
   });
 
@@ -296,6 +326,24 @@ describe("an assistant's 1Password resource record", () => {
     const file = await writtenResources();
     const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
     await writeFile(file, JSON.stringify({ ...raw, operatorGrant }));
+    expect(await readOnePasswordResources(file, { instanceId: INSTANCE_ID })).toEqual({
+      status: 'invalid',
+      problem: 'malformed',
+    });
+  });
+
+  it.each([
+    [
+      'the first schema, which kept no retired accounts',
+      { schemaVersion: 1, retiredRuntimeServiceAccountIds: undefined },
+    ],
+    ['a repeated retired account', { retiredRuntimeServiceAccountIds: [MANAGEMENT_ID, MANAGEMENT_ID] }],
+    ['the current runtime account among the retired', { retiredRuntimeServiceAccountIds: [RUNTIME_ID] }],
+    ['a malformed retired account', { retiredRuntimeServiceAccountIds: ['GWS-EA runtime'] }],
+  ])('fails closed on %s', async (_label, edit) => {
+    const file = await writtenResources();
+    const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify({ ...raw, ...edit }));
     expect(await readOnePasswordResources(file, { instanceId: INSTANCE_ID })).toEqual({
       status: 'invalid',
       problem: 'malformed',

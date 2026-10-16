@@ -19,6 +19,7 @@ import { processLock } from '../community-portal/process-lock.js';
 import {
   discardServiceAccountCreation,
   OnePasswordCli,
+  retireCapturedServiceAccount,
   serviceAccountCreationUnproven,
   type OnePasswordAccount,
   type OnePasswordAccountType,
@@ -62,7 +63,7 @@ import { INSTANCE_ID_PATTERN, isRecord } from './validation.js';
 
 export const ONEPASSWORD_CAPABILITY = {
   name: 'onepassword',
-  actions: ['show', 'check', 'enable'],
+  actions: ['show', 'check', 'enable', 'disable'],
   scope: 'host',
   summary: 'Give each compatible assistant its own 1Password vault for the logins it fills and saves.',
   prerequisites: [
@@ -142,6 +143,8 @@ export interface OnePasswordAssistantProvisioning {
   readonly changed: Changed;
   readonly vault_id: string | null;
   readonly runtime_service_account_id: string | null;
+  /** Earlier runtime service accounts whose tokens a disable deleted: only the operator can revoke them. */
+  readonly retired_service_account_ids: readonly string[];
 }
 
 export interface OnePasswordEnableData {
@@ -350,6 +353,7 @@ function provisioning(
     changed: facts.changed,
     vault_id: facts.resources?.vault.id ?? null,
     runtime_service_account_id: facts.resources?.runtimeServiceAccountId ?? null,
+    retired_service_account_ids: facts.resources?.retiredRuntimeServiceAccountIds ?? [],
   };
 }
 
@@ -433,7 +437,7 @@ async function reconcileAssistant(
     }
     effects.done();
     await record({
-      schemaVersion: 1,
+      schemaVersion: 2,
       instanceId,
       accountId: policy.accountId,
       vault: {
@@ -442,6 +446,7 @@ async function reconcileAssistant(
       },
       operatorGrant: null,
       runtimeServiceAccountId: null,
+      retiredRuntimeServiceAccountIds: [],
     });
     await removePrivateFile(vaultIntent);
   }
@@ -636,6 +641,19 @@ async function verifyOperator(cli: OnePasswordCli, operator: OperatorIdentity): 
   return who.userId;
 }
 
+/**
+ * The recorded management service account no longer authenticates. Only it
+ * may administer the vaults it created, so the recovery is its own token,
+ * never a new management account.
+ */
+export function managementUnavailable(serviceAccountId: string, tokenFile: string): GwsEaError {
+  return new GwsEaError(
+    'onepassword_management_unavailable',
+    `The host management service account ${serviceAccountId} cannot authenticate: its token at ${tokenFile} is missing, expired or revoked. Restore that account's token. The vaults it created stay its own, and gws-ea never hands them to a new management account; if it was revoked, manage those vaults on 1Password.com.`,
+    { details: { managementServiceAccountId: serviceAccountId } },
+  );
+}
+
 /** The recorded management service account, proven to be exactly the one its token authenticates as. */
 async function verifyManagement(
   cli: OnePasswordCli,
@@ -643,6 +661,8 @@ async function verifyManagement(
   expected: string,
 ): Promise<void> {
   const who = await cli.whoami(identity);
+  if (who.status === 'failed' && ['not_signed_in', 'token_unavailable', 'not_found'].includes(who.reason))
+    throw managementUnavailable(expected, identity.tokenFile);
   if (who.status !== 'ok') throw hostProviderError(who.reason, 'management');
   if (who.userId !== expected)
     throw new GwsEaError(
@@ -795,7 +815,8 @@ export async function enableOnePassword(
       managementServiceAccountId = await bootstrapManagement(cli, operator, hostPaths, management, effects);
     }
     const policy = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      enabled: true,
       accountId,
       cliPath: cli.executable,
       managementServiceAccountId,
@@ -836,9 +857,182 @@ export async function enableOnePassword(
   });
 }
 
-/** Whether the operator has set 1Password up on this host; an unusable policy counts, so its owner hears of it. */
+/** One assistant once 1Password is disabled: what happened to its local runtime token, and what only the operator can do. */
+export interface OnePasswordAssistantDisable {
+  readonly instance_id: string;
+  /** `pending` when its record cannot be used safely, so its token was kept for the operator to inspect. */
+  readonly outcome: 'disabled' | 'pending';
+  readonly reason: string | null;
+  readonly changed: Changed;
+  readonly vault_id: string | null;
+  /** Deleted by this run, already absent, or kept beside a record that cannot be used safely. */
+  readonly runtime_token: 'deleted' | 'absent' | 'kept';
+  /** Every runtime service account whose token is gone from this host: deleting a token never revokes its account. */
+  readonly revoke_service_account_ids: readonly string[];
+  /** The name of a runtime service account whose creation was never verified, so it may exist unrecorded. */
+  readonly unproven_service_account: string | null;
+}
+
+export interface OnePasswordDisableData {
+  readonly name: 'onepassword';
+  readonly scope: 'host';
+  readonly enabled: false;
+  /** Null when 1Password was never enabled on this host. */
+  readonly account_id: string | null;
+  /** Kept for re-enabling and removal; no assistant can use it while disabled. */
+  readonly management_service_account_id: string | null;
+  readonly assistants: readonly OnePasswordAssistantDisable[];
+}
+
+/** Every registered assistant's instance lock, or none: a busy one refuses before anything changes. */
+async function underEveryAssistantLock<T>(
+  paths: ControlPlanePaths,
+  instanceIds: readonly string[],
+  work: () => Promise<T>,
+): Promise<T> {
+  const releases: Array<() => void> = [];
+  try {
+    for (const instanceId of instanceIds) {
+      await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
+      const release = await processLock(paths.instanceLock(instanceId));
+      if (!release)
+        throw new GwsEaError(
+          'instance_busy',
+          `Assistant ${instanceId} is undergoing another operation; nothing was changed. Retry once it finishes.`,
+          { details: { instanceId } },
+        );
+      releases.push(release);
+    }
+    return await work();
+  } finally {
+    for (const release of releases.reverse()) release();
+  }
+}
+
+/**
+ * Delete one assistant's local runtime token, under its lock, once the
+ * disabled intent is published. The account it authenticates stays on
+ * 1Password.com until the operator revokes it, so its ID moves to the
+ * record's retired accounts, deleted token first: a crash in between leaves a
+ * recorded account without a token, which a rerun retires.
+ */
+async function retireRuntimeAccess(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  accountId: string,
+  recordEffect: OnePasswordDependencies['recordEffect'],
+): Promise<OnePasswordAssistantDisable> {
+  const effects = new Effects(recordEffect);
+  const files = onePasswordInstancePaths(paths.instanceRoot(instanceId));
+  const entry = (facts: Partial<OnePasswordAssistantDisable>): OnePasswordAssistantDisable => ({
+    instance_id: instanceId,
+    outcome: 'disabled',
+    reason: null,
+    changed: effects.changed,
+    vault_id: null,
+    runtime_token: 'absent',
+    revoke_service_account_ids: [],
+    unproven_service_account: null,
+    ...facts,
+  });
+  const read = await readOnePasswordResources(files.resourceFile, { instanceId, accountId });
+  if (read.status === 'invalid')
+    return entry({
+      outcome: 'pending',
+      reason: pendingMessage('resources_invalid', { file: files.resourceFile }),
+      runtime_token: (await tokenState(files.runtimeTokenFile)) === 'absent' ? 'absent' : 'kept',
+    });
+  // A runtime token is only ever minted for a recorded vault.
+  if (read.status === 'absent') return entry({});
+  let resources = read.resources;
+  const present = (await tokenState(files.runtimeTokenFile)) !== 'absent';
+  let unproven: string | null = null;
+  const current = resources.runtimeServiceAccountId;
+  if (current !== null) {
+    if (present) {
+      effects.starting();
+      await removePrivateFile(files.runtimeTokenFile);
+      effects.done();
+    }
+    resources = {
+      ...resources,
+      runtimeServiceAccountId: null,
+      retiredRuntimeServiceAccountIds: [...resources.retiredRuntimeServiceAccountIds, current],
+    };
+    effects.starting();
+    await writeOnePasswordResources(files.resourceFile, resources);
+    effects.done();
+  } else if (present || (await serviceAccountCreationUnproven(files.runtimeTokenFile))) {
+    // A token captured but never verified names an account gws-ea cannot identify: it stays an unproven creation.
+    const reservation = await getInstanceReservation(paths, instanceId);
+    unproven = resourceNames(reservation.exclusive_resource_claims.workspace_email, instanceId).runtimeServiceAccount;
+    if (present) {
+      effects.starting();
+      await retireCapturedServiceAccount(files.runtimeTokenFile, unproven);
+      effects.done();
+    }
+  }
+  return entry({
+    vault_id: resources.vault.id,
+    runtime_token: present ? 'deleted' : 'absent',
+    revoke_service_account_ids: resources.retiredRuntimeServiceAccountIds,
+    unproven_service_account: unproven,
+  });
+}
+
+/**
+ * Disable 1Password on this host (KTD9). The disabled intent is published
+ * first, under the host lock and every assistant's lock: each host re-reads
+ * it before any listing, fill, disclosure, write or share, so running and
+ * restarted hosts stop at once. Then each local runtime token is deleted.
+ * Vaults and their items, every recorded ID, unfinished credential attempts
+ * and the management service account stay; it needs no provider, and it
+ * revokes nothing: the result names each account only the operator can revoke.
+ */
+export async function disableOnePassword(
+  paths: ControlPlanePaths,
+  dependencies: Pick<OnePasswordDependencies, 'recordEffect'> = {},
+): Promise<OnePasswordDisableData> {
+  return underHostLock(paths, async () => {
+    const hostPaths = onePasswordHostPaths(paths.configRoot);
+    const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
+    if (read.status === 'invalid')
+      throw new GwsEaError(
+        'onepassword_policy_invalid',
+        `The 1Password host policy cannot be used safely (${read.problem}). Inspect ${hostPaths.policyFile} before retrying.`,
+      );
+    const disabled = { name: 'onepassword', scope: 'host', enabled: false } as const;
+    if (read.status === 'absent')
+      return { ...disabled, account_id: null, management_service_account_id: null, assistants: [] };
+    const { policy } = read;
+    const ids = Object.keys((await readRegistry(paths)).instances).sort();
+    return underEveryAssistantLock(paths, ids, async () => {
+      if (policy.enabled) {
+        const effects = new Effects(dependencies.recordEffect);
+        effects.starting();
+        await writeOnePasswordHostPolicy(hostPaths.policyFile, { ...policy, enabled: false });
+        effects.done();
+      }
+      const assistants: OnePasswordAssistantDisable[] = [];
+      for (const id of ids)
+        assistants.push(await retireRuntimeAccess(paths, id, policy.accountId, dependencies.recordEffect));
+      return {
+        ...disabled,
+        account_id: policy.accountId,
+        management_service_account_id: policy.managementServiceAccountId,
+        assistants,
+      };
+    });
+  });
+}
+
+/**
+ * Whether the operator has 1Password enabled on this host; an unusable policy
+ * counts, so its owner hears of it. A disabled host provisions nothing.
+ */
 export async function onePasswordEnabled(paths: ControlPlanePaths): Promise<boolean> {
-  return (await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile)).status !== 'absent';
+  const read = await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile);
+  return read.status === 'invalid' || (read.status === 'ready' && read.policy.enabled);
 }
 
 /**
@@ -855,7 +1049,7 @@ export async function provisionAssistantVault(
   const { paths, instanceId } = operation;
   const hostPaths = onePasswordHostPaths(paths.configRoot);
   const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
-  if (read.status === 'absent') return undefined;
+  if (read.status === 'absent' || (read.status === 'ready' && !read.policy.enabled)) return undefined;
   const hostPending = (reason: OnePasswordPendingReason): OnePasswordAssistantProvisioning =>
     provisioning(instanceId, 'pending', {
       reason,
@@ -921,6 +1115,8 @@ export interface OnePasswordAssistantReadiness {
   readonly provisioning: 'ready' | 'incomplete' | 'absent' | 'invalid' | 'not_applicable';
   readonly vault_id: string | null;
   readonly runtime_service_account_id: string | null;
+  /** Runtime service accounts whose tokens a disable deleted; only the operator can revoke them. */
+  readonly retired_service_account_ids: readonly string[];
   readonly recorded_grants: {
     readonly operator: { readonly user_id: string; readonly permissions: readonly string[] } | null;
     readonly runtime: readonly string[] | null;
@@ -996,6 +1192,7 @@ async function localReadiness(
     provisioning: 'not_applicable',
     vault_id: null,
     runtime_service_account_id: null,
+    retired_service_account_ids: [],
     recorded_grants: { operator: null, runtime: null },
     runtime_token: 'absent',
     unproven_creation: null,
@@ -1042,6 +1239,7 @@ async function localReadiness(
   if (read.status === 'absent') return { readiness: { ...facts, provisioning: 'absent' }, files };
   const resources = read.resources;
   const ready = resources.runtimeServiceAccountId !== null && token === 'present';
+  const retired = resources.retiredRuntimeServiceAccountIds;
   return {
     resources,
     files,
@@ -1050,6 +1248,7 @@ async function localReadiness(
       provisioning: ready ? 'ready' : 'incomplete',
       vault_id: resources.vault.id,
       runtime_service_account_id: resources.runtimeServiceAccountId,
+      retired_service_account_ids: retired,
       recorded_grants: {
         operator: resources.operatorGrant
           ? { user_id: resources.operatorGrant.userId, permissions: resources.operatorGrant.permissions }
@@ -1059,12 +1258,16 @@ async function localReadiness(
       reason:
         resources.runtimeServiceAccountId !== null && token !== 'present'
           ? pendingMessage('runtime_token_unavailable', { serviceAccountId: resources.runtimeServiceAccountId })
-          : null,
+          : resources.runtimeServiceAccountId === null && retired.length
+            ? `Its runtime token was deleted when 1Password was disabled; enabling it again mints a replacement. Revoke ${retired.join(', ')} on 1Password.com if still listed.`
+            : null,
     },
   };
 }
 
 const LIMIT_SPENT = "Not checked: 1Password's request limit is spent.";
+const DISABLED_REASON =
+  'The operator disabled 1Password: no assistant can use its vault. Every vault, its items and the recorded IDs are kept.';
 
 function checkReason(reason: OnePasswordFailureReason): string {
   return `1Password answered ${reason.replaceAll('_', ' ')}.`;
@@ -1088,7 +1291,11 @@ export async function inspectOnePasswordCapability(
           status: 'unknown',
           reason: `The 1Password host policy cannot be used safely (${read.problem}). Inspect ${hostPaths.policyFile}.`,
         }
-      : { status: read.status === 'ready' ? 'enabled' : 'disabled', reason: null };
+      : read.status === 'absent'
+        ? { status: 'disabled', reason: null }
+        : read.policy.enabled
+          ? { status: 'enabled', reason: null }
+          : { status: 'disabled', reason: DISABLED_REASON };
   const ids = Object.keys((await readRegistry(paths)).instances).sort();
   const locals = [];
   for (const id of ids) locals.push({ id, ...(await localReadiness(paths, id, policy?.accountId)) });
@@ -1237,7 +1444,8 @@ export async function onePasswordCapabilityCatalog(paths: ControlPlanePaths): Pr
     scope: ONEPASSWORD_CAPABILITY.scope,
     actions: ONEPASSWORD_CAPABILITY.actions,
     summary: ONEPASSWORD_CAPABILITY.summary,
-    activation: read.status === 'ready' ? 'enabled' : read.status === 'absent' ? 'disabled' : 'unknown',
+    activation:
+      read.status === 'invalid' ? 'unknown' : read.status === 'ready' && read.policy.enabled ? 'enabled' : 'disabled',
   };
 }
 
@@ -1293,10 +1501,94 @@ function distinctActions(actions: readonly NextAction[]): NextAction[] {
   });
 }
 
-/** Every pending or skipped assistant's step, each once; a ready host is checked next. */
+/**
+ * What only the operator can do for runtime service accounts whose tokens
+ * left this host: gws-ea never revokes one, and cannot tell whether it was.
+ */
+export function onePasswordRevocation(
+  owed: readonly { readonly instanceId: string; readonly serviceAccountIds: readonly string[] }[],
+): Extract<NextAction, { readonly kind: 'external' }> | undefined {
+  const named = owed.flatMap(({ instanceId, serviceAccountIds }) =>
+    serviceAccountIds.map((id) => `${id} (assistant ${instanceId})`),
+  );
+  return named.length
+    ? {
+        kind: 'external',
+        instruction: `Revoke these runtime service accounts on 1Password.com under Developer > Directory, if still listed: ${named.join(', ')}. gws-ea deleted their tokens from this host but cannot revoke the accounts.`,
+      }
+    : undefined;
+}
+
+/** Every pending or skipped assistant's step, each once; a ready host is checked next. Replaced accounts are named to revoke. */
 export function onePasswordEnableNextActions(data: OnePasswordEnableData): readonly NextAction[] {
   const actions = distinctActions(data.assistants.flatMap(assistantActions));
-  return actions.length ? actions : [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] }];
+  const revocation = onePasswordRevocation(
+    data.assistants.map((entry) => ({
+      instanceId: entry.instance_id,
+      serviceAccountIds: entry.retired_service_account_ids,
+    })),
+  );
+  return [
+    ...(actions.length
+      ? actions
+      : [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] } as const]),
+    ...(revocation ? [revocation] : []),
+  ];
+}
+
+/** What a disable leaves to the operator: each account to revoke, each unproven creation, each record to inspect. */
+export function onePasswordDisableNextActions(data: OnePasswordDisableData): readonly NextAction[] {
+  const revocation = onePasswordRevocation(
+    data.assistants.map((entry) => ({
+      instanceId: entry.instance_id,
+      serviceAccountIds: entry.revoke_service_account_ids,
+    })),
+  );
+  return [
+    ...(revocation ? [revocation] : []),
+    ...data.assistants.flatMap((entry): NextAction[] => [
+      ...(entry.unproven_service_account
+        ? [
+            {
+              kind: 'external' as const,
+              instruction: `Assistant ${entry.instance_id}: 1Password may hold a runtime service account named "${entry.unproven_service_account}" that gws-ea never verified. Revoke it on 1Password.com under Developer > Directory if it is listed.`,
+            },
+          ]
+        : []),
+      ...(entry.reason
+        ? [{ kind: 'external' as const, instruction: `Assistant ${entry.instance_id}: ${entry.reason}` }]
+        : []),
+    ]),
+    { kind: 'command', argv: ['gws-ea', 'capabilities', 'show', 'onepassword'] },
+  ];
+}
+
+/** The terminal account of a disable: what stopped, what was kept, what was deleted locally, and what was not done. */
+export function onePasswordDisableReport(data: OnePasswordDisableData): {
+  readonly headline: string;
+  readonly details: readonly string[];
+} {
+  if (data.account_id === null)
+    return { headline: '1Password is not enabled on this host; nothing was changed.', details: [] };
+  return {
+    headline: '1Password disabled host-wide: no assistant can use its vault until it is enabled again.',
+    details: [
+      `Kept: every vault and its items, each assistant's recorded IDs and unfinished credential attempts, and the host management service account ${data.management_service_account_id ?? 'none'}, which no assistant can use while disabled.`,
+      ...data.assistants.map((entry) =>
+        entry.runtime_token === 'deleted'
+          ? `Assistant ${entry.instance_id}: runtime token deleted from this host.`
+          : entry.runtime_token === 'kept'
+            ? `Assistant ${entry.instance_id}: runtime token kept, because its record cannot be used safely.`
+            : `Assistant ${entry.instance_id}: no runtime token was on this host.`,
+      ),
+      ...(data.assistants.some((entry) => entry.revoke_service_account_ids.length)
+        ? [
+            'Deleting a token does not revoke its service account on 1Password.com; see below for what is still yours to do.',
+          ]
+        : []),
+      'Enable it again with gws-ea capabilities enable onepassword: each assistant keeps its vault and gets a new runtime service account through your 1Password sign-in.',
+    ],
+  };
 }
 
 /** The pause create or resume reports when 1Password provisioning waits on the operator. */
@@ -1361,7 +1653,7 @@ export function onePasswordCapabilityLines(
   const lines = [
     `${capability.name} (host): ${capability.summary}`,
     `  Activation: ${capability.activation.status}${capability.account_id ? `; account: ${capability.account_id}` : ''}`,
-    ...(capability.activation.status === 'enabled'
+    ...(capability.account_id !== null
       ? [
           `  Management service account: ${capability.management.service_account_id ?? 'none'} (token ${capability.management.token}; ${capability.management.status.replace('_', ' ')})`,
           `  Account type: ${capability.quota.account_type ?? (capability.quota.status === 'not_checked' ? 'not checked' : 'unknown')}`,
@@ -1393,6 +1685,11 @@ export function onePasswordCapabilityLines(
         `  Assistant ${assistant.instance_id}`,
         `    Release: ${assistant.compatibility}; provisioning: ${assistant.provisioning.replace('_', ' ')}`,
         `    Vault: ${assistant.vault_id ?? 'none'}; runtime account: ${assistant.runtime_service_account_id ?? 'none'}; token: ${assistant.runtime_token}`,
+        ...(assistant.retired_service_account_ids.length
+          ? [
+              `    Retired runtime accounts, to revoke on 1Password.com: ${assistant.retired_service_account_ids.join(', ')}`,
+            ]
+          : []),
         `    Grants: operator ${assistant.recorded_grants.operator?.permissions.join(', ') ?? 'none'}; runtime ${assistant.recorded_grants.runtime?.join(', ') ?? 'none'}`,
         `    Access: ${assistant.access.status.replace('_', ' ')}; Write: ${assistant.write}`,
         ...(assistant.unproven_creation
@@ -1407,8 +1704,8 @@ export function onePasswordCapabilityLines(
   return lines;
 }
 
-/** Exact recovery for this capability's host-level error codes. */
-export function onePasswordRecovery(error: unknown): readonly NextAction[] {
+/** Exact recovery for this capability's host-level error codes; a busy command is retried as it was given. */
+export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable' = 'enable'): readonly NextAction[] {
   if (!(error instanceof GwsEaError)) return [];
   const external: NextAction = { kind: 'external', instruction: error.message };
   switch (error.code) {
@@ -1429,7 +1726,10 @@ export function onePasswordRecovery(error: unknown): readonly NextAction[] {
     case 'onepassword_busy':
     case 'instance_busy':
     case 'registry_busy':
-      return [{ kind: 'external', instruction: 'Let the other operation finish, then retry.' }, enableCommand()];
+      return [
+        { kind: 'external', instruction: 'Let the other operation finish, then retry.' },
+        { kind: 'command', argv: ['gws-ea', 'capabilities', command, 'onepassword'] },
+      ];
     case 'onepassword_cli_missing':
     case 'onepassword_cli_untrusted':
     case 'onepassword_cli_unavailable':

@@ -1,5 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -15,12 +27,16 @@ import {
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { serviceAccountCreationUnproven } from '../modules/gws-ea-browser/onepassword-cli.js';
 import {
+  disableOnePassword,
   enableOnePassword,
   inspectOnePasswordCapability,
+  onePasswordEnabled,
   onePasswordCapabilityLines,
   onePasswordEnableNextActions,
   onePasswordNextActions,
+  onePasswordRecovery,
   onePasswordReleaseCompatibility,
   ONEPASSWORD_CONTRACT,
   provisionAssistantVault,
@@ -181,12 +197,13 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
       // The operator manages the vault the management account created, which minting needs.
       expect(vault.grants.get(OPERATOR_USER_ID)).toBe('allow_viewing,allow_editing,allow_managing');
       expect(record).toEqual({
-        schemaVersion: 1,
+        schemaVersion: 2,
         instanceId: runtime.instance_id,
         accountId: ACCOUNT_ID,
         vault: { id: vault.id, createdBy: { kind: 'management_service_account', serviceAccountId: management[0].id } },
         operatorGrant: { userId: OPERATOR_USER_ID, permissions: ['allow_viewing', 'allow_editing', 'allow_managing'] },
         runtimeServiceAccountId: record.runtimeServiceAccountId,
+        retiredRuntimeServiceAccountIds: [],
       });
       const runtimeAccount = provider.serviceAccounts.get(record.runtimeServiceAccountId!)!;
       expect(runtimeAccount.access).toBe(vault.id);
@@ -205,7 +222,13 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
     expect(await readOnePasswordHostPolicy(hostPaths.policyFile)).toEqual({
       status: 'ready',
       paths: hostPaths,
-      policy: { schemaVersion: 1, accountId: ACCOUNT_ID, cliPath: OP, managementServiceAccountId: management[0].id },
+      policy: {
+        schemaVersion: 2,
+        enabled: true,
+        accountId: ACCOUNT_ID,
+        cliPath: OP,
+        managementServiceAccountId: management[0].id,
+      },
     });
     expect((await readFile(hostPaths.managementTokenFile, 'utf8')).trim()).toBe(management[0].token);
     expect((await stat(hostPaths.managementTokenFile)).mode & 0o777).toBe(0o600);
@@ -574,6 +597,226 @@ describe('recovering an interrupted enable', () => {
   });
 });
 
+describe('disabling and re-enabling 1Password (R13, AE5)', () => {
+  /** Two enabled assistants, sorted by ID, with what each recorded. */
+  async function enabledPair() {
+    const runtimes = [await assistant(), await assistant()].sort((left, right) =>
+      left.instance_id.localeCompare(right.instance_id),
+    );
+    const enabled = await enable();
+    const records = await Promise.all(runtimes.map(async (runtime) => (await resourcesOf(runtime))!));
+    return { runtimes, records, management: enabled.management_service_account_id };
+  }
+
+  it('publishes the disabled intent, then deletes each runtime token, keeping vaults, IDs and the management account', async () => {
+    const { runtimes, records, management } = await enabledPair();
+    const hostPaths = onePasswordHostPaths(paths.configRoot);
+    const managementToken = await readFile(hostPaths.managementTokenFile, 'utf8');
+    const vaults = new Map(provider.vaults);
+    const calls = provider.calls.length;
+    const effects: (true | null)[] = [];
+
+    const disabled = await disableOnePassword(paths, { recordEffect: (effect) => effects.push(effect) });
+
+    // Disabling needs no provider: it works with 1Password unreachable, and revokes nothing.
+    expect(provider.calls.length).toBe(calls);
+    expect(provider.serviceAccounts.size).toBe(3);
+    expect(disabled).toMatchObject({
+      name: 'onepassword',
+      enabled: false,
+      account_id: ACCOUNT_ID,
+      management_service_account_id: management,
+    });
+    expect(disabled.assistants).toEqual(
+      runtimes.map((runtime, index) => ({
+        instance_id: runtime.instance_id,
+        outcome: 'disabled',
+        reason: null,
+        changed: true,
+        vault_id: records[index].vault.id,
+        runtime_token: 'deleted',
+        revoke_service_account_ids: [records[index].runtimeServiceAccountId],
+        unproven_service_account: null,
+      })),
+    );
+    expect(effects.at(-1)).toBe(true);
+    const policy = await readOnePasswordHostPolicy(hostPaths.policyFile);
+    expect(policy).toMatchObject({
+      status: 'ready',
+      policy: { enabled: false, accountId: ACCOUNT_ID, managementServiceAccountId: management },
+    });
+    expect(await readFile(hostPaths.managementTokenFile, 'utf8')).toBe(managementToken);
+    expect(provider.vaults).toEqual(vaults);
+    for (const [index, runtime] of runtimes.entries()) {
+      expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(false);
+      expect(await resourcesOf(runtime)).toEqual({
+        ...records[index],
+        runtimeServiceAccountId: null,
+        retiredRuntimeServiceAccountIds: [records[index].runtimeServiceAccountId],
+      });
+    }
+    expect(await onePasswordEnabled(paths)).toBe(false);
+
+    // Readiness and the catalog say so, naming the identities still to revoke; repeating changes nothing.
+    const shown = await inspectOnePasswordCapability(paths, dependencies());
+    expect(shown.activation.status).toBe('disabled');
+    expect(shown.account_id).toBe(ACCOUNT_ID);
+    expect(shown.assistants.map((entry) => entry.retired_service_account_ids)).toEqual(
+      records.map((record) => [record.runtimeServiceAccountId]),
+    );
+    expect(onePasswordNextActions(shown, false)).toEqual([
+      { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+    ]);
+    const again = await disableOnePassword(paths);
+    expect(
+      again.assistants.map((entry) => [entry.changed, entry.runtime_token, entry.revoke_service_account_ids]),
+    ).toEqual(records.map((record) => [false, 'absent', [record.runtimeServiceAccountId]]));
+  });
+
+  it('publishes the disabled intent before any token goes, so a failed unlink still stops every vault use', async () => {
+    const { runtimes } = await enabledPair();
+    // The second token cannot be deleted safely: another account could have replaced it.
+    const stuck = onePasswordInstancePaths(runtimes[1].instance_root).runtimeTokenFile;
+    await chmod(stuck, 0o644);
+
+    await expect(disableOnePassword(paths)).rejects.toThrow();
+
+    expect(await onePasswordEnabled(paths)).toBe(false);
+    expect(await exists(onePasswordInstancePaths(runtimes[0].instance_root).runtimeTokenFile)).toBe(false);
+    await chmod(stuck, 0o600);
+    const finished = await disableOnePassword(paths);
+    expect(finished.assistants.map((entry) => entry.runtime_token)).toEqual(['absent', 'deleted']);
+  });
+
+  it('refuses before publishing anything while another operation holds an assistant', async () => {
+    const { runtimes } = await enabledPair();
+    await mkdir(path.dirname(paths.instanceLock(runtimes[1].instance_id)), { recursive: true, mode: 0o700 });
+    const release = await processLock(paths.instanceLock(runtimes[1].instance_id));
+    if (!release) throw new Error('The lock was not free');
+    try {
+      await expect(disableOnePassword(paths)).rejects.toMatchObject({ code: 'instance_busy' });
+    } finally {
+      release();
+    }
+    expect(await onePasswordEnabled(paths)).toBe(true);
+    for (const runtime of runtimes)
+      expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(true);
+  });
+
+  it('re-enables on the same vaults, minting replacement runtime accounts only with the operator, and names the old ones', async () => {
+    const { runtimes, records, management } = await enabledPair();
+    await disableOnePassword(paths);
+    const before = provider.calls.length;
+
+    // Replacement needs the operator's own sign-in; without it nothing is minted.
+    provider.signedIn = false;
+    await expect(enable(undefined, {})).rejects.toMatchObject({ code: 'onepassword_sign_in_required' });
+    expect(provider.serviceAccounts.size).toBe(3);
+    expect(await onePasswordEnabled(paths)).toBe(false);
+    provider.signedIn = true;
+
+    const reenabled = await enable(undefined, {});
+
+    expect(reenabled.management_service_account_id).toBe(management);
+    expect(provider.vaults.size).toBe(2);
+    const calls = provider.calls.slice(before);
+    expect(calls.filter((call) => call.args.join(' ').startsWith('vault create'))).toEqual([]);
+    const minted = calls.filter((call) => call.args[0] === 'service-account' && call.args[1] === 'create');
+    expect(minted).toHaveLength(2);
+    // Minted by the operator's desktop sign-in, never by a service account.
+    expect(minted.every((call) => call.env?.OP_SERVICE_ACCOUNT_TOKEN === undefined)).toBe(true);
+    for (const [index, runtime] of runtimes.entries()) {
+      const record = (await resourcesOf(runtime))!;
+      expect(record.vault).toEqual(records[index].vault);
+      expect(record.runtimeServiceAccountId).not.toBeNull();
+      expect(record.runtimeServiceAccountId).not.toBe(records[index].runtimeServiceAccountId);
+      expect(record.retiredRuntimeServiceAccountIds).toEqual([records[index].runtimeServiceAccountId]);
+      expect(await runtimeToken(runtime)).toBe(provider.serviceAccounts.get(record.runtimeServiceAccountId!)!.token);
+      expect(reenabled.assistants[index]).toMatchObject({
+        outcome: 'ready',
+        vault_id: records[index].vault.id,
+        runtime_service_account_id: record.runtimeServiceAccountId,
+        retired_service_account_ids: [records[index].runtimeServiceAccountId],
+      });
+    }
+    const instructions = onePasswordEnableNextActions(reenabled)
+      .flatMap((action) => (action.kind === 'external' ? [action.instruction] : []))
+      .join('\n');
+    for (const record of records) expect(instructions).toContain(record.runtimeServiceAccountId!);
+    expect(instructions).toContain('1Password.com');
+    expect(await onePasswordEnabled(paths)).toBe(true);
+  });
+
+  it('provisions nothing for an assistant created while 1Password is disabled', async () => {
+    await assistant();
+    await enable();
+    await disableOnePassword(paths);
+    const created = await assistant();
+    const calls = provider.calls.length;
+    const result = await withInstanceOperation(paths, created.instance_id, (operation) =>
+      provisionAssistantVault(operation, dependencies()),
+    );
+    expect(result).toBeUndefined();
+    expect(provider.calls.length).toBe(calls);
+    expect(await exists(onePasswordInstancePaths(created.instance_root).resourceFile)).toBe(false);
+  });
+
+  it('turns a captured but unrecorded runtime token into an unproven creation, never minting over it', async () => {
+    const runtime = await assistant();
+    // The token was captured; this process died verifying it.
+    let crashed = false;
+    provider.before = (args) => {
+      if (!crashed && args.join(' ') === 'whoami --format json' && provider.serviceAccounts.size === 2) {
+        crashed = true;
+        throw new Error('The process was killed');
+      }
+      return undefined;
+    };
+    await expect(enable()).rejects.toThrow('The process was killed');
+    provider.before = undefined;
+    const tokenFile = onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile;
+
+    const disabled = await disableOnePassword(paths);
+
+    expect(disabled.assistants[0]).toMatchObject({
+      runtime_token: 'deleted',
+      revoke_service_account_ids: [],
+      unproven_service_account: `GWS-EA ${runtime.instance_id.slice(0, 8)} aya.${runtime.instance_id.slice(0, 8)}@example.test`,
+    });
+    expect(await exists(tokenFile)).toBe(false);
+    expect(await serviceAccountCreationUnproven(tokenFile)).toBe(true);
+    const accounts = provider.serviceAccounts.size;
+    const reenabled = await enable(undefined, {});
+    expect(reenabled.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'service_account_creation_unproven' });
+    expect(provider.serviceAccounts.size).toBe(accounts);
+  });
+
+  it('names the expired management account and its recovery, and never substitutes a new one for its vaults', async () => {
+    const { records, management } = await enabledPair();
+    const hostPaths = onePasswordHostPaths(paths.configRoot);
+    const policy = await readFile(hostPaths.policyFile, 'utf8');
+    // The management account's token was revoked or expired on 1Password.com.
+    provider.serviceAccounts.delete(management);
+    // Disabling still works: it needs no provider.
+    await disableOnePassword(paths);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await enable(undefined, {}).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'onepassword_management_unavailable' });
+      const message = error instanceof Error ? error.message : '';
+      expect(message).toContain(management);
+      expect(message).toContain(hostPaths.managementTokenFile);
+      expect(onePasswordRecovery(error)).toContainEqual({ kind: 'external', instruction: message });
+    }
+    // Nothing was minted or created, and the policy still names the account that created every vault.
+    expect([...provider.serviceAccounts.values()].filter((account) => account.access === 'create_vaults')).toEqual([]);
+    expect(provider.serviceAccounts.size).toBe(2);
+    expect(provider.vaults.size).toBe(2);
+    expect(await readFile(hostPaths.policyFile, 'utf8')).toBe(policy.replace('"enabled": true', '"enabled": false'));
+    for (const record of records) expect(provider.vaults.get(record.vault.id)?.creator).toBe(management);
+  });
+});
+
 describe('choosing the 1Password account', () => {
   it('requires an explicit account without a prompt, naming each one the operator holds', async () => {
     await assistant();
@@ -809,6 +1052,70 @@ describe('the native 1Password capability commands', () => {
       expect(everything).not.toContain(token);
       expect(logs).not.toContain(token);
     }
+  });
+
+  it('disables and re-enables through the published contracts, saying what was kept, deleted and still to revoke', async () => {
+    const runtime = await assistant();
+    await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
+    const record = (await resourcesOf(runtime))!;
+    const retired = record.runtimeServiceAccountId!;
+
+    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
+    expect(disabled.code).toBe(0);
+    const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
+    expectResultContract('capabilities disable onepassword', result);
+    expect(result).toMatchObject({
+      outcome: 'succeeded',
+      changed: true,
+      data: {
+        enabled: false,
+        assistants: [
+          { instance_id: runtime.instance_id, runtime_token: 'deleted', revoke_service_account_ids: [retired] },
+        ],
+      },
+    });
+    expect(result.next_actions).toContainEqual({
+      kind: 'external',
+      instruction: expect.stringContaining(retired),
+    });
+
+    const human = await run(['capabilities', 'disable', 'onepassword']);
+    expect(human.code).toBe(0);
+    const text = human.stdout + human.stderr;
+    expect(text).toContain('1Password disabled');
+    expect(text).toContain(`Kept: every vault and its items`);
+    expect(text).toContain(retired);
+    expect(text).toContain('1Password.com');
+    expect(text).not.toMatch(/\brevoked\b/iu);
+
+    const reenabled = await run(['capabilities', 'enable', 'onepassword', '--json']);
+    expect(reenabled.code).toBe(0);
+    const again = JSON.parse(reenabled.stdout) as Record<string, unknown>;
+    expectResultContract('capabilities enable onepassword', again);
+    expect(again).toMatchObject({
+      outcome: 'succeeded',
+      data: { assistants: [{ vault_id: record.vault.id, retired_service_account_ids: [retired] }] },
+    });
+    const listed = await run(['capabilities', 'list', '--json']);
+    expect(JSON.parse(listed.stdout)).toMatchObject({
+      data: { capabilities: [{ name: 'voice' }, { name: 'browser' }, { name: 'onepassword', activation: 'enabled' }] },
+    });
+
+    const everything = [disabled, human, reenabled].map((output) => output.stdout + output.stderr).join('\n');
+    const logs = await treeText(paths.logsRoot);
+    for (const token of provider.tokens) {
+      expect(everything).not.toContain(token);
+      expect(logs).not.toContain(token);
+    }
+  });
+
+  it('reports a host where 1Password was never enabled as already disabled, changing nothing', async () => {
+    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
+    expect(disabled.code).toBe(0);
+    const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
+    expectResultContract('capabilities disable onepassword', result);
+    expect(result).toMatchObject({ outcome: 'succeeded', changed: false, data: { enabled: false, assistants: [] } });
+    expect(await exists(onePasswordHostPaths(paths.configRoot).directory)).toBe(false);
   });
 
   it('pauses a partial enable with exit 10 and the step that continues it', async () => {

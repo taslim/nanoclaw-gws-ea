@@ -12,6 +12,7 @@ import {
   BROWSER_CAPABILITY_SCHEMA,
   BROWSER_OPERATION_SCHEMA,
   ONEPASSWORD_CAPABILITY_SCHEMA,
+  ONEPASSWORD_DISABLE_SCHEMA,
   ONEPASSWORD_OPERATION_SCHEMA,
 } from './result-schema.js';
 /** The public grammar and discovery metadata, bound to existing domain handlers. */
@@ -311,13 +312,21 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     options: [
       id,
       yes,
+      flag(
+        'delete-vault',
+        "Also delete the assistant's 1Password vault and every item it holds; an empty vault this host created is deleted without it.",
+      ),
       value(
         'abandon',
-        'gcp-project,chat-subscription',
-        'Explicit owned external resources removal may leave behind when they cannot be observed.',
+        'gcp-project,chat-subscription,onepassword',
+        'Explicit owned external resources removal may leave behind when they cannot be observed, or 1Password service accounts left for you to revoke.',
       ),
     ],
-    effects: ['Removes only recorded owned resources; external resource abandonment must be explicit.'],
+    effects: [
+      'Removes only recorded owned resources; external resource abandonment must be explicit.',
+      "Deletes the assistant's 1Password runtime token after its host stops; deletes its vault only when this host's management service account created it and it is empty or --delete-vault was confirmed, and never another vault.",
+      'Never revokes a service account: the receipt outside the instance keeps their IDs for you to revoke on 1Password.com.',
+    ],
     prerequisites: assistantPrerequisites,
     recovery: ['Rerun removal to continue its retained journal after fixing the stated blocker.'],
     examples: ['gws-ea remove --id <instance_id> --yes'],
@@ -545,7 +554,9 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
           ? 'Show the 1Password account, management identity and each assistant’s recorded vault.'
           : command === 'check'
             ? 'Verify each assistant’s vault access and the account’s shared request usage.'
-            : 'Provision one vault and runtime service account for every compatible current and future assistant.',
+            : command === 'enable'
+              ? 'Provision one vault and runtime service account for every compatible current and future assistant.'
+              : 'Stop every assistant’s vault use and delete its runtime token, keeping vaults and their IDs.',
       options:
         command === 'enable'
           ? [
@@ -569,18 +580,29 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
                 'Read-only service-account requests: identities, one vault read per assistant and the shared usage; each counts against the account limit.',
                 'Never prompts the operator, writes to a vault or repairs anything.',
               ]
-            : [
-                "Verifies the operator's 1Password desktop sign-in, which may ask for approval in the app.",
-                'Creates or reuses the host management service account and records the host policy.',
-                'Creates a vault for each compatible assistant, running or stopped, and mints its runtime service account; never starts Chrome or a service.',
-                'Keeps finished assistants on a partial run; a retry continues only what is incomplete.',
-              ],
+            : command === 'disable'
+              ? [
+                  'Publishes the disabled intent first: running and restarted hosts refuse every vault listing, fill, disclosure, write and share.',
+                  'Then deletes each assistant’s runtime token from this host; vaults, their items, recorded IDs, unfinished credential attempts and the management service account stay.',
+                  'Makes no 1Password request and revokes nothing: the result names each runtime service account to revoke on 1Password.com.',
+                ]
+              : [
+                  "Verifies the operator's 1Password desktop sign-in, which may ask for approval in the app.",
+                  'Creates or reuses the host management service account and records the host policy.',
+                  'Creates a vault for each compatible assistant, running or stopped, and mints its runtime service account; never starts Chrome or a service.',
+                  'Keeps finished assistants on a partial run; a retry continues only what is incomplete.',
+                  'After a disable, reuses each vault and mints a replacement runtime service account, naming the earlier ones to revoke.',
+                ],
       prerequisites:
         command === 'enable'
           ? [...ONEPASSWORD_CAPABILITY.prerequisites]
-          : ['A readable managed registry; check also needs the CLI the host recorded.'],
+          : command === 'disable'
+            ? ['The host 1Password lock and every assistant’s instance lock must be free.']
+            : ['A readable managed registry; check also needs the CLI the host recorded.'],
       recovery: [
-        'Follow the reported per-assistant cause; rerun capabilities enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
+        command === 'disable'
+          ? 'Rerun capabilities disable onepassword after a refusal; it continues deleting the tokens that remain. Enable again with capabilities enable onepassword.'
+          : 'Follow the reported per-assistant cause; rerun capabilities enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
       ],
       examples: [
         command === 'enable'
@@ -589,7 +611,11 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       ],
       outputModes: managedModes,
       resultSchema: managedResultSchema(
-        command === 'enable' ? ONEPASSWORD_OPERATION_SCHEMA : ONEPASSWORD_CAPABILITY_SCHEMA,
+        command === 'enable'
+          ? ONEPASSWORD_OPERATION_SCHEMA
+          : command === 'disable'
+            ? ONEPASSWORD_DISABLE_SCHEMA
+            : ONEPASSWORD_CAPABILITY_SCHEMA,
       ),
     }),
   ),

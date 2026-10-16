@@ -60,11 +60,12 @@ export function onePasswordPolicyFile(): string | undefined {
 }
 
 /**
- * Why the vault cannot be used: 1Password is not enabled on this host; this
- * assistant's vault, runtime account or token is not provisioned yet; or a
- * record is unsafe, malformed, or names another instance or account.
+ * Why the vault cannot be used: 1Password is not enabled on this host, or the
+ * operator disabled it; this assistant's vault, runtime account or token is
+ * not provisioned yet; or a record is unsafe, malformed, or names another
+ * instance or account.
  */
-export type BrowserVaultUnavailableReason = 'not_enabled' | 'not_provisioned' | 'invalid_state';
+export type BrowserVaultUnavailableReason = 'not_enabled' | 'disabled' | 'not_provisioned' | 'invalid_state';
 
 /** The provisioned identifiers the vault is bound to; host-only, and never a token. */
 export interface BrowserVaultBinding {
@@ -103,6 +104,8 @@ async function readRuntimeAccess(locators: BrowserVaultLocators): Promise<Runtim
   if (!policyFile) return unavailable('not_enabled');
   const host = await readOnePasswordHostPolicy(policyFile);
   if (host.status !== 'ready') return unavailable(host.status === 'absent' ? 'not_enabled' : 'invalid_state');
+  // The operator's published disable stops every use, however far a job got.
+  if (!host.policy.enabled) return unavailable('disabled');
   const located = locators.browserPolicyFile ?? browserPolicyFile();
   const instanceRoot = located ? instanceRootOf(located) : undefined;
   if (!instanceRoot) return unavailable('invalid_state');
@@ -599,15 +602,26 @@ export class BrowserVault {
   async resolve(handle: string, field: BrowserSecretField, origin: string, assertActive = active): Promise<string> {
     const { client, item } = await this.listed(handle, origin, assertActive);
     const name = field === 'otp' ? 'one-time password?attribute=otp' : field;
+    let value: string;
     try {
       await assertActive();
-      const value = await client.secrets.resolve(`op://${item.vaultId}/${item.id}/${name}`);
+      value = await client.secrets.resolve(`op://${item.vaultId}/${item.id}/${name}`);
       await assertActive();
-      if (!value) throw new BrowserVaultError('no_item_for_site');
-      return value;
     } catch (error) {
       throw await this.error(error);
     }
+    if (!value) throw new BrowserVaultError('no_item_for_site');
+    // A disable or rebinding published while 1Password answered keeps the value out of the page.
+    await this.stillBound(item.vaultId);
+    return value;
+  }
+
+  /** The binding still holds, from local records alone: otherwise it resets and the use is refused. */
+  private async stillBound(vaultId: string): Promise<void> {
+    const access = await readRuntimeAccess(this.locators);
+    if (access.status === 'available' && access.token === this.token && access.binding.vaultId === vaultId) return;
+    this.reset();
+    throw new BrowserVaultError('vault_unavailable');
   }
 }
 

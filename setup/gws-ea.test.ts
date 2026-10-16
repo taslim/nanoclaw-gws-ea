@@ -412,6 +412,22 @@ describe('GWS-EA driver', () => {
       output: process.stderr,
     });
   });
+
+  it('names a chosen vault deletion and its items in the same removal confirmation', async () => {
+    await main(['remove', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(false);
+    const preview = {
+      instanceId: 'x',
+      gcpProject: 'p',
+      onepassword: { vault_id: 'VAULT00000000000000000000A', vault: 'delete', item_count: 4 },
+    };
+    await expect(runtimeOf().confirmRemoval!(preview as never)).resolves.toBe(false);
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: expect.stringMatching(/GCP project p, and delete 1Password vault VAULT0+A with its 4 items\?$/u),
+      initialValue: false,
+      output: process.stderr,
+    });
+  });
 });
 
 describe('GWS-EA terminal presenter', () => {

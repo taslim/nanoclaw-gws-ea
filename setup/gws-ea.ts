@@ -21,6 +21,7 @@ import {
 import { parseInvocation } from '../src/gws-ea/command-parser.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
+import { removalQuestion } from '../src/gws-ea/remove.js';
 import type { OnePasswordAccount } from '../src/modules/gws-ea-browser/onepassword-cli.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
 import type { ToolProviderSetup } from '../src/gws-ea/release-target.js';
@@ -299,11 +300,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
     confirmRemoval: async (preview) =>
-      (await p.confirm({
-        message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
-        initialValue: false,
-        output: process.stderr,
-      })) === true,
+      (await p.confirm({ message: removalQuestion(preview), initialValue: false, output: process.stderr })) === true,
     confirmUpdate: async (preview) =>
       (await p.confirm({
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,

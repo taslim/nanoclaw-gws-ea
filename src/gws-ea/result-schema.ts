@@ -288,6 +288,7 @@ export const ONEPASSWORD_CAPABILITY_SCHEMA = object({
       provisioning: choices('ready', 'incomplete', 'absent', 'invalid', 'not_applicable'),
       vault_id: nullable(text),
       runtime_service_account_id: nullable(text),
+      retired_service_account_ids: array(text),
       recorded_grants: object({
         operator: nullable(object({ user_id: text, permissions: array(text) })),
         runtime: nullable(array(text)),
@@ -318,9 +319,29 @@ export const ONEPASSWORD_OPERATION_SCHEMA = object({
       changed: effect,
       vault_id: nullable(text),
       runtime_service_account_id: nullable(text),
+      retired_service_account_ids: array(text),
     }),
   ),
   future_compatible_assistants: { const: true },
+});
+export const ONEPASSWORD_DISABLE_SCHEMA = object({
+  name: { const: 'onepassword' },
+  scope: { const: 'host' },
+  enabled: { const: false },
+  account_id: nullable(text),
+  management_service_account_id: nullable(text),
+  assistants: array(
+    object({
+      instance_id: text,
+      outcome: choices('disabled', 'pending'),
+      reason: nullable(text),
+      changed: effect,
+      vault_id: nullable(text),
+      runtime_token: choices('deleted', 'absent', 'kept'),
+      revoke_service_account_ids: array(text),
+      unproven_service_account: nullable(text),
+    }),
+  ),
 });
 export const CAPABILITY_LIST_SCHEMA = object({
   capabilities: array({
@@ -360,19 +381,41 @@ const cleanup = object(
   { checkout: text, removed: array(text), incomplete: bool, error: object({ code: ERROR_CODE_SCHEMA, message: text }) },
   ['checkout', 'removed'],
 );
+const vaultOutcome = ['deleted', 'retained', 'gone'] as const;
 const removalPreview = object({
   instanceId: text,
   checkout: text,
   gcpProject: text,
   gcpAccount: text,
   onecliProject: text,
+  onepassword: nullable(
+    object({
+      account_id: text,
+      vault_id: text,
+      owned: bool,
+      item_count: nullable(count),
+      vault: choices('delete', 'retain', ...vaultOutcome),
+      reason: text,
+      runtime_service_account_ids: array(text),
+    }),
+  ),
 });
 const removal = object(
   {
     removed: array(choices('nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files')),
-    abandoned: array(object({ resource: choices('gcp-project', 'chat-subscription'), evidence: text })),
+    abandoned: array(object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword'), evidence: text })),
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
+    onepassword: object({
+      account_id: text,
+      vault_id: text,
+      vault: choices(...vaultOutcome, 'left_behind'),
+      item_count: nullable(count),
+      reason: text,
+      runtime_token: choices('deleted', 'absent'),
+      revoke_service_account_ids: array(text),
+      receipt_file: nullable(text),
+    }),
   },
   ['removed', 'abandoned'],
 );

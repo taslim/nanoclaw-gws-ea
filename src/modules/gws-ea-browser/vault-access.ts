@@ -216,7 +216,9 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
   const { accountId, vaultId } = availability.binding;
   const policyFile = dependencies.onePasswordPolicyFile();
   const host = policyFile === undefined ? undefined : await readOnePasswordHostPolicy(policyFile);
-  if (host?.status !== 'ready' || host.policy.accountId !== accountId) return { status: 'vault_unavailable' };
+  // While the operator has 1Password disabled, its management account is theirs alone: no agent request reaches it.
+  if (host?.status !== 'ready' || !host.policy.enabled || host.policy.accountId !== accountId)
+    return { status: 'vault_unavailable' };
 
   const handoff = async (reason: HandoffReason, guest = false): Promise<ShareOutcome> => {
     log.info('Vault sharing needs the operator', { reason });

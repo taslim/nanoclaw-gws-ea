@@ -25,15 +25,17 @@ export interface Reply {
   readonly exitCode?: number;
 }
 
-interface FakeVault {
+export interface FakeVault {
   readonly id: string;
   readonly name: string;
   /** The service account that created it. */
   readonly creator: string;
   readonly grants: Map<string, string>;
+  /** The items it holds, as `op vault get` counts them. */
+  items: number;
 }
 
-interface FakeServiceAccount {
+export interface FakeServiceAccount {
   readonly id: string;
   readonly name: string;
   readonly token: string;
@@ -144,7 +146,13 @@ export class FakeOnePassword {
     }
     if (args[0] === 'vault' && args[1] === 'create') {
       if (account.access !== 'create_vaults') return { exitCode: 1, stderr: '[ERROR] (403) Forbidden' };
-      const vault: FakeVault = { id: this.#id('VAULT'), name: args[2], creator: account.id, grants: new Map() };
+      const vault: FakeVault = {
+        id: this.#id('VAULT'),
+        name: args[2],
+        creator: account.id,
+        grants: new Map(),
+        items: 0,
+      };
       this.vaults.set(vault.id, vault);
       return { stdout: JSON.stringify({ id: vault.id, name: vault.name, content_version: 1 }) };
     }
@@ -166,7 +174,15 @@ export class FakeOnePassword {
       const vault = this.vaults.get(args[2]);
       if (!vault || (account.access !== vault.id && vault.creator !== account.id))
         return { exitCode: 1, stderr: `[ERROR] "${args[2]}" isn't a vault in this account` };
-      return { stdout: JSON.stringify({ id: vault.id, name: vault.name }) };
+      return { stdout: JSON.stringify({ id: vault.id, name: vault.name, items: vault.items }) };
+    }
+    if (words === `vault delete ${args[2]}`) {
+      const vault = this.vaults.get(args[2]);
+      if (!vault) return { exitCode: 1, stderr: `[ERROR] "${args[2]}" isn't a vault in this account` };
+      // A service account deletes only the vaults it created.
+      if (vault.creator !== account.id) return { exitCode: 1, stderr: '[ERROR] (403) Forbidden' };
+      this.vaults.delete(vault.id);
+      return {};
     }
     throw new Error(`Unexpected service account call: ${words}`);
   }

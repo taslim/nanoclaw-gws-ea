@@ -594,7 +594,12 @@ describe('native public capability journeys', () => {
               actions: ['show', 'check', 'enable', 'disable'],
               assistant_ids: [],
             },
-            { name: 'onepassword', scope: 'host', actions: ['show', 'check', 'enable'], activation: 'disabled' },
+            {
+              name: 'onepassword',
+              scope: 'host',
+              actions: ['show', 'check', 'enable', 'disable'],
+              activation: 'disabled',
+            },
           ],
         },
       },

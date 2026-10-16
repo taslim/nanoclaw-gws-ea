@@ -50,13 +50,21 @@ const item = {
   websites: [website()],
 };
 const resources = (overrides: Partial<OnePasswordResources> = {}): OnePasswordResources => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   instanceId: INSTANCE_ID,
   accountId: ACCOUNT_ID,
   vault: { id: VAULT_ID, createdBy: { kind: 'management_service_account', serviceAccountId: MANAGEMENT_ID } },
   operatorGrant: null,
   runtimeServiceAccountId: RUNTIME_ID,
+  retiredRuntimeServiceAccountIds: [],
   ...overrides,
+});
+const hostPolicy = (enabled = true) => ({
+  schemaVersion: 2 as const,
+  enabled,
+  accountId: ACCOUNT_ID,
+  cliPath: '/opt/homebrew/bin/op',
+  managementServiceAccountId: MANAGEMENT_ID,
 });
 const vault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
 
@@ -65,12 +73,7 @@ beforeEach(async () => {
   const configRoot = path.join(directory, 'config');
   await mkdir(configRoot, { mode: 0o700 });
   onePasswordPolicyFile = onePasswordHostPaths(configRoot).policyFile;
-  await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
-    schemaVersion: 1,
-    accountId: ACCOUNT_ID,
-    cliPath: '/opt/homebrew/bin/op',
-    managementServiceAccountId: MANAGEMENT_ID,
-  });
+  await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy());
   instanceRoot = path.join(directory, INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
   browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
@@ -191,6 +194,44 @@ describe('availability from the provisioned resources', () => {
       reason: 'vault_unavailable',
     });
     expect(sdk.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses every use while the operator has disabled 1Password, without reaching it', async () => {
+    const subject = vault();
+    const [choice] = await subject.itemsForOrigin('https://shop.example');
+    const requests = (): number =>
+      [sdk.create, sdk.vaults, sdk.list, sdk.resolve].reduce((total, call) => total + call.mock.calls.length, 0);
+    const before = requests();
+    await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy(false));
+
+    expect(await subject.availability()).toEqual({ status: 'unavailable', reason: 'disabled' });
+    for (const use of [
+      () => subject.itemsForOrigin('https://shop.example'),
+      () => subject.refresh(),
+      () => subject.resolve(choice.item_handle, 'password', 'https://shop.example'),
+      () => subject.readItem(VAULT_ID, 'item1'),
+    ])
+      await expect(use()).rejects.toMatchObject({ reason: 'vault_unavailable' });
+    expect(requests()).toBe(before);
+
+    // Re-enabled with its records and token in place, the same vault serves again.
+    await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy());
+    expect(await subject.availability()).toMatchObject({ status: 'available', binding: { vaultId: VAULT_ID } });
+  });
+
+  it('keeps a secret resolved while the operator disabled 1Password out of the page', async () => {
+    const subject = vault();
+    const [choice] = await subject.itemsForOrigin('https://shop.example');
+    // The disable is published while 1Password answers the fill's one request.
+    sdk.resolve.mockImplementation(async () => {
+      await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy(false));
+      return SECRET;
+    });
+    const refused = await subject
+      .resolve(choice.item_handle, 'password', 'https://shop.example')
+      .catch((error: unknown) => error);
+    expect(refused).toMatchObject({ reason: 'vault_unavailable' });
+    expect(String(refused)).not.toContain(SECRET);
   });
 
   it('refuses a resource record for another instance or account, and an unlocatable instance', async () => {
