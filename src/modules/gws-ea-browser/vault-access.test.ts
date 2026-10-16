@@ -431,7 +431,11 @@ describe('the operator handoff', () => {
     expect(message).not.toMatch(
       /invitation (?:is|was|has been) sent|will (?:be )?invite|you(?:'ll| will) (?:get|receive)/iu,
     );
-    expect(message).not.toMatch(/gws-ea|\bop\b|--/u);
+    // The principal forwards it as written: no command, tool or provider-administration term to learn, and no
+    // request to enable a vault that already works.
+    expect(message).not.toMatch(
+      /gws-ea|\bop\b|--|\bCLI\b|service account|token|capabilit|\benabl|vault_access|operator_message/iu,
+    );
     expectNoSecrets(data);
     return message;
   }

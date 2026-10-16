@@ -61,7 +61,7 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if ('commands' in command)
     return [
       `Usage: gws-ea ${command.path.join(' ')} <action> [options]`,
-      'Operate optional capabilities. Assistant-scoped browser commands require an explicit --id; voice is host-wide.',
+      'Operate optional capabilities. Assistant-scoped browser commands require an explicit --id; voice and 1Password are host-wide.',
       '',
       'Scope: each registered command declares host or assistant ownership.',
       'Commands:',

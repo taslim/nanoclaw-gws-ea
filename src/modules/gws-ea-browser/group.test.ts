@@ -101,6 +101,8 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).toMatch(/exactly as written/u);
   expect(guidance).toMatch(/never promise an invitation/iu);
   expect(guidance).toMatch(/refresh/u);
+  // Operator setup stays the operator's: main never relays its commands or provider-administration terms.
+  expect(guidance).not.toMatch(/gws-ea|capabilit|service account/iu);
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
   expect(
     (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,

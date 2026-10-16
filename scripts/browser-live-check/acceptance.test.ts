@@ -104,6 +104,12 @@ describe('post-deployment browser acceptance evidence', () => {
     await expect(beginAcceptance(root, 'owner-run')).rejects.toMatchObject({ code: 'EEXIST' });
   });
 
+  it('documents what the receipt of every recorded scenario must establish, and no other scenario', async () => {
+    const readme = await readFile(new URL('./README.md', import.meta.url), 'utf8');
+    const documented = [...readme.matchAll(/^\| `([a-z_]+)` +\| \S.*\S +\|$/gmu)].map(([, name]) => name);
+    expect(documented).toEqual([...acceptanceScenarios]);
+  });
+
   it('attributes native request timestamps and labels the remaining time as model and orchestration', () => {
     expect(calculatePhases(start, at(22), nativeEvidence())).toEqual({
       transportMs: 4_000,

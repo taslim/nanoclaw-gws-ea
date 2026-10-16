@@ -314,12 +314,12 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       yes,
       flag(
         'delete-vault',
-        "Also delete the assistant's 1Password vault and every item it holds; an empty vault this host created is deleted without it.",
+        "Also delete the assistant's 1Password vault with every item it holds, when this host created it; an empty one is deleted without this flag.",
       ),
       value(
         'abandon',
         'gcp-project,chat-subscription,onepassword',
-        'Explicit owned external resources removal may leave behind when they cannot be observed, or 1Password service accounts left for you to revoke.',
+        'Explicit owned external resources removal may leave behind when they cannot be observed; onepassword also closes the receipt naming service accounts you revoked.',
       ),
     ],
     effects: [
@@ -327,9 +327,15 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       "Deletes the assistant's 1Password runtime token after its host stops; deletes its vault only when this host's management service account created it and it is empty or --delete-vault was confirmed, and never another vault.",
       'Never revokes a service account: the receipt outside the instance keeps their IDs for you to revoke on 1Password.com.',
     ],
-    prerequisites: assistantPrerequisites,
-    recovery: ['Rerun removal to continue its retained journal after fixing the stated blocker.'],
-    examples: ['gws-ea remove --id <instance_id> --yes'],
+    prerequisites: [
+      ...assistantPrerequisites,
+      '--delete-vault needs the 1Password CLI this host recorded and the management service account that created the vault; without them removal pauses before any change.',
+    ],
+    recovery: [
+      'Rerun removal to continue its retained journal after fixing the stated blocker.',
+      'After revoking the service accounts it names on 1Password.com, close the kept receipt with gws-ea remove --id <instance_id> --yes --abandon onepassword.',
+    ],
+    examples: ['gws-ea remove --id <instance_id> --yes', 'gws-ea remove --id <instance_id> --delete-vault'],
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('remove')),
   },
@@ -511,7 +517,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
           : command === 'check'
             ? 'Check Chrome and agent-network isolation without changing state.'
             : command === 'enable'
-              ? 'Enable one assistant’s host browser with email code/link sign-in.'
+              ? 'Enable one assistant’s host browser; it signs in with emailed codes and links, and its 1Password vault once provisioned.'
               : 'Disable one assistant’s browser.',
       options: [id],
       effects:

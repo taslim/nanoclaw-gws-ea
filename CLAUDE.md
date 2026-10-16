@@ -75,6 +75,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
 | `src/modules/gws-ea-browser/` | Optional host Playwright runtime, private Chrome pipe, public-only proxy, job queue, sign-in, purchase authority, recipes and watches |
+| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning, disable and removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -212,14 +213,45 @@ resume an approved row at host start; they must make re-entry idempotent.
 
 The optional GWS-EA host browser has a separate sign-in boundary from API
 credential injection: its Chrome traffic uses a per-assistant public-only proxy,
-never the credential gateway. It signs in with emailed codes and magic links,
-including a code the principal relays through main. The existing isolated
-external-email agent interprets assistant-mail credentials in a per-claim system
-session; the host alone inserts codes or follows validated same-site links into a
-validated HTTPS frame, and the browser agent receives outcomes only. Profile and
-staging data live under `<instance root>/browser/`, outside routine snapshot
-roots. There is no stored password, Keychain credential store, debugging TCP
-endpoint or takeover portal.
+never the credential gateway. It signs in with logins from the assistant's own
+1Password vault and with emailed codes and magic links, including a code the
+principal relays through main; the existing isolated external-email agent
+interprets assistant-mail codes and links in a per-claim system session. The
+host alone reads, generates, saves and fills credentials into a validated HTTPS
+frame; agents see opaque item handles and outcomes only.
+
+The operator provisions 1Password host-wide (see
+[docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
+`gws-ea capabilities enable onepassword`, their desktop sign-in mints a host
+management service account that may only create vaults. It creates one vault
+for each compatible assistant, and for each one created later, and the operator
+mints that assistant's runtime service account with read/write access to only
+its vault. A signup or password change saves the generated password in the
+vault before any site sees it. Passwords change only on logins the host saved
+itself whose username and site are unchanged; logins the principal added or
+edited, and sign-in email, phone, two-factor and payment-method changes on any
+account, are refused. A confirmed change keeps both credentials until the
+principal moves the new password into the original login (automatic promotion
+stays off until live acceptance proves stale writes are refused). Main asks the
+host to share the vault, view and edit, with the principal's exact confirmed
+1Password user through the management account; when it cannot, the principal
+gets a message to forward to their operator.
+
+`disable` stops every vault use at once and deletes runtime tokens, keeping
+vaults, items, IDs and the management account; re-enabling mints replacement
+runtime accounts through the operator's sign-in. Removal deletes the runtime
+token once the host stops, and the vault only when this host's management
+account created it and it is empty or `--delete-vault` was confirmed. Nothing
+revokes a service account: the operator does that on 1Password.com, and the
+removal receipt outside the instance keeps their IDs until
+`--abandon onepassword` closes it. Every service account in the 1Password
+account shares one daily request limit; `capabilities check onepassword`
+reports its usage, and an exhausted limit returns `rate_limited` without
+retries. Tokens are owner-only host files (the management token under the
+control plane's config root, each runtime token in instance secrets), outside
+snapshots and container mounts. Profile and staging data live under
+`<instance root>/browser/`, outside routine snapshot roots. There is no
+Keychain credential store, debugging TCP endpoint or takeover portal.
 
 ## Rebuild Workflow (Temporary)
 

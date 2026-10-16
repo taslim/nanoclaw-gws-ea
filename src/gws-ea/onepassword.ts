@@ -67,8 +67,8 @@ export const ONEPASSWORD_CAPABILITY = {
   scope: 'host',
   summary: 'Give each compatible assistant its own 1Password vault for the logins it fills and saves.',
   prerequisites: [
-    'The 1Password desktop app, signed in to the account assistants use, with its CLI integration turned on.',
-    'The 1Password CLI 2.29 or later on the operator PATH.',
+    'The 1Password CLI (op) 2.29 or later, installed in an operator-owned location on the operator PATH (for example brew install 1password-cli).',
+    'The 1Password desktop app on this host, signed in to the account assistants use, with Settings > Developer > Integrate with 1Password CLI turned on.',
     'An operator allowed to create service accounts in that account (an owner or administrator).',
   ],
   readiness_limits: [

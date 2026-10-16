@@ -88,7 +88,14 @@ describe('local CLI discovery and grammar', () => {
     expect(await runCli(['help', 'capabilities', 'enable', 'onepassword'], help.runtime)).toBe(0);
     expect(help.stdout.join('\n')).toContain('--account <account_id>');
     expect(help.stdout.join('\n')).toContain('Scope: host');
+    // Enable names what the operator's host needs: a current `op` and the signed-in desktop app's CLI integration.
+    expect(help.stdout.join('\n')).toMatch(/1Password CLI \(op\) 2\.29 or later/u);
+    expect(help.stdout.join('\n')).toContain('Integrate with 1Password CLI');
     expect(help.runtime.checkPrerequisites).not.toHaveBeenCalled();
+    // Removal never revokes a service account; its help names how the kept receipt is closed afterwards.
+    const remove = capture();
+    expect(await runCli(['help', 'remove'], remove.runtime)).toBe(0);
+    expect(remove.stdout.join('\n')).toContain('--yes --abandon onepassword');
   });
   it.each([
     ['help', 'update'],

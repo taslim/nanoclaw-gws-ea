@@ -7,8 +7,8 @@ only after that deployment. Never start the operator checkout's service to run
 these checks.
 
 The acceptance harness sends no errands, fills no credentials, grants no
-permissions, approves no cards and restarts no services. The owner uses their
-normal channel. The harness reads the deployed host's existing, owner-only
+permissions, approves no cards, restarts no services and runs no `gws-ea`
+command. The owner uses their normal channel. The harness reads the deployed host's existing, owner-only
 `ncl.sock` and independently checks the supplied verification artifacts. Any real
 booking or purchase still needs its normal explicit principal authority.
 
@@ -134,22 +134,32 @@ and `observed` facts. Name the actual source (website record, principal card,
 container probe output, platform observation, or operator Space observation) and
 its reference. Preserve the receipt and associated private source artifacts.
 
-| Scenario name                  | What its receipt must establish                                                                                                                                                                    |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `delegation_own_job`           | New errand has a distinct session; its follow-up reaches it; missing thread is refused.                                                                                                            |
-| `different_sites_parallel`     | Different sites have distinct sessions and execute concurrently.                                                                                                                                   |
-| `same_site_serialized`         | A second job waits while the first owns that site, including a pending purchase card.                                                                                                              |
-| `restart_before_commit`        | Mid-batch restart answers once with `interrupted`; a fresh safe request continues; no automatic replay.                                                                                            |
-| `restart_after_commit`         | A marked purchase answers `outcome_unknown`, remains site-blocked across jobs/accounts and does not automatically retry. Reconciliation or an informed one-attempt approval is required.           |
-| `email_code_sign_in`           | Code/link sign-in uses an isolated external-email system task, with no ordinary email thread or wake to main.                                                                                      |
-| `purchase_card_revalidation`   | Complete terms; higher totals/material changes withdraw the old card; an unchanged lower total inside approved bounds may proceed once. Use owned fixtures or explicit real authority for commits. |
-| `unsupported_purchase`         | Unsupported/drifted/no-visible-price flows refuse commits across generic activation and recipe/watch paths.                                                                                        |
-| `standing_guarantee`           | No default grant; separately confirmed total conditional-fee bound applies per reservation/whole party only; prepayment/deposit/hold/trial/subscription needs separate authority.                  |
-| `clipboard_and_external_links` | Clipboard is unchanged and external apps do not open.                                                                                                                                              |
-| `cross_install_isolation`      | An actual agent-network container in another install cannot reach the assistant Chrome; include the attempted destinations and probe result.                                                       |
-| `quiet_spaces`                 | Owner observes no unwanted Space switch throughout the active-desktop checks.                                                                                                                      |
-| `public_only_egress`           | Loopback, link-local, LAN, rebinding, QUIC and non-proxied WebRTC attempts are refused; include live proxy probe evidence.                                                                         |
-| `watch_soak`                   | At least 72 actual hours of native checks, no site block/account warning, and the watch stayed within the site's policy. See below.                                                                |
+| Scenario name                  | What its receipt must establish                                                                                                                                                                                                                                         |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `delegation_own_job`           | New errand has a distinct session; its follow-up reaches it; missing thread is refused.                                                                                                                                                                                 |
+| `different_sites_parallel`     | Different sites have distinct sessions and execute concurrently.                                                                                                                                                                                                        |
+| `same_site_serialized`         | A second job waits while the first owns that site, including a pending purchase card.                                                                                                                                                                                   |
+| `restart_before_commit`        | Mid-batch restart answers once with `interrupted`; a fresh safe request continues; no automatic replay.                                                                                                                                                                 |
+| `restart_after_commit`         | A marked purchase answers `outcome_unknown`, remains site-blocked across jobs/accounts and does not automatically retry. Reconciliation or an informed one-attempt approval is required.                                                                                |
+| `email_code_sign_in`           | Code/link sign-in uses an isolated external-email system task, with no ordinary email thread or wake to main.                                                                                                                                                           |
+| `vault_secret_confinement`     | Dedicated-vault fill succeeds, wrong/full-frame origins are refused, filled documents cannot be screenshotted and no agent output contains the canary.                                                                                                                  |
+| `purchase_card_revalidation`   | Complete terms; higher totals/material changes withdraw the old card; an unchanged lower total inside approved bounds may proceed once. Use owned fixtures or explicit real authority for commits.                                                                      |
+| `unsupported_purchase`         | Unsupported/drifted/no-visible-price flows refuse commits across generic activation and recipe/watch paths.                                                                                                                                                             |
+| `standing_guarantee`           | No default grant; separately confirmed total conditional-fee bound applies per reservation/whole party only; prepayment/deposit/hold/trial/subscription needs separate authority.                                                                                       |
+| `clipboard_and_external_links` | Clipboard is unchanged and external apps do not open.                                                                                                                                                                                                                   |
+| `cross_install_isolation`      | An actual agent-network container in another install cannot reach the assistant Chrome; include the attempted destinations and probe result.                                                                                                                            |
+| `quiet_spaces`                 | Owner observes no unwanted Space switch throughout the active-desktop checks.                                                                                                                                                                                           |
+| `public_only_egress`           | Loopback, link-local, LAN, rebinding, QUIC and non-proxied WebRTC attempts are refused; include live proxy probe evidence.                                                                                                                                              |
+| `watch_soak`                   | At least 72 actual hours of native checks, no site block/account warning, and the watch stayed within the site's policy. See below.                                                                                                                                     |
+| `onepassword_provisioning`     | Enabling covers two assistants, one stopped, with distinct vaults and runtime service accounts (a management-created vault, an operator-minted account, recorded grants); a rerun creates none; a later `create` provisions a third; no browser or Chrome starts.       |
+| `onepassword_sharing`          | A confirmed member principal gets view and edit on only their assistant's vault. A non-member or new guest gets the forwardable message, with no invitation promise, CLI terms or request to enable anything; a re-ask after the operator acts answers `shared`.        |
+| `onepassword_signup`           | An authorized signup saves the generated password before the site sees it. A host restart during its input callback recovers the same saved candidate: one account, one Login, no second submission.                                                                    |
+| `onepassword_owned_change`     | A change on an unedited assistant-created Login reaches the site once. Confirmed or timed out, 1Password keeps both credentials and no tool output or screenshot holds either; the host records the change once the principal moves the new password into the original. |
+| `onepassword_change_refused`   | A change on a Login the principal added, and on an assistant-created Login whose username the principal edited, is refused before any page insertion with a plain explanation.                                                                                          |
+| `onepassword_fresh_login`      | A Login the principal adds in 1Password is used on their explicit retry, while the browser still cannot read its password.                                                                                                                                              |
+| `onepassword_disable_reenable` | Disable stops vault use on running and restarted hosts and deletes runtime tokens, keeping vault items; re-enable reuses each vault, mints new runtime accounts and names the old ones to revoke.                                                                       |
+| `onepassword_scoped_removal`   | Removing one assistant deletes its token and only its own previewed vault, leaves the peer and the management account working, and keeps a receipt naming each service account to revoke on 1Password.com.                                                              |
+| `onepassword_pooled_quota`     | `check` shows the account type, daily limit, usage and every sharing assistant. With the limit nearly spent by the peer, a fill returns `rate_limited` without a retry burst. Record each operation's request cost.                                                     |
 
 ```sh
 pnpm exec tsx scripts/browser-live-check/acceptance.ts scenario \
@@ -162,9 +172,22 @@ operator assertion into an automated browser/system-of-record proof. Missing
 checks stay `not-run`; a receipt with differing expected/observed facts fails.
 Keep real fixtures or records for native assertions in the source artifacts.
 
+Record `vault_secret_confinement` and the `onepassword_*` scenarios on two
+disposable dogfood assistants, in a 1Password account the operator authorized
+for disposable resources; no principal account or Login is a test fixture. The
+operator runs `gws-ea capabilities enable|check|disable onepassword` and
+`gws-ea remove` themselves. Receipts cite resource IDs from
+`gws-ea capabilities show onepassword --json` and the 1Password.com vault,
+access and service-account pages, never a password or token. A request cost is
+the account usage `check` reports before and after the operation, less the
+cost of a `check` itself.
+
 ## Secret canary scan
 
-Long-lived credential canaries must stay absent from all agent contexts.
+Vault and long-lived credential canaries must stay absent from all agent contexts.
+For 1Password runs they include each password saved or generated in the test
+vaults and every service-account token; scan host DBs, logs and retained
+evidence as well as agent output, never the token files themselves.
 Temporary email sign-in credentials intentionally enter the isolated external-email
 system task; scan for those only in main/browser output and operator logs.
 
