@@ -179,13 +179,13 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
       expect(vault.creator).toBe(management[0].id);
       expect(vault.name).toBe(`Assistant aya.${runtime.instance_id.slice(0, 8)}@example.test`);
       // The operator manages the vault the management account created, which minting needs.
-      expect(vault.grants.get(OPERATOR_USER_ID)).toBe('allow_managing');
+      expect(vault.grants.get(OPERATOR_USER_ID)).toBe('allow_viewing,allow_editing,allow_managing');
       expect(record).toEqual({
         schemaVersion: 1,
         instanceId: runtime.instance_id,
         accountId: ACCOUNT_ID,
         vault: { id: vault.id, createdBy: { kind: 'management_service_account', serviceAccountId: management[0].id } },
-        operatorGrant: { userId: OPERATOR_USER_ID, permissions: ['allow_managing'] },
+        operatorGrant: { userId: OPERATOR_USER_ID, permissions: ['allow_viewing', 'allow_editing', 'allow_managing'] },
         runtimeServiceAccountId: record.runtimeServiceAccountId,
       });
       const runtimeAccount = provider.serviceAccounts.get(record.runtimeServiceAccountId!)!;
@@ -683,7 +683,7 @@ describe('1Password readiness (AE8)', () => {
         provisioning: 'ready',
         access: { status: 'verified', reason: null },
         recorded_grants: {
-          operator: { user_id: OPERATOR_USER_ID, permissions: ['allow_managing'] },
+          operator: { user_id: OPERATOR_USER_ID, permissions: ['allow_viewing', 'allow_editing', 'allow_managing'] },
           runtime: ['read_items', 'write_items'],
         },
         write: 'untested',

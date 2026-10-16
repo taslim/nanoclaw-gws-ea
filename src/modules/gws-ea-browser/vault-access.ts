@@ -19,7 +19,6 @@
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
-import { readEnvFile } from '../../env.js';
 import { ALLOW, DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../guard/index.js';
 import { identityMatchKey, normalizePrincipalEmail, resolvePrincipalAddress } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
@@ -32,32 +31,21 @@ import {
   listPrincipalAddresses,
   principalApproverUserId,
 } from '../gws-ea-profile/db.js';
-import type {
-  OnePasswordFailureReason,
-  OnePasswordResult,
-  ServiceAccountIdentity,
-  VaultAccessRequest,
+import {
+  OnePasswordCli,
+  type OnePasswordFailureReason,
+  type OnePasswordResult,
+  type OnePasswordUser,
+  type ServiceAccountIdentity,
+  type VaultAccessRequest,
 } from './onepassword-cli.js';
 import {
-  ONEPASSWORD_POLICY_FILE_ENV,
   onePasswordManagementIdentity,
   readOnePasswordHostPolicy,
   type OnePasswordHostPolicy,
   type OnePasswordVaultPermission,
 } from './onepassword-policy.js';
-import { browserVault, BrowserVaultError, type BrowserVault } from './onepassword.js';
-
-/** A person 1Password holds in the account, as the host management service account reads them. */
-export interface OnePasswordUser {
-  /** The exact provider user. */
-  readonly userId: string;
-  /** The email 1Password holds for them; sharing requires it to be exactly the one asked for. */
-  readonly email: string;
-  /** `MEMBER`, `GUEST` or `SERVICE_ACCOUNT` as 1Password reports it; anything else is `other`. */
-  readonly type: 'member' | 'guest' | 'service_account' | 'other';
-  /** `ACTIVE`: they accepted their invitation, were confirmed, and are not suspended. */
-  readonly active: boolean;
-}
+import { browserVault, BrowserVaultError, onePasswordPolicyFile, type BrowserVault } from './onepassword.js';
 
 /** The provider operations sharing needs, each made as the host management service account. */
 export interface VaultSharingProvider {
@@ -103,22 +91,10 @@ type ShareOutcome =
   | { readonly status: 'rate_limited' }
   | { readonly status: 'vault_unavailable' };
 
-/** The host-process locator of the 1Password host policy, read like the browser vault reads it. */
-function onePasswordPolicyFile(): string | undefined {
-  return (
-    process.env[ONEPASSWORD_POLICY_FILE_ENV]?.trim() ||
-    readEnvFile([ONEPASSWORD_POLICY_FILE_ENV])[ONEPASSWORD_POLICY_FILE_ENV]?.trim() ||
-    undefined
-  );
-}
-
-/**
- * The CLI boundary has no user lookup or vault-membership read yet
- * (`getUser`, `listVaultUsers`), so until it does this host does not share,
- * and the principal gets the operator handoff.
- */
-async function cliSharingProvider(): Promise<VaultSharingProvider | undefined> {
-  return undefined;
+/** The exact CLI the host policy recorded; a host where it cannot open does not share. */
+async function cliSharingProvider(policy: OnePasswordHostPolicy): Promise<VaultSharingProvider | undefined> {
+  const opening = await OnePasswordCli.open({ command: policy.cliPath });
+  return opening.status === 'ready' ? opening.cli : undefined;
 }
 
 const DEFAULT_DEPENDENCIES: VaultAccessDependencies = {

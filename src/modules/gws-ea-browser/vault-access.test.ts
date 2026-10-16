@@ -53,12 +53,8 @@ import {
 } from './onepassword-policy.js';
 import { BrowserVault } from './onepassword.js';
 import { writePrivateFile } from './paths.js';
-import {
-  registerVaultAccessDelivery,
-  vaultAccessGuard,
-  type OnePasswordUser,
-  type VaultSharingProvider,
-} from './vault-access.js';
+import type { OnePasswordUser } from './onepassword-cli.js';
+import { registerVaultAccessDelivery, vaultAccessGuard, type VaultSharingProvider } from './vault-access.js';
 
 const ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
 const MANAGEMENT_ID = 'MANAGEMENTSERVICEACCOUNT01';
@@ -158,7 +154,7 @@ async function writeHostPolicy(managementServiceAccountId: string | null = MANAG
   await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
     schemaVersion: 1,
     accountId: ACCOUNT_ID,
-    cliPath: '/opt/homebrew/bin/op',
+    cliPath: '/nonexistent-onepassword-cli/op',
     managementServiceAccountId,
   });
 }
@@ -496,7 +492,7 @@ describe('the operator handoff', () => {
     expect(onePassword.count('grantVaultAccess')).toBe(0);
   });
 
-  it('as wired by the browser module, hands off while the CLI boundary lacks user lookup', async () => {
+  it('as wired by the browser module, hands off when the recorded CLI cannot open', async () => {
     registerVaultAccessDelivery();
     process.env.GWS_EA_BROWSER_POLICY_FILE = browserPolicyFile;
     process.env.GWS_EA_ONEPASSWORD_POLICY_FILE = onePasswordPolicyFile;

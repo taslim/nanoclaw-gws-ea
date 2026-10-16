@@ -113,6 +113,18 @@ export interface OnePasswordCliOptions {
   readonly ambient?: NodeJS.ProcessEnv;
 }
 
+/** A person 1Password holds in the account, as a service account reads them. */
+export interface OnePasswordUser {
+  /** The exact provider user. */
+  readonly userId: string;
+  /** The email 1Password holds for them. */
+  readonly email: string;
+  /** `MEMBER`, `GUEST` or `SERVICE_ACCOUNT` as 1Password reports it; anything else is `other`. */
+  readonly type: 'member' | 'guest' | 'service_account' | 'other';
+  /** `ACTIVE`: they accepted their invitation, were confirmed, and are not suspended. */
+  readonly active: boolean;
+}
+
 export interface OnePasswordAccount {
   readonly accountId: string;
   /** The operator's own user in that account. */
@@ -222,6 +234,19 @@ function invalidRequest(message: string): GwsEaError {
 function assertId(value: string, label: string): void {
   if (!isOnePasswordId(value)) throw invalidRequest(`${label} must be an exact 1Password ID`);
 }
+
+/** A lowercase address that can never be read as a flag; the caller normalizes before asking. */
+const EMAIL = /^[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/u;
+function assertEmail(email: string): void {
+  if (email.length > 254 || email.startsWith('-') || hasControlCharacters(email) || !EMAIL.test(email))
+    throw invalidRequest('An email must be one lowercase address');
+}
+
+const USER_TYPES: ReadonlyMap<string, OnePasswordUser['type']> = new Map([
+  ['MEMBER', 'member'],
+  ['GUEST', 'guest'],
+  ['SERVICE_ACCOUNT', 'service_account'],
+]);
 
 function assertName(name: string): void {
   if (!RESOURCE_NAME.test(name))
@@ -509,10 +534,12 @@ export class OnePasswordCli {
     assertId(request.vaultId, 'The vault');
     assertId(request.userId, 'The user');
     const permissions = permissionList(request.permissions);
+    // Scripted grants need --no-input and every dependent permission listed.
     const args = [
       'vault',
       'user',
       'grant',
+      '--no-input',
       '--vault',
       request.vaultId,
       '--user',
@@ -532,6 +559,7 @@ export class OnePasswordCli {
       'vault',
       'user',
       'revoke',
+      '--no-input',
       '--vault',
       request.vaultId,
       '--user',
@@ -558,6 +586,52 @@ export class OnePasswordCli {
     if (result.status !== 'ok') return result;
     const value = parseJson(result.stdout);
     return isRecord(value) && value.id === vaultId ? { status: 'ok', vaultId } : failed('unexpected_output');
+  }
+
+  /** The user 1Password holds under exactly this email; matching it to a request is the caller's. */
+  async getUser(
+    identity: OnePasswordIdentity,
+    email: string,
+  ): Promise<OnePasswordResult<{ readonly user: OnePasswordUser }>> {
+    assertEmail(email);
+    const result = await this.#read(identity, ['user', 'get', email, '--format', 'json']);
+    if (result.status !== 'ok') return result;
+    const value = parseJson(result.stdout);
+    if (
+      !isRecord(value) ||
+      !isOnePasswordId(value.id) ||
+      !isDisplayText(value.email) ||
+      typeof value.type !== 'string' ||
+      typeof value.state !== 'string'
+    )
+      return failed('unexpected_output');
+    return {
+      status: 'ok',
+      user: {
+        userId: value.id,
+        email: value.email,
+        type: USER_TYPES.get(value.type.toUpperCase()) ?? 'other',
+        active: value.state.toUpperCase() === 'ACTIVE',
+      },
+    };
+  }
+
+  /** The users with direct access to the vault. */
+  async listVaultUsers(
+    identity: OnePasswordIdentity,
+    vaultId: string,
+  ): Promise<OnePasswordResult<{ readonly userIds: readonly string[] }>> {
+    assertId(vaultId, 'The vault');
+    const result = await this.#read(identity, ['user', 'list', '--vault', vaultId, '--format', 'json']);
+    if (result.status !== 'ok') return result;
+    const value = parseJson(result.stdout);
+    if (!Array.isArray(value)) return failed('unexpected_output');
+    const userIds: string[] = [];
+    for (const entry of value) {
+      if (!isRecord(entry) || !isOnePasswordId(entry.id)) return failed('unexpected_output');
+      userIds.push(entry.id);
+    }
+    return { status: 'ok', userIds };
   }
 
   /** The plan of the account `identity` authenticates to. */

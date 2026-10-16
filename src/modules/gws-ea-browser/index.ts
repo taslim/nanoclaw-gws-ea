@@ -10,6 +10,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
+  browserCredentialAttemptsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
   browserQueueMigration,
@@ -55,6 +56,7 @@ registerMigration(browserReservationBoundsMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
+registerMigration(browserCredentialAttemptsMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';

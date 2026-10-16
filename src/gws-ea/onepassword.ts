@@ -81,7 +81,8 @@ export const ONEPASSWORD_CAPABILITY = {
 export const ONEPASSWORD_CONTRACT = 'gws-ea-onepassword-vault-1';
 const CONTRACT_FILE = 'src/gws-ea/onepassword-compatibility.json';
 /** What the management service account grants the operator on each vault it creates: enough to mint its runtime account. */
-const OPERATOR_GRANT: readonly OnePasswordVaultPermission[] = ['allow_managing'];
+/** Managing requires editing and viewing; a scripted grant lists every dependency. */
+const OPERATOR_GRANT: readonly OnePasswordVaultPermission[] = ['allow_viewing', 'allow_editing', 'allow_managing'];
 const MANAGEMENT_NAME = 'GWS-EA management';
 /** An email address a provider name can hold whole. */
 const NAMEABLE_EMAIL = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,79}$/u;

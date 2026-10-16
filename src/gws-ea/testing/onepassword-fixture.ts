@@ -106,7 +106,7 @@ export class FakeOnePassword {
       if (vaultFlag !== -1) {
         const [vaultId, grant] = args[vaultFlag + 1].split(':');
         if (grant !== 'read_items,write_items') return { exitCode: 1, stderr: '[ERROR] invalid permissions' };
-        if (this.vaults.get(vaultId)?.grants.get(OPERATOR_USER_ID) !== 'allow_managing')
+        if (!this.vaults.get(vaultId)?.grants.get(OPERATOR_USER_ID)?.split(',').includes('allow_managing'))
           return { exitCode: 1, stderr: "[ERROR] (403) Forbidden: You don't have permission to manage this vault" };
         access = vaultId;
       }
@@ -151,7 +151,15 @@ export class FakeOnePassword {
     if (args[0] === 'vault' && args[1] === 'user' && args[2] === 'grant') {
       const vault = this.vaults.get(args[args.indexOf('--vault') + 1]);
       if (!vault || vault.creator !== account.id) return { exitCode: 1, stderr: '[ERROR] (403) Forbidden' };
-      vault.grants.set(args[args.indexOf('--user') + 1], args[args.indexOf('--permissions') + 1]);
+      // Like the provider without a prompt: managing needs editing and viewing listed too.
+      const permissions = args[args.indexOf('--permissions') + 1].split(',');
+      if (
+        !args.includes('--no-input') ||
+        (permissions.includes('allow_managing') &&
+          !(permissions.includes('allow_editing') && permissions.includes('allow_viewing')))
+      )
+        return { exitCode: 1, stderr: '[ERROR] missing dependent permissions' };
+      vault.grants.set(args[args.indexOf('--user') + 1], permissions.join(','));
       return {};
     }
     if (args[0] === 'vault' && args[1] === 'get') {

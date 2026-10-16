@@ -404,6 +404,7 @@ describe('1Password actions', () => {
         'vault',
         'user',
         'grant',
+        '--no-input',
         '--vault',
         VAULT_ID,
         '--user',
@@ -415,6 +416,7 @@ describe('1Password actions', () => {
         'vault',
         'user',
         'revoke',
+        '--no-input',
         '--vault',
         VAULT_ID,
         '--user',
@@ -424,7 +426,7 @@ describe('1Password actions', () => {
         '--account',
         ACCOUNT_ID,
       ],
-      ['vault', 'user', 'revoke', '--vault', VAULT_ID, '--user', PRINCIPAL_USER_ID],
+      ['vault', 'user', 'revoke', '--no-input', '--vault', VAULT_ID, '--user', PRINCIPAL_USER_ID],
     ]);
   });
 
@@ -437,6 +439,72 @@ describe('1Password actions', () => {
       vaultId: VAULT_ID,
     });
     expect(calls[0].args).toEqual(['vault', 'create', 'Assistant aya+ea@example.test', '--format', 'json']);
+  });
+
+  it('reads one user by exact lowercase email, mapping their type and confirmation', async () => {
+    const { cli, calls } = await openCli(() => ({
+      stdout: JSON.stringify({
+        id: PRINCIPAL_USER_ID,
+        email: 'juno.hale@example.test',
+        type: 'GUEST',
+        state: 'ACTIVE',
+      }),
+    }));
+    const management = await managementIdentity();
+    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({
+      status: 'ok',
+      user: { userId: PRINCIPAL_USER_ID, email: 'juno.hale@example.test', type: 'guest', active: true },
+    });
+    expect(calls[0].args).toEqual(['user', 'get', 'juno.hale@example.test', '--format', 'json']);
+    for (const email of ['Juno.Hale@example.test', '-juno@example.test', 'juno', `${'a'.repeat(250)}@example.test`])
+      await expect(cli.getUser(management, email)).rejects.toMatchObject({ code: 'invalid_onepassword_request' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('treats an unrecognized user shape as unexpected and an unknown type as other', async () => {
+    const replies = [
+      {
+        stdout: JSON.stringify({
+          id: PRINCIPAL_USER_ID,
+          email: 'juno.hale@example.test',
+          type: 'OWNER',
+          state: 'SUSPENDED',
+        }),
+      },
+      { stdout: JSON.stringify({ id: 'short', email: 'juno.hale@example.test', type: 'MEMBER', state: 'ACTIVE' }) },
+      { exitCode: 1, stderr: `[ERROR] "juno.hale@example.test" isn't a user in this account` },
+    ];
+    const { cli } = await openCli(() => replies.shift() ?? {});
+    const management = await managementIdentity();
+    expect(await cli.getUser(management, 'juno.hale@example.test')).toMatchObject({
+      status: 'ok',
+      user: { type: 'other', active: false },
+    });
+    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({
+      status: 'failed',
+      reason: 'unexpected_output',
+    });
+    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({ status: 'failed', reason: 'not_found' });
+  });
+
+  it('lists the users with direct access to exactly one vault', async () => {
+    const replies = [
+      { stdout: JSON.stringify([{ id: PRINCIPAL_USER_ID }, { id: OPERATOR_USER_ID }]) },
+      { stdout: JSON.stringify([]) },
+      { stdout: JSON.stringify([{ id: PRINCIPAL_USER_ID }, { name: 'no id' }]) },
+    ];
+    const { cli, calls } = await openCli(() => replies.shift() ?? {});
+    const management = await managementIdentity();
+    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({
+      status: 'ok',
+      userIds: [PRINCIPAL_USER_ID, OPERATOR_USER_ID],
+    });
+    expect(calls[0].args).toEqual(['user', 'list', '--vault', VAULT_ID, '--format', 'json']);
+    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({ status: 'ok', userIds: [] });
+    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({ status: 'failed', reason: 'unexpected_output' });
+    await expect(cli.listVaultUsers(management, 'not-a-vault')).rejects.toMatchObject({
+      code: 'invalid_onepassword_request',
+    });
   });
 
   it('deletes exactly one vault by its ID', async () => {

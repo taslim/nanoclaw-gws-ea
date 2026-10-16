@@ -21,6 +21,7 @@ import {
   writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from './onepassword-policy.js';
+import { browserCredentialAttemptsMigration } from './migration.js';
 import { BrowserVault } from './onepassword.js';
 import { writePrivateFile } from './paths.js';
 
@@ -310,6 +311,7 @@ beforeEach(async () => {
   sdk.create.mockImplementation(async () => fake.client());
   vault = newVault();
   await runMigrations(await initTestDb());
+  await browserCredentialAttemptsMigration.up(getDb());
   output.length = 0;
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
     vi.spyOn(log, level).mockImplementation((message: string, data?: Record<string, unknown>) => {

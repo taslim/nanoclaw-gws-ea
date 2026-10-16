@@ -14,14 +14,12 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { Client, Item, ItemCreateParams, ItemField, ItemOverview, Website } from '@1password/sdk';
 import { getDomain } from 'tldts';
-import { registerMigration } from '../../db/migrations/index.js';
 import { readEnvFile } from '../../env.js';
 import { instanceMarkerFile } from '../../gws-ea/paths.js';
 import { readInstanceMarkerFile } from '../../gws-ea/registry.js';
 import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { httpsOrigin, type BrowserSecretField } from './authentication-signatures.js';
-import { browserCredentialAttemptsMigration } from './migration.js';
 import {
   ONEPASSWORD_POLICY_FILE_ENV,
   onePasswordInstancePaths,
@@ -31,9 +29,6 @@ import {
 } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
 import { browserPolicyFile } from './policy.js';
-
-// Credential attempts live beside every fill: whatever loads the vault has their table.
-registerMigration(browserCredentialAttemptsMigration);
 
 export type BrowserVaultReason = 'vault_unavailable' | 'rate_limited' | 'no_item_for_site' | 'origin_mismatch';
 export class BrowserVaultError extends Error {
@@ -56,7 +51,7 @@ export interface BrowserVaultLocators {
 }
 
 /** The host-process locator of the 1Password host policy, read like the voice and browser policy locators. */
-function onePasswordPolicyFile(): string | undefined {
+export function onePasswordPolicyFile(): string | undefined {
   return (
     process.env[ONEPASSWORD_POLICY_FILE_ENV]?.trim() ||
     readEnvFile([ONEPASSWORD_POLICY_FILE_ENV])[ONEPASSWORD_POLICY_FILE_ENV]?.trim() ||
