@@ -225,7 +225,8 @@ async function loadFixture(state: ResyFixtureState): Promise<Awaited<ReturnType<
   await fixture.page.locator('body[data-ready="yes"]').waitFor();
   return fixture;
 }
-describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome', () => {
+// Each test generates a TLS key and launches a real Chrome, like the other native suites' 30-second budget.
+describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome', { timeout: 30_000 }, () => {
   it('settles fresh checkout captures after a second guarded navigation to the same document', async () => {
     const fixture = await loadFixture(checkoutFixture());
     try {
@@ -239,7 +240,7 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
     } finally {
       await fixture.close();
     }
-  }, 10_000);
+  });
   it('reads explicit free facts and binds native commit result to the exact book token/card', async () => {
     const fixture = await loadFixture(checkoutFixture());
     try {

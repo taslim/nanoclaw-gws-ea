@@ -140,7 +140,8 @@ it('pins immutable recipe versions and keys checks by every named value', async 
 });
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-describe.skipIf(!chromePath)('recorded recipes in native Chrome', () => {
+// Each test launches a real Chrome, like the other native suites' 30-second budget.
+describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_000 }, () => {
   let db: SqliteDriver;
   let browser: Browser;
   let server: Server;
@@ -186,7 +187,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', () => {
       remaining: () => 15_000,
       signal: new AbortController().signal,
     } as unknown as BrowserExecutionContext;
-  });
+  }, 30_000);
   afterEach(async () => {
     await browser?.close();
     await new Promise<void>((resolve) => server?.close(() => resolve()));
