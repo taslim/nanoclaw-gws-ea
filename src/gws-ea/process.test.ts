@@ -442,6 +442,58 @@ describe('GWS-EA command runner', () => {
     expect(error.details?.stderrTail).toBe(`bad key ${REDACTED}`);
   });
 
+  it('keeps private output out of the raw log and every failure detail, logging only byte counts', async () => {
+    const run = await runLog();
+    // Unregistered, and in no shape the redactor knows: only privacy keeps it out.
+    const minted = `minted-${randomBytes(12).toString('hex')}`;
+    const write =
+      'const value = process.env.GWS_EA_TEST_OUTPUT; process.stdout.write(value); process.stderr.write(`notice ${value}\\n`);';
+    const command = (script: string, timeoutMs?: number) => ({
+      command: NODE,
+      args: ['--eval', script],
+      cwd: process.cwd(),
+      env: buildToolEnvironment(process.env, { GWS_EA_TEST_OUTPUT: minted }),
+      privateOutput: true,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
+
+    const exited = await run.step('private_exit', () =>
+      runSanitizedCommandOutcome(command(`${write} process.exit(4)`)),
+    );
+    const checked = await run.step('private_checked', () =>
+      failure(runSanitizedCommand(command(`${write} process.exit(4)`))),
+    );
+    const timedOut = await run.step('private_timeout', () =>
+      failure(runSanitizedCommand(command(`${write} setInterval(() => {}, 1000)`, 500))),
+    );
+
+    expect(exited).toMatchObject({ exitCode: 4, stdout: minted, stderr: `notice ${minted}\n` });
+    expect(checked.details?.stderrTail).toBe('');
+    expect(timedOut.code).toBe('command_timeout');
+    expect(timedOut.details?.stderrTail).toBe('');
+    const raw = await rawLog(run, '01-private-exit.log');
+    expect(raw).toContain(`stdout: ${Buffer.byteLength(minted)} bytes (parsed, not logged)`);
+    expect(raw).toContain(`stderr: ${Buffer.byteLength(`notice ${minted}\n`)} bytes (private, not logged)`);
+    for (const file of ['01-private-exit.log', '02-private-checked.log', '03-private-timeout.log']) {
+      expect(await rawLog(run, file)).not.toContain(minted);
+    }
+    for (const error of [checked, timedOut])
+      expect(JSON.stringify([error.message, error.details])).not.toContain(minted);
+  });
+
+  it('refuses to stream private output', async () => {
+    const error = await failure(
+      runSanitizedCommandOutcome({
+        command: NODE,
+        args: ['--eval', ''],
+        cwd: process.cwd(),
+        stream: true,
+        privateOutput: true,
+      }),
+    );
+    expect(error.code).toBe('invalid_command');
+  });
+
   it('trims retained stderr to whole lines, so no fragment of a secret survives the cut', async () => {
     const run = await runLog();
     const apiKey = `env-secret-${randomBytes(12).toString('hex')}`;
