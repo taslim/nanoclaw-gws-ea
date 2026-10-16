@@ -7,3 +7,7 @@ reviews:
     base_branches:
       - "main"
       - "rebuild-v2"
+  # Temporary for PR #60, which exceeds the 150-file review limit with its tests.
+  # Remove before merge.
+  path_filters:
+    - "!**/*.test.ts"
