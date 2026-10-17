@@ -8,6 +8,8 @@ const root = await vi.hoisted(async () => {
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
+  // The install's zone, which quiet hours fall back to until the profile holds the principal's.
+  TIMEZONE: 'America/New_York',
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -20,8 +22,9 @@ import { browserWatchesMigration } from './migration.js';
 import { createBrowserWatchScheduler } from './scheduler.js';
 import type { WatchBounds } from './watches.js';
 import type { ReservationAvailability } from './merchant-contract.js';
-import { watchInterval, watchQuietUntil, watchSitePolicy } from './watch-policy.js';
+import { watchInterval, watchSitePolicy } from './watch-policy.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
+import { setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
 
 let queue: BrowserQueue;
 let jobId: string;
@@ -411,7 +414,7 @@ it('deduplicates the same outside slot across ticks and reports expiry without a
 it('keeps hourly and daily caps shared across parameters, and never repeats an interval or goes below the floor', async () => {
   await arm('a', 'same');
   const now = Date.now();
-  const policy = { ...watchSitePolicy('resy.com'), quietHours: [], hourlyCap: 2, dailyCap: 3 };
+  const policy = { ...watchSitePolicy('resy.com'), principalQuietHours: [], hourlyCap: 2, dailyCap: 3 };
   for (const [id, minutes] of [
     ['one', 30],
     ['two', 15],
@@ -457,9 +460,75 @@ it('keeps hourly and daily caps shared across parameters, and never repeats an i
     expect(interval).not.toBe(previous);
     previous = interval;
   }
-  expect(watchQuietUntil({ ...policy, quietHours: [{ start: 3, end: 6 }] }, Date.parse('2026-10-15T03:15:00Z'))).toBe(
-    Date.parse('2026-10-15T06:00:00Z'),
+});
+
+function countingScheduler(): { scheduler: ReturnType<typeof createBrowserWatchScheduler>; checks: () => number } {
+  let checks = 0;
+  const empty = availability();
+  empty.slots = [];
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => {
+      checks++;
+      return { status: 'ready', availability: empty };
+    },
+    calendar: freeCalendar,
+    random: () => 0.5,
+  });
+  return { scheduler, checks: () => checks };
+}
+async function nextCheck(id: string): Promise<string | undefined> {
+  return (
+    await getDb().get<{ next_check_at: string }>('SELECT next_check_at FROM gws_ea_browser_watches WHERE id=?', id)
+  )?.next_check_at;
+}
+async function seedPrincipal(timezone: string): Promise<void> {
+  await getDb().run(
+    "UPDATE gws_ea_profile SET principal_display_name = 'Morgan Ellery',principal_timezone = ? WHERE singleton = 1",
+    timezone,
   );
+}
+
+it("checks through the principal's evening and pauses only for their night", async () => {
+  await seedPrincipal('America/Los_Angeles');
+  // 20:30 in Los Angeles, 03:30 UTC.
+  vi.setSystemTime(new Date('2026-10-16T03:30:00Z'));
+  await arm('a', 'same');
+  const { scheduler, checks } = countingScheduler();
+  await scheduler.tick();
+  expect(checks()).toBe(1);
+  // 03:30 in Los Angeles: no check until 06:00 there.
+  vi.setSystemTime(new Date('2026-10-16T10:30:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(1);
+  expect(await nextCheck('a')).toBe('2026-10-16T13:00:00.000Z');
+  vi.setSystemTime(new Date('2026-10-16T13:00:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(2);
+});
+
+it('applies a timezone the principal changes through main from the next check', async () => {
+  await seedPrincipal('America/Los_Angeles');
+  vi.setSystemTime(new Date('2026-10-16T03:30:00Z'));
+  await arm('a', 'same');
+  const { scheduler, checks } = countingScheduler();
+  await scheduler.tick();
+  expect(checks()).toBe(1);
+  await setPrincipalNameAndTimezone({ timezone: 'Europe/London' });
+  // Due at 03:32 UTC, which is 04:32 in London: quiet there until 06:00.
+  vi.setSystemTime(new Date((await nextCheck('a'))!));
+  await scheduler.tick();
+  expect(checks()).toBe(1);
+  expect(await nextCheck('a')).toBe('2026-10-16T05:00:00.000Z');
+});
+
+it("reads quiet hours on the install's timezone until the profile holds the principal's", async () => {
+  // 03:30 in New York, the install's zone.
+  vi.setSystemTime(new Date('2026-10-16T07:30:00Z'));
+  await arm('a', 'same');
+  const { scheduler, checks } = countingScheduler();
+  await scheduler.tick();
+  expect(checks()).toBe(0);
+  expect(await nextCheck('a')).toBe('2026-10-16T10:00:00.000Z');
 });
 
 it('uses an authenticated notify only once within the floor and site caps', async () => {

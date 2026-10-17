@@ -1,13 +1,19 @@
-/** Operator-owned politeness defaults, not claims about a merchant's published limits. */
+/**
+ * Operator-owned politeness defaults, not claims about a merchant's published limits.
+ * Each time of day names its clock: quiet hours are the principal's night, on the
+ * timezone the scheduler reads from their profile at each check, and a release time
+ * is the site's own schedule, on the zone it names.
+ */
 export interface WatchSitePolicy {
   floorMs: number;
   hourlyCap: number;
   dailyCap: number;
   intervalMs: number;
   jitterFraction: number;
-  quietHours: readonly { start: number; end: number }[];
-  timeZone: string;
-  releaseTimes: readonly { hour: number; minute: number; burstMinutes: number }[];
+  /** Hours [start, end) of the principal's local night, when no check starts. */
+  principalQuietHours: readonly { start: number; end: number }[];
+  /** When the site releases inventory, each on the site's clock in its IANA `timeZone`. */
+  releaseTimes: readonly { hour: number; minute: number; burstMinutes: number; timeZone: string }[];
   notifySenders: readonly string[];
 }
 const defaults: WatchSitePolicy = Object.freeze({
@@ -16,8 +22,7 @@ const defaults: WatchSitePolicy = Object.freeze({
   dailyCap: 240,
   intervalMs: 5 * 60_000,
   jitterFraction: 0.2,
-  quietHours: [{ start: 3, end: 6 }],
-  timeZone: 'UTC',
+  principalQuietHours: [{ start: 3, end: 6 }],
   releaseTimes: [],
   notifySenders: [],
 });
@@ -42,12 +47,13 @@ function clock(at: number, timeZone: string): { hour: number; minute: number } {
     minute: Number(parts.find((part) => part.type === 'minute')?.value),
   };
 }
-export function watchQuietUntil(policy: WatchSitePolicy, at: number): number {
+/** The first minute from `at` outside the principal's quiet hours, on their clock in `principalTimeZone`. */
+export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTimeZone: string): number {
   let next = at;
   for (let count = 0; count < 24 * 60; count++) {
-    const { hour } = clock(next, policy.timeZone);
+    const { hour } = clock(next, principalTimeZone);
     if (
-      !policy.quietHours.some((quiet) =>
+      !policy.principalQuietHours.some((quiet) =>
         quiet.start <= quiet.end ? hour >= quiet.start && hour < quiet.end : hour >= quiet.start || hour < quiet.end,
       )
     )
@@ -64,8 +70,8 @@ export function watchInterval(
   previous: number | null,
   random: () => number = Math.random,
 ): number {
-  const { hour, minute } = clock(now, policy.timeZone);
   const release = policy.releaseTimes.some((time) => {
+    const { hour, minute } = clock(now, time.timeZone);
     const elapsed = (hour * 60 + minute - time.hour * 60 - time.minute + 1440) % 1440;
     return elapsed < time.burstMinutes;
   });

@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { TIMEZONE } from '../../config.js';
 import type { DbDriver } from '../../db/driver.js';
 import { findPrincipalCalendarConflicts, type CalendarConflictResult } from '../gws-ea-meetings/calendar-facts.js';
 import { dkimAlignedToSite } from '../gws-ea-inbox/authentication.js';
 import type { ParsedMail } from '../gws-ea-inbox/mime.js';
 import { registerInboxObserver } from '../gws-ea-inbox/observers.js';
+import { principalNameAndTimezone } from '../gws-ea-profile/db.js';
 import { cancelBrowserJob } from './cancel.js';
 import type { ReservationAvailability } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
@@ -48,6 +50,14 @@ interface SiteState {
 const MAX_CONCURRENT_SITES = 4;
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
 const watchBounds = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json) as WatchBounds;
+/**
+ * The clock quiet hours are read on: the principal's, from the profile at each
+ * check, so a change they make through main holds from the next one; the
+ * install's until create seeds it, as the rest of GWS-EA reads it.
+ */
+async function principalClock(): Promise<string> {
+  return (await principalNameAndTimezone()).timezone ?? TIMEZONE;
+}
 function groupKey(watch: WatchRow): string {
   const bounds = watchBounds(watch);
   return JSON.stringify([
@@ -183,7 +193,8 @@ export class BrowserWatchScheduler {
       );
       if (Date.parse(first.next_check_at) > now && !notify) continue;
       const policy = this.deps.policy(first.site);
-      const state = await this.reserveCheck(db, watches, policy, Boolean(notify));
+      const principalTimeZone = await principalClock();
+      const state = await this.reserveCheck(db, watches, policy, principalTimeZone, Boolean(notify));
       if (!state) continue;
       const id = `watch-check-${randomUUID()}`;
       const bounds = watchBounds(first);
@@ -243,7 +254,7 @@ export class BrowserWatchScheduler {
       const arrival = Math.min(...bounds.windows.map((window) => Date.parse(window.start)));
       const interval = watchInterval(policy, Date.now(), arrival, state.last_interval_ms, this.deps.random);
       const next = new Date(
-        Math.max(Date.now() + interval, backoff, watchQuietUntil(policy, Date.now() + interval)),
+        Math.max(Date.now() + interval, backoff, watchQuietUntil(policy, Date.now() + interval, principalTimeZone)),
       ).toISOString();
       await db.transaction(async () => {
         await db.run(
@@ -281,6 +292,7 @@ export class BrowserWatchScheduler {
     db: DbDriver,
     watches: WatchRow[],
     policy: WatchSitePolicy,
+    principalTimeZone: string,
     notify: boolean,
   ): Promise<SiteState | undefined> {
     return db.transaction(async () => {
@@ -289,7 +301,7 @@ export class BrowserWatchScheduler {
       await db.run('INSERT INTO gws_ea_browser_watch_site_state(site) VALUES(?) ON CONFLICT DO NOTHING', site);
       const state = (await db.get<SiteState>('SELECT * FROM gws_ea_browser_watch_site_state WHERE site=?', site))!;
       let next = Math.max(
-        watchQuietUntil(policy, now),
+        watchQuietUntil(policy, now, principalTimeZone),
         Date.parse(state.next_allowed_at ?? '') || 0,
         Date.parse(state.backoff_until ?? '') || 0,
         (Date.parse(state.last_check_at ?? '') || 0) + policy.floorMs,
