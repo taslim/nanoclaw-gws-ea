@@ -497,17 +497,18 @@ it("checks through the principal's evening and pauses only for their night", asy
   const { scheduler, checks } = countingScheduler();
   await scheduler.tick();
   expect(checks()).toBe(1);
-  // 03:30 in Los Angeles: no check until 06:00 there.
-  vi.setSystemTime(new Date('2026-10-16T10:30:00Z'));
-  await scheduler.tick();
-  expect(checks()).toBe(1);
-  expect(await nextCheck('a')).toBe('2026-10-16T13:00:00.000Z');
+  // 03:30 to 05:59 in Los Angeles: no check until 06:00 there.
+  for (const at of ['2026-10-16T10:30:00Z', '2026-10-16T12:59:00Z']) {
+    vi.setSystemTime(new Date(at));
+    await scheduler.tick();
+    expect(checks()).toBe(1);
+  }
   vi.setSystemTime(new Date('2026-10-16T13:00:00Z'));
   await scheduler.tick();
   expect(checks()).toBe(2);
 });
 
-it('applies a timezone the principal changes through main from the next check', async () => {
+it('applies a timezone the principal changes through main at once, whichever way it moves their night', async () => {
   await seedPrincipal('America/Los_Angeles');
   vi.setSystemTime(new Date('2026-10-16T03:30:00Z'));
   await arm('a', 'same');
@@ -519,7 +520,18 @@ it('applies a timezone the principal changes through main from the next check', 
   vi.setSystemTime(new Date((await nextCheck('a'))!));
   await scheduler.tick();
   expect(checks()).toBe(1);
-  expect(await nextCheck('a')).toBe('2026-10-16T05:00:00.000Z');
+  vi.setSystemTime(new Date('2026-10-16T05:00:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(2);
+  // 03:30 in Los Angeles holds the due check until the principal moves to London, where it is 11:30.
+  await setPrincipalNameAndTimezone({ timezone: 'America/Los_Angeles' });
+  vi.setSystemTime(new Date('2026-10-16T10:30:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(2);
+  await setPrincipalNameAndTimezone({ timezone: 'Europe/London' });
+  vi.setSystemTime(new Date('2026-10-16T10:31:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(3);
 });
 
 it('skips only the site whose principal timezone read failed mid-tick, and checks it on the next tick', async () => {
@@ -559,7 +571,9 @@ it("reads quiet hours on the install's timezone until the profile holds the prin
   const { scheduler, checks } = countingScheduler();
   await scheduler.tick();
   expect(checks()).toBe(0);
-  expect(await nextCheck('a')).toBe('2026-10-16T10:00:00.000Z');
+  vi.setSystemTime(new Date('2026-10-16T10:00:00Z'));
+  await scheduler.tick();
+  expect(checks()).toBe(1);
 });
 
 it('uses an authenticated notify only once within the floor and site caps', async () => {

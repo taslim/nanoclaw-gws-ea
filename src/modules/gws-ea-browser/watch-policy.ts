@@ -1,8 +1,11 @@
+import { TIMEZONE } from '../../config.js';
+import { principalNameAndTimezone } from '../gws-ea-profile/db.js';
+
 /**
  * Operator-owned politeness defaults, not claims about a merchant's published limits.
- * Each time of day names its clock: quiet hours are the principal's night, on the
- * timezone the scheduler reads from their profile at each check, and a release time
- * is the site's own schedule, on the zone it names.
+ * Each time of day names its clock: quiet hours are the principal's night, a condition
+ * of their clock now, read from their profile each time, never a stored time; a release
+ * time is the site's own schedule, on the zone it names.
  */
 export interface WatchSitePolicy {
   floorMs: number;
@@ -46,6 +49,14 @@ function clock(at: number, timeZone: string): { hour: number; minute: number } {
     hour: Number(parts.find((part) => part.type === 'hour')?.value),
     minute: Number(parts.find((part) => part.type === 'minute')?.value),
   };
+}
+/**
+ * The clock quiet hours are read on: the principal's, from the profile, so a change
+ * they make through main holds at once; the install's until create seeds it, as the
+ * rest of GWS-EA reads it.
+ */
+export async function principalClock(): Promise<string> {
+  return (await principalNameAndTimezone()).timezone ?? TIMEZONE;
 }
 /** The first minute from `at` outside the principal's quiet hours, on their clock in `principalTimeZone`. */
 export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTimeZone: string): number {
