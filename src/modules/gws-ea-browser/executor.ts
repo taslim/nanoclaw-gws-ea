@@ -232,15 +232,22 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
   });
 }
 
+type GuardReason = ReturnType<BrowserNavigationGuard['reason']>;
+
+/** Whether the navigation guard refused a navigation: an ordinary reading is no refusal. */
+function isGuardRefusal(blocked: GuardReason): blocked is Exclude<GuardReason, 'ordinary' | undefined> {
+  return blocked !== undefined && blocked !== 'ordinary';
+}
+
 function batchErrorReason(
   error: unknown,
-  blocked: ReturnType<BrowserNavigationGuard['reason']>,
+  blocked: GuardReason,
   context: BrowserExecutionContext,
   page: Page,
 ): BrowserStopReason {
   if (error instanceof BrowserBatchStop || error instanceof BrowserActivationError || error instanceof BrowserRefError)
     return error.reason;
-  if (blocked && blocked !== 'ordinary') return blocked;
+  if (isGuardRefusal(blocked)) return blocked;
   if (error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()) return 'timeout';
   return page.isClosed() ? 'window_closed' : 'not_actionable';
 }
@@ -478,7 +485,7 @@ async function executeBatch(
             break;
         }
         const blocked = guard.reason();
-        if (blocked && blocked !== 'ordinary') throw new BrowserBatchStop(blocked);
+        if (isGuardRefusal(blocked)) throw new BrowserBatchStop(blocked);
         await trace?.finish();
         results[index] = { index, status: 'completed', ...data, ...(trace ? { trace_index: trace.index } : {}) };
         if (navigation !== before) {
@@ -509,7 +516,7 @@ async function executeBatch(
   }
   // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
   const blocked = guard.reason();
-  if (!reason && blocked && blocked !== 'ordinary') reason = blocked;
+  if (!reason && isGuardRefusal(blocked)) reason = blocked;
   if (observation && !reason && hasBrowserChallenge(observation.snapshot)) reason = 'challenge';
   if (
     observation &&

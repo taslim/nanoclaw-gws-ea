@@ -99,6 +99,25 @@ function widgetHtml(): string {
     `<a id="${id}" href="${AMAZON_RETAIL.origin}/dp/B012345678" onclick="event.preventDefault(); location.assign('${destination}')">${label}</a>`;
   return `<html><body><h1>Payment plans</h1>${link('plans', 'Compare plans', '/checkout/placeorder')}${link('help', 'Plan help', '/help')}${statement}</body></html>`;
 }
+/** The element reference the first `[ref=…]` in `text` names. */
+const refIn = (text: string): string | undefined => /\[ref=((?:f\d+)?e\d+)\]/u.exec(text)?.[1];
+function fixturePage(pathname: string): string {
+  switch (pathname) {
+    case '/dp/B012345678':
+      return productHtml();
+    case '/dp/B0PAYFRAME':
+    case '/dp/B0PAYLATER':
+      return widgetHostHtml(pathname === '/dp/B0PAYFRAME');
+    case '/gp/cart/view.html':
+      return cartHtml();
+    case AMAZON_RETAIL.reviewPath:
+      return reviewHtml();
+    case '/gp/your-account/order-details':
+      return detailHtml();
+    default:
+      return '<html><body>Processing your order</body></html>';
+  }
+}
 function widgetHostHtml(embedded: boolean): string {
   // The later host loads its widget only once a postcode is typed, from inside a job batch.
   const load = `const widget = document.getElementById('widget'); widget.onload = () => { document.getElementById('status').textContent = 'Plans loaded'; }; widget.src = '${WIDGET_ORIGIN}/';`;
@@ -145,7 +164,7 @@ async function navigate(url: string, id: string): Promise<void> {
 async function nativeRef(control: string): Promise<{ ref: string; generation: number }> {
   const observation = await observePage(page);
   const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(control));
-  const ref = line ? /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1] : undefined;
+  const ref = line ? refIn(line) : undefined;
   if (!ref) throw new Error(`Missing native ref for ${control}: ${observation.snapshot}`);
   return { ref, generation: observation.generation };
 }
@@ -163,7 +182,7 @@ async function assertOutOfProcess(frame: Frame): Promise<void> {
 }
 async function reconcile(attemptId: string, id: string): Promise<Record<string, unknown> | undefined> {
   const observation = await observePage(page);
-  const ref = /\[ref=((?:f\d+)?e\d+)\]/u.exec(observation.snapshot)?.[1];
+  const ref = refIn(observation.snapshot);
   if (!ref) throw new Error('Reconciliation fixture has no native ref');
   await queue.accept(
     'purchase',
@@ -258,19 +277,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
           else finish();
         } else {
           response.writeHead(200, { 'content-type': 'text/html' });
-          response.end(
-            url.pathname === '/dp/B012345678'
-              ? productHtml()
-              : ['/dp/B0PAYFRAME', '/dp/B0PAYLATER'].includes(url.pathname)
-                ? widgetHostHtml(url.pathname === '/dp/B0PAYFRAME')
-                : url.pathname === '/gp/cart/view.html'
-                  ? cartHtml()
-                  : url.pathname === AMAZON_RETAIL.reviewPath
-                    ? reviewHtml()
-                    : url.pathname === '/gp/your-account/order-details'
-                      ? detailHtml()
-                      : '<html><body>Processing your order</body></html>',
-          );
+          response.end(fixturePage(url.pathname));
         }
       },
     );
@@ -414,7 +421,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     const activate = async (label: string, id: string) => {
       const observation = await observePage(page);
       const line = observation.snapshot.split('\n').find((line) => line.includes(`button "${label}"`));
-      const ref = line ? /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1] : undefined;
+      const ref = line ? refIn(line) : undefined;
       if (!ref) throw new Error(`Native fixture control missing: ${label}`);
       await queue.accept(
         'browser',

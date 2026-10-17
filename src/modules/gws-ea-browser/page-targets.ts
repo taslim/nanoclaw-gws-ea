@@ -45,10 +45,10 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
   const report = (isCovered: boolean): void => {
     if (!isCovered) for (const listener of settings.uncovered) listener();
   };
-  const attach = async (frame: Frame, ended: () => void): Promise<'own' | 'shared' | 'uncovered'> => {
+  const attach = async (frame: Frame, ended: () => void): Promise<'own' | 'shared' | 'gone' | 'uncovered'> => {
     // One retry absorbs a target that ended mid-attach; a frame still live and not set up is uncovered.
     for (let attempt = 0; attempt < 2; attempt++) {
-      if (closed || frame.isDetached()) return 'shared';
+      if (closed || frame.isDetached()) return 'gone';
       let frameSession: CDPSession;
       try {
         frameSession = await page.context().newCDPSession(frame);
@@ -77,7 +77,7 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
       frameSessions.delete(frameSession);
       await frameSession.detach().catch(() => undefined);
     }
-    return closed || frame.isDetached() ? 'shared' : 'uncovered';
+    return closed || frame.isDetached() ? 'gone' : 'uncovered';
   };
   const cover = (frame: Frame): Promise<boolean> => {
     if (closed || frame === page.mainFrame() || frame.isDetached()) return Promise.resolve(true);
