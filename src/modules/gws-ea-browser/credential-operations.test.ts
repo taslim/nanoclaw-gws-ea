@@ -40,11 +40,20 @@ import {
   executeCredentialForm,
   recoverCredentialAttempts,
   registerCredentialAuthorityDelivery,
+  settleConfirmedAttempts,
+  settleRefusedSites,
   validateCredentialForm,
 } from './credential-operations.js';
 import { BrowserStore } from './db.js';
 import { BrowserVault } from './onepassword.js';
-import { FakeOnePassword, FIXTURE_VAULT_ID, writeVaultFixture } from './onepassword-fixture.js';
+import {
+  FakeOnePassword,
+  FIXTURE_TOKEN,
+  FIXTURE_VAULT_ID,
+  writeVaultFixture,
+  type VaultFixtureFiles,
+} from './onepassword-fixture.js';
+import { writePrivateFile } from './paths.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 import { openSignupVerification } from './sign-in-mail.js';
 
@@ -53,6 +62,7 @@ const USERNAME = 'morgan.ellery@example.com';
 const PRINCIPAL_USERNAME = 'remy.vance@example.com';
 
 let directory: string;
+let files: VaultFixtureFiles;
 let fake: FakeOnePassword;
 let vault: BrowserVault;
 let attempts: CredentialAttempts;
@@ -62,7 +72,7 @@ let job: Session;
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
   directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'credential-operations-')));
-  const files = await writeVaultFixture(directory);
+  files = await writeVaultFixture(directory);
   fake = new FakeOnePassword();
   sdk.create.mockReset();
   sdk.create.mockImplementation(async () => fake.client());
@@ -127,6 +137,22 @@ const editField = (id: string, value: string) => (item: Item) => ({
   fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
 });
 const editUsername = (value: string) => editField('username', value);
+
+/** A job context for steps that must never touch the page. */
+function context(): { context: BrowserExecutionContext; page: ReturnType<typeof vi.fn> } {
+  const page = vi.fn(async () => {
+    throw new Error('the page must not be touched');
+  });
+  return {
+    page,
+    context: {
+      job: { id: job.thread_id },
+      page,
+      assertActive: async () => undefined,
+      remaining: () => 60_000,
+    } as unknown as BrowserExecutionContext,
+  };
+}
 
 describe("main's credential authority", () => {
   it('records a signup for one job, site and account, repeats safely, and spends no provider request', async () => {
@@ -326,20 +352,6 @@ describe('the browser credential request', () => {
       expect(() => validateCredentialForm(content)).toThrow();
   });
 
-  function context(): { context: BrowserExecutionContext; page: ReturnType<typeof vi.fn> } {
-    const page = vi.fn(async () => {
-      throw new Error('the page must not be touched');
-    });
-    return {
-      page,
-      context: {
-        job: { id: job.thread_id },
-        page,
-        assertActive: async () => undefined,
-        remaining: () => 60_000,
-      } as unknown as BrowserExecutionContext,
-    };
-  }
   const run = (authority: string, fields: Record<string, unknown> = { new_password: ref(2) }) => {
     const { context: execution, page } = context();
     return {
@@ -474,6 +486,42 @@ describe('the browser credential request', () => {
       }
     });
 
+    it.each<[string, (itemId: string) => void]>([
+      ['username', (itemId) => fake.edit(itemId, editUsername(PRINCIPAL_USERNAME))],
+      [
+        'site',
+        (itemId) =>
+          fake.edit(itemId, (item) => ({
+            ...item,
+            websites: [
+              { url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain },
+            ],
+          })),
+      ],
+      ['password', (itemId) => fake.edit(itemId, editField('password', 'principal-chosen-password-1'))],
+      ['deletion', (itemId) => void fake.items.delete(itemId)],
+    ])("leaves the Login as edited when a %s edit lands between the host's read and its write", async (_edit, edit) => {
+      const itemId = await assistantLogin();
+      const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
+      await attempts.save(id);
+      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+      await attempts.markAwaitingVerification(id);
+      await attempts.markConfirmed(id, { signal: 'success_text' });
+      const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
+      const next = fake.value(candidateId, 'password');
+      let edited: Item | undefined;
+      fake.beforePut = () => {
+        edit(itemId);
+        edited = structuredClone(fake.items.get(itemId));
+      };
+      // The stale write proves nothing: the fresh read after it finds the edit, and the host writes no more.
+      expect(await reconcile(id).result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
+      expect(fake.items.get(itemId)).toEqual(edited);
+      expect(fake.value(itemId, 'password')).not.toBe(next);
+      expect(fake.value(candidateId, 'password')).toBe(next);
+      expect(fake.value(candidateId, 'previous-password')).toBeUndefined();
+    });
+
     it('finishes a confirmed change whose vault update was cut short', async () => {
       const itemId = await assistantLogin();
       const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
@@ -550,6 +598,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   const DM = { channelType: 'gchat', platformId: 'gchat:dm:principal-morgan' };
   let cards: string[];
   let closed: string[];
+  let queue: BrowserQueue;
 
   beforeEach(async () => {
     cards = [];
@@ -578,7 +627,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       messaging_group_id: 'mg-principal-dm',
       resolved_at: at,
     });
-    const queue = new BrowserQueue(new BrowserStore(), {
+    queue = new BrowserQueue(new BrowserStore(), {
       pageForJob: async () => {
         throw new Error('A release never opens a page');
       },
@@ -664,8 +713,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     await attempts.markAwaitingVerification(preparing);
     await attempts.markConfirmed(preparing, { signal: 'success_text' });
-    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
-    await attempts.finalize(preparing);
+    // A confirmed attempt 1Password can still finish is settled, never released.
+    expect(await release(preparing)).toEqual({ status: 'account_created', vault: 'saved' });
+    expect(await attempts.get(preparing)).toMatchObject({ phase: 'finalized' });
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     const other = await attempts.prepareSignup({ jobId: 'system:a2a:main:other', origin: ORIGIN, username: USERNAME });
     if (other.status !== 'prepared') throw new Error(other.status);
@@ -763,5 +813,151 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
       status: 'recorded',
     });
+  });
+
+  /** A change the website confirmed on the assistant's own Login, whose vault update has not run. */
+  async function confirmedChange(): Promise<{ id: string; itemId: string; candidateId: string }> {
+    const { id, itemId } = await disclosedChange();
+    await attempts.markAwaitingVerification(id);
+    await attempts.markConfirmed(id, { signal: 'success_text' });
+    return { id, itemId, candidateId: (await attempts.get(id))?.candidate_item_id ?? '' };
+  }
+  const releaseWithQueue = (authority: string) =>
+    credentialAuthorityRequest(
+      { action: 'credential_authority', requestId: 'release', thread: job.thread_id, operation: 'release', authority },
+      main,
+      { attempts, queue: () => queue },
+    );
+
+  it('settles a confirmed change instead of asking, while 1Password can finish it, and frees its site', async () => {
+    const { id, itemId, candidateId } = await confirmedChange();
+    await holdSite();
+    expect(await releaseWithQueue(id)).toEqual({ status: 'password_changed', vault: 'updated' });
+    expect(await pending()).toEqual([]);
+    expect(cards).toEqual([]);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+    expect(fake.items.has(candidateId)).toBe(false);
+    expect(await lease()).toBeUndefined();
+  });
+
+  it("releases a confirmed change 1Password can't be reached to finish, saying what the vault still holds", async () => {
+    const { id, itemId, candidateId } = await confirmedChange();
+    const old = fake.value(itemId, 'password');
+    const next = fake.value(candidateId, 'password');
+    await holdSite();
+    await rm(files.tokenFile);
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain("I can't reach 1Password to put it into the login");
+    expect(card.question).toContain('"New password for shop.example", and the login may still have the old one');
+    expect(card.question).not.toContain('Trying again');
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    await click('approve');
+    const released = await attempts.get(id);
+    expect(released).toMatchObject({ phase: 'rejected', owned_item_id: null, settlement: null });
+    expect(JSON.parse(released!.evidence_json!)).toMatchObject({ release: 'principal', released_from: 'confirmed' });
+    expect(await lease()).toBeUndefined();
+    expect(notes().at(-1)).toContain(
+      'The new password stays in the assistant\'s 1Password vault as its own item, "New password for shop.example"; the login may still have the old one.',
+    );
+    // Releasing touched nothing in 1Password.
+    expect(fake.value(itemId, 'password')).toBe(old);
+    expect(fake.value(candidateId, 'password')).toBe(next);
+  });
+
+  it('finishes a confirmed change at approval when 1Password is back, instead of releasing it', async () => {
+    const { id, itemId } = await confirmedChange();
+    await holdSite();
+    await rm(files.tokenFile);
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
+    await click('approve');
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+    expect(await lease()).toBeUndefined();
+    expect(notes().at(-1)).toContain('was not released: 1Password could be reached again');
+    expect(notes().at(-1)).toContain('password_changed, vault updated');
+  });
+
+  it('describes a promoted change it cannot finish by what is left: the login has it, the separate item may too', async () => {
+    const { id } = await confirmedChange();
+    fake.failNext('delete', new Error('network'));
+    fake.beforePut = () => fake.failNext('list', new Error('network'));
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    await rm(files.tokenFile);
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain('and the login in my 1Password vault has it');
+    expect(card.question).toContain(
+      '"New password for shop.example" may still hold a copy of it and of the old password',
+    );
+  });
+
+  it('settles a stuck confirmed change at browser start without its job, and frees its site', async () => {
+    const { id, itemId } = await confirmedChange();
+    await rm(files.tokenFile);
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    await holdSite();
+    // Still out of reach at the next start: the pass spends nothing more and leaves it held.
+    await settleConfirmedAttempts(queue, undefined, attempts);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'confirmed' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
+    await settleConfirmedAttempts(queue, undefined, attempts);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+    expect(await lease()).toBeUndefined();
+  });
+
+  it('settles the confirmed change holding a site another job was refused', async () => {
+    const { id } = await confirmedChange();
+    await rm(files.tokenFile);
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
+    await holdSite();
+    const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;
+    // A job waiting on another site spends nothing on this one.
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_site_waiters (site, job_id, requested_at) VALUES ('other.example', ?, ?)",
+      other.thread_id,
+      new Date().toISOString(),
+    );
+    const calls = fake.calls.length;
+    await settleRefusedSites(queue, other.thread_id!, attempts);
+    expect(fake.calls).toHaveLength(calls);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'confirmed' });
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_site_waiters (site, job_id, requested_at) VALUES ('shop.example', ?, ?)",
+      other.thread_id,
+      new Date().toISOString(),
+    );
+    await settleRefusedSites(queue, other.thread_id!, attempts);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized' });
+    expect(await lease()).toBeUndefined();
+  });
+
+  it('reports, asks and releases a signup whose login was edited before the host finished saving it', async () => {
+    const id = await disclosedSignup();
+    await attempts.markAwaitingVerification(id);
+    await attempts.markConfirmed(id, { signal: 'success_text' });
+    const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
+    fake.edit(candidateId, editUsername(PRINCIPAL_USERNAME));
+    const { context: execution, page } = context();
+    expect(await executeCredentialForm(execution, { authority: id, operation: 'reconcile' }, { attempts })).toEqual({
+      status: 'account_created',
+      vault: 'left_as_edited',
+    });
+    expect(page).not.toHaveBeenCalled();
+    expect(await attempts.get(id)).toMatchObject({ phase: 'conflict', conflict_reason: 'ownership_mismatch' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain(
+      'its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is',
+    );
+    expect(card.question).not.toContain('Trying again');
+    await click('approve');
+    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
+    expect(notes().at(-1)).toContain(
+      'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+    );
+    expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
   });
 });

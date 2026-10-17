@@ -337,9 +337,9 @@ describe('suggestions and ownership', () => {
     await subject.markConfirmed(attempt.id, { account_page: 'verified' });
     const listings = fake.calls.filter((call) => call === 'list').length;
     expect(await subject.finalize(attempt.id)).toMatchObject({ status: 'finalized' });
-    // Publication drops the pending tag and lists the vault once more on next use.
+    // Finalizing checks the candidate is still active; publication drops the pending tag, and the next use lists again.
     expect(await titles()).toEqual(['Shop', 'shop.example']);
-    expect(fake.calls.filter((call) => call === 'list')).toHaveLength(listings + 1);
+    expect(fake.calls.filter((call) => call === 'list')).toHaveLength(listings + 2);
     const finalized = await subject.get(attempt.id);
     expect(fake.items.get(finalized?.owned_item_id ?? '')?.tags).toEqual([]);
 
@@ -582,11 +582,18 @@ describe('password changes', () => {
       expect(holders(change.next)).toEqual([change.candidateId]);
       expect(fake.value(change.candidateId, 'account')).toBe(USERNAME);
       expect(previousPasswordFields()).toBe(0);
-      // A conflict is settled: finalizing again writes nothing, and only the principal's release ends it.
-      const writes = puts();
-      expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'refused', reason: 'not_confirmed' });
-      expect(puts()).toBe(writes);
-      expect(await subject.release(change.attempt.id, 'approval-released')).toMatchObject({ phase: 'rejected' });
+      // A conflict is settled: finalizing again answers it and writes nothing, and only the principal's release ends it.
+      const calls = fake.calls.length;
+      expect(await subject.finalize(change.attempt.id)).toMatchObject({
+        status: 'conflict',
+        reason: 'ownership_mismatch',
+      });
+      expect(fake.calls).toHaveLength(calls);
+      expect(await subject.release(change.attempt.id, 'approval-released')).toMatchObject({
+        status: 'released',
+        from: 'conflict',
+        attempt: { phase: 'rejected' },
+      });
       expect(holders(change.next)).toEqual([change.candidateId]);
     },
   );
@@ -680,7 +687,7 @@ describe('password changes', () => {
     const change = await confirmedChange(subject, itemId);
     fake.failNext('delete', new Error('network'));
     expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
-    expect(await phase(change.attempt.id)).toBe('confirmed');
+    expect(await subject.get(change.attempt.id)).toMatchObject({ phase: 'confirmed', settlement: 'promoted' });
     expect(fake.value(itemId, 'password')).toBe(change.next);
     expect(fake.items.has(change.candidateId)).toBe(true);
     const writes = puts();
@@ -693,6 +700,161 @@ describe('password changes', () => {
     expect(fake.items.has(change.candidateId)).toBe(false);
     expect(holders(change.next)).toEqual([itemId]);
     expect(previousPasswordFields()).toBe(0);
+  });
+
+  it('resumes a promoted change whose candidate removal landed while the vault could not be listed', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    // The delete lands but its answer is lost, and the listing that would show it gone fails too.
+    fake.failNext('delete', new Error('connection reset'), true);
+    fake.beforePut = () => fake.failNext('list', new Error('network'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.get(change.attempt.id)).toMatchObject({ phase: 'confirmed', settlement: 'promoted' });
+    expect(fake.items.has(change.candidateId)).toBe(false);
+
+    // A new process remembers nothing, and the candidate it would read is gone: the recorded settlement resumes.
+    const restarted = service({ vault: newVault() });
+    expect(await restarted.finalize(change.attempt.id)).toMatchObject({
+      status: 'finalized',
+      attempt: { phase: 'finalized', owned_item_id: itemId },
+    });
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(previousPasswordFields()).toBe(0);
+  });
+
+  it('resumes a kept change whose previous-password removal landed with its answer lost', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    fake.edit(itemId, setField('username', 'remy.vance@example.com'));
+    fake.failNext('put', new Error('connection reset'), true);
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.get(change.attempt.id)).toMatchObject({
+      phase: 'confirmed',
+      settlement: 'kept',
+      conflict_reason: 'ownership_mismatch',
+    });
+    expect(previousPasswordFields()).toBe(0);
+
+    // The candidate no longer matches what an undecided pass reads; the recorded settlement still ends it.
+    const restarted = service({ vault: newVault() });
+    expect(await restarted.finalize(change.attempt.id)).toMatchObject({
+      status: 'conflict',
+      reason: 'ownership_mismatch',
+      attempt: { phase: 'conflict' },
+    });
+    expect(holders(change.next)).toEqual([change.candidateId]);
+  });
+
+  it('recognizes a promotion whose write landed with its answer lost, after a restart', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    // The write lands, its answer is lost, and the fresh read after it fails as well.
+    fake.failNext('put', new Error('connection reset'), true);
+    fake.beforePut = () => fake.failNext('get', new Error('network'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.get(change.attempt.id)).toMatchObject({ phase: 'confirmed', settlement: null });
+    expect(fake.value(itemId, 'password')).toBe(change.next);
+
+    const restarted = service({ vault: newVault() });
+    const writes = puts();
+    expect(await restarted.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(puts()).toBe(writes);
+    expect(fake.items.has(change.candidateId)).toBe(false);
+    expect(holders(change.next)).toEqual([itemId]);
+  });
+
+  it('treats a failed read of a Login the vault still lists as a vault failure, never as its removal', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    fake.failNext('get', new Error('network'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.get(change.attempt.id)).toMatchObject({ phase: 'confirmed', settlement: null });
+    expect(fake.value(change.candidateId, 'previous-password')).toBe(change.previous);
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(holders(change.next)).toEqual([itemId]);
+
+    // A signup's saved login read the same way stays confirmed, unpublished, for its next finalize.
+    const signup = expectPrepared(
+      await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: 'juno.hale@example.com' }),
+    );
+    await subject.save(signup.id);
+    await subject.disclose(signup.id, { jobId: JOB, origin: ORIGIN });
+    await subject.markAwaitingVerification(signup.id);
+    await subject.markConfirmed(signup.id, { account_page: 'verified' });
+    fake.failNext('get', new Error('network'));
+    expect(await subject.finalize(signup.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await phase(signup.id)).toBe('confirmed');
+    expect(await subject.finalize(signup.id)).toMatchObject({ status: 'finalized' });
+  });
+
+  it('stops at a rate-limited candidate removal without listing, then finishes after the backoff', async () => {
+    vi.useFakeTimers();
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    fake.failNext('delete', new RateLimitExceededError('daily limit reached'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'rate_limited' });
+    // Nothing is listed after the refused delete: a rate limit stands without spending another request.
+    expect(fake.calls.at(-1)).toBe('delete');
+    expect(await subject.get(change.attempt.id)).toMatchObject({ phase: 'confirmed', settlement: 'promoted' });
+    vi.advanceTimersByTime(60_001);
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(fake.items.has(change.candidateId)).toBe(false);
+  });
+
+  it.each<[string, (itemId: string) => void]>([
+    ['deleted', (itemId) => void fake.items.delete(itemId)],
+    ['archived', (itemId) => void fake.archived.add(itemId)],
+  ])('refuses a change before anything reaches the site once its Login is %s', async (_how, remove) => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const handle = await handleFor(itemId);
+    const beforeSave = expectPrepared(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: handle }),
+    );
+    remove(itemId);
+    const creates = fake.calls.filter((call) => call === 'create').length;
+    expect(await subject.save(beforeSave.id)).toEqual({ status: 'not_owned' });
+    expect(fake.calls.filter((call) => call === 'create')).toHaveLength(creates);
+    await subject.abandon(beforeSave.id);
+
+    // Removed after its candidate was saved: nothing is disclosed.
+    const restored = await ownedLogin(subject, 'juno.hale@example.com');
+    fake.edit(restored.itemId, (item) => ({ ...item, title: 'Shop (Juno)' }));
+    const afterSave = expectPrepared(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: await handleFor(restored.itemId) }),
+    );
+    expect(await subject.save(afterSave.id)).toMatchObject({ status: 'saved' });
+    remove(restored.itemId);
+    expect(await subject.disclose(afterSave.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_owned',
+    });
+    expect(await phase(afterSave.id)).toBe('saved');
+  });
+
+  it.each<[string, (itemId: string) => void]>([
+    ['deleted', (itemId) => void fake.items.delete(itemId)],
+    ['archived', (itemId) => void fake.archived.add(itemId)],
+  ])('leaves a signup whose saved login was %s before it was published as removed', async (_how, remove) => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    await subject.save(attempt.id);
+    await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
+    await subject.markAwaitingVerification(attempt.id);
+    await subject.markConfirmed(attempt.id, { account_page: 'verified' });
+    const candidateId = (await subject.get(attempt.id))?.candidate_item_id;
+    if (!candidateId) throw new Error('no candidate');
+    remove(candidateId);
+    expect(await subject.finalize(attempt.id)).toMatchObject({
+      status: 'conflict',
+      reason: 'login_removed',
+      attempt: { phase: 'conflict', owned_item_id: null },
+    });
   });
 
   it('lets a later job take over a change another job saved but never disclosed, whose late disclosure then loses', async () => {

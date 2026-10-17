@@ -82,9 +82,11 @@ import {
   MAX_USERNAME,
   type CandidateCredential,
   type CredentialAttempt,
+  type CredentialAttemptPhase,
   type CredentialAttempts,
   type CredentialEvidence,
   type CredentialFinalizeResult,
+  type CredentialReleaseResult,
 } from './credential-attempts.js';
 import { assertBrowserSecretDiagnosticsSafe, settleFilledSecrets } from './fill.js';
 import { HELD_CREDENTIAL_PHASES, SiteLeaseStore } from './leases.js';
@@ -109,6 +111,8 @@ import {
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
+  /** Frees the site of an attempt main's release request finds 1Password can now settle. */
+  readonly queue?: () => BrowserQueue;
 }
 const DEFAULT_DEPENDENCIES: CredentialOperationDependencies = { attempts: credentialAttempts };
 
@@ -257,33 +261,122 @@ export const credentialReleaseGuard = defineGuardedAction({
   },
 });
 
-/** What the principal reads on the card: what is not known, what 1Password keeps, and what releasing means. */
+/**
+ * What 1Password holds for an attempt the host could not finish, in the
+ * principal's words on the card (`mine`) and in main's note (`theirs`). A
+ * confirmed one says which item holds the password the site took, and
+ * whether the original login may still hold the old one, from its recorded
+ * settlement.
+ */
+function vaultLeft(
+  attempt: Pick<CredentialAttempt, 'kind' | 'site' | 'settlement'>,
+  phase: CredentialAttemptPhase,
+): { readonly mine: string | undefined; readonly theirs: string } {
+  const item = `"New password for ${attempt.site}"`;
+  if (attempt.kind === 'signup')
+    switch (phase) {
+      case 'conflict':
+        return {
+          mine: undefined,
+          theirs: 'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+        };
+      case 'confirmed':
+        return {
+          mine: `Its password is in my 1Password vault, in the login "${attempt.site}" that I couldn't finish saving.`,
+          theirs: `Its password stays in the assistant's 1Password vault, in the login "${attempt.site}" the host could not finish saving.`,
+        };
+      default:
+        return {
+          mine: 'The password I generated for it is kept in my 1Password vault.',
+          theirs: "The password generated for it stays in the assistant's 1Password vault, not saved as its login.",
+        };
+    }
+  if (phase === 'conflict')
+    return {
+      mine: `The new password is in my 1Password vault as its own item, ${item}.`,
+      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login stays as it was changed.`,
+    };
+  if (phase !== 'confirmed')
+    return {
+      mine: 'Both the original and the new password are kept in my 1Password vault.',
+      theirs:
+        "Both the original and the new password stay in the assistant's 1Password vault; the login was not updated.",
+    };
+  switch (attempt.settlement) {
+    case 'promoted':
+      return {
+        mine: `The item ${item} may still hold a copy of it and of the old password.`,
+        theirs: `The login holds the new password; the item ${item} may still hold a copy of it and of the old password.`,
+      };
+    case 'kept':
+      return {
+        mine: `The new password is in my 1Password vault as its own item, ${item}, which may still hold the old password too.`,
+        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; the login stays as it was changed.`,
+      };
+    case null:
+      return {
+        mine: `The new password is in my 1Password vault as its own item, ${item}, and the login may still have the old one.`,
+        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login may still have the old one.`,
+      };
+  }
+}
+
+/** What happened, as the principal reads it first on the card. */
+function situation(attempt: CredentialAttempt, account: string): string {
+  if (attempt.kind === 'signup')
+    switch (attempt.phase) {
+      case 'conflict':
+        return `The site created the account ${account}, but its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is.`;
+      case 'confirmed':
+        return `The site created the account ${account}, but I can't reach 1Password to finish saving its login.`;
+      case 'awaiting_verification':
+        return `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`;
+      default:
+        return `I tried to create the account ${account}, but I can't tell whether the account was created.`;
+    }
+  if (attempt.phase === 'conflict' || (attempt.phase === 'confirmed' && attempt.settlement === 'kept'))
+    return `The site took a new password for ${account}, but its login in my 1Password vault was changed or removed while I was changing it, so I left the login as it is.`;
+  if (attempt.phase === 'confirmed')
+    return attempt.settlement === 'promoted'
+      ? `The site took a new password for ${account}, and the login in my 1Password vault has it, but I can't reach 1Password to delete the separate item that held it.`
+      : `The site took a new password for ${account}, but I can't reach 1Password to put it into the login.`;
+  return `I tried to change the password of ${account}, but I can't tell whether the password changed.`;
+}
+
+/** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
 function releaseQuestion(attempt: CredentialAttempt): string {
   const account = `${quotePurchaseText(attempt.username, 256)} on ${attempt.site}`;
-  if (attempt.kind === 'signup')
-    return [
-      attempt.phase === 'conflict'
-        ? `The site created the account ${account}, but its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is.`
-        : `${
-            attempt.phase === 'awaiting_verification'
-              ? `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`
-              : `I tried to create the account ${account}, but I can't tell whether the account was created.`
-          }\nThe password I generated for it is kept in my 1Password vault.`,
-      'If you release it, I stop waiting on it and free the site, and I change nothing in 1Password. Trying again could create a second account.',
-    ].join('\n');
-  return [
-    attempt.phase === 'conflict'
-      ? `The site took a new password for ${account}, but its login in my 1Password vault was changed or removed while I was changing it, so I left the login as it is. The new password is in my 1Password vault as its own item, "New password for ${attempt.site}".`
-      : `I tried to change the password of ${account}, but I can't tell whether the password changed.\nBoth the original and the new password are kept in my 1Password vault.`,
-    'If you release it, I stop waiting on it and free the site and the login, and I change nothing in 1Password. Trying again could change the password a second time.',
-  ].join('\n');
+  const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
+  const consequence =
+    attempt.kind === 'signup'
+      ? `If you release it, I stop waiting on it and free the site, and I change nothing more in 1Password.${uncertain ? ' Trying again could create a second account.' : ''}`
+      : `If you release it, I stop waiting on it and free the site and the login, and I change nothing more in 1Password.${uncertain ? ' Trying again could change the password a second time.' : ''}`;
+  return [situation(attempt, account), vaultLeft(attempt, attempt.phase).mine, consequence]
+    .filter((sentence) => sentence !== undefined)
+    .join('\n');
+}
+
+/** A confirmed attempt is settled when 1Password can still finish it: a release is only for one it cannot. */
+async function settledFirst(attempts: CredentialAttempts, attempt: CredentialAttempt): Promise<Outcome | undefined> {
+  if (attempt.phase !== 'confirmed') return undefined;
+  let result: CredentialFinalizeResult;
+  try {
+    result = await attempts.finalize(attempt.id);
+  } catch (error) {
+    // Another step moved it first; its current phase decides what follows.
+    if (!(error instanceof CredentialAttemptError)) throw error;
+    return undefined;
+  }
+  return result.status === 'finalized' || result.status === 'conflict'
+    ? websiteOutcome(attempt.kind, result.status)
+    : undefined;
 }
 
 /** Main asks for the principal's decision on an attempt only they can now end; never a release by itself. */
 async function credentialReleaseRequest(
   content: Record<string, unknown>,
   session: Session,
-  { attempts }: CredentialOperationDependencies,
+  { attempts, queue }: CredentialOperationDependencies,
 ): Promise<Outcome> {
   const { thread, authority } = content;
   if (
@@ -296,9 +389,16 @@ async function credentialReleaseRequest(
     throw invalidArgs('release needs only the job thread and the credential authority it recorded.');
   const job = await resolveBrowserJob(thread);
   if (!job) throw forbidden('No main-owned browser job exists for that thread.');
-  const attempt = await attempts.get(authority);
-  if (!attempt || attempt.job_id !== job.id || !RELEASABLE_PHASES.includes(attempt.phase))
+  const found = await attempts.get(authority);
+  if (!found || found.job_id !== job.id || !RELEASABLE_PHASES.includes(found.phase))
     return { status: 'not_releasable' };
+  const settled = await settledFirst(attempts, found);
+  if (settled) {
+    if (queue) await freeSite(queue(), found, `credential-settled-${found.id}`);
+    return settled;
+  }
+  const attempt = await attempts.get(found.id);
+  if (!attempt || !RELEASABLE_PHASES.includes(attempt.phase)) return { status: 'not_releasable' };
   const payload = { attemptId: attempt.id, jobId: job.id };
   const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload });
   if (decision.effect !== 'hold') throw forbidden(decision.reason);
@@ -322,16 +422,37 @@ async function credentialReleaseRequest(
   return { status: 'awaiting_principal' };
 }
 
-/** Whether this approval already released the attempt, as a resumed approval finds it. */
-function releasedBy(attempt: CredentialAttempt, approvalId: string): boolean {
+/** The release evidence: this approval's, and the phase it released, as a resumed approval finds it. */
+function releasedFrom(attempt: CredentialAttempt, approvalId: string): CredentialAttemptPhase | undefined {
   const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
-  return attempt.phase === 'rejected' && isRecord(evidence) && evidence.approval === approvalId;
+  if (attempt.phase !== 'rejected' || !isRecord(evidence) || evidence.approval !== approvalId) return undefined;
+  const from = evidence.released_from;
+  return RELEASABLE_PHASES.find((phase) => phase === from) ?? 'unknown';
+}
+
+/**
+ * An attempt that no longer holds its site, settled or released: the site
+ * goes to its waiters now, unless its job is mid-request, whose end releases
+ * it, and a cancellation waiting on it completes.
+ */
+async function freeSite(
+  queue: BrowserQueue,
+  attempt: Pick<CredentialAttempt, 'job_id' | 'site'>,
+  eventId: string,
+): Promise<void> {
+  const running = await queue.store.db.get<{ present: number }>(
+    'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
+    attempt.job_id,
+  );
+  if (!running) await queue.wakeWaiters(await queue.leases.release(attempt.job_id, attempt.site), eventId);
+  await finishRequestedCancellation(attempt.job_id, queue);
 }
 
 /**
  * The principal's approval: re-checked live with the card as its grant, then
- * the attempt ends and everything held for it lifts. Nothing in 1Password is
- * touched, and nothing is finalized, published, promoted or owned.
+ * the attempt ends and everything held for it lifts, unless 1Password could
+ * finish a confirmed one after all. Releasing touches nothing in 1Password,
+ * and nothing is finalized, published, promoted or owned.
  */
 async function applyCredentialRelease(
   { session, payload, approval, userId, notify }: ApprovalHandlerContext,
@@ -342,44 +463,87 @@ async function applyCredentialRelease(
     await notify('The credential attempt was not released: only the principal can decide that.');
     return;
   }
-  const current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
-  if (!current || !releasedBy(current, approval.approval_id)) {
+  let current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
+  let from = current && releasedFrom(current, approval.approval_id);
+  if (!current || !from) {
     const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload, grant: approval });
     if (decision.effect !== 'allow' || !current) {
       await notify(`The credential attempt was not released: ${decision.reason}`);
       return;
     }
+    let result: CredentialReleaseResult;
     try {
-      await attempts.release(current.id, approval.approval_id);
+      result = await attempts.release(current.id, approval.approval_id);
     } catch (error) {
       if (!(error instanceof CredentialAttemptError)) throw error;
       await notify('The credential attempt was not released: another step settled it first.');
       return;
     }
+    if (result.status === 'settled') {
+      await freeSite(queue, result.result.attempt, `credential-settled-${current.id}`);
+      const outcome = websiteOutcome(current.kind, result.result.status);
+      await notify(
+        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it (${String(outcome.status)}, vault ${String(outcome.vault)}).`,
+      );
+      return;
+    }
+    current = result.attempt;
+    from = result.from;
   }
   watchedResponses.delete(current.id);
   await finishSignupVerification(current.id);
-  // The site goes to its waiters now, unless the job is mid-request: that request's end releases it.
-  const running = await queue.store.db.get<{ present: number }>(
-    'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
-    current.job_id,
+  await freeSite(queue, current, `credential-release-${current.id}`);
+  await notify(
+    `The principal released the ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site}. ${vaultLeft(current, from).theirs} The site is free again, and nothing in 1Password changed.`,
   );
-  if (!running)
-    await queue.wakeWaiters(
-      await queue.leases.release(current.job_id, current.site),
-      `credential-release-${current.id}`,
-    );
-  await finishRequestedCancellation(current.job_id, queue);
-  // A released conflict keeps its reason: the login was changed in 1Password before the host finished saving it.
-  const what =
-    current.kind === 'signup'
-      ? current.conflict_reason === null
-        ? `the unresolved signup for ${current.username} on ${current.site}. The password generated for it stays in the assistant's 1Password vault, not saved as its login`
-        : `the signup for ${current.username} on ${current.site}, whose login was changed in 1Password before the host finished saving it`
-      : current.conflict_reason === null
-        ? `the unresolved password change for ${current.username} on ${current.site}. Both the original and the new password stay in the assistant's 1Password vault; the login was not updated`
-        : `the password change for ${current.username} on ${current.site}. The new password stays in the assistant's 1Password vault as its own item, "New password for ${current.site}"; the login stays as it was changed`;
-  await notify(`The principal released ${what}. The site is free again, and nothing in 1Password changed.`);
+}
+
+/**
+ * Finishes saving confirmed attempts that wait only on 1Password, with no job
+ * to drive them: when the browser starts, and when a job is refused a site
+ * one of them holds (`sites`). Each that settles frees its site. A vault out
+ * of reach, or a spent request limit, ends the pass: the rest would only
+ * spend more.
+ */
+export async function settleConfirmedAttempts(
+  queue: BrowserQueue,
+  sites?: ReadonlySet<string>,
+  attempts: CredentialAttempts = credentialAttempts,
+): Promise<void> {
+  for (const attempt of await attempts.unresolved()) {
+    if (attempt.phase !== 'confirmed' || (sites && !sites.has(attempt.site))) continue;
+    let result: CredentialFinalizeResult;
+    try {
+      result = await attempts.finalize(attempt.id);
+    } catch (error) {
+      if (!(error instanceof CredentialAttemptError)) throw error;
+      continue;
+    }
+    if (result.status === 'finalized' || result.status === 'conflict')
+      await freeSite(queue, attempt, `credential-settled-${attempt.id}`);
+    else if (result.status === 'vault_unavailable' || result.status === 'rate_limited') return;
+  }
+}
+
+/**
+ * After a job's request: the sites it was refused that another job holds
+ * only for a confirmed credential attempt settle now, without that job.
+ */
+export async function settleRefusedSites(
+  queue: BrowserQueue,
+  jobId: string,
+  attempts: CredentialAttempts = credentialAttempts,
+): Promise<void> {
+  const { db } = queue.store;
+  if (!(await db.hasTable('gws_ea_browser_credential_attempts'))) return;
+  const held = await db.all<{ site: string }>(
+    `SELECT DISTINCT w.site FROM gws_ea_browser_site_waiters w
+       JOIN gws_ea_browser_site_leases l ON l.site = w.site AND l.job_id <> w.job_id
+       JOIN gws_ea_browser_credential_attempts a ON a.job_id = l.job_id AND a.site = w.site AND a.phase = 'confirmed'
+      WHERE w.job_id = ?`,
+    jobId,
+  );
+  if (held.length) await settleConfirmedAttempts(queue, new Set(held.map((row) => row.site)), attempts);
 }
 
 export function registerCredentialAuthorityDelivery(
@@ -389,7 +553,7 @@ export function registerCredentialAuthorityDelivery(
   registerDeliveryAction(
     'credential_authority',
     answeringAction('credential_authority', (content, session) =>
-      credentialAuthorityRequest(content, session, dependencies),
+      credentialAuthorityRequest(content, session, { ...dependencies, queue }),
     ),
     answeredGuard(browserDelegateGuard),
   );

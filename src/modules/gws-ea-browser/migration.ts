@@ -186,7 +186,7 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
 
 /**
  * Host-generated credentials (KTD6): each operation's binding, candidate and
- * source references and phase; never a value. A finalized row is the
+ * source references, phase and decided settlement; never a value. A finalized row is the
  * ownership record of the Login it names. Rows outlive jobs, so `job_id` is
  * deliberately not a foreign key.
  */
@@ -212,6 +212,7 @@ export const browserCredentialAttemptsMigration: PortableMigration & { name: Mod
         phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
         save_started_at TEXT,
         conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
+        settlement TEXT CHECK(settlement IN ('promoted','kept')),
         evidence_json TEXT,
         owned_item_id TEXT,
         created_at TEXT NOT NULL,
@@ -219,7 +220,9 @@ export const browserCredentialAttemptsMigration: PortableMigration & { name: Mod
         exposed_at TEXT,
         finalized_at TEXT,
         CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
-        CHECK(owned_item_id IS NULL OR phase = 'finalized')
+        CHECK(owned_item_id IS NULL OR phase = 'finalized'),
+        CHECK(settlement IS NULL OR kind = 'rotation'),
+        CHECK(settlement IS NULL OR settlement = 'promoted' OR conflict_reason IS NOT NULL)
       );
       CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
       CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;

@@ -15,6 +15,7 @@ import { wakeContainer } from '../../container-runner.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
+import { log } from '../../log.js';
 import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserJob, type BrowserRequest } from './db.js';
@@ -382,6 +383,19 @@ export class BrowserQueue {
       await this.wakeWaiters(await this.leases.release(jobId, lease.site), `${eventId}:${lease.site}`);
     const { finishRequestedCancellation } = await import('./cancel.js');
     await finishRequestedCancellation(jobId, this);
+    this.settleRefusedSites(jobId);
+  }
+
+  /**
+   * A job refused a site waits on it. When another job holds that site only
+   * for a confirmed credential attempt, which waits on 1Password alone, it
+   * settles now without that job, so the site can go to its waiters. No
+   * provider call holds up this job's queue.
+   */
+  private settleRefusedSites(jobId: string): void {
+    void import('./credential-operations.js')
+      .then(({ settleRefusedSites }) => settleRefusedSites(this, jobId))
+      .catch(() => log.warn('A held credential site could not be settled', { reason: 'settlement_failed' }));
   }
 
   /**

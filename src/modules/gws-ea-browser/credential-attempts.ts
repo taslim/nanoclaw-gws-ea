@@ -11,9 +11,12 @@
  *   awaiting_verification → rejected;  confirmed → conflict, when the login changed in 1Password meanwhile
  *   preparing | saved → rejected, when abandoned before any disclosure
  *   unknown | awaiting_verification | conflict → rejected, when the principal releases it
+ *   confirmed → rejected, when the principal releases one 1Password cannot settle
  *
  * A confirmed change writes the new password into the original Login and then
  * deletes its candidate, so the old password stays nowhere the host keeps.
+ * Settling is several 1Password writes and one phase move, so the decided
+ * outcome is recorded first and any later pass resumes from it (`settlement`).
  * Passwords live only in 1Password and this process's memory: rows, results,
  * errors and logs carry identifiers and constant reasons. Each operation
  * issues at most one create, tagged with its own marker; a lost response is
@@ -63,12 +66,28 @@ export type CredentialAttemptPhase =
 export type CredentialConflictReason = 'ownership_mismatch' | 'password_changed' | 'login_removed';
 
 /**
+ * How a confirmed change settles, recorded while it is still confirmed and
+ * before the first 1Password write that removes what an undecided pass reads:
+ * `promoted`, the original Login holds the new password and the candidate
+ * goes; `kept`, the Login is left as edited and the candidate keeps only the
+ * new password.
+ */
+export type CredentialSettlement = 'promoted' | 'kept';
+
+/**
  * The phases only the principal's informed decision can end once the host
  * cannot settle them: whether the website took the credential is unknown, its
- * email verification never completed, or the login it confirmed was changed
- * in 1Password before the host finished saving it.
+ * email verification never completed, the login it confirmed was changed in
+ * 1Password before the host finished saving it, or 1Password cannot be
+ * reached to finish saving a confirmed one (which `release` settles first
+ * when it can).
  */
-export const RELEASABLE_PHASES: readonly CredentialAttemptPhase[] = ['unknown', 'awaiting_verification', 'conflict'];
+export const RELEASABLE_PHASES: readonly CredentialAttemptPhase[] = [
+  'unknown',
+  'awaiting_verification',
+  'conflict',
+  'confirmed',
+];
 
 /** One operation's durable record: identifiers, references and phase, never a value. */
 export interface CredentialAttempt {
@@ -92,6 +111,8 @@ export interface CredentialAttempt {
   /** When the one create this operation may issue was sent; it is never sent again. */
   readonly save_started_at: string | null;
   readonly conflict_reason: CredentialConflictReason | null;
+  /** A confirmed change's decided outcome; its `kept` reason is `conflict_reason`. */
+  readonly settlement: CredentialSettlement | null;
   readonly evidence_json: string | null;
   /** Set on finalizing: the Login the host saved, owned while its username and site still match this row. */
   readonly owned_item_id: string | null;
@@ -113,7 +134,7 @@ export interface CandidateCredential {
 }
 
 type VaultFailure = { readonly status: 'vault_unavailable' } | { readonly status: 'rate_limited' };
-/** A fresh read, or `removed` once a listing shows the item is no longer active in the vault. */
+/** A fresh read of an active item, or `removed` once the vault's active listing no longer has it. */
 type FreshRead = { readonly value: VaultItemRead } | { readonly status: 'removed' } | VaultFailure;
 type Refused<Reason extends string> = { readonly status: 'refused'; readonly reason: Reason };
 type Saved = { readonly status: 'saved'; readonly attempt: CredentialAttempt };
@@ -139,11 +160,14 @@ export type CredentialDisclosure =
   | { readonly status: 'disclosed'; readonly credential: CandidateCredential }
   | Refused<'not_saved' | 'wrong_job' | 'origin_mismatch' | 'not_owned' | 'source_changed' | 'candidate_mismatch'>
   | VaultFailure;
-export type CredentialFinalizeResult =
+type Settled =
   | { readonly status: 'finalized'; readonly attempt: CredentialAttempt }
-  | { readonly status: 'conflict'; readonly reason: CredentialConflictReason; readonly attempt: CredentialAttempt }
-  | Refused<'not_confirmed' | 'candidate_mismatch'>
-  | VaultFailure;
+  | { readonly status: 'conflict'; readonly reason: CredentialConflictReason; readonly attempt: CredentialAttempt };
+export type CredentialFinalizeResult = Settled | Refused<'not_confirmed' | 'candidate_mismatch'> | VaultFailure;
+/** A release, or the settlement that came first because 1Password could still finish it. */
+export type CredentialReleaseResult =
+  | { readonly status: 'released'; readonly from: CredentialAttemptPhase; readonly attempt: CredentialAttempt }
+  | { readonly status: 'settled'; readonly result: Settled };
 export type CredentialOwnership =
   | { readonly status: 'owned' }
   | { readonly status: 'not_owned'; readonly reason: 'no_record' | 'changed' }
@@ -225,6 +249,8 @@ export interface CredentialAttemptsOptions {
  */
 export class CredentialAttempts {
   private readonly secrets = new Map<string, CandidateSecret>();
+  /** Each attempt's settlement or release in progress, so this process runs them one at a time. */
+  private readonly running = new Map<string, Promise<unknown>>();
   private readonly vault: BrowserVault;
 
   constructor(private readonly options: CredentialAttemptsOptions = {}) {
@@ -414,15 +440,34 @@ export class CredentialAttempts {
   }
 
   /**
-   * One fresh read of an item. A read fails alike for an item that is gone and
-   * for a vault that is not answering, so one listing then tells them apart.
+   * One fresh read of an item that is still active. An item read carries no
+   * state, and fails alike for an item that is gone and for a vault that is
+   * not answering, so the vault's active listing decides: an item it no longer
+   * has was deleted or archived.
    */
   private async fresh(vaultId: string, itemId: string, assertActive: () => Promise<void>): Promise<FreshRead> {
     const read = await provider(this.vault.readItem(vaultId, itemId, assertActive));
-    if ('value' in read || read.status === 'rate_limited') return read;
+    if (!('value' in read) && read.status === 'rate_limited') return read;
     const listed = await provider(this.vault.holds(vaultId, itemId, assertActive));
     if (!('value' in listed)) return listed;
     return listed.value ? read : { status: 'removed' };
+  }
+
+  /**
+   * After a failed request about an item, whether the vault's active listing
+   * no longer has it, which is all a removal needs. A rate limit stands
+   * without spending another request.
+   */
+  private async gone(
+    failure: VaultFailure,
+    vaultId: string,
+    itemId: string,
+    assertActive: () => Promise<void>,
+  ): Promise<true | VaultFailure> {
+    if (failure.status === 'rate_limited') return failure;
+    const listed = await provider(this.vault.holds(vaultId, itemId, assertActive));
+    if (!('value' in listed)) return listed;
+    return listed.value ? failure : true;
   }
 
   /** A change's original Login, read fresh, while it still matches its ownership record. */
@@ -742,23 +787,53 @@ export class CredentialAttempts {
     return attempt;
   }
 
+  /** This attempt's settlements and releases in this process, one after another. */
+  private async exclusive<T>(id: string, work: () => Promise<T>): Promise<T> {
+    const run = (this.running.get(id) ?? Promise.resolve()).then(work, work);
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.running.set(id, settled);
+    try {
+      return await run;
+    } finally {
+      if (this.running.get(id) === settled) this.running.delete(id);
+    }
+  }
+
   /**
    * Ends an attempt the principal released on their approval card: it becomes
-   * rejected, with the release and the approval added to its evidence. It
-   * never touches 1Password: no candidate is deleted, published or promoted,
-   * and no ownership is recorded, so every credential the site may hold stays
-   * where the principal can see it.
+   * rejected, with the release and the approval added to its evidence. A
+   * confirmed one is settled first if 1Password can finish it, and only an
+   * unsettled one is released. Releasing touches nothing in 1Password: no
+   * candidate is deleted, published or promoted, and no ownership is
+   * recorded, so every credential the site may hold stays where the principal
+   * can see it.
    */
-  async release(id: string, approvalId: string): Promise<CredentialAttempt> {
-    const attempt = await this.require(id);
-    const recorded: unknown = attempt.evidence_json === null ? {} : JSON.parse(attempt.evidence_json);
-    const evidence = Object.fromEntries(
-      Object.entries(isRecord(recorded) ? recorded : {}).filter(
-        (entry): entry is [string, string | number | boolean | null] =>
-          entry[1] === null || ['string', 'number', 'boolean'].includes(typeof entry[1]),
-      ),
-    );
-    return this.move(id, RELEASABLE_PHASES, 'rejected', { ...evidence, release: 'principal', approval: approvalId });
+  release(id: string, approvalId: string, assertActive = active): Promise<CredentialReleaseResult> {
+    return this.exclusive(id, async () => {
+      const current = await this.require(id);
+      if (current.phase === 'confirmed') {
+        const result = await this.settle(current, assertActive);
+        if (result.status === 'finalized' || result.status === 'conflict') return { status: 'settled', result };
+      }
+      const attempt = await this.require(id);
+      const recorded: unknown = attempt.evidence_json === null ? {} : JSON.parse(attempt.evidence_json);
+      const evidence = Object.fromEntries(
+        Object.entries(isRecord(recorded) ? recorded : {}).filter(
+          (entry): entry is [string, string | number | boolean | null] =>
+            entry[1] === null || ['string', 'number', 'boolean'].includes(typeof entry[1]),
+        ),
+      );
+      const released = await this.move(id, RELEASABLE_PHASES, 'rejected', {
+        ...evidence,
+        release: 'principal',
+        approval: approvalId,
+        released_from: attempt.phase,
+      });
+      return { status: 'released', from: attempt.phase, attempt: released };
+    });
   }
 
   /**
@@ -796,13 +871,30 @@ export class CredentialAttempts {
 
   /**
    * Publishes a confirmed signup's Login, or writes a confirmed change into the
-   * original Login (KTD8), and records ownership. Everything is read fresh;
-   * a vault failure leaves the attempt confirmed for its next finalize.
+   * original Login (KTD8), and records ownership. Everything is read fresh; a
+   * vault failure leaves the attempt confirmed, and the next finalize resumes
+   * from its recorded settlement. A settled attempt answers how it settled.
    */
-  async finalize(id: string, assertActive = active): Promise<CredentialFinalizeResult> {
-    const attempt = await this.require(id);
-    if (attempt.phase !== 'confirmed') return refused('not_confirmed');
-    return attempt.kind === 'signup' ? this.publish(attempt, assertActive) : this.promote(attempt, assertActive);
+  finalize(id: string, assertActive = active): Promise<CredentialFinalizeResult> {
+    return this.exclusive(id, async () => this.settle(await this.require(id), assertActive));
+  }
+
+  private async settle(
+    attempt: CredentialAttempt,
+    assertActive: () => Promise<void>,
+  ): Promise<CredentialFinalizeResult> {
+    switch (attempt.phase) {
+      case 'confirmed':
+        return attempt.kind === 'signup' ? this.publish(attempt, assertActive) : this.promote(attempt, assertActive);
+      case 'finalized':
+        return { status: 'finalized', attempt };
+      case 'conflict':
+        return attempt.conflict_reason === null
+          ? refused('not_confirmed')
+          : { status: 'conflict', reason: attempt.conflict_reason, attempt };
+      default:
+        return refused('not_confirmed');
+    }
   }
 
   private async publish(
@@ -825,12 +917,14 @@ export class CredentialAttempts {
 
   /**
    * Writes the new password into the original Login, read fresh immediately
-   * before each write and re-checked against its ownership record. Only its
-   * password changes, on the version just read, so every other edit the
-   * principal made stays; a write the provider refuses because they saved the
-   * Login meanwhile is retried on the fresher version, up to
-   * `PROMOTION_WRITES` times. A Login they removed, pointed at another account
-   * or site, or gave a password themselves is left as they made it.
+   * before each write and re-checked against its ownership record and its
+   * active state. Only its password changes, on the version just read, so
+   * every other edit the principal made stays. A write proves nothing until a
+   * read shows the new password: a failed or odd answer is followed by a
+   * fresh read, which retries a racing edit on the fresher version, up to
+   * `PROMOTION_WRITES` times. A Login they removed, archived, pointed at
+   * another account or site, or gave a password themselves is left as they
+   * made it. A recorded settlement resumes instead.
    */
   private async promote(
     attempt: CredentialAttempt,
@@ -838,18 +932,21 @@ export class CredentialAttempts {
   ): Promise<CredentialFinalizeResult> {
     const sourceId = attempt.source_item_id;
     if (sourceId === null) return refused('candidate_mismatch');
+    if (attempt.settlement === 'promoted') return this.finish(attempt, sourceId, assertActive);
+    if (attempt.settlement === 'kept' && attempt.conflict_reason !== null)
+      return this.keepCandidate(attempt, attempt.conflict_reason, assertActive);
     const candidate = await this.candidate(attempt, assertActive);
     if (!('secret' in candidate)) return candidate.status === 'mismatch' ? refused('candidate_mismatch') : candidate;
     const { password, previousPassword } = candidate.secret;
     let refusedVersion: number | undefined;
     for (let writes = 0; ; writes++) {
       const owned = await this.ownedSource(attempt, assertActive);
-      if (owned.status === 'removed') return this.keepCandidate(attempt, 'login_removed', assertActive);
-      if (owned.status === 'not_owned') return this.keepCandidate(attempt, 'ownership_mismatch', assertActive);
+      if (owned.status === 'removed') return this.keep(attempt, 'login_removed', assertActive);
+      if (owned.status === 'not_owned') return this.keep(attempt, 'ownership_mismatch', assertActive);
       if (owned.status !== 'owned') return owned;
-      // Already written, by an earlier finalize whose candidate removal failed or whose answer was lost.
-      if (owned.password === password) return this.finish(attempt, sourceId, assertActive);
-      if (owned.password !== previousPassword) return this.keepCandidate(attempt, 'password_changed', assertActive);
+      // The Login holds it already: an earlier write landed, whatever its answer.
+      if (owned.password === password) return this.promoted(attempt, sourceId, assertActive);
+      if (owned.password !== previousPassword) return this.keep(attempt, 'password_changed', assertActive);
       // The last write did not land and nothing has changed the Login since: this is no race to retry.
       if (owned.read.version === refusedVersion) return { status: 'vault_unavailable' };
       if (writes === PROMOTION_WRITES) {
@@ -857,20 +954,59 @@ export class CredentialAttempts {
         return { status: 'vault_unavailable' };
       }
       const updated = await provider(this.vault.replacePassword(owned.read, password, assertActive));
-      if ('value' in updated)
-        return updated.value.password === password
-          ? this.finish(attempt, sourceId, assertActive)
-          : { status: 'vault_unavailable' };
-      if (updated.status === 'rate_limited') return updated;
-      // The provider refused a stale version, or the write landed and its answer was lost: the next read says which.
+      if ('value' in updated && updated.value.password === password)
+        return this.promoted(attempt, sourceId, assertActive);
+      if (!('value' in updated) && updated.status === 'rate_limited') return updated;
+      // A refused stale version, or a write that landed with its answer lost: the next fresh read says which.
       refusedVersion = owned.read.version;
     }
   }
 
   /**
-   * The original Login is no longer the host's to write, while the website
-   * holds the new password: the candidate, its only copy, stays in the vault,
-   * first without the password it replaced.
+   * Records how a confirmed change settles while it stays confirmed, before
+   * the first 1Password write that removes what an undecided pass reads: the
+   * candidate itself, or its previous password.
+   */
+  private async decide(
+    attempt: CredentialAttempt,
+    settlement: CredentialSettlement,
+    reason: CredentialConflictReason | null,
+  ): Promise<CredentialAttempt> {
+    const changed = await this.db.run(
+      `UPDATE ${TABLE} SET settlement = ?, conflict_reason = ?, updated_at = ?
+       WHERE id = ? AND phase = 'confirmed' AND settlement IS NULL`,
+      settlement,
+      reason,
+      now(),
+      attempt.id,
+    );
+    if (!changed.changes) throw new CredentialAttemptError('invalid_phase');
+    return this.require(attempt.id);
+  }
+
+  /** The original Login holds the new password, so its candidate can go. */
+  private async promoted(
+    attempt: CredentialAttempt,
+    sourceId: string,
+    assertActive: () => Promise<void>,
+  ): Promise<CredentialFinalizeResult> {
+    return this.finish(await this.decide(attempt, 'promoted', null), sourceId, assertActive);
+  }
+
+  /** The original Login is no longer the host's to write. */
+  private async keep(
+    attempt: CredentialAttempt,
+    reason: CredentialConflictReason,
+    assertActive: () => Promise<void>,
+  ): Promise<CredentialFinalizeResult> {
+    return this.keepCandidate(await this.decide(attempt, 'kept', reason), reason, assertActive);
+  }
+
+  /**
+   * The website holds the new password and the original Login was left as
+   * edited: the candidate, its only copy, stays in the vault without the
+   * password it replaced. One already without it, or already gone, needs
+   * nothing more.
    */
   private async keepCandidate(
     attempt: CredentialAttempt,
@@ -878,13 +1014,14 @@ export class CredentialAttempts {
     assertActive: () => Promise<void>,
   ): Promise<CredentialFinalizeResult> {
     if (attempt.candidate_item_id !== null) {
-      const read = await this.fresh(attempt.vault_id, attempt.candidate_item_id, assertActive);
-      if ('value' in read) {
-        if (read.value.previousPassword !== undefined) {
-          const kept = await provider(this.vault.forgetPreviousPassword(read.value, assertActive));
-          if (!('value' in kept)) return kept;
-        }
-      } else if (read.status !== 'removed') return read;
+      const read = await provider(this.vault.readItem(attempt.vault_id, attempt.candidate_item_id, assertActive));
+      if (!('value' in read)) {
+        const gone = await this.gone(read, attempt.vault_id, attempt.candidate_item_id, assertActive);
+        if (gone !== true) return gone;
+      } else if (read.value.previousPassword !== undefined) {
+        const kept = await provider(this.vault.forgetPreviousPassword(read.value, assertActive));
+        if (!('value' in kept)) return kept;
+      }
     }
     return this.conflict(attempt, reason);
   }
@@ -905,11 +1042,7 @@ export class CredentialAttempts {
     return { status: 'conflict', reason, attempt: await this.require(attempt.id) };
   }
 
-  /**
-   * Deletes a confirmed change's candidate, which the original Login has
-   * replaced: it is gone once 1Password no longer lists it, even when the
-   * answer to the delete was lost.
-   */
+  /** Deletes a promoted change's candidate: done once the vault no longer lists it, whatever the delete answered. */
   private async removeCandidate(
     attempt: CredentialAttempt,
     assertActive: () => Promise<void>,
@@ -917,10 +1050,8 @@ export class CredentialAttempts {
     if (attempt.candidate_item_id === null) return undefined;
     const deleted = await provider(this.vault.deleteItem(attempt.vault_id, attempt.candidate_item_id, assertActive));
     if ('value' in deleted) return undefined;
-    if (deleted.status === 'rate_limited') return deleted;
-    const listed = await provider(this.vault.holds(attempt.vault_id, attempt.candidate_item_id, assertActive));
-    if (!('value' in listed)) return listed;
-    return listed.value ? deleted : undefined;
+    const gone = await this.gone(deleted, attempt.vault_id, attempt.candidate_item_id, assertActive);
+    return gone === true ? undefined : gone;
   }
 
   private async finish(
@@ -928,7 +1059,7 @@ export class CredentialAttempts {
     ownedItemId: string,
     assertActive: () => Promise<void>,
   ): Promise<CredentialFinalizeResult> {
-    // Before finalizing: while the candidate remains, the attempt stays confirmed and its next finalize removes it.
+    // While the candidate remains, the attempt stays confirmed, and its next finalize removes it.
     if (attempt.kind === 'rotation') {
       const kept = await this.removeCandidate(attempt, assertActive);
       if (kept) return kept;

@@ -37,11 +37,12 @@ const fail = (): never => {
 /**
  * The provider as the SDK presents it: item versions, the optimistic lock on
  * put, active listings, and faults that can land a write before failing, as a
- * lost response does.
+ * lost response does. A full item carries no state, so a read returns an
+ * archived item like any other; only the listing tells it apart.
  */
 export class FakeOnePassword {
   readonly items = new Map<string, Item>();
-  /** Items the principal archived in the 1Password app: the SDK neither reads nor lists them as active. */
+  /** Items the principal archived in the 1Password app: still read in full, never listed as active. */
   readonly archived = new Set<string>();
   readonly calls: Operation[] = [];
   beforePut: (() => void) | undefined;
@@ -140,7 +141,7 @@ export class FakeOnePassword {
           const fault = this.take('get');
           if (fault) throw fault.error;
           const item = this.items.get(itemId);
-          if (!item || item.vaultId !== vaultId || this.archived.has(itemId)) throw new Error('item not found');
+          if (!item || item.vaultId !== vaultId) throw new Error('item not found');
           return structuredClone(item);
         },
         put: async (item: Item) => {
@@ -157,7 +158,8 @@ export class FakeOnePassword {
           return structuredClone(next);
         },
         list: async (vaultId: string) => {
-          this.take('list');
+          const fault = this.take('list');
+          if (fault) throw fault.error;
           return [...this.items.values()]
             .filter((item) => item.vaultId === vaultId && !this.archived.has(item.id))
             .map(
