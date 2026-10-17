@@ -70,7 +70,7 @@ function fixture(origin = 'https://www.shop.example') {
   };
   form.elements = [field, button];
   nodes.push(field);
-  let navigation: ((frame: unknown) => void) | undefined;
+  const navigations = new Set<(frame: unknown) => void>();
   const handle = (node: unknown) => ({
     ownerFrame: async () => frame,
     focus: async () => {
@@ -95,6 +95,7 @@ function fixture(origin = 'https://www.shop.example') {
   const page = {
     url: () => url,
     frames: () => [frame],
+    mainFrame: () => frame,
     isClosed: () => false,
     locator: () => ({ innerText: async () => '', ariaSnapshot: async () => `- alert: ${SECRET}` }),
     keyboard: {
@@ -102,16 +103,25 @@ function fixture(origin = 'https://www.shop.example') {
         (activeElement as { value: string }).value = value;
       }),
     },
-    on: (_event: string, callback: typeof navigation) => {
-      navigation = callback;
+    on: (event: string, callback: (frame: unknown) => void) => {
+      if (event === 'framenavigated') navigations.add(callback);
     },
-    off: () => undefined,
+    off: (_event: string, callback: (frame: unknown) => void) => {
+      navigations.delete(callback);
+    },
     waitForEvent: async () => undefined,
     once: () => undefined,
     context: () => ({
       newCDPSession: async () => ({
         on: () => undefined,
-        send: async () => ({ frameTree: { frame: { loaderId: 'fixture-document' } } }),
+        send: async () => ({
+          frameTree: { frame: { loaderId: 'fixture-document' } },
+          targetInfo: { targetId: 'fixture-page' },
+        }),
+      }),
+      browser: () => ({
+        once: () => undefined,
+        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
       }),
     }),
   } as unknown as Page;
@@ -183,7 +193,7 @@ function fixture(origin = 'https://www.shop.example') {
     },
     navigate: () => {
       url = `${origin}/`;
-      navigation?.(frame);
+      for (const callback of navigations) callback(frame);
     },
   };
 }

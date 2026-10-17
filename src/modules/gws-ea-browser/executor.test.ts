@@ -23,7 +23,10 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   let screenshots = 0;
   const page = {
     url: () => 'about:blank',
-    context: () => ({ newCDPSession: async () => ({ on() {}, send: async () => undefined }) }),
+    context: () => ({
+      newCDPSession: async () => ({ on() {}, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
+      browser: () => ({ once() {}, newBrowserCDPSession: async () => ({ on() {}, send: async () => undefined }) }),
+    }),
     on() {},
     off() {},
     once() {},

@@ -16,7 +16,13 @@ import {
   type WatchBounds,
   type WatchRow,
 } from './watches.js';
-import { watchInterval, watchQuietUntil, watchSitePolicy, type WatchSitePolicy } from './watch-policy.js';
+import {
+  principalClock,
+  watchInterval,
+  watchQuietUntil,
+  watchSitePolicy,
+  type WatchSitePolicy,
+} from './watch-policy.js';
 
 export interface BrowserWatchCheckInput {
   id: string;
@@ -183,6 +189,9 @@ export class BrowserWatchScheduler {
       );
       if (Date.parse(first.next_check_at) > now && !notify) continue;
       const policy = this.deps.policy(first.site);
+      // A due check waits out the principal's night on their clock as it is now, so a timezone they
+      // change holds at once, whichever way it moves the night.
+      if (watchQuietUntil(policy, now, await principalClock()) > now) continue;
       const state = await this.reserveCheck(db, watches, policy, Boolean(notify));
       if (!state) continue;
       const id = `watch-check-${randomUUID()}`;
@@ -242,9 +251,7 @@ export class BrowserWatchScheduler {
           : 0;
       const arrival = Math.min(...bounds.windows.map((window) => Date.parse(window.start)));
       const interval = watchInterval(policy, Date.now(), arrival, state.last_interval_ms, this.deps.random);
-      const next = new Date(
-        Math.max(Date.now() + interval, backoff, watchQuietUntil(policy, Date.now() + interval)),
-      ).toISOString();
+      const next = new Date(Math.max(Date.now() + interval, backoff)).toISOString();
       await db.transaction(async () => {
         await db.run(
           'UPDATE gws_ea_browser_watch_checks SET finished_at=?,outcome=?,next_check_at=?,backoff_until=? WHERE id=?',
@@ -289,7 +296,6 @@ export class BrowserWatchScheduler {
       await db.run('INSERT INTO gws_ea_browser_watch_site_state(site) VALUES(?) ON CONFLICT DO NOTHING', site);
       const state = (await db.get<SiteState>('SELECT * FROM gws_ea_browser_watch_site_state WHERE site=?', site))!;
       let next = Math.max(
-        watchQuietUntil(policy, now),
         Date.parse(state.next_allowed_at ?? '') || 0,
         Date.parse(state.backoff_until ?? '') || 0,
         (Date.parse(state.last_check_at ?? '') || 0) + policy.floorMs,

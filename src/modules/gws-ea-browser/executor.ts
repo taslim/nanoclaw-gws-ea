@@ -10,6 +10,7 @@ import {
   BrowserSiteBusyError,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
+  framesUnreadyStop,
   withBrowserJobNavigation,
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
@@ -232,15 +233,22 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
   });
 }
 
+type GuardReason = ReturnType<BrowserNavigationGuard['reason']>;
+
+/** Whether the navigation guard refused a navigation: an ordinary reading is no refusal. */
+function isGuardRefusal(blocked: GuardReason): blocked is Exclude<GuardReason, 'ordinary' | undefined> {
+  return blocked !== undefined && blocked !== 'ordinary';
+}
+
 function batchErrorReason(
   error: unknown,
-  blocked: ReturnType<BrowserNavigationGuard['reason']>,
+  blocked: GuardReason,
   context: BrowserExecutionContext,
   page: Page,
 ): BrowserStopReason {
   if (error instanceof BrowserBatchStop || error instanceof BrowserActivationError || error instanceof BrowserRefError)
     return error.reason;
-  if (blocked && blocked !== 'ordinary') return blocked;
+  if (isGuardRefusal(blocked)) return blocked;
   if (error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()) return 'timeout';
   return page.isClosed() ? 'window_closed' : 'not_actionable';
 }
@@ -262,6 +270,8 @@ export async function executeBrowserBatch(
     );
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
+    const refused = framesUnreadyStop(error);
+    if (refused) return refused;
     throw error;
   }
 }
@@ -275,8 +285,8 @@ async function executeBatch(
   const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
   const images: Array<{ mime_type: 'image/png'; data: string }> = [];
+  // The guard starts each operation clean, before its readiness pass.
   const guard = await ensureBrowserNavigationGuard(page);
-  guard.clearReason();
   let reason: BrowserStopReason | undefined;
   let repeatSafe = true;
   let refs = new Map<string, PinnedBrowserRef>();
@@ -476,7 +486,7 @@ async function executeBatch(
             break;
         }
         const blocked = guard.reason();
-        if (blocked && blocked !== 'ordinary') throw new BrowserBatchStop(blocked);
+        if (isGuardRefusal(blocked)) throw new BrowserBatchStop(blocked);
         await trace?.finish();
         results[index] = { index, status: 'completed', ...data, ...(trace ? { trace_index: trace.index } : {}) };
         if (navigation !== before) {
@@ -505,6 +515,9 @@ async function executeBatch(
       reason ??= 'not_actionable';
     }
   }
+  // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
+  const blocked = guard.reason();
+  if (!reason && isGuardRefusal(blocked)) reason = blocked;
   if (observation && !reason && hasBrowserChallenge(observation.snapshot)) reason = 'challenge';
   if (
     observation &&

@@ -13,6 +13,8 @@ import {
 import { stopChrome } from './chrome.js';
 import { prepareMerchantPage } from './merchant-signatures.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
+import { documentGate } from './document-gate.js';
+import { coverPageTargets } from './page-targets.js';
 import { ensurePrivateDirectory, type BrowserPaths } from './paths.js';
 
 const allowedDownloads = new WeakSet<Page>();
@@ -95,6 +97,8 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
     const context = browser.contexts()[0];
     if (!context) throw new Error('Chrome default context unavailable');
     await prepareAuthenticationIsolation(context);
+    // Every document of this connection pauses at its gate from the first request; the gate ends with it.
+    await documentGate(browser);
     const session = await browser.newBrowserCDPSession();
     for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
       await session.send('Browser.setPermission', { permission: { name }, setting: 'denied' });
@@ -139,10 +143,11 @@ export async function secureJobPage(page: Page): Promise<void> {
   page.on('download', (download) => {
     if (!allowedDownloads.has(page)) void download.cancel().catch(() => undefined);
   });
-  const session = await page.context().newCDPSession(page);
-  await session.send('Page.setInterceptFileChooserDialog', { enabled: true });
-  page.once('close', () => {
-    void session.detach().catch(() => undefined);
+  // A cross-site frame's file input opens its chooser from that frame's own target.
+  await coverPageTargets(page, async (session) => {
+    // Chrome intercepts a chooser only for a session whose Page domain is enabled.
+    await session.send('Page.enable');
+    await session.send('Page.setInterceptFileChooserDialog', { enabled: true });
   });
 }
 

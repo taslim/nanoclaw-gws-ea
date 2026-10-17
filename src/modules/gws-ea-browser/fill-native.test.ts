@@ -32,6 +32,7 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
   let certificateSession: CDPSession;
   const sockets = new Set<Socket>();
   const posts: Array<{ host: string; body: string }> = [];
+  const parentDocuments: string[] = [];
 
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
@@ -66,20 +67,42 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
           });
           request.on('end', () => {
             posts.push({ host, body });
-            response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
+            // The session form's document survives its submission, so its mirror of the value stays on screen.
+            if (request.url === '/session') response.writeHead(204).end();
+            else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
           });
+        } else if (
+          host === 'parent.example' &&
+          (request.url?.startsWith('/help/') || request.url === '/checkout/placeorder')
+        ) {
+          parentDocuments.push(request.url ?? '');
+          // Speculation rules ask to fetch and render a purchase before anyone navigates there.
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              request.url === '/help/speculate'
+                ? '<h1>Help</h1><script type="speculationrules">{"prefetch":[{"source":"list","urls":["/checkout/placeorder"]}],"prerender":[{"source":"list","urls":["/checkout/placeorder"]}]}</script>'
+                : '<h1>Order</h1>',
+            );
         } else if (host === 'parent.example') {
           response
             .writeHead(200, { 'content-type': 'text/html' })
             .end(
-              `<input id="untrusted"><iframe src="https://auth.example/login"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
+              request.url === '/mirror'
+                ? '<h1>Account</h1><iframe src="https://auth.example/session"></iframe>'
+                : `<input id="untrusted"><iframe src="https://auth.example/login"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
             );
         } else {
-          const action = host === 'www.amazon.com' ? '/ap/signin' : '/login';
+          const action = host === 'www.amazon.com' ? '/ap/signin' : request.url === '/session' ? '/session' : '/login';
+          // A page script may copy a typed value anywhere in its own document.
+          const mirror =
+            request.url === '/session'
+              ? `<p id="mirror"></p><script>setInterval(() => { const value = document.querySelector('input').value; if (value) document.getElementById('mirror').textContent = value; }, 5);</script>`
+              : '';
           response
             .writeHead(200, { 'content-type': 'text/html' })
             .end(
-              `<form id="chosen" method="post" action="${action}"><input name="password" type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>${host === 'www.amazon.com' ? "<script>Object.defineProperty(HTMLInputElement.prototype, 'value', { set() { throw new Error('page setter must not run'); } });</script>" : ''}`,
+              `<form id="chosen" method="post" action="${action}"><input name="password" type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>${mirror}${host === 'www.amazon.com' ? "<script>Object.defineProperty(HTMLInputElement.prototype, 'value', { set() { throw new Error('page setter must not run'); } });</script>" : ''}`,
             );
         }
       },
@@ -128,6 +151,7 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(root, 'browser', 'policy.json'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
     posts.length = 0;
+    parentDocuments.length = 0;
     const appeared = connection.context.waitForEvent('page');
     await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
     page = await appeared;
@@ -255,5 +279,41 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     expect(await fillBoundBrowserSecret(context(), bound, async () => secret)).toEqual({ status: 'submitted' });
     await expect.poll(() => posts.length).toBe(1);
     expect(posts).toEqual([{ host: 'www.amazon.com', body: `password=${secret}` }]);
+  });
+
+  // Pins existing taint behaviour, not frame coverage: the hosting main document carries the taint
+  // for every frame under it, so a cross-site frame needs no taint entry of its own.
+  it('keeps screenshots refused after a secret enters a cross-site frame, until the hosting document is gone', async () => {
+    await page.goto('https://parent.example/mirror');
+    const frame = page.frames().find((candidate) => candidate.url() === 'https://auth.example/session');
+    if (!frame) throw new Error('Cross-origin session frame missing');
+    // Playwright opens a session only for a frame Chrome runs as its own out-of-process target.
+    await (await connection.context.newCDPSession(frame)).detach();
+    expect(await fillBoundBrowserSecret(context(), await binding(frame), async () => secret)).toEqual({
+      status: 'cleared_after_submit',
+    });
+    await expect.poll(() => frame.locator('#mirror').textContent()).toBe(secret);
+    const refused = await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false });
+    expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+    expect(JSON.stringify(refused)).not.toContain(secret);
+    // Leaving the hosting document ends its taint, together with every frame document under it.
+    await executeBrowserBatch(
+      context(),
+      { actions: [{ kind: 'navigate', url: 'https://parent.example/login' }] },
+      { record: false },
+    );
+    expect(
+      await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false }),
+    ).toMatchObject({ status: 'completed', images: [{ mime_type: 'image/png' }] });
+  });
+
+  it('loads nothing speculatively, so every page is a request the document gate decides', async () => {
+    await executeBrowserBatch(
+      context(),
+      { actions: [{ kind: 'navigate', url: 'https://parent.example/help/speculate' }] },
+      { record: false },
+    );
+    await page.waitForTimeout(1_500);
+    expect(parentDocuments).toEqual(['/help/speculate']);
   });
 });

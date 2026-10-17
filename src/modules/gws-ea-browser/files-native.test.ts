@@ -28,6 +28,7 @@ import './index.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
+import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { browserPaths, writePrivateFile } from './paths.js';
@@ -48,6 +49,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
   let session: Session;
   let context: BrowserExecutionContext;
   let invoiceRequests = 0;
+  const documentRequests: string[] = [];
 
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
@@ -59,6 +61,11 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
         return;
       }
       const url = new URL(request.url);
+      documentRequests.push(url.pathname);
+      if (url.pathname.startsWith('/help/')) {
+        response.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><h1>${url.pathname}</h1>`);
+        return;
+      }
       if (url.pathname === '/docs/invoice.pdf') {
         ++invoiceRequests;
         response
@@ -138,6 +145,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
       remaining: () => Math.max(1, deadline - Date.now()),
     };
     invoiceRequests = 0;
+    documentRequests.length = 0;
   });
 
   afterEach(async () => {
@@ -263,6 +271,53 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     expect(sha256(Uint8Array.from(bytes))).toBe(sha256(original));
     await windows.closeJob(context.job.id);
     expect(fs.readdirSync(uploadRoot)).toEqual([]);
+  }, 20_000);
+
+  it('refuses File System Access pickers before any native panel opens', async () => {
+    // These pickers need a secure context; a routed origin provides one without the network.
+    const picker = (name: string, call: string) =>
+      `<button onclick="${call}().then(() => { document.body.dataset.${name} = 'opened'; }, (error) => { document.body.dataset.${name} = error.name; })">${name}</button>`;
+    const appeared = connection.context.waitForEvent('page');
+    await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
+    // A page without the job page's chooser interception, so only the profile's guards stand.
+    const plain = await appeared;
+    try {
+      for (const [target, refusal] of [
+        [page, 'AbortError'],
+        [plain, 'NotAllowedError'],
+      ] as const) {
+        await target.route('https://picker.example/**', (route) =>
+          route.fulfill({
+            contentType: 'text/html',
+            body: `${picker('open', 'showOpenFilePicker')}${picker('save', 'showSaveFilePicker')}`,
+          }),
+        );
+        await target.goto('https://picker.example/');
+        for (const name of ['open', 'save']) {
+          await target.getByRole('button', { name }).click();
+          await expect
+            .poll(() => target.locator('body').getAttribute(`data-${name}`), { timeout: 2_000 })
+            .toBe(refusal);
+        }
+      }
+    } finally {
+      await plain.close();
+    }
+  });
+
+  it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {
+    for (const step of ['first', 'second'])
+      await executeBrowserBatch(
+        context,
+        { actions: [{ kind: 'navigate', url: `http://fixture.example/help/${step}` }] },
+        { record: false },
+      );
+    const guard = await ensureBrowserNavigationGuard(page);
+    await page.evaluate('history.back()');
+    // Outside any errand the guard refuses every document; a restored page would have asked nothing.
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    expect(documentRequests.filter((request) => request === '/help/first')).toHaveLength(1);
+    expect(page.url()).not.toBe('http://fixture.example/help/first');
   }, 20_000);
 });
 
