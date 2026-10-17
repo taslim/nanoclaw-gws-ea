@@ -25,7 +25,12 @@ import {
   renderPurchaseCard,
   type PurchaseCard,
 } from './cards.js';
-import { activateControl, BrowserSiteBusyError, withBrowserJobNavigation } from './commit-classifier.js';
+import {
+  activateControl,
+  BrowserSiteBusyError,
+  framesUnreadyStop,
+  withBrowserJobNavigation,
+} from './commit-classifier.js';
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
@@ -553,6 +558,8 @@ export async function executeBrowserPurchase(
   } catch (error) {
     if (error instanceof BrowserSiteBusyError)
       return { status: 'site_purchase_blocked', reason: 'site_busy', repeat_safe: true };
+    const refused = framesUnreadyStop(error);
+    if (refused) return refused;
     throw error;
   }
 }
@@ -613,7 +620,15 @@ registerBrowserQueuedAction('browser_purchase_commit', {
     if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');
     return { authority_id: content.authority_id };
   },
-  execute: (context, payload) => executeAuthorizedPurchase(context, String(payload.authority_id)),
+  async execute(context, payload) {
+    try {
+      return await executeAuthorizedPurchase(context, String(payload.authority_id));
+    } catch (error) {
+      const refused = framesUnreadyStop(error);
+      if (refused) return refused;
+      throw error;
+    }
+  },
   deliverAnswer: deliverPurchaseCommitAnswer,
 });
 export function registerBrowserPurchaseDelivery(queue: () => BrowserQueue): void {

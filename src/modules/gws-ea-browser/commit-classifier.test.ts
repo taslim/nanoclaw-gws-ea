@@ -9,6 +9,7 @@ import {
   termsConsentLabel,
   classifyCredentialNavigation,
   classifyNavigationUrl,
+  ensureBrowserNavigationGuard,
   registerReviewedMerchantFlow,
   type ControlFacts,
 } from './commit-classifier.js';
@@ -128,10 +129,19 @@ it('submits positively identified native authentication forms without invoking a
   } as unknown as ElementHandle;
   const page = {
     url: () => frame.url(),
+    frames: () => [frame],
+    mainFrame: () => frame,
     locator: () => ({ innerText: async () => '' }),
     waitForEvent: async () => undefined,
+    on: () => undefined,
     once: () => undefined,
-    context: () => ({ newCDPSession: async () => ({ on: () => undefined, send: async () => undefined }) }),
+    context: () => ({
+      newCDPSession: async () => ({ on: () => undefined, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
+      browser: () => ({
+        once: () => undefined,
+        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
+      }),
+    }),
   } as unknown as Page;
   // This unit mocks only the native Chrome object binding. Native-world integrity has its own real-renderer suite.
   vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({
@@ -337,4 +347,125 @@ describe('the credential activation scope', () => {
     // Another site keeps the generic rules: the scope says nothing about it.
     expect(classifyCredentialNavigation('https://collector.example/welcome', 'signup', 'shop.example')).toBeUndefined();
   });
+});
+
+/** A page whose sessions and browser record what the guard sends; the gate's pauses are driven by hand. */
+function guardedPageFixture(url: string, frameTree: unknown, lookup?: () => Promise<never>) {
+  const sends: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  const pageEvents = new Map<string, (event: unknown) => void>();
+  const gateEvents = new Map<string, (event: unknown) => void>();
+  const answers = new Map<string, string>();
+  const frame = { isDetached: () => false, url: () => url };
+  const pageSession = {
+    on: (name: string, handler: (event: unknown) => void) => pageEvents.set(name, handler),
+    once: () => undefined,
+    detach: async () => undefined,
+    send: async (method: string, params?: Record<string, unknown>) => {
+      sends.push({ method, params });
+      if (method === 'Fetch.continueRequest') throw new Error('Invalid InterceptionId.');
+      if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: 'fixture-page' } };
+      if (method === 'Page.getFrameTree') return { frameTree };
+      return {};
+    },
+  };
+  const gateSession = {
+    on: (name: string, handler: (event: unknown) => void) => gateEvents.set(name, handler),
+    send: async (method: string, params?: { requestId?: string }) => {
+      if (method === 'Target.getTargetInfo') {
+        if (lookup) return lookup();
+        throw new Error('Protocol error (Target.getTargetInfo): No target with given id found');
+      }
+      if (method === 'Target.getTargets') return { targetInfos: [{ targetId: 'fixture-page', type: 'page' }] };
+      if (method === 'Fetch.continueRequest' || method === 'Fetch.failRequest')
+        answers.set(String(params?.requestId), method === 'Fetch.continueRequest' ? 'continued' : 'refused');
+      return {};
+    },
+  };
+  const page = {
+    url: () => url,
+    frames: () => [frame],
+    mainFrame: () => frame,
+    isClosed: () => false,
+    locator: () => ({ innerText: async () => '' }),
+    on: () => undefined,
+    once: () => undefined,
+    off: () => undefined,
+  } as unknown as Page;
+  const browser = {
+    once: () => undefined,
+    contexts: () => [{ pages: () => [page] }],
+    newBrowserCDPSession: async () => gateSession,
+  };
+  Object.assign(page, { context: () => ({ newCDPSession: async () => pageSession, browser: () => browser }) });
+  return { page, sends, pageEvents, gateEvents, answers };
+}
+
+it('strips Referer only from subresources, once across nested sign-in scopes, and fails what it cannot continue', async () => {
+  const fixture = guardedPageFixture('https://sign-in.example/', { frame: { id: 'fixture-page' } });
+  const guard = await ensureBrowserNavigationGuard(fixture.page);
+  const fetch = () => fixture.sends.filter((send) => send.method.startsWith('Fetch.'));
+  await guard.runWithPolicy({ stripReferrer: true }, async () => {
+    await guard.runWithPolicy({ stripReferrer: true }, async () => undefined);
+    // The inner scope's end leaves the outer one stripping.
+    expect(fetch().map((send) => send.method)).toEqual(['Fetch.enable']);
+    fixture.pageEvents.get('Fetch.requestPaused')?.({ requestId: 'image', request: { headers: { Referer: 'x' } } });
+    await vi.waitFor(() => expect(fetch().map((send) => send.method)).toContain('Fetch.failRequest'));
+  });
+  expect(fetch().map((send) => send.method)).toEqual([
+    'Fetch.enable',
+    'Fetch.continueRequest',
+    'Fetch.failRequest',
+    'Fetch.disable',
+  ]);
+  // Documents are the gate's alone: the page session never pauses one.
+  const patterns = fetch()[0].params?.patterns as Array<{ resourceType?: string }>;
+  expect(patterns.length).toBeGreaterThan(0);
+  expect(patterns.every((pattern) => pattern.resourceType && pattern.resourceType !== 'Document')).toBe(true);
+});
+
+it('decides a document under the purchase press that was approved when it paused', async () => {
+  registerReviewedMerchantFlow({
+    id: 'approved-press-fixture',
+    matches: (url) => url.hostname === 'press.example',
+    classifyControl: async () => 'purchase_control',
+    classifyNavigation: () => 'purchase_control',
+    verifyPurchaseControl: async () => true,
+  });
+  let place!: () => void;
+  const placed = new Promise<never>((_resolve, reject) => {
+    place = () => reject(new Error('Protocol error (Target.getTargetInfo): No target with given id found'));
+  });
+  // The receipt's frame is placed only after the press has ended.
+  const fixture = guardedPageFixture(
+    'https://press.example/checkout',
+    { frame: { id: 'fixture-page' }, childFrames: [{ frame: { id: 'receipt-frame' } }] },
+    () => placed,
+  );
+  await ensureBrowserNavigationGuard(fixture.page);
+  const element = {
+    ownerFrame: async () => fixture.page.mainFrame(),
+    evaluate: async () => ({
+      name: 'Place order',
+      visibleLabel: 'Place order',
+      role: '',
+      tag: 'button',
+      type: 'submit',
+      href: null,
+    }),
+  } as unknown as ElementHandle;
+  await activateControl(
+    fixture.page,
+    element,
+    async () => {
+      fixture.gateEvents.get('Fetch.requestPaused')?.({
+        requestId: 'receipt',
+        frameId: 'receipt-frame',
+        resourceType: 'Document',
+        request: { url: 'https://press.example/receipt', headers: {} },
+      });
+    },
+    { commitStarted: async () => undefined },
+  );
+  place();
+  await vi.waitFor(() => expect(fixture.answers.get('receipt')).toBe('continued'));
 });

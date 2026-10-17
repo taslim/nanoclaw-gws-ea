@@ -37,6 +37,7 @@ import type { ReservationPolicy } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
 import { loadRecipe, recipeCheckKey, executeRecipe, type BrowserRecipe } from './recipes.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { principalClock, watchQuietUntil, watchSitePolicy } from './watch-policy.js';
 
 export interface WatchFinancialBounds {
   freeOnly: boolean;
@@ -1048,12 +1049,24 @@ registerBrowserQueuedAction('list_watches', {
       'SELECT * FROM gws_ea_browser_watches WHERE job_id = ? ORDER BY created_at,id',
       context.job.id,
     );
+    const principalTimeZone = await principalClock();
+    const now = Date.now();
     return {
       watches: watches.map((watch) => ({
         id: watch.id,
         status: watch.status,
         bounds: boundsOf(watch),
-        next_check_at: watch.next_check_at,
+        // An armed check also waits out the principal's night, on their clock as it is now.
+        next_check_at:
+          watch.status === 'armed'
+            ? new Date(
+                watchQuietUntil(
+                  watchSitePolicy(watch.site),
+                  Math.max(Date.parse(watch.next_check_at), now),
+                  principalTimeZone,
+                ),
+              ).toISOString()
+            : watch.next_check_at,
       })),
     };
   },

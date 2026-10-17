@@ -37,6 +37,7 @@ import {
   activateControl,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
+  framesUnreadyStop,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
 import {
@@ -625,6 +626,10 @@ export async function executeSignInCode(
         );
       }
     }
+  }).catch((error: unknown) => {
+    const refused = framesUnreadyStop(error);
+    if (refused) return refused;
+    throw error;
   });
 }
 

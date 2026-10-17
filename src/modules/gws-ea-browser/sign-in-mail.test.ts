@@ -183,29 +183,51 @@ function fixture(username = false) {
   const submit: PinnedBrowserRef = { ref: 'e2', generation: 1, element: control, frame };
   const listeners = new Map<string, Array<(...values: unknown[]) => void>>();
   const cdpEvents = new Map<string, (event: unknown) => void>();
+  const gateEvents = new Map<string, (event: unknown) => void>();
   const pending = new Map<string, (allowed: boolean) => void>();
   const network: Array<{ url: string; allowed: boolean; headers?: unknown }> = [];
   const redirects: string[] = [];
+  let pageFetch = false;
+  const answer = (method: string, params?: Record<string, unknown>): void => {
+    if (method !== 'Fetch.continueRequest' && method !== 'Fetch.failRequest') return;
+    const requestId = String(params?.requestId);
+    network[Number(requestId)].allowed = method === 'Fetch.continueRequest';
+    network[Number(requestId)].headers = params?.headers;
+    pending.get(requestId)?.(method === 'Fetch.continueRequest');
+  };
+  // The page's own sessions: the guard pauses its other requests only while a sign-in scope strips Referer.
   const cdp = {
     on: vi.fn((name: string, handler: (event: unknown) => void) => cdpEvents.set(name, handler)),
     detach: async () => undefined,
     send: vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'Fetch.continueRequest' || method === 'Fetch.failRequest') {
-        const requestId = String(params?.requestId);
-        network[Number(requestId)].allowed = method === 'Fetch.continueRequest';
-        network[Number(requestId)].headers = params?.headers;
-        pending.get(requestId)?.(method === 'Fetch.continueRequest');
-      }
-      return { frameTree: { frame: { loaderId: loader } } };
+      if (method === 'Fetch.enable' || method === 'Fetch.disable') pageFetch = method === 'Fetch.enable';
+      answer(method, params);
+      return { frameTree: { frame: { id: 'page-target', loaderId: loader } }, targetInfo: { targetId: 'page-target' } };
     }),
+  };
+  // The browser-level document gate pauses every document.
+  const gate = {
+    on: (name: string, handler: (event: unknown) => void) => gateEvents.set(name, handler),
+    send: vi.fn(async (method: string, params?: Record<string, unknown>) => answer(method, params)),
   };
   const request = async (next: string, resourceType: string): Promise<void> => {
     const requestId = String(network.length);
     network.push({ url: next, allowed: false });
+    const handler =
+      resourceType === 'Document'
+        ? gateEvents.get('Fetch.requestPaused')
+        : pageFetch
+          ? cdpEvents.get('Fetch.requestPaused')
+          : undefined;
+    if (!handler) {
+      network[Number(requestId)].allowed = true;
+      return;
+    }
     const completed = new Promise<boolean>((resolve) => pending.set(requestId, resolve));
-    cdpEvents.get('Fetch.requestPaused')!({
+    handler({
       requestId,
       resourceType,
+      frameId: 'page-target',
       request: { url: next, headers: { Referer: url, Cookie: 'host-cookie' } },
     });
     if (!(await completed)) throw new Error(`Navigation refused ${next}`);
@@ -217,7 +239,10 @@ function fixture(username = false) {
     isClosed: () => false,
     locator: () => ({ ariaSnapshot: async () => '- heading: Signed in' }),
     getByRef: (ref: string) => ({ elementHandle: async () => (ref === 'e1' ? field : control) }),
-    context: () => ({ newCDPSession: async () => cdp }),
+    context: () => ({
+      newCDPSession: async () => cdp,
+      browser: () => ({ once: () => undefined, newBrowserCDPSession: async () => gate }),
+    }),
     on: (name: string, callback: (...values: unknown[]) => void) =>
       listeners.set(name, [...(listeners.get(name) ?? []), callback]),
     off: () => undefined,
@@ -433,11 +458,11 @@ it('taints bearer documents before traffic and returns only after fresh sanitize
   expect(f.cdp.send).toHaveBeenCalledWith('Page.resetNavigationHistory');
   expect(JSON.stringify(result) + JSON.stringify(await observePage(f.page))).not.toContain(secret);
   expect(await pageHasSecret(f.page)).toBe(false);
-  expect(
-    f.network.every(
-      (request) => Array.isArray(request.headers) && !JSON.stringify(request.headers).toLowerCase().includes('referer'),
-    ),
-  ).toBe(true);
+  // Each request clears its Referer: Chrome restores one an override merely leaves out.
+  for (const request of f.network)
+    expect(
+      (request.headers as Array<{ name: string; value: string }>).filter(({ name }) => /^referr?er$/iu.test(name)),
+    ).toEqual([{ name: 'Referer', value: '' }]);
 });
 
 it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere.example/verify?token=magic-bearer'])(

@@ -26,7 +26,8 @@ it('lets a client install listeners after a reply before delivering a coalesced 
   const seen: boolean[] = [];
   const browser = {
     contexts: () => [{}],
-    newBrowserCDPSession: async () => ({ send: async () => undefined }),
+    newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
+    once: () => undefined,
     close: async () => undefined,
   } as unknown as Browser;
   vi.spyOn(chromium, 'connectOverCDP').mockImplementation(async (input) => {
