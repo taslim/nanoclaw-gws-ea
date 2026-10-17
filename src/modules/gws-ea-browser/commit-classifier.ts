@@ -1,6 +1,7 @@
 import type { ElementHandle, Page } from 'playwright-core';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
+import { coverPageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
   authenticationEndpoint,
@@ -371,7 +372,7 @@ export interface BrowserNavigationGuard {
 }
 const navigationGuards = new WeakMap<Page, Promise<BrowserNavigationGuard>>();
 
-/** The sole Fetch owner for a page, kept installed between requests until the page closes. */
+/** The sole Fetch owner for a page and its out-of-process frames, kept installed until the page closes. */
 export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let guard = navigationGuards.get(page);
   if (!guard) {
@@ -382,67 +383,75 @@ export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigat
 }
 
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
-  const session = await page.context().newCDPSession(page);
   let blocked: ActivationClass | 'site_busy' | undefined;
   const policies: BrowserNavigationPolicy[] = [];
-  session.on('Fetch.requestPaused', (event) => {
-    const scopes = [...policies];
-    void (async () => {
-      let classification: ActivationClass | 'site_busy' =
-        event.resourceType !== 'Document'
-          ? 'ordinary'
-          : scopes.length
-            ? classifyNavigationUrl(event.request.url)
-            : 'unsupported_merchant';
-      const approved = approvedPresses.get(page);
-      if (
-        event.resourceType === 'Document' &&
-        approved &&
-        classification !== 'blocked_address' &&
-        classification !== 'account_security' &&
-        classification !== 'speaks_as_principal'
-      ) {
-        const target = new URL(event.request.url);
-        if (target.origin === approved.origin && approved.flow.matches(target)) {
-          const known = approved.flow.classifyNavigation(target);
-          classification = known === 'purchase_control' ? 'ordinary' : known;
-        }
-      }
-      if (event.resourceType === 'Document')
-        for (const policy of scopes) {
-          if (policy.classify) {
-            let scoped: ActivationClass;
-            try {
-              scoped = policy.classify(new URL(event.request.url));
-            } catch (_error) {
-              scoped = 'blocked_address';
-            }
-            if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
-          }
-          if (classification === 'ordinary' && policy.beforeNavigate)
-            classification = await policy.beforeNavigate(new URL(event.request.url));
-        }
-      if (classification === 'ordinary' || event.request.url === 'about:blank') {
-        const headers = scopes.some((policy) => policy.stripReferrer)
-          ? Object.entries(event.request.headers)
-              .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
-              .map(([name, value]) => ({ name, value: String(value) }))
-          : undefined;
-        await session.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) });
-      } else {
-        blocked = classification;
-        await session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' });
-      }
-    })().catch(() => {
-      blocked = 'blocked_address';
-      void session
-        .send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' })
-        .catch(() => undefined);
-    });
+  // Any page-target setting that cannot reach a later frame stops the operation in progress.
+  onUncoveredPageTarget(page, () => {
+    blocked = 'blocked_address';
   });
-  await session.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
+  // Every covered target shares this handler, its policy stack and its block record.
+  await coverPageTargets(page, async (session) => {
+    session.on('Fetch.requestPaused', (event) => {
+      const scopes = [...policies];
+      void (async () => {
+        let classification: ActivationClass | 'site_busy' =
+          event.resourceType !== 'Document'
+            ? 'ordinary'
+            : scopes.length
+              ? classifyNavigationUrl(event.request.url)
+              : 'unsupported_merchant';
+        const approved = approvedPresses.get(page);
+        if (
+          event.resourceType === 'Document' &&
+          approved &&
+          classification !== 'blocked_address' &&
+          classification !== 'account_security' &&
+          classification !== 'speaks_as_principal'
+        ) {
+          const target = new URL(event.request.url);
+          if (target.origin === approved.origin && approved.flow.matches(target)) {
+            const known = approved.flow.classifyNavigation(target);
+            classification = known === 'purchase_control' ? 'ordinary' : known;
+          }
+        }
+        if (event.resourceType === 'Document')
+          for (const policy of scopes) {
+            if (policy.classify) {
+              let scoped: ActivationClass;
+              try {
+                scoped = policy.classify(new URL(event.request.url));
+              } catch (_error) {
+                scoped = 'blocked_address';
+              }
+              if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
+            }
+            if (classification === 'ordinary' && policy.beforeNavigate)
+              classification = await policy.beforeNavigate(new URL(event.request.url));
+          }
+        if (classification === 'ordinary' || event.request.url === 'about:blank') {
+          const headers = scopes.some((policy) => policy.stripReferrer)
+            ? Object.entries(event.request.headers)
+                .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
+                .map(([name, value]) => ({ name, value: String(value) }))
+            : undefined;
+          await session.send('Fetch.continueRequest', {
+            requestId: event.requestId,
+            ...(headers ? { headers } : {}),
+          });
+        } else {
+          blocked = classification;
+          await session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' });
+        }
+      })().catch(() => {
+        blocked = 'blocked_address';
+        void session
+          .send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' })
+          .catch(() => undefined);
+      });
+    });
+    await session.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
+  });
   page.once('close', () => {
-    void session.detach().catch(() => undefined);
     navigationGuards.delete(page);
   });
   return {
@@ -451,6 +460,11 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       blocked = undefined;
     },
     async runWithPolicy(scope, operation) {
+      // An operation can act only in frames that exist now, so every page-target setting covers each first.
+      if (!(await pageTargetsReady(page))) {
+        blocked = 'blocked_address';
+        throw new BrowserActivationError('blocked_address');
+      }
       policies.push(scope);
       try {
         return await operation();

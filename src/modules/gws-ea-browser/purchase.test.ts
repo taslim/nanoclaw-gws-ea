@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { connect, type Socket } from 'node:net';
-import { chromium, type Browser, type Page } from 'playwright-core';
+import { chromium, errors, type Browser, type Frame, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const { root } = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -43,6 +43,9 @@ import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits, validatePurchaseRequest } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
+import { ensureBrowserNavigationGuard } from './commit-classifier.js';
+import { secureJobPage } from './connection.js';
+import { coverPageTargets } from './page-targets.js';
 import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 import { setBrowserAdmissionReady } from './group.js';
 
@@ -67,6 +70,8 @@ let sent: Array<{ platformId: string; content: string }>;
 let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
+let widgetRequests: string[];
+const WIDGET_ORIGIN = 'https://pay.example';
 
 function reviewHtml(): string {
   return `<html><body><a id="nav-link-accountList"><span class="nav-line-1">Hello, Morgan</span></a>
@@ -85,6 +90,21 @@ function cartHtml(): string {
 }
 function detailHtml(status = 'Order placed'): string {
   return `<html><body><a id="nav-link-accountList"><span class="nav-line-1">Hello, Morgan</span></a><div id="orderDetails"><span class="order-number">Order # 123-1234567-1234567</span><time class="order-date" datetime="${orderedAt}">October 15, 2026</time><span class="grand-total">Grand total: $${total}</span><div class="payment-method">Visa ending in 4242</div><div class="shipping-address">Morgan, 10 Main St, Seattle WA 98101</div><span class="order-status">${status}</span><input type="hidden" name="purchaseId" value="checkout-1"><div class="shipment"><div class="item-row" data-asin="B012345678"><a class="a-link-normal" href="/dp/B012345678">Tea kettle</a><span class="quantity">Qty: 1</span></div></div></div></body></html>`;
+}
+// A chooser that reaches the browser returns to its input as a change or cancel event.
+const statement = `<input type="file" id="statement" aria-label="Statement" oncancel="this.dataset.chooser = 'returned'" onchange="this.dataset.chooser = 'returned'">`;
+/** A cross-site widget whose own script navigates its frame, as embedded payment widgets do. */
+function widgetHtml(): string {
+  const link = (id: string, label: string, destination: string) =>
+    `<a id="${id}" href="${AMAZON_RETAIL.origin}/dp/B012345678" onclick="event.preventDefault(); location.assign('${destination}')">${label}</a>`;
+  return `<html><body><h1>Payment plans</h1>${link('plans', 'Compare plans', '/checkout/placeorder')}${link('help', 'Plan help', '/help')}${statement}</body></html>`;
+}
+function widgetHostHtml(embedded: boolean): string {
+  // The later host loads its widget only once a postcode is typed, from inside a job batch.
+  const load = `const widget = document.getElementById('widget'); widget.onload = () => { document.getElementById('status').textContent = 'Plans loaded'; }; widget.src = '${WIDGET_ORIGIN}/';`;
+  return embedded
+    ? `<html><body><h1>Tea kettle</h1>${statement}<iframe id="widget" title="Payment plans" src="${WIDGET_ORIGIN}/"></iframe></body></html>`
+    : `<html><body><h1>Tea kettle</h1><input aria-label="Postcode" oninput="${load}"><p id="status"></p><iframe id="widget" title="Payment plans"></iframe></body></html>`;
 }
 async function approvals(): Promise<PendingApproval[]> {
   return getDb().all('SELECT * FROM pending_approvals ORDER BY created_at');
@@ -121,6 +141,25 @@ async function buy(id = 'buy'): Promise<void> {
 async function navigate(url: string, id: string): Promise<void> {
   await queue.accept('browser', { actions: [{ kind: 'navigate', url }] }, session, id);
   await queue.idle();
+}
+async function nativeRef(control: string): Promise<{ ref: string; generation: number }> {
+  const observation = await observePage(page);
+  const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(control));
+  const ref = line ? /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1] : undefined;
+  if (!ref) throw new Error(`Missing native ref for ${control}: ${observation.snapshot}`);
+  return { ref, generation: observation.generation };
+}
+async function widgetFrame(): Promise<Frame> {
+  const element = await page.locator('#widget').elementHandle();
+  const frame = await element?.contentFrame();
+  await element?.dispose();
+  if (!frame) throw new Error('Widget frame missing');
+  return frame;
+}
+/** Playwright opens a session only for a frame Chrome runs as its own out-of-process target. */
+async function assertOutOfProcess(frame: Frame): Promise<void> {
+  await frame.locator('#plans').waitFor();
+  await (await page.context().newCDPSession(frame)).detach();
 }
 async function reconcile(attemptId: string, id: string): Promise<Record<string, unknown> | undefined> {
   const observation = await observePage(page);
@@ -195,7 +234,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       (request, response) => {
         const url = new URL(request.url ?? '/', AMAZON_RETAIL.origin);
         request.resume();
-        if (request.method === 'POST' && url.pathname.startsWith('/gp/product/handle-buy-box')) {
+        if (request.headers.host === new URL(WIDGET_ORIGIN).host) {
+          widgetRequests.push(url.pathname);
+          response.writeHead(200, { 'content-type': 'text/html' });
+          response.end(url.pathname === '/' ? widgetHtml() : '<html><body>Plan details</body></html>');
+        } else if (request.method === 'POST' && url.pathname.startsWith('/gp/product/handle-buy-box')) {
           cartAdded++;
           response.writeHead(302, { location: `${AMAZON_RETAIL.origin}/gp/cart/view.html` });
           response.end();
@@ -218,13 +261,15 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
           response.end(
             url.pathname === '/dp/B012345678'
               ? productHtml()
-              : url.pathname === '/gp/cart/view.html'
-                ? cartHtml()
-                : url.pathname === AMAZON_RETAIL.reviewPath
-                  ? reviewHtml()
-                  : url.pathname === '/gp/your-account/order-details'
-                    ? detailHtml()
-                    : '<html><body>Processing your order</body></html>',
+              : ['/dp/B0PAYFRAME', '/dp/B0PAYLATER'].includes(url.pathname)
+                ? widgetHostHtml(url.pathname === '/dp/B0PAYFRAME')
+                : url.pathname === '/gp/cart/view.html'
+                  ? cartHtml()
+                  : url.pathname === AMAZON_RETAIL.reviewPath
+                    ? reviewHtml()
+                    : url.pathname === '/gp/your-account/order-details'
+                      ? detailHtml()
+                      : '<html><body>Processing your order</body></html>',
           );
         }
       },
@@ -242,7 +287,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       socket.once('close', () => transportSockets.delete(socket));
     });
     fixtureProxy.on('connect', (request, socket, head) => {
-      if (request.url !== 'www.amazon.com:443') {
+      if (request.url !== 'www.amazon.com:443' && request.url !== `${new URL(WIDGET_ORIGIN).host}:443`) {
         socket.destroy();
         return;
       }
@@ -330,6 +375,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     cardDuringDelivery = undefined;
     holdPost = undefined;
     sawPost = undefined;
+    widgetRequests = [];
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
@@ -864,5 +910,96 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
     await click(approval);
     expect(submitted).toBe(2);
+  });
+  it('refuses a purchase navigation inside an out-of-process widget frame before the widget receives it', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
+    const frame = await widgetFrame();
+    await assertOutOfProcess(frame);
+    await queue.accept(
+      'browser',
+      { actions: [{ kind: 'click', ...(await nativeRef('link "Compare plans"')) }] },
+      session,
+      'widget-plans',
+    );
+    await queue.idle();
+    expect(widgetRequests).toEqual(['/']);
+    expect(await request('widget-plans')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+  });
+  it('lets an ordinary navigation inside the out-of-process widget frame proceed', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
+    const frame = await widgetFrame();
+    await assertOutOfProcess(frame);
+    await queue.accept(
+      'browser',
+      { actions: [{ kind: 'click', ...(await nativeRef('link "Plan help"')) }] },
+      session,
+      'widget-help',
+    );
+    await queue.idle();
+    expect(await request('widget-help')).toMatchObject({ status: 'completed' });
+    await expect.poll(() => frame.url()).toBe(`${WIDGET_ORIGIN}/help`);
+    expect(widgetRequests).toEqual(['/', '/help']);
+  });
+  it('guards a frame that turns out-of-process after the guard installed', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYLATER`, 'later-page');
+    const guard = await ensureBrowserNavigationGuard(page);
+    const frame = await widgetFrame();
+    await expect(page.context().newCDPSession(frame)).rejects.toThrow('does not have a separate CDP session');
+    // The batch's pre-operation pass still sees a same-process frame; only the swap during the batch creates its target.
+    await queue.accept(
+      'browser',
+      {
+        actions: [
+          { kind: 'type', ...(await nativeRef('textbox "Postcode"')), text: '98101' },
+          { kind: 'wait_for', text: 'Plans loaded' },
+        ],
+      },
+      session,
+      'later-load',
+    );
+    await queue.idle();
+    expect(await request('later-load')).toMatchObject({ status: 'completed' });
+    expect(frame.url()).toBe(`${WIDGET_ORIGIN}/`);
+    await assertOutOfProcess(frame);
+    // Outside any job batch the guard refuses every document, in this frame as in the page.
+    await frame.locator('#help').click();
+    await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
+    expect(widgetRequests).toEqual(['/']);
+  });
+  it('holds file choosers opened in the page and in an out-of-process frame instead of showing them', async () => {
+    await secureJobPage(page);
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
+    const frame = await widgetFrame();
+    await assertOutOfProcess(frame);
+    const targets = [page.mainFrame(), frame];
+    for (const target of targets) await target.locator('#statement').click();
+    // Headless Chrome cancels a chooser nobody intercepted; headed Chrome would show the operator a native panel.
+    const outcomes = await Promise.all(
+      targets.map((target) =>
+        target
+          .locator('#statement[data-chooser]')
+          .waitFor({ timeout: 1_000 })
+          .then(
+            () => 'returned',
+            (error: unknown) => (error instanceof errors.TimeoutError ? 'held' : error),
+          ),
+      ),
+    );
+    expect(outcomes).toEqual(['held', 'held']);
+  });
+  it('refuses to start an operation while a page-target setting cannot reach an out-of-process frame', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
+    await assertOutOfProcess(await widgetFrame());
+    let pageTarget = true;
+    // A setting that reaches the page target but can never be set up on a frame target.
+    await coverPageTargets(page, async () => {
+      if (!pageTarget) throw new Error('Fixture frame setup refused');
+      pageTarget = false;
+    });
+    await queue.accept('browser', { actions: [{ kind: 'observe' }] }, session, 'uncovered-frame');
+    await queue.idle();
+    const result = await request('uncovered-frame');
+    expect(result).toMatchObject({ status: 'stopped', reason: 'blocked_address', repeat_safe: true });
+    expect(result?.actions).toBeUndefined();
   });
 });

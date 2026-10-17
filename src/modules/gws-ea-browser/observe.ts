@@ -105,6 +105,9 @@ interface DocumentTree {
   frame: { loaderId: string };
   childFrames?: DocumentTree[];
 }
+/** The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the
+ * main-frame document it was created under, and that document is always in this tree.
+ */
 async function documentLoaders(page: Page): Promise<Set<string>> {
   let attached = documentSessions.get(page);
   if (!attached) {

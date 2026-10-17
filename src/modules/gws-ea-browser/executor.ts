@@ -262,6 +262,8 @@ export async function executeBrowserBatch(
     );
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
+    // The guard refused to start the batch: a frame it could not cover means no action ran.
+    if (error instanceof BrowserActivationError) return { status: 'stopped', reason: error.reason, repeat_safe: true };
     throw error;
   }
 }
@@ -505,6 +507,9 @@ async function executeBatch(
       reason ??= 'not_actionable';
     }
   }
+  // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
+  const blocked = guard.reason();
+  if (!reason && blocked && blocked !== 'ordinary') reason = blocked;
   if (observation && !reason && hasBrowserChallenge(observation.snapshot)) reason = 'challenge';
   if (
     observation &&

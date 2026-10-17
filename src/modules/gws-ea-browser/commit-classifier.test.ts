@@ -124,8 +124,11 @@ it('submits positively identified native authentication forms without invoking a
   } as unknown as ElementHandle;
   const page = {
     url: () => frame.url(),
+    frames: () => [frame],
+    mainFrame: () => frame,
     locator: () => ({ innerText: async () => '' }),
     waitForEvent: async () => undefined,
+    on: () => undefined,
     once: () => undefined,
     context: () => ({ newCDPSession: async () => ({ on: () => undefined, send: async () => undefined }) }),
   } as unknown as Page;

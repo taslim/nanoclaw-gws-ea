@@ -13,6 +13,7 @@ import {
 import { stopChrome } from './chrome.js';
 import { prepareMerchantPage } from './merchant-signatures.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
+import { coverPageTargets } from './page-targets.js';
 import { ensurePrivateDirectory, type BrowserPaths } from './paths.js';
 
 const allowedDownloads = new WeakSet<Page>();
@@ -139,10 +140,11 @@ export async function secureJobPage(page: Page): Promise<void> {
   page.on('download', (download) => {
     if (!allowedDownloads.has(page)) void download.cancel().catch(() => undefined);
   });
-  const session = await page.context().newCDPSession(page);
-  await session.send('Page.setInterceptFileChooserDialog', { enabled: true });
-  page.once('close', () => {
-    void session.detach().catch(() => undefined);
+  // A cross-site frame's file input opens its chooser from that frame's own target.
+  await coverPageTargets(page, async (session) => {
+    // Chrome intercepts a chooser only for a session whose Page domain is enabled.
+    await session.send('Page.enable');
+    await session.send('Page.setInterceptFileChooserDialog', { enabled: true });
   });
 }
 
