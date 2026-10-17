@@ -32,6 +32,7 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
   let certificateSession: CDPSession;
   const sockets = new Set<Socket>();
   const posts: Array<{ host: string; body: string }> = [];
+  const parentDocuments: string[] = [];
 
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
@@ -70,6 +71,19 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
             if (request.url === '/session') response.writeHead(204).end();
             else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
           });
+        } else if (
+          host === 'parent.example' &&
+          (request.url?.startsWith('/help/') || request.url === '/checkout/placeorder')
+        ) {
+          parentDocuments.push(request.url ?? '');
+          // Speculation rules ask to fetch and render a purchase before anyone navigates there.
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              request.url === '/help/speculate'
+                ? '<h1>Help</h1><script type="speculationrules">{"prefetch":[{"source":"list","urls":["/checkout/placeorder"]}],"prerender":[{"source":"list","urls":["/checkout/placeorder"]}]}</script>'
+                : '<h1>Order</h1>',
+            );
         } else if (host === 'parent.example') {
           response
             .writeHead(200, { 'content-type': 'text/html' })
@@ -137,6 +151,7 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(root, 'browser', 'policy.json'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
     posts.length = 0;
+    parentDocuments.length = 0;
     const appeared = connection.context.waitForEvent('page');
     await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
     page = await appeared;
@@ -290,5 +305,15 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     expect(
       await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false }),
     ).toMatchObject({ status: 'completed', images: [{ mime_type: 'image/png' }] });
+  });
+
+  it('loads nothing speculatively, so every page is a request the document gate decides', async () => {
+    await executeBrowserBatch(
+      context(),
+      { actions: [{ kind: 'navigate', url: 'https://parent.example/help/speculate' }] },
+      { record: false },
+    );
+    await page.waitForTimeout(1_500);
+    expect(parentDocuments).toEqual(['/help/speculate']);
   });
 });

@@ -2,7 +2,7 @@ import type { ElementHandle, Page } from 'playwright-core';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import { documentGate } from './document-gate.js';
-import { ensurePageTargets, onUncoveredPageTarget, pageTargetFrameIds, pageTargetsReady } from './page-targets.js';
+import { ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
   authenticationEndpoint,
@@ -397,16 +397,15 @@ export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigat
   return guard;
 }
 
-/** One paused document's class under the operation scopes that were current when it paused. */
+/** One paused document's class under the scopes and approved press that were current when it paused. */
 async function decideNavigation(
-  page: Page,
   url: string,
   scopes: readonly BrowserNavigationPolicy[],
+  approved: { origin: string; flow: ReviewedMerchantFlow } | undefined,
 ): Promise<ActivationClass | 'site_busy'> {
   let classification: ActivationClass | 'site_busy' = scopes.length
     ? classifyNavigationUrl(url)
     : 'unsupported_merchant';
-  const approved = approvedPresses.get(page);
   if (
     approved &&
     classification !== 'blocked_address' &&
@@ -435,6 +434,28 @@ async function decideNavigation(
   return classification;
 }
 
+// Every request type but Document: documents are decided, and stripped, at the document gate.
+const SUBRESOURCE_TYPES = [
+  'Stylesheet',
+  'Image',
+  'Media',
+  'Font',
+  'Script',
+  'TextTrack',
+  'XHR',
+  'Fetch',
+  'Prefetch',
+  'EventSource',
+  'WebSocket',
+  'Manifest',
+  'SignedExchange',
+  'Ping',
+  'CSPViolationReport',
+  'Preflight',
+  'FedCM',
+  'Other',
+] as const;
+
 function withoutReferrer(headers: Record<string, string>): Array<{ name: string; value: string }> {
   return Object.entries(headers)
     .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
@@ -456,18 +477,22 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   const gate = await documentGate(browser);
   // The gate places a same-process child frame through these sessions' frame trees.
   await ensurePageTargets(page);
-  // The gate decides documents. While a sign-in scope asks, this session also strips the Referer
-  // from the page's other requests.
+  // The gate decides documents. While a sign-in scope asks, this session pauses the page's other
+  // requests, never a document, to strip their Referer.
   const pageSession = await page.context().newCDPSession(page);
   pageSession.on('Fetch.requestPaused', (event) => {
     void pageSession
       .send('Fetch.continueRequest', { requestId: event.requestId, headers: withoutReferrer(event.request.headers) })
+      .catch(() =>
+        pageSession.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }),
+      )
       .catch(() => undefined);
   });
   const { targetInfo } = await pageSession.send('Target.getTargetInfo');
   const unregister = gate.register(targetInfo.targetId, {
     capture() {
       const scopes = [...policies];
+      const approved = approvedPresses.get(page);
       const pausedIn = generation;
       const record = (classification: Exclude<ActivationClass, 'ordinary'> | 'site_busy'): void => {
         if (pausedIn === generation) blocked = classification;
@@ -476,7 +501,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         async decide(document) {
           let classification: ActivationClass | 'site_busy';
           try {
-            classification = await decideNavigation(page, document.url, scopes);
+            classification = await decideNavigation(document.url, scopes, approved);
             // eslint-disable-next-line no-catch-all/no-catch-all -- A decision that cannot complete refuses its request.
           } catch (_error) {
             classification = 'blocked_address';
@@ -491,7 +516,6 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         refuse: () => record('blocked_address'),
       };
     },
-    frameIds: () => pageTargetFrameIds(page),
   });
   page.once('close', () => {
     unregister();
@@ -515,7 +539,9 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       const strips = Boolean(scope.stripReferrer);
       try {
         if (strips && stripping++ === 0)
-          await pageSession.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
+          await pageSession.send('Fetch.enable', {
+            patterns: SUBRESOURCE_TYPES.map((resourceType) => ({ requestStage: 'Request' as const, resourceType })),
+          });
         // An operation can act only in frames that exist now, so every page-target setting covers each first.
         if (!(await pageTargetsReady(page))) {
           blocked = 'blocked_address';

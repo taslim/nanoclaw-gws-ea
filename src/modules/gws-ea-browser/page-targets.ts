@@ -3,15 +3,17 @@ import type { CDPSession, Frame, Page } from 'playwright-core';
 interface PageTargetSettings {
   /** Each setting resolves once every current frame is covered; false while a live out-of-process frame is not. */
   covered: Array<() => Promise<boolean>>;
-  /** Each setting's sessions read the frame ids their targets host; undefined when one cannot be read. */
-  frameIds: Array<() => Promise<Set<string> | undefined>>;
+  /** Each setting's sessions map every frame their targets host to the hosting target; undefined if one fails. */
+  frameHosts: Array<() => Promise<Map<string, string> | undefined>>;
+  /** The page's own target id, which is also its main frame's id. */
+  targetId?: string;
   uncovered: Set<() => void>;
 }
 const settingsByPage = new WeakMap<Page, PageTargetSettings>();
 function settingsFor(page: Page): PageTargetSettings {
   let settings = settingsByPage.get(page);
   if (!settings) {
-    settings = { covered: [], frameIds: [], uncovered: new Set() };
+    settings = { covered: [], frameHosts: [], uncovered: new Set() };
     settingsByPage.set(page, settings);
   }
   return settings;
@@ -27,18 +29,40 @@ export async function pageTargetsReady(page: Page): Promise<boolean> {
   return (await Promise.all(settingsFor(page).covered.map((covered) => covered()))).every(Boolean);
 }
 
-/** Every frame id the page's targets host now, read through any setting's sessions, or undefined. */
-export async function pageTargetFrameIds(page: Page): Promise<ReadonlySet<string> | undefined> {
-  for (const read of settingsFor(page).frameIds) {
-    const ids = await read();
-    if (ids) return ids;
+/** A protocol read that has not answered within this is no answer. */
+export const PROTOCOL_READ_TIMEOUT_MS = 2_000;
+
+/** `work`, or a rejection once `ms` pass without its answer. */
+export function withinTime<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  return Promise.race([
+    work,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`No answer within ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Every frame the page's targets host now, each mapped to the target hosting it, read through any
+ * setting's sessions; undefined when the page's targets cannot all be read.
+ */
+export async function pageTargetFrameHosts(page: Page): Promise<ReadonlyMap<string, string> | undefined> {
+  for (const read of settingsFor(page).frameHosts) {
+    const hosts = await read();
+    if (hosts) return hosts;
   }
   return undefined;
 }
 
+/** The page's target id, once some setting covers it. */
+export function pageTargetId(page: Page): string | undefined {
+  return settingsFor(page).targetId;
+}
+
 /** A page with no setting yet gets sessions with none, so its frame trees stay readable. */
 export async function ensurePageTargets(page: Page): Promise<void> {
-  if (!settingsFor(page).frameIds.length) await coverPageTargets(page, async () => undefined);
+  if (!settingsFor(page).frameHosts.length) await coverPageTargets(page, async () => undefined);
 }
 
 interface FrameTreeNode {
@@ -55,6 +79,7 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
   const settings = settingsFor(page);
   const pageSession = await page.context().newCDPSession(page);
   try {
+    settings.targetId ??= (await pageSession.send('Target.getTargetInfo')).targetInfo.targetId;
     await setup(pageSession);
   } catch (error) {
     await pageSession.detach().catch(() => undefined);
@@ -138,28 +163,33 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
     for (const session of [pageSession, ...frameSessions]) void session.detach().catch(() => undefined);
     frameSessions.clear();
   });
-  const frameIds = async (): Promise<Set<string> | undefined> => {
+  const frameHosts = async (): Promise<Map<string, string> | undefined> => {
     if (!(await covered())) return undefined;
-    const ids = new Set<string>();
-    for (const session of [pageSession, ...frameSessions]) {
-      let tree: FrameTreeNode;
-      try {
-        ({ frameTree: tree } = await session.send('Page.getFrameTree'));
-        // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read leaves the page's frames unknown.
-      } catch (_error) {
-        // A frame session that closed meanwhile took its frames with it; any other failure is unknown.
-        if (session !== pageSession && !frameSessions.has(session)) continue;
-        return undefined;
-      }
+    const sessions = [pageSession, ...frameSessions];
+    const trees = await Promise.all(
+      sessions.map((session) =>
+        withinTime(session.send('Page.getFrameTree'), PROTOCOL_READ_TIMEOUT_MS).then(
+          ({ frameTree }) => frameTree as FrameTreeNode,
+          // A frame session that closed meanwhile took its frames with it; any other failure is unknown.
+          () => (session !== pageSession && !frameSessions.has(session) ? null : undefined),
+        ),
+      ),
+    );
+    const hosts = new Map<string, string>();
+    for (const tree of trees) {
+      if (tree === undefined) return undefined;
+      if (tree === null) continue;
+      // A session's tree is rooted at its own target: the page, or an out-of-process frame.
+      const host = tree.frame.id;
       const visit = (node: FrameTreeNode): void => {
-        ids.add(node.frame.id);
+        hosts.set(node.frame.id, host);
         node.childFrames?.forEach(visit);
       };
       visit(tree);
     }
-    return ids;
+    return hosts;
   };
   settings.covered.push(covered);
-  settings.frameIds.push(frameIds);
+  settings.frameHosts.push(frameHosts);
   report(await covered());
 }

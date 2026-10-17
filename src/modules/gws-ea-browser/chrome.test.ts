@@ -44,6 +44,8 @@ describe('dedicated Chrome profile and launch', () => {
         '--no-startup-window',
         '--disable-quic',
         '--deny-permission-prompts',
+        // A page restored from the back/forward cache would skip the document gate.
+        '--disable-back-forward-cache',
       ]),
     );
     expect(
@@ -91,12 +93,25 @@ describe('dedicated Chrome profile and launch', () => {
     expect(actual).toMatchObject({
       policy: { url_blocklist: ['*'], url_allowlist: ['http://*', 'https://*', 'about:*', 'data:*'] },
       signin: { allowed: false },
+      // Speculative prefetch and prerender would fetch a page without any request the gate sees.
+      net: { network_prediction_options: 2 },
     });
     for (const dir of [paths.root, paths.profileDir, paths.stagingDir])
       expect((await lstat(dir)).mode & 0o777).toBe(0o700);
     expect((await lstat(pref)).mode & 0o777).toBe(0o600);
     await symlink(path.join(root, 'elsewhere'), path.join(paths.stagingDir, 'escape'));
     await expect(ensureBrowserPaths(paths)).rejects.toThrow(/symbolic|symlink/i);
+  });
+
+  it('drops every service worker registration while Chrome is stopped', async () => {
+    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    await prepareChromeProfile(paths);
+    // A worker registered before would answer navigations without a request the gate sees.
+    const workers = path.join(paths.profileDir, 'Default', 'Service Worker');
+    await mkdir(path.join(workers, 'Database'), { recursive: true });
+    await writeFile(path.join(workers, 'Database', 'CURRENT'), 'MANIFEST-000001');
+    await prepareChromeProfile(paths);
+    await expect(lstat(workers)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('removes orphaned upload copies while retaining unhanded downloads before a fresh Chrome launch', async () => {

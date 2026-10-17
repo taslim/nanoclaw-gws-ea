@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -54,6 +55,8 @@ export function buildChromeLaunch(input: ChromeLaunchInput): { command: string; 
       '--mute-audio',
       '--disable-extensions',
       '--disable-component-extensions-with-background-pages',
+      // A page restored from the back/forward cache skips the document gate; a fresh load is decided.
+      '--disable-back-forward-cache',
     ],
   };
 }
@@ -68,6 +71,9 @@ export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
   await clearBrowserUploadStaging(paths);
   const defaultDir = path.join(paths.profileDir, 'Default');
   await ensurePrivateDirectory(defaultDir);
+  // A registered service worker answers navigations without a request the document gate sees. The
+  // gate refuses every new worker script; registrations from before are dropped here, while stopped.
+  await rm(path.join(defaultDir, 'Service Worker'), { recursive: true, force: true });
   const file = path.join(defaultDir, 'Preferences');
   let prefs: Record<string, unknown> = {};
   try {
@@ -108,6 +114,9 @@ export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
   prefs.browser = { ...object(prefs.browser), check_default_browser: false };
   prefs.session = { ...object(prefs.session), restore_on_startup: 5 };
   prefs.webrtc = { ...object(prefs.webrtc), ip_handling_policy: 'disable_non_proxied_udp' };
+  // Speculative prefetch and prerender fetch a page with no request the document gate sees, and serve
+  // it on navigation. Verified on Chrome 155: with this off, both are plain, gated navigations.
+  prefs.net = { ...object(prefs.net), network_prediction_options: 2 };
   await writePrivateFile(file, JSON.stringify(prefs));
 }
 

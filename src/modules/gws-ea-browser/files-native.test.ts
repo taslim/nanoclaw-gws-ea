@@ -28,6 +28,7 @@ import './index.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
+import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { browserPaths, writePrivateFile } from './paths.js';
@@ -48,6 +49,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
   let session: Session;
   let context: BrowserExecutionContext;
   let invoiceRequests = 0;
+  const documentRequests: string[] = [];
 
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
@@ -59,6 +61,11 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
         return;
       }
       const url = new URL(request.url);
+      documentRequests.push(url.pathname);
+      if (url.pathname.startsWith('/help/')) {
+        response.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><h1>${url.pathname}</h1>`);
+        return;
+      }
       if (url.pathname === '/docs/invoice.pdf') {
         ++invoiceRequests;
         response
@@ -138,6 +145,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
       remaining: () => Math.max(1, deadline - Date.now()),
     };
     invoiceRequests = 0;
+    documentRequests.length = 0;
   });
 
   afterEach(async () => {
@@ -296,6 +304,21 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
       await plain.close();
     }
   });
+
+  it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {
+    for (const step of ['first', 'second'])
+      await executeBrowserBatch(
+        context,
+        { actions: [{ kind: 'navigate', url: `http://fixture.example/help/${step}` }] },
+        { record: false },
+      );
+    const guard = await ensureBrowserNavigationGuard(page);
+    await page.evaluate('history.back()');
+    // Outside any errand the guard refuses every document; a restored page would have asked nothing.
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    expect(documentRequests.filter((request) => request === '/help/first')).toHaveLength(1);
+    expect(page.url()).not.toBe('http://fixture.example/help/first');
+  }, 20_000);
 });
 
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));

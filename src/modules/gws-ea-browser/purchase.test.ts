@@ -72,6 +72,7 @@ let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
 let widgetRequests: string[];
 let offerRequests: string[];
+let merchantDocuments: string[];
 const WIDGET_ORIGIN = 'https://pay.example';
 const OFFERS_ORIGIN = 'https://offers.example';
 
@@ -113,6 +114,8 @@ function fixturePage(pathname: string): string {
       return widgetHostHtml(`${WIDGET_ORIGIN}/`);
     case '/dp/B0OFFERS01':
       return offersHostHtml();
+    case '/dp/B0WORKER01':
+      return `<html><body><h1>Tea kettle</h1><script>navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).then(() => { document.body.dataset.worker = 'registered'; }, () => { document.body.dataset.worker = 'refused'; });</script></body></html>`;
     case '/dp/B0PAYLATER':
       return widgetHostHtml();
     case '/gp/cart/view.html':
@@ -133,6 +136,9 @@ function offerDocument(url: URL): string | undefined {
   // A widget hosting one same-site child, in its own process, and one cross-site child, in another.
   if (url.searchParams.has('nest'))
     return `<html><body><iframe src="/?child=same"></iframe><iframe src="${OFFERS_ORIGIN}/?child=cross"></iframe></body></html>`;
+  // A brand-new widget whose same-site child navigates itself while both are still loading.
+  if (url.searchParams.has('nestnow'))
+    return `<html><body><iframe src="/?redirect=${url.searchParams.get('nestnow')}"></iframe></body></html>`;
   // A nested child that navigates itself only when the top page asks.
   if (url.searchParams.has('child'))
     return `<html><body><script>top.postMessage('ready', '*'); addEventListener('message', (event) => { if (event.data === 'go') { ${purchase} } });</script></body></html>`;
@@ -144,7 +150,7 @@ function offersHostHtml(): string {
   const count = `let ready = 0; let redirected = 0; addEventListener('message', (event) => { if (event.data === 'ready') document.getElementById('ready').textContent = 'Ready ' + ++ready; if (event.data === 'redirecting') document.getElementById('redirected').textContent = 'Redirected ' + ++redirected; });`;
   const insert = (query: string) =>
     `const offer = document.createElement('iframe'); offer.src = '${WIDGET_ORIGIN}/?' + ${query}; document.body.append(offer);`;
-  return `<html><body><h1>Tea kettle</h1>${control('Load offers', insert("'redirect=' + document.querySelectorAll('iframe').length"))}${control('Load nested offers', insert("'nest=1'"))}${control('Start offers', "const widget = frames[frames.length - 1]; for (let i = 0; i < widget.length; i++) widget[i].postMessage('go', '*');")}<p id="ready"></p><p id="redirected"></p><script>${count}</script></body></html>`;
+  return `<html><body><h1>Tea kettle</h1>${control('Load offers', insert("'redirect=' + document.querySelectorAll('iframe').length"))}${control('Load nested offers', insert("'nest=1'"))}${control('Start offers', "const widget = frames[frames.length - 1]; for (let i = 0; i < widget.length; i++) widget[i].postMessage('go', '*');")}${control('Load nested now', insert("'nestnow=' + document.querySelectorAll('iframe').length"))}${control('Load checkout frame', "const frame = document.createElement('iframe'); frame.src = '/checkout/placeorder?frame=' + document.querySelectorAll('iframe').length; document.body.append(frame);")}<a href="${AMAZON_RETAIL.origin}/dp/B0POPUP001" target="_blank">Open deals</a>${control('Open deals window', `window.open('${AMAZON_RETAIL.origin}/dp/B0POPUP001?window')`)}<p id="ready"></p><p id="redirected"></p><script>${count}</script></body></html>`;
 }
 function widgetHostHtml(widgetSrc?: string): string {
   // The later host loads its widget only once a postcode is typed, from inside a job batch.
@@ -314,7 +320,18 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
           };
           if (holdPost) void holdPost.then(finish);
           else finish();
+        } else if (url.pathname === '/sw.js') {
+          // A worker that answers a purchase navigation itself, without the network.
+          response.writeHead(200, { 'content-type': 'text/javascript' });
+          response.end(
+            `self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', (event) => event.waitUntil(clients.claim())); self.addEventListener('fetch', (event) => { if (event.request.mode === 'navigate' && new URL(event.request.url).pathname === '/checkout/placeorder') event.respondWith(new Response('<html><body>served by worker</body></html>', { headers: { 'content-type': 'text/html' } })); });`,
+          );
+        } else if (url.pathname === '/dp/B0POPUP001') {
+          // An ordinary product address that redirects its window to a purchase.
+          response.writeHead(302, { location: `${WIDGET_ORIGIN}/checkout/placeorder` });
+          response.end();
         } else {
+          merchantDocuments.push(url.pathname);
           response.writeHead(200, { 'content-type': 'text/html' });
           response.end(fixturePage(url.pathname));
         }
@@ -427,6 +444,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     sawPost = undefined;
     widgetRequests = [];
     offerRequests = [];
+    merchantDocuments = [];
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
@@ -1251,5 +1269,68 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('nested-go')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
     expect(widgetRequests).not.toContain('/checkout/placeorder');
     expect(offerRequests).not.toContain('/checkout/placeorder');
+  }, 30_000);
+  it('refuses brand-new same-site frames inside a brand-new widget that navigate themselves as they load', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
+    for (let trial = 1; trial <= 20; trial++) {
+      await queue.accept(
+        'browser',
+        {
+          actions: [
+            { kind: 'click', ...(await nativeRef('link "Load nested now"')) },
+            { kind: 'wait_for', text: `Redirected ${trial}`, timeout_ms: 5_000 },
+          ],
+        },
+        session,
+        `nested-now-${trial}`,
+      );
+      await queue.idle();
+    }
+    expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
+  }, 60_000);
+  it.each(['Open deals', 'Open deals window'])(
+    'decides the documents of a window the page opens under the page guard (%s)',
+    async (link) => {
+      await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
+      const opened = page.context().waitForEvent('page');
+      await queue.accept(
+        'browser',
+        { actions: [{ kind: 'click', ...(await nativeRef(`link "${link}"`)) }] },
+        session,
+        'deals',
+      );
+      await queue.idle();
+      const window = await opened;
+      // The window's ordinary first address is allowed; its redirect to a purchase is refused.
+      await expect.poll(() => window.url(), { timeout: 5_000 }).toMatch(/^chrome-error:|placeorder/);
+      expect(widgetRequests).not.toContain('/checkout/placeorder');
+    },
+    30_000,
+  );
+  it('decides under the page policy a same-process frame whose very first document is a purchase', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
+    const reasons: unknown[] = [];
+    for (let trial = 1; trial <= 20; trial++) {
+      await queue.accept(
+        'browser',
+        { actions: [{ kind: 'click', ...(await nativeRef('link "Load checkout frame"')) }] },
+        session,
+        `checkout-frame-${trial}`,
+      );
+      await queue.idle();
+      reasons.push((await request(`checkout-frame-${trial}`))?.reason);
+    }
+    expect(merchantDocuments).not.toContain('/checkout/placeorder');
+    expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
+  }, 60_000);
+  it('never lets a service worker answer a navigation the document gate has not decided', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0WORKER01`, 'worker-page');
+    const guard = await ensureBrowserNavigationGuard(page);
+    await page.locator('body[data-worker]').waitFor({ timeout: 10_000 });
+    expect(await page.locator('body').getAttribute('data-worker')).toBe('refused');
+    // With no worker registered, the purchase navigation reaches the gate, which refuses it outside any errand.
+    await page.evaluate("location.assign('/checkout/placeorder')");
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    expect(await page.content()).not.toContain('served by worker');
   }, 30_000);
 });

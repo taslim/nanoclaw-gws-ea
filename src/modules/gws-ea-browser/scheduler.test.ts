@@ -24,6 +24,7 @@ import type { WatchBounds } from './watches.js';
 import type { ReservationAvailability } from './merchant-contract.js';
 import { watchInterval, watchSitePolicy } from './watch-policy.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
+import * as profile from '../gws-ea-profile/db.js';
 import { setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
 
 let queue: BrowserQueue;
@@ -519,6 +520,36 @@ it('applies a timezone the principal changes through main from the next check', 
   await scheduler.tick();
   expect(checks()).toBe(1);
   expect(await nextCheck('a')).toBe('2026-10-16T05:00:00.000Z');
+});
+
+it('skips only the site whose principal timezone read failed mid-tick, and checks it on the next tick', async () => {
+  await seedPrincipal('America/Los_Angeles');
+  // 20:30 in Los Angeles: no quiet hours stand in the way.
+  vi.setSystemTime(new Date('2026-10-16T03:30:00Z'));
+  await arm('a', 'same');
+  await arm('b', 'same', 4, 1, 'opentable.com');
+  const armedAt = new Date().toISOString();
+  const read = vi.spyOn(profile, 'principalNameAndTimezone');
+  read.mockRejectedValueOnce(new Error('Profile unavailable'));
+  const { scheduler, checks } = countingScheduler();
+  await expect(scheduler.tick()).rejects.toThrow('Profile unavailable');
+  // The other site was checked; the failed one reserved nothing and kept its schedule.
+  expect(checks()).toBe(1);
+  const untouched = await getDb().all<{ id: string; next_check_at: string }>(
+    'SELECT id,next_check_at FROM gws_ea_browser_watches WHERE next_check_at=?',
+    armedAt,
+  );
+  expect(untouched).toHaveLength(1);
+  const skipped = untouched[0].id === 'a' ? 'resy.com' : 'opentable.com';
+  expect(
+    await getDb().get(
+      'SELECT last_check_at FROM gws_ea_browser_watch_site_state WHERE site=? AND last_check_at IS NOT NULL',
+      skipped,
+    ),
+  ).toBeUndefined();
+  await scheduler.tick();
+  expect(checks()).toBe(2);
+  read.mockRestore();
 });
 
 it("reads quiet hours on the install's timezone until the profile holds the principal's", async () => {
