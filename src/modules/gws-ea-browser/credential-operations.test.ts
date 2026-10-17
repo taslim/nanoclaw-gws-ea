@@ -934,6 +934,18 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await lease()).toBeUndefined();
   });
 
+  it('tells the principal a signup whose emailed confirmation the host used is unknown, not unconfirmed', async () => {
+    const id = await disclosedSignup();
+    await attempts.markAwaitingVerification(id);
+    await attempts.markUnknown(id, { signal: 'none', activation: 'activated', via: 'code' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain(
+      `The site asked to confirm the account "${USERNAME}" on shop.example by email, and I used the code it sent, but I can't tell whether the site accepted it.`,
+    );
+    expect(card.question).not.toContain('never completed');
+  });
+
   it('reports, asks and releases a signup whose login was edited before the host finished saving it', async () => {
     const id = await disclosedSignup();
     await attempts.markAwaitingVerification(id);

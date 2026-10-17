@@ -331,8 +331,13 @@ function situation(attempt: CredentialAttempt, account: string): string {
         return `The site created the account ${account}, but I can't reach 1Password to finish saving its login.`;
       case 'awaiting_verification':
         return `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`;
-      default:
-        return `I tried to create the account ${account}, but I can't tell whether the account was created.`;
+      default: {
+        const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+        const via = isRecord(evidence) ? evidence.via : undefined;
+        return via === 'link' || via === 'code'
+          ? `The site asked to confirm the account ${account} by email, and I used the ${via} it sent, but I can't tell whether the site accepted it.`
+          : `I tried to create the account ${account}, but I can't tell whether the account was created.`;
+      }
     }
   if (attempt.phase === 'conflict' || (attempt.phase === 'confirmed' && attempt.settlement === 'kept'))
     return `The site took a new password for ${account}, but its login in my 1Password vault was changed or removed while I was changing it, so I left the login as it is.`;
@@ -1575,9 +1580,13 @@ const VERIFY_MARGIN_MS = 15_000;
  * Completes a signup the site asked to confirm by email. Only the answer the
  * isolated interpreter returned for this signup's own claim is used, and only
  * by the host: a link is opened on the site, a code goes into the field the
- * browser named. Success needs the site's own fresh confirmation. With no
- * wait for this signup's mail, `not_watched`: the host cannot complete it,
- * and the attempt stays for the principal's release.
+ * browser named. Success needs the site's own fresh confirmation. The answer
+ * stays for the next verify until the site may have it: once a link was
+ * opened or a code entered, the wait ends, and without the site's
+ * confirmation the signup is unknown, for reconcile to read the site's late
+ * response or for the principal's release. With no wait for this signup's
+ * mail, `not_watched`: the host cannot complete it, and the attempt stays for
+ * the principal's release.
  */
 async function verify(
   context: BrowserExecutionContext,
@@ -1605,13 +1614,21 @@ async function verify(
         );
       } catch (error) {
         await finishSignupVerification(attempt.id);
-        throw error;
+        if (!(error instanceof ActionRefusal)) throw error;
+        // Opening began, so the site may have taken the link; its window is closed, leaving nothing to watch.
+        return interruptedOutcome(attempts, attempt, { signal: 'interrupted', via: 'link' });
       }
-      if (typeof opened !== 'string') return refused('origin_mismatch');
+      if (typeof opened !== 'string') {
+        // Off the site, the link waits for a step on it.
+        if (opened.status === 'origin_mismatch') return refused('origin_mismatch');
+        await finishSignupVerification(attempt.id);
+        throw forbidden('The host refused an insecure or off-site verification link.');
+      }
       await finishSignupVerification(attempt.id);
+      // The link is spent: a landing without the site's confirmation leaves the signup unknown, the bearer page cleared.
       return opened === 'verified'
         ? confirmVerified(context, attempt, attempts, 'link')
-        : { status: 'verification_requested' };
+        : interruptedOutcome(attempts, attempt, { signal: 'none', via: 'link' });
     });
   const { code_field: codeField, activate } = payload;
   // The code waits for a step that names its field.
@@ -1648,21 +1665,23 @@ async function enterCode(
   try {
     await bindPageSecretDocuments(page, code);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, [code], context.assertActive);
+    // Nothing reached the page: the answer stays for the next verify.
     if (filled === 'not_inserted') return refused('form_changed');
     inserted = true;
-    await finishSignupVerification(attempt.id);
     return await activateWithin(context, page, group, [code], [code], async (activation) => {
+      await finishSignupVerification(attempt.id);
       if (activation === 'uncertain') return unknownAfterCode({ signal: 'none', activation, via: 'code' });
-      if (activation !== 'activated') return { status: 'verification_requested' };
-      const result = await awaitSite(context, 15_000, async () =>
+      // A control that never ran can still leave a code its field submits by itself, so the site is read either way.
+      const result = await awaitSite(context, activation === 'activated' ? 15_000 : 2_000, async () =>
         verificationResult(before, await readSite(page, group), true),
       );
       return result === 'verified'
         ? confirmVerified(context, attempt, attempts, 'code')
-        : { status: 'verification_requested' };
+        : unknownAfterCode({ signal: 'none', activation, via: 'code' });
     });
   } catch (error) {
     if (!inserted) throw error;
+    await finishSignupVerification(attempt.id);
     return await unknownAfterCode({ signal: 'interrupted', via: 'code' });
   } finally {
     await settleFilledSecrets(context, page, [code]);

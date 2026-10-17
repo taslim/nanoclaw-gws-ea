@@ -193,6 +193,7 @@ const PAGES: Record<string, string> = {
     '/api/slow-signup',
   )}`,
   '/verify-email': '<h1>Your email has been verified.</h1><p>Your account is ready.</p>',
+  '/verify-email-quiet': '<h1>Shop</h1><p>Browse the catalogue.</p>',
 };
 
 describe.skipIf(!chromePath)('native authorized signup and password change', () => {
@@ -211,6 +212,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
   const posts: Array<{ host: string; path: string; body: string }> = [];
   const addresses: string[] = [];
   const responses = new Map<string, string>();
+  /** Answers to `/api/slow-*`, held until the test releases them: a response that arrives after the host stopped waiting. */
+  const held: Array<() => void> = [];
+  const answerSlow = (): void => {
+    for (const answer of held.splice(0)) answer();
+  };
   let accountPassword: string | undefined;
   let callbackPhases: Array<string | undefined>;
 
@@ -246,6 +252,10 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         };
         if (request.method !== 'POST') {
           addresses.push(`${host}${request.url ?? ''}`);
+          if (path === '/verify-away') {
+            response.writeHead(302, { location: 'https://collector.example/landing' }).end();
+            return;
+          }
           if (host === 'parent.example')
             html(
               `<input id="untrusted" aria-label="Untrusted"><iframe src="${SITE}${path === '/get' ? '/get-signup' : '/native-signup'}"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
@@ -259,8 +269,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         });
         request.on('end', () => {
           posts.push({ host, path, body });
-          if (path.startsWith('/api/slow-'))
-            setTimeout(() => html(responses.get(path) ?? '<h1>Account created</h1>'), 3_000).unref();
+          if (path.startsWith('/api/slow-')) held.push(() => html(responses.get(path) ?? '<h1>Account created</h1>'));
           else if (path === '/signup/email')
             html(
               `<h1>Choose a password</h1><form method="post" action="/signup/password">${field('Password', 'password', 'password', 'new-password')}${field('Confirm password', 'confirm', 'password', 'new-password')}<button type="submit">Create account</button></form>`,
@@ -343,8 +352,10 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     await certificateSession.send('Security.setIgnoreCertificateErrors', { ignore: true });
   });
   afterEach(async () => {
+    answerSlow();
     vi.restoreAllMocks();
-    await certificateSession?.detach();
+    // A step that closed the job's window took its session with it.
+    if (!page?.isClosed()) await certificateSession?.detach();
     await page?.close();
     await closeDb();
   });
@@ -1000,6 +1011,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         remaining = 4_000;
         const { authority, result } = await signUp('/slow-js-signup', SIGNUP);
         expect(result).toEqual({ status: 'outcome_unknown' });
+        answerSlow();
         await page.locator('#result > *').waitFor();
         remaining = 20_000;
         const reconcile = () =>
@@ -1125,6 +1137,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       ).toEqual({ status: 'outcome_unknown' });
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
 
+      answerSlow();
       await page.locator('#result > *').waitFor();
       expect(
         await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
@@ -1164,6 +1177,91 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(posts.filter((post) => post.path === '/api/verify-code')).toEqual([
         { host: 'accounts.shop.example', path: '/api/verify-code', body: '518204' },
       ]);
+    }, 30_000);
+
+    /** A signup the site asked to confirm, its emailed answer delivered and its wait still open. */
+    async function awaitingConfirmation(signupPage: string, reply: { kind: 'code' | 'link'; value: string }) {
+      responses.set('/signup', signupPage);
+      const { authority, result } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'verification_requested' });
+      await deliver(reply);
+      return authority;
+    }
+    const claimStates = () => getDb().all<{ state: string }>('SELECT state FROM gws_ea_browser_sign_in_claims');
+
+    it('leaves a signup unknown when the opened link lands without the site confirming it, never asking to verify again', async () => {
+      const authority = await awaitingConfirmation('<p>Check your email to verify your account.</p>', {
+        kind: 'link',
+        value: `${SITE}/verify-email-quiet?token=verification-bearer-6610`,
+      });
+      expect(await verify(authority)).toEqual({ status: 'outcome_unknown' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      expect(await claimStates()).toEqual([{ state: 'finished' }]);
+      // The spent link is never opened again; the cleared page leaves nothing to read, so the principal decides.
+      expect(await verify(authority)).toEqual({ status: 'outcome_unknown' });
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'inconclusive' });
+      expect(addresses.filter((address) => address.includes('verify-email-quiet'))).toHaveLength(1);
+    }, 30_000);
+
+    it('leaves a signup unknown when opening its link fails part way', async () => {
+      const authority = await awaitingConfirmation('<p>Check your email to verify your account.</p>', {
+        kind: 'link',
+        value: `${SITE}/verify-away?token=verification-bearer-6611`,
+      });
+      expect(await verify(authority)).toEqual({ status: 'outcome_unknown' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      expect(JSON.parse((await attempts.get(authority.id))!.evidence_json!)).toMatchObject({ via: 'link' });
+      expect(await claimStates()).toEqual([{ state: 'finished' }]);
+    }, 30_000);
+
+    it('leaves an entered code unknown when the site confirms after the wait, then reconciles its confirmation', async () => {
+      const authority = await awaitingConfirmation(
+        `<p>Check your email to verify your account.</p><form id="verify"><label>Verification code <input name="code" autocomplete="one-time-code"></label><button type="submit">Verify</button></form><div id="result"></div><script>
+          document.getElementById('verify').addEventListener('submit', (event) => {
+            event.preventDefault();
+            fetch('/api/slow-verify', { method: 'POST', body: document.querySelector('[name=code]').value })
+              .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+          });
+        </script>`,
+        { kind: 'code', value: '640372' },
+      );
+      responses.set('/api/slow-verify', '<h1>Your email has been verified.</h1>');
+      remaining = 4_000;
+      expect(await verify(authority, await refs({ code_field: 'Verification code', activate: 'Verify' }))).toEqual({
+        status: 'outcome_unknown',
+      });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      remaining = 20_000;
+      answerSlow();
+      await page.locator('#result > *').waitFor();
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts.filter((post) => post.path === '/api/slow-verify')).toHaveLength(1);
+    }, 30_000);
+
+    it('reads the site after a code its field submitted by itself, though the control never enabled', async () => {
+      const authority = await awaitingConfirmation(
+        `<p>Check your email to verify your account.</p><form id="verify"><label>Verification code <input name="code" autocomplete="one-time-code"></label><button type="submit" disabled>Verify</button></form><div id="result"></div><script>
+          document.querySelector('[name=code]').addEventListener('input', (event) => {
+            if (event.target.value.length < 6) return;
+            fetch('/api/verify-code', { method: 'POST', body: event.target.value })
+              .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+          });
+        </script>`,
+        { kind: 'code', value: '271828' },
+      );
+      responses.set('/api/verify-code', '<h1>Your email has been verified.</h1>');
+      expect(await verify(authority, await refs({ code_field: 'Verification code', activate: 'Verify' }))).toEqual({
+        status: 'account_created',
+        vault: 'saved',
+      });
+      expect(posts.filter((post) => post.path === '/api/verify-code')).toEqual([
+        { host: 'accounts.shop.example', path: '/api/verify-code', body: '271828' },
+      ]);
+      expect(await claimStates()).toEqual([{ state: 'finished' }]);
     }, 30_000);
 
     it('reports a signup the site already confirmed without waiting for mail', async () => {

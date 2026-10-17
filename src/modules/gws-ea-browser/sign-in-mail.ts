@@ -370,7 +370,9 @@ async function consumeMagicLink(
 /**
  * Opens a signup's emailed verification link the same way: on its claim's
  * site, from the job's main document there, reading the landing page through
- * `landing` before the bearer document is cleared.
+ * `landing` before the bearer document is cleared. An insecure or off-site
+ * link is `refused` before anything opens it; a failure once opening began
+ * throws, and the site may have taken the link by then.
  */
 export async function openVerificationLink<T>(
   context: BrowserExecutionContext,
@@ -378,14 +380,14 @@ export async function openVerificationLink<T>(
   claim: SignInClaim,
   link: string,
   landing: () => Promise<T>,
-): Promise<T | { readonly status: 'origin_mismatch' }> {
+): Promise<T | { readonly status: 'origin_mismatch' | 'refused' }> {
   const url = httpsOrigin(link);
   if (
     !url ||
     getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain ||
     classifyNavigationUrl(url.href) === 'account_security'
   )
-    throw forbidden('The host refused an insecure or off-site verification link.');
+    return { status: 'refused' };
   const origin = httpsOrigin(page.mainFrame().url());
   if (!origin || getDomain(origin.hostname, { allowPrivateDomains: true }) !== claim.domain)
     return { status: 'origin_mismatch' };
