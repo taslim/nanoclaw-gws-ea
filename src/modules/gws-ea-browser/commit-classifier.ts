@@ -434,32 +434,34 @@ async function decideNavigation(
   return classification;
 }
 
-// Every request type but Document: documents are decided, and stripped, at the document gate.
+// Every request type but Document: documents are decided, and stripped, at the document gate. These are
+// the types Chrome's Fetch filter accepts (it refuses TextTrack, Prefetch, Manifest and others by name);
+// Chrome files every other request under one of them, a text track as Media and a prefetch as Fetch.
 const SUBRESOURCE_TYPES = [
   'Stylesheet',
   'Image',
   'Media',
   'Font',
   'Script',
-  'TextTrack',
   'XHR',
   'Fetch',
-  'Prefetch',
   'EventSource',
-  'WebSocket',
-  'Manifest',
-  'SignedExchange',
   'Ping',
   'CSPViolationReport',
-  'Preflight',
-  'FedCM',
   'Other',
 ] as const;
 
+/**
+ * The request's headers with an empty Referer. Chrome keeps a request's referrer apart from its
+ * headers and restores the Referer when an override merely leaves it out; only an empty one clears it.
+ */
 function withoutReferrer(headers: Record<string, string>): Array<{ name: string; value: string }> {
-  return Object.entries(headers)
-    .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
-    .map(([name, value]) => ({ name, value: String(value) }));
+  return [
+    ...Object.entries(headers)
+      .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
+      .map(([name, value]) => ({ name, value: String(value) })),
+    { name: 'Referer', value: '' },
+  ];
 }
 
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {

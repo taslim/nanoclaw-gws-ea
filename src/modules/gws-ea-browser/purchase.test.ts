@@ -71,6 +71,7 @@ let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
 let widgetRequests: string[];
+let signInReferers: Array<[string, string | undefined]>;
 let offerRequests: string[];
 let merchantDocuments: string[];
 const WIDGET_ORIGIN = 'https://pay.example';
@@ -326,6 +327,16 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
           response.end(
             `self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', (event) => event.waitUntil(clients.claim())); self.addEventListener('fetch', (event) => { if (event.request.mode === 'navigate' && new URL(event.request.url).pathname === '/checkout/placeorder') event.respondWith(new Response('<html><body>served by worker</body></html>', { headers: { 'content-type': 'text/html' } })); });`,
           );
+        } else if (url.pathname === '/ap/signin/landing') {
+          // A sign-in landing page whose image would carry the page's address as its Referer.
+          response.writeHead(200, { 'content-type': 'text/html' });
+          response.end(
+            '<html><body><img src="/ap/signin/pixel.png"><a id="next" href="/ap/signin/next">Next</a></body></html>',
+          );
+        } else if (url.pathname === '/ap/signin/pixel.png' || url.pathname === '/ap/signin/next') {
+          signInReferers.push([url.pathname, request.headers.referer]);
+          response.writeHead(200, { 'content-type': url.pathname.endsWith('.png') ? 'image/png' : 'text/html' });
+          response.end();
         } else if (url.pathname === '/dp/B0POPUP001') {
           // An ordinary product address that redirects its window to a purchase.
           response.writeHead(302, { location: `${WIDGET_ORIGIN}/checkout/placeorder` });
@@ -443,6 +454,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     holdPost = undefined;
     sawPost = undefined;
     widgetRequests = [];
+    signInReferers = [];
     offerRequests = [];
     merchantDocuments = [];
     sent = [];
@@ -1175,6 +1187,28 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await frame.locator('#plans').click();
     await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
     expect(widgetRequests).toEqual(['/', '/']);
+  }, 30_000);
+  it('strips the Referer from what a sign-in scope loads, documents and subresources alike', async () => {
+    const guard = await ensureBrowserNavigationGuard(page);
+    const landing = `${AMAZON_RETAIL.origin}/ap/signin/landing`;
+    const visit = async (scope: { stripReferrer?: boolean }) =>
+      guard.runWithPolicy({ ...scope, classify: () => 'ordinary' }, async () => {
+        await page.goto(landing, { waitUntil: 'load' });
+        await Promise.all([page.waitForURL('**/ap/signin/next'), page.click('#next')]);
+      });
+    await visit({ stripReferrer: true });
+    expect(guard.reason()).toBeUndefined();
+    expect(signInReferers).toEqual([
+      ['/ap/signin/pixel.png', undefined],
+      ['/ap/signin/next', undefined],
+    ]);
+    // Outside the scope the same page's loads carry its Referer as usual.
+    signInReferers = [];
+    await visit({});
+    expect(signInReferers).toEqual([
+      ['/ap/signin/pixel.png', landing],
+      ['/ap/signin/next', landing],
+    ]);
   }, 30_000);
   it('still refuses but does not report a decision that lands after its operation ended', async () => {
     const guard = await ensureBrowserNavigationGuard(page);

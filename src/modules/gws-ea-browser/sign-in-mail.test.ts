@@ -453,11 +453,11 @@ it('taints bearer documents before traffic and returns only after fresh sanitize
   expect(f.cdp.send).toHaveBeenCalledWith('Page.resetNavigationHistory');
   expect(JSON.stringify(result) + JSON.stringify(await observePage(f.page))).not.toContain(secret);
   expect(await pageHasSecret(f.page)).toBe(false);
-  expect(
-    f.network.every(
-      (request) => Array.isArray(request.headers) && !JSON.stringify(request.headers).toLowerCase().includes('referer'),
-    ),
-  ).toBe(true);
+  // Each request clears its Referer: Chrome restores one an override merely leaves out.
+  for (const request of f.network)
+    expect(
+      (request.headers as Array<{ name: string; value: string }>).filter(({ name }) => /^referr?er$/iu.test(name)),
+    ).toEqual([{ name: 'Referer', value: '' }]);
 });
 
 it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere.example/verify?token=magic-bearer'])(

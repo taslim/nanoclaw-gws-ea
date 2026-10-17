@@ -60,9 +60,19 @@ export function pageTargetId(page: Page): string | undefined {
   return settingsFor(page).targetId;
 }
 
-/** A page with no setting yet gets sessions with none, so its frame trees stay readable. */
+const ensuring = new WeakMap<Page, Promise<void>>();
+/**
+ * A page with no setting yet gets sessions with none, so its frame trees stay readable. Concurrent
+ * callers share one setup; one that fails is forgotten, so a later call tries again.
+ */
 export async function ensurePageTargets(page: Page): Promise<void> {
-  if (!settingsFor(page).frameHosts.length) await coverPageTargets(page, async () => undefined);
+  if (settingsFor(page).frameHosts.length) return;
+  let pending = ensuring.get(page);
+  if (!pending) {
+    pending = coverPageTargets(page, async () => undefined).finally(() => ensuring.delete(page));
+    ensuring.set(page, pending);
+  }
+  await pending;
 }
 
 interface FrameTreeNode {

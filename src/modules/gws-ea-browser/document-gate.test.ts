@@ -38,6 +38,7 @@ function fixture(
   let paused: ((event: unknown) => void) | undefined;
   const answers = new Map<string, string>();
   const lookups: string[] = [];
+  const pageSessions = { count: 0 };
   const gateSession = {
     on: (name: string, handler: (event: unknown) => void) => {
       if (name === 'Fetch.requestPaused') paused = handler;
@@ -85,7 +86,10 @@ function fixture(
     const fake = {
       context: () => ({
         newCDPSession: async (target: unknown) => {
-          if (target === fake) return session(page, () => page.tree);
+          if (target === fake) {
+            pageSessions.count++;
+            return session(page, () => page.tree);
+          }
           const frame = (page.frames ?? []).find((candidate) => frameOf(candidate) === target);
           if (!frame)
             throw new Error(
@@ -119,7 +123,7 @@ function fixture(
     await vi.waitFor(() => expect(answers.has(requestId)).toBe(true), { timeout: 5_000 });
     return answers.get(requestId);
   };
-  return { browser: browser as unknown as Browser & EventEmitter, pause, lookups, opens };
+  return { browser: browser as unknown as Browser & EventEmitter, pause, lookups, opens, pageSessions };
 }
 
 function guardedPage() {
@@ -255,6 +259,17 @@ it('places a same-process frame once, so its next document is decided without an
   expect(await pause('first')).toBe('continued');
   expect(lookups).toEqual([]);
   expect(guarded.decide).toHaveBeenCalledTimes(2);
+});
+
+it('covers an unguarded page once, however many placements read it at once', async () => {
+  const { browser, pause, pageSessions } = fixture({ main: { type: 'page' } }, [{ tree: tree('main', 'a', 'b', 'c') }]);
+  await documentGate(browser);
+  expect(await Promise.all(['a', 'b', 'c'].map((frame) => pause(frame)))).toEqual([
+    'continued',
+    'continued',
+    'continued',
+  ]);
+  expect(pageSessions.count).toBe(1);
 });
 
 it('forgets frames no page hosts any more', async () => {
