@@ -266,7 +266,9 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     expect(posts).toEqual([{ host: 'www.amazon.com', body: `password=${secret}` }]);
   });
 
-  it('refuses screenshots while an out-of-process frame document that saw a secret can still show it', async () => {
+  // Pins existing taint behaviour, not frame coverage: the hosting main document carries the taint
+  // for every frame under it, so a cross-site frame needs no taint entry of its own.
+  it('keeps screenshots refused after a secret enters a cross-site frame, until the hosting document is gone', async () => {
     await page.goto('https://parent.example/mirror');
     const frame = page.frames().find((candidate) => candidate.url() === 'https://auth.example/session');
     if (!frame) throw new Error('Cross-origin session frame missing');
@@ -279,7 +281,7 @@ describe.skipIf(!chromePath)('native host secret fill', () => {
     const refused = await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false });
     expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
     expect(JSON.stringify(refused)).not.toContain(secret);
-    // The frame document cannot outlive the page document that hosted it, whose taint ends with it.
+    // Leaving the hosting document ends its taint, together with every frame document under it.
     await executeBrowserBatch(
       context(),
       { actions: [{ kind: 'navigate', url: 'https://parent.example/login' }] },

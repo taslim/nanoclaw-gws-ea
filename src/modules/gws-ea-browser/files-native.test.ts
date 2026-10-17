@@ -264,6 +264,38 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     await windows.closeJob(context.job.id);
     expect(fs.readdirSync(uploadRoot)).toEqual([]);
   }, 20_000);
+
+  it('refuses File System Access pickers before any native panel opens', async () => {
+    // These pickers need a secure context; a routed origin provides one without the network.
+    const picker = (name: string, call: string) =>
+      `<button onclick="${call}().then(() => { document.body.dataset.${name} = 'opened'; }, (error) => { document.body.dataset.${name} = error.name; })">${name}</button>`;
+    const appeared = connection.context.waitForEvent('page');
+    await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
+    // A page without the job page's chooser interception, so only the profile's guards stand.
+    const plain = await appeared;
+    try {
+      for (const [target, refusal] of [
+        [page, 'AbortError'],
+        [plain, 'NotAllowedError'],
+      ] as const) {
+        await target.route('https://picker.example/**', (route) =>
+          route.fulfill({
+            contentType: 'text/html',
+            body: `${picker('open', 'showOpenFilePicker')}${picker('save', 'showSaveFilePicker')}`,
+          }),
+        );
+        await target.goto('https://picker.example/');
+        for (const name of ['open', 'save']) {
+          await target.getByRole('button', { name }).click();
+          await expect
+            .poll(() => target.locator('body').getAttribute(`data-${name}`), { timeout: 2_000 })
+            .toBe(refusal);
+        }
+      }
+    } finally {
+      await plain.close();
+    }
+  });
 });
 
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));

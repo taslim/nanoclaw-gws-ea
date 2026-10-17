@@ -242,6 +242,20 @@ export class BrowserActivationError extends Error {
   }
 }
 
+/** The guard refused to start an operation: a page-target setting cannot reach a live frame, so nothing ran. */
+export class BrowserFramesUnreadyError extends BrowserActivationError {
+  constructor() {
+    super('blocked_address');
+  }
+}
+
+/** The stable, repeat-safe stop every executor answers when the guard refused to start its operation. */
+export function framesUnreadyStop(error: unknown): Record<string, unknown> | undefined {
+  return error instanceof BrowserFramesUnreadyError
+    ? { status: 'stopped', reason: error.reason, repeat_safe: true }
+    : undefined;
+}
+
 const approvedPresses = new WeakMap<Page, { origin: string; flow: ReviewedMerchantFlow }>();
 
 /** All recipes, fills, watches and tool activations use this single boundary. */
@@ -382,9 +396,52 @@ export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigat
   return guard;
 }
 
+/** One paused request's class under the operation scopes that were current when it paused. */
+async function decideNavigation(
+  page: Page,
+  url: string,
+  resourceType: string,
+  scopes: readonly BrowserNavigationPolicy[],
+): Promise<ActivationClass | 'site_busy'> {
+  let classification: ActivationClass | 'site_busy' =
+    resourceType !== 'Document' ? 'ordinary' : scopes.length ? classifyNavigationUrl(url) : 'unsupported_merchant';
+  const approved = approvedPresses.get(page);
+  if (
+    resourceType === 'Document' &&
+    approved &&
+    classification !== 'blocked_address' &&
+    classification !== 'account_security' &&
+    classification !== 'speaks_as_principal'
+  ) {
+    const target = new URL(url);
+    if (target.origin === approved.origin && approved.flow.matches(target)) {
+      const known = approved.flow.classifyNavigation(target);
+      classification = known === 'purchase_control' ? 'ordinary' : known;
+    }
+  }
+  if (resourceType === 'Document')
+    for (const policy of scopes) {
+      if (policy.classify) {
+        let scoped: ActivationClass;
+        try {
+          scoped = policy.classify(new URL(url));
+        } catch (_error) {
+          scoped = 'blocked_address';
+        }
+        if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
+      }
+      if (classification === 'ordinary' && policy.beforeNavigate)
+        classification = await policy.beforeNavigate(new URL(url));
+    }
+  return classification;
+}
+
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: ActivationClass | 'site_busy' | undefined;
   const policies: BrowserNavigationPolicy[] = [];
+  // Each outermost operation, and each span between them, is its own generation. A decision is
+  // reported only to the generation its request paused in; a late one is still enforced, not reported.
+  let generation = 0;
   // Any page-target setting that cannot reach a later frame stops the operation in progress.
   onUncoveredPageTarget(page, () => {
     blocked = 'blocked_address';
@@ -393,60 +450,32 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   await coverPageTargets(page, async (session) => {
     session.on('Fetch.requestPaused', (event) => {
       const scopes = [...policies];
+      const pausedIn = generation;
       void (async () => {
-        let classification: ActivationClass | 'site_busy' =
-          event.resourceType !== 'Document'
-            ? 'ordinary'
-            : scopes.length
-              ? classifyNavigationUrl(event.request.url)
-              : 'unsupported_merchant';
-        const approved = approvedPresses.get(page);
-        if (
-          event.resourceType === 'Document' &&
-          approved &&
-          classification !== 'blocked_address' &&
-          classification !== 'account_security' &&
-          classification !== 'speaks_as_principal'
-        ) {
-          const target = new URL(event.request.url);
-          if (target.origin === approved.origin && approved.flow.matches(target)) {
-            const known = approved.flow.classifyNavigation(target);
-            classification = known === 'purchase_control' ? 'ordinary' : known;
-          }
+        let classification: ActivationClass | 'site_busy';
+        try {
+          classification = await decideNavigation(page, event.request.url, event.resourceType, scopes);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- A decision that cannot complete refuses its request.
+        } catch (_error) {
+          classification = 'blocked_address';
         }
-        if (event.resourceType === 'Document')
-          for (const policy of scopes) {
-            if (policy.classify) {
-              let scoped: ActivationClass;
-              try {
-                scoped = policy.classify(new URL(event.request.url));
-              } catch (_error) {
-                scoped = 'blocked_address';
-              }
-              if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
-            }
-            if (classification === 'ordinary' && policy.beforeNavigate)
-              classification = await policy.beforeNavigate(new URL(event.request.url));
-          }
         if (classification === 'ordinary' || event.request.url === 'about:blank') {
           const headers = scopes.some((policy) => policy.stripReferrer)
             ? Object.entries(event.request.headers)
                 .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
                 .map(([name, value]) => ({ name, value: String(value) }))
             : undefined;
-          await session.send('Fetch.continueRequest', {
-            requestId: event.requestId,
-            ...(headers ? { headers } : {}),
-          });
+          await session
+            .send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) })
+            .catch(() =>
+              session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }),
+            );
         } else {
-          blocked = classification;
+          if (pausedIn === generation) blocked = classification;
           await session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' });
         }
       })().catch(() => {
-        blocked = 'blocked_address';
-        void session
-          .send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' })
-          .catch(() => undefined);
+        // Only a send fails here, once its request or its target is gone: nothing was let through.
       });
     });
     await session.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
@@ -460,17 +489,24 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       blocked = undefined;
     },
     async runWithPolicy(scope, operation) {
-      // An operation can act only in frames that exist now, so every page-target setting covers each first.
-      if (!(await pageTargetsReady(page))) {
-        blocked = 'blocked_address';
-        throw new BrowserActivationError('blocked_address');
+      const outermost = !policies.length;
+      if (outermost) {
+        // A new operation starts clean, before readiness can report a frame it could not reach.
+        blocked = undefined;
+        ++generation;
       }
       policies.push(scope);
       try {
+        // An operation can act only in frames that exist now, so every page-target setting covers each first.
+        if (!(await pageTargetsReady(page))) {
+          blocked = 'blocked_address';
+          throw new BrowserFramesUnreadyError();
+        }
         return await operation();
       } finally {
         const index = policies.lastIndexOf(scope);
         if (index !== -1) policies.splice(index, 1);
+        if (outermost) ++generation;
       }
     },
   };

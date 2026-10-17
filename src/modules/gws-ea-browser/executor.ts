@@ -10,6 +10,7 @@ import {
   BrowserSiteBusyError,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
+  framesUnreadyStop,
   withBrowserJobNavigation,
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
@@ -269,8 +270,8 @@ export async function executeBrowserBatch(
     );
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
-    // The guard refused to start the batch: a frame it could not cover means no action ran.
-    if (error instanceof BrowserActivationError) return { status: 'stopped', reason: error.reason, repeat_safe: true };
+    const refused = framesUnreadyStop(error);
+    if (refused) return refused;
     throw error;
   }
 }
@@ -284,8 +285,8 @@ async function executeBatch(
   const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
   const images: Array<{ mime_type: 'image/png'; data: string }> = [];
+  // The guard starts each operation clean, before its readiness pass.
   const guard = await ensureBrowserNavigationGuard(page);
-  guard.clearReason();
   let reason: BrowserStopReason | undefined;
   let repeatSafe = true;
   let refs = new Map<string, PinnedBrowserRef>();

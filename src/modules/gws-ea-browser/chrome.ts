@@ -89,6 +89,10 @@ export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
       media_stream_mic: 2,
       media_stream_camera: 2,
       popups: 2,
+      // File System Access pickers open a native panel that chooser interception never sees.
+      // Verified on Chrome 155: blocked, both pickers reject with NotAllowedError before any panel.
+      file_system_read_guard: 2,
+      file_system_write_guard: 2,
     },
   };
   prefs.credentials_enable_service = false;

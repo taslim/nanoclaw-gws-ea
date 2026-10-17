@@ -46,7 +46,9 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
     if (!isCovered) for (const listener of settings.uncovered) listener();
   };
   const attach = async (frame: Frame, ended: () => void): Promise<'own' | 'shared' | 'gone' | 'uncovered'> => {
-    // One retry absorbs a target that ended mid-attach; a frame still live and not set up is uncovered.
+    // Only a refusal by a live target makes a frame uncovered; one retry absorbs a transient one.
+    // A target that ended is gone: Playwright may list its frame a moment longer, and the frame's
+    // next event or the next readiness pass checks it again.
     for (let attempt = 0; attempt < 2; attempt++) {
       if (closed || frame.isDetached()) return 'gone';
       let frameSession: CDPSession;
@@ -54,8 +56,10 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
         frameSession = await page.context().newCDPSession(frame);
         // eslint-disable-next-line no-catch-all/no-catch-all -- Any other attach failure is retried, then reported uncovered.
       } catch (error) {
+        const message = error instanceof Error ? error.message : '';
         // Playwright opens no session for an in-process frame, which its local root's session already covers.
-        if (error instanceof Error && error.message.includes('does not have a separate CDP session')) return 'shared';
+        if (message.includes('does not have a separate CDP session')) return 'shared';
+        if (message.includes('No target with given id found')) return 'gone';
         continue;
       }
       let live = true;
@@ -74,8 +78,11 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
         ready = true;
         return 'own';
       }
+      // A session that closed during setup lost its target; one that is still live refused the setup.
+      const lost = !live || closed;
       frameSessions.delete(frameSession);
       await frameSession.detach().catch(() => undefined);
+      if (lost) return 'gone';
     }
     return closed || frame.isDetached() ? 'gone' : 'uncovered';
   };
@@ -98,6 +105,9 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
   const coverChanged = (frame: Frame): void => {
     void cover(frame).then(report);
   };
+  // Accepted residual: Playwright's public API cannot pause a new frame target, so a page script that
+  // navigates a brand-new out-of-process frame within milliseconds of its creation can act before this
+  // coverage lands. Agent actions are always covered: pageTargetsReady runs before every operation.
   page.on('frameattached', coverChanged);
   page.on('framenavigated', coverChanged);
   page.once('close', () => {
