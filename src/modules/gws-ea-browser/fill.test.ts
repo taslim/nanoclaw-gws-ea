@@ -8,11 +8,13 @@ import {
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecret,
+  validateFillSecret,
 } from './fill.js';
 import type { BrowserExecutionContext } from './queue.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
 import * as nativeAuthentication from './authentication-submit.js';
+import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
@@ -264,13 +266,43 @@ it('detects a changed target value and clears every field holding the value, inc
   expect(f.nodes.map((node) => node.value)).toEqual(['', '']);
 });
 
-it('sanitizes browser and resolver failures', async () => {
+it('sanitizes browser and resolver failures and accepts no raw values or references', async () => {
   const f = fixture();
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
   const error = await fillBoundBrowserSecret(f.context, binding, async () => {
     throw new Error(SECRET);
   }).catch((value: unknown) => value);
   expect(String(error)).not.toContain(SECRET);
+  expect(() =>
+    validateFillSecret({
+      item_handle: 'op://vault/item/password',
+      field: 'password',
+      target: { ref: 'e1', generation: 1 },
+      submit: { ref: 'e2', generation: 1 },
+    }),
+  ).toThrow();
+  expect(() =>
+    validateFillSecret({
+      item_handle: 'vault_opaque',
+      field: 'password',
+      value: SECRET,
+      target: { ref: 'e1', generation: 1 },
+      submit: { ref: 'e2', generation: 1 },
+    }),
+  ).toThrow();
+});
+
+it('returns a vault refusal as its own bounded outcome before anything reaches the page', async () => {
+  const f = fixture();
+  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  for (const reason of ['rate_limited', 'vault_unavailable', 'no_item_for_site', 'origin_mismatch'] as const)
+    expect(
+      await fillBoundBrowserSecret(f.context, binding, async () => {
+        throw new BrowserVaultError(reason);
+      }),
+    ).toEqual({ status: reason });
+  expect(f.nativeFill).not.toHaveBeenCalled();
+  expect(f.nativeSubmit).not.toHaveBeenCalled();
 });
 
 it('discovers a native OTP transition after old handles detach, while retaining the exact frame origin', async () => {
@@ -303,4 +335,32 @@ it('refuses secret resolution while Playwright protocol debugging could disclose
   vi.stubEnv('DEBUG', 'pw:protocol');
   await expect(fillBoundBrowserSecret(f.context, binding, resolve)).rejects.toMatchObject({ code: 'forbidden' });
   expect(resolve).not.toHaveBeenCalled();
+});
+
+it('offers ExactDomain vault handles after redirecting to a different HTTPS origin on the same site', async () => {
+  const f = fixture();
+  const website = { url: 'https://login.shop.example', autofillBehavior: 'ExactDomain' };
+  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
+    websitePermitsOrigin(website, origin) ? [{ item_handle: 'vault_exact-login', title: 'Site login' }] : [],
+  );
+  expect((await observePage(f.page)).site?.vault_items).toEqual([]);
+  f.setUrl('https://login.shop.example/login');
+  expect((await observePage(f.page)).site?.vault_items).toEqual([
+    { item_handle: 'vault_exact-login', title: 'Site login' },
+  ]);
+  expect((await observePage(f.page)).site).toBeUndefined();
+});
+
+it('offers a newly attached login iframe origin without repeatedly refreshing an unchanged origin set', async () => {
+  const f = fixture();
+  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
+    origin === 'https://identity.example' ? [{ item_handle: 'vault_frame-login', title: 'Identity login' }] : [],
+  );
+  expect((await observePage(f.page)).site?.vault_items).toEqual([]);
+  const child = { url: () => 'https://identity.example/login', evaluate: async () => [] };
+  f.page.frames = () => [f.frame, child] as unknown as ReturnType<Page['frames']>;
+  expect((await observePage(f.page)).site?.vault_items).toEqual([
+    { item_handle: 'vault_frame-login', title: 'Identity login' },
+  ]);
+  expect((await observePage(f.page)).site).toBeUndefined();
 });

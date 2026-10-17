@@ -63,6 +63,8 @@ const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'peop
 const BROWSER_TOOLS = [
   'browser',
   'cancel_watch',
+  'credential_form',
+  'fill_secret',
   'list_watches',
   'purchase',
   'run_recipe',
@@ -78,6 +80,7 @@ const DEFAULT_ON_TOOLS = [
   'ask_user_question',
   'create_agent',
   'cancel_job',
+  'credential_authority',
   'edit_message',
   'install_packages',
   'request_status',
@@ -87,6 +90,7 @@ const DEFAULT_ON_TOOLS = [
   'send_card',
   'send_file',
   'send_message',
+  'vault_access',
   ...MAIN_EMAIL_TOOLS,
   ...CALENDAR_TOOLS,
   ...TIME_TOOLS,
@@ -137,7 +141,14 @@ describe('NanoClaw tool server capabilities', () => {
     [
       'browser-delegate',
       ['browser-delegate'],
-      ['cancel_job', 'relay_code', 'reservation_bounds', 'reservation_guarantee'],
+      [
+        'cancel_job',
+        'credential_authority',
+        'relay_code',
+        'reservation_bounds',
+        'reservation_guarantee',
+        'vault_access',
+      ],
     ],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],

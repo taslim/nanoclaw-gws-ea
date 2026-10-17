@@ -165,7 +165,7 @@ export const signInReply = requestTool({
   ...common,
   name: 'sign_in_reply',
   description:
-    'Answer only a host sign-in task in this isolated session. Return the one requested sign-in code or HTTPS sign-in link from its email, or unavailable if absent or ambiguous. Never return an account-security, lock, reset, revoke, footer or unsubscribe link. The host alone inserts or opens it. End silently after this tool; no email or tell_main.',
+    'Answer only a host sign-in task in this isolated session. Return the one requested sign-in code or HTTPS sign-in link from its email, or the code or link that verifies a new account’s email, or unavailable if absent or ambiguous. Never return an account-security, lock, reset, revoke, footer or unsubscribe link. The host alone inserts or opens it. End silently after this tool; no email or tell_main.',
   properties: {
     kind: { type: 'string', enum: ['code', 'link', 'unavailable'] },
     value: { type: 'string', description: 'The exact code or complete sign-in URL. Omit for unavailable.' },

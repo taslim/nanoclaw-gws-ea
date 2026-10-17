@@ -21,7 +21,7 @@ import {
 } from './paths.js';
 import { readRegistry, withMachineLock } from './registry.js';
 import {
-  bindInstanceVoicePolicy,
+  bindInstanceHostPolicies,
   loadInstanceRuntimeConfig,
   type InstanceRuntimeConfig,
   type UpsertEnvVars,
@@ -264,7 +264,7 @@ export async function enableLocalVoice(
       if (upsert)
         for (const runtime of runtimes) {
           dependencies.recordEffect?.(null);
-          await bindInstanceVoicePolicy(runtime, voicePolicyFile(paths), upsert);
+          await bindInstanceHostPolicies(runtime, paths.configRoot, upsert);
           dependencies.recordEffect?.(true);
         }
       const enabled = { ...policy, enabled: true } satisfies VoiceHostPolicy;

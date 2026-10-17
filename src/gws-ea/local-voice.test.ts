@@ -162,7 +162,7 @@ async function assistant(port: number, compatible = true): Promise<InstanceRunti
     selectedProvider: 'claude',
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
-  await persistInstanceRuntime(runtime, upsertEnvVars, voicePolicyFile(paths));
+  await persistInstanceRuntime(runtime, upsertEnvVars, paths.configRoot);
   return runtime;
 }
 function health(overrides: Record<string, unknown> = {}): unknown {
@@ -593,6 +593,12 @@ describe('native public capability journeys', () => {
               scope: 'assistant',
               actions: ['show', 'check', 'enable', 'disable'],
               assistant_ids: [],
+            },
+            {
+              name: 'onepassword',
+              scope: 'host',
+              actions: ['show', 'check', 'enable', 'disable'],
+              activation: 'disabled',
             },
           ],
         },

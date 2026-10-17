@@ -1,4 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
+import { getDomain } from 'tldts';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import { documentGate } from './document-gate.js';
@@ -9,6 +10,8 @@ import {
   inspectAuthenticationControl,
   submitAuthenticationForm,
   type AuthenticationFormSignature,
+  type CredentialKind,
+  httpsOrigin,
 } from './authentication-signatures.js';
 
 export type ActivationClass =
@@ -29,6 +32,8 @@ export interface ControlFacts {
   type: string;
   href: string | null;
   transaction: boolean;
+  /** Prices, recurring charges, trials or billing anywhere on the page, read by the host. */
+  moneyTerms?: boolean;
 }
 export interface ReviewedMerchantFlow {
   readonly id: string;
@@ -51,18 +56,18 @@ const security =
   /\b(?:change|reset|delete|remove|update|manage)\s+(?:password|security|account|payment\s+method|credit\s+card)|\b(?:sign\s*out|log\s*out|delete\s+account)\b/iu;
 const speaking =
   /\b(?:send\s+(?:message|email)|publish|post\s+(?:review|comment)|submit\s+(?:review|comment)|agree\s+on\s+behalf)\b/iu;
+const unrelatedSecurity =
+  /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu;
+const securityRoute =
+  /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu;
+const purchaseRoute =
+  /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu;
 const ordinaryName =
   /^(?:search|find(?:\s+(?:a\s+)?(?:table|restaurant|time|availability))?|check\s+availability|view(?:\s+(?:details|menu|availability|more|results|cart|basket))?|show\s+more|load\s+more|learn\s+more|details|next|previous|back|close|cancel|dismiss|continue\s+(?:shopping|browsing)|add\s+to\s+(?:cart|basket)|sign\s*in|log\s*in|continue\s+with\s+email|send\s+(?:(?:sign.?in|verification|login|one.?time)\s+)?(?:code|link)|verify\s+(?:code|email)|submit\s+code|accept\s+(?:all\s+)?cookies|reject\s+(?:all\s+)?cookies|(?:cookie\s+)?preferences)$/iu;
 
 export function classifyControlFacts(facts: ControlFacts): ActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
-  if (
-    security.test(evidence) ||
-    /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu.test(
-      evidence,
-    )
-  )
-    return 'account_security';
+  if (security.test(evidence) || unrelatedSecurity.test(evidence)) return 'account_security';
   if (
     speaking.test(evidence) ||
     /\b(?:write a review|message (?:the |a )?(?:restaurant|seller|host))\b/iu.test(evidence)
@@ -99,6 +104,18 @@ export function classifyControlFacts(facts: ControlFacts): ActivationClass {
   return 'unsupported_merchant';
 }
 
+/** A navigation's path and action parameters as words, for the host's own route signatures. */
+function navigationEvidence(url: URL): string | undefined {
+  try {
+    const actionParameters = [...url.searchParams]
+      .map(([name, value]) => (/^(?:action|operation|intent|command|do)$/iu.test(name) ? `${name} ${value}` : name))
+      .join(' ');
+    return decodeURIComponent(`${url.pathname} ${actionParameters}`).replace(/[_/-]+/gu, ' ');
+  } catch (_error) {
+    return undefined;
+  }
+}
+
 export function classifyNavigationUrl(raw: string): ActivationClass {
   let url: URL;
   try {
@@ -107,22 +124,9 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     return 'blocked_address';
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return 'blocked_address';
-  let decoded: string;
-  try {
-    const actionParameters = [...url.searchParams]
-      .map(([name, value]) => (/^(?:action|operation|intent|command|do)$/iu.test(name) ? `${name} ${value}` : name))
-      .join(' ');
-    decoded = decodeURIComponent(`${url.pathname} ${actionParameters}`).replace(/[_/-]+/gu, ' ');
-  } catch (_error) {
-    return 'blocked_address';
-  }
-  if (
-    security.test(decoded) ||
-    /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu.test(
-      decoded,
-    )
-  )
-    return 'account_security';
+  const decoded = navigationEvidence(url);
+  if (decoded === undefined) return 'blocked_address';
+  if (security.test(decoded) || securityRoute.test(decoded)) return 'account_security';
   if (speaking.test(decoded)) return 'speaks_as_principal';
   const reviewed = merchantFlows.find((candidate) => candidate.matches(url));
   if (
@@ -131,13 +135,7 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     ![...url.searchParams.keys()].some((name) => /^(?:action|operation|intent|command|do)$/iu.test(name))
   )
     return 'ordinary';
-  if (
-    purchase.test(decoded) ||
-    /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu.test(
-      decoded,
-    )
-  )
-    return 'purchase_control';
+  if (purchase.test(decoded) || purchaseRoute.test(decoded)) return 'purchase_control';
   if (authenticationEndpoint(url)) return 'ordinary';
   const flow = merchantFlows.find((candidate) => candidate.matches(url));
   if (flow) return flow.classifyNavigation(url);
@@ -149,6 +147,136 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
   )
     return 'ordinary';
   return 'unsupported_merchant';
+}
+
+/**
+ * The words an authorized password change may use (KTD7, R18). Only within a
+ * change's own scope are they set aside before the security checks; every
+ * other account-security change stays refused there too.
+ */
+const passwordChange = /\b(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password\b/giu;
+const credentialSecurity =
+  /\b(?:change|update|add|remove|manage|edit|replace|reset|delete)\s+(?:(?:your|my|sign.?in|login)\s+)?(?:e-?mail(?:\s+address)?|phone(?:\s+number)?|mobile|two.?factor|2fa|mfa|totp|authenticator|passkeys?|security\s+(?:keys?|questions?)|payment(?:\s+methods?)?|billing|cards?)\b/iu;
+/** Inside the widened scope, any money route is refused, not merely the generic commit signatures. */
+const credentialFinancial =
+  /\b(?:checkout|cart|basket|billing|payments?|orders?|subscriptions?|subscribe|trials?|donate|donations?|purchase|upgrade|plans?|pricing)\b/iu;
+const signupActivation =
+  'sign\\s*up(?:\\s+with\\s+email)?|create\\s+(?:(?:an|your|my|new)\\s+)?account|register|join(?:\\s+now)?|get\\s+started|continue(?:\\s+with\\s+email)?|next|submit|done|finish|save|create';
+const credentialActivation: Record<CredentialKind, RegExp> = {
+  signup: new RegExp(`^(?:${signupActivation})$`, 'iu'),
+  rotation:
+    /^(?:(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password|save(?:\s+changes)?|submit|continue|next|done|confirm|update)$/iu,
+};
+/**
+ * A signup form's own submit control that accepts the site's terms as it
+ * creates the account ("Agree and create account", "Agree & Join"). Only the
+ * bound form's control may carry it, with no money terms on the page.
+ */
+const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(?:${signupActivation})$`, 'iu');
+/** The control that submits a signup's emailed verification code. */
+const verificationActivation =
+  /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
+const moneyTerms =
+  /(?:[$€£¥]\s?\d|\b\d+(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|dollars?|euros?|pounds?)\b|\bper\s+(?:month|year|week|day)\b|\/\s?(?:mo|month|yr|year)\b|\b(?:subscriptions?|free\s+trial|trial\s+period|billing|billed|recurring|auto-?renew\w*|membership\s+fees?)\b)/iu;
+
+/** The site terms a delegated signup accepts with the account, and what never rides along with them. */
+const siteTerms =
+  /\b(?:terms(?:\s+(?:of\s+(?:service|use)|(?:and|&)\s+conditions))?|user\s+agreement|privacy\s+(?:policy|notice|statement))\b/iu;
+const notSiteTerms =
+  /\b(?:marketing|newsletters?|news|offers?|promotions?|promotional|partners?|third[\s-]+part(?:y|ies)|shar(?:e|ing)|advertis\w*|sponsors?|surveys?|updates|e-?mails?|sms|texts?|pay(?:ment|ments|ing)?|billing|billed|charges?|fees?|prices?|pricing|purchases?|orders?|sales?|trials?|subscri\w*|renew\w*|recurring|memberships?|plans?|cards?|credit|refunds?)\b|[$€£¥]/iu;
+
+/**
+ * Whether a checkbox's label accepts only the site's terms of service, terms
+ * and conditions, user agreement or privacy policy, the terms a delegated
+ * signup accepts with the account. Marketing, data sharing and every money
+ * term keep their own authority.
+ */
+export function termsConsentLabel(label: string): boolean {
+  return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
+}
+
+/** Where a credential operation's control sits: the bound form's own control, or the step it submits. */
+export interface CredentialControlScope {
+  /** The control belongs to the bound form, or both stand outside any form. */
+  readonly formControl?: boolean;
+  /** `verification` submits a signup's emailed code; otherwise the operation's own fields. */
+  readonly step?: 'credentials' | 'verification';
+}
+
+function credentialSecurityClass(evidence: string, kind: CredentialKind): ActivationClass | undefined {
+  const remaining = kind === 'rotation' ? evidence.replace(passwordChange, ' ') : evidence;
+  if (
+    security.test(remaining) ||
+    securityRoute.test(remaining) ||
+    unrelatedSecurity.test(remaining) ||
+    credentialSecurity.test(remaining)
+  )
+    return 'account_security';
+  if (speaking.test(evidence)) return 'speaks_as_principal';
+  return undefined;
+}
+
+/**
+ * A credential operation's own classification of a document address on its
+ * site: HTTPS only, with financial, speaking and every security route other
+ * than a change's own password route refused. Another site is left to the
+ * generic rules (undefined).
+ */
+export function classifyCredentialNavigation(
+  raw: string,
+  kind: CredentialKind,
+  site: string,
+): ActivationClass | undefined {
+  const url = httpsOrigin(raw);
+  if (!url) return 'blocked_address';
+  if (getDomain(url.hostname, { allowPrivateDomains: true }) !== site) return undefined;
+  const decoded = navigationEvidence(url);
+  if (decoded === undefined) return 'blocked_address';
+  const refused = credentialSecurityClass(decoded, kind);
+  if (refused) return refused;
+  if (purchase.test(decoded) || purchaseRoute.test(decoded) || credentialFinancial.test(decoded))
+    return 'purchase_control';
+  return 'ordinary';
+}
+
+/**
+ * Whether an authorized signup or password change may activate this control.
+ * Visible money terms, purchase or subscription wording, unrelated security,
+ * speaking and links are refused; so is any name outside the operation's own
+ * vocabulary, as ambiguous. The form's destination must stay on the site.
+ */
+export function classifyCredentialControlFacts(
+  facts: ControlFacts,
+  kind: CredentialKind,
+  site: string,
+  scope: CredentialControlScope = {},
+): ActivationClass {
+  const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
+  const refused = credentialSecurityClass(evidence, kind);
+  if (refused) return refused;
+  if (purchase.test(evidence)) return 'purchase_control';
+  if (facts.transaction || facts.tag === 'a' || facts.href) return 'unsupported_merchant';
+  if (facts.formAction) {
+    const destination = classifyCredentialNavigation(facts.formAction, kind, site);
+    if (destination !== 'ordinary') return destination ?? 'unsupported_merchant';
+  }
+  const fits = (name: string): boolean => {
+    if (scope.step === 'verification') return kind === 'signup' && verificationActivation.test(name);
+    if (credentialActivation[kind].test(name)) return true;
+    return kind === 'signup' && scope.formControl === true && !facts.moneyTerms && agreeingSignup.test(name);
+  };
+  const names = [facts.name.trim(), facts.visibleLabel?.trim() ?? ''].filter(Boolean);
+  return names.length > 0 && names.every(fits) ? 'ordinary' : 'unsupported_merchant';
+}
+
+export async function classifyCredentialActivation(
+  page: Page,
+  element: ElementHandle,
+  kind: CredentialKind,
+  site: string,
+  scope: CredentialControlScope = {},
+): Promise<ActivationClass> {
+  return classifyCredentialControlFacts(await readControlFacts(page, element), kind, site, scope);
 }
 
 export async function readControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
@@ -200,7 +328,12 @@ export async function readControlFacts(page: Page, element: ElementHandle): Prom
       text,
     );
   const frame = await element.ownerFrame();
-  return { ...facts, href: facts.href ? new URL(facts.href, frame?.url() ?? page.url()).href : null, transaction };
+  return {
+    ...facts,
+    href: facts.href ? new URL(facts.href, frame?.url() ?? page.url()).href : null,
+    transaction,
+    moneyTerms: moneyTerms.test(text),
+  };
 }
 
 export async function classifyActivation(page: Page, element: ElementHandle): Promise<ActivationClass> {
@@ -375,6 +508,12 @@ export async function activateControl(
 }
 
 export interface BrowserNavigationPolicy {
+  /**
+   * A host-owned operation's own complete classification of a document on its
+   * site, replacing the generic one; undefined leaves the generic rules. Only
+   * an authorized credential operation installs one, for its activation.
+   */
+  decide?(url: URL): ActivationClass | undefined;
   /** A host-owned sign-in scope may recognize an otherwise unsupported bearer-link route. */
   classify?(url: URL): ActivationClass;
   stripReferrer?: boolean;
@@ -417,6 +556,16 @@ async function decideNavigation(
       const known = approved.flow.classifyNavigation(target);
       classification = known === 'purchase_control' ? 'ordinary' : known;
     }
+  }
+  for (const policy of scopes) {
+    let decided: ActivationClass | undefined;
+    try {
+      decided = policy.decide?.(new URL(url));
+      // eslint-disable-next-line no-catch-all/no-catch-all -- a scope that cannot classify a document blocks it
+    } catch (_error) {
+      decided = 'blocked_address';
+    }
+    if (decided) classification = decided;
   }
   for (const policy of scopes) {
     if (policy.classify) {

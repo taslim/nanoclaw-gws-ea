@@ -7,8 +7,10 @@ import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import type { DbDriver } from '../../db/driver.js';
 import { BrowserStore, type BrowserJob } from './db.js';
-import { SiteLeaseStore } from './leases.js';
+import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
+import { heldCredentialSites, SiteLeaseStore } from './leases.js';
 import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
@@ -118,6 +120,28 @@ export interface BrowserJobCancellation {
   readonly job: BrowserJob;
   readonly waitingJobs: readonly string[];
   readonly withdrawnCards?: readonly PendingApproval[];
+  /** Credential attempts that disclosed nothing: their unused candidates are archived after commit. */
+  readonly abandonedAttempts?: readonly CredentialAttempt[];
+}
+
+/** A purchase commit or watch booking in progress, which finishes and reports before cancellation completes. */
+async function committing(db: DbDriver, jobId: string): Promise<boolean> {
+  const purchase =
+    (await db.hasTable('gws_ea_browser_authorities')) &&
+    (await db.get("SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1", jobId));
+  const booking =
+    (await db.hasTable('gws_ea_browser_watches')) &&
+    (await db.get("SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status = 'booking' LIMIT 1", jobId));
+  return Boolean(purchase) || Boolean(booking);
+}
+
+/**
+ * Work a cancellation waits for: a commit or booking in progress, or a
+ * credential attempt the website may have taken that is not yet settled.
+ * Each finishes or is reconciled through this still-live job.
+ */
+async function unresolvedWork(db: DbDriver, jobId: string): Promise<boolean> {
+  return (await committing(db, jobId)) || (await heldCredentialSites(db, jobId)).size > 0;
 }
 
 /** DB-only half: callers may join authority/watch/card changes in this same transaction. */
@@ -129,25 +153,22 @@ export async function cancelBrowserJobInTransaction(
   if (!job) throw invalidArgs('No main-owned browser job exists for that thread.');
   if (job.cancelled) return { status: 'already_cancelled', thread, job, waitingJobs: [] };
   const purchases = await store.db.hasTable('gws_ea_browser_authorities');
-  const committing = purchases
-    ? await store.db.get(
-        "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
-        job.id,
-      )
-    : undefined;
-  const watchCommitting = (await store.db.hasTable('gws_ea_browser_watches'))
-    ? await store.db.get("SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status = 'booking' LIMIT 1", job.id)
-    : undefined;
+  const inProgress = await committing(store.db, job.id);
   const withdrawnCards = purchases ? await detachPurchaseCards(job.id, 'withdrawn') : [];
   if (await store.db.hasTable('gws_ea_browser_watches'))
     withdrawnCards.push(...(await (await import('./watches.js')).detachBrowserWatchCards(job.id, 'cancelled')));
-  if (committing || watchCommitting) {
+  // No authority the job has not used survives it: nothing was disclosed for these.
+  const abandonedAttempts = (await store.db.hasTable('gws_ea_browser_credential_attempts'))
+    ? await credentialAttempts.abandonForJob(job.id)
+    : [];
+  // Read after abandoning, so an attempt whose disclosure won the race keeps the job live.
+  if (inProgress || (await heldCredentialSites(store.db, job.id)).size > 0) {
     await store.db.run(
       'UPDATE gws_ea_browser_jobs SET cancel_requested = 1,updated_at = ? WHERE id = ?',
       new Date().toISOString(),
       job.id,
     );
-    return { status: 'in_progress', thread, job, waitingJobs: [], withdrawnCards };
+    return { status: 'in_progress', thread, job, waitingJobs: [], withdrawnCards, abandonedAttempts };
   }
   await store.db.run(
     'UPDATE gws_ea_browser_jobs SET cancelled = 1, updated_at = ? WHERE id = ?',
@@ -155,7 +176,7 @@ export async function cancelBrowserJobInTransaction(
     job.id,
   );
   const waitingJobs = await new SiteLeaseStore(store.db).release(job.id);
-  return { status: 'cancelled', thread, job, waitingJobs, withdrawnCards };
+  return { status: 'cancelled', thread, job, waitingJobs, withdrawnCards, abandonedAttempts };
 }
 
 let cancellationQueue: BrowserQueue | undefined;
@@ -169,6 +190,7 @@ export async function finishBrowserJobCancellation(
   result: BrowserJobCancellation,
   queue = cancellationQueue,
 ): Promise<void> {
+  if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
   if (result.withdrawnCards)
     await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
   if (result.withdrawnCards && (await getDb().hasTable('gws_ea_browser_watches')))
@@ -188,6 +210,33 @@ export async function cancelBrowserJob(thread: string, store = new BrowserStore(
   const result = await store.db.transaction(() => cancelBrowserJobInTransaction(thread, store));
   await finishBrowserJobCancellation(result);
   return result;
+}
+
+/**
+ * Completes a cancellation that answered in_progress once the work it waited
+ * for has settled; until then the job stays live so it can settle it.
+ */
+export async function finishRequestedCancellation(jobId: string, queue: BrowserQueue): Promise<void> {
+  const { db } = queue.store;
+  const result = await db.transaction(async (): Promise<BrowserJobCancellation | undefined> => {
+    const job = await db.get<BrowserJob & { cancel_requested: number }>(
+      'SELECT * FROM gws_ea_browser_jobs WHERE id = ?',
+      jobId,
+    );
+    if (!job || job.cancelled || !job.cancel_requested || (await unresolvedWork(db, jobId))) return undefined;
+    await db.run(
+      'UPDATE gws_ea_browser_jobs SET cancelled = 1, updated_at = ? WHERE id = ?',
+      new Date().toISOString(),
+      jobId,
+    );
+    return {
+      status: 'cancelled',
+      thread: job.thread_id,
+      job: { ...job, cancelled: 1 },
+      waitingJobs: await new SiteLeaseStore(db).release(jobId),
+    };
+  });
+  if (result) await finishBrowserJobCancellation(result, queue);
 }
 
 const JOB_IDLE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
@@ -265,7 +314,9 @@ export async function sweepBrowserJobSessions(
           "SELECT 1 FROM gws_ea_browser_watches WHERE job_id = ? AND status IN ('awaiting_principal','armed','checking','preparing','booking') LIMIT 1",
           job.id,
         ));
-      if (pending.length > 0 || lease || purchase || watch) return;
+      // An unresolved credential attempt can be settled only through this job.
+      const credential = (await heldCredentialSites(store.db, job.id)).size > 0;
+      if (pending.length > 0 || lease || purchase || watch || credential) return;
       await updateSession(session.id, { status: 'closed' });
     });
   }

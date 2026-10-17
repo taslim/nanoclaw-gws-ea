@@ -90,7 +90,15 @@ async function storedPolicy(file: string): Promise<BrowserPolicyFile | undefined
   }
 }
 
-async function withAssistantLock<T>(paths: ControlPlanePaths, instanceId: string, work: () => Promise<T>): Promise<T> {
+/**
+ * Run `work` under the assistant's native instance lock, or refuse at once
+ * with `instance_busy`. The assistant's capabilities (browser, 1Password) share it.
+ */
+export async function withAssistantLock<T>(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  work: () => Promise<T>,
+): Promise<T> {
   // Share removal/update's native lock so a policy cannot be republished after teardown.
   await getInstanceReservation(paths, instanceId);
   await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));

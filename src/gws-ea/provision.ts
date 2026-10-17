@@ -2,7 +2,6 @@ import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import path from 'node:path';
 
 import {
   readProvisionJournal,
@@ -100,7 +99,7 @@ import {
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
-import { googleSignInPause, type Interaction } from './events.js';
+import { googleSignInPause, runStep, type Interaction, type StepReporter } from './events.js';
 import {
   GOOGLE_CLIENT_FILE_FLAG,
   googleAccessResources,
@@ -110,6 +109,12 @@ import {
   type GoogleConnectionInput,
 } from './google-connection.js';
 import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
+import {
+  onePasswordEnabled,
+  onePasswordProvisioningDetails,
+  provisionAssistantVault,
+  type OnePasswordCliSeams,
+} from './onepassword.js';
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -121,6 +126,8 @@ export interface ProductionProvisionOptions {
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
   readonly runtime?: ProvisionRuntime;
+  /** How the 1Password CLI the host recorded is run, for the vault a new assistant inherits. */
+  readonly onePassword?: { readonly cli?: OnePasswordCliSeams };
 }
 
 export interface ProductionProvisionInput {
@@ -1390,7 +1397,7 @@ export async function runProductionProvision(
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
-        voicePolicyFile: path.join(operation.paths.configRoot, 'voice.json'),
+        hostPolicyRoot: operation.paths.configRoot,
         restartService: (config) =>
           createServiceControl(options.serviceHelpers, runtimeServiceTarget(config)).restart(),
         platform: manifest?.platform ?? instanceServicePlatform(),
@@ -1412,8 +1419,62 @@ export async function runProductionProvision(
     },
   };
   const gcpAccount = reservation.exclusive_resource_claims.gcp_account;
-  return runProvisionSteps(operation, context, createProductionProvisionSteps(context, {}, provisionRuntime), {
-    ...provisionRuntime,
-    ...(interaction ? { signIn: () => interaction.signInToGoogleCloud(gcpAccount) } : {}),
-  });
+  const result = await runProvisionSteps(
+    operation,
+    context,
+    createProductionProvisionSteps(context, {}, provisionRuntime),
+    {
+      ...provisionRuntime,
+      ...(interaction ? { signIn: () => interaction.signInToGoogleCloud(gcpAccount) } : {}),
+    },
+  );
+  return result.status === 'ready'
+    ? provisionAssistantResources(operation, provisionRuntime, {
+        ...options.onePassword,
+        upsertEnvVars: options.upsertEnvVars,
+      })
+    : result;
+}
+
+/** The step a create or resume shows while it provisions the vault a new assistant inherits. */
+const ONEPASSWORD_STEP = {
+  id: 'provision_onepassword',
+  label: "Provisioning the assistant's 1Password vault…",
+} as const;
+
+/**
+ * Once every step is complete: the optional resources the operator's host
+ * enablement gives each new compatible assistant, today its 1Password vault
+ * (KTD3). The assistant is already talkable, so what waits here waits on the
+ * operator, with the cause and the command that clears it; a resume of an
+ * assistant already provisioned costs no request and no prompt.
+ */
+export async function provisionAssistantResources(
+  operation: InstanceOperation,
+  reporter: StepReporter,
+  onePassword: { readonly cli?: OnePasswordCliSeams; readonly upsertEnvVars?: UpsertEnvVars } = {},
+): Promise<ProvisionResult> {
+  if (!(await onePasswordEnabled(operation.paths))) return { status: 'ready' };
+  return runStep(
+    reporter,
+    ONEPASSWORD_STEP,
+    async (): Promise<ProvisionResult> => {
+      const vault = await provisionAssistantVault(operation, {
+        ...onePassword,
+        ...(operation.recordEffect ? { recordEffect: operation.recordEffect } : {}),
+      });
+      if (vault?.outcome !== 'pending' || vault.reason === null) return { status: 'ready' };
+      return {
+        status: 'paused',
+        pause: {
+          kind: 'human-action',
+          phase: ONEPASSWORD_STEP.id,
+          code: `onepassword_${vault.reason}`,
+          message: `The assistant is ready, but its 1Password vault waits. ${vault.message ?? ''}`.trim(),
+          details: onePasswordProvisioningDetails(vault),
+        },
+      };
+    },
+    (result) => (result.status === 'paused' ? result.pause : undefined),
+  );
 }

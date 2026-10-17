@@ -24,6 +24,7 @@ export const acceptanceScenarios = [
   'restart_before_commit',
   'restart_after_commit',
   'email_code_sign_in',
+  'vault_secret_confinement',
   'purchase_card_revalidation',
   'unsupported_purchase',
   'standing_guarantee',
@@ -32,6 +33,15 @@ export const acceptanceScenarios = [
   'quiet_spaces',
   'public_only_egress',
   'watch_soak',
+  'onepassword_provisioning',
+  'onepassword_sharing',
+  'onepassword_signup',
+  'onepassword_owned_change',
+  'onepassword_change_refused',
+  'onepassword_fresh_login',
+  'onepassword_disable_reenable',
+  'onepassword_scoped_removal',
+  'onepassword_pooled_quota',
 ] as const;
 const errands = ['booking', 'form', 'invoice', 'compare-buy'] as const;
 type Errand = (typeof errands)[number];

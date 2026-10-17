@@ -211,6 +211,10 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
       `GWS_EA_VOICE_POLICY_FILE=${voicePolicy}`,
     );
+    // The 1Password host policy is located through the same root: a locator, never a token.
+    expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
+      `GWS_EA_ONEPASSWORD_POLICY_FILE=${path.join(host.paths.configRoot, 'onepassword', 'policy.json')}`,
+    );
     expect(await centralInode(runtime)).toBe(inode);
     expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
     expect(await readFile(path.join(runtime.checkout_root, MEMORY), 'utf8')).toContain('mornings');

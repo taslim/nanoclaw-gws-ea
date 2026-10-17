@@ -4,7 +4,9 @@ import {
   authenticationEndpoint,
   authenticationFieldKind,
   browserDiagnosticsUnsafe,
+  credentialFieldFits,
   httpsOrigin,
+  isSensitiveField,
 } from './authentication-signatures.js';
 
 it('recognizes credential fields without granting card, new-password or security fields authority', () => {
@@ -58,4 +60,63 @@ it('treats Playwright protocol logging as unsafe for sign-in', () => {
   expect(browserDiagnosticsUnsafe({ PWDEBUG: '0', DEBUG: 'app:*,-pw:api' })).toBe(false);
   for (const environment of [{ PWDEBUG: '1' }, { DEBUG: 'pw:protocol' }, { DEBUG: 'app pw:*' }, { DEBUG: '*' }])
     expect(browserDiagnosticsUnsafe(environment)).toBe(true);
+});
+
+it('treats every password-bearing field as secret, including a show-password toggle that made it text', () => {
+  const field = (facts: Partial<Parameters<typeof isSensitiveField>[0]>) => ({
+    type: 'text',
+    autocomplete: '',
+    name: '',
+    ...facts,
+  });
+  for (const facts of [
+    field({ type: 'password' }),
+    field({ autocomplete: 'new-password' }),
+    field({ autocomplete: 'current-password' }),
+    field({ name: 'confirm_password' }),
+    field({ name: 'passwordConfirmation' }),
+    field({ id: 'new-pwd' }),
+    field({ label: 'Repeat passphrase' }),
+    field({ autocomplete: 'one-time-code' }),
+    field({ autocomplete: 'cc-number' }),
+    field({ name: 'cvv' }),
+  ])
+    expect(isSensitiveField(facts)).toBe(true);
+  for (const facts of [
+    field({ name: 'email', type: 'email', autocomplete: 'email' }),
+    field({ name: 'passenger_name' }),
+    field({ name: 'compass_heading' }),
+    field({ name: 'first_name', autocomplete: 'given-name' }),
+  ])
+    expect(isSensitiveField(facts)).toBe(false);
+});
+
+it('fits credential roles only to fields whose structure supports them, never current and new interchangeably', () => {
+  const facts = (name: string, type = 'password', autocomplete = '', id = '') => ({ name, type, autocomplete, id });
+  expect(credentialFieldFits('username', facts('email', 'email', 'email'), 'signup', false)).toBe(true);
+  expect(credentialFieldFits('username', facts('user[email]', 'text'), 'signup', false)).toBe(true);
+  expect(credentialFieldFits('username', facts('first_name', 'text', 'given-name'), 'signup', false)).toBe(false);
+  // A signup's single unmarked password field is the new password; a toggled one stays a password field.
+  expect(credentialFieldFits('new_password', facts('password'), 'signup', false)).toBe(true);
+  expect(credentialFieldFits('new_password', facts('password', 'text', 'new-password'), 'signup', false)).toBe(true);
+  expect(credentialFieldFits('confirmation', facts('password_confirmation'), 'signup', false)).toBe(true);
+  expect(credentialFieldFits('new_password', facts('nickname', 'text'), 'signup', false)).toBe(false);
+  // A change binds the current password only to a current field, and the new one only to a new or confirming field.
+  expect(credentialFieldFits('current_password', facts('old_password'), 'rotation', false)).toBe(true);
+  expect(credentialFieldFits('current_password', facts('pw', 'password', 'current-password'), 'rotation', false)).toBe(
+    true,
+  );
+  expect(credentialFieldFits('new_password', facts('new_password1'), 'rotation', true)).toBe(true);
+  expect(credentialFieldFits('confirmation', facts('new_password2'), 'rotation', true)).toBe(true);
+  expect(credentialFieldFits('new_password', facts('current_password'), 'rotation', true)).toBe(false);
+  expect(credentialFieldFits('current_password', facts('new_password'), 'rotation', false)).toBe(false);
+  expect(credentialFieldFits('current_password', facts('old_password'), 'signup', false)).toBe(false);
+  // An unmarked field in a change form is new only beside a bound current field.
+  expect(credentialFieldFits('new_password', facts('password'), 'rotation', false)).toBe(false);
+  expect(credentialFieldFits('new_password', facts('password'), 'rotation', true)).toBe(true);
+  for (const role of ['new_password', 'confirmation', 'current_password'] as const) {
+    expect(credentialFieldFits(role, facts('password', 'password', 'cc-number'), 'rotation', true)).toBe(false);
+    expect(credentialFieldFits(role, facts('code', 'text', 'one-time-code'), 'rotation', true)).toBe(false);
+    expect(credentialFieldFits(role, facts('security_question_answer'), 'rotation', true)).toBe(false);
+  }
 });

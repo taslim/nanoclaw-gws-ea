@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const uploadRace = vi.hoisted(() => ({
   beforeOpen: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
+  beforeLstat: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
   afterLstat: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
 }));
 
@@ -18,6 +19,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       return actual.open(...args);
     },
     async lstat(...args: Parameters<typeof actual.lstat>) {
+      uploadRace.beforeLstat?.(args[0]);
       const stat = await actual.lstat(...args);
       uploadRace.afterLstat?.(args[0]);
       return stat;
@@ -25,7 +27,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
-import { stageBrowserUpload, handoffBrowserDownload } from './files.js';
+import { browserStagingBytes, stageBrowserUpload, handoffBrowserDownload } from './files.js';
 
 let root: string;
 beforeEach(() => {
@@ -33,6 +35,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   uploadRace.beforeOpen = undefined;
+  uploadRace.beforeLstat = undefined;
   uploadRace.afterLstat = undefined;
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -137,4 +140,22 @@ it('compares every download byte on replay and retains a changed host original',
   );
   expect(fs.readFileSync(host)).toEqual(bytes);
   expect(fs.readFileSync(result).at(-1)).toBe(7);
+});
+
+it("counts a download's staged bytes across Chrome's rename of its partial file, and refuses anything but files", async () => {
+  const staging = path.join(root, 'download');
+  fs.mkdirSync(staging);
+  const guid = '76347a02-c21a-4763-839a-327c7e0cbb9e';
+  fs.writeFileSync(path.join(staging, `${guid}.crdownload`), Buffer.alloc(120));
+  // Chrome completes the download between the listing and the size read: the partial name is gone.
+  uploadRace.beforeLstat = (file) => {
+    if (String(file).endsWith('.crdownload')) {
+      uploadRace.beforeLstat = undefined;
+      fs.renameSync(path.join(staging, `${guid}.crdownload`), path.join(staging, guid));
+    }
+  };
+  expect(await browserStagingBytes(staging)).toBe(0);
+  expect(await browserStagingBytes(staging)).toBe(120);
+  fs.symlinkSync('/etc/passwd', path.join(staging, 'link'));
+  await expect(browserStagingBytes(staging)).rejects.toThrow('Unsafe download staging');
 });
