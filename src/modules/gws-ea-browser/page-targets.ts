@@ -27,14 +27,18 @@ export async function pageTargetsReady(page: Page): Promise<boolean> {
 
 /**
  * Chrome runs a cross-site frame as its own target, so a setting made on the page session never reaches it.
- * `setup` runs on the page session and on one session per live out-of-process frame until the page closes;
+ * `setup` runs on the page session and on one session per live out-of-process frame until the page closes,
+ * told which of the two it is;
  * an in-process frame shares its local root's session.
  */
-export async function coverPageTargets(page: Page, setup: (session: CDPSession) => Promise<void>): Promise<void> {
+export async function coverPageTargets(
+  page: Page,
+  setup: (session: CDPSession, target: 'page' | 'frame') => Promise<void>,
+): Promise<void> {
   const settings = settingsFor(page);
   const pageSession = await page.context().newCDPSession(page);
   try {
-    await setup(pageSession);
+    await setup(pageSession, 'page');
   } catch (error) {
     await pageSession.detach().catch(() => undefined);
     throw error;
@@ -70,7 +74,7 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
         if (ready) ended();
       });
       frameSessions.add(frameSession);
-      const applied = await setup(frameSession).then(
+      const applied = await setup(frameSession, 'frame').then(
         () => true,
         () => false,
       );

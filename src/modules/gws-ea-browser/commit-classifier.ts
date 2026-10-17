@@ -447,7 +447,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     blocked = 'blocked_address';
   });
   // Every covered target shares this handler, its policy stack and its block record.
-  await coverPageTargets(page, async (session) => {
+  await coverPageTargets(page, async (session, target) => {
     session.on('Fetch.requestPaused', (event) => {
       const scopes = [...policies];
       const pausedIn = generation;
@@ -478,7 +478,14 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         // Only a send fails here, once its request or its target is gone: nothing was let through.
       });
     });
-    await session.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
+    // The page session pauses every request, so a sign-in scope can strip any Referer. A frame session
+    // pauses documents only: every other request is let through unchanged, and pausing each one would
+    // cost the host a round trip per request from busy cross-site frames.
+    await session.send('Fetch.enable', {
+      patterns: [
+        target === 'page' ? { requestStage: 'Request' } : { requestStage: 'Request', resourceType: 'Document' },
+      ],
+    });
   });
   page.once('close', () => {
     navigationGuards.delete(page);

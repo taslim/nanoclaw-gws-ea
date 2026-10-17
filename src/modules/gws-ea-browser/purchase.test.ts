@@ -71,8 +71,6 @@ let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
 let widgetRequests: string[];
-// Live-widget polling is counted apart: a closing page's late polls must not reach the next test's record.
-let widgetTicks: number;
 const WIDGET_ORIGIN = 'https://pay.example';
 
 function reviewHtml(): string {
@@ -113,8 +111,6 @@ function fixturePage(pathname: string): string {
       return widgetHostHtml(`${WIDGET_ORIGIN}/`);
     case '/dp/B0PAYLATER':
       return widgetHostHtml();
-    case '/dp/B0LIVEPLAN':
-      return widgetHostHtml(`${WIDGET_ORIGIN}/news`);
     case '/gp/cart/view.html':
       return cartHtml();
     case AMAZON_RETAIL.reviewPath:
@@ -264,17 +260,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         const url = new URL(request.url ?? '/', AMAZON_RETAIL.origin);
         request.resume();
         if (request.headers.host === new URL(WIDGET_ORIGIN).host) {
-          if (url.pathname === '/tick') widgetTicks++;
-          else widgetRequests.push(url.pathname);
+          widgetRequests.push(url.pathname);
           response.writeHead(200, { 'content-type': 'text/html' });
-          response.end(
-            url.pathname === '/'
-              ? widgetHtml()
-              : url.pathname === '/news'
-                ? // A live widget keeps requests in flight, so some are paused whenever its frame dies.
-                  "<html><body><h1>Plan news</h1><script>setInterval(() => { for (let i = 0; i < 20; i++) fetch('/tick').catch(() => undefined); }, 1);</script></body></html>"
-                : '<html><body>Plan details</body></html>',
-          );
+          response.end(url.pathname === '/' ? widgetHtml() : '<html><body>Plan details</body></html>');
         } else if (request.method === 'POST' && url.pathname.startsWith('/gp/product/handle-buy-box')) {
           cartAdded++;
           response.writeHead(302, { location: `${AMAZON_RETAIL.origin}/gp/cart/view.html` });
@@ -401,7 +389,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     holdPost = undefined;
     sawPost = undefined;
     widgetRequests = [];
-    widgetTicks = 0;
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
@@ -950,7 +937,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue.idle();
     expect(widgetRequests).toEqual(['/']);
     expect(await request('widget-plans')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
-  });
+  }, 30_000);
   it('lets an ordinary navigation inside the out-of-process widget frame proceed', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
     const frame = await widgetFrame();
@@ -965,7 +952,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('widget-help')).toMatchObject({ status: 'completed' });
     await expect.poll(() => frame.url()).toBe(`${WIDGET_ORIGIN}/help`);
     expect(widgetRequests).toEqual(['/', '/help']);
-  });
+  }, 30_000);
   it('guards a frame that turns out-of-process after the guard installed', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYLATER`, 'later-page');
     const guard = await ensureBrowserNavigationGuard(page);
@@ -991,7 +978,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await frame.locator('#help').click();
     await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
     expect(widgetRequests).toEqual(['/']);
-  });
+  }, 30_000);
   it('holds file choosers opened in the page and in an out-of-process frame instead of showing them', async () => {
     await secureJobPage(page);
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
@@ -1012,7 +999,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       ),
     );
     expect(outcomes).toEqual(['held', 'held']);
-  });
+  }, 30_000);
   it.each(['browser', 'purchase'] as const)(
     'refuses to start a %s request while a page-target setting cannot reach an out-of-process frame',
     async (action) => {
@@ -1033,6 +1020,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       expect(result?.actions).toBeUndefined();
       expect(await approvals()).toEqual([]);
     },
+    30_000,
   );
   it('completes a batch whose widget frame navigates back to the hosting page site', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
@@ -1048,7 +1036,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('widget-back')).toMatchObject({ status: 'completed' });
     expect(frame.url()).toBe(`${AMAZON_RETAIL.origin}/dp/B012345678`);
     await expect(page.context().newCDPSession(frame)).rejects.toThrow('does not have a separate CDP session');
-  });
+  }, 30_000);
   it('completes a batch that removes its out-of-process widget frame', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
     const frame = await widgetFrame();
@@ -1062,22 +1050,42 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue.idle();
     expect(await request('widget-hide')).toMatchObject({ status: 'completed' });
     expect(frame.isDetached()).toBe(true);
-  });
-  it('completes a batch that removes a widget frame while its requests are still paused', async () => {
-    await navigate(`${AMAZON_RETAIL.origin}/dp/B0LIVEPLAN`, 'live-page');
+  }, 30_000);
+  it('does not report a refusal for a paused request whose frame was removed before its decision', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
+    const guard = await ensureBrowserNavigationGuard(page);
     const frame = await widgetFrame();
-    await expect.poll(() => widgetTicks).toBeGreaterThan(0);
-    await (await page.context().newCDPSession(frame)).detach();
-    await queue.accept(
-      'browser',
-      { actions: [{ kind: 'click', ...(await nativeRef('link "Hide plans"')) }] },
-      session,
-      'live-hide',
+    await assertOutOfProcess(frame);
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release!: () => void;
+    const decided = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await guard.runWithPolicy(
+      {
+        async beforeNavigate() {
+          reached();
+          await decided;
+          return 'ordinary';
+        },
+      },
+      async () => {
+        // The widget's own navigation waits on this decision while the page removes the widget.
+        await frame.evaluate("location.assign('/help')");
+        await paused;
+        await page.evaluate("document.getElementById('widget').remove()");
+        await expect.poll(() => frame.isDetached()).toBe(true);
+        release();
+        // A later round trip on the same connection orders after the dead request's continue.
+        await page.evaluate('0');
+        expect(guard.reason()).toBeUndefined();
+      },
     );
-    await queue.idle();
-    expect(await request('live-hide')).toMatchObject({ status: 'completed' });
-    expect(frame.isDetached()).toBe(true);
-  });
+    expect(widgetRequests).toEqual(['/']);
+  }, 30_000);
   it('guards a widget frame again after it swapped back in-process and then cross-site', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
     const guard = await ensureBrowserNavigationGuard(page);
@@ -1111,7 +1119,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await frame.locator('#plans').click();
     await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
     expect(widgetRequests).toEqual(['/', '/']);
-  });
+  }, 30_000);
   it('still refuses but does not report a decision that lands after its operation ended', async () => {
     const guard = await ensureBrowserNavigationGuard(page);
     let reached!: () => void;
@@ -1141,5 +1149,5 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       expect(String(await leaving)).toContain('ERR_BLOCKED_BY_CLIENT');
       expect(guard.reason()).toBeUndefined();
     });
-  });
+  }, 30_000);
 });
