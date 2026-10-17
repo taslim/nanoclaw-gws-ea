@@ -1,10 +1,11 @@
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import { chmod, link, lstat, open, readdir, realpath, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Download, Page } from 'playwright-core';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
+import { isErrno } from '../../community-portal/errors.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { sessionDir } from '../../session-manager.js';
 import { withBrowserDownload } from './connection.js';
@@ -247,10 +248,22 @@ export async function handoffBrowserDownload(
   }
 }
 
-async function stagingBytes(directory: string): Promise<number> {
+/**
+ * The bytes a download has staged so far. Chrome writes `<guid>.crdownload`
+ * and renames it to `<guid>` when the download completes, so an entry can
+ * vanish between the listing and its size read: it is counted under its new
+ * name by the next check, never taken for unsafe staging.
+ */
+export async function browserStagingBytes(directory: string): Promise<number> {
   let total = 0;
   for (const name of await readdir(directory)) {
-    const stat = await lstat(path.join(directory, name));
+    let stat: Stats;
+    try {
+      stat = await lstat(path.join(directory, name));
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) continue;
+      throw error;
+    }
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Unsafe download staging');
     total += stat.size;
   }
@@ -301,7 +314,7 @@ export async function captureBrowserDownload(
   const monitor = setInterval(() => {
     if (checking) return;
     checking = true;
-    void stagingBytes(directory)
+    void browserStagingBytes(directory)
       .then(async (bytes) => {
         if (bytes > cap) {
           overCap = true;

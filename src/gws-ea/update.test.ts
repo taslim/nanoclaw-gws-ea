@@ -439,6 +439,10 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
       `GWS_EA_VOICE_POLICY_FILE=${voicePolicy}`,
     );
+    // The 1Password host policy is located through the same root: a locator, never a token.
+    expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
+      `GWS_EA_ONEPASSWORD_POLICY_FILE=${path.join(host.paths.configRoot, 'onepassword', 'policy.json')}`,
+    );
     // The state stayed where it was, whole: the release reaches it through its links.
     expect(await centralInode(runtime)).toBe(inode);
     expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);

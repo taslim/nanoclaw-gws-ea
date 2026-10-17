@@ -2,7 +2,14 @@ import { afterEach, beforeEach, expect, it } from 'bun:test';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import Ajv from 'ajv';
-import { cancelJob, relayCode, reservationGuarantee, reservationBounds } from './gws-ea-browser-delegate.js';
+import {
+  cancelJob,
+  credentialAuthority,
+  relayCode,
+  reservationGuarantee,
+  reservationBounds,
+  vaultAccess,
+} from './gws-ea-browser-delegate.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -136,4 +143,158 @@ it('sends only the explicit guarantee proposal fields through the native request
       }),
     );
   expect(JSON.stringify(await waiting)).toContain('awaiting_principal');
+});
+
+it('shares or refreshes the 1Password vault through the native host request, never with a chosen vault, account or permission', async () => {
+  const validate = new Ajv().compile(vaultAccess.tool.inputSchema);
+  for (const fields of [
+    { operation: 'share' },
+    { operation: 'share', email: 'morgan@example.test' },
+    { operation: 'refresh' },
+  ])
+    expect(validate(fields)).toBe(true);
+  for (const fields of [
+    {},
+    { operation: 'grant' },
+    { operation: 'refresh', email: 'morgan@example.test' },
+    { operation: 'share', vault_id: 'remyvancevault000000000002' },
+    { operation: 'share', account_id: 'REMYVANCEACCOUNT0000000002' },
+    { operation: 'share', permissions: ['allow_managing'] },
+    { operation: 'share', email: 'morgan@example.test', principal_confirmed: true },
+  ])
+    expect(validate(fields)).toBe(false);
+
+  expect((await vaultAccess.handler({ operation: 'refresh', email: 'morgan@example.test' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+
+  const message = 'Could you give morgan@example.test view and edit access to the 1Password vault my assistant keeps?';
+  const waiting = vaultAccess.handler({
+    operation: 'share',
+    email: 'morgan@example.test',
+    vault_id: 'remyvancevault000000000002',
+    permissions: ['allow_managing'],
+  });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({
+    action: 'vault_access',
+    requestId: row.id,
+    operation: 'share',
+    email: 'morgan@example.test',
+  });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: {
+          id: row.id,
+          ok: true,
+          data: {
+            status: 'operator_needed',
+            email: 'morgan@example.test',
+            reason: 'not_a_member',
+            operator_message: message,
+          },
+        },
+      }),
+    );
+  const result = await waiting;
+  expect(result.isError).not.toBe(true);
+  // main reads the status beside the message it forwards as written.
+  expect(JSON.stringify(result)).toContain('operator_needed');
+  expect(JSON.stringify(result)).toContain(message);
+  // main's guidance branches on the reason, so the tool names each one it can receive.
+  for (const reason of ['not_a_member', 'not_confirmed', 'refused', 'host_cannot_share', 'unconfirmed'])
+    expect(vaultAccess.tool.description).toContain(reason);
+  // On shared, main gives the principal the host's link and the vault's name.
+  for (const field of ['link', 'vault_name']) expect(vaultAccess.tool.description).toContain(field);
+});
+
+it('records signup or password-change authority through the native host request, never another security change or a value', async () => {
+  const validate = new Ajv().compile(credentialAuthority.tool.inputSchema);
+  const fields = {
+    thread: 'system:a2a:main:join',
+    operation: 'signup',
+    site: 'https://accounts.shop.example/join',
+    username: 'morgan.ellery@example.com',
+  };
+  expect(validate(fields)).toBe(true);
+  expect(validate({ ...fields, operation: 'change_password' })).toBe(true);
+  for (const changed of [
+    { ...fields, operation: 'change_email' },
+    { ...fields, operation: 'disable_two_factor' },
+    { ...fields, password: 'chosen-by-main' },
+    { ...fields, approved: true },
+    { thread: fields.thread, operation: 'signup', site: fields.site },
+  ])
+    expect(validate(changed)).toBe(false);
+  const waiting = credentialAuthority.handler({ ...fields, password: 'chosen-by-main' });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'credential_authority', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'not_owned', reason: 'no_record' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('not_owned');
+  for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable', 'rate_limited'])
+    expect(credentialAuthority.tool.description).toContain(outcome);
+});
+
+it("asks for the principal's release of an unresolved credential attempt by its job and authority alone", async () => {
+  const validate = new Ajv().compile(credentialAuthority.tool.inputSchema);
+  const fields = {
+    thread: 'system:a2a:main:join',
+    operation: 'release',
+    authority: '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+  };
+  expect(validate(fields)).toBe(true);
+  for (const changed of [
+    { thread: fields.thread, operation: 'release' },
+    { ...fields, site: 'https://accounts.shop.example' },
+    { ...fields, username: 'morgan.ellery@example.com' },
+    { ...fields, approved: true },
+    {
+      thread: fields.thread,
+      operation: 'signup',
+      site: 'https://accounts.shop.example',
+      username: 'morgan.ellery@example.com',
+      authority: fields.authority,
+    },
+  ])
+    expect(validate(changed)).toBe(false);
+  expect((await credentialAuthority.handler({ thread: fields.thread, operation: 'release' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  const waiting = credentialAuthority.handler({ ...fields, approved: true });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'credential_authority', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'awaiting_principal' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('awaiting_principal');
+  for (const outcome of ['release', 'awaiting_principal', 'not_releasable'])
+    expect(credentialAuthority.tool.description).toContain(outcome);
 });

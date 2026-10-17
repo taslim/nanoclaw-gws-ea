@@ -45,7 +45,7 @@ function action(kind: string, properties: Record<string, object> = {}, required:
 export const browser = requestTool({
   name: 'browser',
   description:
-    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use sign_in_code for sign-in. ' +
+    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
     'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main. An unknown commit must be reconciled, never retried. ' +
     NO_REPEAT,
   properties: {
@@ -140,6 +140,108 @@ export const browser = requestTool({
   },
   required: ['actions'],
   additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+export const fillSecret = requestTool({
+  name: 'fill_secret',
+  description:
+    'Ask the host to fill a 1Password login by handle and submit it. The host validates the complete HTTPS frame origin before resolving and again before insertion; no secret value reaches you. Outcomes: submitted, no_item_for_site, origin_mismatch, cleared_after_submit, vault_unavailable or rate_limited. Continue from a fresh observation after submission; report a missing item, unavailable vault or mismatched origin to main. ' +
+    NO_REPEAT,
+  properties: {
+    item_handle: { type: 'string', description: 'The opaque login handle the host listed for this site.' },
+    field: {
+      type: 'string',
+      enum: ['username', 'password', 'otp'],
+      description: 'Which login field the host should resolve.',
+    },
+    target: REF,
+    submit: REF,
+  },
+  required: ['item_handle', 'field', 'target', 'submit'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
+});
+
+const ACCOUNT_FIELDS = ['username', 'current_password', 'new_password', 'confirmation'] as const;
+const has = (fields: Record<string, unknown>, ...names: readonly string[]): boolean =>
+  names.some((name) => fields[name] !== undefined);
+
+export const credentialForm = requestTool({
+  name: 'credential_form',
+  description:
+    'Fill and submit a signup or password-change form with a password the host generates and saves in 1Password first, under the credential authority main recorded for this job. Give fresh refs for the fields the form has (a signup’s username, new_password and confirmation; a change’s current_password, new_password and confirmation) and the control that submits them. A multi-step signup sends username alone first, then the password step. For a signup whose form requires accepting the site’s terms of service, give that checkbox as accept_terms; the host checks only a required box named for the site’s terms, never marketing, data sharing or payment terms. The host refuses before revealing anything when the frame, origin, form or control is unexpected, financial or another security change; no value reaches you. ' +
+    'Outcomes: continued (observe the next step), account_created or password_changed with vault saved or updated (the login holds the new password), left_as_edited (the login was changed or removed in 1Password meanwhile, so the host left it as it is; after a password change, the new password is saved as its own item) or pending (1Password is not updated yet: reconcile later finishes it); account_exists, password_rejected, current_password_rejected, verification_requested, outcome_unknown, not_owned, refused with a reason, vault_unavailable or rate_limited. The authority covers one submission: never submit it again. ' +
+    'After verification_requested, use operation verify: the host waits for the site’s email to the account and opens its link or, given the code field and its control, enters its code; outcomes account_created, outcome_unknown (the site may have taken the link or code but showed no confirmation: reconcile next), nothing_arrived (verify again later), not_watched (the host is not watching this account’s mail, so it cannot complete the verification) or ambiguous, or refused with code_field_needed. After outcome_unknown, use operation reconcile as your next step, with no other action but an observation: it only reads the site’s late response and answers its outcome or inconclusive. Report every outcome but continued to main. ' +
+    NO_REPEAT,
+  properties: {
+    operation: {
+      type: 'string',
+      enum: ['submit', 'verify', 'reconcile'],
+      default: 'submit',
+      description:
+        'submit fills and activates the form; verify completes the email verification a signup asked for; reconcile only reads the site’s response to an unknown outcome, or finishes saving a pending one in 1Password.',
+    },
+    authority: { type: 'string', description: 'The credential authority id main gave this job.' },
+    username: REF,
+    current_password: REF,
+    new_password: REF,
+    confirmation: REF,
+    accept_terms: { ...REF, description: 'A signup’s required terms-of-service checkbox in the same form.' },
+    code_field: { ...REF, description: 'For verify: the field for the emailed verification code.' },
+    activate: { ...REF, description: 'The control that submits these fields.' },
+  },
+  required: ['authority'],
+  additionalProperties: false,
+  oneOf: [
+    {
+      properties: { operation: { const: 'submit' } },
+      required: ['activate'],
+      not: { required: ['code_field'] },
+      oneOf: [
+        {
+          required: ['username'],
+          not: {
+            anyOf: [{ required: ['new_password'] }, { required: ['confirmation'] }, { required: ['current_password'] }],
+          },
+        },
+        { required: ['new_password'] },
+      ],
+    },
+    {
+      properties: { operation: { const: 'verify' } },
+      required: ['operation'],
+      not: { anyOf: [...ACCOUNT_FIELDS, 'accept_terms'].map((field) => ({ required: [field] })) },
+    },
+    {
+      properties: { operation: { const: 'reconcile' } },
+      required: ['operation'],
+      not: {
+        anyOf: [...ACCOUNT_FIELDS, 'accept_terms', 'code_field', 'activate'].map((field) => ({ required: [field] })),
+      },
+    },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'reconcile')
+      return has(fields, ...ACCOUNT_FIELDS, 'accept_terms', 'code_field', 'activate')
+        ? 'reconcile takes only the authority.'
+        : fields;
+    if (fields.operation === 'verify') {
+      if (has(fields, ...ACCOUNT_FIELDS, 'accept_terms')) return 'verify takes only the code field and its control.';
+      return has(fields, 'code_field') === has(fields, 'activate')
+        ? fields
+        : 'Name the verification code field together with the control that submits it, or neither.';
+    }
+    if (has(fields, 'code_field')) return 'code_field is for verify.';
+    if (!has(fields, 'activate')) return 'Name the control that submits these fields.';
+    if (!has(fields, 'new_password', 'username'))
+      return 'Name the username field, or the new password field with any confirmation and current password.';
+    if (!has(fields, 'new_password') && has(fields, 'confirmation', 'current_password'))
+      return 'A confirmation or current password goes with the new password field.';
+    return fields;
+  },
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
 });
@@ -317,4 +419,7 @@ export const cancelWatch = requestTool({
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
 });
 
-registerTools([browser, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch], 'browser');
+registerTools(
+  [browser, fillSecret, credentialForm, signInCode, purchase, saveRecipe, runRecipe, watch, listWatches, cancelWatch],
+  'browser',
+);

@@ -21,6 +21,8 @@ import {
 import { parseInvocation } from '../src/gws-ea/command-parser.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
+import { removalQuestion } from '../src/gws-ea/remove.js';
+import type { OnePasswordAccount } from '../src/modules/gws-ea-browser/onepassword-cli.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
 import type { ToolProviderSetup } from '../src/gws-ea/release-target.js';
 import type { HostStatusHelpers } from '../src/gws-ea/service.js';
@@ -171,6 +173,23 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
 }
 
 /**
+ * The terminal operator's choice among the accounts their 1Password app
+ * holds, by exact ID; cancelled, enable reports the choice it needs instead.
+ */
+export async function chooseOnePasswordAccount(accounts: readonly OnePasswordAccount[]): Promise<string | undefined> {
+  const chosen = await p.select({
+    message: 'Which 1Password account should assistants keep their vaults in?',
+    options: accounts.map((account) => ({
+      value: account.accountId,
+      label: `${account.email} on ${account.url}`,
+      hint: account.accountId,
+    })),
+    output: process.stderr,
+  });
+  return p.isCancel(chosen) || typeof chosen !== 'string' ? undefined : chosen;
+}
+
+/**
  * Upstream's host readiness helpers, unchanged. They ship as untyped ESM
  * (`setup/lib/host-status.mjs`), so they are loaded by URL and checked here
  * rather than given a declaration file inside upstream's tree.
@@ -277,14 +296,11 @@ export async function main(argv: readonly string[], options: { readonly interact
     toolCheckout: checkout,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
+    chooseOnePasswordAccount,
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
     confirmRemoval: async (preview) =>
-      (await p.confirm({
-        message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
-        initialValue: false,
-        output: process.stderr,
-      })) === true,
+      (await p.confirm({ message: removalQuestion(preview), initialValue: false, output: process.stderr })) === true,
     confirmUpdate: async (preview) =>
       (await p.confirm({
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,

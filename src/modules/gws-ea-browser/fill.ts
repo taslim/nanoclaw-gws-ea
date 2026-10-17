@@ -1,5 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
-import { forbidden } from '../../cli/delivery-action.js';
+import { ActionRefusal, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import {
   authenticationFieldKind,
   browserDiagnosticsUnsafe,
@@ -8,14 +8,25 @@ import {
   type AuthenticationFormSignature,
   type BrowserSecretField,
 } from './authentication-signatures.js';
-import { activateControl, classifyActivation } from './commit-classifier.js';
+import { activateControl, classifyActivation, withBrowserJobNavigation } from './commit-classifier.js';
 import {
   fillNativeAuthenticationField,
   inspectNativeAuthenticationControl,
   type NativeAuthenticationBinding,
 } from './authentication-submit.js';
-import { registerPageSecret, bindPageSecretDocuments, releasePageSecret, type PinnedBrowserRef } from './observe.js';
-import type { BrowserExecutionContext } from './queue.js';
+import { browserVault, BrowserVaultError } from './onepassword.js';
+import {
+  disposeBrowserRefs,
+  pinBrowserRefs,
+  readBrowserRef,
+  registerPageSecret,
+  bindPageSecretDocuments,
+  releasePageSecret,
+  registerBrowserSiteInfoProvider,
+  type BrowserRef,
+  type PinnedBrowserRef,
+} from './observe.js';
+import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -26,7 +37,15 @@ export interface BoundBrowserSecretField {
   readonly authentication: AuthenticationFormSignature;
   readonly nativeField: NativeAuthenticationBinding;
 }
-export type BrowserSecretFillResult = { status: 'submitted' | 'cleared_after_submit' | 'origin_mismatch' };
+export type BrowserSecretFillResult = {
+  status:
+    | 'submitted'
+    | 'cleared_after_submit'
+    | 'origin_mismatch'
+    | 'no_item_for_site'
+    | 'vault_unavailable'
+    | 'rate_limited';
+};
 
 /** The bound field's frame no longer shows the exact HTTPS origin it was bound on. */
 export class BrowserOriginMismatchError extends Error {
@@ -129,6 +148,22 @@ async function clearValueEverywhere(page: Page, value: string): Promise<boolean>
   return complete;
 }
 
+/**
+ * After a host fill: clear every field still holding one of the values, then
+ * release their active taint. Redaction and document taint stay for the
+ * page's lifetime. A page that cannot be cleared is closed instead.
+ */
+export async function settleFilledSecrets(
+  context: BrowserExecutionContext,
+  page: Page,
+  values: readonly string[],
+): Promise<void> {
+  let cleared = true;
+  for (const value of values) if (!(await clearValueEverywhere(page, value))) cleared = false;
+  if (!cleared && !page.isClosed()) await context.runtime.closeJob(context.job.id).catch(() => undefined);
+  if (cleared || page.isClosed()) for (const value of values) releasePageSecret(page, value);
+}
+
 /** Caller owns the queue's exclusive job lock; resolve remains lazy until the pinned HTTPS checks pass. */
 export async function fillBoundBrowserSecret(
   context: BrowserExecutionContext,
@@ -194,15 +229,12 @@ export async function fillBoundBrowserSecret(
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
   } catch (error) {
     if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
-    // Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
+    if (error instanceof BrowserVaultError) return { status: error.reason };
+    // SDK and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
-    if (value) {
-      const cleared = await clearValueEverywhere(page, value);
-      if (!cleared && !page.isClosed()) await context.runtime.closeJob(context.job.id).catch(() => undefined);
-      if (cleared || page.isClosed()) releasePageSecret(page, value);
-    }
+    if (value) await settleFilledSecrets(context, page, [value]);
   }
 }
 
@@ -245,3 +277,84 @@ export async function discoverAuthenticationCodeField(
     return undefined;
   }
 }
+
+const SECRET_FIELDS: readonly BrowserSecretField[] = ['username', 'password', 'otp'];
+const isSecretField = (value: unknown): value is BrowserSecretField => SECRET_FIELDS.some((field) => field === value);
+
+interface FillSecretPayload extends Record<string, unknown> {
+  item_handle: string;
+  field: BrowserSecretField;
+  target: BrowserRef;
+  submit: BrowserRef;
+}
+export function validateFillSecret(content: Record<string, unknown>): FillSecretPayload {
+  const { item_handle: handle, field } = content;
+  if (
+    Object.keys(content).some(
+      (key) => !['action', 'requestId', 'budget_ms', 'item_handle', 'field', 'target', 'submit'].includes(key),
+    ) ||
+    typeof handle !== 'string' ||
+    !/^vault_[a-z\d_-]{1,100}$/iu.test(handle) ||
+    !isSecretField(field)
+  )
+    throw invalidArgs('Choose a listed vault item and a username, password or one-time-code field.');
+  const message = 'Choose a field and submit control from a fresh observation.';
+  return {
+    item_handle: handle,
+    field,
+    target: readBrowserRef(content.target, message),
+    submit: readBrowserRef(content.submit, message),
+  };
+}
+
+export async function executeFillSecret(
+  context: BrowserExecutionContext,
+  content: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const payload = validateFillSecret(content);
+  const page = await context.page();
+  return withBrowserJobNavigation(context, page, async () => {
+    let refs = new Map<string, PinnedBrowserRef>();
+    try {
+      await context.assertActive();
+      refs = await pinBrowserRefs(page, [payload.target, payload.submit]);
+      const binding = await bindBrowserSecretField(
+        page,
+        refs.get(payload.target.ref)!,
+        refs.get(payload.submit.ref)!,
+        payload.field,
+      );
+      return await fillBoundBrowserSecret(context, binding, () =>
+        browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive),
+      );
+    } catch (error) {
+      if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
+      if (error instanceof BrowserVaultError) return { status: error.reason };
+      if (error instanceof ActionRefusal) throw error;
+      throw forbidden('Choose a supported sign-in field and submit control from a fresh observation.');
+    } finally {
+      await disposeBrowserRefs(refs);
+    }
+  });
+}
+
+registerBrowserQueuedAction('fill_secret', { validate: validateFillSecret, execute: executeFillSecret });
+registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
+  try {
+    const origins = new Set([
+      origin,
+      ...page.frames().flatMap((frame) => {
+        const url = httpsOrigin(frame.url());
+        return url ? [url.origin] : [];
+      }),
+    ]);
+    const items = new Map<string, { item_handle: string; title: string }>();
+    for (const frameOrigin of origins)
+      for (const item of await browserVault.itemsForOrigin(frameOrigin, assertActive))
+        items.set(item.item_handle, item);
+    return { vault_items: [...items.values()] };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- optional vault metadata becomes a constant status, never a failed observation
+  } catch (error) {
+    return { vault_status: error instanceof BrowserVaultError ? error.reason : 'vault_unavailable' };
+  }
+});

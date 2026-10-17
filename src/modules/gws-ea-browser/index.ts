@@ -10,6 +10,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
+  browserCredentialAttemptsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
   browserQueueMigration,
@@ -22,6 +23,8 @@ import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './recipes.js';
 import './capability.js';
+import './fill.js';
+import { registerCredentialAuthorityDelivery } from './credential-operations.js';
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
@@ -43,6 +46,7 @@ import {
   sweepBrowserPurchaseState,
 } from './purchase.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import { registerVaultAccessDelivery } from './vault-access.js';
 import './watches.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 
@@ -53,6 +57,7 @@ registerMigration(browserReservationBoundsMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
+registerMigration(browserCredentialAttemptsMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -404,6 +409,8 @@ export function getBrowserQueue(): BrowserQueue {
   return queue;
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
+registerBrowserActionDelivery('fill_secret', getBrowserQueue);
+registerBrowserActionDelivery('credential_form', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
@@ -412,6 +419,8 @@ registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
+registerVaultAccessDelivery();
+registerCredentialAuthorityDelivery(getBrowserQueue);
 
 export {
   BrowserStore,

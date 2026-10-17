@@ -73,6 +73,12 @@ export interface SanitizedCommand {
    * returning stdout. Only for output nobody parses: image builds and compose.
    */
   readonly stream?: boolean;
+  /**
+   * Keep both streams out of the raw log and every failure detail; the log
+   * records only their byte counts. For a tool whose output can carry a
+   * secret before the caller can register it. Never with `stream`.
+   */
+  readonly privateOutput?: boolean;
   /** Text written to the child's stdin, then closed. Never logged. */
   readonly input?: string;
 }
@@ -288,7 +294,7 @@ function commandFailure(
 export function commandExitError(command: SanitizedCommand, outcome: SanitizedCommandOutcome): GwsEaError {
   return commandFailure('command_failed', `Command failed (exit code ${outcome.exitCode})`, command, {
     exitCode: outcome.exitCode,
-    stderr: outcome.stderr,
+    stderr: command.privateOutput ? '' : outcome.stderr,
   });
 }
 
@@ -450,7 +456,11 @@ function execute(
       clearTimeout(pipeRelease);
       if (pid !== undefined) releaseGroup(pid);
       if (tees) writeStream(`${tees.stdout.end()}${tees.stderr.end()}`);
-      const facts: FailureFacts = { exitCode: code, signal, stderr: retainedStderr.text() };
+      const facts: FailureFacts = {
+        exitCode: code,
+        signal,
+        stderr: command.privateOutput ? '' : retainedStderr.text(),
+      };
       if (startError !== undefined) {
         const errno = errorCode(startError, 'unknown');
         reject(
@@ -513,6 +523,9 @@ function commandEnvironment(command: SanitizedCommand): {
  * count, and redacted stderr. Streamed output is teed through the redactor.
  */
 export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) => {
+  if (command.stream && command.privateOutput) {
+    throw new GwsEaError('invalid_command', 'A command with private output cannot stream it to the raw log');
+  }
   const { environment, searched } = commandEnvironment(command);
   for (const [key, value] of Object.entries(environment)) {
     if (isSecretEnvironmentKey(key)) registerSecret(value);
@@ -531,7 +544,11 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
       ? ''
       : `; stdout: ${Buffer.byteLength(outcome.stdout)} bytes (parsed, not logged)`;
     const stderrFact =
-      command.stream || !outcome.stderr.trim() ? '' : `\n  stderr:\n${indent(redact(outcome.stderr.trim()))}`;
+      command.stream || !outcome.stderr.trim()
+        ? ''
+        : command.privateOutput
+          ? `; stderr: ${Buffer.byteLength(outcome.stderr)} bytes (private, not logged)`
+          : `\n  stderr:\n${indent(redact(outcome.stderr.trim()))}`;
     step?.write(`  exit ${outcome.exitCode} after ${elapsed}${stdoutFact}${stderrFact}\n`);
     return outcome;
   } catch (error) {

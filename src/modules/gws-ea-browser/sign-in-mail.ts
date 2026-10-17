@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Page } from 'playwright-core';
+import type { Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import {
   ANSWER_LATER,
@@ -106,6 +106,7 @@ async function codeBinding(page: Page, binding: BoundBrowserSecretField): Promis
 }
 
 export type SignInReply = { readonly kind: 'code' | 'link'; readonly value: string } | { readonly kind: 'unavailable' };
+export type SignInCredential = Extract<SignInReply, { readonly value: string }>;
 interface AssistantWait {
   readonly jobId: string;
   readonly assertActive: () => Promise<void>;
@@ -145,6 +146,130 @@ function awaitAssistantReply(
   return { answer, dispose: complete };
 }
 
+/**
+ * A new account waiting for its verification email (F3). The host opens the
+ * wait before the signup's activation, so the site's email cannot outrun it,
+ * and binds its claim to that signup's site, origin and account: only mail
+ * from that site, to that account, reaches the isolated interpreter for it.
+ * The interpreter's one answer is held in host memory alone, never a record,
+ * until that signup's own verify step uses it or the claim expires.
+ */
+interface SignupVerification {
+  readonly claimId: string;
+  readonly jobId: string;
+  readonly attemptId: string;
+  readonly expiresAt: number;
+  readonly timer: NodeJS.Timeout;
+  readonly listeners: Set<() => void>;
+  reply?: SignInReply;
+}
+const signupVerifications = new Map<string, SignupVerification>();
+
+function dropSignupVerification(verification: SignupVerification): void {
+  if (signupVerifications.get(verification.claimId) !== verification) return;
+  signupVerifications.delete(verification.claimId);
+  clearTimeout(verification.timer);
+  for (const listener of [...verification.listeners]) listener();
+}
+
+/** The assistant's own mailbox receives this account's mail, including a +tag on one of its addresses. */
+async function assistantMailbox(account: string): Promise<boolean> {
+  const address = account.toLowerCase();
+  const tagged = /^([^@+]+)\+[^@]*(@.+)$/u.exec(address);
+  const addresses = await assistantAddresses();
+  return addresses.has(address) || (tagged !== null && addresses.has(`${tagged[1]}${tagged[2]}`));
+}
+
+/**
+ * Opens a signup's verification wait, replacing any earlier one for it.
+ * False when the account's mail does not reach the assistant's own inbox.
+ */
+export async function openSignupVerification(input: {
+  readonly jobId: string;
+  readonly claimId: string;
+  readonly attemptId: string;
+  readonly origin: string;
+  readonly username: string;
+}): Promise<boolean> {
+  if (!activeInbox() || !(await assistantMailbox(input.username))) return false;
+  await finishSignupVerification(input.attemptId);
+  const claim = await createSignInClaim({
+    id: input.claimId,
+    jobId: input.jobId,
+    source: 'assistant',
+    origin: input.origin,
+    binding: { attempt: input.attemptId, username: input.username },
+  });
+  const expiresAt = Date.parse(claim.expires_at);
+  const verification: SignupVerification = {
+    claimId: claim.id,
+    jobId: input.jobId,
+    attemptId: input.attemptId,
+    expiresAt,
+    listeners: new Set(),
+    timer: setTimeout(() => dropSignupVerification(verification), Math.max(0, expiresAt - Date.now())),
+  };
+  verification.timer.unref();
+  signupVerifications.set(claim.id, verification);
+  return true;
+}
+
+export type SignupVerificationReply =
+  | { readonly status: 'arrived'; readonly reply: SignInCredential; readonly claim: SignInClaim }
+  | { readonly status: 'unavailable' }
+  | { readonly status: 'nothing_arrived' }
+  | { readonly status: 'not_watched' };
+
+/**
+ * The verification email's answer for this job's signup, waiting at most
+ * `waitMs` and the claim's life for it. Reading it does not spend it: a step
+ * that cannot use it yet leaves it for the next, and `finishSignupVerification`
+ * ends the wait once it is used. `not_watched` means no wait exists, or it
+ * ended: the account's mail does not reach the assistant's inbox, or the
+ * claim expired, was finished or was forgotten by a restart. Nothing later
+ * can arrive for it.
+ */
+export async function takeSignupVerification(
+  context: Pick<BrowserExecutionContext, 'job' | 'signal' | 'remaining'>,
+  attemptId: string,
+  waitMs = context.remaining(),
+): Promise<SignupVerificationReply> {
+  const verification = [...signupVerifications.values()].find(
+    (candidate) => candidate.attemptId === attemptId && candidate.jobId === context.job.id,
+  );
+  if (!verification) return { status: 'not_watched' };
+  if (verification.reply === undefined) {
+    const duration = Math.max(0, Math.min(90_000, waitMs, verification.expiresAt - Date.now()));
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        context.signal.removeEventListener('abort', done);
+        verification.listeners.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, duration);
+      context.signal.addEventListener('abort', done, { once: true });
+      verification.listeners.add(done);
+      if (context.signal.aborted) done();
+    });
+  }
+  const { reply } = verification;
+  if (signupVerifications.get(verification.claimId) !== verification) return { status: 'not_watched' };
+  if (reply === undefined) return { status: 'nothing_arrived' };
+  if (reply.kind === 'unavailable') return { status: 'unavailable' };
+  const claim = await getSignInClaim(verification.claimId);
+  return claim ? { status: 'arrived', reply, claim } : { status: 'not_watched' };
+}
+
+/** Ends a signup's verification wait: its answer is dropped and its claim finished. */
+export async function finishSignupVerification(attemptId: string): Promise<void> {
+  for (const verification of [...signupVerifications.values()])
+    if (verification.attemptId === attemptId) {
+      dropSignupVerification(verification);
+      await finishSignInClaim(verification.claimId);
+    }
+}
+
 function signInReply(content: Record<string, unknown>): SignInReply {
   if (Object.keys(content).some((key) => !['action', 'requestId', 'kind', 'value'].includes(key)))
     throw invalidArgs('Return one sign-in code, one link, or unavailable.');
@@ -174,15 +299,17 @@ export async function answerSignInReply(
       ? session.thread_id.slice(prefix.length)
       : undefined;
   const wait = claimId ? assistantWaits.get(claimId) : undefined;
+  const verification = claimId ? signupVerifications.get(claimId) : undefined;
+  const jobId = verification?.jobId ?? wait?.jobId;
   const claim = claimId ? await getSignInClaim(claimId) : undefined;
   const current = await getSession(session.id);
   if (
     !claim ||
-    !wait ||
+    jobId === undefined ||
     claim.source !== 'assistant' ||
     claim.state !== 'waiting' ||
     claim.gmail_message_id === null ||
-    claim.job_id !== wait.jobId ||
+    claim.job_id !== jobId ||
     Date.parse(claim.expires_at) <= Date.now() ||
     current?.status !== 'active' ||
     current.agent_group_id !== session.agent_group_id ||
@@ -190,6 +317,15 @@ export async function answerSignInReply(
     current.thread_id !== session.thread_id
   )
     return { status: 'no_wait' };
+  if (verification) {
+    // A signup's answer waits for that signup's own verify step; only the first answer is kept.
+    if (verification.reply !== undefined || signupVerifications.get(claim.id) !== verification)
+      return { status: 'no_wait' };
+    verification.reply = reply;
+    for (const listener of [...verification.listeners]) listener();
+    return { status: 'accepted' };
+  }
+  if (!wait) return { status: 'no_wait' };
   // A cancelled or timed-out browser request must never accept a late credential; errors carry no credential.
   /* eslint-disable no-catch-all/no-catch-all -- inactive requests discard credentials and return only a constant outcome */
   try {
@@ -220,11 +356,66 @@ async function consumeMagicLink(
   claim: SignInClaim,
   link: string,
 ): Promise<Record<string, unknown>> {
-  const { page } = binding;
-  if (!sameOrigin(binding) || binding.target.frame !== page.mainFrame()) return { status: 'origin_mismatch' };
+  if (!sameOrigin(binding)) return { status: 'origin_mismatch' };
+  return openBearerLink(
+    context,
+    { page: binding.page, frame: binding.target.frame, origin: binding.origin },
+    claim,
+    link,
+    async () => ({ status: 'link_opened' }),
+    'The host could not safely consume this sign-in link.',
+  );
+}
+
+/**
+ * Opens a signup's emailed verification link the same way: on its claim's
+ * site, from the job's main document there, reading the landing page through
+ * `landing` before the bearer document is cleared. An insecure or off-site
+ * link is `refused` before anything opens it; a failure once opening began
+ * throws, and the site may have taken the link by then.
+ */
+export async function openVerificationLink<T>(
+  context: BrowserExecutionContext,
+  page: Page,
+  claim: SignInClaim,
+  link: string,
+  landing: () => Promise<T>,
+): Promise<T | { readonly status: 'origin_mismatch' | 'refused' }> {
+  const url = httpsOrigin(link);
+  if (
+    !url ||
+    getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain ||
+    classifyNavigationUrl(url.href) === 'account_security'
+  )
+    return { status: 'refused' };
+  const origin = httpsOrigin(page.mainFrame().url());
+  if (!origin || getDomain(origin.hostname, { allowPrivateDomains: true }) !== claim.domain)
+    return { status: 'origin_mismatch' };
+  return openBearerLink(
+    context,
+    { page, frame: page.mainFrame(), origin: origin.origin },
+    claim,
+    link,
+    landing,
+    'The host could not safely open this verification link.',
+  );
+}
+
+async function openBearerLink<T>(
+  context: BrowserExecutionContext,
+  site: { readonly page: Page; readonly frame: Frame; readonly origin: string },
+  claim: SignInClaim,
+  link: string,
+  landing: () => Promise<T>,
+  failure: string,
+): Promise<T | { readonly status: 'origin_mismatch' }> {
+  const { page } = site;
+  if (httpsOrigin(site.frame.url())?.origin !== site.origin || site.frame !== page.mainFrame())
+    return { status: 'origin_mismatch' };
   assertBrowserSecretDiagnosticsSafe();
   const secrets = new Set<string>();
-  const taint = async (raw: string): Promise<void> => {
+  /** Every part of a bearer address is secret from the moment it is known, before any traffic. */
+  const taint = (raw: string): void => {
     const url = new URL(raw);
     const values = [
       raw,
@@ -236,15 +427,19 @@ async function consumeMagicLink(
       if (value) {
         secrets.add(value);
         registerPageSecret(page, value);
-        await bindPageSecretDocuments(page, value);
       }
+  };
+  // Chrome answers no frame-tree read while a document request waits in the guard, so documents are
+  // bound only between navigations: before the first, and as each one commits.
+  const bindSecrets = async (): Promise<void> => {
+    for (const value of secrets) await bindPageSecretDocuments(page, value);
   };
   let sanitized = false;
   let sanitizing = false;
   const documents = new Set<Promise<void>>();
   const navigation = (): void => {
     if (sanitizing) return;
-    const work = bindPageSecretDocuments(page, link);
+    const work = bindSecrets();
     documents.add(work);
     void work.catch(() => undefined);
   };
@@ -252,8 +447,9 @@ async function consumeMagicLink(
   try {
     const guard = await ensureBrowserNavigationGuard(page);
     guard.clearReason();
-    await taint(link);
-    await guard.runWithPolicy(
+    taint(link);
+    await bindSecrets();
+    const landed = await guard.runWithPolicy(
       {
         stripReferrer: true,
         classify(url) {
@@ -264,7 +460,7 @@ async function consumeMagicLink(
         },
         async beforeNavigate(url) {
           await context.assertActive();
-          if (!sanitizing) await taint(url.href);
+          if (!sanitizing) taint(url.href);
           return 'ordinary';
         },
       },
@@ -273,8 +469,10 @@ async function consumeMagicLink(
         assertBrowserSecretDiagnosticsSafe();
         await page.goto(link, { waitUntil: 'domcontentloaded', referer: '' });
         await Promise.all(documents);
-        await bindPageSecretDocuments(page, link);
+        await bindSecrets();
         if (guard.reason()) throw forbidden('The sign-in link left its permitted site.');
+        await context.assertActive();
+        const read = await landing();
         await context.assertActive();
         sanitizing = true;
         await page.goto(`${claim.origin}/`, { waitUntil: 'domcontentloaded', referer: '' });
@@ -288,12 +486,13 @@ async function consumeMagicLink(
           await session.detach();
         }
         sanitized = true;
+        return read;
       },
     );
-    return { status: 'link_opened' };
+    return landed;
   } catch (_error) {
     await context.runtime.closeJob(context.job.id).catch(() => undefined);
-    throw forbidden('The host could not safely consume this sign-in link.');
+    throw forbidden(failure);
   } finally {
     page.off('framenavigated', navigation);
     if (sanitized || page.isClosed()) for (const value of secrets) releasePageSecret(page, value);
@@ -598,6 +797,7 @@ async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame)
 }
 export async function recoverBrowserSignInMail(): Promise<void> {
   for (const wait of assistantWaits.values()) wait.complete();
+  for (const verification of [...signupVerifications.values()]) dropSignupVerification(verification);
   for (const id of bindings.keys()) await releaseBinding(id);
   await recoverSignInClaims();
 }
@@ -609,6 +809,11 @@ export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
     const claim = await getSignInClaim(id);
     if (!claim || claim.state !== 'waiting' || Date.parse(claim.expires_at) <= Date.now() || claim.job_id === jobId)
       wait.complete();
+  }
+  for (const verification of [...signupVerifications.values()]) {
+    const claim = await getSignInClaim(verification.claimId);
+    if (!claim || claim.state !== 'waiting' || verification.expiresAt <= Date.now() || verification.jobId === jobId)
+      dropSignupVerification(verification);
   }
   for (const [id] of bindings) {
     const claim = await getSignInClaim(id);

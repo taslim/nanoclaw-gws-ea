@@ -1,5 +1,6 @@
 import { getDomain } from 'tldts';
 import { getDb } from '../../db/connection.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { activeInbox } from './runtime.js';
 import { dkimAlignedToSite } from './authentication.js';
 import { reserveSignInMessage } from './db.js';
@@ -34,6 +35,13 @@ export async function waitingSignInClaim(
     new Date().toISOString(),
   );
 }
+/** A signup's verification claim is bound to its attempt, which alone ends it (`finishSignupVerification`). */
+function signupAttemptClaim(claim: SignInClaim): boolean {
+  const binding: unknown = JSON.parse(claim.binding_json);
+  return isRecord(binding) && typeof binding.attempt === 'string';
+}
+
+/** A new claim supersedes the job's waiting sign-in claims; every signup's verification claim stays waiting. */
 export async function createSignInClaim(input: {
   id: string;
   jobId: string;
@@ -47,12 +55,15 @@ export async function createSignInClaim(input: {
   if (origin.protocol !== 'https:' || origin.username || origin.password || !domain) throw new Error('origin_mismatch');
   const at = input.at ?? new Date();
   await getDb().transaction(async () => {
-    await getDb().run(
-      'UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE job_id = ? AND state = ?',
-      'finished',
+    const waiting = await getDb().all<SignInClaim>(
+      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE job_id = ? AND state = ?',
       input.jobId,
       'waiting',
     );
+    for (const claim of waiting) {
+      if (signupAttemptClaim(claim)) continue;
+      await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE id = ?', 'finished', claim.id);
+    }
     await getDb().run(
       `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
        VALUES(?,?,?,?,?,?,?,?,?)`,
@@ -71,6 +82,14 @@ export async function createSignInClaim(input: {
   return (await getSignInClaim(input.id))!;
 }
 
+/** A signup's verification claim names the account it created: it takes only mail addressed to that account. */
+function addressedTo(claim: SignInClaim, mail: ParsedMail): boolean {
+  const binding: unknown = JSON.parse(claim.binding_json);
+  if (!isRecord(binding) || typeof binding.username !== 'string') return true;
+  const account = binding.username.toLowerCase();
+  return [...mail.to, ...mail.cc].some((mailbox) => mailbox.address.toLowerCase() === account);
+}
+
 /** The inbox reserves the first verified fresh message, atomically. Replays return the same claim. */
 export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promise<SignInClaim | undefined> {
   const db = getDb();
@@ -82,7 +101,11 @@ export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promis
       at.toISOString(),
     );
     for (const claim of claims) {
-      if (mail.receivedAt!.getTime() < Date.parse(claim.since_at) || !dkimAlignedToSite(mail.headers, claim.domain))
+      if (
+        mail.receivedAt!.getTime() < Date.parse(claim.since_at) ||
+        !dkimAlignedToSite(mail.headers, claim.domain) ||
+        !addressedTo(claim, mail)
+      )
         continue;
       if (claim.gmail_message_id !== null) {
         if (claim.gmail_message_id === mail.id) return claim;

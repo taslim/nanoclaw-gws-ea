@@ -38,6 +38,8 @@ import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { BROWSER_POLICY_FILE_ENV } from '../modules/gws-ea-browser/policy.js';
+import { ONEPASSWORD_POLICY_FILE_ENV, onePasswordHostPaths } from '../modules/gws-ea-browser/onepassword-policy.js';
+import { VOICE_POLICY_FILE_ENV } from '../modules/gws-ea-voice/config.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
@@ -165,8 +167,8 @@ export interface InstanceServiceStart {
 
 export interface InstanceRuntimeDependencies extends InstanceServiceDependencies {
   readonly upsertEnvVars: UpsertEnvVars;
-  /** The shared operator policy locator, supplied by create's control-plane roots. */
-  readonly voicePolicyFile?: string;
+  /** The control plane's config root, whose shared operator policies the host reads; supplied by create. */
+  readonly hostPolicyRoot?: string;
 }
 
 function assertPort(value: unknown, label: string): number {
@@ -357,14 +359,14 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   upsertEnvVars: UpsertEnvVars,
-  voicePolicyFile?: string,
+  hostPolicyRoot?: string,
 ): Promise<void> {
   const config = validateRuntimeConfig(configInput);
   await preparePrivateDirectory(path.dirname(instanceRuntimeFile(config.state_root)));
   await preparePrivateDirectory(path.dirname(config.secret_files.gchat_subscriber_key));
   await preparePrivateDirectory(instanceLayout(config.instance_root).logs);
   await persistRuntimeFile(config);
-  if (voicePolicyFile) await bindInstanceVoicePolicy(config, voicePolicyFile, upsertEnvVars);
+  if (hostPolicyRoot) await bindInstanceHostPolicies(config, hostPolicyRoot, upsertEnvVars);
   const owned = instanceHostConfiguration(config);
   const present = readInstanceHostEnvironment(config.state_root);
   const missing = Object.entries(owned).filter(([key]) => present[key] === undefined);
@@ -376,16 +378,35 @@ export async function persistInstanceRuntime(
   );
 }
 
-/** Bind a locator in native host configuration; it conveys no per-assistant consent. */
-export async function bindInstanceVoicePolicy(
+/**
+ * The shared operator policies under the control plane's config root, by the
+ * host variable that locates each: voice, and 1Password. Each names a file,
+ * never a value, and never the 1Password management token beside its policy.
+ */
+export function hostPolicyLocators(configRoot: string): Readonly<Record<string, string>> {
+  return {
+    [VOICE_POLICY_FILE_ENV]: path.join(configRoot, 'voice.json'),
+    [ONEPASSWORD_POLICY_FILE_ENV]: onePasswordHostPaths(configRoot).policyFile,
+  };
+}
+
+/**
+ * Bind the shared policy locators in native host configuration, rewriting
+ * only one that differs; whether one did. A locator conveys no per-assistant
+ * consent: each policy decides for itself, and stays out of runtime.json,
+ * container env and release snapshots.
+ */
+export async function bindInstanceHostPolicies(
   config: InstanceRuntimeConfig,
-  policyFile: string,
+  configRoot: string,
   upsertEnvVars: UpsertEnvVars,
-): Promise<void> {
-  if (!path.isAbsolute(policyFile)) throw new GwsEaError('invalid_arguments', 'Voice policy locator must be absolute');
-  const key = 'GWS_EA_VOICE_POLICY_FILE';
-  if (readEnvFile([key], config.state_root)[key] !== policyFile)
-    upsertEnvVars({ [key]: policyFile }, config.state_root);
+): Promise<boolean> {
+  if (!path.isAbsolute(configRoot)) throw new GwsEaError('invalid_arguments', 'Host policy locators must be absolute');
+  const locators = hostPolicyLocators(configRoot);
+  const present = readEnvFile(Object.keys(locators), config.state_root);
+  const changed = Object.entries(locators).filter(([key, file]) => present[key] !== file);
+  if (changed.length) upsertEnvVars(Object.fromEntries(changed), config.state_root);
+  return changed.length > 0;
 }
 
 /** gws-ea's `.env` keys as the `.env` in `root` holds them, as NanoClaw reads it; other writers' keys are not read. */
@@ -871,7 +892,7 @@ export async function reconcileInstanceRuntime(
 ): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   const release = instanceLayout(config.instance_root).release(releaseName(commit));
-  await persistInstanceRuntime(config, dependencies.upsertEnvVars, dependencies.voicePolicyFile);
+  await persistInstanceRuntime(config, dependencies.upsertEnvVars, dependencies.hostPolicyRoot);
   // The script runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
   const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
     HOME: config.home_directory,

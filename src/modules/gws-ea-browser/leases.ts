@@ -11,6 +11,26 @@ export function browserSite(url: string): string {
   return domain;
 }
 
+/**
+ * Credential phases whose site stays held by their job (KTD8): the website
+ * may have taken a credential, and only that job's verification or
+ * reconciliation may settle it. Another errand can neither submit there
+ * again nor take the site meanwhile; every other site stays free.
+ */
+export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown', 'confirmed'] as const;
+
+/** The sites a job holds for its unresolved credential attempts. */
+export async function heldCredentialSites(db: DbDriver, jobId: string): Promise<Set<string>> {
+  if (!(await db.hasTable('gws_ea_browser_credential_attempts'))) return new Set();
+  const rows = await db.all<{ site: string }>(
+    `SELECT DISTINCT site FROM gws_ea_browser_credential_attempts
+      WHERE job_id = ? AND phase IN (${HELD_CREDENTIAL_PHASES.map(() => '?').join(',')})`,
+    jobId,
+    ...HELD_CREDENTIAL_PHASES,
+  );
+  return new Set(rows.map((row) => row.site));
+}
+
 export interface SiteLease {
   site: string;
   job_id: string;
@@ -47,10 +67,13 @@ export class SiteLeaseStore {
         jobId,
         at,
       );
-      const idle = await this.db.all<{ site: string }>(
-        "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state = 'idle' ORDER BY site",
-        jobId,
-      );
+      const held = await heldCredentialSites(this.db, jobId);
+      const idle = (
+        await this.db.all<{ site: string }>(
+          "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state = 'idle' ORDER BY site",
+          jobId,
+        )
+      ).filter((row) => !held.has(row.site));
       const waitingJobs = new Set<string>();
       for (const row of idle) {
         const waiters = await this.db.all<{ job_id: string }>(
@@ -58,8 +81,12 @@ export class SiteLeaseStore {
           row.site,
         );
         for (const waiter of waiters) waitingJobs.add(waiter.job_id);
+        await this.db.run(
+          "DELETE FROM gws_ea_browser_site_leases WHERE site = ? AND job_id = ? AND state = 'idle'",
+          row.site,
+          jobId,
+        );
       }
-      await this.db.run("DELETE FROM gws_ea_browser_site_leases WHERE job_id = ? AND state = 'idle'", jobId);
       return { acquired: false, site, releasedSites: idle.map((row) => row.site), waitingJobs: [...waitingJobs] };
     });
   }
@@ -121,17 +148,22 @@ export class SiteLeaseStore {
     });
   }
 
-  /** The caller wakes returned jobs after commit; it never awaits delivery inside a transaction. */
+  /**
+   * The caller wakes returned jobs after commit; it never awaits delivery inside a transaction.
+   * A site the job holds for an unresolved credential attempt stays leased to it.
+   */
   async release(jobId: string, site?: string): Promise<string[]> {
     return this.db.transaction(async () => {
-      const held =
+      const credentials = await heldCredentialSites(this.db, jobId);
+      const held = (
         site === undefined
           ? await this.db.all<{ site: string }>('SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ?', jobId)
           : await this.db.all<{ site: string }>(
               'SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND site = ?',
               jobId,
               site,
-            );
+            )
+      ).filter((row) => !credentials.has(row.site));
       const waiting = new Set<string>();
       for (const row of held) {
         const waiters = await this.db.all<{ job_id: string }>(

@@ -1,5 +1,6 @@
 import type { CapabilityList, VoiceCapabilityObservation } from './capabilities.js';
 import type { BrowserCapabilityObservation, BrowserOperationData } from './browser-capability.js';
+import type { OnePasswordCapabilityObservation, OnePasswordDisableData, OnePasswordEnableData } from './onepassword.js';
 import {
   COMMAND_DEFINITIONS,
   findCommand,
@@ -67,6 +68,9 @@ export type CommandData =
   | VoiceCapabilityObservation
   | BrowserCapabilityObservation
   | BrowserOperationData
+  | OnePasswordCapabilityObservation
+  | OnePasswordEnableData
+  | OnePasswordDisableData
   | AssistantListing
   | AssistantStatus;
 export interface ManagedResult<T = CommandData> {

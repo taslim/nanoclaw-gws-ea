@@ -6,6 +6,7 @@ import { isRecord } from '../../gws-ea/validation.js';
 import { requestWake } from '../../request-wake.js';
 import { writeBrowserNotice } from './notices.js';
 import { markBrowserRequestCommitStarted } from './db.js';
+import { heldCredentialSites } from './leases.js';
 import {
   completePurchaseFacts,
   materialPurchaseChange,
@@ -337,7 +338,8 @@ export class PurchaseAuthorityStore {
         "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
         authority.job_id,
       );
-      if (!committing)
+      // An unresolved credential attempt keeps a requested cancellation waiting too.
+      if (!committing && (await heldCredentialSites(this.db, authority.job_id)).size === 0)
         await this.db.run(
           'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
           at,

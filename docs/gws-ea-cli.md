@@ -9,7 +9,8 @@ for a command's flags, scope, effects, prerequisites, recovery, and examples.
 `gws-ea help capabilities install` and `gws-ea capabilities install --help`
 print identical help. Invalid paths remain errors even with `--help`.
 See [the voice guide](gws-ea-voice.md) for optional voice installation,
-activation, and health checks.
+activation, and health checks, and [1Password vaults](#1password-vaults) for
+assistants' saved logins.
 
 ## Find and inspect an assistant
 
@@ -96,6 +97,76 @@ before a later step pauses or is cancelled. Its scope, removed resources, and
 incomplete cleanup remain visible, including under `--quiet`. `gws-ea cleanup`
 repeats that authoring-checkout cleanup. Managed assistant state remains governed
 by its own lifecycle and ownership rules.
+
+## 1Password vaults
+
+```sh
+gws-ea capabilities enable onepassword
+gws-ea capabilities check onepassword
+gws-ea capabilities disable onepassword
+gws-ea remove --id 01234567-89ab-4def-8123-456789abcdef --delete-vault
+```
+
+`enable` needs the 1Password CLI (`op`) 2.29 or later in an operator-owned
+location on this host's PATH (for example `brew install 1password-cli`), and the
+1Password desktop app signed in to the account assistants use, with Settings >
+Developer > Integrate with 1Password CLI turned on. The operator must be an owner
+or administrator allowed to create service accounts. The first run selects the
+account (`--account <account_id>`, or a terminal choice), recording its ID with
+the sign-in address the app lists for it, and the app may ask for approval. It
+creates a host management service account that may only create
+vaults. Then, for each compatible assistant, running or stopped, it creates a
+vault named after the assistant's address and a runtime service account with
+read and write access to only that vault. It never enables a browser or starts
+Chrome. Later `create` and `resume` provision new assistants the same way,
+through the same desktop sign-in; a wait there pauses with the assistant
+already talkable. An older release is skipped; `update` it, then rerun
+`enable`. A partial run keeps finished assistants, and a rerun continues the
+rest. When a creation's outcome is unknown, the result names what to delete or
+revoke on 1Password.com; then `--discard-unproven <instance_id|management>`
+forgets that attempt.
+
+`show` reads local records only. `check` spends service-account requests on
+identities, one vault read per assistant, and the account's usage. It never
+writes, so a recorded write grant is not a tested write. Every service account
+in the 1Password account, including another host's, shares one daily request
+limit set by the account's plan. `check` reports the account type, that limit,
+its usage and the assistants sharing it. A spent limit returns a rate-limited
+outcome, and nothing retries it automatically; a larger plan is the operator's
+choice.
+
+An assistant saves there the passwords it generates for new accounts and for
+password changes, which it makes only on logins it saved itself, with their
+username and site unchanged. A confirmed change replaces the password in that
+login and deletes the separate item that held the new one, so no item the
+assistant keeps holds the old password (1Password's item history and Recently
+Deleted keep earlier versions, as for any edit). If someone changes or removes
+the login in 1Password during the change, the assistant leaves it as they made
+it and keeps the new password in its own item. Principals manage the saved
+logins through their assistant, which shares its vault, view and edit, with the
+principal's confirmed 1Password user, and gives them the account's sign-in
+address and the vault's name. When it cannot (no confirmed member or guest has
+that email, a guest already uses another vault, an Individual account cannot
+share, or the host cannot share), the principal gets a message to forward naming
+the assistant, the account's sign-in address and ID, the vault's name when known
+and ID, and the email. Share the vault on 1Password.com, or add and confirm the
+person; the principal then asks the assistant to check again. After adding a
+login in 1Password, the principal asks the assistant to retry, which lists the
+vault again.
+
+`disable` stops every assistant's vault use at once and deletes their runtime
+tokens. Vaults, items, recorded IDs, unfinished credential attempts and the
+management service account stay. `enable` again reuses each vault and mints
+replacement runtime service accounts through the desktop sign-in. `remove`
+previews the vault and its item count, deletes the runtime token after the host
+stops, and deletes the vault only when this host's management service account
+created it and it is empty or `--delete-vault` was confirmed; never another
+vault. gws-ea never revokes a service account: revoke the ones disable and
+removal results name on 1Password.com under Developer > Directory. A removal
+receipt keeps their IDs after the assistant is gone, and the names of any vault
+or runtime service account whose creation was never proven; once you have
+revoked or deleted them, close it with
+`gws-ea remove --id <full-id> --yes --abandon onepassword`.
 
 ## Automation and streams
 

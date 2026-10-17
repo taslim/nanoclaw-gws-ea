@@ -19,9 +19,15 @@ import {
 import { activeStep } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
 
+/**
+ * Where provisioning paused: a journaled step, or the optional vault
+ * 1Password enablement gives a new assistant once every step is complete.
+ */
+export type ProvisionPausePhase = ProvisionStepId | 'provision_onepassword';
+
 export interface ProvisionHumanPause {
   readonly kind: 'human-action';
-  readonly phase: ProvisionStepId;
+  readonly phase: ProvisionPausePhase;
   readonly code: string;
   readonly message: string;
   readonly details?: readonly string[];
