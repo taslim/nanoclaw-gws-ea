@@ -13,6 +13,7 @@ import {
 import { stopChrome } from './chrome.js';
 import { prepareMerchantPage } from './merchant-signatures.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
+import { documentGate } from './document-gate.js';
 import { coverPageTargets } from './page-targets.js';
 import { ensurePrivateDirectory, type BrowserPaths } from './paths.js';
 
@@ -96,6 +97,8 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
     const context = browser.contexts()[0];
     if (!context) throw new Error('Chrome default context unavailable');
     await prepareAuthenticationIsolation(context);
+    // Every document of this connection pauses at its gate from the first request; the gate ends with it.
+    await documentGate(browser);
     const session = await browser.newBrowserCDPSession();
     for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
       await session.send('Browser.setPermission', { permission: { name }, setting: 'denied' });

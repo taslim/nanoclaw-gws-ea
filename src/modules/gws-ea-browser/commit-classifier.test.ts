@@ -130,7 +130,13 @@ it('submits positively identified native authentication forms without invoking a
     waitForEvent: async () => undefined,
     on: () => undefined,
     once: () => undefined,
-    context: () => ({ newCDPSession: async () => ({ on: () => undefined, send: async () => undefined }) }),
+    context: () => ({
+      newCDPSession: async () => ({ on: () => undefined, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
+      browser: () => ({
+        once: () => undefined,
+        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
+      }),
+    }),
   } as unknown as Page;
   // This unit mocks only the native Chrome object binding. Native-world integrity has its own real-renderer suite.
   vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({

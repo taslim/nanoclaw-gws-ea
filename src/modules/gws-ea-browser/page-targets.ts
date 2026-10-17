@@ -3,13 +3,15 @@ import type { CDPSession, Frame, Page } from 'playwright-core';
 interface PageTargetSettings {
   /** Each setting resolves once every current frame is covered; false while a live out-of-process frame is not. */
   covered: Array<() => Promise<boolean>>;
+  /** Each setting's sessions read the frame ids their targets host; undefined when one cannot be read. */
+  frameIds: Array<() => Promise<Set<string> | undefined>>;
   uncovered: Set<() => void>;
 }
 const settingsByPage = new WeakMap<Page, PageTargetSettings>();
 function settingsFor(page: Page): PageTargetSettings {
   let settings = settingsByPage.get(page);
   if (!settings) {
-    settings = { covered: [], uncovered: new Set() };
+    settings = { covered: [], frameIds: [], uncovered: new Set() };
     settingsByPage.set(page, settings);
   }
   return settings;
@@ -25,20 +27,35 @@ export async function pageTargetsReady(page: Page): Promise<boolean> {
   return (await Promise.all(settingsFor(page).covered.map((covered) => covered()))).every(Boolean);
 }
 
+/** Every frame id the page's targets host now, read through any setting's sessions, or undefined. */
+export async function pageTargetFrameIds(page: Page): Promise<ReadonlySet<string> | undefined> {
+  for (const read of settingsFor(page).frameIds) {
+    const ids = await read();
+    if (ids) return ids;
+  }
+  return undefined;
+}
+
+/** A page with no setting yet gets sessions with none, so its frame trees stay readable. */
+export async function ensurePageTargets(page: Page): Promise<void> {
+  if (!settingsFor(page).frameIds.length) await coverPageTargets(page, async () => undefined);
+}
+
+interface FrameTreeNode {
+  frame: { id: string };
+  childFrames?: FrameTreeNode[];
+}
+
 /**
  * Chrome runs a cross-site frame as its own target, so a setting made on the page session never reaches it.
- * `setup` runs on the page session and on one session per live out-of-process frame until the page closes,
- * told which of the two it is;
+ * `setup` runs on the page session and on one session per live out-of-process frame until the page closes;
  * an in-process frame shares its local root's session.
  */
-export async function coverPageTargets(
-  page: Page,
-  setup: (session: CDPSession, target: 'page' | 'frame') => Promise<void>,
-): Promise<void> {
+export async function coverPageTargets(page: Page, setup: (session: CDPSession) => Promise<void>): Promise<void> {
   const settings = settingsFor(page);
   const pageSession = await page.context().newCDPSession(page);
   try {
-    await setup(pageSession, 'page');
+    await setup(pageSession);
   } catch (error) {
     await pageSession.detach().catch(() => undefined);
     throw error;
@@ -74,7 +91,7 @@ export async function coverPageTargets(
         if (ready) ended();
       });
       frameSessions.add(frameSession);
-      const applied = await setup(frameSession, 'frame').then(
+      const applied = await setup(frameSession).then(
         () => true,
         () => false,
       );
@@ -109,9 +126,9 @@ export async function coverPageTargets(
   const coverChanged = (frame: Frame): void => {
     void cover(frame).then(report);
   };
-  // Accepted residual: Playwright's public API cannot pause a new frame target, so a page script that
-  // navigates a brand-new out-of-process frame within milliseconds of its creation can act before this
-  // coverage lands. Agent actions are always covered: pageTargetsReady runs before every operation.
+  // A brand-new out-of-process frame gets these sessions a few milliseconds after it starts. Its documents
+  // never wait on them: the browser-level document gate pauses each from its first request. A setting
+  // here guards what needs an agent action, and pageTargetsReady covers every frame before each one.
   page.on('frameattached', coverChanged);
   page.on('framenavigated', coverChanged);
   page.once('close', () => {
@@ -121,6 +138,28 @@ export async function coverPageTargets(
     for (const session of [pageSession, ...frameSessions]) void session.detach().catch(() => undefined);
     frameSessions.clear();
   });
+  const frameIds = async (): Promise<Set<string> | undefined> => {
+    if (!(await covered())) return undefined;
+    const ids = new Set<string>();
+    for (const session of [pageSession, ...frameSessions]) {
+      let tree: FrameTreeNode;
+      try {
+        ({ frameTree: tree } = await session.send('Page.getFrameTree'));
+        // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read leaves the page's frames unknown.
+      } catch (_error) {
+        // A frame session that closed meanwhile took its frames with it; any other failure is unknown.
+        if (session !== pageSession && !frameSessions.has(session)) continue;
+        return undefined;
+      }
+      const visit = (node: FrameTreeNode): void => {
+        ids.add(node.frame.id);
+        node.childFrames?.forEach(visit);
+      };
+      visit(tree);
+    }
+    return ids;
+  };
   settings.covered.push(covered);
+  settings.frameIds.push(frameIds);
   report(await covered());
 }

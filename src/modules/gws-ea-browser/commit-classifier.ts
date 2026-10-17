@@ -1,7 +1,8 @@
 import type { ElementHandle, Page } from 'playwright-core';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
-import { coverPageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
+import { documentGate } from './document-gate.js';
+import { ensurePageTargets, onUncoveredPageTarget, pageTargetFrameIds, pageTargetsReady } from './page-targets.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
   authenticationEndpoint,
@@ -386,7 +387,7 @@ export interface BrowserNavigationGuard {
 }
 const navigationGuards = new WeakMap<Page, Promise<BrowserNavigationGuard>>();
 
-/** The sole Fetch owner for a page and its out-of-process frames, kept installed until the page closes. */
+/** The page's navigation guard: it decides the page's documents at the browser's document gate until the page closes. */
 export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let guard = navigationGuards.get(page);
   if (!guard) {
@@ -396,18 +397,17 @@ export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigat
   return guard;
 }
 
-/** One paused request's class under the operation scopes that were current when it paused. */
+/** One paused document's class under the operation scopes that were current when it paused. */
 async function decideNavigation(
   page: Page,
   url: string,
-  resourceType: string,
   scopes: readonly BrowserNavigationPolicy[],
 ): Promise<ActivationClass | 'site_busy'> {
-  let classification: ActivationClass | 'site_busy' =
-    resourceType !== 'Document' ? 'ordinary' : scopes.length ? classifyNavigationUrl(url) : 'unsupported_merchant';
+  let classification: ActivationClass | 'site_busy' = scopes.length
+    ? classifyNavigationUrl(url)
+    : 'unsupported_merchant';
   const approved = approvedPresses.get(page);
   if (
-    resourceType === 'Document' &&
     approved &&
     classification !== 'blocked_address' &&
     classification !== 'account_security' &&
@@ -419,21 +419,26 @@ async function decideNavigation(
       classification = known === 'purchase_control' ? 'ordinary' : known;
     }
   }
-  if (resourceType === 'Document')
-    for (const policy of scopes) {
-      if (policy.classify) {
-        let scoped: ActivationClass;
-        try {
-          scoped = policy.classify(new URL(url));
-        } catch (_error) {
-          scoped = 'blocked_address';
-        }
-        if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
+  for (const policy of scopes) {
+    if (policy.classify) {
+      let scoped: ActivationClass;
+      try {
+        scoped = policy.classify(new URL(url));
+      } catch (_error) {
+        scoped = 'blocked_address';
       }
-      if (classification === 'ordinary' && policy.beforeNavigate)
-        classification = await policy.beforeNavigate(new URL(url));
+      if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
     }
+    if (classification === 'ordinary' && policy.beforeNavigate)
+      classification = await policy.beforeNavigate(new URL(url));
+  }
   return classification;
+}
+
+function withoutReferrer(headers: Record<string, string>): Array<{ name: string; value: string }> {
+  return Object.entries(headers)
+    .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
+    .map(([name, value]) => ({ name, value: String(value) }));
 }
 
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
@@ -446,50 +451,54 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   onUncoveredPageTarget(page, () => {
     blocked = 'blocked_address';
   });
-  // Every covered target shares this handler, its policy stack and its block record.
-  await coverPageTargets(page, async (session, target) => {
-    session.on('Fetch.requestPaused', (event) => {
+  const browser = page.context().browser();
+  if (!browser) throw new Error('A navigation guard needs its Chrome connection');
+  const gate = await documentGate(browser);
+  // The gate places a same-process child frame through these sessions' frame trees.
+  await ensurePageTargets(page);
+  // The gate decides documents. While a sign-in scope asks, this session also strips the Referer
+  // from the page's other requests.
+  const pageSession = await page.context().newCDPSession(page);
+  pageSession.on('Fetch.requestPaused', (event) => {
+    void pageSession
+      .send('Fetch.continueRequest', { requestId: event.requestId, headers: withoutReferrer(event.request.headers) })
+      .catch(() => undefined);
+  });
+  const { targetInfo } = await pageSession.send('Target.getTargetInfo');
+  const unregister = gate.register(targetInfo.targetId, {
+    capture() {
       const scopes = [...policies];
       const pausedIn = generation;
-      void (async () => {
-        let classification: ActivationClass | 'site_busy';
-        try {
-          classification = await decideNavigation(page, event.request.url, event.resourceType, scopes);
-          // eslint-disable-next-line no-catch-all/no-catch-all -- A decision that cannot complete refuses its request.
-        } catch (_error) {
-          classification = 'blocked_address';
-        }
-        if (classification === 'ordinary' || event.request.url === 'about:blank') {
-          const headers = scopes.some((policy) => policy.stripReferrer)
-            ? Object.entries(event.request.headers)
-                .filter(([name]) => !/^(?:referer|referrer)$/iu.test(name))
-                .map(([name, value]) => ({ name, value: String(value) }))
-            : undefined;
-          await session
-            .send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) })
-            .catch(() =>
-              session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }),
-            );
-        } else {
-          if (pausedIn === generation) blocked = classification;
-          await session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' });
-        }
-      })().catch(() => {
-        // Only a send fails here, once its request or its target is gone: nothing was let through.
-      });
-    });
-    // The page session pauses every request, so a sign-in scope can strip any Referer. A frame session
-    // pauses documents only: every other request is let through unchanged, and pausing each one would
-    // cost the host a round trip per request from busy cross-site frames.
-    await session.send('Fetch.enable', {
-      patterns: [
-        target === 'page' ? { requestStage: 'Request' } : { requestStage: 'Request', resourceType: 'Document' },
-      ],
-    });
+      const record = (classification: Exclude<ActivationClass, 'ordinary'> | 'site_busy'): void => {
+        if (pausedIn === generation) blocked = classification;
+      };
+      return {
+        async decide(document) {
+          let classification: ActivationClass | 'site_busy';
+          try {
+            classification = await decideNavigation(page, document.url, scopes);
+            // eslint-disable-next-line no-catch-all/no-catch-all -- A decision that cannot complete refuses its request.
+          } catch (_error) {
+            classification = 'blocked_address';
+          }
+          if (classification === 'ordinary' || document.url === 'about:blank')
+            return scopes.some((policy) => policy.stripReferrer)
+              ? { allow: true, headers: withoutReferrer(document.headers) }
+              : { allow: true };
+          record(classification);
+          return { allow: false };
+        },
+        refuse: () => record('blocked_address'),
+      };
+    },
+    frameIds: () => pageTargetFrameIds(page),
   });
   page.once('close', () => {
+    unregister();
     navigationGuards.delete(page);
+    void pageSession.detach().catch(() => undefined);
   });
+  let stripping = 0;
   return {
     reason: () => blocked,
     clearReason() {
@@ -503,7 +512,10 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         ++generation;
       }
       policies.push(scope);
+      const strips = Boolean(scope.stripReferrer);
       try {
+        if (strips && stripping++ === 0)
+          await pageSession.send('Fetch.enable', { patterns: [{ requestStage: 'Request' }] });
         // An operation can act only in frames that exist now, so every page-target setting covers each first.
         if (!(await pageTargetsReady(page))) {
           blocked = 'blocked_address';
@@ -513,6 +525,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       } finally {
         const index = policies.lastIndexOf(scope);
         if (index !== -1) policies.splice(index, 1);
+        if (strips && --stripping === 0) await pageSession.send('Fetch.disable').catch(() => undefined);
         if (outermost) ++generation;
       }
     },
@@ -521,7 +534,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
 
 export type BrowserSiteAccess = (url: URL) => Promise<'ordinary' | 'site_busy' | 'blocked_address'>;
 
-/** Use around every host browser executor; nested secret scopes share this same Fetch owner. */
+/** Use around every host browser executor; nested secret scopes share this same page guard. */
 export async function withBrowserJobNavigation<T>(
   context: BrowserExecutionContext,
   page: Page,

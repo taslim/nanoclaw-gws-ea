@@ -114,7 +114,14 @@ function fixture(origin = 'https://www.shop.example') {
     context: () => ({
       newCDPSession: async () => ({
         on: () => undefined,
-        send: async () => ({ frameTree: { frame: { loaderId: 'fixture-document' } } }),
+        send: async () => ({
+          frameTree: { frame: { loaderId: 'fixture-document' } },
+          targetInfo: { targetId: 'fixture-page' },
+        }),
+      }),
+      browser: () => ({
+        once: () => undefined,
+        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
       }),
     }),
   } as unknown as Page;

@@ -71,7 +71,9 @@ let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
 let widgetRequests: string[];
+let offerRequests: string[];
 const WIDGET_ORIGIN = 'https://pay.example';
+const OFFERS_ORIGIN = 'https://offers.example';
 
 function reviewHtml(): string {
   return `<html><body><a id="nav-link-accountList"><span class="nav-line-1">Hello, Morgan</span></a>
@@ -109,6 +111,8 @@ function fixturePage(pathname: string): string {
       return productHtml();
     case '/dp/B0PAYFRAME':
       return widgetHostHtml(`${WIDGET_ORIGIN}/`);
+    case '/dp/B0OFFERS01':
+      return offersHostHtml();
     case '/dp/B0PAYLATER':
       return widgetHostHtml();
     case '/gp/cart/view.html':
@@ -120,6 +124,27 @@ function fixturePage(pathname: string): string {
     default:
       return '<html><body>Processing your order</body></html>';
   }
+}
+/** Frame documents that report to the top page, then navigate themselves to a purchase. */
+function offerDocument(url: URL): string | undefined {
+  const purchase = `top.postMessage('redirecting', '*'); location.replace('/checkout/placeorder');`;
+  // A brand-new frame that navigates itself while it loads.
+  if (url.searchParams.has('redirect')) return `<html><body><script>${purchase}</script></body></html>`;
+  // A widget hosting one same-site child, in its own process, and one cross-site child, in another.
+  if (url.searchParams.has('nest'))
+    return `<html><body><iframe src="/?child=same"></iframe><iframe src="${OFFERS_ORIGIN}/?child=cross"></iframe></body></html>`;
+  // A nested child that navigates itself only when the top page asks.
+  if (url.searchParams.has('child'))
+    return `<html><body><script>top.postMessage('ready', '*'); addEventListener('message', (event) => { if (event.data === 'go') { ${purchase} } });</script></body></html>`;
+  return undefined;
+}
+function offersHostHtml(): string {
+  const control = (label: string, script: string) =>
+    `<a href="${AMAZON_RETAIL.origin}/dp/B012345678" onclick="event.preventDefault(); ${script}">${label}</a>`;
+  const count = `let ready = 0; let redirected = 0; addEventListener('message', (event) => { if (event.data === 'ready') document.getElementById('ready').textContent = 'Ready ' + ++ready; if (event.data === 'redirecting') document.getElementById('redirected').textContent = 'Redirected ' + ++redirected; });`;
+  const insert = (query: string) =>
+    `const offer = document.createElement('iframe'); offer.src = '${WIDGET_ORIGIN}/?' + ${query}; document.body.append(offer);`;
+  return `<html><body><h1>Tea kettle</h1>${control('Load offers', insert("'redirect=' + document.querySelectorAll('iframe').length"))}${control('Load nested offers', insert("'nest=1'"))}${control('Start offers', "const widget = frames[frames.length - 1]; for (let i = 0; i < widget.length; i++) widget[i].postMessage('go', '*');")}<p id="ready"></p><p id="redirected"></p><script>${count}</script></body></html>`;
 }
 function widgetHostHtml(widgetSrc?: string): string {
   // The later host loads its widget only once a postcode is typed, from inside a job batch.
@@ -259,7 +284,15 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       (request, response) => {
         const url = new URL(request.url ?? '/', AMAZON_RETAIL.origin);
         request.resume();
-        if (request.headers.host === new URL(WIDGET_ORIGIN).host) {
+        if (request.headers.host === new URL(OFFERS_ORIGIN).host) {
+          offerRequests.push(url.pathname);
+          response.writeHead(200, { 'content-type': 'text/html' });
+          response.end(offerDocument(url) ?? '<html><body>Offer details</body></html>');
+        } else if (request.headers.host === new URL(WIDGET_ORIGIN).host && offerDocument(url)) {
+          widgetRequests.push(url.pathname);
+          response.writeHead(200, { 'content-type': 'text/html' });
+          response.end(offerDocument(url));
+        } else if (request.headers.host === new URL(WIDGET_ORIGIN).host) {
           widgetRequests.push(url.pathname);
           response.writeHead(200, { 'content-type': 'text/html' });
           response.end(url.pathname === '/' ? widgetHtml() : '<html><body>Plan details</body></html>');
@@ -300,7 +333,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       socket.once('close', () => transportSockets.delete(socket));
     });
     fixtureProxy.on('connect', (request, socket, head) => {
-      if (request.url !== 'www.amazon.com:443' && request.url !== `${new URL(WIDGET_ORIGIN).host}:443`) {
+      if (
+        ![AMAZON_RETAIL.origin, WIDGET_ORIGIN, OFFERS_ORIGIN].some(
+          (origin) => request.url === `${new URL(origin).host}:443`,
+        )
+      ) {
         socket.destroy();
         return;
       }
@@ -389,6 +426,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     holdPost = undefined;
     sawPost = undefined;
     widgetRequests = [];
+    offerRequests = [];
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
@@ -1149,5 +1187,69 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       expect(String(await leaving)).toContain('ERR_BLOCKED_BY_CLIENT');
       expect(guard.reason()).toBeUndefined();
     });
+  }, 30_000);
+  it('refuses brand-new cross-site frames that navigate themselves to a purchase as they load', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
+    const reasons: unknown[] = [];
+    for (let trial = 1; trial <= 20; trial++) {
+      await queue.accept(
+        'browser',
+        {
+          actions: [
+            { kind: 'click', ...(await nativeRef('link "Load offers"')) },
+            { kind: 'wait_for', text: `Redirected ${trial}`, timeout_ms: 5_000 },
+          ],
+        },
+        session,
+        `offers-${trial}`,
+      );
+      await queue.idle();
+      reasons.push((await request(`offers-${trial}`))?.reason);
+    }
+    expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
+    expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
+  }, 60_000);
+  it('places nested same-site and cross-site frames with the page that hosts their widget', async () => {
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
+    await queue.accept(
+      'browser',
+      {
+        actions: [
+          { kind: 'click', ...(await nativeRef('link "Load nested offers"')) },
+          { kind: 'wait_for', text: 'Ready 2', timeout_ms: 5_000 },
+        ],
+      },
+      session,
+      'nested-load',
+    );
+    await queue.idle();
+    // Both children loaded, so the gate placed each first document with this page.
+    expect(await request('nested-load')).toMatchObject({ status: 'completed' });
+    const child = (url: string) => {
+      const frame = page.frames().find((candidate) => candidate.url() === url);
+      if (!frame) throw new Error(`Nested frame missing: ${url}`);
+      return frame;
+    };
+    // The cross-site child is its own target, found through its parent; the same-site child is not a
+    // target at all, found only in its widget's frame tree.
+    await (await page.context().newCDPSession(child(`${OFFERS_ORIGIN}/?child=cross`))).detach();
+    await expect(page.context().newCDPSession(child(`${WIDGET_ORIGIN}/?child=same`))).rejects.toThrow(
+      'does not have a separate CDP session',
+    );
+    await queue.accept(
+      'browser',
+      {
+        actions: [
+          { kind: 'click', ...(await nativeRef('link "Start offers"')) },
+          { kind: 'wait_for', text: 'Redirected 2', timeout_ms: 5_000 },
+        ],
+      },
+      session,
+      'nested-go',
+    );
+    await queue.idle();
+    expect(await request('nested-go')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+    expect(widgetRequests).not.toContain('/checkout/placeorder');
+    expect(offerRequests).not.toContain('/checkout/placeorder');
   }, 30_000);
 });
