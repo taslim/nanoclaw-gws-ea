@@ -223,19 +223,24 @@ frame; agents see opaque item handles and outcomes only.
 The operator provisions 1Password host-wide (see
 [docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
 `gws-ea capabilities enable onepassword`, their desktop sign-in mints a host
-management service account that may only create vaults. It creates one vault
+management service account that may only create vaults, and the host records
+the account's ID with its sign-in address as the app lists it. It creates one vault
 for each compatible assistant, and for each one created later, and the operator
 mints that assistant's runtime service account with read/write access to only
 its vault. A signup or password change saves the generated password in the
 vault before any site sees it. Passwords change only on logins the host saved
 itself whose username and site are unchanged; logins the principal added or
 edited, and sign-in email, phone, two-factor and payment-method changes on any
-account, are refused. A confirmed change keeps both credentials until the
-principal moves the new password into the original login (automatic promotion
-stays off until live acceptance proves stale writes are refused). Main asks the
-host to share the vault, view and edit, with the principal's exact confirmed
-1Password user through the management account; when it cannot, the principal
-gets a message to forward to their operator.
+account, are refused. A confirmed change writes the new password into the
+original login, read fresh and re-checked against its ownership record, on the
+version just read (a racing edit is retried, bounded), then deletes the
+candidate, so the old password stays nowhere the host keeps. A login changed or
+removed in 1Password meanwhile is left as it is, with the new password in its
+own item. Main asks the host to share the vault, view and edit, with the
+principal's exact confirmed 1Password user through the management account; a
+share answers with the recorded sign-in address as a link and the vault's exact
+name (1Password documents no link to a vault itself). When it cannot, the
+principal gets a message to forward to their operator.
 
 `disable` stops every vault use at once and deletes runtime tokens, keeping
 vaults, items, IDs and the management account; re-enabling mints replacement

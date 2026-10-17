@@ -112,8 +112,9 @@ location on this host's PATH (for example `brew install 1password-cli`), and the
 1Password desktop app signed in to the account assistants use, with Settings >
 Developer > Integrate with 1Password CLI turned on. The operator must be an owner
 or administrator allowed to create service accounts. The first run selects the
-account (`--account <account_id>`, or a terminal choice) and the app may ask for
-approval. It creates a host management service account that may only create
+account (`--account <account_id>`, or a terminal choice), recording its ID with
+the sign-in address the app lists for it, and the app may ask for approval. It
+creates a host management service account that may only create
 vaults. Then, for each compatible assistant, running or stopped, it creates a
 vault named after the assistant's address and a runtime service account with
 read and write access to only that vault. It never enables a browser or starts
@@ -136,15 +137,22 @@ choice.
 
 An assistant saves there the passwords it generates for new accounts and for
 password changes, which it makes only on logins it saved itself, with their
-username and site unchanged. Principals manage the saved logins through their
-assistant, which shares its vault, view and edit, with the principal's
-confirmed 1Password user. When it cannot (no confirmed member or guest has that
-email, a guest already uses another vault, an Individual account cannot share,
-or the host cannot share), the principal gets a message to forward naming the
-assistant, the account and vault IDs, and the email. Share the vault on
-1Password.com, or add and confirm the person; the principal then asks the
-assistant to check again. After adding a login in 1Password, the principal asks
-the assistant to retry, which lists the vault again.
+username and site unchanged. A confirmed change replaces the password in that
+login and deletes the separate item that held the new one, so no item the
+assistant keeps holds the old password (1Password's item history and Recently
+Deleted keep earlier versions, as for any edit). If someone changes or removes
+the login in 1Password during the change, the assistant leaves it as they made
+it and keeps the new password in its own item. Principals manage the saved
+logins through their assistant, which shares its vault, view and edit, with the
+principal's confirmed 1Password user, and gives them the account's sign-in
+address and the vault's name. When it cannot (no confirmed member or guest has
+that email, a guest already uses another vault, an Individual account cannot
+share, or the host cannot share), the principal gets a message to forward naming
+the assistant, the account's sign-in address and ID, the vault's name when known
+and ID, and the email. Share the vault on 1Password.com, or add and confirm the
+person; the principal then asks the assistant to check again. After adding a
+login in 1Password, the principal asks the assistant to retry, which lists the
+vault again.
 
 `disable` stops every assistant's vault use at once and deletes their runtime
 tokens. Vaults, items, recorded IDs, unfinished credential attempts and the

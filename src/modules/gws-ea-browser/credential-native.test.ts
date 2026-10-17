@@ -62,7 +62,12 @@ import './index.js';
 import { browserCredentialAttemptsMigration, browserSiteLeasesMigration } from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
-import { FakeOnePassword, FIXTURE_ACCOUNT_ID, writeVaultFixture } from './onepassword-fixture.js';
+import {
+  FakeOnePassword,
+  FIXTURE_ACCOUNT_ID,
+  FIXTURE_SIGN_IN_ADDRESS,
+  writeVaultFixture,
+} from './onepassword-fixture.js';
 import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './queue.js';
@@ -323,7 +328,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     fake = new FakeOnePassword();
     sdk.create.mockReset();
     sdk.create.mockImplementation(async () => fake.client());
-    attempts = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+    attempts = new CredentialAttempts({ db: getDb(), vault });
     posts.length = 0;
     addresses.length = 0;
     responses.clear();
@@ -541,14 +546,15 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       activate: 'Change password',
     };
 
-    it('fills current, new and confirmation from one saved candidate and keeps both credentials while promotion is off', async () => {
+    it('fills current, new and confirmation from one saved candidate and writes the new password into the login', async () => {
       const { itemId, handle } = await ownedAccount();
       const original = accountPassword;
       const authority = await changeAuthority(handle);
       await page.goto(`${SITE}/change`);
       const result = await fill(authority, await refs(CHANGE));
-      expect(result).toEqual({ status: 'password_changed', vault: 'both_kept' });
-      const next = await candidatePassword(authority.id);
+      expect(result).toEqual({ status: 'password_changed', vault: 'updated' });
+      const next = fake.value(itemId, 'password');
+      if (next === undefined) throw new Error('no password');
       expect(posts).toEqual([
         {
           host: 'accounts.shop.example',
@@ -561,23 +567,21 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         },
       ]);
       expect(accountPassword).toBe(next);
-      // AE4: both credentials stay in 1Password; neither reaches a tool result.
-      expect(fake.value(itemId, 'password')).toBe(original);
-      expect(await attempts.get(authority.id)).toMatchObject({
-        phase: 'conflict',
-        conflict_reason: 'promotion_disabled',
-      });
+      // One login holds the site's new password; the candidate and the old password are gone, and neither reaches a tool result.
+      expect(next).not.toBe(original);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+      expect([...fake.items.keys()]).toEqual([itemId]);
+      expect(fake.concealed()).toEqual([next]);
       for (const value of [original!, next]) expect(JSON.stringify(result)).not.toContain(value);
     }, 30_000);
 
     it('accepts a change form that only displays the account read-only, and never writes to it', async () => {
-      const { handle } = await ownedAccount();
+      const { itemId, handle } = await ownedAccount();
       const authority = await changeAuthority(handle);
       await page.goto(`${SITE}/change-shown-account`);
-      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'password_changed', vault: 'both_kept' });
-      const next = await candidatePassword(authority.id);
+      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'password_changed', vault: 'updated' });
       expect(new URLSearchParams(posts[0]?.body).get('email')).toBe(USERNAME);
-      expect(accountPassword).toBe(next);
+      expect(accountPassword).toBe(fake.value(itemId, 'password'));
     }, 30_000);
 
     it('covers AE7 at the page: a Login edited after delegation is refused before any insertion', async () => {
@@ -606,15 +610,15 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     }, 30_000);
 
     it('changes the password on a formless page whose only editable fields are the bound ones', async () => {
-      const { handle } = await ownedAccount();
+      const { itemId, handle } = await ownedAccount();
       const original = accountPassword;
       const authority = await changeAuthority(handle);
       await page.goto(`${SITE}/no-form-change`);
       expect(await fill(authority, await refs(NO_FORM_CHANGE))).toEqual({
         status: 'password_changed',
-        vault: 'both_kept',
+        vault: 'updated',
       });
-      const next = await candidatePassword(authority.id);
+      const next = fake.value(itemId, 'password');
       expect(posts).toEqual([
         {
           host: 'accounts.shop.example',
@@ -633,8 +637,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         '<h1>Your password has been changed.</h1><p>We sent you an email to let you know.</p>',
       );
       await page.goto(`${SITE}/change`);
-      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'password_changed', vault: 'both_kept' });
-      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'conflict' });
+      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'password_changed', vault: 'updated' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
     }, 30_000);
 
     for (const [path, names] of [
@@ -732,6 +736,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
           schemaVersion: 2,
           enabled: false,
           accountId: FIXTURE_ACCOUNT_ID,
+          signInAddress: FIXTURE_SIGN_IN_ADDRESS,
           cliPath: '/opt/homebrew/bin/op',
           managementServiceAccountId: null,
         });
@@ -967,7 +972,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       const password = await candidatePassword(authority.id);
 
       // A fresh process knows only the durable record and 1Password.
-      const restarted = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      const restarted = new CredentialAttempts({ db: getDb(), vault });
       expect(
         await executeCredentialForm(
           context(),
@@ -1009,7 +1014,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     let delivered = 0;
     beforeEach(async () => {
       await runMigrations(await initTestDb());
-      attempts = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      attempts = new CredentialAttempts({ db: getDb(), vault });
       await createAgentGroup({
         id: 'external-email',
         name: 'external-email',

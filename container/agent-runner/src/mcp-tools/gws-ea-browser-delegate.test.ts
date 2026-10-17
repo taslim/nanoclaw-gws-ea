@@ -211,6 +211,8 @@ it('shares or refreshes the 1Password vault through the native host request, nev
   // main's guidance branches on the reason, so the tool names each one it can receive.
   for (const reason of ['not_a_member', 'not_confirmed', 'refused', 'host_cannot_share', 'unconfirmed'])
     expect(vaultAccess.tool.description).toContain(reason);
+  // On shared, main gives the principal the host's link and the vault's name.
+  for (const field of ['link', 'vault_name']) expect(vaultAccess.tool.description).toContain(field);
 });
 
 it('records signup or password-change authority through the native host request, never another security change or a value', async () => {

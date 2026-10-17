@@ -1788,6 +1788,7 @@ async function onePasswordHost(paths: ControlPlanePaths, provider: FakeOnePasswo
     schemaVersion: 2,
     enabled: true,
     accountId: ONEPASSWORD_ACCOUNT,
+    signInAddress: 'hale.1password.com',
     cliPath: OP,
     managementServiceAccountId: id,
   });

@@ -532,7 +532,12 @@ describe('1Password actions', () => {
     const runtime = await managementIdentity();
     const { cli, calls } = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant' }) }));
     // A reply without an item count reads as an unknown count, never as an empty vault.
-    expect(await cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID, itemCount: null });
+    expect(await cli.getVault(runtime, VAULT_ID)).toEqual({
+      status: 'ok',
+      vaultId: VAULT_ID,
+      name: 'Assistant',
+      itemCount: null,
+    });
     expect(calls[0].args).toEqual(['vault', 'get', VAULT_ID, '--format', 'json']);
     for (const [items, itemCount] of [
       [0, 0],
@@ -542,8 +547,16 @@ describe('1Password actions', () => {
       ['3', null],
     ] as const) {
       const counted = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant', items }) }));
-      expect(await counted.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'ok', vaultId: VAULT_ID, itemCount });
+      expect(await counted.cli.getVault(runtime, VAULT_ID)).toEqual({
+        status: 'ok',
+        vaultId: VAULT_ID,
+        name: 'Assistant',
+        itemCount,
+      });
     }
+    // A name the provider does not report as one line of text is no name.
+    const unnamed = await openCli(() => ({ stdout: JSON.stringify({ id: VAULT_ID, name: 'Assistant\nVault' }) }));
+    expect(await unnamed.cli.getVault(runtime, VAULT_ID)).toMatchObject({ status: 'ok', name: null });
 
     const other = await openCli(() => ({ stdout: JSON.stringify({ id: 'othervault0000000000000001' }) }));
     expect(await other.cli.getVault(runtime, VAULT_ID)).toEqual({ status: 'failed', reason: 'unexpected_output' });

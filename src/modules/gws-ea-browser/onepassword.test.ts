@@ -63,6 +63,7 @@ const hostPolicy = (enabled = true) => ({
   schemaVersion: 2 as const,
   enabled,
   accountId: ACCOUNT_ID,
+  signInAddress: 'hale.1password.com',
   cliPath: '/opt/homebrew/bin/op',
   managementServiceAccountId: MANAGEMENT_ID,
 });

@@ -37,6 +37,28 @@ export function isOnePasswordId(value: unknown): value is string {
 }
 
 /**
+ * An account's sign-in address: `my.1password.com`, `.ca` or `.eu` for a
+ * personal or family account, its own address on 1Password.com (or `.ca`,
+ * `.eu`, `ent.1password.com`) for a team or business.
+ */
+const SIGN_IN_ADDRESS = /^(?:[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?\.){1,2}1password\.(?:com|ca|eu)$/u;
+
+/** The sign-in address `op account list` reports for an account, with or without its scheme; undefined for anything else. */
+export function onePasswordSignInAddress(value: string): string | undefined {
+  const address = value
+    .trim()
+    .toLowerCase()
+    .replace(/^https:\/\//u, '')
+    .replace(/\/$/u, '');
+  return SIGN_IN_ADDRESS.test(address) ? address : undefined;
+}
+
+/** The link that opens the account on 1Password.com, built from its recorded sign-in address alone. */
+export function onePasswordAccountLink(policy: Pick<OnePasswordHostPolicy, 'signInAddress'>): string {
+  return new URL(`https://${policy.signInAddress}/`).href;
+}
+
+/**
  * Every vault permission the CLI documents: the first three on Teams and
  * Families; on Business they group the granular permissions that follow.
  */
@@ -93,6 +115,12 @@ export interface OnePasswordHostPolicy {
   readonly enabled: boolean;
   /** The one account every assistant on this host uses, by its exact ID: never a shorthand, URL or name. */
   readonly accountId: string;
+  /**
+   * That account's sign-in address, as the operator's 1Password app listed it
+   * for exactly that ID (`op account list`): where its members open it on the
+   * web. It locates the account for people; the ID alone binds it.
+   */
+  readonly signInAddress: string;
   /** The `op` the operator enabled, re-checked before each use: assistant services run with a PATH that may not reach it. */
   readonly cliPath: string;
   /** The host management service account; null when the operator's CLI creates each vault itself (KTD1's fallback). */
@@ -213,14 +241,23 @@ function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]):
 function parseHostPolicy(value: unknown): OnePasswordHostPolicy | undefined {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ['schemaVersion', 'enabled', 'accountId', 'cliPath', 'managementServiceAccountId'])
+    !hasExactKeys(value, [
+      'schemaVersion',
+      'enabled',
+      'accountId',
+      'signInAddress',
+      'cliPath',
+      'managementServiceAccountId',
+    ])
   )
     return undefined;
-  const { schemaVersion, enabled, accountId, cliPath, managementServiceAccountId } = value;
+  const { schemaVersion, enabled, accountId, signInAddress, cliPath, managementServiceAccountId } = value;
   if (
     schemaVersion !== 2 ||
     typeof enabled !== 'boolean' ||
     !isOnePasswordId(accountId) ||
+    typeof signInAddress !== 'string' ||
+    onePasswordSignInAddress(signInAddress) !== signInAddress ||
     typeof cliPath !== 'string' ||
     cliPath.length > MAX_CLI_PATH_CHARACTERS ||
     !isNormalizedAbsolute(cliPath) ||
@@ -228,7 +265,7 @@ function parseHostPolicy(value: unknown): OnePasswordHostPolicy | undefined {
     (managementServiceAccountId !== null && !isOnePasswordId(managementServiceAccountId))
   )
     return undefined;
-  return { schemaVersion, enabled, accountId, cliPath, managementServiceAccountId };
+  return { schemaVersion, enabled, accountId, signInAddress, cliPath, managementServiceAccountId };
 }
 
 function parseVaultCreator(value: unknown): OnePasswordVaultCreator | undefined {

@@ -234,6 +234,8 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
         schemaVersion: 2,
         enabled: true,
         accountId: ACCOUNT_ID,
+        // As the 1Password app lists the account: where its members open it on the web.
+        signInAddress: 'hale.1password.com',
         cliPath: OP,
         managementServiceAccountId: management[0].id,
       },
@@ -253,10 +255,12 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
     ]);
     expect(provider.vaults.size).toBe(2);
     expect(provider.serviceAccounts.size).toBe(accounts);
-    // A ready assistant costs no request: only the operator and management identities are verified.
-    expect(provider.calls.slice(callsBefore).map((call) => call.args.slice(0, 1).join(' '))).toEqual([
-      'whoami',
-      'whoami',
+    // A ready assistant costs no request: the app's own account list gives the sign-in address again, and only the
+    // operator and management identities are verified.
+    expect(provider.calls.slice(callsBefore).map((call) => call.args.slice(0, 2).join(' '))).toEqual([
+      'account list',
+      'whoami --format',
+      'whoami --format',
     ]);
 
     // A third assistant inherits provisioning during its operator-led creation.
@@ -912,6 +916,32 @@ describe('choosing the 1Password account', () => {
     expect(enabled.account_id).toBe(ACCOUNT_ID);
     await expect(enable(undefined, { accountId: OTHER_ACCOUNT_ID })).rejects.toMatchObject({
       code: 'onepassword_account_mismatch',
+    });
+  });
+
+  it('records the sign-in address the app lists for exactly that account, and refuses any other', async () => {
+    await assistant();
+    const hostPaths = onePasswordHostPaths(paths.configRoot);
+    // An account the app does not hold, or one it lists without a 1Password sign-in address, creates nothing.
+    await expect(enable(undefined, { accountId: OTHER_ACCOUNT_ID })).rejects.toMatchObject({
+      code: 'onepassword_account_unknown',
+    });
+    provider.accounts[0].url = 'hale.example.test';
+    await expect(enable()).rejects.toMatchObject({ code: 'onepassword_provider_failed' });
+    expect(provider.serviceAccounts.size).toBe(0);
+    expect(await exists(hostPaths.policyFile)).toBe(false);
+
+    provider.accounts[0].url = 'https://Hale.1Password.com/';
+    await enable();
+    expect(await readOnePasswordHostPolicy(hostPaths.policyFile)).toMatchObject({
+      status: 'ready',
+      policy: { accountId: ACCOUNT_ID, signInAddress: 'hale.1password.com' },
+    });
+    // A rerun re-reads it for the recorded account, so a changed team address is recorded too.
+    provider.accounts[0].url = 'hale-family.1password.com';
+    await enable(undefined, {});
+    expect(await readOnePasswordHostPolicy(hostPaths.policyFile)).toMatchObject({
+      policy: { accountId: ACCOUNT_ID, signInAddress: 'hale-family.1password.com' },
     });
   });
 

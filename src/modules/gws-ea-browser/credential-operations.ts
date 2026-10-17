@@ -26,7 +26,7 @@
  * host inserts the code or opens the link the isolated interpreter returned.
  * `reconcile` is read-only: it reads the site's late response, which counts
  * only in the same document the host was watching with no interaction since;
- * from `confirmed` or `conflict` it re-runs the vault's finalize.
+ * from `confirmed` it re-runs the vault's finalize.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -263,18 +263,18 @@ function releaseQuestion(attempt: CredentialAttempt): string {
   if (attempt.kind === 'signup')
     return [
       attempt.phase === 'conflict'
-        ? `The site created the account ${account}, but I couldn't save its login in my 1Password vault as I recorded it.`
-        : attempt.phase === 'awaiting_verification'
-          ? `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`
-          : `I tried to create the account ${account}, but I can't tell whether the account was created.`,
-      'The password I generated for it is kept in my 1Password vault.',
+        ? `The site created the account ${account}, but its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is.`
+        : `${
+            attempt.phase === 'awaiting_verification'
+              ? `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`
+              : `I tried to create the account ${account}, but I can't tell whether the account was created.`
+          }\nThe password I generated for it is kept in my 1Password vault.`,
       'If you release it, I stop waiting on it and free the site, and I change nothing in 1Password. Trying again could create a second account.',
     ].join('\n');
   return [
     attempt.phase === 'conflict'
-      ? `The site took a new password for ${account}, but the login in my 1Password vault still has the original one.`
-      : `I tried to change the password of ${account}, but I can't tell whether the password changed.`,
-    'Both the original and the new password are kept in my 1Password vault.',
+      ? `The site took a new password for ${account}, but its login in my 1Password vault was changed or removed while I was changing it, so I left the login as it is. The new password is in my 1Password vault as its own item, "New password for ${attempt.site}".`
+      : `I tried to change the password of ${account}, but I can't tell whether the password changed.\nBoth the original and the new password are kept in my 1Password vault.`,
     'If you release it, I stop waiting on it and free the site and the login, and I change nothing in 1Password. Trying again could change the password a second time.',
   ].join('\n');
 }
@@ -370,10 +370,15 @@ async function applyCredentialRelease(
       `credential-release-${current.id}`,
     );
   await finishRequestedCancellation(current.job_id, queue);
+  // A released conflict keeps its reason: the login was changed in 1Password before the host finished saving it.
   const what =
     current.kind === 'signup'
-      ? `the unresolved signup for ${current.username} on ${current.site}. The password generated for it stays in the assistant's 1Password vault, not saved as its login`
-      : `the unresolved password change for ${current.username} on ${current.site}. Both the original and the new password stay in the assistant's 1Password vault; the login was not updated`;
+      ? current.conflict_reason === null
+        ? `the unresolved signup for ${current.username} on ${current.site}. The password generated for it stays in the assistant's 1Password vault, not saved as its login`
+        : `the signup for ${current.username} on ${current.site}, whose login was changed in 1Password before the host finished saving it`
+      : current.conflict_reason === null
+        ? `the unresolved password change for ${current.username} on ${current.site}. Both the original and the new password stay in the assistant's 1Password vault; the login was not updated`
+        : `the password change for ${current.username} on ${current.site}. The new password stays in the assistant's 1Password vault as its own item, "New password for ${current.site}"; the login stays as it was changed`;
   await notify(`The principal released ${what}. The site is free again, and nothing in 1Password changed.`);
 }
 
@@ -485,11 +490,6 @@ type VaultState = 'finalized' | 'conflict' | 'pending';
 const vaultState = (status: CredentialFinalizeResult['status']): VaultState =>
   status === 'finalized' || status === 'conflict' ? status : 'pending';
 
-/**
- * A confirmed website change: a change the vault could not take over keeps
- * both credentials, the original Login and the saved candidate; anything not
- * yet finalized is pending.
- */
 /** Finalize a confirmed attempt and report its website outcome with the vault's resulting state. */
 async function finalizedOutcome(
   attempt: Pick<CredentialAttempt, 'id' | 'kind'>,
@@ -499,10 +499,22 @@ async function finalizedOutcome(
   return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, assertActive)).status));
 }
 
+/**
+ * A confirmed website change: the login holds the new password (`saved`,
+ * `updated`); it was changed in 1Password meanwhile and stays as it was made
+ * (`left_as_edited`); or 1Password is not updated yet (`pending`), which the
+ * next reconcile finishes.
+ */
 function websiteOutcome(kind: CredentialKind, vault: VaultState): Outcome {
   const status = kind === 'signup' ? 'account_created' : 'password_changed';
-  if (vault === 'finalized') return { status, vault: kind === 'signup' ? 'saved' : 'updated' };
-  return { status, vault: vault === 'conflict' && kind === 'rotation' ? 'both_kept' : 'pending' };
+  switch (vault) {
+    case 'finalized':
+      return { status, vault: kind === 'signup' ? 'saved' : 'updated' };
+    case 'conflict':
+      return { status, vault: 'left_as_edited' };
+    case 'pending':
+      return { status, vault: 'pending' };
+  }
 }
 
 /** An attempt past its one disclosure is reported, never filled again. */
@@ -1333,8 +1345,8 @@ async function attributable(context: BrowserExecutionContext, watched: WatchedRe
  * the website's own late response to the watched activation counts: a
  * rejection, a request to verify the email, or success; after a verification
  * code, only the account's confirmation. Otherwise it stays unknown, and its
- * site stays held. From confirmed or a conflict, the vault's finalize runs
- * again, reading everything fresh.
+ * site stays held. From confirmed, the vault's finalize runs again, reading
+ * everything fresh.
  */
 async function reconcile(
   context: BrowserExecutionContext,
@@ -1346,7 +1358,6 @@ async function reconcile(
     case 'saved':
       return refused('not_disclosed');
     case 'confirmed':
-    case 'conflict':
       return await finalizedOutcome(attempt, attempts, context.assertActive);
     case 'unknown': {
       const watched = watchedResponses.get(attempt.id);

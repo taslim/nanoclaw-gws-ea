@@ -6,9 +6,12 @@
  * management service account, which may grant access only on the vaults it
  * created. Actual access is read before any grant and after it, so a repeat
  * is safe and an unknown outcome is observed before anything is granted
- * again. Whatever stops sharing, the principal gets one message to forward
- * to their operator, naming the assistant, account, vault and email: there
- * is no request table, inbox or notification route behind it.
+ * again. A share answers with the link to the account's sign-in address and
+ * the vault's exact name, which 1Password lists in the account's sidebar:
+ * 1Password documents no link to a vault itself. Whatever stops sharing, the
+ * principal gets one message to forward to their operator, naming the
+ * assistant, account, vault and email: there is no request table, inbox or
+ * notification route behind it.
  *
  * An email that is not one of the principal's addresses waits for the
  * principal's own confirmation, and binds only to the share it confirms: it
@@ -40,12 +43,12 @@ import {
   type VaultAccessRequest,
 } from './onepassword-cli.js';
 import {
+  onePasswordAccountLink,
   onePasswordManagementIdentity,
   readOnePasswordHostPolicy,
   type OnePasswordHostPolicy,
   type OnePasswordVaultPermission,
 } from './onepassword-policy.js';
-import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
   browserVault,
   BrowserVaultError,
@@ -56,6 +59,11 @@ import {
 
 /** The provider operations sharing needs, each made as the host management service account. */
 export interface VaultSharingProvider {
+  /** The vault as 1Password names it now (`op vault get <vault>`). */
+  getVault(
+    identity: ServiceAccountIdentity,
+    vaultId: string,
+  ): Promise<OnePasswordResult<{ readonly name: string | null }>>;
   /** The user 1Password holds under exactly this email (`op user get <email>`). */
   getUser(
     identity: ServiceAccountIdentity,
@@ -72,8 +80,6 @@ export interface VaultSharingProvider {
 export interface VaultAccessDependencies {
   /** The assistant's vault: its binding from local records, and the principal's explicit refresh. */
   readonly vault: Pick<BrowserVault, 'availability' | 'refresh'>;
-  /** Password changes that kept both credentials, reconciled on that refresh; defaults to the host's. */
-  readonly attempts?: Pick<CredentialAttempts, 'reconcileConflicts'>;
   /** Where the 1Password host policy is, located for every use. */
   readonly onePasswordPolicyFile: () => string | undefined;
   /** The provider through the CLI the host policy recorded; undefined when this host cannot share. */
@@ -90,7 +96,16 @@ const FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'operation',
 type HandoffReason = 'not_a_member' | 'not_confirmed' | 'refused' | 'host_cannot_share' | 'unconfirmed';
 
 type ShareOutcome =
-  | { readonly status: 'shared'; readonly email: string; readonly account_id: string; readonly vault_id: string }
+  | {
+      readonly status: 'shared';
+      readonly email: string;
+      readonly account_id: string;
+      readonly vault_id: string;
+      /** Exactly as 1Password names the recorded vault. */
+      readonly vault_name: string;
+      /** Opens the recorded account on 1Password.com, from its recorded sign-in address. */
+      readonly link: string;
+    }
   | {
       readonly status: 'operator_needed';
       readonly email: string;
@@ -163,7 +178,10 @@ function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
 interface MessageFacts {
   readonly email: string;
   readonly accountId: string;
+  readonly link: string;
   readonly vaultId: string;
+  /** Known once 1Password has named the vault. */
+  readonly vaultName: string | undefined;
   readonly guest: boolean;
 }
 
@@ -188,7 +206,11 @@ async function operatorMessage(reason: HandoffReason, facts: MessageFacts): Prom
         return `${name} couldn't confirm with 1Password whether they have access.`;
     }
   })();
-  return `Could you give ${facts.email} view and edit access to the 1Password vault my assistant ${assistant} keeps its logins in? It is the vault with ID ${facts.vaultId} in the 1Password account with ID ${facts.accountId}. ${why} Once that's done, I'll ask ${name} to check again.`;
+  const vault =
+    facts.vaultName === undefined
+      ? `the vault with ID ${facts.vaultId}`
+      : `the vault "${facts.vaultName}" (ID ${facts.vaultId})`;
+  return `Could you give ${facts.email} view and edit access to the 1Password vault my assistant ${assistant} keeps its logins in? It is ${vault} in the 1Password account at ${facts.link} (ID ${facts.accountId}). ${why} Once that's done, I'll ask ${name} to check again.`;
 }
 
 /** How a failed provider call ends a share. */
@@ -210,29 +232,18 @@ function failureKind(reason: OnePasswordFailureReason): 'rate_limited' | 'refuse
   }
 }
 
-/**
- * Share the recorded vault with the exact user 1Password holds under
- * `email`, which the caller established as the principal's. Access is read
- * first, so a repeat grants nothing and an earlier unknown outcome is seen
- * before any new grant; a grant counts only once access reads back.
- */
-async function shareVault(email: string, dependencies: VaultAccessDependencies): Promise<ShareOutcome> {
-  const availability = await dependencies.vault.availability();
-  if (availability.status !== 'available') return { status: 'vault_unavailable' };
-  const { accountId, vaultId } = availability.binding;
-  const policyFile = dependencies.onePasswordPolicyFile();
-  const host = policyFile === undefined ? undefined : await readOnePasswordHostPolicy(policyFile);
-  // While the operator has 1Password disabled, its management account is theirs alone: no agent request reaches it.
-  if (host?.status !== 'ready' || !host.policy.enabled || host.policy.accountId !== accountId)
-    return { status: 'vault_unavailable' };
-
+/** How a share ends without access: a forwardable handoff, or a provider failure as one. */
+function endings(facts: Omit<MessageFacts, 'guest'>): {
+  readonly handoff: (reason: HandoffReason, guest?: boolean) => Promise<ShareOutcome>;
+  readonly failure: (reason: OnePasswordFailureReason) => Promise<ShareOutcome>;
+} {
   const handoff = async (reason: HandoffReason, guest = false): Promise<ShareOutcome> => {
     log.info('Vault sharing needs the operator', { reason });
     return {
       status: 'operator_needed',
-      email,
+      email: facts.email,
       reason,
-      operator_message: await operatorMessage(reason, { email, accountId, vaultId, guest }),
+      operator_message: await operatorMessage(reason, { ...facts, guest }),
     };
   };
   const failure = async (reason: OnePasswordFailureReason): Promise<ShareOutcome> => {
@@ -246,19 +257,52 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
         return handoff('unconfirmed');
     }
   };
+  return { handoff, failure };
+}
+
+/**
+ * Share the recorded vault with the exact user 1Password holds under
+ * `email`, which the caller established as the principal's. Access is read
+ * first, so a repeat grants nothing and an earlier unknown outcome is seen
+ * before any new grant; a grant counts only once access reads back. The
+ * answer's link and vault name come from the host's records and 1Password's
+ * own name for that vault, never from the request.
+ */
+async function shareVault(email: string, dependencies: VaultAccessDependencies): Promise<ShareOutcome> {
+  const availability = await dependencies.vault.availability();
+  if (availability.status !== 'available') return { status: 'vault_unavailable' };
+  const { accountId, vaultId } = availability.binding;
+  const policyFile = dependencies.onePasswordPolicyFile();
+  const host = policyFile === undefined ? undefined : await readOnePasswordHostPolicy(policyFile);
+  // While the operator has 1Password disabled, its management account is theirs alone: no agent request reaches it.
+  if (host?.status !== 'ready' || !host.policy.enabled || host.policy.accountId !== accountId)
+    return { status: 'vault_unavailable' };
+  const known = { email, accountId, link: onePasswordAccountLink(host.policy), vaultId };
+  const unnamed = endings({ ...known, vaultName: undefined });
 
   // Only the management service account may grant access, and only on the vaults it created.
   const management = onePasswordManagementIdentity(host.policy, host.paths);
-  if (!management) return handoff('host_cannot_share');
+  if (!management) return unnamed.handoff('host_cannot_share');
   const provider = await dependencies.openProvider(host.policy);
-  if (!provider) return handoff('host_cannot_share');
+  if (!provider) return unnamed.handoff('host_cannot_share');
+  const vault = await provider.getVault(management, vaultId);
+  if (vault.status !== 'ok') return unnamed.failure(vault.reason);
+  if (vault.name === null) return unnamed.failure('unexpected_output');
+  const { handoff, failure } = endings({ ...known, vaultName: vault.name });
 
   const found = await provider.getUser(management, email);
   if (found.status !== 'ok') return found.reason === 'not_found' ? handoff('not_a_member') : failure(found.reason);
   const { user } = found;
   if (user.email.toLowerCase() !== email || user.type === 'service_account') return handoff('not_a_member');
   if (!user.active) return handoff('not_confirmed');
-  const shared: ShareOutcome = { status: 'shared', email, account_id: accountId, vault_id: vaultId };
+  const shared: ShareOutcome = {
+    status: 'shared',
+    email,
+    account_id: accountId,
+    vault_id: vaultId,
+    vault_name: vault.name,
+    link: known.link,
+  };
 
   const before = await provider.listVaultUsers(management, vaultId);
   if (before.status !== 'ok') return failure(before.reason);
@@ -280,11 +324,7 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
   return after.userIds.includes(user.userId) ? shared : handoff('unconfirmed');
 }
 
-/**
- * AE6: list the vault again now, so a login the principal just added is
- * usable. A password change that kept both credentials is recorded once the
- * principal's edit put the new password into the original login (KTD8).
- */
+/** AE6: list the vault again now, so a login the principal just added is usable. */
 async function refreshVault(dependencies: VaultAccessDependencies): Promise<Record<string, unknown>> {
   try {
     await dependencies.vault.refresh();
@@ -292,7 +332,6 @@ async function refreshVault(dependencies: VaultAccessDependencies): Promise<Reco
     if (!(error instanceof BrowserVaultError)) throw error;
     return { status: vaultFailureStatus(error) };
   }
-  await (dependencies.attempts ?? credentialAttempts).reconcileConflicts();
   return { status: 'usable' };
 }
 
@@ -365,7 +404,7 @@ function confirmedNote(email: string, outcome: ShareOutcome): string {
   const confirmed = `The principal confirmed ${email} as the email their 1Password account uses.`;
   switch (outcome.status) {
     case 'shared':
-      return `${confirmed} The assistant's vault is now shared with it, and 1Password shows their access.`;
+      return `${confirmed} The assistant's vault is now shared with it, and 1Password shows their access. Give the principal ${outcome.link} to open their 1Password account, where the vault "${outcome.vault_name}" is listed.`;
     case 'operator_needed':
       return `${confirmed} The vault could not be shared with it. Give the principal this message to forward to their operator, exactly as written:\n\n${outcome.operator_message}`;
     case 'rate_limited':

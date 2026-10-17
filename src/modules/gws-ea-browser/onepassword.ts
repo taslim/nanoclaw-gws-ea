@@ -6,7 +6,8 @@
  * metadata is listed once per binding and kept until an explicit refresh or a
  * write that changes what is listed (KTD11); a secret is resolved only at
  * fill time. The host-private writes behind credential attempts (KTD6) read
- * and save whole items here, in host memory only. Item IDs, vault IDs, tokens
+ * and save whole items here, in host memory only, and delete a candidate once
+ * its operation no longer needs it. Item IDs, vault IDs, tokens
  * and values stay on the host: agents see opaque handles, titles and constant
  * reasons.
  */
@@ -179,7 +180,7 @@ export const credentialCandidateTag = (operationId: string): string => `${CANDID
 const isCandidateTag = (tag: string): boolean => tag === CANDIDATE_TAG || tag.startsWith(`${CANDIDATE_TAG}/`);
 const pendingCandidate = (tags: readonly string[] | undefined): boolean => (tags ?? []).some(isCandidateTag);
 
-/** A rotation candidate's own section: the account it belongs to, and the password it replaces. */
+/** A rotation candidate's own section: the account it belongs to, and the password it replaces while the change is open. */
 const CHANGE_SECTION = 'gws-ea-password-change';
 
 /** One fresh read of an item, in host memory only: none of its values leave the host. */
@@ -195,7 +196,7 @@ export interface VaultItemRead {
   readonly username: string | undefined;
   /** The built-in password. */
   readonly password: string | undefined;
-  /** The password a rotation candidate replaces. */
+  /** The password a rotation candidate replaces, until the change no longer needs it. */
   readonly previousPassword: string | undefined;
   /** The registrable domains of the item's HTTPS websites. */
   readonly domains: readonly string[];
@@ -565,25 +566,33 @@ export class BrowserVault {
     }
   }
 
-  /** The active items that carry exactly one operation's marker: one listing, which never feeds the cache. */
-  async findCandidates(vaultId: string, operationId: string, assertActive = active): Promise<string[]> {
+  /** The IDs of the bound vault's active items: one listing, which never feeds the cache. */
+  private async activeItemIds(
+    vaultId: string,
+    keep: (item: ItemOverview) => boolean,
+    assertActive: () => Promise<void>,
+  ): Promise<string[]> {
     const client = await this.bound(vaultId, assertActive);
-    const marker = credentialCandidateTag(operationId);
     try {
       const items = await client.items.list(vaultId, { type: 'ByState', content: { active: true, archived: false } });
       await assertActive();
       return items
-        .filter(
-          (item) =>
-            item.vaultId === vaultId &&
-            item.state === 'active' &&
-            ITEM_ID.test(item.id) &&
-            (item.tags ?? []).includes(marker),
-        )
+        .filter((item) => item.vaultId === vaultId && item.state === 'active' && ITEM_ID.test(item.id) && keep(item))
         .map((item) => item.id);
     } catch (error) {
       throw await this.error(error);
     }
+  }
+
+  /** The active items that carry exactly one operation's marker. */
+  findCandidates(vaultId: string, operationId: string, assertActive = active): Promise<string[]> {
+    const marker = credentialCandidateTag(operationId);
+    return this.activeItemIds(vaultId, (item) => (item.tags ?? []).includes(marker), assertActive);
+  }
+
+  /** Whether the bound vault still lists an item as active; a deleted or archived item is not. */
+  async holds(vaultId: string, itemId: string, assertActive = active): Promise<boolean> {
+    return (await this.activeItemIds(vaultId, (item) => item.id === itemId, assertActive)).length > 0;
   }
 
   /**
@@ -635,12 +644,25 @@ export class BrowserVault {
     }
   }
 
-  /** Retires a candidate the host no longer needs; the principal can still restore it from the archive. */
-  async archiveItem(vaultId: string, itemId: string, assertActive = active): Promise<void> {
+  /**
+   * A rotation candidate without the password it replaced: it then holds only
+   * the new password, for a change the original Login could not take.
+   */
+  async forgetPreviousPassword(read: VaultItemRead, assertActive = active): Promise<VaultItemRead> {
+    const item = readItems.get(read);
+    if (!item || read.category !== 'password') throw new BrowserVaultError('vault_unavailable');
+    const fields = item.fields.filter(
+      (field) => !(field.id === 'previous-password' && field.sectionId === CHANGE_SECTION),
+    );
+    return this.put({ ...item, fields }, assertActive);
+  }
+
+  /** Deletes a candidate the host no longer needs. */
+  async deleteItem(vaultId: string, itemId: string, assertActive = active): Promise<void> {
     if (!ITEM_ID.test(itemId)) throw new BrowserVaultError('vault_unavailable');
     const client = await this.bound(vaultId, assertActive);
     try {
-      await client.items.archive(vaultId, itemId);
+      await client.items.delete(vaultId, itemId);
     } catch (error) {
       throw await this.error(error);
     }

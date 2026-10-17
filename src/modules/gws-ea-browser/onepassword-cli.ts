@@ -587,22 +587,25 @@ export class OnePasswordCli {
 
   /**
    * Whether `identity` can read exactly this vault: success names the vault
-   * the provider returned and the item count it reports, null when it reports
-   * none: an unknown count is never an empty vault.
+   * the provider returned, its name, and the item count it reports; each is
+   * null when it reports none, so an unknown count is never an empty vault.
    */
   async getVault(
     identity: OnePasswordIdentity,
     vaultId: string,
-  ): Promise<OnePasswordResult<{ readonly vaultId: string; readonly itemCount: number | null }>> {
+  ): Promise<
+    OnePasswordResult<{ readonly vaultId: string; readonly name: string | null; readonly itemCount: number | null }>
+  > {
     assertId(vaultId, 'The vault');
     const result = await this.#read(identity, ['vault', 'get', vaultId, '--format', 'json']);
     if (result.status !== 'ok') return result;
     const value = parseText(result.stdout);
     if (!isRecord(value) || value.id !== vaultId) return failed('unexpected_output');
-    const { items } = value;
+    const { items, name } = value;
     return {
       status: 'ok',
       vaultId,
+      name: isDisplayText(name) ? name : null,
       itemCount: typeof items === 'number' && Number.isSafeInteger(items) && items >= 0 ? items : null,
     };
   }

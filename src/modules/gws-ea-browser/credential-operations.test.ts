@@ -68,7 +68,7 @@ beforeEach(async () => {
   sdk.create.mockImplementation(async () => fake.client());
   vault = new BrowserVault(files);
   await runMigrations(await initTestDb());
-  attempts = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+  attempts = new CredentialAttempts({ db: getDb(), vault });
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
@@ -122,10 +122,11 @@ async function assistantLogin(): Promise<string> {
   return finalized.attempt.owned_item_id;
 }
 
-const editUsername = (value: string) => (item: Item) => ({
+const editField = (id: string, value: string) => (item: Item) => ({
   ...item,
-  fields: item.fields.map((field) => (field.id === 'username' ? { ...field, value } : field)),
+  fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
 });
+const editUsername = (value: string) => editField('username', value);
 
 describe("main's credential authority", () => {
   it('records a signup for one job, site and account, repeats safely, and spends no provider request', async () => {
@@ -385,20 +386,24 @@ describe('the browser credential request', () => {
     expect(await run(String(second.authority)).result).toEqual({ status: 'refused', reason: 'no_authority' });
   });
 
-  it('reports a confirmed change that keeps both credentials while automatic promotion is off', async () => {
-    await assistantLogin();
+  it('reports a confirmed change written into the original login, its candidate gone', async () => {
+    const itemId = await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
     const id = String(recorded.authority);
     for (const fields of [{ username: ref(1) }, { username: ref(1), new_password: ref(2) }])
       await expect(run(id, fields).result).rejects.toMatchObject({ code: 'invalid-args' });
     expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
-    await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+    const disclosed = await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+    if (disclosed.status !== 'disclosed') throw new Error(disclosed.status);
+    const candidateId = (await attempts.get(id))?.candidate_item_id;
     await attempts.markAwaitingVerification(id);
     await attempts.markConfirmed(id, { signal: 'success_text' });
     const { page, result } = run(id);
-    expect(await result).toEqual({ status: 'password_changed', vault: 'both_kept' });
+    expect(await result).toEqual({ status: 'password_changed', vault: 'updated' });
     expect(page).not.toHaveBeenCalled();
-    expect(await attempts.get(id)).toMatchObject({ phase: 'conflict', conflict_reason: 'promotion_disabled' });
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+    expect(fake.value(itemId, 'password')).toBe(disclosed.credential.password);
+    expect(fake.items.has(candidateId ?? '')).toBe(false);
   });
 
   it("answers not_watched from verify when the signup's email has no wait, and leaves it for the principal's release", async () => {
@@ -445,8 +450,7 @@ describe('the browser credential request', () => {
       };
     };
 
-    /** A confirmed change that kept both credentials, as every change does while automatic promotion is off. */
-    async function keptBoth(): Promise<{ id: string; itemId: string }> {
+    it('reports a change whose login was edited in 1Password meanwhile as left as edited, and writes nothing more', async () => {
       const itemId = await assistantLogin();
       const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
       const id = String(recorded.authority);
@@ -454,41 +458,35 @@ describe('the browser credential request', () => {
       await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
       await attempts.markAwaitingVerification(id);
       await attempts.markConfirmed(id, { signal: 'success_text' });
-      expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict', reason: 'promotion_disabled' });
-      return { id, itemId };
-    }
-
-    it('finalizes from conflict once the original Login holds the new password, and keeps both until then', async () => {
-      const { id, itemId } = await keptBoth();
+      fake.edit(itemId, editUsername(PRINCIPAL_USERNAME));
       const first = reconcile(id);
-      expect(await first.result).toEqual({ status: 'password_changed', vault: 'both_kept' });
-      expect(await attempts.get(id)).toMatchObject({ phase: 'conflict' });
+      expect(await first.result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
       const attempt = await attempts.get(id);
+      expect(attempt).toMatchObject({ phase: 'conflict', conflict_reason: 'ownership_mismatch' });
       const next = fake.value(attempt!.candidate_item_id!, 'password')!;
-      fake.edit(itemId, (item) => ({
-        ...item,
-        fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: next } : field)),
-      }));
+      const writes = fake.calls.length;
       const second = reconcile(id);
-      expect(await second.result).toEqual({ status: 'password_changed', vault: 'updated' });
-      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
+      expect(await second.result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
+      expect(fake.calls).toHaveLength(writes);
       for (const { page, result } of [first, second]) {
         expect(page).not.toHaveBeenCalled();
         expect(JSON.stringify(await result)).not.toContain(next);
       }
     });
 
-    it("finalizes a conflict when main refreshes the vault after the principal's edit", async () => {
-      const { id, itemId } = await keptBoth();
-      const attempt = await attempts.get(id);
-      const next = fake.value(attempt!.candidate_item_id!, 'password')!;
-      expect(await attempts.reconcileConflicts()).toEqual({ finalized: 0 });
-      fake.edit(itemId, (item) => ({
-        ...item,
-        fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: next } : field)),
-      }));
-      expect(await attempts.reconcileConflicts()).toEqual({ finalized: 1 });
-      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized' });
+    it('finishes a confirmed change whose vault update was cut short', async () => {
+      const itemId = await assistantLogin();
+      const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
+      await attempts.save(id);
+      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
+      await attempts.markAwaitingVerification(id);
+      await attempts.markConfirmed(id, { signal: 'success_text' });
+      fake.failNext('put', new Error('network'));
+      expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+      const { page, result } = reconcile(id);
+      expect(await result).toEqual({ status: 'password_changed', vault: 'updated' });
+      expect(page).not.toHaveBeenCalled();
+      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
     });
 
     it('finalizes a confirmed attempt whose vault update was cut short', async () => {
@@ -509,7 +507,7 @@ describe('the browser credential request', () => {
       await attempts.save(id);
       await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
       await attempts.markUnknown(id, { signal: 'interrupted' });
-      const restarted = new CredentialAttempts({ db: getDb(), vault, automaticPromotion: false });
+      const restarted = new CredentialAttempts({ db: getDb(), vault });
       const { page, result } = reconcile(id, restarted);
       expect(await result).toEqual({ status: 'inconclusive' });
       expect(page).not.toHaveBeenCalled();
@@ -744,17 +742,24 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     ).toMatchObject({ status: 'recorded' });
   });
 
-  it('releases a change that kept both credentials without promoting it, so the login can be changed again', async () => {
+  it('releases a change whose login the principal edited meanwhile, so the login can be changed again', async () => {
     const { id, itemId } = await disclosedChange();
     await attempts.markAwaitingVerification(id);
     await attempts.markConfirmed(id, { signal: 'success_text' });
-    expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict' });
-    const original = fake.value(itemId, 'password');
+    fake.edit(itemId, editField('password', 'principal-chosen-password-1'));
+    expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict', reason: 'password_changed' });
+    const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
+    const next = fake.value(candidateId, 'password');
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const card = JSON.parse(cards[0]) as { question: string };
+    expect(card.question).toContain('was changed or removed while I was changing it');
+    expect(card.question).toContain('"New password for shop.example"');
+    expect(card.question).not.toContain('Both the original and the new password');
     await click('approve');
     expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
-    expect(fake.value(itemId, 'password')).toBe(original);
-    expect(fake.archived.size).toBe(0);
+    expect(fake.value(itemId, 'password')).toBe('principal-chosen-password-1');
+    expect(fake.value(candidateId, 'password')).toBe(next);
+    expect(notes().at(-1)).toContain('"New password for shop.example"');
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
       status: 'recorded',
     });

@@ -48,14 +48,15 @@ async function writeHostPolicy(enabled: boolean): Promise<void> {
     schemaVersion: 2,
     enabled,
     accountId: ACCOUNT_ID,
+    signInAddress: 'hale.1password.com',
     cliPath: '/opt/homebrew/bin/op',
     managementServiceAccountId: null,
   });
 }
 
 const newVault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
-const service = (options: { automaticPromotion?: boolean; vault?: BrowserVault } = {}): CredentialAttempts =>
-  new CredentialAttempts({ db: getDb(), vault: options.vault ?? vault, automaticPromotion: true, ...options });
+const service = (options: { vault?: BrowserVault } = {}): CredentialAttempts =>
+  new CredentialAttempts({ db: getDb(), vault: options.vault ?? vault });
 const rows = (): Promise<CredentialAttempt[]> => getDb().all('SELECT * FROM gws_ea_browser_credential_attempts');
 const phase = async (id: string): Promise<string | undefined> =>
   (await getDb().get<{ phase: string }>('SELECT phase FROM gws_ea_browser_credential_attempts WHERE id = ?', id))
@@ -416,7 +417,60 @@ describe('naming the account to change', () => {
 });
 
 describe('password changes', () => {
-  it('keeps both credentials after an uncertain change, discloses no value, and recovers exact references after a restart (AE4)', async () => {
+  /** A change the website confirmed, not yet written into 1Password. */
+  async function confirmedChange(
+    subject: CredentialAttempts,
+    itemId: string,
+  ): Promise<{ attempt: CredentialAttempt; candidateId: string; previous: string; next: string }> {
+    const change = await changedPassword(subject, itemId);
+    await subject.markAwaitingVerification(change.attempt.id);
+    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
+    return change;
+  }
+  /** Every item in the vault, archived or not, with a field holding `value`. */
+  const holders = (value: string): string[] =>
+    [...fake.items.values()]
+      .filter((item) => item.fields.some((field) => field.value === value))
+      .map((item) => item.id);
+  const previousPasswordFields = (): number =>
+    [...fake.items.values()].flatMap((item) => item.fields).filter((field) => field.id === 'previous-password').length;
+  const puts = (): number => fake.calls.filter((call) => call === 'put').length;
+  const setField =
+    (id: string, value: string) =>
+    (item: Item): Item => ({
+      ...item,
+      fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
+    });
+  /** The principal saves the Login between the host's fresh read and its write, `times` writes in a row. */
+  function racing(itemId: string, times: number): void {
+    let left = times;
+    const edit = (): void => {
+      fake.edit(itemId, (item) => ({ ...item, notes: `${item.notes}edit ${left};` }));
+      left -= 1;
+      fake.beforePut = left > 0 ? edit : undefined;
+    };
+    fake.beforePut = edit;
+  }
+
+  it('writes a confirmed change into the original Login and keeps neither the candidate nor the old password', async () => {
+    const subject = new CredentialAttempts({ db: getDb(), vault });
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    expect(fake.value(change.candidateId, 'previous-password')).toBe(change.previous);
+
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({
+      status: 'finalized',
+      attempt: { phase: 'finalized', owned_item_id: itemId, conflict_reason: null },
+    });
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(holders(change.previous)).toEqual([]);
+    expect(fake.items.has(change.candidateId)).toBe(false);
+    expect(previousPasswordFields()).toBe(0);
+    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.unresolved()).toEqual([]);
+  });
+
+  it('keeps both credentials while a change is uncertain, discloses no value, and settles it after a restart (AE4)', async () => {
     const results: unknown[] = [];
     const errors: unknown[] = [];
     const subject = service();
@@ -427,6 +481,7 @@ describe('password changes', () => {
     expect(change.next).not.toBe(previous);
     results.push(await subject.markUnknown(change.attempt.id, { website: 'timed_out' }));
 
+    // The site may hold either password, so 1Password keeps both.
     expect(fake.value(itemId, 'password')).toBe(previous);
     expect(fake.items.get(change.candidateId)).toMatchObject({
       category: ItemCategory.Password,
@@ -456,8 +511,8 @@ describe('password changes', () => {
     results.push(await restarted.markConfirmed(change.attempt.id, { account_page: 'password_changed' }));
     await restarted.markUnknown(change.attempt.id).catch((error: unknown) => errors.push(error));
     results.push(await restarted.finalize(change.attempt.id));
-    expect(fake.value(itemId, 'password')).toBe(change.next);
-    expect(fake.archived.has(change.candidateId)).toBe(true);
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(fake.items.has(change.candidateId)).toBe(false);
     expect(await restarted.get(change.attempt.id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
 
     expect(errors.map((error) => (error instanceof Error ? error.message : error))).toEqual([
@@ -465,16 +520,13 @@ describe('password changes', () => {
       'invalid_phase',
     ]);
     const surfaces = JSON.stringify([await rows(), results, errors.map(String), output]);
-    expect(fake.concealed().length).toBeGreaterThanOrEqual(3);
-    for (const secret of fake.concealed()) expect(surfaces).not.toContain(secret);
+    for (const secret of [change.previous, change.next]) expect(surfaces).not.toContain(secret);
   });
 
-  it('preserves the principal’s unrelated edits on promotion and reports a conflict when they changed the password', async () => {
+  it("keeps the principal's other edits to the Login made during the change", async () => {
     const subject = service();
     const { itemId } = await ownedLogin(subject);
-    const change = await changedPassword(subject, itemId);
-    await subject.markAwaitingVerification(change.attempt.id);
-    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
+    const change = await confirmedChange(subject, itemId);
     fake.edit(itemId, (item) => ({
       ...item,
       title: 'Shop (household)',
@@ -498,28 +550,149 @@ describe('password changes', () => {
       version: before.version + 1,
       updatedAt: expect.any(Date),
     });
+    expect(fake.items.has(change.candidateId)).toBe(false);
     expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+  });
 
-    const second = await changedPassword(subject, itemId);
-    await subject.markAwaitingVerification(second.attempt.id);
-    await subject.markConfirmed(second.attempt.id, { account_page: 'password_changed' });
-    fake.edit(itemId, (item) => ({
-      ...item,
-      fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: PRINCIPAL_PASSWORD } : field)),
-    }));
-    const puts = fake.calls.filter((call) => call === 'put').length;
-    expect(await subject.finalize(second.attempt.id)).toMatchObject({
-      status: 'conflict',
-      reason: 'password_changed',
-      attempt: { phase: 'conflict', conflict_reason: 'password_changed' },
-    });
-    expect(fake.calls.filter((call) => call === 'put')).toHaveLength(puts);
-    expect(fake.value(itemId, 'password')).toBe(PRINCIPAL_PASSWORD);
-    expect(fake.value(second.candidateId, 'password')).toBe(second.next);
-    expect(fake.archived.has(second.candidateId)).toBe(false);
-    expect(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) })).toEqual({
-      status: 'busy',
-    });
+  it.each<[string, (item: Item) => Item]>([
+    ['username', setField('username', 'remy.vance@example.com')],
+    [
+      'site',
+      (item) => ({
+        ...item,
+        websites: [
+          { url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain },
+        ],
+      }),
+    ],
+  ])(
+    'never overwrites a %s the principal changed during the change; the new password stays in its own item',
+    async (_field, edit) => {
+      const subject = service();
+      const { itemId } = await ownedLogin(subject);
+      const change = await confirmedChange(subject, itemId);
+      fake.edit(itemId, edit);
+      const edited = structuredClone(fake.items.get(itemId));
+      expect(await subject.finalize(change.attempt.id)).toMatchObject({
+        status: 'conflict',
+        reason: 'ownership_mismatch',
+        attempt: { phase: 'conflict', conflict_reason: 'ownership_mismatch', owned_item_id: null },
+      });
+      expect(fake.items.get(itemId)).toEqual(edited);
+      expect(holders(change.next)).toEqual([change.candidateId]);
+      expect(fake.value(change.candidateId, 'account')).toBe(USERNAME);
+      expect(previousPasswordFields()).toBe(0);
+      // A conflict is settled: finalizing again writes nothing, and only the principal's release ends it.
+      const writes = puts();
+      expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'refused', reason: 'not_confirmed' });
+      expect(puts()).toBe(writes);
+      expect(await subject.release(change.attempt.id, 'approval-released')).toMatchObject({ phase: 'rejected' });
+      expect(holders(change.next)).toEqual([change.candidateId]);
+    },
+  );
+
+  it.each<[string, (itemId: string) => void, 'login_removed' | 'password_changed', boolean]>([
+    ['deleted the Login', (itemId) => void fake.items.delete(itemId), 'login_removed', false],
+    ['archived the Login', (itemId) => void fake.archived.add(itemId), 'login_removed', true],
+    [
+      'set its password',
+      (itemId) => fake.edit(itemId, setField('password', PRINCIPAL_PASSWORD)),
+      'password_changed',
+      false,
+    ],
+  ])(
+    'keeps the new password in its own item when the principal %s during the change',
+    async (_case, edit, reason, archived) => {
+      const subject = service();
+      const { itemId } = await ownedLogin(subject);
+      const change = await confirmedChange(subject, itemId);
+      edit(itemId);
+      const original = structuredClone(fake.items.get(itemId));
+      expect(await subject.finalize(change.attempt.id)).toMatchObject({
+        status: 'conflict',
+        reason,
+        attempt: { phase: 'conflict', conflict_reason: reason },
+      });
+      // The only copy of the password the site now has stays; the one it replaced is gone from the host's item.
+      expect(holders(change.next)).toEqual([change.candidateId]);
+      expect(previousPasswordFields()).toBe(0);
+      // The principal's own item is left exactly as they made it: an archived Login keeps whatever it held.
+      expect(fake.items.get(itemId)).toEqual(original);
+      expect(holders(change.previous)).toEqual(archived ? [itemId] : []);
+      if (reason === 'password_changed')
+        expect(
+          await subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) }),
+        ).toEqual({ status: 'busy' });
+    },
+  );
+
+  it('retries a version race on the freshest Login, keeping every racing edit, and settles', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    const writes = puts();
+    racing(itemId, 2);
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(puts()).toBe(writes + 3);
+    expect(fake.items.get(itemId)).toMatchObject({ notes: 'edit 2;edit 1;' });
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(fake.items.has(change.candidateId)).toBe(false);
+  });
+
+  it('leaves a change confirmed when the race persists, then settles it on the next finalize', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    const writes = puts();
+    racing(itemId, 5);
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    // Bounded: three refused writes, then the Login and both credentials stay as they were.
+    expect(puts()).toBe(writes + 3);
+    expect(await phase(change.attempt.id)).toBe('confirmed');
+    expect(fake.value(itemId, 'password')).toBe(change.previous);
+    expect(fake.value(change.candidateId, 'password')).toBe(change.next);
+    fake.beforePut = undefined;
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(fake.items.get(itemId)).toMatchObject({ notes: 'edit 5;edit 4;edit 3;' });
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(previousPasswordFields()).toBe(0);
+  });
+
+  it('bounds a rate-limited update to one outcome until its backoff ends', async () => {
+    vi.useFakeTimers();
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    fake.failNext('put', new RateLimitExceededError('daily limit reached'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'rate_limited' });
+    const spent = fake.calls.length;
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'rate_limited' });
+    expect(fake.calls).toHaveLength(spent);
+    expect(await phase(change.attempt.id)).toBe('confirmed');
+    vi.advanceTimersByTime(60_001);
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(holders(change.next)).toEqual([itemId]);
+  });
+
+  it('keeps a change confirmed until its candidate is gone, and never writes the Login twice', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    const change = await confirmedChange(subject, itemId);
+    fake.failNext('delete', new Error('network'));
+    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await phase(change.attempt.id)).toBe('confirmed');
+    expect(fake.value(itemId, 'password')).toBe(change.next);
+    expect(fake.items.has(change.candidateId)).toBe(true);
+    const writes = puts();
+
+    // After a restart, the next finalize finds the Login already updated; a removal whose answer is lost still counts.
+    fake.failNext('delete', new Error('connection reset'), true);
+    const restarted = service({ vault: newVault() });
+    expect(await restarted.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    expect(puts()).toBe(writes);
+    expect(fake.items.has(change.candidateId)).toBe(false);
+    expect(holders(change.next)).toEqual([itemId]);
+    expect(previousPasswordFields()).toBe(0);
   });
 
   it('lets a later job take over a change another job saved but never disclosed, whose late disclosure then loses', async () => {
@@ -533,12 +706,12 @@ describe('password changes', () => {
 
     // The later job takes over while the earlier one is between its checks and its compare-and-set.
     const takeover: Promise<CredentialPrepareResult>[] = [];
-    const racing = async (): Promise<void> => {
+    const racingPrepare = async (): Promise<void> => {
       if (takeover.length === 0)
         takeover.push(subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: handle }));
       await takeover[0];
     };
-    expect(await subject.disclose(idle.id, { jobId: JOB, origin: ORIGIN }, racing)).toEqual({
+    expect(await subject.disclose(idle.id, { jobId: JOB, origin: ORIGIN }, racingPrepare)).toEqual({
       status: 'refused',
       reason: 'not_saved',
     });
@@ -546,12 +719,12 @@ describe('password changes', () => {
     const next = expectPrepared(await takeover[0]);
     expect(next).toMatchObject({ job_id: OTHER_JOB, phase: 'preparing', source_item_id: itemId });
     expect(await phase(idle.id)).toBe('rejected');
-    expect(fake.archived.has(candidateId)).toBe(true);
+    expect(fake.items.has(candidateId)).toBe(false);
     expect(await subject.unresolved()).toEqual([expect.objectContaining({ id: next.id })]);
   });
 
   it('answers busy to every other job while a change may have reached the site', async () => {
-    const subject = service({ automaticPromotion: false });
+    const subject = service();
     const { itemId } = await ownedLogin(subject);
     const change = await changedPassword(subject, itemId);
     const other = async (): Promise<CredentialPrepareResult> =>
@@ -563,89 +736,8 @@ describe('password changes', () => {
     expect(await other()).toEqual({ status: 'busy' });
     await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
     expect(await other()).toEqual({ status: 'busy' });
-    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'conflict' });
-    expect(await other()).toEqual({ status: 'busy' });
-    expect(await phase(change.attempt.id)).toBe('conflict');
-    expect(fake.archived.has(change.candidateId)).toBe(false);
-  });
-
-  it('bounds a rate-limited update, reports a racing edit as a conflict, and promotes on explicit reconciliation', async () => {
-    vi.useFakeTimers();
-    const subject = service();
-    const { itemId } = await ownedLogin(subject);
-    const change = await changedPassword(subject, itemId);
-    await subject.markAwaitingVerification(change.attempt.id);
-    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
-
-    fake.failNext('put', new RateLimitExceededError('daily limit reached'));
-    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'rate_limited' });
-    const spent = fake.calls.length;
-    expect(await subject.finalize(change.attempt.id)).toEqual({ status: 'rate_limited' });
-    expect(fake.calls).toHaveLength(spent);
-    expect(await phase(change.attempt.id)).toBe('confirmed');
-    vi.advanceTimersByTime(60_001);
-
-    // The principal saves a note between the host's read and its update: the version check refuses the stale write.
-    fake.beforePut = () => fake.edit(itemId, (item) => ({ ...item, notes: 'Edited during the update' }));
-    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'conflict', reason: 'concurrent_edit' });
-    expect(fake.value(itemId, 'password')).toBe(change.previous);
-    expect(fake.archived.has(change.candidateId)).toBe(false);
     expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
-    expect(fake.items.get(itemId)).toMatchObject({ notes: 'Edited during the update' });
-    expect(fake.value(itemId, 'password')).toBe(change.next);
-  });
-
-  it('leaves the original Login to the principal while automatic promotion is disabled, its default', async () => {
-    const subject = new CredentialAttempts({ db: getDb(), vault });
-    const { itemId } = await ownedLogin(subject);
-    const change = await changedPassword(subject, itemId);
-    await subject.markAwaitingVerification(change.attempt.id);
-    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
-    const puts = fake.calls.filter((call) => call === 'put').length;
-    expect(await subject.finalize(change.attempt.id)).toMatchObject({
-      status: 'conflict',
-      reason: 'promotion_disabled',
-    });
-    expect(fake.value(itemId, 'password')).toBe(change.previous);
-    // The principal copies the new password into their Login; reconciliation confirms it without writing.
-    fake.edit(itemId, (item) => ({
-      ...item,
-      fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: change.next } : field)),
-    }));
-    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
-    expect(fake.calls.filter((call) => call === 'put')).toHaveLength(puts);
-  });
-
-  it('skips a conflict the principal releases mid-reconciliation and still reconciles the rest', async () => {
-    vi.useFakeTimers();
-    const subject = service({ automaticPromotion: false });
-    const keptBoth = async (itemId: string) => {
-      const change = await changedPassword(subject, itemId);
-      await subject.markAwaitingVerification(change.attempt.id);
-      await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
-      expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'conflict' });
-      return change;
-    };
-    const first = await ownedLogin(subject);
-    const second = await ownedLogin(subject, 'juno.hale@example.com');
-    fake.edit(second.itemId, (item) => ({ ...item, title: 'Shop (Juno)' }));
-    const released = await keptBoth(first.itemId);
-    vi.advanceTimersByTime(1_000);
-    const moved = await keptBoth(second.itemId);
-    fake.edit(second.itemId, (item) => ({
-      ...item,
-      fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: moved.next } : field)),
-    }));
-
-    // The principal's release of the first lands between its fresh read and its compare-and-set.
-    let releasing: Promise<unknown> | undefined;
-    const racing = async (): Promise<void> => {
-      releasing ??= subject.release(released.attempt.id, 'approval-released');
-      await releasing;
-    };
-    expect(await subject.reconcileConflicts(racing)).toEqual({ finalized: 1 });
-    expect(await phase(released.attempt.id)).toBe('rejected');
-    expect(await phase(moved.attempt.id)).toBe('finalized');
+    expect(await other()).toMatchObject({ status: 'prepared' });
   });
 });
 
@@ -671,12 +763,12 @@ describe('phases', () => {
     });
     expect(await subject.finalize(attempt.id)).toEqual({ status: 'refused', reason: 'not_confirmed' });
 
-    // An attempt abandoned before any disclosure retires its unused candidate.
+    // An attempt abandoned before any disclosure deletes its unused candidate.
     const unused = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
     await subject.save(unused.id);
     const saved = await subject.get(unused.id);
     expect(await subject.abandon(unused.id)).toMatchObject({ phase: 'rejected' });
-    expect(fake.archived.has(saved?.candidate_item_id ?? '')).toBe(true);
+    expect(fake.items.has(saved?.candidate_item_id ?? '')).toBe(false);
     expect(await subject.unresolved()).toEqual([]);
     await expect(
       subject.prepareSignup({ jobId: JOB, origin: 'http://accounts.shop.example', username: USERNAME }),

@@ -4,7 +4,9 @@
  * host binds the vault and account from its own records, shares only with
  * the principal's exact confirmed 1Password user, checks actual access
  * before and after any grant, and otherwise answers with the operator
- * handoff. A principal's explicit retry lists the vault again at once.
+ * handoff. A share answers with the recorded account's sign-in link and the
+ * vault's exact name. A principal's explicit retry lists the vault again at
+ * once.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -60,6 +62,9 @@ const ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
 const MANAGEMENT_ID = 'MANAGEMENTSERVICEACCOUNT01';
 const RUNTIME_ID = 'RUNTIMESERVICEACCOUNT00001';
 const VAULT_ID = 'morganelleryvault000000001';
+const VAULT_NAME = 'Assistant juno@assistant.example.test';
+const SIGN_IN_ADDRESS = 'hale.1password.com';
+const LINK = 'https://hale.1password.com/';
 const PRINCIPAL_USER_ID = 'MORGANELLERYUSER0000000001';
 const ALTERNATE_USER_ID = 'MORGANPERSONALUSER00000001';
 const INSTANCE_ID = '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b';
@@ -73,9 +78,9 @@ const PRINCIPAL_EMAIL = 'morgan@example.test';
 const WORK_EMAIL = 'morgan@work.example.test';
 const ALTERNATE_EMAIL = 'morgan.ellery@personal.example.test';
 
-type Operation = 'getUser' | 'listVaultUsers' | 'grantVaultAccess';
+type Operation = 'getVault' | 'getUser' | 'listVaultUsers' | 'grantVaultAccess';
 
-/** 1Password as the management service account sees it: its users, and who has direct access to the one vault. */
+/** 1Password as the management service account sees it: the one vault, its users, and who has direct access to it. */
 class FakeOnePassword implements VaultSharingProvider {
   readonly calls: Array<{ readonly operation: Operation; readonly identity: ServiceAccountIdentity; args: unknown }> =
     [];
@@ -96,6 +101,15 @@ class FakeOnePassword implements VaultSharingProvider {
 
   count(operation: Operation): number {
     return this.calls.filter((call) => call.operation === operation).length;
+  }
+
+  async getVault(identity: ServiceAccountIdentity, vaultId: string) {
+    this.calls.push({ operation: 'getVault', identity, args: vaultId });
+    const failed = this.failure('getVault');
+    if (failed?.status === 'failed') return failed;
+    return vaultId === VAULT_ID
+      ? ({ status: 'ok', name: VAULT_NAME } as const)
+      : ({ status: 'failed', reason: 'not_found' } as const);
   }
 
   async getUser(identity: ServiceAccountIdentity, email: string) {
@@ -153,11 +167,13 @@ function member(email: string, userId: string, changes: Partial<OnePasswordUser>
 async function writeHostPolicy(
   managementServiceAccountId: string | null = MANAGEMENT_ID,
   enabled = true,
+  signInAddress = SIGN_IN_ADDRESS,
 ): Promise<void> {
   await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
     schemaVersion: 2,
     enabled,
     accountId: ACCOUNT_ID,
+    signInAddress,
     cliPath: '/nonexistent-onepassword-cli/op',
     managementServiceAccountId,
   });
@@ -334,13 +350,22 @@ afterEach(async () => {
 describe('sharing with the principal', () => {
   it("grants only the principal's exact confirmed user view and edit on the recorded vault, then verifies access (AE2)", async () => {
     const data = answer(await ask({ operation: 'share' }));
-    expect(data).toEqual({ status: 'shared', email: PRINCIPAL_EMAIL, account_id: ACCOUNT_ID, vault_id: VAULT_ID });
+    expect(data).toEqual({
+      status: 'shared',
+      email: PRINCIPAL_EMAIL,
+      account_id: ACCOUNT_ID,
+      vault_id: VAULT_ID,
+      vault_name: VAULT_NAME,
+      link: LINK,
+    });
     expect(onePassword.calls.map((call) => call.operation)).toEqual([
+      'getVault',
       'getUser',
       'listVaultUsers',
       'grantVaultAccess',
       'listVaultUsers',
     ]);
+    expect(onePassword.calls[0]?.args).toBe(VAULT_ID);
     const [grant] = onePassword.calls.filter((call) => call.operation === 'grantVaultAccess');
     expect(grant?.args).toEqual({
       vaultId: VAULT_ID,
@@ -355,6 +380,28 @@ describe('sharing with the principal', () => {
         tokenFile: onePasswordHostPaths(path.join(vaultRoot, 'config')).managementTokenFile,
       });
     expectNoSecrets(data);
+  });
+
+  it('links exactly the recorded account and names exactly the recorded vault, whatever the request says', async () => {
+    // Another account's address in the host's record is the only thing that moves the link.
+    await writeHostPolicy(MANAGEMENT_ID, true, 'vance-team.1password.eu');
+    expect(answer(await ask({ operation: 'share' }))).toMatchObject({
+      status: 'shared',
+      account_id: ACCOUNT_ID,
+      vault_id: VAULT_ID,
+      vault_name: VAULT_NAME,
+      link: 'https://vance-team.1password.eu/',
+    });
+    for (const extra of [{ link: 'https://hale.1password.example/' }, { vault_name: 'Shared' }])
+      expect(await ask({ operation: 'share', ...extra })).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+    // A vault 1Password does not name is not shared on a guessed name.
+    onePassword.calls.length = 0;
+    onePassword.fail('getVault', 'unexpected_output');
+    expect(answer(await ask({ operation: 'share' }))).toMatchObject({
+      status: 'operator_needed',
+      reason: 'unconfirmed',
+    });
+    expect(onePassword.calls.map((call) => call.operation)).toEqual(['getVault']);
   });
 
   it('answers a repeated request with verified access and grants nothing again', async () => {
@@ -401,7 +448,7 @@ describe('sharing with the principal', () => {
   it('returns a bounded rate-limited outcome and retries nothing', async () => {
     onePassword.fail('getUser', 'rate_limited');
     expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'rate_limited' });
-    expect(onePassword.calls.map((call) => call.operation)).toEqual(['getUser']);
+    expect(onePassword.calls.map((call) => call.operation)).toEqual(['getVault', 'getUser']);
   });
 
   it('reports the vault unavailable, spending no request, until the assistant is provisioned', async () => {
@@ -425,7 +472,7 @@ describe('the operator handoff', () => {
     expect(data.status).toBe('operator_needed');
     const message = data.operator_message;
     if (typeof message !== 'string') throw new Error('No operator message');
-    for (const fact of ['Juno', 'juno@assistant.example.test', ACCOUNT_ID, VAULT_ID, email])
+    for (const fact of ['Juno', 'juno@assistant.example.test', ACCOUNT_ID, VAULT_ID, LINK, email])
       expect(message).toContain(fact);
     // It asks for what the operator must do; it never tells the principal an invitation is coming.
     expect(message).not.toMatch(
@@ -486,7 +533,10 @@ describe('the operator handoff', () => {
     arrange(onePassword);
     const data = answer(await ask({ operation: 'share' }));
     expect(data).toMatchObject({ reason, email: PRINCIPAL_EMAIL });
-    expect(expectForwardable(data, PRINCIPAL_EMAIL)).toMatch(why);
+    const message = expectForwardable(data, PRINCIPAL_EMAIL);
+    expect(message).toMatch(why);
+    // Once 1Password has named the vault, the operator can find it by that name at the account's address.
+    expect(message).toContain(`the vault "${VAULT_NAME}" (ID ${VAULT_ID}) in the 1Password account at ${LINK}`);
   });
 
   it('names neither a guest nor an Individual account when 1Password no longer knows the vault or user it is granting', async () => {
@@ -503,7 +553,10 @@ describe('the operator handoff', () => {
     await writeHostPolicy(null);
     const data = answer(await ask({ operation: 'share' }));
     expect(data).toMatchObject({ reason: 'host_cannot_share' });
-    expectForwardable(data, PRINCIPAL_EMAIL);
+    // Without a provider request the vault has no name to give, only its ID.
+    expect(expectForwardable(data, PRINCIPAL_EMAIL)).toContain(
+      `the vault with ID ${VAULT_ID} in the 1Password account`,
+    );
     expect(providerOpened).toBe(false);
   });
 
@@ -621,6 +674,8 @@ describe('who may ask, and for whom', () => {
       userId: ALTERNATE_USER_ID,
     });
     expect(notes(main).at(-1)).toMatch(new RegExp(`${ALTERNATE_EMAIL.replaceAll('.', '\\.')}.*shared`, 'u'));
+    expect(notes(main).at(-1)).toContain(`Give the principal ${LINK}`);
+    expect(notes(main).at(-1)).toContain(`"${VAULT_NAME}"`);
     expect(await listPrincipalAddresses()).toEqual(before);
     expect(await getDb().all('SELECT email FROM gws_ea_principal_addresses')).toEqual([{ email: PRINCIPAL_EMAIL }]);
     expectNoSecrets(notes(main));
@@ -667,22 +722,6 @@ describe("the principal's retry after adding a login (AE6)", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it('records password changes that kept both credentials once the principal updated the original login', async () => {
-    const reconcileConflicts = vi.fn(async () => ({ finalized: 1 }));
-    registerVaultAccessDelivery({
-      vault,
-      onePasswordPolicyFile: () => onePasswordPolicyFile,
-      openProvider: async () => onePassword,
-      attempts: { reconcileConflicts },
-    });
-    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'usable' });
-    expect(reconcileConflicts).toHaveBeenCalledOnce();
-    const { RateLimitExceededError } = await import('@1password/sdk');
-    sdk.list.mockRejectedValueOnce(new RateLimitExceededError('limited'));
-    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'rate_limited' });
-    expect(reconcileConflicts).toHaveBeenCalledOnce();
   });
 
   it('reports a spent request limit or an unusable vault, without secrets', async () => {

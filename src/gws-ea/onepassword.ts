@@ -34,6 +34,7 @@ import {
   ONEPASSWORD_RUNTIME_GRANT,
   onePasswordHostPaths,
   onePasswordInstancePaths,
+  onePasswordSignInAddress,
   readOnePasswordHostPolicy,
   readOnePasswordResources,
   readOnePasswordToken,
@@ -597,23 +598,23 @@ async function underHostLock<T>(paths: ControlPlanePaths, work: () => Promise<T>
   }
 }
 
-/** The one account every assistant on this host uses: the recorded one, or one the operator names or chooses. */
+/**
+ * The one account every assistant on this host uses, as the 1Password app
+ * lists it: the recorded one, or one the operator names or chooses. The
+ * listing gives its sign-in address, which the host records beside its ID.
+ */
 async function selectAccount(
   cli: OnePasswordCli,
   recorded: OnePasswordHostPolicy | undefined,
   requested: string | undefined,
   choose: OnePasswordDependencies['chooseAccount'],
-): Promise<string> {
-  if (recorded) {
-    if (requested !== undefined && requested !== recorded.accountId)
-      throw new GwsEaError(
-        'onepassword_account_mismatch',
-        `1Password is set up on this host with account ${recorded.accountId}; assistants keep their vaults there, so another account is refused.`,
-        { details: { accountId: recorded.accountId } },
-      );
-    return recorded.accountId;
-  }
-  if (requested !== undefined) return requested;
+): Promise<{ readonly accountId: string; readonly signInAddress: string }> {
+  if (recorded && requested !== undefined && requested !== recorded.accountId)
+    throw new GwsEaError(
+      'onepassword_account_mismatch',
+      `1Password is set up on this host with account ${recorded.accountId}; assistants keep their vaults there, so another account is refused.`,
+      { details: { accountId: recorded.accountId } },
+    );
   const listed = await cli.listAccounts();
   if (listed.status !== 'ok') throw hostProviderError(listed.reason, 'operator');
   if (!listed.accounts.length)
@@ -621,7 +622,8 @@ async function selectAccount(
       'onepassword_sign_in_required',
       'The 1Password app holds no account. Sign in to the account assistants should use, then retry.',
     );
-  const chosen = choose ? await choose(listed.accounts) : undefined;
+  const named = recorded?.accountId ?? requested;
+  const chosen = named ?? (choose ? await choose(listed.accounts) : undefined);
   if (chosen === undefined)
     throw new GwsEaError(
       'onepassword_account_required',
@@ -633,9 +635,14 @@ async function selectAccount(
         },
       },
     );
-  if (!listed.accounts.some((account) => account.accountId === chosen))
-    throw invalidArguments('The chosen 1Password account is not one the app holds.');
-  return chosen;
+  const account = listed.accounts.find((candidate) => candidate.accountId === chosen);
+  if (!account) {
+    if (named === undefined) throw invalidArguments('The chosen 1Password account is not one the app holds.');
+    throw hostProviderError('not_found', 'operator');
+  }
+  const signInAddress = onePasswordSignInAddress(account.url);
+  if (signInAddress === undefined) throw hostProviderError('unexpected_output', 'operator');
+  return { accountId: account.accountId, signInAddress };
 }
 
 /** The operator's own user in the account, through the desktop sign-in. */
@@ -807,7 +814,12 @@ export async function enableOnePassword(
         'The gws-ea launcher must supply its native environment writer to enable 1Password.',
       );
 
-    const accountId = await selectAccount(cli, recorded, request.accountId, dependencies.chooseAccount);
+    const { accountId, signInAddress } = await selectAccount(
+      cli,
+      recorded,
+      request.accountId,
+      dependencies.chooseAccount,
+    );
     const operator: OperatorIdentity = { kind: 'operator', accountId };
     dependencies.progress?.('Approve the 1Password app’s request if it asks.');
     const operatorUserId = await verifyOperator(cli, operator);
@@ -828,6 +840,7 @@ export async function enableOnePassword(
       schemaVersion: 2,
       enabled: true,
       accountId,
+      signInAddress,
       cliPath: cli.executable,
       managementServiceAccountId,
     } as const satisfies OnePasswordHostPolicy;

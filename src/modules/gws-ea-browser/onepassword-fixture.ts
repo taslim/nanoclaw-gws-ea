@@ -19,12 +19,13 @@ import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { writePrivateFile } from './paths.js';
 
 export const FIXTURE_ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
+export const FIXTURE_SIGN_IN_ADDRESS = 'hale.1password.com';
 export const FIXTURE_RUNTIME_ID = 'RUNTIMESERVICEACCOUNT00001';
 export const FIXTURE_VAULT_ID = 'morganelleryvault000000001';
 export const FIXTURE_INSTANCE_ID = '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b';
 export const FIXTURE_TOKEN = 'ops_fixture-runtime-service-account-token';
 
-type Operation = 'vaults' | 'list' | 'get' | 'create' | 'put' | 'archive' | 'resolve';
+type Operation = 'vaults' | 'list' | 'get' | 'create' | 'put' | 'delete' | 'resolve';
 interface Fault {
   readonly error: Error;
   readonly applied: boolean | 'later';
@@ -40,6 +41,7 @@ const fail = (): never => {
  */
 export class FakeOnePassword {
   readonly items = new Map<string, Item>();
+  /** Items the principal archived in the 1Password app: the SDK neither reads nor lists them as active. */
   readonly archived = new Set<string>();
   readonly calls: Operation[] = [];
   beforePut: (() => void) | undefined;
@@ -172,10 +174,13 @@ export class FakeOnePassword {
               }),
             );
         },
-        archive: async (_vaultId: string, itemId: string) => {
-          const fault = this.take('archive');
+        delete: async (vaultId: string, itemId: string) => {
+          const fault = this.take('delete');
+          if (fault?.applied === true) this.items.delete(itemId);
           if (fault) throw fault.error;
-          this.archived.add(itemId);
+          const item = this.items.get(itemId);
+          if (!item || item.vaultId !== vaultId) throw new Error('item not found');
+          this.items.delete(itemId);
         },
       },
       secrets: {
@@ -204,6 +209,7 @@ export async function writeVaultFixture(directory: string): Promise<VaultFixture
     schemaVersion: 2,
     enabled: true,
     accountId: FIXTURE_ACCOUNT_ID,
+    signInAddress: FIXTURE_SIGN_IN_ADDRESS,
     cliPath: '/opt/homebrew/bin/op',
     managementServiceAccountId: null,
   });

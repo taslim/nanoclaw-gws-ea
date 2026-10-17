@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { REDACTED, redact } from '../../gws-ea/redact.js';
 import {
   isOnePasswordId,
+  onePasswordAccountLink,
   onePasswordHostPaths,
   onePasswordInstancePaths,
   onePasswordManagementIdentity,
+  onePasswordSignInAddress,
   readOnePasswordHostPolicy,
   readOnePasswordResources,
   readOnePasswordToken,
@@ -46,6 +48,7 @@ function hostPolicy(overrides: Partial<OnePasswordHostPolicy> = {}): OnePassword
     schemaVersion: 2,
     enabled: true,
     accountId: ACCOUNT_ID,
+    signInAddress: 'hale.1password.com',
     cliPath: '/opt/homebrew/bin/op',
     managementServiceAccountId: MANAGEMENT_ID,
     ...overrides,
@@ -99,6 +102,30 @@ describe('1Password identifiers', () => {
       7,
     ])
       expect(isOnePasswordId(invalid)).toBe(false);
+  });
+});
+
+describe('the account sign-in address', () => {
+  it('keeps the address the 1Password app lists, in one form, and builds its link from that alone', () => {
+    for (const [listed, address] of [
+      ['hale.1password.com', 'hale.1password.com'],
+      ['https://Hale.1Password.com/', 'hale.1password.com'],
+      ['my.1password.eu', 'my.1password.eu'],
+      ['vance-team.ent.1password.com', 'vance-team.ent.1password.com'],
+    ])
+      expect(onePasswordSignInAddress(listed)).toBe(address);
+    for (const other of [
+      '',
+      '1password.com',
+      'hale.1password.example',
+      'hale.1password.com.example',
+      'http://hale.1password.com',
+      'https://hale.1password.com/vaults',
+      'hale.1password.com?a=x',
+      'a.b.c.1password.com',
+    ])
+      expect(onePasswordSignInAddress(other)).toBeUndefined();
+    expect(onePasswordAccountLink({ signInAddress: 'hale.1password.com' })).toBe('https://hale.1password.com/');
   });
 });
 
@@ -185,6 +212,15 @@ describe('the host 1Password policy', () => {
     ['a missing disabled intent', ({ enabled: _omitted, ...raw }: Record<string, unknown>) => raw],
     ['a disabled intent that is not a boolean', (raw: Record<string, unknown>) => ({ ...raw, enabled: 'no' })],
     ['an account shorthand instead of its ID', (raw: Record<string, unknown>) => ({ ...raw, accountId: 'my' })],
+    ['a missing sign-in address', ({ signInAddress: _omitted, ...raw }: Record<string, unknown>) => raw],
+    [
+      'a sign-in address on another domain',
+      (raw: Record<string, unknown>) => ({ ...raw, signInAddress: 'hale.1password.example' }),
+    ],
+    [
+      'a sign-in address that is a full URL',
+      (raw: Record<string, unknown>) => ({ ...raw, signInAddress: 'https://hale.1password.com/vaults' }),
+    ],
     ['a relative CLI path', (raw: Record<string, unknown>) => ({ ...raw, cliPath: 'bin/op' })],
     ['an unnormalized CLI path', (raw: Record<string, unknown>) => ({ ...raw, cliPath: '/opt/homebrew/../bin/op' })],
     ['a missing management field', ({ managementServiceAccountId: _omitted, ...raw }: Record<string, unknown>) => raw],

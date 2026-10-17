@@ -211,7 +211,7 @@ export const browserCredentialAttemptsMigration: PortableMigration & { name: Mod
         candidate_version INTEGER,
         phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
         save_started_at TEXT,
-        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','concurrent_edit','promotion_disabled')),
+        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
         evidence_json TEXT,
         owned_item_id TEXT,
         created_at TEXT NOT NULL,
