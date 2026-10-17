@@ -58,6 +58,7 @@ import {
   type NativeCredentialBinding,
   type NativeCredentialFacts,
   type NativeCredentialGroup,
+  type NativeDocumentField,
   type NativeFieldFacts,
 } from './authentication-submit.js';
 import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
@@ -665,11 +666,13 @@ async function checkDocument(
   frame: Frame,
   group: Pick<CredentialGroup, 'kind' | 'site'>,
   native: Pick<NativeCredentialGroup, 'fields' | 'control'>,
-): Promise<void> {
+  account: string,
+): Promise<NativeDocumentField[]> {
   destination(frame.url(), group.kind, group.site);
-  const others = await readNativeDocumentFields(frame, native);
+  const others = await readNativeDocumentFields(frame, native, account);
   if (!others) throw new StepStop('unsupported_form');
   checkFields(others, group.kind);
+  return others;
 }
 
 async function bindGroup(
@@ -724,17 +727,25 @@ async function bindGroup(
   const group = { kind: attempt.kind, site: attempt.site, frame, fields };
   checkForm(fields[0].binding.facts, group);
   checkForm(controlBinding.facts, group);
-  if (form === null)
-    await checkDocument(frame, group, { control: controlBinding, fields: fields.map((field) => field.binding) });
-  // The Login is saved under the authority's username: a form that names the account must receive exactly that.
-  if (
-    scope.step === 'credentials' &&
-    !fields.some((field) => field.role === 'username') &&
-    fields[0].binding.facts.form?.fields.some(
-      (field) => editable(field) && credentialFieldFits('username', { ...field, id: '' }, attempt.kind, currentBound),
-    )
-  )
-    throw new StepStop('unsupported_form');
+  const others =
+    form === null
+      ? await checkDocument(
+          frame,
+          group,
+          { control: controlBinding, fields: fields.map((field) => field.binding) },
+          attempt.username,
+        )
+      : undefined;
+  if (scope.step === 'credentials') {
+    const namesAccount = (field: NativeFieldFacts): boolean =>
+      editable(field) && credentialFieldFits('username', { ...field, id: '' }, attempt.kind, currentBound);
+    // The Login is saved under the authority's username: a form that names the account must receive exactly that,
+    if (!fields.some((field) => field.role === 'username') && fields[0].binding.facts.form?.fields.some(namesAccount))
+      throw new StepStop('unsupported_form');
+    // and a formless signup page, whose handler may send any field on it, must name no other account.
+    if (attempt.kind === 'signup' && others?.some((field) => namesAccount(field) && field.holds === 'other'))
+      throw new StepStop('unsupported_form');
+  }
   const terms =
     scope.terms && (await bindTerms(page, attempt, pinned(scope.terms), controlBinding, form, origin.origin));
   const activation = await classifyCredentialActivation(page, control.element, attempt.kind, attempt.site, {
@@ -1102,6 +1113,36 @@ async function rejectExposed(attempts: CredentialAttempts, id: string, proof: Cr
   await settle(() => attempts.markRejected(id, proof));
 }
 
+/**
+ * An error, or an activation the host cannot see through, after a value
+ * reached the page, when nothing is safe to repeat: an attempt still in
+ * flight becomes unknown, `watch` keeping the site's response for
+ * reconciliation, and the answer is whatever the attempt recorded.
+ */
+async function interruptedOutcome(
+  attempts: CredentialAttempts,
+  attempt: Pick<CredentialAttempt, 'id' | 'kind'>,
+  proof: CredentialEvidence,
+  watch?: () => void,
+): Promise<Outcome> {
+  const current = await attempts.get(attempt.id);
+  switch (current?.phase) {
+    case 'exposed':
+    case 'awaiting_verification':
+      await settle(() => attempts.markUnknown(attempt.id, proof));
+      watch?.();
+      return { status: 'outcome_unknown' };
+    // The website already confirmed it; only 1Password's update was cut short.
+    case 'confirmed':
+      return websiteOutcome(attempt.kind, 'pending');
+    case 'conflict':
+    case 'finalized':
+      return websiteOutcome(attempt.kind, current.phase);
+    default:
+      return { status: 'outcome_unknown' };
+  }
+}
+
 async function disclosingStep(
   context: BrowserExecutionContext,
   page: Page,
@@ -1158,15 +1199,7 @@ async function disclosingStep(
   /** An outcome left unknown after the control may have run: the response is watched for reconciliation. */
   const unknownAfterActivation = async (proof: CredentialEvidence): Promise<Outcome> => {
     await settle(() => attempts.markUnknown(saved.id, proof));
-    watchedResponses.set(saved.id, {
-      page,
-      frame: group.frame,
-      site: group.site,
-      kind: group.kind,
-      before,
-      requestId: context.request.id,
-      at: new Date().toISOString(),
-    });
+    watchResponse(saved.id, context, page, group, { step: 'credentials', before });
     return { status: 'outcome_unknown' };
   };
   page.on('framenavigated', navigation);
@@ -1177,6 +1210,11 @@ async function disclosingStep(
     }
     assertBrowserSecretDiagnosticsSafe();
     const values = valuesFor(group, credential);
+    // A disable the operator published since the disclosure stops the insertion: nothing has reached the page yet.
+    if (!(await attempts.usable(saved))) {
+      await rejectExposed(attempts, saved.id, evidence('none', 'not_inserted', 'none'));
+      return { status: 'vault_unavailable' };
+    }
     const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
     if (filled === 'not_inserted') {
       // Proven: nothing reached the page, so no website could have acted on it.
@@ -1214,21 +1252,7 @@ async function disclosingStep(
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- after a disclosure nothing is safe to repeat, and no Playwright, SDK or renderer prose crosses this boundary
   } catch (_error) {
-    const current = await attempts.get(saved.id);
-    switch (current?.phase) {
-      case 'exposed':
-      case 'awaiting_verification':
-        await settle(() => attempts.markUnknown(saved.id, evidence('interrupted', 'unknown', 'unknown')));
-        return { status: 'outcome_unknown' };
-      // The website already confirmed the change; only 1Password's update was cut short.
-      case 'confirmed':
-        return websiteOutcome(saved.kind, 'pending');
-      case 'conflict':
-      case 'finalized':
-        return websiteOutcome(saved.kind, current.phase);
-      default:
-        return { status: 'outcome_unknown' };
-    }
+    return await interruptedOutcome(attempts, saved, evidence('interrupted', 'unknown', 'unknown'));
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
@@ -1244,18 +1268,38 @@ async function disclosingStep(
 
 /**
  * The response this host was watching when an activation's outcome stayed
- * unknown, in host memory only: the document, the site, and the lines it
- * showed before the activation. A restart forgets it, and so can only leave
- * the attempt unknown.
+ * unknown, in host memory only: the document, the site, the step it
+ * submitted, and the lines it showed before the activation. A restart
+ * forgets it, and so can only leave the attempt unknown.
  */
 interface WatchedResponse extends SiteScope {
   readonly page: Page;
   readonly kind: CredentialKind;
+  readonly step: BindingScope['step'];
   readonly before: SiteState;
   readonly requestId: string;
   readonly at: string;
 }
 const watchedResponses = new Map<string, WatchedResponse>();
+
+/** Keeps the response to an activation whose outcome stayed unknown, for `reconcile` to read. */
+function watchResponse(
+  id: string,
+  context: BrowserExecutionContext,
+  page: Page,
+  { frame, site, kind }: CredentialGroup,
+  submitted: Pick<WatchedResponse, 'step' | 'before'>,
+): void {
+  watchedResponses.set(id, {
+    page,
+    frame,
+    site,
+    kind,
+    ...submitted,
+    requestId: context.request.id,
+    at: new Date().toISOString(),
+  });
+}
 
 /** Browser actions that cannot change what a site shows: anything else since the activation makes its response unattributable. */
 const READ_ONLY_ACTIONS: ReadonlySet<unknown> = new Set(['observe', 'screenshot', 'wait_for']);
@@ -1287,9 +1331,10 @@ async function attributable(context: BrowserExecutionContext, watched: WatchedRe
 /**
  * Settles an attempt without submitting anything (KTD8). From unknown, only
  * the website's own late response to the watched activation counts: a
- * rejection, a request to verify the email, or success. Otherwise it stays
- * unknown, and its site stays held. From confirmed or a conflict, the vault's
- * finalize runs again, reading everything fresh.
+ * rejection, a request to verify the email, or success; after a verification
+ * code, only the account's confirmation. Otherwise it stays unknown, and its
+ * site stays held. From confirmed or a conflict, the vault's finalize runs
+ * again, reading everything fresh.
  */
 async function reconcile(
   context: BrowserExecutionContext,
@@ -1313,6 +1358,12 @@ async function reconcile(
   }
 }
 
+/** The site's late response as `enterCode` would read it for a code, or as the submission would. */
+function lateResult(watched: WatchedResponse, now: SiteState): WebsiteResult {
+  if (watched.step === 'credentials') return websiteResult(watched.kind, watched.before, now);
+  return verificationResult(watched.before, now, true) === 'verified' ? 'confirmed' : 'none';
+}
+
 async function reconcileResponse(
   context: BrowserExecutionContext,
   page: Page,
@@ -1321,7 +1372,7 @@ async function reconcileResponse(
   attempts: CredentialAttempts,
 ): Promise<Outcome> {
   if (page !== watched.page) return { status: 'inconclusive' };
-  const result = websiteResult(watched.kind, watched.before, await readSite(page, watched));
+  const result = lateResult(watched, await readSite(page, watched));
   if (result === 'none') return { status: 'inconclusive' };
   watchedResponses.delete(attempt.id);
   const proof: CredentialEvidence = { signal: result, reconciled: true };
@@ -1413,12 +1464,20 @@ async function enterCode(
   await context.assertActive();
   assertBrowserSecretDiagnosticsSafe();
   registerPageSecret(page, code);
+  // Once the code is in the page the site may have taken it: only its late response can settle the signup.
+  const unknownAfterCode = (proof: CredentialEvidence): Promise<Outcome> =>
+    interruptedOutcome(attempts, attempt, proof, () =>
+      watchResponse(attempt.id, context, page, group, { step: 'verification', before }),
+    );
+  let inserted = false;
   try {
     await bindPageSecretDocuments(page, code);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, [code], context.assertActive);
     if (filled === 'not_inserted') return refused('form_changed');
+    inserted = true;
     await finishSignupVerification(attempt.id);
     return await activateWithin(context, page, group, [code], [code], async (activation) => {
+      if (activation === 'uncertain') return unknownAfterCode({ signal: 'none', activation, via: 'code' });
       if (activation !== 'activated') return { status: 'verification_requested' };
       const result = await awaitSite(context, 15_000, async () =>
         verificationResult(before, await readSite(page, group), true),
@@ -1427,6 +1486,9 @@ async function enterCode(
         ? confirmVerified(context, attempt, attempts, 'code')
         : { status: 'verification_requested' };
     });
+  } catch (error) {
+    if (!inserted) throw error;
+    return await unknownAfterCode({ signal: 'interrupted', via: 'code' });
   } finally {
     await settleFilledSecrets(context, page, [code]);
   }

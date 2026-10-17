@@ -575,6 +575,20 @@ export class CredentialAttempts {
   }
 
   /**
+   * Whether the operator's published intent still lets this attempt use its
+   * vault, from local records alone: no provider request is spent. The caller
+   * asks again right before a disclosed value reaches a page.
+   */
+  async usable(attempt: Pick<CredentialAttempt, 'vault_id' | 'account_id'>): Promise<boolean> {
+    const availability = await this.vault.availability();
+    return (
+      availability.status === 'available' &&
+      availability.binding.vaultId === attempt.vault_id &&
+      availability.binding.accountId === attempt.account_id
+    );
+  }
+
+  /**
    * The only way to obtain a saved candidate's value. It records possible
    * disclosure (`exposed`) before returning anything, so the caller may insert
    * the value only after this resolves. A change also returns the original
@@ -603,13 +617,7 @@ export class CredentialAttempts {
       currentPassword = owned.password;
     }
     // A remembered value needs no provider request, so only the operator's published disable can stop it here.
-    const availability = await this.vault.availability();
-    if (
-      availability.status !== 'available' ||
-      availability.binding.vaultId !== attempt.vault_id ||
-      availability.binding.accountId !== attempt.account_id
-    )
-      return { status: 'vault_unavailable' };
+    if (!(await this.usable(attempt))) return { status: 'vault_unavailable' };
     await assertActive();
     const at = now();
     const changed = await this.db.run(
@@ -777,14 +785,23 @@ export class CredentialAttempts {
    * The explicit reconciliation of every conflict, run when main refreshes
    * the vault after the principal's edits: each is re-read fresh and
    * finalizes once its original Login holds the new password. A spent
-   * request budget or an unusable vault stops it; nothing is retried.
+   * request budget or an unusable vault stops it; nothing is retried. One a
+   * concurrent change settled first, such as the principal's release, is
+   * skipped.
    */
   async reconcileConflicts(assertActive = active): Promise<{ readonly finalized: number }> {
     let finalized = 0;
     for (const { id } of await this.db.all<{ id: string }>(
       `SELECT id FROM ${TABLE} WHERE phase = 'conflict' ORDER BY updated_at, id`,
     )) {
-      const result = await this.finalize(id, assertActive);
+      let result: CredentialFinalizeResult;
+      try {
+        result = await this.finalize(id, assertActive);
+      } catch (error) {
+        // It lost its compare-and-set: whoever won settled it.
+        if (!(error instanceof CredentialAttemptError)) throw error;
+        continue;
+      }
       if (result.status === 'finalized') finalized++;
       if (result.status === 'rate_limited' || result.status === 'vault_unavailable') break;
     }

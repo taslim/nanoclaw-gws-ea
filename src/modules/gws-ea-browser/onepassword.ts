@@ -249,6 +249,9 @@ function remember(item: Item): VaultItemRead {
 let sdkModule: Promise<typeof import('@1password/sdk')> | undefined;
 const sdk = (): Promise<typeof import('@1password/sdk')> => (sdkModule ??= import('@1password/sdk'));
 const RATE_LIMIT_BACKOFF_MS = 60_000;
+/** The first hold after a failure to reach or list the vault; each consecutive failure doubles it, up to the cap. */
+const UNAVAILABLE_BACKOFF_MS = 60_000;
+const UNAVAILABLE_BACKOFF_MAX_MS = 60 * 60_000;
 const ITEM_ID = /^[a-z\d_-]+$/iu;
 /** The default activity check: a caller without a cancellable job is always active. */
 export const active = async (): Promise<void> => undefined;
@@ -322,6 +325,9 @@ export class BrowserVault {
   /** Advances when a write changes what is listed, so a listing begun before it never marks the cache current. */
   private generation = 0;
   private rateLimitedUntil = 0;
+  /** Consecutive failures to reach or list the vault, and the hold the last one set. */
+  private failures = 0;
+  private unavailableUntil = 0;
   private loading: Promise<void> | undefined;
 
   constructor(private readonly locators: BrowserVaultLocators = {}) {}
@@ -334,6 +340,19 @@ export class BrowserVault {
     this.handles.clear();
     this.loaded = false;
     this.loading = undefined;
+    this.clearHold();
+  }
+
+  /** The vault answered, the binding changed, or the principal retried: no failure holds the next attempt off. */
+  private clearHold(): void {
+    this.failures = 0;
+    this.unavailableUntil = 0;
+  }
+
+  /** Refuses while a hold lasts: the provider's own rate limit, or the backoff after the vault could not be reached. */
+  private refuseWhileHeld(): void {
+    if (Date.now() < this.rateLimitedUntil) throw new BrowserVaultError('rate_limited');
+    if (Date.now() < this.unavailableUntil) throw new BrowserVaultError('vault_unavailable');
   }
 
   /** Whether the provisioned resources are in place, from local records alone: it spends no provider request. */
@@ -352,6 +371,27 @@ export class BrowserVault {
     return new BrowserVaultError('vault_unavailable');
   }
 
+  /**
+   * A request that reaches or lists the vault under the binding of `epoch`.
+   * While these keep failing for any reason but the rate limit, each failure
+   * holds every use off twice as long as the last, from a minute up to an hour:
+   * page observations would otherwise spend, on a vault that stays unreachable,
+   * the daily request limit every service account in the account shares.
+   */
+  private async reach<T>(epoch: number, request: () => Promise<T>): Promise<T> {
+    try {
+      return await request();
+    } catch (error) {
+      const failure = await this.error(error);
+      if (failure.reason === 'vault_unavailable' && epoch === this.epoch) {
+        this.unavailableUntil =
+          Date.now() + Math.min(UNAVAILABLE_BACKOFF_MS * 2 ** this.failures, UNAVAILABLE_BACKOFF_MAX_MS);
+        this.failures += 1;
+      }
+      throw failure;
+    }
+  }
+
   private async ready(assertActive: () => Promise<void>): Promise<Client> {
     await assertActive();
     const access = await readRuntimeAccess(this.locators);
@@ -366,21 +406,27 @@ export class BrowserVault {
       this.token = token;
       this.vaultId = vaultId;
     }
-    if (Date.now() < this.rateLimitedUntil) throw new BrowserVaultError('rate_limited');
+    this.refuseWhileHeld();
     if (!this.client) {
+      const { epoch } = this;
       this.client = (async () => {
         const { createClient } = await sdk();
         await assertActive();
-        const client = await createClient({
-          auth: token,
-          integrationName: 'GWS-EA host browser',
-          integrationVersion: '1.0.0',
-        });
+        const client = await this.reach(epoch, () =>
+          createClient({
+            auth: token,
+            integrationName: 'GWS-EA host browser',
+            integrationVersion: '1.0.0',
+          }),
+        );
         await assertActive();
         // The record pins the vault: one the token cannot reach is refused, and any other it can is never used.
-        const vaults = await client.vaults.list();
+        await this.reach(epoch, async () => {
+          const vaults = await client.vaults.list();
+          if (!vaults.some((vault) => vault.id === vaultId)) throw new BrowserVaultError('vault_unavailable');
+        });
+        if (epoch === this.epoch) this.clearHold();
         await assertActive();
-        if (!vaults.some((vault) => vault.id === vaultId)) throw new BrowserVaultError('vault_unavailable');
         return client;
       })();
     }
@@ -409,17 +455,20 @@ export class BrowserVault {
   }
 
   private async load(client: Client, assertActive: () => Promise<void>): Promise<void> {
-    if (Date.now() < this.rateLimitedUntil) throw new BrowserVaultError('rate_limited');
+    this.refuseWhileHeld();
     const { epoch, vaultId, generation } = this;
     const loading = (this.loading ??= (async () => {
       if (!vaultId) throw new BrowserVaultError('vault_unavailable');
       await assertActive();
-      const items = await client.items.list(vaultId, {
-        type: 'ByState',
-        content: { active: true, archived: false },
-      });
+      const items = await this.reach(epoch, () =>
+        client.items.list(vaultId, {
+          type: 'ByState',
+          content: { active: true, archived: false },
+        }),
+      );
       await assertActive();
       if (epoch !== this.epoch) throw new BrowserVaultError('vault_unavailable');
+      this.clearHold();
       const overviews = items.filter(
         (item) =>
           item.category === 'Login' &&
@@ -467,9 +516,12 @@ export class BrowserVault {
   /**
    * An explicit retry (AE6): list the vault's logins again now, bypassing the
    * cache, so a login the principal just added is usable. Handles of logins
-   * still listed stay valid. A rate-limit backoff still holds.
+   * still listed stay valid. It skips the hold after a failure to reach the
+   * vault, so one the principal just shared again is tried at once; a
+   * rate-limit backoff still holds, because that limit is the provider's own.
    */
   async refresh(assertActive = active): Promise<void> {
+    this.clearHold();
     await this.load(await this.ready(assertActive), assertActive);
   }
 

@@ -67,6 +67,8 @@ const hostPolicy = (enabled = true) => ({
   managementServiceAccountId: MANAGEMENT_ID,
 });
 const vault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
+const requests = (): number =>
+  [sdk.create, sdk.vaults, sdk.list, sdk.resolve].reduce((total, call) => total + call.mock.calls.length, 0);
 
 beforeEach(async () => {
   directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'browser-vault-')));
@@ -199,8 +201,6 @@ describe('availability from the provisioned resources', () => {
   it('refuses every use while the operator has disabled 1Password, without reaching it', async () => {
     const subject = vault();
     const [choice] = await subject.itemsForOrigin('https://shop.example');
-    const requests = (): number =>
-      [sdk.create, sdk.vaults, sdk.list, sdk.resolve].reduce((total, call) => total + call.mock.calls.length, 0);
     const before = requests();
     await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy(false));
 
@@ -322,8 +322,6 @@ it('reads a fill’s metadata from the cache and spends one request on its secre
   const { RateLimitExceededError } = await import('@1password/sdk');
   const subject = vault();
   const [choice] = await subject.itemsForOrigin('https://shop.example');
-  const requests = (): number =>
-    [sdk.create, sdk.vaults, sdk.list, sdk.resolve].reduce((total, call) => total + call.mock.calls.length, 0);
   const before = requests();
   vi.advanceTimersByTime(24 * 60 * 60_000);
   expect(await subject.resolve(choice.item_handle, 'password', 'https://shop.example')).toBe(SECRET);
@@ -341,6 +339,114 @@ it('reads a fill’s metadata from the cache and spends one request on its secre
   await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject({ reason: 'rate_limited' });
   await expect(subject.refresh()).rejects.toMatchObject({ reason: 'rate_limited' });
   expect(requests()).toBe(spent);
+});
+
+describe('holding off while the vault cannot be reached', () => {
+  const unavailable = { reason: 'vault_unavailable' };
+
+  it('refuses page observations without a request until the hold expires, doubling it up to an hour', async () => {
+    vi.useFakeTimers();
+    sdk.vaults.mockRejectedValue(new Error(SECRET));
+    const subject = vault();
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    let spent = requests();
+    for (const minutes of [1, 2, 4, 8, 16, 32, 60, 60]) {
+      vi.advanceTimersByTime(minutes * 60_000 - 1);
+      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+      expect(requests()).toBe(spent);
+      // Once the hold expires, the next observation authenticates and checks the vault again.
+      vi.advanceTimersByTime(1);
+      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+      expect(requests()).toBe(spent + 2);
+      spent = requests();
+    }
+  });
+
+  it('tries again at once on the principal’s refresh or a new binding', async () => {
+    vi.useFakeTimers();
+    // The vault was unshared: the token authenticates, but no longer reaches it.
+    sdk.vaults.mockResolvedValue([]);
+    const subject = vault();
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    let spent = requests();
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    expect(requests()).toBe(spent);
+    await expect(subject.refresh()).rejects.toMatchObject(unavailable);
+    expect(requests()).toBe(spent + 2);
+    // Shared again, the next refresh lists it within the hold the failed one set.
+    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
+    await subject.refresh();
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    expect(sdk.list).toHaveBeenCalledTimes(1);
+
+    sdk.vaults.mockRejectedValue(new Error(SECRET));
+    const revoked = vault();
+    await expect(revoked.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    spent = requests();
+    // Provisioning replaces the revoked token: the new binding starts without a hold.
+    await writePrivateFile(tokenFile, `${TOKEN}-replacement`);
+    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
+    expect(await revoked.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    expect(requests()).toBe(spent + 3);
+  });
+
+  it('starts over at a minute once the vault answers', async () => {
+    vi.useFakeTimers();
+    sdk.vaults.mockRejectedValue(new Error(SECRET));
+    const subject = vault();
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    vi.advanceTimersByTime(60_000);
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    vi.advanceTimersByTime(2 * 60_000);
+    // The vault is reached again, but its listing fails: the hold that follows is a minute, not four.
+    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
+    sdk.list.mockRejectedValueOnce(new Error(SECRET));
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    const spent = requests();
+    vi.advanceTimersByTime(60_000);
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    // The verified client is kept: only the listing is retried.
+    expect(requests()).toBe(spent + 1);
+  });
+
+  it('keeps the rate limit’s own one-minute hold, which a refresh does not lift and failures never double', async () => {
+    vi.useFakeTimers();
+    const { RateLimitExceededError } = await import('@1password/sdk');
+    sdk.list.mockRejectedValue(new RateLimitExceededError(SECRET));
+    const subject = vault();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject({ reason: 'rate_limited' });
+      const spent = requests();
+      vi.advanceTimersByTime(60_000 - 1);
+      await expect(subject.refresh()).rejects.toMatchObject({ reason: 'rate_limited' });
+      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject({ reason: 'rate_limited' });
+      expect(requests()).toBe(spent);
+      vi.advanceTimersByTime(1);
+    }
+    sdk.list.mockResolvedValue([item]);
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    expect(sdk.list).toHaveBeenCalledTimes(3);
+  });
+
+  it('holds nothing for a failure that did not come from 1Password', async () => {
+    const subject = vault();
+    // The job stops while 1Password answers its listing.
+    let stopped = false;
+    const stopping = async (): Promise<void> => {
+      if (stopped) throw new Error('Browser request is no longer active');
+    };
+    sdk.list.mockImplementationOnce(async () => {
+      stopped = true;
+      return [item];
+    });
+    await expect(subject.itemsForOrigin('https://shop.example', stopping)).rejects.toMatchObject(unavailable);
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    // The runtime token is briefly missing on the host.
+    await rm(tokenFile);
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    await writePrivateFile(tokenFile, TOKEN);
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
+  });
 });
 
 it('rejects unsafe token files before SDK initialization and ignores Never items', async () => {

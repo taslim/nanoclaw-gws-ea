@@ -82,8 +82,11 @@ function principalLogin(username = USERNAME, password = PRINCIPAL_PASSWORD): Ite
 }
 
 /** Runs an authorized signup to the Login the host owns. */
-async function ownedLogin(subject = service()): Promise<{ attempt: CredentialAttempt; itemId: string }> {
-  const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+async function ownedLogin(
+  subject = service(),
+  username = USERNAME,
+): Promise<{ attempt: CredentialAttempt; itemId: string }> {
+  const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username }));
   expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
   expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
   await subject.markAwaitingVerification(attempt.id);
@@ -611,6 +614,38 @@ describe('password changes', () => {
     }));
     expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
     expect(fake.calls.filter((call) => call === 'put')).toHaveLength(puts);
+  });
+
+  it('skips a conflict the principal releases mid-reconciliation and still reconciles the rest', async () => {
+    vi.useFakeTimers();
+    const subject = service({ automaticPromotion: false });
+    const keptBoth = async (itemId: string) => {
+      const change = await changedPassword(subject, itemId);
+      await subject.markAwaitingVerification(change.attempt.id);
+      await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
+      expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'conflict' });
+      return change;
+    };
+    const first = await ownedLogin(subject);
+    const second = await ownedLogin(subject, 'juno.hale@example.com');
+    fake.edit(second.itemId, (item) => ({ ...item, title: 'Shop (Juno)' }));
+    const released = await keptBoth(first.itemId);
+    vi.advanceTimersByTime(1_000);
+    const moved = await keptBoth(second.itemId);
+    fake.edit(second.itemId, (item) => ({
+      ...item,
+      fields: item.fields.map((field) => (field.id === 'password' ? { ...field, value: moved.next } : field)),
+    }));
+
+    // The principal's release of the first lands between its fresh read and its compare-and-set.
+    let releasing: Promise<unknown> | undefined;
+    const racing = async (): Promise<void> => {
+      releasing ??= subject.release(released.attempt.id, 'approval-released');
+      await releasing;
+    };
+    expect(await subject.reconcileConflicts(racing)).toEqual({ finalized: 1 });
+    expect(await phase(released.attempt.id)).toBe('rejected');
+    expect(await phase(moved.attempt.id)).toBe('finalized');
   });
 });
 

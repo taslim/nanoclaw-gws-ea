@@ -465,20 +465,28 @@ export async function activateNativeCredentialControl(
   });
 }
 
+/** A field beside a formless group, and what it holds compared with the account: never the value itself. */
+export interface NativeDocumentField extends NativeFieldFacts {
+  holds: 'empty' | 'account' | 'other';
+}
+
 /**
  * Every other field in a formless group's document, open shadow roots
  * included, as the isolated world reads it: with no form to bound it, the
  * site's own handler may read and send any of them with the group. The bound
- * nodes are left out. Undefined when the bound document or a node is gone.
+ * nodes are left out. Each value is compared with the account there, an email
+ * in any case, and only the comparison returns. Undefined when the bound
+ * document or a node is gone.
  */
 export async function readNativeDocumentFields(
   frame: Frame,
   group: Pick<NativeCredentialGroup, 'fields' | 'control'>,
-): Promise<NativeFieldFacts[] | undefined> {
+  account: string,
+): Promise<NativeDocumentField[] | undefined> {
   const bound = [group.control, ...group.fields];
   if (bound.some((node) => node.frameId !== group.control.frameId || node.loaderId !== group.control.loaderId))
     return undefined;
-  return withBoundNodes<NativeFieldFacts[] | undefined>(
+  return withBoundNodes<NativeDocumentField[] | undefined>(
     frame,
     group.control,
     bound.map((node) => node.controlBackendNodeId),
@@ -488,9 +496,12 @@ export async function readNativeDocumentFields(
         const result = await session.send('Runtime.callFunctionOn', {
           objectId: objects[0],
           returnByValue: true,
-          arguments: objects.map((objectId) => ({ objectId })),
-          functionDeclaration: `function (...bound) {
+          arguments: [{ value: account }, ...objects.map((objectId) => ({ objectId }))],
+          functionDeclaration: `function (account, ...bound) {
             if (bound.some((node) => node.ownerDocument !== document || !node.isConnected)) return null;
+            const same = account.includes('@')
+              ? (value) => value.toLowerCase() === account.toLowerCase()
+              : (value) => value === account;
             const roots = [document];
             for (let index = 0; index < roots.length; index++)
               for (const node of roots[index].querySelectorAll('*'))
@@ -499,12 +510,13 @@ export async function readNativeDocumentFields(
               .filter((field) => !bound.includes(field))
               .map((field) => ({
                 name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || '',
-                readonly: field.readOnly === true, disabled: field.matches(':disabled')
+                readonly: field.readOnly === true, disabled: field.matches(':disabled'),
+                holds: field.value === '' ? 'empty' : same(field.value) ? 'account' : 'other'
               }));
           }`,
         });
         const value: unknown = result.result.value;
-        return !result.exceptionDetails && Array.isArray(value) ? (value as NativeFieldFacts[]) : undefined;
+        return !result.exceptionDetails && Array.isArray(value) ? (value as NativeDocumentField[]) : undefined;
         // eslint-disable-next-line no-catch-all/no-catch-all -- A vanished document refuses without exposing renderer prose.
       } catch (_error) {
         return undefined;

@@ -28,6 +28,20 @@ vi.mock('../../config.js', async (original) => ({
   DATA_DIR: dataRoot,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
+/** When set, a click that ran is reported as the renderer would after losing its answer. */
+const clicks = vi.hoisted(() => ({ lostAnswer: false }));
+vi.mock('./authentication-submit.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./authentication-submit.js')>();
+  return {
+    ...actual,
+    activateNativeCredentialControl: async (
+      ...args: Parameters<typeof actual.activateNativeCredentialControl>
+    ): ReturnType<typeof actual.activateNativeCredentialControl> => {
+      const activation = await actual.activateNativeCredentialControl(...args);
+      return clicks.lostAnswer && activation === 'activated' ? 'uncertain' : activation;
+    },
+  };
+});
 
 import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
 import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -48,7 +62,8 @@ import './index.js';
 import { browserCredentialAttemptsMigration, browserSiteLeasesMigration } from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
-import { FakeOnePassword, writeVaultFixture } from './onepassword-fixture.js';
+import { FakeOnePassword, FIXTURE_ACCOUNT_ID, writeVaultFixture } from './onepassword-fixture.js';
+import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './queue.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
@@ -92,21 +107,23 @@ const controlled = (submit: string, endpoint = '/api/signup'): string => `<div i
 const noFormSignup = `<h1>Join</h1><div>${field('Email', 'email', 'email', 'email')}${field('Password', 'password', 'password', 'new-password')}<div role="button" tabindex="0" id="go">Create account</div></div>${controlled(
   "go.addEventListener('click', () => { if (go.getAttribute('aria-disabled') !== 'true') send(); });",
 )}`;
-/** A formless change page whose own handler sends every field on it, as a whole-page settings save does. */
-const noFormChange = (extra = ''): string =>
-  `<h1>Security</h1><div>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${extra}<div role="button" tabindex="0" id="go">Change password</div></div><div id="result"></div><script>
+/** A formless page's own handler that sends every field on it, as a whole-page save does. */
+const sendsEveryField = (endpoint: string): string => `<div id="result"></div><script>
   document.getElementById('go').addEventListener('click', () => {
     const body = Object.fromEntries(Array.from(document.querySelectorAll('input'), (input) => [input.name, input.value]));
-    fetch('/api/change-password', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    fetch('${endpoint}', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
   });
 </script>`;
+const noFormChange = (extra = ''): string =>
+  `<h1>Security</h1><div>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${extra}<div role="button" tabindex="0" id="go">Change password</div></div>${sendsEveryField('/api/change-password')}`;
 const PAGES: Record<string, string> = {
   '/native-signup': nativeForm('/signup'),
   '/js-signup': `<h1>Join</h1><form id="join">${signupFields}<button id="go" type="submit" disabled>Create account</button></form>${controlled(
     "document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });",
   )}`,
   '/no-form-signup': noFormSignup,
+  '/no-form-join': `<h1>Join</h1><div>${field('Email', 'email', 'email', 'email')}${field('Password', 'password', 'password', 'new-password')}<div role="button" tabindex="0" id="go">Create account</div></div>${sendsEveryField('/api/signup')}`,
   '/checkout/join': noFormSignup,
   '/multi-step': `<h1>Join</h1><form method="post" action="/signup/email">${field('Email', 'email', 'email', 'username')}<button type="submit">Continue</button></form>`,
   '/masking': `<h1>Join</h1><form id="join">${signupFields}<button id="go" type="submit">Create account</button></form><input name="notes" aria-label="Notes"><div id="echo"></div>${controlled(
@@ -183,6 +200,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
   let fake: FakeOnePassword;
   let attempts: CredentialAttempts;
   let vault: BrowserVault;
+  let onePasswordPolicyFile: string;
   let remaining = 20_000;
   const sockets = new Set<Socket>();
   const posts: Array<{ host: string; path: string; body: string }> = [];
@@ -299,7 +317,9 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     await browserSiteLeasesMigration.up(db);
     await browserCredentialAttemptsMigration.up(db);
     const directory = await realpath(await mkdtemp(join(root, 'vault-')));
-    vault = new BrowserVault(await writeVaultFixture(directory));
+    const files = await writeVaultFixture(directory);
+    onePasswordPolicyFile = files.onePasswordPolicyFile;
+    vault = new BrowserVault(files);
     fake = new FakeOnePassword();
     sdk.create.mockReset();
     sdk.create.mockImplementation(async () => fake.client());
@@ -310,6 +330,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     accountPassword = undefined;
     remaining = 20_000;
     callbackPhases = [];
+    clicks.lostAnswer = false;
     const appeared = connection.context.waitForEvent('page');
     await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
     page = await appeared;
@@ -444,6 +465,24 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         { host: 'accounts.shop.example', path: '/api/signup', body: JSON.stringify({ email: USERNAME, password }) },
       ]);
     }, 30_000);
+
+    for (const [held, what] of [
+      ['', 'nothing'],
+      [USERNAME.toUpperCase(), "the account's address"],
+    ] as const)
+      it(`signs up on a formless page whose unbound email field holds ${what}`, async () => {
+        await page.goto(`${SITE}/no-form-join`);
+        await page.locator('[name=email]').fill(held);
+        const authority = await signupAuthority();
+        expect(await fill(authority, await refs({ new_password: 'Password', activate: 'Create account' }))).toEqual({
+          status: 'account_created',
+          vault: 'saved',
+        });
+        const password = await candidatePassword(authority.id);
+        expect(posts).toEqual([
+          { host: 'accounts.shop.example', path: '/api/signup', body: JSON.stringify({ email: held, password }) },
+        ]);
+      }, 30_000);
 
     it('completes a multi-step signup with fresh refs per step and one candidate disclosed once', async () => {
       await page.goto(`${SITE}/multi-step`);
@@ -654,6 +693,18 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(fake.calls).not.toContain('create');
     }, 30_000);
 
+    it('refuses a formless signup whose unbound email field holds another address, since its handler would send it', async () => {
+      await page.goto(`${SITE}/no-form-join`);
+      await page.locator('[name=email]').fill('remy.vance@example.com');
+      const authority = await signupAuthority();
+      expect(await fill(authority, await refs({ new_password: 'Password', activate: 'Create account' }))).toEqual({
+        status: 'refused',
+        reason: 'unsupported_form',
+      });
+      await unexposed(authority);
+      expect(fake.calls).not.toContain('create');
+    }, 30_000);
+
     it("refuses a formless page whose own address is the site's checkout", async () => {
       await page.goto(`${SITE}/checkout/join`);
       const authority = await signupAuthority();
@@ -669,6 +720,27 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       const authority = await signupAuthority();
       expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'refused', reason: 'origin_mismatch' });
       await unexposed(authority);
+    }, 30_000);
+
+    it('inserts nothing when the operator disables 1Password between the disclosure and the fill', async () => {
+      await page.goto(`${SITE}/native-signup`);
+      const authority = await signupAuthority();
+      const disclose = attempts.disclose.bind(attempts);
+      vi.spyOn(attempts, 'disclose').mockImplementation(async (...args) => {
+        const disclosed = await disclose(...args);
+        await writeOnePasswordHostPolicy(onePasswordPolicyFile, {
+          schemaVersion: 2,
+          enabled: false,
+          accountId: FIXTURE_ACCOUNT_ID,
+          cliPath: '/opt/homebrew/bin/op',
+          managementServiceAccountId: null,
+        });
+        return disclosed;
+      });
+      expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'vault_unavailable' });
+      expect(posts).toEqual([]);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected', exposed_at: expect.any(String) });
+      expect(await page.locator('input[name=password]').inputValue()).toBe('');
     }, 30_000);
 
     it('refuses a form whose node was replaced while the candidate was being saved', async () => {
@@ -1018,6 +1090,75 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(posts.at(-1)).toEqual({ host: 'accounts.shop.example', path: '/verify-code', body: 'code=482913' });
       expect(JSON.stringify(verified)).not.toContain('482913');
       expect(JSON.stringify(await observePage(page))).not.toContain('482913');
+    }, 30_000);
+
+    it('leaves a code the site may have taken unknown when the step is cut off, then reconciles its late confirmation', async () => {
+      responses.set(
+        '/signup',
+        `<p>Check your email to verify your account.</p><form id="verify"><label>Verification code <input name="code" autocomplete="one-time-code"></label><button type="submit">Verify</button></form><div id="result"></div><script>
+          document.getElementById('verify').addEventListener('submit', (event) => {
+            event.preventDefault();
+            fetch('/api/slow-verify', { method: 'POST', body: document.querySelector('[name=code]').value })
+              .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+          });
+        </script>`,
+      );
+      responses.set('/api/slow-verify', '<h1>Your email has been verified.</h1>');
+      const { authority, result } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'verification_requested' });
+      await deliver({ kind: 'code', value: '730165' });
+      // The host stops once the site has the code, before its answer arrives.
+      const cutOff = {
+        ...context(),
+        assertActive: async () => {
+          if (posts.some((post) => post.path === '/api/slow-verify')) throw new Error('The host stopped');
+        },
+      } as BrowserExecutionContext;
+      const chosen = await refs({ code_field: 'Verification code', activate: 'Verify' });
+      expect(
+        await executeCredentialForm(cutOff, { authority: authority.id, operation: 'verify', ...chosen }, { attempts }),
+      ).toEqual({ status: 'outcome_unknown' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+
+      await page.locator('#result > *').waitFor();
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
+      expect(posts.filter((post) => post.path === '/api/slow-verify')).toEqual([
+        { host: 'accounts.shop.example', path: '/api/slow-verify', body: '730165' },
+      ]);
+    }, 30_000);
+
+    it('leaves a code activation it cannot see through unknown, then reconciles the confirmation the site showed', async () => {
+      responses.set(
+        '/signup',
+        `<p>Check your email to verify your account.</p><form id="verify"><label>Verification code <input name="code" autocomplete="one-time-code"></label><button type="submit">Verify</button></form><div id="result"></div><script>
+          document.getElementById('verify').addEventListener('submit', (event) => {
+            event.preventDefault();
+            fetch('/api/verify-code', { method: 'POST', body: document.querySelector('[name=code]').value })
+              .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
+          });
+        </script>`,
+      );
+      responses.set('/api/verify-code', '<h1>Your email has been verified.</h1>');
+      const { authority, result } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'verification_requested' });
+      await deliver({ kind: 'code', value: '518204' });
+      clicks.lostAnswer = true;
+      expect(await verify(authority, await refs({ code_field: 'Verification code', activate: 'Verify' }))).toEqual({
+        status: 'outcome_unknown',
+      });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+
+      await page.locator('#result > *').waitFor();
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
+      expect(posts.filter((post) => post.path === '/api/verify-code')).toEqual([
+        { host: 'accounts.shop.example', path: '/api/verify-code', body: '518204' },
+      ]);
     }, 30_000);
 
     it('reports a signup the site already confirmed without waiting for mail', async () => {
