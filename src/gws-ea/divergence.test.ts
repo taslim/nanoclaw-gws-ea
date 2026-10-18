@@ -1466,6 +1466,37 @@ function runProgram(
   });
 }
 
+describe('recorded divergence: one tool name can have a capability-specific definition', () => {
+  it('serves each key its own schema and wire handler through the real runner MCP server', async () => {
+    const result = await runProgram('bun', ['test', '--isolate', 'src/mcp-tools/server.variants.test.ts'], {
+      cwd: path.join(originalCwd, 'container/agent-runner'),
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('1 pass');
+  });
+});
+
+describe('recorded divergence: a bridge adapter can make a text delivery retry idempotent', () => {
+  it('passes the same row and part key through repeated file-free text deliveries', async () => {
+    const { createChatSdkBridge } = await import('../channels/chat-sdk-bridge.js');
+    const keys: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'durable-text',
+        postTextOnce: async (threadId: string, _text: string, key: string) => {
+          keys.push(key);
+          return { id: key, threadId, raw: {} };
+        },
+      } as unknown as Adapter,
+      supportsThreads: false,
+    });
+    const message = { kind: 'chat', content: { text: 'One outage notice' } };
+    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
+    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
+    expect(keys).toEqual(['one-notice:0', 'one-notice:0']);
+  });
+});
+
 describe("recorded divergence: NanoClaw's update helpers act on the install they are given", () => {
   type UpdateHelpers = Pick<NanoclawServiceHelpers, 'createCommandRunner' | 'detectService' | 'drainContainers'>;
 

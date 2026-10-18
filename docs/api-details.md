@@ -2,6 +2,20 @@
 
 Implementation-level details for the architecture. See [architecture.md](architecture.md) for the high-level design.
 
+## Capability-specific MCP tool definitions
+
+The runner's `registerToolVariant(tool, capability)` registers another definition
+for an existing tool name. The capability selects its schema and handler together;
+an ungranted variant is neither listed nor callable. The base definition keeps
+priority if both keys are granted. Ordinary `registerTools` duplicate handling
+and `extendTool` behavior remain unchanged.
+
+The Chat SDK bridge also accepts an adapter's optional
+`postTextOnce(threadId, text, deliveryId)` method for ordinary file-free text.
+When a durable delivery row is present, each text part gets a stable row/part
+key. Attachments, cards and direct sends without a row ID retain their existing
+posting path.
+
 ## Channel Adapter Interface
 
 ### NanoClaw Channel Interface

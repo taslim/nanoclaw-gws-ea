@@ -161,6 +161,15 @@ function isFileAttacher(adapter: Adapter): adapter is Adapter & FileAttacher {
   return typeof (adapter as Partial<FileAttacher>).postWithFiles === 'function';
 }
 
+/** An opt-in platform post whose delivery key makes repeated file-free text creates idempotent. */
+export interface IdempotentTextPoster {
+  readonly postTextOnce: (threadId: string, text: string, deliveryId: string) => Promise<RawMessage<unknown>>;
+}
+
+function isIdempotentTextPoster(adapter: Adapter): adapter is Adapter & IdempotentTextPoster {
+  return typeof (adapter as Partial<IdempotentTextPoster>).postTextOnce === 'function';
+}
+
 /** How much of the message reacted to the agent sees with the reaction. */
 const REACTION_EXCERPT_CHARS = 200;
 
@@ -1434,7 +1443,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       log.info('Chat SDK bridge initialized', { adapter: adapter.name });
     },
 
-    async deliver(platformId: string, threadId: string | null, message): Promise<string | undefined> {
+    async deliver(platformId: string, threadId: string | null, message, deliveryId): Promise<string | undefined> {
       // platformId is already in the adapter's encoded format (e.g. "telegram:6037840640",
       // "discord:guildId:channelId") — use it directly as the thread ID
       const tid = threadId ?? platformId;
@@ -1584,10 +1593,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
+          const result =
+            deliveryId !== undefined && !attachFiles && isIdempotentTextPoster(adapter)
+              ? await adapter.postTextOnce(tid, chunk, `${deliveryId}:${i}`)
+              : await adapter.postMessage(
+                  tid,
+                  attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+                );
           if (i === 0) firstId = result?.id;
         }
         return firstId;

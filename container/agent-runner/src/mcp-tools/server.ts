@@ -8,10 +8,11 @@
  * Default when only `core.ts` is imported: the core `send_message` /
  * `send_file` / `edit_message` / `add_reaction` tools are available.
  *
- * Every tool is granted by one capability key: `registerTools` takes it, and
+ * Each tool definition is granted by one capability key: `registerTools` takes it, and
  * `loadToolModule` attributes a whole module's tools to one key while it
  * loads. The runner's server serves only the tools of the keys its group
- * holds; a tool registered without a key is never served to a group.
+ * holds; a tool registered without a key is never served to a group. An explicit
+ * variant can give another key its own schema and handler for the same name.
  *
  * Installed feature modules can additively extend an already-registered
  * tool via `extendTool()` instead of editing the base tool's source —
@@ -34,6 +35,7 @@ const allTools: McpToolDefinition[] = [];
 const toolMap = new Map<string, McpToolDefinition>();
 /** Tool name → the capability key that grants it. */
 const toolCapabilities = new Map<string, string>();
+const toolVariants = new Map<string, Map<string, McpToolDefinition>>();
 /** The key `loadToolModule` is attributing registrations to, while one loads. */
 let loadingCapability: string | undefined;
 
@@ -47,6 +49,21 @@ export function registerTools(tools: McpToolDefinition[], capability: string | u
     toolMap.set(t.tool.name, t);
     if (capability !== undefined) toolCapabilities.set(t.tool.name, capability);
   }
+}
+
+/**
+ * Serve a capability its own definition of an existing tool name. The base
+ * definition keeps priority when both keys are granted, and stays unchanged
+ * for callers without capability filtering. Other keys cannot see this variant.
+ */
+export function registerToolVariant(tool: McpToolDefinition, capability: string): void {
+  const name = tool.tool.name;
+  if (!toolMap.has(name)) throw new Error(`registerToolVariant: unknown base tool "${name}"`);
+  const variants = toolVariants.get(name) ?? new Map<string, McpToolDefinition>();
+  if (toolCapabilities.get(name) === capability || variants.has(capability))
+    throw new Error(`registerToolVariant: "${name}" already has a definition for "${capability}"`);
+  variants.set(capability, tool);
+  toolVariants.set(name, variants);
 }
 
 /**
@@ -76,6 +93,13 @@ function isServed(name: string, grants: ReadonlySet<string> | undefined): boolea
   if (!grants) return true;
   const capability = toolCapabilities.get(name);
   return capability !== undefined && grants.has(capability);
+}
+
+function servedTool(name: string, grants: ReadonlySet<string> | undefined): McpToolDefinition | undefined {
+  const base = toolMap.get(name);
+  if (isServed(name, grants)) return base;
+  if (grants) for (const [capability, tool] of toolVariants.get(name) ?? []) if (grants.has(capability)) return tool;
+  return undefined;
 }
 
 /** Additive extension of an already-registered tool. All fields optional. */
@@ -168,13 +192,16 @@ export function createMcpServer(
   const server = new Server({ name: 'nanoclaw', version: '2.0.0' }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allTools.filter((t) => isServed(t.tool.name, grants)).map((t) => t.tool),
+    tools: allTools.flatMap((t) => {
+      const served = servedTool(t.tool.name, grants);
+      return served ? [served.tool] : [];
+    }),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, context) => {
     const { name, arguments: args } = request.params;
-    const tool = toolMap.get(name);
-    if (!tool || !isServed(name, grants)) {
+    const tool = servedTool(name, grants);
+    if (!tool) {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
     }
     return run(() => tool.handler(args ?? {}, { signal: context.signal }));
