@@ -78,13 +78,13 @@ export interface WatchReleaseRule {
   wording: string;
 }
 /** The first check comes a few seconds after the release, once a venue that opens on the minute has opened. */
-export const RELEASE_CHECK_DELAY_MS = 5_000;
+const RELEASE_CHECK_DELAY_MS = 5_000;
 /**
  * Checks then run at the site's floor for ten minutes: long enough for a release that opens
  * late and for tables that come back when the first rush's checkouts are abandoned, and at
  * the default floor about a third of the hourly cap, which still bounds it.
  */
-export const RELEASE_BURST_MS = 10 * 60_000;
+const RELEASE_BURST_MS = 10 * 60_000;
 
 const calendarDay = (date: string, days: number): string =>
   new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
@@ -153,7 +153,7 @@ export const WATCH_HOURLY_WAKES = 5;
 /** The most normalized text a marked region may hold (KTD20): the part that shows availability, not a whole page. */
 export const WATCH_REGION_TEXT_LIMIT = 4_000;
 /** The longest a slowed watch waits between checks, before jitter, however many of its changes matched nothing. */
-export const WATCH_SLOWED_INTERVAL_MS = 60 * 60_000;
+const WATCH_SLOWED_INTERVAL_MS = 60 * 60_000;
 /** How much slower a watch checks after `unmatched` wakes this hour that led to no booking: doubling, from none. */
 export function watchSlowdown(unmatched: number): number {
   return 2 ** Math.min(Math.max(0, unmatched), WATCH_HOURLY_WAKES);

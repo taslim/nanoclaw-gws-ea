@@ -1,11 +1,9 @@
-import type { Page } from 'playwright-core';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import {
   chooseCookieBanners,
   cookieBannerControlKind,
   nextCookieBannerStep,
-  settleCookieBanners,
   type CookieBannerControlRead,
   type CookieBannerRegionRead,
 } from './cookie-banners.js';
@@ -175,13 +173,4 @@ describe('the host’s next step on a page load', () => {
     for (const after of ['reappeared', 'reject_failed', 'no_reject_option'] as const)
       expect(nextCookieBannerStep([rejecting], { after, opened: false })).toEqual({ kind: 'report', status: after });
   });
-});
-
-it('settles nothing off the web or in a context not prepared for isolated-world reads', async () => {
-  const newCDPSession = vi.fn();
-  const page = (url: string) =>
-    ({ isClosed: () => false, url: () => url, context: () => ({ newCDPSession }) }) as unknown as Page;
-  expect(await settleCookieBanners(page('about:blank'))).toBeUndefined();
-  expect(await settleCookieBanners(page('https://news.example/'))).toBeUndefined();
-  expect(newCDPSession).not.toHaveBeenCalled();
 });

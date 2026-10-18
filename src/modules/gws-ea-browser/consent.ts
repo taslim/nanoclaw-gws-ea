@@ -111,7 +111,7 @@ function readable(text: string): string {
  * Whether a box's wording accepts only the site's terms of service, terms and conditions, user agreement or
  * privacy policy. Marketing, data sharing and every money term keep their own authority.
  */
-export function termsConsentLabel(label: string): boolean {
+function termsConsentLabel(label: string): boolean {
   return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
 }
 

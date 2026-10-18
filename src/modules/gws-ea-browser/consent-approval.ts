@@ -263,7 +263,7 @@ const GRANT_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'opera
  * Main reads the principal's standing agreements, or withdraws one the principal asked to withdraw: from then
  * on that wording stops again on its site, and a purchase approved with it asks again before it commits.
  */
-export async function consentGrantsRequest(
+async function consentGrantsRequest(
   content: Record<string, unknown>,
   session: Session,
 ): Promise<Record<string, unknown>> {

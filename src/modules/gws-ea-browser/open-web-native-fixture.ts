@@ -542,7 +542,6 @@ export const CONSENT = {
   sms: 'https://join.example/sms',
   reticking: 'https://join.example/reticking',
   required: 'https://join.example/required-marketing',
-  terms: 'https://join.example/terms',
   bundled: 'https://join.example/bundled',
   waiver: 'https://climb.example/waiver',
   attestation: 'https://cellar.example/age',
@@ -628,15 +627,6 @@ export function requiredMarketingPage(): string {
     `<form id="join" method="get" action="/required-marketing/joined">${signupFields}
 ${box('marketing', 'I agree to receive marketing', 'required')}${box('partners', 'Send me partner offers')}
 <button type="submit" id="join-button">Join</button></form>`,
-  );
-}
-
-/** A signup whose terms box carries no required attribute. */
-export function optionalTermsPage(): string {
-  return document(
-    'Join',
-    `<form id="join" method="get" action="/terms/joined">${signupFields}${box('terms', 'I agree to the Terms of Service')}
-<button type="submit" id="join-button">Create account</button></form>`,
   );
 }
 
@@ -741,8 +731,6 @@ export function consentPages(): Record<string, OpenWebRoute> {
     'https://join.example/reticking/joined': done,
     [CONSENT.required]: requiredMarketingPage(),
     'https://join.example/required-marketing/joined': done,
-    [CONSENT.terms]: optionalTermsPage(),
-    'https://join.example/terms/joined': done,
     [CONSENT.bundled]: bundledPage(),
     'https://join.example/bundled/joined': done,
     [CONSENT.waiver]: waiverPage(),
@@ -1013,12 +1001,14 @@ export function bookedPage(): string {
   );
 }
 
-/** The sign-in to an account at the restaurant: its email step. */
+/** The sign-in to an account at the restaurant: its email step, with an offers box the site ticks for you. */
 export function restaurantSignInPage(): string {
   return document(
     'Sign in',
     `<h1>Sign in to Osteria del Ponte</h1><form id="sign-in" method="post" action="/login">
-<label>Email <input type="email" name="email" autocomplete="username"></label><button type="submit" id="sign-in-continue">Continue</button></form>`,
+<label>Email <input type="email" name="email" autocomplete="username"></label>
+<label><input type="checkbox" name="offers" checked> Send me offers</label>
+<button type="submit" id="sign-in-continue">Continue</button></form>`,
   );
 }
 

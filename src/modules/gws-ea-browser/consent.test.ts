@@ -6,7 +6,6 @@ import {
   consentClassChoice,
   decideConsent,
   normalizeConsentWording,
-  termsConsentLabel,
   type ConsentChoice,
   type ConsentDecision,
 } from './consent.js';
@@ -34,17 +33,30 @@ const decide = (choices: ConsentChoice[], granted: readonly string[] = [], purch
   decideConsent(choices, { granted: new Set(granted.map(normalizeConsentWording)), purchase });
 
 describe('the wording of a choice', () => {
-  it('reads a box that only accepts the site’s terms or privacy policy as terms', () => {
+  it('reads a box that only accepts the site’s terms or privacy policy as terms, never one carrying marketing, data sharing or money', () => {
     for (const label of [
       'I agree to the Terms of Service',
       'I accept the Terms and Conditions and the Privacy Policy',
       'I have read and agree to the User Agreement',
+      'I agree to the Terms & Conditions',
       'By creating an account you agree to our Terms & Conditions',
       'I agree to the terms of use',
-    ]) {
-      expect(termsConsentLabel(label)).toBe(true);
-      expect(classifyConsentLabel(label)).toBe('terms');
-    }
+    ])
+      expect(classifyConsentLabel(label), label).toBe('terms');
+    for (const [label, kind] of [
+      ['Send me marketing emails', 'marketing'],
+      ['Share my data with partners', 'marketing'],
+      ['I agree to the Terms of Service and to receive newsletters', 'bundled'],
+      ['I agree to the Terms and to special offers', 'bundled'],
+      ['I agree to the Privacy Policy and data sharing with third parties', 'bundled'],
+      ['I agree to the subscription terms', 'bundled'],
+      ['I agree to the Terms and authorize recurring billing', 'bundled'],
+      ['I accept the membership terms', 'bundled'],
+      ['I agree to the payment terms', 'bundled'],
+      ['I agree to the Terms of Service and the free trial', 'bundled'],
+      ['I agree to the Terms; my plan renews automatically at $10/month', 'bundled'],
+    ] as const)
+      expect(classifyConsentLabel(label), label).toBe(kind);
   });
 
   it('reads marketing, sharing and SMS opt-ins, and inverted opt-outs by their meaning', () => {
@@ -205,16 +217,16 @@ describe('the engine’s decision for a form', () => {
   });
 
   it('stops for a required opt-in, a waiver, an attestation, a bundled box and a double negative', () => {
-    for (const choice of [
-      box('I agree to receive marketing', { required: true }),
-      box('I have read and accept the liability waiver'),
-      box('I confirm I am 21 or older', { required: true }),
-      box('I agree to the Terms and to receive marketing emails', { required: true }),
-      box('Uncheck this box if you do not want to receive offers', { checked: true }),
-    ])
-      expect(decide([choice])).toEqual({
+    for (const [wording, kind, changes] of [
+      ['I agree to receive marketing', 'marketing', { required: true }],
+      ['I have read and accept the liability waiver', 'agreement', {}],
+      ['I confirm I am 21 or older', 'agreement', { required: true }],
+      ['I agree to the Terms and to receive marketing emails', 'bundled', { required: true }],
+      ['Uncheck this box if you do not want to receive offers', 'double_negative', { checked: true }],
+    ] as const)
+      expect(decide([box(wording, changes)])).toEqual({
         status: 'consent_required',
-        items: [{ id: 0, wording: normalizeConsentWording(choice.label), kind: classifyConsentLabel(choice.label) }],
+        items: [{ id: 0, wording, kind }],
       });
   });
 

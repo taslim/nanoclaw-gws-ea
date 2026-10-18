@@ -215,7 +215,7 @@ describe('an unapproved commit', () => {
         site: 'events.example',
         evidence: { ...EVIDENCE, charged: { amountMinor: 0, currency: 'USD' } },
       }),
-    ).rejects.toThrow();
+    ).rejects.toThrow('A confirmation without a charge is no unapproved commit');
     expect(await incidents()).toEqual([]);
     expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
       cancelled: 0,

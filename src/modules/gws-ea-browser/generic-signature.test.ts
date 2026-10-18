@@ -215,7 +215,7 @@ describe('the generic fact floor', () => {
     expect(materialPurchaseChange(before, after, {})).toBeUndefined();
   });
 
-  it('names a total rise, a new item, a new payment method, a changed email and a moved checkout as material', () => {
+  it('names a total rise, a new currency, item, payment method, term, email or note, and a moved checkout as material', () => {
     const approved = ready(decide(shop));
     const changed = (lines: string[], fields = shop.fields, frameUrl?: string): string | undefined =>
       materialPurchaseChange(approved, ready(decide({ lines, fields, ...(frameUrl ? { frameUrl } : {}) })), {});
@@ -223,9 +223,20 @@ describe('the generic fact floor', () => {
       'The total rose to $43.00, from $42.00.',
     );
     expect(changed(shop.lines.map((line) => line.replace('$42.00', '$41.00')))).toBeUndefined();
+    expect(changed(shop.lines.map((line) => line.replace('$42.00', '€42.00')))).toBe('The currency changed.');
     expect(changed([...shop.lines.slice(0, 3), 'Teapot × 1', ...shop.lines.slice(3)])).toBe('The items changed.');
     expect(changed(shop.lines.map((line) => line.replace('4242', '1881')))).toBe('The payment method changed.');
+    expect(changed([...shop.lines, 'Membership: $12.00/month, renews automatically until you cancel.'])).toBe(
+      'The financial terms changed.',
+    );
     expect(changed(shop.lines, [email('morgan@example.test')])).toBe('The contact email changed.');
+    const note = field({
+      tag: 'textarea',
+      name: 'note',
+      label: 'Delivery instructions',
+      value: 'Leave it at the door',
+    });
+    expect(changed(shop.lines, [...(shop.fields ?? []), note])).toBe('The note changed.');
     expect(changed(shop.lines, shop.fields, 'https://pay.example/c/pottery-42')).toBe('The checkout origin changed.');
     // A next step's own commit label is no change.
     expect(

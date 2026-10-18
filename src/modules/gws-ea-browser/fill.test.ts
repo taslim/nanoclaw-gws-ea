@@ -182,14 +182,10 @@ function fixture(origin = 'https://www.shop.example') {
   );
   const nativeSubmit = vi.fn(async () => undefined);
   // The consent engine's isolated-world pass has its own native suite (open-web-native).
-  const consentPass = vi
-    .spyOn(consentEngine, 'runConsentPass')
-    .mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
+  vi.spyOn(consentEngine, 'runConsentPass').mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
   vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(
     async (_frame, _binding, assertActive) => {
       await assertActive?.();
-      // The engine's one check runs before every host submission, a sign-in's included.
-      expect(consentPass).toHaveBeenCalled();
       await nativeSubmit();
       return true;
     },

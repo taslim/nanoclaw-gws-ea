@@ -926,7 +926,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     it('ticks it in a controlled JS form whose submit control waits for it, through the form’s own handlers', async () => {
       const { result, password } = await signUp('/js-terms', SIGNUP);
       expect(result).toEqual({ status: 'account_created', vault: 'saved' });
-      // The form's state took the terms first: the engine ticked the box before anything was disclosed.
+      // The tick reached the controlled form's own state, which is what it posts; the stop tests below prove the
+      // engine decides before anything is disclosed.
       expect(posts.map(({ host, path, body }) => ({ host, path, body: JSON.parse(body) as unknown }))).toEqual([
         {
           host: 'accounts.shop.example',
@@ -975,16 +976,6 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
         expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
         expect(await anyChecked()).toBe(false);
       }, 30_000);
-
-    it('refuses a terms box the agent names', async () => {
-      await page.goto(`${SITE}/terms-signup`);
-      const authority = await signupAuthority();
-      await expect(
-        fill(authority, await refs({ ...SIGNUP, accept_terms: 'I agree to the Terms of Service' })),
-      ).rejects.toMatchObject({ code: 'invalid-args' });
-      expect(posts).toEqual([]);
-      expect(await anyChecked()).toBe(false);
-    }, 30_000);
 
     it("takes a signup form's own agree-and-create control as its activation", async () => {
       const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });

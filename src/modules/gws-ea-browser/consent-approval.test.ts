@@ -1,5 +1,6 @@
 /** The principal's side of the consent engine: real approvals, delivery, central DB and mailbox. Only the container wake is mocked. */
 import fs from 'node:fs';
+import Database from 'better-sqlite3';
 import type { Locator, Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const { root } = await vi.hoisted(async () => {
@@ -20,9 +21,11 @@ vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
+import type { ResponseFrame } from '../../cli/frame.js';
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createPendingApproval } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { sweepExpiredApprovals } from '../approvals/index.js';
@@ -32,7 +35,6 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { consentGrantsRequest } from './consent-approval.js';
 import { recordConsentStops, runConsentPass } from './consent.js';
 import { BrowserStore, browserRequestId, type BrowserJob } from './db.js';
 import { setBrowserAdmissionReady } from './group.js';
@@ -50,6 +52,7 @@ let job: BrowserJob;
 let queue: BrowserQueue;
 let sent: Array<{ platformId: string; content: string }>;
 let page: Page | undefined;
+let requests = 0;
 
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
@@ -126,13 +129,18 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-/** A stop the engine recorded for this job's signup form. */
-async function stop(wording = WORDING, jobId = job.id): Promise<string> {
+/** A stop the engine recorded for this job's signup form, on a site and in the frame origin that served it. */
+async function stop(
+  wording = WORDING,
+  jobId = job.id,
+  site = 'join.example',
+  origin = 'https://join.example',
+): Promise<string> {
   const [view] = await recordConsentStops(
     { jobId, db: getDb() },
     {
-      site: 'join.example',
-      origin: 'https://join.example',
+      site,
+      origin,
       fingerprint: 'join-form',
       items: [{ id: 0, wording, kind: 'marketing' }],
     },
@@ -148,6 +156,20 @@ async function ask(stopId: string, requestId: string, from = session): Promise<R
   if (!row?.answer_json) return undefined;
   const frame = JSON.parse(row.answer_json) as { ok: boolean; data?: Record<string, unknown> };
   return frame.data;
+}
+/** Main's consent_grants tool: one request through native delivery, and the host's one answer in the caller's inbound mailbox. */
+async function manageGrants(from: Session, fields: Record<string, unknown>): Promise<ResponseFrame> {
+  const requestId = `grants-${++requests}`;
+  await getDeliveryAction('consent_grants')!({ ...fields, action: 'consent_grants', requestId }, from);
+  const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
+  try {
+    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
+      content: string;
+    };
+    return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
+  } finally {
+    db.close();
+  }
 }
 async function approvals(): Promise<PendingApproval[]> {
   return getDb().all('SELECT * FROM pending_approvals ORDER BY created_at');
@@ -266,7 +288,7 @@ describe('asking the principal for consent', () => {
     expect(sent).toHaveLength(1);
   });
 
-  it('approves a wording the principal already agreed to on the site without a card', async () => {
+  it('approves a wording the principal already agreed to on that site and frame origin without a card, and asks again anywhere else', async () => {
     const first = await stop();
     await ask(first, 'consent-1');
     await click((await approvals())[0]);
@@ -274,6 +296,19 @@ describe('asking the principal for consent', () => {
     expect(second).not.toBe(first);
     expect(await ask(second, 'consent-2')).toMatchObject({ status: 'approved', stop_id: second });
     expect(sent).toHaveLength(1);
+    // The grant stands for join.example's own form only: the same words on another site, or in a form another
+    // site serves inside join.example, are a new decision.
+    const elsewhere = await stop(WORDING, job.id, 'other.example', 'https://other.example');
+    expect(await ask(elsewhere, 'consent-3')).toMatchObject({ status: 'awaiting_principal', stop_id: elsewhere });
+    const widget = await stop(WORDING, job.id, 'join.example', 'https://widgets.example');
+    expect(await ask(widget, 'consent-4')).toMatchObject({ status: 'awaiting_principal', stop_id: widget });
+    const cards = await approvals();
+    const card = (stopId: string) =>
+      cards.find((approval) => (JSON.parse(approval.payload) as { stopId?: unknown }).stopId === stopId);
+    expect(cards).toHaveLength(2);
+    expect(card(elsewhere)?.title).toBe('Agree to this on other.example?');
+    expect(card(widget)?.question).toContain('It is in a form from "https://widgets.example".');
+    expect(sent).toHaveLength(3);
   });
 
   it('lets main list and withdraw a grant, and only a group with browser access', async () => {
@@ -281,32 +316,34 @@ describe('asking the principal for consent', () => {
     await ask(id, 'consent-1');
     await click((await approvals())[0]);
     const [grant] = await grants();
-    expect(getDeliveryAction('consent_grants')).toBeDefined();
-    expect(await consentGrantsRequest({ operation: 'list', site: 'https://www.join.example/signup' }, main)).toEqual({
-      status: 'listed',
-      grants: [
-        {
-          grant_id: grant.id,
-          site: 'join.example',
-          origin: 'https://join.example',
-          wording: WORDING,
-          approved_at: expect.any(String),
-        },
-      ],
-    });
+    const answered = (data: Record<string, unknown>) => ({ id: expect.any(String), ok: true, data });
+    expect(await manageGrants(main, { operation: 'list', site: 'https://www.join.example/signup' })).toEqual(
+      answered({
+        status: 'listed',
+        grants: [
+          {
+            grant_id: grant.id,
+            site: 'join.example',
+            origin: 'https://join.example',
+            wording: WORDING,
+            approved_at: expect.any(String),
+          },
+        ],
+      }),
+    );
     const other = (await resolveSession('other-p', 'mg-operator', null, 'agent-shared')).session;
-    await expect(consentGrantsRequest({ operation: 'list' }, other)).rejects.toMatchObject({ code: 'forbidden' });
-    await expect(consentGrantsRequest({ operation: 'withdraw', grant_id: grant.id }, other)).rejects.toMatchObject({
-      code: 'forbidden',
+    expect(await manageGrants(other, { operation: 'list' })).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    expect(await manageGrants(other, { operation: 'withdraw', grant_id: grant.id })).toMatchObject({
+      ok: false,
+      error: { code: 'forbidden' },
     });
-    expect(await consentGrantsRequest({ operation: 'withdraw', grant_id: grant.id }, main)).toEqual({
-      status: 'withdrawn',
-      grant_id: grant.id,
-    });
+    expect(await manageGrants(main, { operation: 'withdraw', grant_id: grant.id })).toEqual(
+      answered({ status: 'withdrawn', grant_id: grant.id }),
+    );
     expect(await grants()).toEqual([]);
-    expect(await consentGrantsRequest({ operation: 'withdraw', grant_id: grant.id }, main)).toEqual({
-      status: 'not_found',
-    });
+    expect(await manageGrants(main, { operation: 'withdraw', grant_id: grant.id })).toEqual(
+      answered({ status: 'not_found' }),
+    );
   });
 });
 

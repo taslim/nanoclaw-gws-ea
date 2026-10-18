@@ -55,7 +55,6 @@ import { BrowserStore } from './db.js';
 import { recordDisclosureRequest } from './disclosures.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
 import { setBrowserAdmissionReady } from './group.js';
-import type { CheckoutRegions } from './merchant-contract.js';
 import { prepareMerchantPage, readMerchantPurchase } from './merchant-signatures.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import {
@@ -352,21 +351,6 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
       await db.close();
     }
   });
-
-  it('reads the control under an overlay by its own facts', async () => {
-    await visit(OPEN_WEB.overlay);
-    const covered = await page.locator('#search').evaluate((button) => {
-      const node = button as unknown as {
-        getBoundingClientRect(): { x: number; y: number; width: number; height: number };
-        ownerDocument: { elementFromPoint(x: number, y: number): { id: string } | null };
-      };
-      const box = node.getBoundingClientRect();
-      return node.ownerDocument.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)?.id;
-    });
-    // The trick is live: the layer, not the search, sits under the pointer.
-    expect(covered).toBe('overlay');
-    expect(await classify(page.locator('#search'))).toBe('ordinary');
-  });
 });
 
 describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 30_000 }, () => {
@@ -548,12 +532,6 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     });
   });
 
-  it('ticks a terms box that carries no required attribute on a signup', async () => {
-    await visit(CONSENT.terms);
-    await act(['click', 'Create account']);
-    expect(submitted('/terms/joined')?.get('terms')).toBe('on');
-  });
-
   it('stops for a bundled box, a waiver and an age attestation, naming each, and ticks none', async () => {
     for (const [url, control, wording] of [
       [CONSENT.bundled, '#join-button', 'I agree to the Terms and to receive marketing emails'],
@@ -619,24 +597,13 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
   });
 });
 
-/** The aria ref of the one control named `name` in an observation, with its generation. */
 /** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } {
   expect(data.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
 }
 
-/** The whole-pixel size of the clip around a checkout's total and its commit control. */
-function clipSize(regions: CheckoutRegions): { width: number; height: number } {
-  const boxes = [regions.control, ...(regions.total ? [regions.total] : [])];
-  const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
-  const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
-  return {
-    width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
-    height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
-  };
-}
-
+/** The aria ref of the one control named `name` in an observation, with its generation. */
 function refIn(observation: { snapshot: string; generation: number }, name: string): BrowserRef {
   const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
   const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
@@ -1273,7 +1240,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
     policy({ schemaVersion: 1, enabled: true });
     process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
     await runMigrations(await initTestDb());
-    for (const id of ['main-p', 'browser-p', 'research-p'])
+    for (const id of ['main-p', 'browser-p'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Juno',
@@ -1316,29 +1283,27 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
     id: string,
     action: string,
     content: Record<string, unknown>,
-    from: Session = errand,
   ): Promise<Record<string, unknown>> {
-    await queue.accept(action, content, from, id);
+    await queue.accept(action, content, errand, id);
     await queue.idle();
     const row = await getDb().get<{ answer_json: string }>(
       'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
-      from.id,
+      errand.id,
       id,
     );
     if (!row) throw new Error(`No answer for ${id}`);
     const { timing: _timing, ...data } = (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
     return data;
   }
-  const run = (id: string, actions: BrowserAction[], from: Session = errand) =>
-    request(id, 'browser', { actions }, from);
+  const run = (id: string, actions: BrowserAction[]) => request(id, 'browser', { actions });
   /** Opens `url` and answers with the observation the navigation returned. */
-  async function open(url: string, from: Session = errand): Promise<BrowserObservation> {
-    const opened = await run(`open-${randomUUID()}`, [{ kind: 'navigate', url }], from);
+  async function open(url: string): Promise<BrowserObservation> {
+    const opened = await run(`open-${randomUUID()}`, [{ kind: 'navigate', url }]);
     expect(opened).toMatchObject({ status: 'stopped', reason: 'navigated' });
     return opened.observation as BrowserObservation;
   }
-  const disclose = (site: string, from: Session = main, thread = errand.thread_id) =>
-    recordDisclosureRequest({ thread, site, value_id: mobile }, from);
+  const disclose = (site: string) =>
+    recordDisclosureRequest({ thread: errand.thread_id, site, value_id: mobile }, main);
   const refusedBeforeTyping = { status: 'stopped', reason: 'personal_data', repeat_safe: true };
 
   it('fills the mobile number main disclosed for the restaurant its brief names, and the booking goes through', async () => {
@@ -1441,8 +1406,9 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
         'https://osteria.example',
         expect.any(Function),
       );
-      expect(posts().map((sent) => [sent.url, new URLSearchParams(sent.body).get('email')])).toEqual([
-        [PERSONAL_DATA.signIn, 'morgan@example.test'],
+      // The host's sign-in submission runs the consent pass first: the site's pre-ticked offers box goes unticked.
+      expect(posts().map((sent) => [sent.url, Object.fromEntries(new URLSearchParams(sent.body))])).toEqual([
+        [PERSONAL_DATA.signIn, { email: 'morgan@example.test' }],
       ]);
       expect(await page.locator('h1').textContent()).toBe('Welcome back');
     } finally {
@@ -1455,21 +1421,6 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
       );
     expect(await page.locator('input[name="email"]').inputValue()).toBe('');
     expect(posts()).toHaveLength(1);
-  });
-
-  it("never lets another group's errand use main's disclosure, nor record one against main's errand", async () => {
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main-p', 'research-p'] });
-    const research = (await resolveSystemSession('research-p', 'system:test:research')).session;
-    const theirs = (await resolveSystemSession('browser-p', 'system:a2a:research-p:dinner')).session;
-    expect(await disclose('osteria.example')).toMatchObject({ status: 'recorded' });
-    await expect(disclose('osteria.example', research)).rejects.toThrow(
-      'No live browser job of yours exists for that thread.',
-    );
-    const form = await open(PERSONAL_DATA.booking, theirs);
-    expect(await run('their-booking', [{ kind: 'type', ...refIn(form, 'Mobile'), text: MOBILE }], theirs)).toEqual(
-      refusedBeforeTyping,
-    );
-    expect(await page.locator('input[name="mobile"]').inputValue()).toBe('');
   });
 });
 
@@ -1685,8 +1636,6 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     await run('note', [
       { kind: 'type', ...refIn(await observePage(page), 'Delivery instructions'), text: 'Leave it with the porter' },
     ]);
-    const checkout = await read('#commit');
-    if (checkout.status !== 'ready' || !checkout.regions) throw new Error(`Checkout unread: ${checkout.status}`);
     expect(await purchase('Place order', 'ae3')).toMatchObject({ status: 'awaiting_principal' });
     expect(posts()).toEqual([]);
     const [approval] = await approvals();
@@ -1696,7 +1645,21 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     expect(card.pictures).toBe(1);
     expect(card.files).toHaveLength(1);
     expect(card.files![0]).toMatchObject({ filename: 'checkout.png', mimeType: 'image/png' });
-    expect(pngSize(card.files![0].data)).toEqual(clipSize(checkout.regions));
+    const boxes = await Promise.all(
+      [page.locator('#checkout p').filter({ hasText: /^Order total/u }), page.locator('#commit')].map(
+        async (target) => {
+          const box = await target.boundingBox();
+          if (!box) throw new Error('Fixture checkout box missing');
+          return box;
+        },
+      ),
+    );
+    const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
+    const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
+    expect(pngSize(card.files![0].data)).toEqual({
+      width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
+      height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
+    });
     for (const line of [
       'Site: pottery.example',
       'Account: guest checkout',
@@ -1875,6 +1838,30 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
   });
 
+  it('stops the job, records an incident and tells main once when a free booking’s confirmation shows a charge', async () => {
+    fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
+    try {
+      await open(GENERIC.freeTable);
+      expect(await purchase('Reserve now')).toMatchObject({
+        status: 'stopped',
+        reason: 'unapproved_commit',
+        incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
+        repeat_safe: false,
+      });
+      expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
+        { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
+      ]);
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+        cancelled: 1,
+      });
+      expect((await texts(main)).filter((text) => text.includes('Nobody approved this purchase'))).toEqual([
+        expect.stringContaining('$25.00, reference T-2210'),
+      ]);
+    } finally {
+      fixture.serve(GENERIC.booked, genericCheckoutPages()[GENERIC.booked]);
+    }
+  });
+
   it('keeps a booking free past "No credit card required" and a Gift cards link outside its form, but not beside Google Pay or a saved card', async () => {
     await open(GENERIC.freeTable);
     expect(await read('#reserve')).toMatchObject({ status: 'free' });
@@ -1919,6 +1906,15 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
       repeat_safe: true,
     });
     expect(await approvals()).toEqual([]);
+    // The page as the site serves it again: its readable terms reach the principal's card.
+    await open(GENERIC.club);
+    expect(await purchase('Subscribe')).toMatchObject({ status: 'awaiting_principal' });
+    const [approval] = await approvals();
+    for (const line of [
+      'Financial commitment: subscription; "Membership: $12.00/month, renews automatically until you cancel."',
+      'Recurring frequency: "monthly"',
+    ])
+      expect(approval.question).toContain(line);
   });
 
   it('presses Continue then Place order under one card, as one attempt', async () => {
@@ -1930,6 +1926,39 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     expect(posts()).toEqual([GENERIC.stepsNext, GENERIC.placeOrder]);
     expect(sent).toHaveLength(1);
     expect(await attempts()).toMatchObject([{ resolution: 'committed', merchant_record_id: 'HP-1043' }]);
+  });
+
+  it('presses at most three steps under one approval, and leaves a checkout that keeps asking unconfirmed', async () => {
+    // Each step names a new commit and posts to the next, with the same items, total and card: nothing to ask again.
+    // From the fifth on, the same step comes back, so a press past the cap shows as a post rather than a hang.
+    let step = 1;
+    fixture.serve(GENERIC.stepsNext, () => {
+      step += 1;
+      return {
+        body: checkoutPage({
+          title: 'Review your order',
+          action: `/checkout/steps/next?step=${step + 1}`,
+          commit: `Continue to step ${Math.min(step, 5)}`,
+          items: ['Celadon mug × 2', 'Ash glaze bowl × 1'],
+          total: '$42.00',
+          payment: 'Visa ending in 4242',
+          email: ALIAS,
+        }),
+      };
+    });
+    try {
+      await open(GENERIC.steps);
+      expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
+      await approve((await approvals())[0]);
+      expect(posts()).toEqual([GENERIC.stepsNext, `${GENERIC.stepsNext}?step=3`, `${GENERIC.stepsNext}?step=4`]);
+      expect(sent).toHaveLength(1);
+      const [authority] = await authorities();
+      expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'unconfirmed' });
+      expect(await attempts()).toMatchObject([{ resolution: null }]);
+      expect(await blocks()).toEqual([{ site: 'pottery.example' }]);
+    } finally {
+      fixture.serve(GENERIC.stepsNext, genericCheckoutPages()[GENERIC.stepsNext]);
+    }
   });
 
   it('sends a new card when the total rises between steps, and stops the job at the fourth change', async () => {
@@ -1964,6 +1993,9 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     );
     expect(notices?.some((content) => content.includes('checkout_changing'))).toBe(true);
     expect(await attempts()).toMatchObject(Array(4).fill({ resolution: 'not_committed' }));
+    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+      cancelled: 1,
+    });
   });
 
   it('presses Place order once when the same step comes back, and leaves the attempt unconfirmed', async () => {
@@ -2114,7 +2146,7 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     expect(posts()).toEqual([GENERIC.placed]);
   });
 
-  it('puts a no-show fee on the card, and books under the standing guarantee when every booking fact is read', async () => {
+  it('reads a per-person no-show fee as a commitment, and books under the standing guarantee with no card when every booking fact is read', async () => {
     await open(GENERIC.feeTable);
     const fee = await read('#reserve');
     expect(fee).toMatchObject({

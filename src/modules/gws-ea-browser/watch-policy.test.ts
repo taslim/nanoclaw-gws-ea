@@ -1,9 +1,6 @@
 import { expect, it } from 'vitest';
 
 import {
-  RELEASE_BURST_MS,
-  RELEASE_CHECK_DELAY_MS,
-  WATCH_SLOWED_INTERVAL_MS,
   nextWatchCheck,
   releaseInstants,
   watchQuietUntil,
@@ -120,14 +117,13 @@ it('checks a few seconds after the release, then at the floor through the burst,
   };
   // An ordinary check close before the release gives way to the release check at 10:00:05 in Tokyo.
   expect(next('2026-10-25T00:57:30Z').at).toBe('2026-10-25T01:00:05.000Z');
-  expect(RELEASE_CHECK_DELAY_MS).toBe(5_000);
   // One well before keeps the ordinary cadence.
   expect(next('2026-10-24T12:00:00Z')).toEqual({ at: '2026-10-24T12:05:00.000Z', interval: policy.intervalMs });
-  // Inside the burst, the floor.
+  // Inside the ten-minute burst from the release check, the floor.
   expect(next('2026-10-25T01:00:05Z').interval).toBe(policy.floorMs);
-  expect(next(iso(release + RELEASE_CHECK_DELAY_MS + RELEASE_BURST_MS - 1)).interval).toBe(policy.floorMs);
+  expect(next('2026-10-25T01:10:04.999Z').interval).toBe(policy.floorMs);
   // After it, and with no rule at all, the ordinary cadence.
-  expect(next(iso(release + RELEASE_CHECK_DELAY_MS + RELEASE_BURST_MS)).interval).toBe(policy.intervalMs);
+  expect(next('2026-10-25T01:10:05Z').interval).toBe(policy.intervalMs);
   expect(next('2026-10-25T00:57:30Z', [])).toEqual({ at: '2026-10-25T01:02:30.000Z', interval: policy.intervalMs });
 });
 
@@ -158,10 +154,9 @@ it('slows a watch whose changes keep matching nothing, to at most an hour, but n
   expect([0, 1, 2, 3, 4, 5, 9].map((unmatched) => plan('2026-10-17T12:00:00Z', unmatched).interval / 60_000)).toEqual([
     5, 10, 20, 40, 60, 60, 60,
   ]);
-  expect(WATCH_SLOWED_INTERVAL_MS).toBe(60 * 60_000);
   // The day before arrival the cadence is two minutes, and slows from there.
   expect(plan('2026-11-24T00:00:00Z', 2).interval).toBe(8 * 60_000);
   // A release is the moment the watch exists for: its burst keeps the floor, and a slowed check gives way to it.
   expect(plan('2026-10-25T01:00:05Z', 5, [release]).interval).toBe(policy.floorMs);
-  expect(plan('2026-10-25T00:30:00Z', 5, [release]).at).toBe(release + RELEASE_CHECK_DELAY_MS);
+  expect(iso(plan('2026-10-25T00:30:00Z', 5, [release]).at)).toBe('2026-10-25T01:00:05.000Z');
 });
