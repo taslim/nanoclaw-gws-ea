@@ -69,10 +69,16 @@ export const reservationGuarantee = requestTool({
 export const reservationBounds = requestTool({
   name: 'reservation_bounds',
   description:
-    'Record the principal’s delegated venue, party size and time window for one direct reservation errand. Use the exact browser thread before asking it to commit under an existing standing guarantee. The browser cannot set or widen these bounds. This tool grants no financial permission; absent bounds require the usual principal purchase approval. One errand can use a standing guarantee for at most one booking. Repeating identical bounds is safe; changed bounds need a new errand after authority exists.',
+    'Record the principal’s delegated venue, party size and time window for one direct reservation errand, on any site. Use the exact browser thread before asking it to commit under an existing standing guarantee. The browser cannot set or widen these bounds. This tool grants no financial permission; absent bounds require the usual principal purchase approval. One errand can use a standing guarantee for at most one booking. Repeating identical bounds is safe; changed bounds need a new errand after authority exists.',
   properties: {
     thread: THREAD,
-    venue_id: { type: 'string', minLength: 1, maxLength: 256 },
+    venue_id: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 256,
+      description:
+        'On Resy, the venue’s Resy id. On any other site, the venue’s name exactly as its booking page shows it: the host matches it against the page.',
+    },
     party_size: { type: 'integer', minimum: 1 },
     window_start: {
       type: 'string',
@@ -181,7 +187,7 @@ export const consentGrants = requestTool({
 export const recordDisclosure = requestTool({
   name: 'record_disclosure',
   description:
-    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id from `ncl private-values list`. Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up, and before the job fills the value in. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
+    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id from `ncl private-values list`. Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up: right after you delegate, before the job reaches the form. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
   properties: {
     thread: THREAD,
     site: { type: 'string', description: 'The site the principal named, as its address or its domain.' },

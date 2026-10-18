@@ -17,6 +17,7 @@ import './index.js';
 import { BrowserStore } from './db.js';
 import { BrowserQueue } from './queue.js';
 import { PurchaseAuthorityStore } from './authority.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
 import {
@@ -547,6 +548,9 @@ describe('native watch bounds and one booking claim', () => {
         "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
       )
     )[0];
+    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+    expect(approval.question).not.toContain(jobId);
     await handleApprovalsResponse({
       questionId: approval.approval_id,
       value: 'approve',

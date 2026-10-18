@@ -21,7 +21,7 @@ import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-fact
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type ResolutionSource, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
-import { cardEventSpan, cardTime, quotePurchaseText } from './cards.js';
+import { cardEventSpan, cardTime, ERRAND_ORIGIN_LINE, quotePurchaseText } from './cards.js';
 import { agreementsGranted } from './consent.js';
 import { browserSite } from './leases.js';
 import {
@@ -1333,7 +1333,7 @@ export async function createBrowserWatch(
     question,
     approverUserId: decision.approverUserId,
     expiresAt: bounds.until,
-    originLine: `From your browser errand ${context.job.thread_id}.`,
+    originLine: ERRAND_ORIGIN_LINE,
   });
   if (approvalId) {
     const approval = await getPendingApproval(approvalId);

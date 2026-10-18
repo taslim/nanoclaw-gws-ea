@@ -23,6 +23,11 @@ export interface PurchaseCard {
   created_at: string;
   notified_at: string | null;
 }
+/**
+ * Where a browser errand's card (purchase, consent or watch) says it comes from (KTD18): the errand, in words the
+ * principal knows, never its internal thread.
+ */
+export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
 /** Seller-controlled strings are visibly quoted and bounded individually. */
 export function quotePurchaseText(text: string, limit = 360): string {
   const clean = Array.from(text, (character) => {

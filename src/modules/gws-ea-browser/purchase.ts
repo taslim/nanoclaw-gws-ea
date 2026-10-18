@@ -21,6 +21,7 @@ import {
 } from './authority.js';
 import {
   detachPurchaseCards,
+  ERRAND_ORIGIN_LINE,
   finishPurchaseCardWithdrawals,
   notifyPurchaseCard,
   renderPurchaseCard,
@@ -379,7 +380,7 @@ async function requestPurchaseCard(
     question,
     approverUserId: decision.approverUserId,
     expiresAt: expires,
-    originLine: `From your browser errand ${context.job.thread_id}.`,
+    originLine: ERRAND_ORIGIN_LINE,
     details: { facts: { site: facts.site, total_minor: String(facts.totalMinor), currency: facts.currency } },
     pictures: [picture],
   });
@@ -1140,8 +1141,10 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
         safe_to_rebuild: rebuild,
         repeat_safe: false,
         message: rebuild
-          ? 'No purchase was attempted. Rebuild the supported checkout from a fresh observation and call purchase; the host will revalidate the original approved facts, bounds and expiry. Do not repeat the internal commit request.'
-          : 'No purchase was attempted. The existing approval cannot currently be used; report this outcome and continue only through the normal purchase flow.',
+          ? 'No purchase was attempted. Rebuild the checkout from a fresh observation and call purchase; the host will revalidate the original approved facts, bounds and expiry. Do not repeat the internal commit request.'
+          : data.status === 'awaiting_principal'
+            ? "No purchase was attempted: the principal has a new card with the checkout's current facts. Stay on the checkout and wait for its outcome."
+            : 'No purchase was attempted. The existing approval cannot currently be used; report this outcome and continue only through the normal purchase flow.',
       }),
     );
   } catch (error) {

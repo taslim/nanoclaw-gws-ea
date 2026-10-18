@@ -38,6 +38,7 @@ import { BrowserStore, browserRequestId, type BrowserJob } from './db.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { CONSENT, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
 import { BrowserQueue } from './queue.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -196,6 +197,9 @@ describe('asking the principal for consent', () => {
     expect(approval.title).toBe('Agree to this on join.example?');
     expect(approval.question).toContain(`join.example asks me to agree to this:\n"${WORDING}"`);
     expect(approval.question).toContain('until you ask me to stop');
+    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+    expect(approval.question).not.toContain(job.thread_id);
     // Only the principal decides it.
     await click(approval, 'approve', OPERATOR);
     expect(await grants()).toEqual([]);

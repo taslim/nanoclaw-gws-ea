@@ -49,6 +49,7 @@ import {
   validatePurchaseRequest,
 } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
@@ -627,6 +628,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(approval.question).toMatch(/Place your order/);
     expect(approval.question).toMatch(/Due now: \$85.00/);
     expect(approval.question).toMatch(/Due later: none/);
+    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+    expect(approval.question).not.toContain(session.thread_id!);
     // The reviewed reader places its order total and commit control: the card's one picture is clipped to both.
     expect(JSON.parse(sent[0].content)).toMatchObject({ pictures: 1 });
     expect(sent[0].files).toHaveLength(1);

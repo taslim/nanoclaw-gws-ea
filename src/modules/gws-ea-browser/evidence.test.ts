@@ -221,6 +221,35 @@ it('does not guess missing or ambiguous emissions, and never exports arbitrary r
   expect(JSON.stringify(evidence)).not.toContain(canary);
 });
 
+it('records the open design’s outcomes as operational codes (KTD18)', async () => {
+  const answers: ReadonlyArray<Record<string, unknown>> = [
+    { status: 'card_needed' },
+    { status: 'facts_incomplete', missing: [canary] },
+    { status: 'stopped', reason: 'consent_required', consent: [{ wording: canary }] },
+    { status: 'stopped', reason: 'consent_control' },
+    { status: 'unconfirmed', attempt_id: canary },
+    { status: 'stopped', reason: 'read_only' },
+    { status: 'stopped', reason: 'alias_unavailable' },
+    { status: 'stopped', reason: 'personal_data' },
+    { status: 'stopped', reason: 'unapproved_commit' },
+    { status: 'confirmed_not_placed', attempt_id: canary },
+    { status: 'refused', reason: 'read_only_recipe_required' },
+  ];
+  for (const [index, data] of answers.entries()) {
+    vi.setSystemTime(new Date(at(index + 1)));
+    await getDb().run(
+      'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+      JSON.stringify({ ok: true, data }),
+      await accept(`outcome-${index}`, index === 9 ? 'purchase' : index === 10 ? 'watch' : 'browser'),
+    );
+  }
+  const evidence = await readBrowserEvidence(thread);
+  expect(evidence.requests.map(({ status, reason }) => ({ status, reason }))).toEqual(
+    answers.map(({ status, reason }) => ({ status, reason: reason ?? null })),
+  );
+  expect(JSON.stringify(evidence)).not.toContain(canary);
+});
+
 it('leaves truncated mailbox timing unavailable and never provisions an absent mailbox', async () => {
   await accept('old-request');
   await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {

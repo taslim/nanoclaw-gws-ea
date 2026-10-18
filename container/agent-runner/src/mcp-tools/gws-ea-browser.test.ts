@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import Ajv from 'ajv';
 
+import { OPERATIONAL_CODES } from '../../../../src/modules/gws-ea-browser/operational-codes.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import {
@@ -107,6 +108,94 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
   [listWatches, {}],
   [cancelWatch, { watch_id: 'watch-1' }],
 ];
+
+const BROWSER_TOOLS = [
+  browser,
+  fillSecret,
+  credentialForm,
+  signInCode,
+  purchase,
+  requestConsent,
+  saveRecipe,
+  runRecipe,
+  watch,
+  listWatches,
+  cancelWatch,
+];
+/** Names the descriptions use that are no answer’s status or reason. */
+const NOT_CODES = new Set([
+  // An action’s screenshot, by its index among the images.
+  'image_index',
+  // The observation’s report of what the host did about a cookie banner.
+  'cookie_banner',
+  // credential_form’s vault state beside its status.
+  'left_as_edited',
+]);
+/** Codes the host records that no browser tool names: the agent never meets them, or reads them for themselves. */
+const UNNAMED_CODES = new Set([
+  // An error frame, which the agent reads as the tool’s error.
+  'error',
+  'unknown-command',
+  'invalid-args',
+  'forbidden',
+  'approval-pending',
+  'handler-error',
+  'transport-error',
+  // An action a stop left unrun.
+  'not_executed',
+  // The host’s own commit and booking requests, and its watch checks and states.
+  'committed',
+  'not_committed',
+  'superseded',
+  'authority_unavailable',
+  'purchase_blocked',
+  'checking',
+  'preparing',
+  'booking',
+  'region_read',
+  'ready',
+  'failed',
+  'unavailable',
+  // An answer to main’s relay of a sign-in code.
+  'no_wait',
+  // Reasons a refusal names, which explain themselves.
+  'no_authority',
+  'not_disclosed',
+  'unsupported_form',
+  'form_changed',
+  'unsupported_control',
+  'login_changed',
+  'invalid_request',
+  'not_configured',
+  'bounds_changed',
+  'principal_unavailable',
+  'region_not_found',
+  'route_changed',
+]);
+/** Everything the browser agent or a delegating agent reads about the browser, relative to this file. */
+const AGENT_FACING_FILES = [
+  './gws-ea-browser.ts',
+  './gws-ea-browser.instructions.md',
+  './gws-ea-browser-delegate.ts',
+  './gws-ea-browser-delegate.instructions.md',
+  '../../../../templates/gws-ea/browser/instructions.md',
+  '../../../../templates/gws-ea/browser/README.md',
+  '../../../../src/modules/gws-ea-browser/main-guidance.md',
+];
+/** Every name a schema gives: its property keys, and its const and enum values. */
+function schemaNames(schema: unknown, names = new Set<string>()): Set<string> {
+  if (Array.isArray(schema)) for (const item of schema) schemaNames(item, names);
+  else if (schema && typeof schema === 'object')
+    for (const [key, value] of Object.entries(schema)) {
+      if (key === 'properties' && value && typeof value === 'object')
+        for (const name of Object.keys(value)) names.add(name);
+      if (key === 'const' && typeof value === 'string') names.add(value);
+      if (key === 'enum' && Array.isArray(value))
+        for (const option of value) if (typeof option === 'string') names.add(option);
+      schemaNames(value, names);
+    }
+  return names;
+}
 
 describe('the browser tools', () => {
   it('sends exactly one native host request with its own action name and returns its answer', async () => {
@@ -237,6 +326,47 @@ describe('the browser tools', () => {
     expect(consent({ stop_id: '0b5c3a52-8f4e-4c1d-9a7b-2e6f1d3c4b5a' })).toBe(true);
     for (const fields of [{}, { stop_id: 'stop-1', approved: true }, { stop_id: 'stop-1', wording: 'I agree' }])
       expect(consent(fields)).toBe(false);
+  });
+
+  it('names as outcomes only codes the host records, and every code the agent meets by name', () => {
+    const descriptions = BROWSER_TOOLS.map((tool) => tool.tool.description).join('\n');
+    const tools = new Set([...BROWSER_TOOLS, requestStatus].map((tool) => tool.tool.name));
+    const fields = schemaNames(BROWSER_TOOLS.map((tool) => tool.tool.inputSchema));
+    const named = new Set(descriptions.match(/\b[a-z]+(?:_[a-z]+)+\b/gu));
+    expect(
+      [...named].filter(
+        (name) => !OPERATIONAL_CODES.has(name) && !tools.has(name) && !fields.has(name) && !NOT_CODES.has(name),
+      ),
+    ).toEqual([]);
+    for (const code of UNNAMED_CODES) expect(OPERATIONAL_CODES.has(code)).toBe(true);
+    expect(
+      [...OPERATIONAL_CODES].filter(
+        (code) => !UNNAMED_CODES.has(code) && !new RegExp(`(?<![\\w-])${code}(?![\\w-])`, 'u').test(descriptions),
+      ),
+    ).toEqual([]);
+  });
+
+  it('describes the open design with no deny-by-default wording in anything either agent reads', () => {
+    for (const file of AGENT_FACING_FILES) {
+      const text = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+      expect({ file, denied: text.match(/unsupported_merchant|supported merchant|reviewed flows only/giu) }).toEqual({
+        file,
+        denied: null,
+      });
+    }
+    // An unproven purchase or watch booking is unconfirmed now; outcome_unknown stays a credential outcome.
+    for (const tool of [purchase, watch, browser]) expect(tool.tool.description).not.toContain('outcome_unknown');
+    expect(purchase.tool.description).toContain('unconfirmed');
+    expect(watch.tool.description).toContain('unconfirmed');
+  });
+
+  it('takes needed_by as a date or a date and time with an offset, as the host reads it', () => {
+    const validate = new Ajv({ validateFormats: false }).compile(purchase.tool.inputSchema);
+    for (const needed_by of ['2026-10-23', '2026-10-23T17:00:00-07:00', '2026-10-23T17:00:00.000Z'])
+      expect(validate({ target, needed_by })).toBe(true);
+    for (const needed_by of ['2026-10-23T17:00:00', 'October 23', '23/10/2026'])
+      expect(validate({ target, needed_by })).toBe(false);
+    expect(purchase.tool.inputSchema.properties?.needed_by).not.toHaveProperty('format');
   });
 
   it('names only real tools in its mechanics instructions', async () => {

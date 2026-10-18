@@ -20,7 +20,7 @@ import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
-import { quotePurchaseText } from './cards.js';
+import { ERRAND_ORIGIN_LINE, quotePurchaseText } from './cards.js';
 import {
   getConsentStop,
   liveConsentGrants,
@@ -139,7 +139,7 @@ export async function executeConsentRequest(
     question: consentQuestion(stop),
     approverUserId: decision.approverUserId,
     expiresAt: new Date(Date.now() + CONSENT_CARD_LIFE_MS).toISOString(),
-    originLine: `From your browser errand ${context.job.thread_id}.`,
+    originLine: ERRAND_ORIGIN_LINE,
     details: { facts: { site: stop.site, wording: stop.wording } },
   });
   if (!approvalId) {

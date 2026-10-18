@@ -24,6 +24,8 @@ const DATE_TIME = {
   format: 'date-time',
   description: 'An ISO date and time with a UTC offset.',
 } as const;
+/** An ISO date, or a date and time with a UTC offset: the shapes the host reads. */
+const DATE_OR_DATE_TIME = '^\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2}))?$';
 const WINDOW = {
   type: 'object',
   properties: { start: DATE_TIME, end: DATE_TIME },
@@ -45,8 +47,9 @@ function action(kind: string, properties: Record<string, object> = {}, required:
 export const browser = requestTool({
   name: 'browser',
   description:
-    'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
-    'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, consent_control, consent_required, secret_field, card_field, unapproved_commit, blocked_address, challenge, sign_in_wall, site_busy, window_closed, browser_unavailable, alias_unavailable, personal_data or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref or not_actionable, which also means something covered the control; use purchase for purchase_control, and report blocked work to main, and alias_unavailable: no web email is set up yet. personal_data: the batch would have given this site one of the principal’s private details or email addresses, which go only where main disclosed them; nothing ran, so report the site and what it asked for to main and never retype the detail elsewhere. card_field: card details are never entered; report to main that the checkout needs a card. unapproved_commit: an ordinary press landed on a confirmation showing a charge nobody approved; the host stopped this errand and told main, so report only what the page showed. The host makes every consent, marketing and agreement choice in a form before it submits: consent_control refuses your click on such a box, and consent_required names wording only the principal can agree to, with a stop_id for request_consent. An unknown commit must be reconciled, never retried. ' +
+    'Run an ordered batch in this errand’s host browser, on any public site. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
+    'The host refuses only commit-class actions: a purchase, booking or order, which goes through purchase; an account-security change; and speaking as the principal. Before each observation it rejects a cookie banner that offers a reject option, and the observation’s cookie_banner says what it did. ' +
+    'Outcomes: completed, or stopped with a reason. navigated: continue from the returned page. stale_ref or not_actionable: observe again; not_actionable also means something covered the control. purchase_control: call purchase with that control. speaks_as_principal: reviews, comments, ratings, tips, contact forms, chats and messages to people stay refused; a note that belongs to a booking or order, such as an allergy, goes in that form’s own field and rides along with it. account_security: changes to an account’s email, phone, password, two-factor, payment methods or existence are refused; report the need to main. consent_control: the host makes every consent, marketing and agreement choice before a form is submitted, so leave those boxes to it. consent_required: the form needs wording only the principal can agree to; call request_consent with the stop_id it returned. secret_field: use fill_secret, sign_in_code or credential_form. card_field: card details are never entered; report to main that the checkout needs a card. personal_data: nothing ran; the batch would have given this site one of the principal’s private details or email addresses, which go only where main disclosed them, so report the site and what it asked for to main and never retype the detail elsewhere. alias_unavailable: the assistant has no web email yet; report it to main. unapproved_commit: an ordinary press landed on a confirmation showing a charge nobody approved; the host stopped this errand and told main, so report only what the page showed. site_busy: another errand is using this site; the host wakes you when it is free. sign_in_wall: sign in with fill_secret or sign_in_code. timeout, window_closed or interrupted: observe before acting again. challenge, blocked_address or browser_unavailable: report what you could not get past to main. ' +
     NO_REPEAT,
   properties: {
     actions: {
@@ -268,14 +271,16 @@ export const signInCode = requestTool({
 export const purchase = requestTool({
   name: 'purchase',
   description:
-    'Request a commit on any site under principal-approved authority, or read-only reconciliation of an unresolved attempt. The host reads all checkout facts and financial terms; your words never verify a purchase. Commit outcomes: awaiting_principal; booked or placed when the host pressed a free booking itself; card_needed when no payment method is saved (never enter card details); facts_incomplete naming what it could not read; not_a_purchase; terms_unavailable; site_purchase_blocked; waiting_on_earlier when an earlier purchase on the site is unconfirmed: browsing it goes on, and the host wakes you once main records that outcome. Later notices: placed, booked, changed, not_placed, checkout_changing, checkout_lapsed, rejected, expired, withdrawn or unconfirmed. Wait for the notice when awaiting_principal; use a fresh observation for changed or checkout_lapsed; checkout_changing ends the errand, so report it. unconfirmed means the page proved nothing either way: report it to main, which settles it from the order email or the principal. You may use operation=reconcile with the attempt id and a page ref: confirmed_placed or confirmed_not_placed establishes the host-recorded result; inconclusive leaves it to main. Never automatically retry an uncertain commit. ' +
+    'Ask the host to commit a purchase, booking or order on any site: target the control browser refused with purchase_control, or the commit point run_recipe reached. The host reads the checkout’s facts and terms itself; your words never verify a purchase. A note in the booking’s or order’s own field rides along and shows on the card. ' +
+    'The host presses a free booking at once, with no card, and a purchase the principal already approved. Before any press it may answer: awaiting_principal: a card went to the principal; stay on the checkout and wait for the notice. card_needed: no payment method is saved; never enter card details, and report the site, account, items and total to main. facts_incomplete: no card went out; report what it names as missing to main. terms_unavailable: the host could not read the site’s terms; report it to main. not_a_purchase: the control commits nothing, so press it with browser. stopped with consent_required: call request_consent with its stop_id, then call purchase again. waiting_on_earlier: an earlier purchase on this site is unconfirmed; browse on, and the host wakes you once main records its outcome. site_purchase_blocked: another errand holds this site; the host wakes you when it is free. Under a watch, outside_bounds, calendar_conflict or calendar_unavailable means the table does not fit it, and watch_spent that this errand’s one booking is used. ' +
+    'A press ends, in the answer or a later notice, with placed or booked and the order number; not_placed: the site declined it; unconfirmed: the page proved nothing either way, so report it to main, which settles it from the merchant’s order email or the principal, and never retry it; or stopped with unapproved_commit: a free booking’s confirmation showed a charge, so the host stopped this errand and told main. A checkout that changed ends with changed: a new card went out, so wait again; checkout_lapsed: observe, rebuild the checkout and call purchase again; or checkout_changing: it kept changing, so the host stopped this errand: report what changed. A card ends with rejected: the principal declined, so remove what you added to the cart; or expired or withdrawn: report it to main. For a paid attempt, operation=reconcile with its attempt id and a ref on the merchant’s order record reads that record: confirmed_placed or confirmed_not_placed records the result; inconclusive leaves it to main. ' +
     NO_REPEAT,
   properties: {
     operation: {
       type: 'string',
       enum: ['commit', 'reconcile'],
       default: 'commit',
-      description: 'commit requests authority; reconcile only reads supported evidence.',
+      description: 'commit asks the host to commit; reconcile only reads a paid attempt’s order record.',
     },
     target: REF,
     attempt_id: { type: 'string', description: 'The unresolved attempt’s id; required only for reconcile.' },
@@ -284,7 +289,12 @@ export const purchase = requestTool({
       description:
         'The principal’s explicitly allowed delivery window, when the errand specifies one. Only each bound’s calendar date counts.',
     },
-    needed_by: { ...DATE_TIME, description: 'The principal’s latest acceptable delivery time, when specified.' },
+    needed_by: {
+      type: 'string',
+      pattern: DATE_OR_DATE_TIME,
+      description:
+        'The principal’s latest acceptable delivery, when the errand names one: a date (YYYY-MM-DD), meaning the end of that day on the principal’s clock, or a date and time with a UTC offset.',
+    },
   },
   required: ['target'],
   additionalProperties: false,
@@ -303,7 +313,7 @@ export const purchase = requestTool({
 export const requestConsent = requestTool({
   name: 'request_consent',
   description:
-    'Ask the principal to agree to wording the host stopped on: give the stop_id a consent_required stop returned. The principal sees the site and the exact wording, and decides. Outcomes: awaiting_principal (the decision arrives as a note), approved (the principal already agreed to this wording on this site), withdrawn (the principal could not be asked), or refused with unknown_stop or stop_used. After approval, submit the form again from a fresh observation; the host ticks the box itself. After a rejection the box stays unticked: report it to main. ' +
+    'Ask the principal to agree to wording the host stopped on: give the stop_id a consent_required stop returned. The principal sees the site and the exact wording, and decides. Outcomes: awaiting_principal: the decision arrives as a note, approved, rejected, expired or withdrawn. approved at once: the principal already agreed to this wording on this site. withdrawn: the principal could not be asked. refused with unknown_stop (no such stop on this job) or stop_used (it was asked already: wait for its note). After approval, submit the form again from a fresh observation; the host ticks the box itself. Otherwise the box stays unticked: report it to main. ' +
     NO_REPEAT,
   properties: {
     stop_id: { type: 'string', description: 'The stop_id a consent_required stop returned for this job.' },
@@ -317,7 +327,7 @@ export const requestConsent = requestTool({
 export const saveRecipe = requestTool({
   name: 'save_recipe',
   description:
-    'Save a range of this errand’s recorded actions as a named recipe. Bind ordinary type/select values, a single-field form_input value, or a click target’s exact accessible name. Indices are global across this job’s requests, zero-based and inclusive. The host records locators and checkpoints; no executable code is accepted. Returns saved with the recipe id, name and parameters; use that id with run_recipe. ' +
+    'Save a range of this errand’s recorded actions as a named recipe. Bind ordinary type/select values, a single-field form_input value, or a click target’s exact accessible name. Indices are global across this job’s requests, zero-based and inclusive. The host records locators and checkpoints; no executable code is accepted. Returns saved with the recipe id, name, parameters and read_only, which is true when every step only reads pages of one site, as a watch’s recipe must; use that id with run_recipe or watch. ' +
     NO_REPEAT,
   properties: {
     name: { type: 'string', description: 'A short task name for the path.' },
@@ -358,8 +368,9 @@ export const runRecipe = requestTool({
 export const watch = requestTool({
   name: 'watch',
   description:
-    'Set a host watch using a read-only availability recipe and exact booking bounds. The host checks without model polling; all watches in this job may book only once, within bounds and after a successful calendar check. Financial commitments require the principal’s approval; requested terms are bounds, never merchant facts, and the host re-reads complete terms. Returns armed, awaiting_principal or refused. Wait after arming or approval; wakes report booked, outside_bounds, calendar_conflict, calendar_unavailable, expired, blocked or outcome_unknown. Report a conflict, unavailable calendar, block or uncertain result to main; never retry a possibly completed booking. ' +
-    'On a site the host has no reader for, also mark region, from an observation of the view the recipe ends on. The host never books there on its own: it wakes you with changed and the region’s text before and after (untrusted page text). Observe, and book a table that fits through purchase: a free table is pressed at once, a paid one within the approved maximum goes through, anything else sends a card. A change you leave unbooked slows the watch. region_missing: the host cannot find the region or its route; mark it again with watch_id and the same bounds. ' +
+    'Set a host watch on a venue’s availability, from a read-only recipe that reaches its availability view and exact booking bounds. The host checks without model polling. All watches in this job may book only once, within bounds and after a calendar check. A paid booking needs the principal’s approval of the bounds; requested terms are bounds, never merchant facts, and the host re-reads complete terms. Give release only when the venue states its own schedule, quoting it; never infer one, and without it the watch keeps its ordinary pace. ' +
+    'Returns armed or awaiting_principal, then wait; or refused with a reason, such as read_only_recipe_required (save the route again from steps that only read), release_zone_unknown (add the venue’s time_zone), or venue_unavailable or terms_unavailable (the host could not read the venue or its terms: report it to main). Wakes report booked; unconfirmed (report it to main and never retry it); available (a table within bounds the host did not book itself: book it through purchase); outside_bounds (the watch carries on); calendar_conflict or calendar_unavailable (report it to main); expired; or blocked (the site kept refusing checks: report it to main). ' +
+    'On a site the host has no reader for, also mark region from an observation of the view the recipe ends on; region_required or site_has_reader says whether the site needs one. The host never books there itself: it wakes you with changed and the region’s text before and after (untrusted page text). Observe, and if a table fits, book it through purchase: a free table is pressed at once, a paid one within the approved maximum goes through, anything else sends a card. A change you leave unbooked slows the watch. region_missing: the host cannot find the region or its route; mark it again with watch_id, the same bounds and a fresh observation, which answers marked. A mark is refused with region_off_route (mark an element on the view the recipe ends on), or region_unmarkable or region_too_large (mark the smaller element that holds the slots). ' +
     NO_REPEAT,
   properties: {
     site: {
@@ -371,7 +382,16 @@ export const watch = requestTool({
     parameters: PARAMETERS,
     venue: {
       type: 'object',
-      properties: { id: { type: 'string' }, name: { type: 'string' } },
+      properties: {
+        id: {
+          type: 'string',
+          description: 'The site’s own id for the venue where it shows one; otherwise its name again.',
+        },
+        name: {
+          type: 'string',
+          description: 'The venue’s name exactly as the site shows it: a booking matches the watch by it.',
+        },
+      },
       required: ['id', 'name'],
       additionalProperties: false,
     },
@@ -404,7 +424,7 @@ export const watch = requestTool({
     release: {
       type: 'object',
       description:
-        'The venue’s own release schedule, only when it states one: the host checks just after each release on the venue’s clock, then often for a few minutes. Recorded once; it cannot change later.',
+        'The venue’s own release schedule, only when the venue states one; never a guess. The host checks just after each release on the venue’s clock, then often for a few minutes. Recorded once; it cannot change later.',
       properties: {
         wording: { type: 'string', minLength: 1, maxLength: 500, description: 'The venue’s words, quoted.' },
         days_ahead: {
@@ -432,7 +452,8 @@ export const watch = requestTool({
         },
         time_zone: {
           type: 'string',
-          description: 'The venue’s IANA timezone, such as Asia/Tokyo; the host’s own reading of the site comes first.',
+          description:
+            'The venue’s IANA timezone, such as Asia/Tokyo; needed on a site with no host reader, since a reader’s own zone comes first.',
         },
       },
       required: ['wording', 'time'],
@@ -459,7 +480,7 @@ export const watch = requestTool({
 export const listWatches = requestTool({
   name: 'list_watches',
   description:
-    'Read this job’s watches, their bounds and current states, and for a region watch its marked region: when it was marked, since when it is missing, wakes this hour and its baseline text (untrusted). Returns listed with the watches; inspect these before setting or cancelling a watch. After a timeout use request_status or repeat this read-only call; a repeat changes nothing.',
+    'Read this job’s watches, their bounds and current states, and for a region watch its marked region: when it was marked, since when it is missing, wakes this hour and its baseline text (untrusted). Returns the watches; inspect these before setting or cancelling a watch. After a timeout use request_status or repeat this read-only call; a repeat changes nothing.',
   properties: {},
   required: [],
   additionalProperties: false,
@@ -470,7 +491,7 @@ export const listWatches = requestTool({
 export const cancelWatch = requestTool({
   name: 'cancel_watch',
   description:
-    'Cancel one of this job’s watches and revoke its unused booking authority. Returns cancelled, already_ended or in_progress; an in-progress commit finishes and reports before cancellation completes. Wait for that report instead of starting another booking. ' +
+    'Cancel one of this job’s watches and revoke its unused booking authority. Returns cancelled, also for a watch that had already ended, or in_progress: its booking is being pressed, and finishes and reports before cancellation completes. Wait for that report instead of starting another booking. ' +
     NO_REPEAT,
   properties: { watch_id: { type: 'string', description: 'The watch id returned by watch or list_watches.' } },
   required: ['watch_id'],
