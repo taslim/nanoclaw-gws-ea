@@ -709,7 +709,9 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
         const body = await resy.page
           .evaluate<string>("JSON.stringify(document.body.dataset) + ' ' + document.body.innerHTML.slice(0, 200)")
           .catch((failure: unknown) => String(failure));
-        throw new Error(`${String(error)}\nurl ${resy.page.url()}\nbody ${body}\n${seen.join('\n')}`);
+        throw new Error(
+          `${String(error)}\nchrome ${resy.browser.version()}\nurl ${resy.page.url()}\nbody ${body}\n${seen.join('\n')}`,
+        );
       });
     const observation = await observePage(resy.page);
     expect(
