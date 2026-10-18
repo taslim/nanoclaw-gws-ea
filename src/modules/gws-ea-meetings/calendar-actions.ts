@@ -96,6 +96,8 @@ export interface Invitation {
   readonly recipients: readonly string[];
   /** Who writes it, so a refused link is explained in words fitted to them. */
   readonly writer: LinkWriter;
+  /** Canonical chat, supplied only by the host's serving-session check. */
+  readonly chatId?: string;
 }
 
 /**
@@ -118,6 +120,7 @@ export async function assertInvitationShareable(
   const check = await checkOutbound(
     [...invitation.texts, ...invitation.shown].map((text) => text ?? ''),
     await audienceForAddresses(invitation.recipients),
+    invitation.chatId,
   );
   if (!check.allowed) {
     throw forbidden(

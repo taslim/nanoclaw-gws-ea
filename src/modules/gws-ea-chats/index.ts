@@ -16,7 +16,7 @@ import { registerPersonForgetHook } from '../gws-ea-people/db.js';
 import { registerWhatsAppObserver } from '../gws-ea-whatsapp/observers.js';
 import { registerChannelCardInterceptor } from '../permissions/channel-approval.js';
 import { chatIsActive, getChat, listChats } from './db.js';
-import { decideChatEngagement } from './engage.js';
+import { decideChatEngagement, registerExpectedChatReplyReader } from './engage.js';
 import { chatInboundDelay, detachChat } from './hold.js';
 import { chatByAddress, decideJoin, interceptChatMessage } from './join.js';
 import { chatsMigration } from './migration.js';
@@ -27,6 +27,9 @@ import { CHAT_BRIDGE_ACTIONS, flushChatHandoffs, inChatConversation } from './br
 import { writeChatContext } from './context.js';
 import { chatHandoffMigration } from './handoff-migration.js';
 import { registerChatLifecycleTask } from './lifecycle.js';
+import { chatToolsMigration } from './tools-migration.js';
+import { EXPECT_REPLY_ACTION, consumeExpectedChatReply, expireExpectedChatReplies } from './expect.js';
+import { REMIND_ACTION } from './remind.js';
 
 export * from './db.js';
 export * from './hold.js';
@@ -38,6 +41,11 @@ export { registerChatLifecycleTask, sweepChatLifecycle } from './lifecycle.js';
 
 registerMigration(chatsMigration);
 registerMigration(chatHandoffMigration);
+registerMigration(chatToolsMigration);
+registerDeliveryAction(...EXPECT_REPLY_ACTION);
+registerDeliveryAction(...REMIND_ACTION);
+registerExpectedChatReplyReader('gws-ea-chats:expected', consumeExpectedChatReply);
+registerChatLifecycleTask('gws-ea-chats:expected', expireExpectedChatReplies);
 for (const [action, handler, guard] of CHAT_BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);
 registerSessionAdmissionPolicy('gws-ea-chats:context', async ({ key }) => {
   const session = await getSession(key.sessionId);

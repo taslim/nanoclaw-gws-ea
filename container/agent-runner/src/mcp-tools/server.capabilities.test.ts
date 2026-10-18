@@ -61,6 +61,16 @@ const EXTERNAL_EMAIL_TOOLS = [
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 const MAIN_CHAT_TOOLS = ['chat_admit', 'chat_decline', 'chat_handoff', 'chat_leave', 'whatsapp_link'];
+const EXTERNAL_CHAT_TOOLS = [
+  'book',
+  'cancel_booking',
+  'change_booking',
+  'expect_reply',
+  'free_time',
+  'remind',
+  'tell_main',
+];
+const JOB_DOCUMENT_TOOLS = ['doc_create', 'doc_edit', 'doc_read', 'doc_share'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
 const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats', 'respond_to_event'];
 const BROWSER_TOOLS = [
@@ -144,7 +154,8 @@ describe('NanoClaw tool server capabilities', () => {
     ['request-status', ['request-status'], ['request_status']],
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-chat', ['gws-ea-chat'], MAIN_CHAT_TOOLS],
-    ['gws-ea-chat-external', ['gws-ea-chat-external'], ['tell_main']],
+    ['gws-ea-chat-external', ['gws-ea-chat-external'], EXTERNAL_CHAT_TOOLS],
+    ['gws-ea-chat-documents', ['gws-ea-chat-documents'], JOB_DOCUMENT_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     ['browser', ['browser'], BROWSER_TOOLS],
@@ -206,7 +217,16 @@ describe('NanoClaw tool server capabilities', () => {
 
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
-    for (const tool of ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking']) {
+    for (const tool of [
+      'tell_main',
+      'free_time',
+      'book',
+      'change_booking',
+      'cancel_booking',
+      'expect_reply',
+      'remind',
+      ...JOB_DOCUMENT_TOOLS,
+    ]) {
       expect(tools).not.toContain(tool);
     }
   });

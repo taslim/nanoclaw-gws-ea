@@ -30,7 +30,8 @@ import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarFactTools } from './calendar-facts.js';
-import { principalEventAction, threadCalendarAction } from './guard.js';
+import { chatCalendarAction, principalEventAction, threadCalendarAction } from './guard.js';
+import { createChatSchedulingTools } from './chat-calendar.js';
 import { createPrincipalEventTools } from './principal-events.js';
 import { createSchedulingTools } from './tools.js';
 
@@ -80,6 +81,16 @@ for (const [action, answer] of SCHEDULING_REQUESTS) {
     answeringAction(action, withConnectionStep(action, answer, EXTERNAL_EMAIL_STEP)),
     answeredGuard(threadCalendarAction),
   );
+}
+
+const chatScheduling = createChatSchedulingTools({ calendar: calendarApi });
+for (const [action, answer] of [
+  ['chat_free_time', chatScheduling.freeTime],
+  ['chat_book', chatScheduling.book],
+  ['chat_change_booking', chatScheduling.changeBooking],
+  ['chat_cancel_booking', chatScheduling.cancelBooking],
+] as const) {
+  registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(chatCalendarAction));
 }
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });

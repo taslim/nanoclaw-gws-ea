@@ -9,7 +9,7 @@ import { getChat } from './db.js';
 import { admitChatFromPrincipalMessage } from './hold.js';
 import { channelUserId, getChatMember, memberFact, recordChatSpeaker, setChatMemberEmail } from './roster.js';
 
-export type ExpectedChatReplyReader = (chatId: string, userId: string) => Promise<boolean>;
+export type ExpectedChatReplyReader = (chatId: string, userId: string, messageId: string) => Promise<boolean>;
 const expectedReaders = new Map<string, ExpectedChatReplyReader>();
 /** The expected-replies owner supplies its real durable lookup; registration conveys no authority. */
 export function registerExpectedChatReplyReader(id: string, read: ExpectedChatReplyReader): void {
@@ -56,6 +56,10 @@ export async function decideChatEngagement({ event, messagingGroup }: Engagement
     )
       await setChatMemberEmail(messagingGroup.id, userId, emails[0], 'member');
   }
+  let expected = false;
+  if (userId)
+    for (const reader of expectedReaders.values())
+      if (await reader(messagingGroup.id, userId, event.message.id)) expected = true;
   if (messagingGroup.is_group === 0 || event.message.isMention === true) return true;
   const name = (await getGwsEaProfile()).assistant_display_name;
   if (name) {
@@ -83,6 +87,5 @@ export async function decideChatEngagement({ event, messagingGroup }: Engagement
     )
       return true;
   }
-  if (userId) for (const reader of expectedReaders.values()) if (await reader(messagingGroup.id, userId)) return true;
-  return false;
+  return expected;
 }

@@ -252,6 +252,17 @@ export interface SchedulingToolsDeps {
   readonly calendar: () => MeetingsCalendarApi;
 }
 
+/** Calendar writes serialize across email and chat so two sources cannot take one slot. */
+let schedulingTurn: Promise<unknown> = Promise.resolve();
+export function inSchedulingTurn<T>(work: () => Promise<T>): Promise<T> {
+  const done = schedulingTurn.then(work);
+  schedulingTurn = done.then(
+    () => undefined,
+    () => undefined,
+  );
+  return done;
+}
+
 export function createSchedulingTools(deps: SchedulingToolsDeps) {
   const calendar = () => deps.calendar();
 
@@ -337,17 +348,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * is free and writes before the next looks, so two threads never take one
    * time, and the second is told it has gone.
    */
-  let turn: Promise<unknown> = Promise.resolve();
-  function takeTurn<T>(work: () => Promise<T>): Promise<T> {
-    const done = turn.then(work);
-    turn = done.then(
-      () => undefined,
-      () => undefined,
-    );
-    return done;
-  }
   function inTurn(answer: ActionAnswer): ActionAnswer {
-    return (content, session, requestId) => takeTurn(() => answer(content, session, requestId));
+    return (content, session, requestId) => inSchedulingTurn(() => answer(content, session, requestId));
   }
 
   // -------------------------------------------------------------------------
