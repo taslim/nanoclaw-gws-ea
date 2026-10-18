@@ -70,6 +70,8 @@ export interface ReplyContext {
   sender: string;
   /** The platform's id for the message replied to, when the platform names it. */
   id?: string;
+  /** A native forward carries source material, never the sender's own words. */
+  forwarded?: true;
 }
 
 // ---------------------------------------------------------------------------

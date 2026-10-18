@@ -647,8 +647,9 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   const text = typeof snapshot?.text === 'string' ? snapshot.text : '';
   const sender = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : 'unknown';
   const id = quote.quoteType !== 'FORWARD' && typeof quote.name === 'string' ? quote.name : undefined;
-  if (!text.trim() && id === undefined) return null;
-  return { sender, text, ...(id === undefined ? {} : { id }) };
+  const forwarded = quote.quoteType === 'FORWARD';
+  if (!text.trim() && id === undefined && !forwarded) return null;
+  return { sender, text, ...(id === undefined ? {} : { id }), ...(forwarded ? { forwarded: true } : {}) };
 }
 
 /** A native forward contains source audio; replying to a message does not forward a new recording. */

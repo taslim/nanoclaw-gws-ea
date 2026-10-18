@@ -1,5 +1,23 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
+export const gwsEaChatClearancesMigration: ModuleMigration = {
+  version: 3,
+  name: 'module:gws-ea-privacy:chat-clearances',
+  async up(db) {
+    // The cited mark expires after a day; the clearance lasts until detach,
+    // so its audit id deliberately has no foreign key to the pruned marks.
+    await db.exec(`
+      CREATE TABLE gws_ea_chat_clearances (
+        messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id) ON DELETE CASCADE,
+        private_value_id TEXT NOT NULL REFERENCES gws_ea_private_values(id) ON DELETE CASCADE,
+        principal_message_id TEXT NOT NULL,
+        cleared_at TEXT NOT NULL,
+        PRIMARY KEY (messaging_group_id, private_value_id)
+      );
+    `);
+  },
+};
+
 /**
  * The principal's private values. Each has a label the principal knows it by
  * and one fixed kind. The value is held as the principal wrote it; the check

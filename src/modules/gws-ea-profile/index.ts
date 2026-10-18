@@ -4,6 +4,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
+import { registerInboundPreparer } from '../../inbound-preparation.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -45,7 +46,9 @@ import {
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
   gwsEaWebAliasMigration,
+  gwsEaPrincipalMessagesMigration,
 } from './migration.js';
+import { preparePrincipalMessageContent } from './marks.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
 import './wiring-policy.js';
 
@@ -55,6 +58,8 @@ registerMigration(gwsEaExternalEmailPointerMigration);
 registerMigration(gwsEaBrowserPointerMigration);
 registerMigration(gwsEaWebAliasMigration);
 registerMigration(gwsEaExternalChatPointerMigration);
+registerMigration(gwsEaPrincipalMessagesMigration);
+registerInboundPreparer(preparePrincipalMessageContent);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.
@@ -583,3 +588,9 @@ export {
   listVerifiedPrincipalUsers,
   reconcileGwsEaProfile,
 } from './db.js';
+export {
+  requirePrincipalMessage,
+  requirePrincipalDirectMessage,
+  PRINCIPAL_MESSAGE_LIFETIME_MS,
+  type PrincipalMessage,
+} from './marks.js';

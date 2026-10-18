@@ -333,7 +333,17 @@ function formatSingleChat(msg: MessageInRow): string {
   const fromAttr = originAttr(msg);
   const threadAttr = msg.channel_type === 'agent' && msg.thread_id ? ` thread="${escapeXml(msg.thread_id)}"` : '';
 
-  return `<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  const principalMark = msg.channel_type === 'agent' ? '' : formatPrincipalMark(content.principalMessage);
+  return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+}
+
+/** Host attribution sits outside the source body, whose markup remains escaped. */
+function formatPrincipalMark(value: unknown): string {
+  const mark = attachmentRecord(value);
+  if (typeof mark?.id !== 'string' || !mark.id || typeof mark.messagingGroupId !== 'string' || !mark.messagingGroupId) {
+    return '';
+  }
+  return `<principal_message id="${escapeXml(mark.id)}" chat="${escapeXml(mark.messagingGroupId)}"/>\n`;
 }
 
 /** content.reaction, as the host's chat-sdk bridge writes it on a reaction's row. */

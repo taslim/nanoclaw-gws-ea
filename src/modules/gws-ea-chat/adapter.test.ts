@@ -1536,8 +1536,12 @@ describe('the reply context', () => {
           quotedMessageSnapshot: { sender: 'Remy Vance', text: 'Offsite moved to May.' },
         }),
       ),
-    ).toEqual({ sender: 'Remy Vance', text: 'Offsite moved to May.' });
-    expect(extractGchatReplyContext(quoting({ name: `${ROOM}/messages/remy.9`, quoteType: 'FORWARD' }))).toBeNull();
+    ).toEqual({ sender: 'Remy Vance', text: 'Offsite moved to May.', forwarded: true });
+    expect(extractGchatReplyContext(quoting({ name: `${ROOM}/messages/remy.9`, quoteType: 'FORWARD' }))).toEqual({
+      sender: 'unknown',
+      text: '',
+      forwarded: true,
+    });
   });
 });
 

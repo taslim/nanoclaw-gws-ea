@@ -1,5 +1,23 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
+export const gwsEaPrincipalMessagesMigration: ModuleMigration = {
+  version: 7,
+  name: 'module:gws-ea-profile:principal-messages',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_principal_messages (
+        messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        timestamp TEXT NOT NULL,
+        text TEXT NOT NULL CHECK (text <> ''),
+        PRIMARY KEY (messaging_group_id, message_id)
+      );
+      CREATE INDEX gws_ea_principal_messages_timestamp ON gws_ea_principal_messages(timestamp);
+    `);
+  },
+};
+
 export const gwsEaExternalChatPointerMigration: ModuleMigration = {
   version: 6,
   name: 'module:gws-ea-profile:external-chat-pointer',
