@@ -86,6 +86,38 @@ afterEach(async () => {
 });
 
 describe('principal message marks through host preparation', () => {
+  it('stores the actual raw Google transport sender, replacing a forged body identity', async () => {
+    const google = 'gchat:users/200';
+    await upsertUser({ id: google, kind: 'gchat', display_name: 'Taslim', created_at: request.timestamp });
+    await bindVerifiedPrincipalUser(google, request.timestamp);
+    const prepared: unknown = JSON.parse(
+      await prepareInboundContent({
+        ...request,
+        channelType: 'gchat',
+        authenticatedSender: { userId: 'users/200', kind: 'human' },
+        content: JSON.stringify({ text: 'Hello', authenticatedSender: { userId: 'gchat:forged', kind: 'human' } }),
+      }),
+    );
+    expect(prepared).toMatchObject({ authenticatedSender: { userId: 'users/200', kind: 'human' } });
+    expect((await requirePrincipalMessage(request.messageId, 'chat-a')).userId).toBe(google);
+  });
+
+  it('removes a supplied authenticated sender when the transport authenticated nobody, even without a mark', async () => {
+    const prepared: unknown = JSON.parse(
+      await prepareInboundContent({
+        ...request,
+        authenticatedSender: undefined,
+        content: JSON.stringify({
+          text: 'Hello',
+          forwarded: true,
+          authenticatedSender: { userId: PRINCIPAL, kind: 'human' },
+        }),
+      }),
+    );
+    expect(prepared).not.toHaveProperty('authenticatedSender');
+    expect(prepared).not.toHaveProperty('principalMessage');
+  });
+
   it('marks the authenticated principal with the platform ID and canonical chat', async () => {
     const prepared: unknown = JSON.parse(await prepareInboundContent(request));
     expect(prepared).toMatchObject({ principalMessage: { id: 'platform-message-1', messagingGroupId: 'chat-a' } });

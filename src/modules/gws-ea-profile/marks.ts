@@ -2,7 +2,7 @@ import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import type { InboundPreparationRequest } from '../../inbound-preparation.js';
-import { isVerifiedPrincipalUser } from './db.js';
+import { isVerifiedPrincipalUser, recordPrincipalDmActivity } from './db.js';
 
 export const PRINCIPAL_MESSAGE_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 
@@ -41,9 +41,14 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
     throw error;
   }
   if (!isRecord(parsed)) return request.content;
-  const hadMarker = 'principalMessage' in parsed;
+  const hadMetadata = 'principalMessage' in parsed || 'authenticatedSender' in parsed;
   delete parsed.principalMessage;
-  const clean = (): string => (hadMarker ? JSON.stringify(parsed) : request.content);
+  delete parsed.authenticatedSender;
+  // The transport assertion survives in the mailbox for failure notices.
+  // Every body-supplied assertion is replaced, including on unmarked input.
+  if (request.authenticatedSender !== undefined) parsed.authenticatedSender = { ...request.authenticatedSender };
+  const clean = (): string =>
+    hadMetadata || request.authenticatedSender !== undefined ? JSON.stringify(parsed) : request.content;
   const db = getDb();
   if (!(await db.hasTable('gws_ea_principal_messages'))) return clean();
   const now = Date.now();
@@ -71,16 +76,20 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
   }
   // Native inbound dedup can retry preparation. The first words and time
   // remain authoritative; a retry can neither replace nor refresh them.
-  await db.run(
-    `INSERT INTO gws_ea_principal_messages (message_id, messaging_group_id, user_id, timestamp, text)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT (messaging_group_id, message_id) DO NOTHING`,
-    request.messageId,
-    request.messagingGroup.id,
-    userId,
-    new Date(received).toISOString(),
-    text,
-  );
+  await db.transaction(async () => {
+    const inserted = await db.run(
+      `INSERT INTO gws_ea_principal_messages (message_id, messaging_group_id, user_id, timestamp, text)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (messaging_group_id, message_id) DO NOTHING`,
+      request.messageId,
+      request.messagingGroup.id,
+      userId,
+      new Date(received).toISOString(),
+      text,
+    );
+    if (inserted.changes > 0)
+      await recordPrincipalDmActivity(userId, request.messagingGroup.id, new Date(received).toISOString());
+  });
   parsed.principalMessage = { id: request.messageId, messagingGroupId: request.messagingGroup.id };
   return JSON.stringify(parsed);
 }

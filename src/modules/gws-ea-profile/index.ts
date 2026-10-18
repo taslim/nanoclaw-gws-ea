@@ -46,6 +46,7 @@ import {
   gwsEaProfileMigration,
   gwsEaWebAliasMigration,
   gwsEaPrincipalMessagesMigration,
+  gwsEaPrincipalDmRoutingMigration,
 } from './migration.js';
 import { preparePrincipalMessageContent } from './marks.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
@@ -58,6 +59,7 @@ registerMigration(gwsEaBrowserPointerMigration);
 registerMigration(gwsEaWebAliasMigration);
 registerMigration(gwsEaExternalChatPointerMigration);
 registerMigration(gwsEaPrincipalMessagesMigration);
+registerMigration(gwsEaPrincipalDmRoutingMigration);
 registerInboundPreparer(preparePrincipalMessageContent);
 
 // What a spawn reads synchronously: main's group, as the profile names it.

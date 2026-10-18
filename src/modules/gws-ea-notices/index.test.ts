@@ -42,6 +42,7 @@ import { setMessagingGroupDetachedAt } from '../../db/messaging-groups.js';
 import { deliverSessionMessages, registerDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { prepareInboundContent } from '../../inbound-preparation.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { resolveSession, resolveTaskSession, writeSessionMessage } from '../../session-manager.js';
@@ -159,6 +160,7 @@ async function fromMorgan(id: string, threadId: string | null = null): Promise<s
       text: 'Find me an hour with Juno Hale on Friday.',
       sender: 'Morgan Ellery',
       senderId: 'users/morgan',
+      authenticatedSender: { userId: 'users/morgan', kind: 'human' },
     }),
   });
   return id;
@@ -257,7 +259,12 @@ const FROM_MORGAN: Origin = {
   kind: 'chat-sdk',
   ...DM,
   threadId: null,
-  content: { text: 'Find me an hour with Juno Hale on Friday.', sender: 'Morgan Ellery', senderId: 'users/morgan' },
+  content: {
+    text: 'Find me an hour with Juno Hale on Friday.',
+    sender: 'Morgan Ellery',
+    senderId: 'users/morgan',
+    authenticatedSender: { userId: 'users/morgan', kind: 'human' },
+  },
 };
 
 /** An inbound message the dead container had claimed `claimAgeMs` ago, on its `tries`-th retry. */
@@ -352,6 +359,58 @@ afterEach(async () => {
 });
 
 describe('a reply that fails permanently', () => {
+  it('recognises the raw authenticated Google sender even when senderId names someone else', async () => {
+    const content = await prepareInboundContent({
+      content: JSON.stringify({ text: 'Help me please.', senderId: 'users/someone-else' }),
+      channelType: 'gchat',
+      instance: 'gchat',
+      platformId: DM.platformId,
+      messageId: 'native-google',
+      timestamp: now(),
+      authenticatedSender: { userId: 'users/morgan', kind: 'human' },
+      messagingGroup: {
+        id: 'mg-dm',
+        channel_type: 'gchat',
+        instance: 'gchat',
+        platform_id: DM.platformId,
+        is_group: 0,
+        name: null,
+        unknown_sender_policy: 'strict',
+        created_at: now(),
+      },
+      session: main,
+    });
+    await writeSessionMessage(main.agent_group_id, main.id, {
+      id: 'native-google',
+      kind: 'chat-sdk',
+      timestamp: now(),
+      ...DM,
+      threadId: null,
+      content,
+    });
+    reply('out-native-google', ['native-google']);
+    channel((send) => !isNotice(send));
+    await drain(main, 3);
+    expect(notices()).toEqual([noticeInDm(null)]);
+    expect(facts()).toEqual([]);
+  });
+
+  it('does not treat an unauthenticated senderId claim as the principal', async () => {
+    await writeSessionMessage(main.agent_group_id, main.id, {
+      id: 'untrusted-claim',
+      kind: 'chat-sdk',
+      timestamp: now(),
+      ...DM,
+      threadId: null,
+      content: JSON.stringify({ text: 'Help me.', senderId: 'users/morgan' }),
+    });
+    reply('out-untrusted', ['untrusted-claim']);
+    channel((send) => !isNotice(send));
+    await drain(main, 3);
+    expect(notices()).toEqual([]);
+    expect(onlyFact().text).toBe("A message you wrote didn't go out, even after retrying.");
+  });
+
   it('answering Morgan, sends them one plain sentence in the thread of their conversation, and main nothing', async () => {
     await fromMorgan('in-ask', DM_THREAD);
     reply('out-a', ['in-ask'], DM_THREAD);

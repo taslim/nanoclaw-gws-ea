@@ -193,6 +193,7 @@ export class WhatsAppLinking {
         principalNumber,
         ...(previous?.account ? { account: previous.account } : {}),
         ...(previous?.principal ? { principal: previous.principal } : {}),
+        ...(previous?.principalVerifiedAt ? { principalVerifiedAt: previous.principalVerifiedAt } : {}),
         ...(previous?.outage ? { outage: previous.outage } : {}),
         pairing: { expiresAt, previousState: previous ? 'needs-relink' : null },
       });
@@ -288,9 +289,14 @@ export class WhatsAppLinking {
         .split(/\s+/u)
         .some((word) => word.replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/gu, '') === binding.code);
     if (!binding || binding.expiresAt <= Date.now() || received.content.forwarded || !carriesCode) return 'hold';
-    await bindWhatsAppPrincipal(received.person, new Date().toISOString());
+    const verifiedAt = new Date().toISOString();
+    await bindWhatsAppPrincipal(received.person, verifiedAt);
     const { binding: _binding, ...bound } = record;
-    await writeWhatsAppLink(this.options.directory, { ...bound, principal: received.person });
+    await writeWhatsAppLink(this.options.directory, {
+      ...bound,
+      principal: received.person,
+      principalVerifiedAt: verifiedAt,
+    });
     await transport()?.releaseHeldPrincipal(received.person.lid);
     return 'consume';
   }

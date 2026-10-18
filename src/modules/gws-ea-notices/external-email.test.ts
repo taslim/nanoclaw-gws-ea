@@ -528,7 +528,12 @@ describe('failures outside external-email’s threads', () => {
     await ensurePrincipalConversation('ag-main');
     const { key } = await emailThread();
     const other = (await resolveSession('ag-other', 'mg-other', 'spaces/other/threads/t1', 'per-thread')).session;
-    const fromPat = { text: EMAIL_WORDS, sender: 'Pat', senderId: 'users/pat' };
+    const fromPat = {
+      text: EMAIL_WORDS,
+      sender: 'Pat',
+      senderId: 'users/pat',
+      authenticatedSender: { userId: 'users/pat', kind: 'human' },
+    };
     const failures: ReadonlyArray<{ readonly session: Session; readonly route: Route }> = [
       // main's one session, in the principal's direct message and in their own email conversation.
       { session: main, route: { channelType: 'gchat', platformId: 'spaces/dm', threadId: null } },

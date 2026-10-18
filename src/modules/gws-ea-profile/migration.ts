@@ -1,5 +1,20 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
+export const gwsEaPrincipalDmRoutingMigration: ModuleMigration = {
+  version: 8,
+  name: 'module:gws-ea-profile:principal-dm-routing',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_principal_dm_activity (
+        user_id TEXT NOT NULL REFERENCES gws_ea_principal_users(user_id) ON DELETE CASCADE,
+        messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id) ON DELETE CASCADE,
+        last_message_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, messaging_group_id)
+      );
+    `);
+  },
+};
+
 export const gwsEaPrincipalMessagesMigration: ModuleMigration = {
   version: 7,
   name: 'module:gws-ea-profile:principal-messages',

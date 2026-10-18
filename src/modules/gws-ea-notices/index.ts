@@ -83,6 +83,7 @@ import {
 } from '../gws-ea-profile/db.js';
 import { noteNames, writeNoteForMain, type NoteNames, type NotePiece } from '../gws-ea-profile/main-note.js';
 import { gwsEaNoticesMigration } from './migration.js';
+import './whatsapp.js';
 
 registerMigration(gwsEaNoticesMigration);
 
@@ -203,7 +204,9 @@ const CHAT_KINDS: ReadonlySet<string> = new Set(['chat', 'chat-sdk']);
 
 /** The sender's user id, named as the router names users: a handle without a channel takes the message's own. */
 function senderUserId(message: InboundOrigin): string | undefined {
-  const senderId = contentOf(message.content)?.senderId;
+  const sender = contentOf(message.content)?.authenticatedSender;
+  if (!isRecord(sender) || sender.kind !== 'human') return undefined;
+  const senderId = sender.userId;
   if (typeof senderId !== 'string' || senderId === '') return undefined;
   return senderId.includes(':') ? senderId : `${message.channelType ?? ''}:${senderId}`;
 }

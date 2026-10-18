@@ -1,4 +1,5 @@
 import type { CallerContext } from '../../cli/frame.js';
+import { getChannelAdapterExact } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
@@ -15,6 +16,8 @@ import {
 import { ianaTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
+import { whatsAppPrincipalUnavailable } from '../gws-ea-notices/whatsapp-store.js';
+import { readWhatsAppLink, whatsappDirectory } from '../gws-ea-whatsapp/paths.js';
 import { addMember, getMembers, removeMember } from '../permissions/db/agent-group-members.js';
 import { upsertUser } from '../permissions/db/users.js';
 
@@ -730,24 +733,62 @@ export interface PrincipalContact {
   readonly directMessage: MessagingGroup;
 }
 
+/** Only a newly stored principal mark in its verified DM can move the preference. */
+export async function recordPrincipalDmActivity(
+  userId: string,
+  messagingGroupId: string,
+  timestamp: string,
+): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_principal_dm_activity (user_id, messaging_group_id, last_message_at)
+     SELECT dm.user_id, direct.id, ?
+       FROM user_dms dm
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id AND direct.channel_type = dm.channel_type
+      WHERE dm.user_id = ? AND direct.id = ? AND direct.is_group = 0
+     ON CONFLICT (user_id, messaging_group_id) DO UPDATE SET last_message_at = excluded.last_message_at
+       WHERE gws_ea_principal_dm_activity.last_message_at < excluded.last_message_at`,
+    timestamp,
+    userId,
+    messagingGroupId,
+  );
+}
+
 /**
- * Where the principal is reached: the most recently verified principal
- * identity whose direct message the assistant is still in. While every such
- * message is detached, the most recent one, so a note for main keeps its
- * route; whoever sends to it checks `detached_at` first. Undefined until a
- * principal is bound with a direct message.
+ * Where the principal last wrote a marked DM. An unavailable WhatsApp link
+ * falls back to Google Chat; a changed phone remains unavailable until a new
+ * binding. A channel can be pinned by a host notice. Detached conversations
+ * remain a last resort for notes; senders check detached_at before delivery.
  */
-export async function principalContact(): Promise<PrincipalContact | undefined> {
+export async function principalContact(channelType?: string): Promise<PrincipalContact | undefined> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
-  const row = await db.get<{ user_id: string; messaging_group_id: string }>(
-    `SELECT principal.user_id, dm.messaging_group_id
+  const rows = await db.all<{ user_id: string; verified_at: string; messaging_group_id: string; channel_type: string }>(
+    `SELECT principal.user_id, principal.verified_at, dm.messaging_group_id, direct.channel_type
        FROM gws_ea_principal_users principal
        JOIN user_dms dm ON dm.user_id = principal.user_id
-       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id AND direct.channel_type = dm.channel_type
+       LEFT JOIN gws_ea_principal_dm_activity activity
+         ON activity.user_id = principal.user_id AND activity.messaging_group_id = direct.id
+      WHERE direct.is_group = 0
+        ${channelType === undefined ? '' : 'AND direct.channel_type = ?'}
       ORDER BY CASE WHEN direct.detached_at IS NULL OR direct.detached_at = '' THEN 0 ELSE 1 END,
-               principal.verified_at DESC, dm.resolved_at DESC
-      LIMIT 1`,
+               CASE WHEN activity.last_message_at IS NULL THEN 1 ELSE 0 END,
+               activity.last_message_at DESC, principal.verified_at DESC, dm.resolved_at DESC, direct.id`,
+    ...(channelType === undefined ? [] : [channelType]),
+  );
+  const directory = rows.some((row) => row.channel_type === 'whatsapp') ? whatsappDirectory() : undefined;
+  const link = directory === undefined ? undefined : await readWhatsAppLink(directory);
+  const whatsappConnected =
+    link?.state === 'connected' &&
+    getChannelAdapterExact('whatsapp')?.isConnected() === true &&
+    directory !== undefined &&
+    !whatsAppPrincipalUnavailable(directory, link);
+  const row = rows.find(
+    (candidate) =>
+      candidate.channel_type !== 'whatsapp' ||
+      (whatsappConnected &&
+        candidate.user_id === `whatsapp:${link?.principal?.lid ?? ''}` &&
+        candidate.verified_at === link?.principalVerifiedAt),
   );
   if (!row) return undefined;
   const directMessage = await getMessagingGroup(row.messaging_group_id);

@@ -24,6 +24,7 @@ export interface WhatsAppLink {
   readonly outage?: { readonly id: string; readonly notified?: boolean };
   readonly account?: WhatsAppPerson;
   readonly principal?: WhatsAppPerson;
+  readonly principalVerifiedAt?: string;
   readonly error?: { readonly message: string; readonly at: string };
 }
 
@@ -63,7 +64,7 @@ export function ensureWhatsAppDirectory(directory: string): void {
 
 export function privateDatabaseFile(
   directory: string,
-  name: 'auth.sqlite' | 'messages.sqlite' | 'contacts.sqlite',
+  name: 'auth.sqlite' | 'messages.sqlite' | 'contacts.sqlite' | 'notices.sqlite',
 ): string {
   ensureWhatsAppDirectory(directory);
   const file = path.join(directory, name);
@@ -126,6 +127,10 @@ export async function readWhatsAppLink(directory: string): Promise<WhatsAppLink 
         (value.outage.notified !== undefined && typeof value.outage.notified !== 'boolean'))) ||
     (value.account !== undefined && !person(value.account)) ||
     (value.principal !== undefined && !person(value.principal)) ||
+    (value.principalVerifiedAt !== undefined &&
+      (typeof value.principalVerifiedAt !== 'string' ||
+        !Number.isFinite(Date.parse(value.principalVerifiedAt)) ||
+        new Date(value.principalVerifiedAt).toISOString() !== value.principalVerifiedAt)) ||
     (value.error !== undefined &&
       (!isRecord(value.error) || typeof value.error.message !== 'string' || typeof value.error.at !== 'string'))
   ) {

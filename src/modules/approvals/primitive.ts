@@ -33,6 +33,7 @@ import {
   type RawOption,
 } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getDb } from '../../db/connection.js';
 import {
   bindPendingApprovalMessage,
   createPendingApproval,
@@ -46,6 +47,7 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
+import { isVerifiedPrincipalUser, principalContact } from '../gws-ea-profile/db.js';
 import { combineDetails, recordRequestOutcome, recordRequestPosted, type RequestDetails } from './request-context.js';
 import { requestOrigin } from './request-text.js';
 import { detachApproval, finishApprovalWithdrawal } from './lifecycle.js';
@@ -259,23 +261,35 @@ export async function pickApprover(agentGroupId: string | null): Promise<string[
  * Walk the approver list and return the first (approverId, messagingGroup)
  * pair we can actually deliver to. Returns null if nobody is reachable.
  *
- * Tie-break: prefer approvers reachable on the same channel kind as the
- * origin; else first in list. A same-channel origin resolves through its
- * exact adapter instance.
+ * A verified principal's cards follow their current reachable profile DM.
+ * Other approvers prefer the origin channel, then their list order. A
+ * same-channel origin resolves through its exact adapter instance.
  */
 export async function pickApprovalDelivery(
   approvers: string[],
   originChannelType: string,
   originInstance?: string,
 ): Promise<{ userId: string; messagingGroup: MessagingGroup } | null> {
+  const principals = new Set<string>();
+  if (await getDb().hasTable('gws_ea_principal_users')) {
+    for (const userId of approvers) if (await isVerifiedPrincipalUser(userId)) principals.add(userId);
+  }
+  if (principals.size > 0) {
+    const contact = await principalContact();
+    if (contact && !contact.directMessage.detached_at)
+      return { userId: contact.userId, messagingGroup: contact.directMessage };
+  }
+  // A principal identity that cannot receive a card must not be reopened by
+  // the generic cold-DM fallback; other eligible administrators still can.
+  const reachable = approvers.filter((userId) => !principals.has(userId));
   if (originChannelType) {
-    for (const userId of approvers) {
+    for (const userId of reachable) {
       if (channelTypeOf(userId) !== originChannelType) continue;
       const mg = await ensureUserDm(userId, originInstance === undefined ? undefined : { instance: originInstance });
       if (mg) return { userId, messagingGroup: mg };
     }
   }
-  for (const userId of approvers) {
+  for (const userId of reachable) {
     if (originChannelType && channelTypeOf(userId) === originChannelType) continue;
     const mg = await ensureUserDm(userId);
     if (mg) return { userId, messagingGroup: mg };
@@ -394,7 +408,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
   const question = asking ? `${opts.question}\n\n${asking.line}` : opts.question;
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
-  const approver = approverUserId ?? target.userId;
+  const approver = target.userId;
   await createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,

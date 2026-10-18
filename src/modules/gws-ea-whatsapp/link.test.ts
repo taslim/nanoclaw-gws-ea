@@ -232,6 +232,11 @@ it('links from marked numbers, holds the principal until proof, then releases th
   expect(socket.profileName).toBe('Aya');
   expect(socket.profileAbout).toBe('Personal assistant');
   expect((await linking.status()).principal).toEqual({ lid: '12000', phoneJid: '447700900123@s.whatsapp.net' });
+  const bound = await readWhatsAppLink(linking.options.directory);
+  expect(bound?.principalVerifiedAt).toEqual(expect.any(String));
+  expect(await getDb().get("SELECT verified_at FROM gws_ea_principal_users WHERE user_id = 'whatsapp:12000'")).toEqual({
+    verified_at: bound?.principalVerifiedAt,
+  });
 });
 
 interface MailboxRow {
@@ -294,7 +299,9 @@ it('expires an unpaired closed connection, removes its credentials, releases the
   expect(fs.existsSync(path.join(linking.options.directory, 'auth.sqlite'))).toBe(false);
   expect(sockets).toHaveLength(1);
   expect(sockets[0].ended).toBe(true);
-  expect((await mailboxRows()).some(({ content }) => content.includes('pairing code expired'))).toBe(true);
+  await vi.waitFor(async () => {
+    expect((await mailboxRows()).some(({ content }) => content.includes('pairing code expired'))).toBe(true);
+  });
   expect(
     (await getInstanceReservation(linking.options.paths, instanceId)).exclusive_resource_claims.whatsapp_number,
   ).toBeUndefined();
@@ -384,6 +391,8 @@ it('keeps pending principal messages durable across transport restart and releas
 it('requests one code-free logout notice, re-links without numbers, keeps the principal, and restores needs-relink if pairing expires', async () => {
   const { socket, code } = await connect();
   await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('bind', code)] });
+  const principalVerifiedAt = (await readWhatsAppLink(linking.options.directory))?.principalVerifiedAt;
+  expect(principalVerifiedAt).toEqual(expect.any(String));
   const logout = {
     connection: 'close' as const,
     lastDisconnect: {
@@ -415,6 +424,7 @@ it('requests one code-free logout notice, re-links without numbers, keeps the pr
     principal: { lid: '12000', phoneJid: '447700900123@s.whatsapp.net' },
     bindingPending: false,
   });
+  expect((await readWhatsAppLink(linking.options.directory))?.principalVerifiedAt).toBe(principalVerifiedAt);
 });
 
 it('blocks a bound principal LID whose authenticated phone changed before answers or normal routing', async () => {
