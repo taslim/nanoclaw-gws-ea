@@ -57,7 +57,10 @@ export function ensureWhatsAppDirectory(directory: string): void {
   }
 }
 
-export function privateDatabaseFile(directory: string, name: 'auth.sqlite' | 'messages.sqlite'): string {
+export function privateDatabaseFile(
+  directory: string,
+  name: 'auth.sqlite' | 'messages.sqlite' | 'contacts.sqlite',
+): string {
   ensureWhatsAppDirectory(directory);
   const file = path.join(directory, name);
   const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);

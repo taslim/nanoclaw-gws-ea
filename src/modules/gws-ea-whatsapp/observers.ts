@@ -3,6 +3,7 @@ import type { BaileysEventMap, WAMessage } from '@whiskeysockets/baileys';
 
 import type { InboundMessage } from '../../channels/adapter.js';
 import type { WhatsAppContent } from './inbound.js';
+import type { WhatsAppMembershipEvent } from './events.js';
 import type { WhatsAppLink, WhatsAppPerson } from './paths.js';
 
 export interface WhatsAppReceived {
@@ -18,6 +19,7 @@ export type WhatsAppGroupEvent =
   | { readonly type: 'groups.update'; readonly value: BaileysEventMap['groups.update'] }
   | { readonly type: 'group-participants.update'; readonly value: BaileysEventMap['group-participants.update'] };
 export interface WhatsAppObserver {
+  readonly onMembership?: (event: WhatsAppMembershipEvent) => Promise<void>;
   /** A binding message may be consumed; only a completed effect may return consume. */
   readonly onMessage?: (received: WhatsAppReceived) => Promise<'consume' | 'route'>;
   readonly onConnectionUpdate?: (event: {
@@ -46,4 +48,8 @@ export async function observeWhatsAppConnection(
   link: WhatsAppLink | undefined,
 ): Promise<void> {
   for (const observer of observers) await observer.onConnectionUpdate?.({ update, link });
+}
+
+export async function observeWhatsAppMembership(event: WhatsAppMembershipEvent): Promise<void> {
+  for (const observer of observers) await observer.onMembership?.(event);
 }

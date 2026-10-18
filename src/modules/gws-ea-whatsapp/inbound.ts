@@ -8,6 +8,7 @@ import { normalizedJid, resolvePerson } from './identity.js';
 import type { WhatsAppIndex } from './index-store.js';
 import { chatMediaEligible, inboundMedia, isForwarded, messageContext, type WhatsAppAttachment } from './media.js';
 import { observeWhatsAppMessage } from './observers.js';
+import type { WhatsAppPerson } from './paths.js';
 
 export interface WhatsAppContent {
   readonly text: string;
@@ -33,6 +34,7 @@ export interface WhatsAppInboundOptions {
   readonly answers: Answers;
   readonly download: (raw: WAMessage) => Promise<Buffer>;
   readonly now: () => number;
+  readonly onDirectMessage: (person: WhatsAppPerson, at: number) => void;
 }
 
 /** One serial durable inbox: a duplicate concurrent event cannot pass a still-running route. */
@@ -89,6 +91,7 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
     }
     // Save before media/host routing: WhatsApp has already acknowledged this message.
     options.index.receive({ chat: platformId, id, sender, fromMe: false, forwarded, text, at, routed: false }, raw);
+    if (!isGroup && person) options.onDirectMessage(person, at);
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);
       const name = options.index.name(jid);

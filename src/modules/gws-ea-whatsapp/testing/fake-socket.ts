@@ -1,6 +1,8 @@
 /** Baileys' event and network boundary; no routing, identity or delivery logic lives here. */
 import type {
   AnyMessageContent,
+  GroupMetadata,
+  ParticipantAction,
   BaileysEventEmitter,
   BaileysEventMap,
   MiscMessageGenerationOptions,
@@ -16,6 +18,12 @@ export class FakeSocket implements WhatsAppSocket {
   readonly mappings = new Map<string, string>();
   readonly usync = new Map<string, string>();
   readonly lookups: string[] = [];
+  readonly numberQueries: string[] = [];
+  readonly groups = new Map<string, GroupMetadata>();
+  readonly createdGroups: { subject: string; participants: string[] }[] = [];
+  readonly participantUpdates: { jid: string; participants: string[]; action: ParticipantAction }[] = [];
+  readonly addResults = new Map<string, Awaited<ReturnType<WhatsAppSocket['groupParticipantsUpdate']>>[number]>();
+  readonly registered = new Map<string, boolean>();
   lookupGate?: Promise<void>;
   readonly user = { id: '15550000000:1@s.whatsapp.net', lid: '999000:1@lid', name: 'Assistant' };
   sendError?: Error;
@@ -82,8 +90,47 @@ export class FakeSocket implements WhatsAppSocket {
   async requestPairingCode(_phone: string): Promise<string> {
     return this.pairingCode;
   }
-  async groupFetchAllParticipating(): Promise<Record<string, never>> {
-    return {};
+  async groupFetchAllParticipating(): Promise<Record<string, GroupMetadata>> {
+    return Object.fromEntries(this.groups);
+  }
+  async groupMetadata(jid: string): Promise<GroupMetadata> {
+    const group = this.groups.get(jid);
+    if (!group) throw new Error('Unknown group at fake network boundary');
+    return group;
+  }
+  async onWhatsApp(...numbers: string[]): ReturnType<WhatsAppSocket['onWhatsApp']> {
+    this.numberQueries.push(...numbers);
+    return numbers.map((number) => ({
+      jid: number.replace(/^\+/u, '').split('@')[0] + '@s.whatsapp.net',
+      exists: this.registered.get(number) ?? true,
+    }));
+  }
+  async groupCreate(subject: string, participants: string[]): Promise<GroupMetadata> {
+    this.createdGroups.push({ subject, participants });
+    const id = `created-${this.createdGroups.length}@g.us`;
+    const group: GroupMetadata = {
+      id,
+      owner: this.user.lid,
+      subject,
+      participants: [{ id: this.user.lid }, ...participants.map((person) => ({ id: person }))],
+    };
+    this.groups.set(id, group);
+    return group;
+  }
+  async groupParticipantsUpdate(
+    jid: string,
+    participants: string[],
+    action: ParticipantAction,
+  ): ReturnType<WhatsAppSocket['groupParticipantsUpdate']> {
+    this.participantUpdates.push({ jid, participants, action });
+    return participants.map(
+      (person) =>
+        this.addResults.get(person) ?? {
+          jid: person,
+          status: '200',
+          content: { tag: 'participant', attrs: { jid: person } },
+        },
+    );
   }
   async end(_error: Error | undefined): Promise<void> {
     this.ended = true;

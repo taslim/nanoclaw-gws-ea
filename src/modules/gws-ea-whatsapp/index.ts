@@ -51,3 +51,7 @@ export {
   type WhatsAppGroupEvent,
 } from './observers.js';
 export type { WhatsAppContent } from './inbound.js';
+
+export type { WhatsAppOutreachRequest } from './contacts.js';
+export type { WhatsAppGroup, WhatsAppGroupMember, WhatsAppMembershipEvent } from './events.js';
+export type { WhatsAppGroupOutreach } from './outreach.js';

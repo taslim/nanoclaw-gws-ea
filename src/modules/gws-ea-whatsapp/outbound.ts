@@ -7,6 +7,8 @@ import { approveRejectRequest, normalizeOptions, type RawOption } from '../../ch
 import { indexPostedRequest } from '../../channels/answers.js';
 import { OutboundRefusedError } from '../../delivery.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { whatsappStatusCode, type WhatsAppContacts, type WhatsAppOutreachRequest } from './contacts.js';
+import type { WhatsAppPerson } from './paths.js';
 import type { SqliteStateAdapter } from '../../state-sqlite.js';
 import type { WhatsAppSocket } from './adapter.js';
 import { formatWhatsApp } from './format.js';
@@ -16,11 +18,6 @@ const HELD_SEND_LIMIT_MS = 4 * 60 * 60 * 1000;
 /** Baileys rc14 messages-send.js spreads caller options after generateMessageIDV2 and relays fullMsg.key.id. */
 export function whatsappMessageId(rowId: string, part = 0): string {
   return `3EB0${createHash('sha256').update(rowId).update(`:${part}`).digest('hex').slice(0, 28).toUpperCase()}`;
-}
-function statusCode(error: unknown): number | undefined {
-  return isRecord(error) && isRecord(error.output) && typeof error.output.statusCode === 'number'
-    ? error.output.statusCode
-    : undefined;
 }
 
 function rawOptions(value: unknown): RawOption[] {
@@ -63,6 +60,8 @@ function words(content: Record<string, unknown>): string {
 
 export interface WhatsAppOutboundOptions {
   readonly index: WhatsAppIndex;
+  readonly contacts: WhatsAppContacts;
+  readonly resolvePerson: (jid: string) => Promise<WhatsAppPerson | undefined>;
   readonly state: SqliteStateAdapter;
   readonly socket: () => WhatsAppSocket | undefined;
   readonly connected: () => boolean;
@@ -72,7 +71,12 @@ export interface WhatsAppOutboundOptions {
 
 export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
   const inflight = new Map<string, Promise<string>>();
-  async function deliver(platformId: string, message: OutboundMessage, rowId?: string): Promise<string> {
+  async function deliver(
+    platformId: string,
+    message: OutboundMessage,
+    rowId?: string,
+    request?: WhatsAppOutreachRequest,
+  ): Promise<string> {
     if (!isRecord(message.content)) throw new Error('WhatsApp outbound content must be an object');
     const content = message.content;
     const key = rowId ?? `host-${randomUUID()}`;
@@ -150,6 +154,13 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         const id = whatsappMessageId(key, i);
         if (i === 0) firstId = id;
         if (options.index.message(platformId, id)?.fromMe) continue;
+        const person = !platformId.endsWith('@g.us') ? await options.resolvePerson(platformId) : undefined;
+        if (!platformId.endsWith('@g.us') && !person)
+          throw new Error('WhatsApp first contact requires a resolved recipient');
+        if (person) {
+          await options.contacts.reserve([person.lid], key, request);
+          options.contacts.handoff(id, person.lid, key, request);
+        }
         try {
           const sent = await socket.sendMessage(platformId, part, { messageId: id });
           if (sent?.key.id !== id)
@@ -168,7 +179,15 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
           );
           if ('edit' in part && part.edit?.id) options.index.edit(platformId, part.edit.id, formatted.text);
         } catch (error) {
-          const status = statusCode(error);
+          const status = whatsappStatusCode(error);
+          if (status === 463 && person) {
+            await options.contacts.refused(person.lid, key, request?.principalMessageId ?? null);
+            options.index.complete(key);
+            throw new OutboundRefusedError(
+              'gws-ea-whatsapp:contact-refused',
+              'WhatsApp refused first contact (463). Use email or tell the principal.',
+            );
+          }
           if (status === 400 || status === 403 || status === 404) {
             options.index.complete(key);
             throw new OutboundRefusedError('gws-ea-whatsapp:refused', `WhatsApp refused the message (${status}).`);
@@ -191,11 +210,16 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     return firstId;
   }
   return {
-    deliver(platformId: string, message: OutboundMessage, rowId?: string): Promise<string> {
-      if (rowId === undefined) return deliver(platformId, message);
+    deliver(
+      platformId: string,
+      message: OutboundMessage,
+      rowId?: string,
+      request?: WhatsAppOutreachRequest,
+    ): Promise<string> {
+      if (rowId === undefined) return deliver(platformId, message, undefined, request);
       const running = inflight.get(rowId);
       if (running) return running;
-      const run = deliver(platformId, message, rowId);
+      const run = deliver(platformId, message, rowId, request);
       inflight.set(rowId, run);
       void run
         .finally(() => {
