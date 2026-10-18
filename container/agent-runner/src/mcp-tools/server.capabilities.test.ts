@@ -60,6 +60,7 @@ const EXTERNAL_EMAIL_TOOLS = [
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
+const MAIN_CHAT_TOOLS = ['chat_admit', 'chat_decline', 'chat_handoff', 'chat_leave', 'whatsapp_link'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
 const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats', 'respond_to_event'];
 const BROWSER_TOOLS = [
@@ -97,7 +98,7 @@ const DEFAULT_ON_TOOLS = [
   'send_file',
   'send_message',
   'vault_access',
-  'whatsapp_link',
+  ...MAIN_CHAT_TOOLS,
   ...MAIN_EMAIL_TOOLS,
   ...CALENDAR_TOOLS,
   ...TIME_TOOLS,
@@ -142,7 +143,8 @@ describe('NanoClaw tool server capabilities', () => {
     ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
     ['request-status', ['request-status'], ['request_status']],
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
-    ['gws-ea-chat', ['gws-ea-chat'], ['whatsapp_link']],
+    ['gws-ea-chat', ['gws-ea-chat'], MAIN_CHAT_TOOLS],
+    ['gws-ea-chat-external', ['gws-ea-chat-external'], ['tell_main']],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     ['browser', ['browser'], BROWSER_TOOLS],

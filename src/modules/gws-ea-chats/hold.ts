@@ -51,7 +51,7 @@ async function releaseChat(chatId: string, principalUserId?: string): Promise<Ch
   return chat;
 }
 /** Active state is durable admission; retry interrupted mailbox release without waking an ambient-only batch. */
-export async function releaseChatMessages(chatId: string): Promise<void> {
+export async function releaseChatMessages(chatId: string, options: { readonly wake?: boolean } = {}): Promise<void> {
   const chat = await getChat(chatId);
   if (!chat || !chatIsActive(chat)) return;
   for (const session of await sessions(chatId)) {
@@ -60,7 +60,7 @@ export async function releaseChatMessages(chatId: string): Promise<void> {
       const released = mailbox.releaseHeldMessages(null, { preserveTriggers: true });
       return released > 0 && mailbox.countDueMessages() > 0;
     });
-    if (releasedDue) await requestWake(session, 'due-message');
+    if (releasedDue && options.wake !== false) await requestWake(session, 'due-message');
   }
 }
 async function inChatTail<T>(chatId: string, work: () => Promise<T>): Promise<T> {
@@ -93,6 +93,13 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
       chatId,
     );
     await deleteChatClearances(chatId, db);
+    if (await db.hasTable('gws_ea_chat_handoffs')) {
+      await db.run('DELETE FROM gws_ea_chat_handoffs WHERE messaging_group_id = ?', chatId);
+      await db.run(
+        'UPDATE gws_ea_chats SET calendar_id = NULL, placed_nowhere = 0 WHERE messaging_group_id = ?',
+        chatId,
+      );
+    }
   });
   await settleChatMessages(chatId);
 }
@@ -119,4 +126,19 @@ export async function expireAskingChats(now = Date.now()): Promise<void> {
       if ((await getChat(chat.messaging_group_id))?.state === 'asking')
         await closeChat(chat.messaging_group_id, 'declined');
     });
+}
+
+/** A checked main handoff places a new private conversation. Caller owns the tail and transaction. */
+export async function connectPrivateChatHandoff(chatId: string): Promise<void> {
+  const group = await getMessagingGroup(chatId);
+  const chat = await getChat(chatId);
+  if (!group || group.is_group !== 0 || chat?.state !== 'asking')
+    throw new Error('Only an asking private conversation is connected by a checked handoff.');
+  const now = new Date().toISOString();
+  await getDb().run(
+    "UPDATE gws_ea_chats SET state = 'connected', connected_at = ?, updated_at = ? WHERE messaging_group_id = ?",
+    now,
+    now,
+    chatId,
+  );
 }

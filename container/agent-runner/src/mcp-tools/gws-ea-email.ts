@@ -58,7 +58,7 @@ function isWithin(root: string, file: string): boolean {
  * send those names. Every file is checked first, so a refusal stages nothing.
  * With `fromInbox`, each must be one that came in the session's thread.
  */
-function stageFiles(
+export function stageFiles(
   fields: Record<string, unknown>,
   requestId: string,
   fromInbox = false,

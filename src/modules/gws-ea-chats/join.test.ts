@@ -14,11 +14,21 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
-vi.mock('../gws-ea-profile/main-note.js', () => ({ writeNoteForMain: note }));
+vi.mock('../gws-ea-profile/main-note.js', async (original) => ({
+  ...(await original<typeof import('../gws-ea-profile/main-note.js')>()),
+  writeNoteForMain: note,
+}));
 
 import '../permissions/index.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-people/index.js';
+import {
+  gwsEaMattersMigration,
+  gwsEaMatterJobsMigration,
+  gwsEaMatterChatsMigration,
+} from '../gws-ea-matters/migration.js';
+import '../gws-ea-privacy/index.js';
+import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-chat-agents/index.js';
 import './index.js';
 import {
@@ -28,7 +38,9 @@ import {
 } from '../../channels/channel-registry.js';
 import type { ChannelAdapter, InboundEvent } from '../../channels/adapter.js';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { registerMigration, runMigrations } from '../../db/migrations/index.js';
+for (const migration of [gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaMatterChatsMigration])
+  registerMigration(migration);
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroupByPlatform, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -153,7 +165,9 @@ async function rows() {
   if (!session) throw new Error('No session');
   const db = new Database(inboundDbPath('external', session.id), { readonly: true });
   try {
-    return db.prepare('SELECT id, status, trigger, content FROM messages_in ORDER BY seq').all();
+    return db
+      .prepare("SELECT id, status, trigger, content FROM messages_in WHERE id NOT LIKE 'chat-context-%' ORDER BY seq")
+      .all();
   } finally {
     db.close();
   }
@@ -356,9 +370,14 @@ it('detaches through membership removal, settles held rows and deletes chat clea
   principal = false;
   await routeInbound(inbound('held'));
   const id = (await group()).id;
-  // Exercise the DB-only clearance delete boundary without importing unrelated privacy actions.
-  await getDb().exec('CREATE TABLE gws_ea_chat_clearances(messaging_group_id TEXT, private_value_id TEXT)');
-  await getDb().run("INSERT INTO gws_ea_chat_clearances VALUES (?, 'secret')", id);
+  const secret = await addPrivateValue({ kind: 'other', value: 'Private fixture detail', label: 'Fixture' });
+  await getDb().run(
+    'INSERT INTO gws_ea_chat_clearances(messaging_group_id,private_value_id,principal_message_id,cleared_at) VALUES(?,?,?,?)',
+    id,
+    secret.id,
+    'old-principal-message',
+    new Date().toISOString(),
+  );
   await observeWhatsAppMembership({ kind: 'detach', platformId: 'trip@g.us', reason: 'removed' });
   expect(await getChat(id)).toMatchObject({ state: 'detached' });
   expect(await rows()).toEqual([expect.objectContaining({ status: 'completed' })]);
@@ -421,8 +440,14 @@ it('recovers terminal held settlement when the mailbox is unavailable after the 
   principal = false;
   await routeInbound(inbound('held'));
   const id = (await group()).id;
-  await getDb().exec('CREATE TABLE gws_ea_chat_clearances(messaging_group_id TEXT, private_value_id TEXT)');
-  await getDb().run("INSERT INTO gws_ea_chat_clearances VALUES (?, 'secret')", id);
+  const secret = await addPrivateValue({ kind: 'other', value: 'Private fixture detail', label: 'Fixture' });
+  await getDb().run(
+    'INSERT INTO gws_ea_chat_clearances(messaging_group_id,private_value_id,principal_message_id,cleared_at) VALUES(?,?,?,?)',
+    id,
+    secret.id,
+    'old-principal-message',
+    new Date().toISOString(),
+  );
   vi.spyOn(sessionManager, 'withExistingMailboxSession').mockRejectedValueOnce(
     new Error('Interrupted mailbox settlement'),
   );
@@ -543,8 +568,14 @@ it('rejoins only on an actual assistant-added event, starts a fresh admission ep
   await routeInbound(inbound('held', 'Robin'));
   const id = (await group()).id;
   const old = await getChat(id);
-  await getDb().exec('CREATE TABLE gws_ea_chat_clearances(messaging_group_id TEXT, private_value_id TEXT)');
-  await getDb().run("INSERT INTO gws_ea_chat_clearances VALUES (?, 'secret')", id);
+  const secret = await addPrivateValue({ kind: 'other', value: 'Private fixture detail', label: 'Fixture' });
+  await getDb().run(
+    'INSERT INTO gws_ea_chat_clearances(messaging_group_id,private_value_id,principal_message_id,cleared_at) VALUES(?,?,?,?)',
+    id,
+    secret.id,
+    'old-principal-message',
+    new Date().toISOString(),
+  );
   await detachChat(id);
   await routeInbound(inbound('late', 'Robin'));
   const facts = {
@@ -655,4 +686,44 @@ it('declines a held chat through main’s host boundary without adding a princip
   });
   expect(await getChat(id)).toMatchObject({ state: 'declined' });
   expect(requestWake).not.toHaveBeenCalled();
+});
+
+it('refreshes host context on a real engaged turn, including new verified levels, while ambient and held chats stay silent', async () => {
+  await routeInbound(inbound('ambient-context'));
+  const mg = await group();
+  const session = await getDb().get<{ id: string }>('SELECT id FROM sessions WHERE messaging_group_id=?', mg.id);
+  if (!session) throw new Error('No session');
+  const contextTexts = () => {
+    const db = new Database(inboundDbPath('external', session.id), { readonly: true });
+    try {
+      return (
+        db.prepare("SELECT content FROM messages_in WHERE id LIKE 'chat-context-%' ORDER BY seq").all() as {
+          content: string;
+        }[]
+      ).map((row) => (JSON.parse(row.content) as { text: string }).text);
+    } finally {
+      db.close();
+    }
+  };
+  expect(contextTexts()).toEqual([]);
+  await routeInbound(inbound('first-context', 'Robin, help.'));
+  expect(contextTexts()).toHaveLength(1);
+  await addPerson({
+    name: 'Private person name',
+    level: 'close',
+    source: 'principal',
+    basis: 'Private basis not for the chat',
+    identity: 'whatsapp:22',
+  });
+  await routeInbound(
+    inbound('changed-context', 'Robin, new request.', {
+      authenticatedSender: { userId: 'whatsapp:22', displayName: 'Mira Updated', kind: 'human' },
+    }),
+  );
+  expect(contextTexts()).toHaveLength(2);
+  const current = contextTexts()[1];
+  expect(current).toContain('level: close');
+  expect(current).toContain('Mira Updated');
+  expect(current).not.toContain('Private person name');
+  expect(current).not.toContain('Private basis');
 });

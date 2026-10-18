@@ -1,7 +1,9 @@
 import { setMembershipHandler } from '../../channels/chat-sdk-bridge.js';
-import { register } from '../../cli/registry.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { registerSessionAdmissionPolicy } from '../../container-runner.js';
+import { getSession } from '../../db/sessions.js';
+import { registerDeliveryAction } from '../../delivery.js';
 import {
   registerEngagementDecider,
   registerInboundDelay,
@@ -11,17 +13,20 @@ import {
 import { registerChatMembershipObserver, type AssistantChatChannel } from '../gws-ea-chat/membership.js';
 import { getChannelAdapterExact } from '../../channels/channel-registry.js';
 import { registerPersonForgetHook } from '../gws-ea-people/db.js';
-import { assertMainCaller } from '../gws-ea-profile/db.js';
 import { registerWhatsAppObserver } from '../gws-ea-whatsapp/observers.js';
 import { registerChannelCardInterceptor } from '../permissions/channel-approval.js';
-import { getChat, listChats } from './db.js';
+import { chatIsActive, getChat, listChats } from './db.js';
 import { decideChatEngagement } from './engage.js';
-import { renderChat } from './framing.js';
 import { chatInboundDelay, detachChat } from './hold.js';
 import { chatByAddress, decideJoin, interceptChatMessage } from './join.js';
 import { chatsMigration } from './migration.js';
 import { forgetFromChatRosters, memberFact } from './roster.js';
 import './destination-policy.js';
+import './directory.js';
+import { CHAT_BRIDGE_ACTIONS, flushChatHandoffs, inChatConversation } from './bridge.js';
+import { writeChatContext } from './context.js';
+import { chatHandoffMigration } from './handoff-migration.js';
+import { registerChatLifecycleTask } from './lifecycle.js';
 
 export * from './db.js';
 export * from './hold.js';
@@ -32,10 +37,27 @@ export { registerExpectedChatReplyReader } from './engage.js';
 export { registerChatLifecycleTask, sweepChatLifecycle } from './lifecycle.js';
 
 registerMigration(chatsMigration);
+registerMigration(chatHandoffMigration);
+for (const [action, handler, guard] of CHAT_BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);
+registerSessionAdmissionPolicy('gws-ea-chats:context', async ({ key }) => {
+  const session = await getSession(key.sessionId);
+  if (session) await writeChatContext(session);
+});
+registerChatLifecycleTask('gws-ea-chats:handoffs', async () => {
+  for (const chat of await listChats())
+    await inChatConversation(chat.messaging_group_id, () => flushChatHandoffs(chat.messaging_group_id));
+});
 registerMessageInterceptor(interceptChatMessage);
 registerInboundDelay((_event, session) => chatInboundDelay(session));
 for (const channel of ['whatsapp', 'gchat']) {
-  registerEngagementDecider(channel, decideChatEngagement);
+  registerEngagementDecider(channel, async (request) => {
+    const engaged = await decideChatEngagement(request);
+    if (engaged) {
+      const chat = await getChat(request.messagingGroup.id);
+      if (chat && chatIsActive(chat)) await writeChatContext(request.session);
+    }
+    return engaged;
+  });
   registerChannelCardInterceptor(channel, async () => 'handled');
 }
 registerPersonForgetHook('gws-ea-chats:rosters', forgetFromChatRosters);
@@ -100,23 +122,3 @@ setMembershipHandler('gchat', async (event) => {
     }),
   );
 });
-
-for (const verb of ['list', 'get'] as const)
-  register({
-    name: `chats-${verb}`,
-    resource: 'chats',
-    description: 'Read chat state and framed member information.',
-    access: 'open',
-    parseArgs(raw) {
-      if (Object.keys(raw).some((key) => key !== 'id')) throw new Error('Unknown chats field.');
-      if (verb === 'get' && typeof raw.id !== 'string') throw new Error('A chat id is required.');
-      return { id: typeof raw.id === 'string' ? raw.id : undefined };
-    },
-    async handler({ id }, ctx) {
-      await assertMainCaller(ctx, 'chats');
-      const chats = id ? [await getChat(id)] : await listChats();
-      const rendered: string[] = [];
-      for (const chat of chats) if (chat) rendered.push(await renderChat(chat));
-      return rendered;
-    },
-  });

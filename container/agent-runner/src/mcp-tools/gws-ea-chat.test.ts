@@ -3,7 +3,8 @@ import Ajv from 'ajv';
 
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
-import { whatsappLink } from './gws-ea-chat.js';
+import { whatsappLink, chatHandoff, chatAdmit, chatDecline, chatLeave, chatTellMain } from './gws-ea-chat.js';
+import type { McpToolDefinition } from './types.js';
 
 beforeEach(() => initTestSessionDb());
 afterEach(() => closeSessionDb());
@@ -47,4 +48,55 @@ it('carries the principal citations to the host and returns its pairing result t
     state: 'linking',
     pairingCode: '87654321',
   });
+});
+
+it.each<[McpToolDefinition, Record<string, unknown>, string]>([
+  [
+    chatHandoff,
+    {
+      chat: 'chat-trip',
+      message: 'Find a venue.',
+      matter: 'nowhere',
+      people: [{ member: 'whatsapp:22', email: 'mira@example.com' }],
+      principal_message: 'principal-share',
+    },
+    'chat_handoff',
+  ],
+  [chatAdmit, { chat: 'chat-trip', principal_message: 'principal-yes' }, 'chat_admit'],
+  [chatDecline, { chat: 'chat-trip' }, 'chat_decline'],
+  [chatLeave, { chat: 'chat-trip' }, 'chat_leave'],
+  [
+    chatTellMain,
+    { account: 'Mira can meet Friday.', matter: 'm-123456abcdef', wake: true, cite: ['principal-friday'] },
+    'chat_tell_main',
+  ],
+])(
+  'carries %s through its own host action without an agent or cross-chat routing field',
+  async (tool, args, action) => {
+    const waiting = tool.handler({ ...args, agent: 'forged', target_chat: 'another' });
+    while (getUndeliveredMessages().length === 0) await Bun.sleep(1);
+    const row = getUndeliveredMessages()[0];
+    expect(JSON.parse(row.content)).toEqual({ ...args, action, requestId: row.id });
+    getInboundDb()
+      .prepare('INSERT INTO messages_in(id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+      .run(
+        `action-resp-${row.id}`,
+        'system',
+        new Date().toISOString(),
+        JSON.stringify({
+          type: 'action_response',
+          requestId: row.id,
+          frame: { id: row.id, ok: true, data: { message: 'Kept.' } },
+        }),
+      );
+    expect(await waiting).toMatchObject({ content: [{ type: 'text', text: 'Kept.' }] });
+  },
+);
+it('uses closed chat schemas and requires the consent citation for admission', () => {
+  const valid = new Ajv().compile(chatAdmit.tool.inputSchema);
+  expect(valid({ chat: 'chat-trip' })).toBe(false);
+  expect(valid({ chat: 'chat-trip', principal_message: 'yes' })).toBe(true);
+  const report = new Ajv().compile(chatTellMain.tool.inputSchema);
+  expect(report({ account: 'Update.', chat: 'another' })).toBe(false);
+  expect(report({ account: 'Update.', cite: ['own'] })).toBe(true);
 });
