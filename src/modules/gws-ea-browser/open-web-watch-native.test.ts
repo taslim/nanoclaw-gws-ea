@@ -544,6 +544,22 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await watch()).toMatchObject({ status: 'booked' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
   });
+
+  it('books a carded table outside the watch’s window without spending the watch', async () => {
+    site.deposit = 80;
+    await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' });
+    await approve((await approvals())[0]);
+    await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'awaiting_principal' });
+    const purchaseCard = (await approvals()).find((approval) => approval.action === 'browser_purchase');
+    if (!purchaseCard) throw new Error('No purchase card');
+    await approve(purchaseCard);
+    expect(await getDb().all('SELECT kind,state FROM gws_ea_browser_authorities')).toEqual(
+      expect.arrayContaining([{ kind: 'checkout', state: 'committed' }]),
+    );
+    expect(await watch()).toMatchObject({ status: 'armed' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+  });
 });
 
 describe.skipIf(!chromePath)('a reader watch beside region watches in native Chrome', { timeout: 90_000 }, () => {

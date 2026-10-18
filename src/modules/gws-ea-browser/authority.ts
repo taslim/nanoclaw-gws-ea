@@ -396,7 +396,8 @@ export class PurchaseAuthorityStore {
         throw new PurchaseAuthorityError('authority_unavailable');
       if (claim) await claim(this.db, authority, current);
       else if (current.reservation || current.generic?.booking) {
-        // A booking a card or the standing guarantee covers on a region watch's site spends its one booking (KTD20).
+        // A booking a card or the standing guarantee covers on a region watch's site spends its one booking
+        // (KTD20), and only a watch whose bounds the booking does not fall outside.
         const { claimRegionWatchCommit } = await import('./watches.js');
         await claimRegionWatchCommit(this.db, {
           jobId: authority.job_id,
@@ -404,6 +405,7 @@ export class PurchaseAuthorityStore {
           attemptId: authority.attempt_id,
           requestId: context.request.id,
           at,
+          ...(current.generic?.booking ? { booking: current.generic.booking } : {}),
         });
       }
       const changed = await this.db.run(
