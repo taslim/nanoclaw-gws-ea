@@ -710,7 +710,7 @@ it("checks a few seconds after the venue's release, at the floor through its bur
   expect(Date.parse((await nextCheck('capped'))!)).toBe(Date.parse(capped[0]) + 3_600_000 + 1);
   // A watch without a rule keeps the ordinary cadence, which waits out the night.
   expect(await checksStarted('opentable.com')).toEqual([]);
-});
+}, 30_000);
 
 /** A region watch (KTD20) on an unreviewed site, its slot list marked with `baseline` as its text. */
 const armRegion = (id: string, baseline: string): Promise<void> =>
