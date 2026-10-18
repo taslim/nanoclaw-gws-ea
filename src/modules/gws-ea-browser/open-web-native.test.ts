@@ -14,8 +14,8 @@ import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './co
 import { BrowserStore } from './db.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
 import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
-import { CONSENT, OPEN_WEB, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
-import { observePage } from './observe.js';
+import { CONSENT, COOKIE_BANNERS, OPEN_WEB, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
+import { observePage, type BrowserObservation } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
@@ -545,5 +545,150 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     await page.locator('#q').fill('yoga');
     expect(await act(['key', 'Class'])).toMatchObject({ status: 'stopped', reason: 'navigated' });
     expect(Object.fromEntries(submitted('/classes') ?? [])).toEqual({ q: 'yoga' });
+  });
+});
+
+describe.skipIf(!chromePath)('cookie banners in native Chrome', { timeout: 30_000 }, () => {
+  let fixture: OpenWebFixture;
+  let page: Page;
+  let db: SqliteDriver;
+  const JOB = 'job-banners';
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    page = await fixture.newPage();
+    db = new SqliteDriver(new Database(':memory:'));
+    await db.exec(
+      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
+    );
+    await browserSiteLeasesMigration.up(db);
+    fixture.requests.length = 0;
+  });
+  afterEach(async () => {
+    await page?.context().close();
+    await db?.close();
+  });
+
+  /** A fresh page: a job's navigation guard, once installed, refuses a document loaded between its operations. */
+  const visit = async (url: string): Promise<void> => {
+    await page.context().close();
+    page = await fixture.newPage();
+    await page.goto(url, { waitUntil: 'load' });
+  };
+  /** One batch through the executor, which settles cookie banners before the observation it returns. */
+  async function batch(
+    ...actions: BrowserAction[]
+  ): Promise<{ result: Record<string, unknown>; seen: BrowserObservation }> {
+    const context = {
+      job: { id: JOB },
+      request: { id: `request-${Math.random()}` },
+      session: {},
+      store: new BrowserStore(db),
+      page: async () => page,
+      assertActive: async () => undefined,
+      wakeWaiters: async () => undefined,
+      remaining: () => 15_000,
+      signal: new AbortController().signal,
+    } as unknown as BrowserExecutionContext;
+    const result = await executeBrowserBatch(context, { actions }, { record: false });
+    return { result, seen: result.observation as BrowserObservation };
+  }
+  const observe = () => batch({ kind: 'observe' });
+  /** What the page's banner received: its choice, whether a real click made it, and how many presses it took. */
+  const received = () =>
+    page
+      .locator('body')
+      .evaluate((body) => ({ ...(body as unknown as { dataset: Record<string, string | undefined> }).dataset }));
+
+  it('rejects a OneTrust and a Cookiebot banner with a real click, and neither is in the next observation', async () => {
+    // The OneTrust page loads inside the job's own operation; its banner fades before it leaves the page.
+    const loaded = await batch({ kind: 'navigate', url: COOKIE_BANNERS.oneTrust });
+    expect(loaded.result).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(loaded.seen.cookie_banner).toEqual({ status: 'rejected' });
+    expect(loaded.seen.snapshot).toContain('Autumn menus open this week');
+    expect(loaded.seen.snapshot).not.toContain('We use cookies');
+    expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+    const next = (await observe()).seen;
+    expect(next.cookie_banner).toBeUndefined();
+    expect(next.snapshot).not.toContain('We use cookies');
+
+    await visit(COOKIE_BANNERS.cookiebot);
+    const rejected = (await observe()).seen;
+    expect(rejected.cookie_banner).toEqual({ status: 'rejected' });
+    expect(rejected.snapshot).not.toContain('This website uses cookies');
+    expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+    expect((await observe()).seen.cookie_banner).toBeUndefined();
+  });
+
+  it('rejects a banner inside a shadow root, and one inside a cross-site consent frame', async () => {
+    await visit(COOKIE_BANNERS.shadow);
+    const shadow = (await observe()).seen;
+    expect(shadow.cookie_banner).toEqual({ status: 'rejected' });
+    expect(shadow.snapshot).not.toContain('similar technologies');
+    expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+
+    for (const url of [COOKIE_BANNERS.frame, COOKIE_BANNERS.sourcepoint]) {
+      await visit(url);
+      expect(page.frames().some((frame) => new URL(frame.url()).host !== 'bistro.example')).toBe(true);
+      const framed = (await observe()).seen;
+      expect(framed.cookie_banner).toEqual({ status: 'rejected' });
+      expect(framed.snapshot).not.toContain('cookies');
+      expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+    }
+  });
+
+  it('rejects through a second layer: a preference centre and a "Manage options" panel', async () => {
+    for (const [url, words] of [
+      [COOKIE_BANNERS.oneTrustSettings, 'Privacy Preference Center'],
+      [COOKIE_BANNERS.layered, 'Cookie preferences'],
+    ] as const) {
+      await visit(url);
+      const seen = (await observe()).seen;
+      expect(seen.cookie_banner).toEqual({ status: 'rejected' });
+      expect(seen.snapshot).not.toContain(words);
+      expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+    }
+  });
+
+  it('reports a banner that offers only Accept, and presses nothing', async () => {
+    await visit(COOKIE_BANNERS.acceptOnly);
+    for (let observation = 0; observation < 2; observation++) {
+      const seen = (await observe()).seen;
+      expect(seen.cookie_banner).toEqual({ status: 'no_reject_option' });
+      expect(seen.snapshot).toContain('By continuing you accept our use of cookies');
+    }
+    expect(await received()).toEqual({});
+  });
+
+  it('reports a banner that comes back after its reject, and presses it again only on a new page load', async () => {
+    await visit(COOKIE_BANNERS.reappearing);
+    expect((await observe()).seen.cookie_banner).toEqual({ status: 'rejected' });
+    await page.evaluate('window.showCookieBar()');
+    for (let observation = 0; observation < 2; observation++) {
+      const seen = (await observe()).seen;
+      expect(seen.cookie_banner).toEqual({ status: 'reappeared' });
+      expect(seen.snapshot).toContain('This site uses cookies');
+    }
+    expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+    const reloaded = await batch({ kind: 'navigate', url: COOKIE_BANNERS.reappearing });
+    expect(reloaded.seen.cookie_banner).toEqual({ status: 'rejected' });
+    expect(await received()).toEqual({ choice: 'reject', trusted: 'true', presses: '1' });
+  });
+
+  it('never presses a reject that submits a form outside its banner, or one the classifier refuses', async () => {
+    for (const url of [COOKIE_BANNERS.foreignForm, COOKIE_BANNERS.spoofed]) {
+      await visit(url);
+      const seen = (await observe()).seen;
+      expect(seen.cookie_banner).toEqual({ status: 'no_reject_option' });
+      expect(seen.snapshot).toContain('We use cookies');
+      expect(await received()).toEqual({});
+    }
+    expect(fixture.requests.filter((request) => request.method !== 'GET')).toEqual([]);
   });
 });

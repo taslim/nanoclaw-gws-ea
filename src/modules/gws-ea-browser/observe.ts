@@ -3,6 +3,7 @@ import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { httpsOrigin, SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
+import type { CookieBannerReport } from './cookie-banners.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -17,6 +18,8 @@ export interface BrowserObservation {
   snapshot: string;
   delta?: { removed: string[]; added: string[] };
   site?: { origin: string; untrusted: true; [key: string]: unknown };
+  /** What the host did about a cookie banner just before this observation (R18); absent when none showed. */
+  cookie_banner?: CookieBannerReport;
 }
 export interface BrowserRef {
   ref: string;
@@ -184,7 +187,16 @@ export async function pageHasSecret(page: Page): Promise<boolean> {
   }
 }
 
-export async function observePage(page: Page, assertActive?: () => Promise<void>): Promise<BrowserObservation> {
+export interface ObservePageOptions {
+  /** What the host did about a cookie banner just before this observation (R18), for it to report. */
+  readonly cookieBanner?: CookieBannerReport | undefined;
+}
+
+export async function observePage(
+  page: Page,
+  assertActive?: () => Promise<void>,
+  options: ObservePageOptions = {},
+): Promise<BrowserObservation> {
   await collectSecretFields(page);
   const state = stateFor(page);
   const url = redactPageText(page, page.url());
@@ -222,7 +234,14 @@ export async function observePage(page: Page, assertActive?: () => Promise<void>
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */
   }
-  return { generation: state.generation, url, snapshot, ...(delta ? { delta } : {}), ...(site ? { site } : {}) };
+  return {
+    generation: state.generation,
+    url,
+    snapshot,
+    ...(delta ? { delta } : {}),
+    ...(site ? { site } : {}),
+    ...(options.cookieBanner ? { cookie_banner: options.cookieBanner } : {}),
+  };
 }
 
 /** Structured host checkpoints replace native refs just like agent observations do. */

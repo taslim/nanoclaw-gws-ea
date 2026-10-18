@@ -576,6 +576,225 @@ export function consentPages(): Record<string, OpenWebRoute> {
   };
 }
 
+/** Where the cookie-banner pages live (R18). */
+export const COOKIE_BANNERS = {
+  oneTrust: 'https://news.example/cookies/onetrust',
+  oneTrustSettings: 'https://news.example/cookies/onetrust-settings',
+  cookiebot: 'https://shop.example/cookies/cookiebot',
+  shadow: 'https://shop.example/cookies/shadow',
+  frame: 'https://bistro.example/cookies/frame',
+  sourcepoint: 'https://bistro.example/cookies/sourcepoint',
+  layered: 'https://bistro.example/cookies/manage-options',
+  acceptOnly: 'https://news.example/cookies/accept-only',
+  reappearing: 'https://news.example/cookies/reappearing',
+  foreignForm: 'https://shop.example/cookies/foreign-form',
+  spoofed: 'https://shop.example/cookies/spoofed',
+} as const;
+
+const bannerArticle =
+  '<main><h1>Autumn menus open this week</h1><p>Three kitchens change their menus for the season.</p><a href="/about">About us</a></main>';
+const bannerStyle = 'position:fixed;bottom:0;left:0;right:0;padding:16px;background:#fff';
+/** Each banner page records the choice it received, whether a real (trusted) click made it, and how many it got. */
+const recordChoice = `const record = (choice, event) => {
+  const data = document.body.dataset;
+  data.choice = choice;
+  data.trusted = String(event.isTrusted);
+  data.presses = String(Number(data.presses || 0) + 1);
+};`;
+
+/** A OneTrust-like banner; with `settings`, its reject sits only in the preference centre it opens. */
+export function oneTrustPage(settings: boolean): string {
+  return document(
+    'Autumn menus',
+    `${bannerArticle}<div id="onetrust-consent-sdk"><div id="onetrust-banner-sdk" role="region" aria-label="Cookie banner" style="${bannerStyle}">
+<p id="onetrust-policy-text">We use cookies to personalise content and ads and to analyse our traffic.</p><div id="onetrust-button-group">
+${settings ? '<button id="onetrust-pc-btn-handler">Cookie Settings</button>' : '<button id="onetrust-reject-all-handler">Reject All</button>'}
+<button id="onetrust-accept-btn-handler">Accept All Cookies</button></div></div>
+<div id="onetrust-pc-sdk" role="dialog" aria-modal="true" aria-label="Privacy Preference Center" style="display:none;position:fixed;top:10%;left:10%;right:10%;padding:16px;background:#fff">
+<h2>Privacy Preference Center</h2><p>Choose which cookies we may use: performance cookies and targeting cookies.</p>
+<button class="save-preference-btn-handler">Confirm My Choices</button> <button class="ot-pc-refuse-all-handler">Reject All</button>
+<button id="accept-recommended-btn-handler">Allow All</button></div></div>`,
+    `${recordChoice}
+const banner = document.getElementById('onetrust-banner-sdk');
+const centre = document.getElementById('onetrust-pc-sdk');
+// Like the platform's own, a closing layer fades out before it leaves the page.
+const close = (layer) => { layer.style.opacity = '0'; setTimeout(() => { layer.style.display = 'none'; }, 150); };
+document.getElementById('onetrust-accept-btn-handler').addEventListener('click', (event) => { record('accept', event); close(banner); });
+document.getElementById('onetrust-reject-all-handler')?.addEventListener('click', (event) => { record('reject', event); close(banner); });
+document.getElementById('onetrust-pc-btn-handler')?.addEventListener('click', () => { banner.style.display = 'none'; centre.style.display = 'block'; });
+centre.querySelector('.ot-pc-refuse-all-handler').addEventListener('click', (event) => { record('reject', event); close(centre); });
+centre.querySelector('.save-preference-btn-handler').addEventListener('click', (event) => { record('save', event); close(centre); });
+document.getElementById('accept-recommended-btn-handler').addEventListener('click', (event) => { record('accept', event); close(centre); });`,
+  );
+}
+
+/** A Cookiebot-like dialog over a product page. */
+export function cookiebotPage(): string {
+  return document(
+    'Linen apron',
+    `${shopHeader}<main><h1>Linen apron</h1><p class="price">$39.00</p></main>
+<div id="CybotCookiebotDialog" role="dialog" aria-modal="true" aria-label="Cookie consent" style="${bannerStyle}">
+<h2>This website uses cookies</h2><p>We use cookies to personalise content and ads, to provide social media features and to analyse our traffic.</p>
+<button id="CybotCookiebotDialogBodyButtonDecline">Deny</button> <button id="CybotCookiebotDialogBodyLevelButtonCustomize">Customize</button>
+<button id="CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll">Allow all</button></div>`,
+    `${recordChoice}
+const dialog = document.getElementById('CybotCookiebotDialog');
+document.getElementById('CybotCookiebotDialogBodyButtonDecline').addEventListener('click', (event) => { record('reject', event); dialog.remove(); });
+document.getElementById('CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll').addEventListener('click', (event) => { record('accept', event); dialog.remove(); });`,
+  );
+}
+
+/** A Usercentrics-like banner rendered inside an open shadow root. */
+export function shadowBannerPage(): string {
+  return document(
+    'Linen & Co',
+    `${shopHeader}<main><h1>Linen &amp; Co</h1><p>Aprons, napkins and tea towels.</p></main><div id="usercentrics-root"></div>`,
+    `${recordChoice}
+const root = document.getElementById('usercentrics-root').attachShadow({ mode: 'open' });
+root.innerHTML = '<div data-testid="uc-default-banner" role="dialog" aria-label="Privacy settings" style="${bannerStyle}">' +
+  '<p>We use cookies and similar technologies to measure visits and personalise ads.</p>' +
+  '<button data-testid="uc-more-button">Settings</button> <button data-testid="uc-deny-all-button">Deny</button> ' +
+  '<button data-testid="uc-accept-all-button">Accept All</button></div>';
+const banner = root.querySelector('[data-testid="uc-default-banner"]');
+root.querySelector('[data-testid="uc-deny-all-button"]').addEventListener('click', (event) => { record('reject', event); banner.remove(); });
+root.querySelector('[data-testid="uc-accept-all-button"]').addEventListener('click', (event) => { record('accept', event); banner.remove(); });`,
+  );
+}
+
+/**
+ * A page whose banner is a cross-site consent frame in a fixed container; the frame posts the choice back and
+ * the page removes it.
+ */
+export function consentFramePage(container: string, frame: string, title: string, src: string): string {
+  return document(
+    'Bistro Juno',
+    `<main><h1>Bistro Juno</h1><p>Seasonal plates in the old mill.</p></main>
+<div id="${container}" style="position:fixed;bottom:0;left:0;right:0;height:160px"><iframe id="${frame}" title="${title}" src="${src}" style="width:100%;height:160px;border:0"></iframe></div>`,
+    `window.addEventListener('message', (event) => {
+  if (event.origin !== ${JSON.stringify(new URL(src).origin)}) return;
+  const data = document.body.dataset;
+  data.choice = event.data.choice;
+  data.trusted = String(event.data.trusted);
+  data.presses = String(Number(data.presses || 0) + 1);
+  document.getElementById(${JSON.stringify(container)}).remove();
+});`,
+  );
+}
+
+/** A consent frame's own document: its buttons post the choice to the page that embeds it. */
+export function consentFrameDocument(body: string): string {
+  return document(
+    'Cookie consent',
+    body,
+    `for (const button of document.querySelectorAll('button[data-choice]'))
+  button.addEventListener('click', (event) => parent.postMessage({ choice: button.dataset.choice, trusted: event.isTrusted }, '*'));`,
+  );
+}
+
+/** A banner whose reject sits behind "Manage options", in a preferences dialog. */
+export function layeredBannerPage(): string {
+  return document(
+    'Bistro Juno',
+    `<main><h1>Bistro Juno</h1><p>Book a table for the autumn menu.</p></main>
+<div id="cookie-notice" style="${bannerStyle}"><p>We use cookies to remember your visit and to measure our audience.</p>
+<button id="manage">Manage options</button> <button id="accept">Accept all</button></div>
+<div id="cookie-preferences" role="dialog" aria-label="Cookie preferences" hidden style="position:fixed;top:10%;left:10%;right:10%;padding:16px;background:#fff">
+<h2>Cookie preferences</h2><label><input type="checkbox" checked> Audience measurement cookies</label> <label><input type="checkbox" checked> Advertising cookies</label>
+<button id="save">Save choices</button> <button id="reject">Reject all</button></div>`,
+    `${recordChoice}
+const notice = document.getElementById('cookie-notice');
+const preferences = document.getElementById('cookie-preferences');
+document.getElementById('manage').addEventListener('click', () => { notice.hidden = true; preferences.hidden = false; });
+document.getElementById('accept').addEventListener('click', (event) => { record('accept', event); notice.hidden = true; });
+document.getElementById('save').addEventListener('click', (event) => { record('save', event); preferences.hidden = true; });
+document.getElementById('reject').addEventListener('click', (event) => { record('reject', event); preferences.hidden = true; });`,
+  );
+}
+
+/** A notice that offers only Accept, beside a link to its policy. */
+export function acceptOnlyBannerPage(): string {
+  return document(
+    'Autumn menus',
+    `${bannerArticle}<div id="cookie-notice" role="dialog" aria-label="Cookies" style="${bannerStyle}">
+<p>We use cookies to improve your visit. By continuing you accept our use of cookies.</p><a href="/cookie-policy">Cookie policy</a> <button id="accept">Accept</button></div>`,
+    `${recordChoice}
+document.getElementById('accept').addEventListener('click', (event) => { record('accept', event); document.getElementById('cookie-notice').remove(); });`,
+  );
+}
+
+/** A bar the site shows again, as when it cannot keep its own record of the choice. */
+export function reappearingBannerPage(): string {
+  return document(
+    'Autumn menus',
+    `${bannerArticle}<div id="cookie-bar" style="${bannerStyle}"><p>This site uses cookies.</p>
+<button id="reject">Reject all</button> <button id="accept">Accept all</button></div>`,
+    `${recordChoice}
+const bar = document.getElementById('cookie-bar');
+window.showCookieBar = () => { bar.hidden = false; };
+document.getElementById('reject').addEventListener('click', (event) => { record('reject', event); bar.hidden = true; });
+document.getElementById('accept').addEventListener('click', (event) => { record('accept', event); bar.hidden = true; });`,
+  );
+}
+
+/** A bar whose "Reject all" submits an order form elsewhere on the page. */
+export function foreignFormBannerPage(): string {
+  return document(
+    'Linen apron',
+    `${shopHeader}<main><h1>Linen apron</h1><form id="order" method="post" action="/checkout/complete"><input type="hidden" name="sku" value="apron"></form></main>
+<div id="cookie-bar" style="${bannerStyle}"><p>We use cookies.</p>
+<button type="submit" form="order" id="reject">Reject all</button> <button type="button" id="accept">Accept all</button></div>`,
+  );
+}
+
+/** A page that dresses a subscription as a OneTrust banner's reject. */
+export function spoofedBannerPage(): string {
+  return document(
+    'Linen apron',
+    `${shopHeader}<main><h1>Linen apron</h1></main><div id="onetrust-banner-sdk" style="${bannerStyle}"><p>We use cookies.</p>
+<button id="onetrust-reject-all-handler">Subscribe for $2.99/month</button> <button id="onetrust-accept-btn-handler">Accept All Cookies</button></div>`,
+    `${recordChoice}
+document.getElementById('onetrust-reject-all-handler').addEventListener('click', (event) => record('subscribe', event));`,
+  );
+}
+
+/** The cookie-banner pages, by address. */
+export function cookieBannerPages(): Record<string, OpenWebRoute> {
+  return {
+    [COOKIE_BANNERS.oneTrust]: oneTrustPage(false),
+    [COOKIE_BANNERS.oneTrustSettings]: oneTrustPage(true),
+    [COOKIE_BANNERS.cookiebot]: cookiebotPage(),
+    [COOKIE_BANNERS.shadow]: shadowBannerPage(),
+    [COOKIE_BANNERS.frame]: consentFramePage(
+      'consent-host',
+      'consent-frame',
+      'Cookie consent',
+      'https://consent.example/notice',
+    ),
+    'https://consent.example/notice': consentFrameDocument(
+      `<p>Bistro Juno and its partners use cookies to measure visits and to show ads.</p>
+<button data-choice="accept">Accept all</button> <button data-choice="reject">Reject all</button>`,
+    ),
+    // Sourcepoint's message names its controls by choice type; this one's reject wording no label rule knows.
+    [COOKIE_BANNERS.sourcepoint]: consentFramePage(
+      'sp_message_container_1',
+      'sp_message_iframe_1',
+      'SP Consent Message',
+      'https://cmp.privacy-mgmt.example/index.html?message_id=1',
+    ),
+    'https://cmp.privacy-mgmt.example/index.html': consentFrameDocument(
+      `<div class="message-container"><p>We and our partners store and access information on your device, such as cookies.</p>
+<button class="message-button sp_choice_type_12">Settings</button>
+<button class="message-button sp_choice_type_13" data-choice="reject">Continue with essentials</button>
+<button class="message-button sp_choice_type_11" data-choice="accept">Accept</button></div>`,
+    ),
+    [COOKIE_BANNERS.layered]: layeredBannerPage(),
+    [COOKIE_BANNERS.acceptOnly]: acceptOnlyBannerPage(),
+    [COOKIE_BANNERS.reappearing]: reappearingBannerPage(),
+    [COOKIE_BANNERS.foreignForm]: foreignFormBannerPage(),
+    [COOKIE_BANNERS.spoofed]: spoofedBannerPage(),
+  };
+}
+
 /** The shared open-web pages, by address. */
 export function openWebPages(): Record<string, OpenWebRoute> {
   return {
@@ -612,6 +831,7 @@ export function openWebPages(): Record<string, OpenWebRoute> {
     [OPEN_WEB.account]: accountPage(),
     [OPEN_WEB.overlay]: overlayPage(),
     ...consentPages(),
+    ...cookieBannerPages(),
   };
 }
 

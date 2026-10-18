@@ -17,6 +17,7 @@ import {
 } from './commit-classifier.js';
 import { isSensitiveField } from './authentication-signatures.js';
 import { BrowserConsentStop, type ConsentStopView } from './consent.js';
+import { settleCookieBanners } from './cookie-banners.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import { SiteLeaseStore } from './leases.js';
 import {
@@ -544,7 +545,9 @@ async function executeBatch(
   let observation;
   if (!page.isClosed()) {
     try {
-      observation = await observePage(page, context.assertActive);
+      // Still inside the job's operation: the host settles a cookie banner before it observes (R18).
+      const cookieBanner = await settleCookieBanners(page, context.assertActive);
+      observation = await observePage(page, context.assertActive, { cookieBanner });
     } catch (_error) {
       reason ??= 'not_actionable';
     }
