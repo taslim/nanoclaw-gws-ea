@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
-import { createDriveApi, FOLDER_MIME_TYPE, isShareRefusal } from './drive-api.js';
+import { createDriveApi, generateDriveFileId, FOLDER_MIME_TYPE, isShareRefusal } from './drive-api.js';
 
 interface Recorded {
   readonly method: string;
@@ -31,7 +31,7 @@ function stubGoogle(reply: (request: Recorded) => { status: number; body?: unkno
     return new Response(body === undefined ? null : JSON.stringify(body), { status });
   }) as typeof globalThis.fetch;
   const api = createDriveApi({ token: async () => 'host-drive-token', fetch });
-  return { api, requests };
+  return { api, requests, fetch };
 }
 
 /** Drive's error body, as its v3 API words one. */
@@ -48,6 +48,27 @@ const FOLDER = {
 };
 
 describe('the Drive client', () => {
+  it('allocates one native ID and sends that same ID when creating a folder', async () => {
+    const { api, requests, fetch } = stubGoogle((request) =>
+      request.url.pathname.endsWith('/generateIds')
+        ? { status: 200, body: { ids: ['reserved-folder'] } }
+        : { status: 200, body: { id: 'reserved-folder', mimeType: FOLDER_MIME_TYPE } },
+    );
+    const id = await generateDriveFileId({ token: async () => 'host-drive-token', fetch });
+    expect(id).toBe('reserved-folder');
+    await api.createFile({ id, name: 'Documents', mimeType: FOLDER_MIME_TYPE, parents: ['home'] });
+    expect(requests[0].method).toBe('GET');
+    expect(requests[0].url.pathname).toBe('/drive/v3/files/generateIds');
+    expect(requests[0].url.searchParams.get('count')).toBe('1');
+    expect(requests[0].url.searchParams.get('space')).toBe('drive');
+    expect(requests[0].headers.authorization).toBe('Bearer host-drive-token');
+    expect(requests[1].body).toEqual({
+      id: 'reserved-folder',
+      name: 'Documents',
+      mimeType: FOLDER_MIME_TYPE,
+      parents: ['home'],
+    });
+  });
   it('reads a file with the host token, asking only for what the host reads, and says when it is gone', async () => {
     const { api, requests } = stubGoogle((request) =>
       request.url.pathname.endsWith('/folder-1') ? { status: 200, body: FOLDER } : { status: 404 },
@@ -239,6 +260,7 @@ describe('the Drive client', () => {
       modifiedTime: '2026-10-10T08:00:00.000Z',
       assigneeEmailAddress: 'juno@northwind.example',
       mentionedEmailAddresses: ['juno@northwind.example'],
+      replies: [{ content: 'The total is twelve.' }],
     };
     const { api, requests } = stubGoogle((request) =>
       request.url.searchParams.get('pageToken') === null
@@ -246,7 +268,11 @@ describe('the Drive client', () => {
             status: 200,
             body: {
               comments: [
-                { ...assigned, author: { displayName: 'Remy Vance', me: false } },
+                {
+                  ...assigned,
+                  replies: [...assigned.replies, { content: 'Deleted', deleted: true }],
+                  author: { displayName: 'Remy Vance', me: false },
+                },
                 { id: 'c-2', content: 'Looks good', resolved: true },
                 { content: 'no id' },
               ],
@@ -261,7 +287,7 @@ describe('the Drive client', () => {
       '/drive/v3/files/doc-1/comments',
     ]);
     expect(requests[0].url.searchParams.get('fields')).toBe(
-      'nextPageToken,comments(id,content,resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses)',
+      'nextPageToken,comments(id,content,htmlContent,quotedFileContent(mimeType,value),replies(content,htmlContent,deleted),resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses)',
     );
     expect(requests[0].url.searchParams.get('includeDeleted')).toBeNull();
     expect(requests[1].url.searchParams.get('pageToken')).toBe('p2');

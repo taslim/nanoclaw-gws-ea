@@ -23,6 +23,7 @@ await loadToolModule('time', () => import('./time.js'));
 // ahead of this barrel.
 await import('./gws-ea-email.js');
 await import('./gws-ea-chat.js');
+await import('./gws-ea-chat-docs.js');
 await import('./calendar-write.js');
 await import('./request-status.js');
 await import('./gws-ea-browser.js');

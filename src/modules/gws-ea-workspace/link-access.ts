@@ -69,7 +69,7 @@ export const LINK_ACCESS_REFUSER = 'gws-ea-workspace:link-access';
 export const LINKS_UNCHECKED = "the host couldn't check the links in it just now; try again shortly.";
 
 /** Who wrote a message, so its refusal speaks to them. */
-export type LinkWriter = 'main' | 'external-email';
+export type LinkWriter = 'main' | 'external-email' | 'external-chat' | 'job';
 
 export interface LinkCheckRequest {
   /** What the assistant wrote; never text it quotes from someone else. */

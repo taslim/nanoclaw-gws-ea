@@ -5,6 +5,7 @@ import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { register } from '../../cli/registry.js';
 import { TIMEZONE } from '../../config.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
+import { registerDeliveryAction } from '../../delivery.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { getSession } from '../../db/sessions.js';
@@ -22,6 +23,8 @@ import { reconcileChatGateway } from './gateway.js';
 import { getJobAgent, listJobAgents } from './jobs.js';
 import { chatAgentsMigration } from './migration.js';
 import { retireJobAgent } from './retire.js';
+import { JOB_DOCUMENT_ACTIONS } from './docs.js';
+import { jobDocumentsMigration } from './docs-migration.js';
 
 export { ensureExternalChatGroup } from './external-chat.js';
 export {
@@ -41,6 +44,8 @@ export {
 } from './shape.js';
 
 registerMigration(chatAgentsMigration);
+registerMigration(jobDocumentsMigration);
+for (const [action, handler, guard] of JOB_DOCUMENT_ACTIONS) registerDeliveryAction(action, handler, guard);
 
 async function kind(group: string): Promise<'external-chat' | 'job' | undefined> {
   if (group === (await getExternalChatAgentGroupId())) return 'external-chat';
