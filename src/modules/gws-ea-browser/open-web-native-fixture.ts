@@ -348,6 +348,234 @@ export function overlayPage(): string {
   );
 }
 
+/** Where the consent engine's pages live (KTD11). */
+export const CONSENT = {
+  offers: 'https://table.example/book/r-7',
+  inverted: 'https://join.example/newsletter',
+  radio: 'https://join.example/offers-question',
+  sms: 'https://join.example/sms',
+  reticking: 'https://join.example/reticking',
+  required: 'https://join.example/required-marketing',
+  terms: 'https://join.example/terms',
+  bundled: 'https://join.example/bundled',
+  waiver: 'https://climb.example/waiver',
+  attestation: 'https://cellar.example/age',
+  donation: 'https://give.example/checkout/round-up',
+  redonation: 'https://give.example/checkout/round-up-again',
+  address: 'https://shop.example/checkout/address',
+  preferences: 'https://shop.example/account/preferences',
+  classes: 'https://classes.example/',
+} as const;
+
+const box = (name: string, label: string, attributes = ''): string =>
+  `<label><input type="checkbox" name="${name}"${attributes ? ` ${attributes}` : ''}> ${label}</label>`;
+const signupFields = '<label>Email <input type="email" name="email" autocomplete="email"></label>';
+
+/**
+ * A free table's booking step whose pre-ticked offers box is a styled label over a hidden input (AE2). The
+ * page records whether the box changed under a real click.
+ */
+export function offersBookingPage(): string {
+  return document(
+    'Book a table',
+    `<style>.pretty .box{display:inline-block;width:14px;height:14px;border:1px solid #333}</style><h1>Bistro Remy</h1>
+<form id="book" method="post" action="/book/r-7/confirm"><label>Party size <select name="party"><option>2</option><option>4</option></select></label>
+<p>No payment is needed to reserve.</p>
+<label class="pretty" id="offers-label"><input type="checkbox" id="offers" name="offers" value="yes" checked style="display:none"><span class="box" aria-hidden="true"></span> Send me offers from Bistro Remy</label>
+<button type="submit" id="reserve">Reserve now</button></form>`,
+    `document.getElementById('offers').addEventListener('click', (event) => { document.body.dataset.trusted = String(event.isTrusted); });`,
+  );
+}
+
+/** A newsletter signup whose box opts out when ticked (AE5). */
+export function invertedNewsletterPage(): string {
+  return document(
+    'Join',
+    `<h1>Join Linen &amp; Co</h1><form id="join" method="get" action="/newsletter/joined">${signupFields}
+${box('no_newsletter', 'Tick here if you do NOT want our newsletter')}<button type="submit" id="join-button">Sign up</button></form>`,
+  );
+}
+
+/** A Yes/No question about offers, answered Yes. */
+export function offersQuestionPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/offers-question/joined">${signupFields}
+<div class="question"><p>Would you like to receive offers by email?</p>
+<label><input type="radio" name="offers" value="yes" checked> Yes</label> <label><input type="radio" name="offers" value="no"> No</label></div>
+<button type="submit" id="join-button">Continue</button></form>`,
+  );
+}
+
+/** An ARIA switch for SMS, on, that a page script turns only for a real (trusted) click. */
+export function smsSwitchPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/sms/joined">${signupFields}
+<div class="setting"><span id="sms-label">Text me offers by SMS</span> <button type="button" role="switch" id="sms" aria-checked="true" aria-labelledby="sms-label"></button>
+<input type="hidden" name="sms" id="sms-value" value="on"></div><button type="submit" id="join-button">Continue</button></form>`,
+    `const sms = document.getElementById('sms');
+sms.addEventListener('click', (event) => {
+  if (!event.isTrusted) return;
+  const on = sms.getAttribute('aria-checked') !== 'true';
+  sms.setAttribute('aria-checked', String(on));
+  document.getElementById('sms-value').value = on ? 'on' : 'off';
+});`,
+  );
+}
+
+/** A site that ticks its offers box again after anyone unticks it. */
+export function retickingPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/reticking/joined">${signupFields}${box('offers', 'Send me offers', 'id="offers" checked')}
+<button type="submit" id="join-button">Join</button></form>`,
+    `const offers = document.getElementById('offers');
+offers.addEventListener('change', () => { if (!offers.checked) setTimeout(() => { offers.checked = true; }, 50); });`,
+  );
+}
+
+/** A signup that will not submit without agreeing to marketing (AE6), beside an optional partner box. */
+export function requiredMarketingPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/required-marketing/joined">${signupFields}
+${box('marketing', 'I agree to receive marketing', 'required')}${box('partners', 'Send me partner offers')}
+<button type="submit" id="join-button">Join</button></form>`,
+  );
+}
+
+/** A signup whose terms box carries no required attribute. */
+export function optionalTermsPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/terms/joined">${signupFields}${box('terms', 'I agree to the Terms of Service')}
+<button type="submit" id="join-button">Create account</button></form>`,
+  );
+}
+
+/** A signup whose one required box bundles the terms with marketing. */
+export function bundledPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/bundled/joined">${signupFields}
+${box('consent', 'I agree to the Terms and to receive marketing emails', 'required')}<button type="submit" id="join-button">Create account</button></form>`,
+  );
+}
+
+/** A climbing gym's booking step with a liability waiver. */
+export function waiverPage(): string {
+  return document(
+    'Book a climb',
+    `<form id="climb" method="get" action="/waiver/booked"><label>Name <input name="name"></label>
+${box('waiver', 'I have read and accept the liability waiver', 'required')}<button type="submit" id="climb-button">Continue</button></form>`,
+  );
+}
+
+/** A wine shop's age gate. */
+export function attestationPage(): string {
+  return document(
+    'Welcome',
+    `<form id="age" method="get" action="/age/entered">${box('age', 'I confirm I am 21 or older', 'required')}
+<button type="submit" id="enter">Enter site</button></form>`,
+  );
+}
+
+/** A donation step with a pre-ticked round-up; with `again`, the site ticks it again whenever it is unticked. */
+export function roundUpPage(again: boolean): string {
+  return document(
+    'Checkout',
+    `<form id="give" method="get" action="/checkout/${again ? 'round-up-again' : 'round-up'}/next"><p>Notebook × 1</p>
+${box('round_up', 'Round up for charity ($0.58)', 'id="round-up" checked')}<button type="submit" id="next">Continue</button></form>`,
+    again
+      ? `const box = document.getElementById('round-up');
+box.addEventListener('change', () => { if (!box.checked) setTimeout(() => { box.checked = true; }, 50); });`
+      : '',
+  );
+}
+
+/**
+ * A checkout address step: a functional "same as billing" box, a labelled marketing box with its own words in a
+ * span, and an SMS box hidden inside a styled wrapper whose own script toggles it.
+ */
+export function addressPage(): string {
+  return document(
+    'Checkout: address',
+    `<style>.toggle{display:inline-block;padding:4px;border:1px solid #333}.slider{display:inline-block;width:24px;height:12px;background:#999}</style>
+<form id="address" method="get" action="/checkout/review"><label>Address <input name="address"></label>
+${box('same', 'Same as billing address', 'id="same" checked')}
+<label id="offers-label"><input type="checkbox" name="offers" id="offers"> <span id="offers-words">Email me offers and news</span></label>
+<div class="toggle" id="sms-wrapper"><input type="checkbox" name="sms" id="sms-box" style="display:none"><span class="slider" id="slider"></span> <span>Text me deals</span></div>
+<button type="submit" id="continue">Continue</button></form>`,
+    `document.getElementById('sms-wrapper').addEventListener('click', () => { const sms = document.getElementById('sms-box'); sms.checked = !sms.checked; });`,
+  );
+}
+
+/** A signed-in preferences page whose switches save themselves the moment they turn. */
+export function preferencesPage(): string {
+  return document(
+    'Preferences',
+    `<style>[role=switch]{display:inline-block;width:32px;height:16px;border:1px solid #333}</style>
+${shopHeader.replace('</header>', ' <a href="/account/sign-out">Sign out</a></header>')}<h1>Preferences</h1>
+<div class="pref"><span id="news-label">Email me product news</span> <div role="switch" id="news" tabindex="0" aria-checked="false" aria-labelledby="news-label"></div></div>
+<div class="pref"><span id="dark-label">Dark mode</span> <div role="switch" id="dark" tabindex="0" aria-checked="false" aria-labelledby="dark-label"></div></div>`,
+    `for (const id of ['news', 'dark']) {
+  const toggle = document.getElementById(id);
+  toggle.addEventListener('click', () => {
+    const on = toggle.getAttribute('aria-checked') !== 'true';
+    toggle.setAttribute('aria-checked', String(on));
+    fetch('/account/preferences/save', { method: 'POST', body: id + '=' + on });
+  });
+}`,
+  );
+}
+
+/** A class search submitted by Enter, beside a pre-ticked offers box. */
+export function classSearchPage(): string {
+  return document(
+    'Classes',
+    `<h1>Find a class</h1><form id="find" method="get" action="/classes"><label>Class <input type="search" name="q" id="q"></label>
+${box('offers', 'Email me class offers', 'checked')}<button type="submit" id="find-button">Find classes</button></form>`,
+  );
+}
+
+/** The consent pages, by address; each form's destination answers with a plain page. */
+export function consentPages(): Record<string, OpenWebRoute> {
+  const done = document('Done', '<h1>Thanks</h1>');
+  return {
+    [CONSENT.offers]: offersBookingPage(),
+    'https://table.example/book/r-7/confirm': document('Booked', '<h1>Your table is booked</h1>'),
+    [CONSENT.inverted]: invertedNewsletterPage(),
+    'https://join.example/newsletter/joined': done,
+    [CONSENT.radio]: offersQuestionPage(),
+    'https://join.example/offers-question/joined': done,
+    [CONSENT.sms]: smsSwitchPage(),
+    'https://join.example/sms/joined': done,
+    [CONSENT.reticking]: retickingPage(),
+    'https://join.example/reticking/joined': done,
+    [CONSENT.required]: requiredMarketingPage(),
+    'https://join.example/required-marketing/joined': done,
+    [CONSENT.terms]: optionalTermsPage(),
+    'https://join.example/terms/joined': done,
+    [CONSENT.bundled]: bundledPage(),
+    'https://join.example/bundled/joined': done,
+    [CONSENT.waiver]: waiverPage(),
+    'https://climb.example/waiver/booked': done,
+    [CONSENT.attestation]: attestationPage(),
+    'https://cellar.example/age/entered': done,
+    [CONSENT.donation]: roundUpPage(false),
+    'https://give.example/checkout/round-up/next': done,
+    [CONSENT.redonation]: roundUpPage(true),
+    'https://give.example/checkout/round-up-again/next': done,
+    [CONSENT.address]: addressPage(),
+    'https://shop.example/checkout/review': done,
+    [CONSENT.preferences]: preferencesPage(),
+    'https://shop.example/account/preferences/save': done,
+    [CONSENT.classes]: classSearchPage(),
+    'https://classes.example/classes': done,
+  };
+}
+
 /** The shared open-web pages, by address. */
 export function openWebPages(): Record<string, OpenWebRoute> {
   return {
@@ -383,6 +611,7 @@ export function openWebPages(): Record<string, OpenWebRoute> {
     'https://chat.example/widget': chatWidget(),
     [OPEN_WEB.account]: accountPage(),
     [OPEN_WEB.overlay]: overlayPage(),
+    ...consentPages(),
   };
 }
 

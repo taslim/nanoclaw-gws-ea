@@ -44,6 +44,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
     },
   } as unknown as Page;
   const context = {
+    job: { id: 'job' },
     page: async () => page,
     assertActive: async () => undefined,
     remaining: () => 90_000,

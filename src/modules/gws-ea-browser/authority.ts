@@ -5,6 +5,7 @@ import { getSession } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { requestWake } from '../../request-wake.js';
 import { writeBrowserNotice } from './notices.js';
+import { agreementsGranted } from './consent.js';
 import { markBrowserRequestCommitStarted } from './db.js';
 import { heldCredentialSites } from './leases.js';
 import {
@@ -237,6 +238,9 @@ export class PurchaseAuthorityStore {
       if (change) throw new PurchaseAuthorityError('changed', change);
       if (!completePurchaseFacts(current))
         throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
+      // Every agreement the press carries stands approved, none withdrawn since the card (KTD11).
+      if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
+        throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
       if (authority.guarantee_id) {
         const { guaranteeCoversReservation, readDelegatedReservationBounds } =
           await import('./reservation-guarantee.js');

@@ -31,6 +31,20 @@ export interface ControlRegion {
   readonly accountFields: boolean;
 }
 
+/**
+ * The choice a click would toggle (KTD1 step 4): a label's control, the choice inside a clicked label or styled
+ * wrapper, or the nearest checkbox, switch or radio around the target; a select for a selection.
+ */
+export interface ToggledChoice {
+  readonly kind: 'checkbox' | 'switch' | 'radio' | 'select';
+  /** The choice's own wording as the page shows it: a box's label, a radio option's, a select's. */
+  readonly label: string;
+  /** A radio option's question: its group's legend or label. */
+  readonly group?: string;
+  /** A select's options, in order. */
+  readonly options?: readonly string[];
+}
+
 /** The facts the classifier decides from. */
 export interface ControlFacts {
   name: string;
@@ -55,6 +69,8 @@ export interface ControlFacts {
   /** The control sits in a chat widget's frame. */
   chatFrame?: boolean;
   region?: ControlRegion;
+  /** The choice the action would toggle, when it toggles one. */
+  toggles?: ToggledChoice;
 }
 
 /** Prices, recurring charges, trials and billing, in a label or anywhere on a page. */
@@ -128,6 +144,179 @@ const CHAT_PROVIDERS: ReadonlySet<string> = new Set([
 const ACCOUNT_PATH =
   /(?:^|\/)(?:account|accounts|my-?account|profile|settings|preferences|security|user|me|wallet|payment-?methods?)(?:[/.]|$)/iu;
 
+/**
+ * How an isolated world reads a choice, shared by the classifier's reader and the consent engine's
+ * (consent.ts), so both read the same wording for the same box. Plain JavaScript statements: a choice's kind,
+ * the choice a click toggles, and its wording as the page shows it. Visible text only; a box with none is
+ * named by its accessible name, then its field name.
+ */
+export const CHOICE_SOURCE = String.raw`
+  const choiceParent = (node) => (node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentElement);
+  const choiceSquash = (value) => (value || '').replace(/\s+/gu, ' ').trim();
+  const choiceRole = (element) => (element.getAttribute('role') || '').trim().toLowerCase();
+  const choiceChildren = (node) => [...(node.shadowRoot ? node.shadowRoot.children : []), ...node.children];
+  const choiceDescendants = (root) => {
+    const list = [];
+    const visit = (node) => {
+      for (const child of choiceChildren(node)) {
+        list.push(child);
+        visit(child);
+      }
+    };
+    visit(root);
+    return list;
+  };
+  const choiceWithin = (root, element) => {
+    for (let current = element; current; current = choiceParent(current)) if (current === root) return true;
+    return false;
+  };
+  // A checkbox, a switch, a radio option or a select; null for anything else.
+  const choiceKind = (element) => {
+    if (!(element instanceof Element)) return null;
+    if (element instanceof HTMLInputElement) {
+      if (element.type === 'checkbox') return choiceRole(element) === 'switch' || element.hasAttribute('switch') ? 'switch' : 'checkbox';
+      return element.type === 'radio' ? 'radio' : null;
+    }
+    if (element instanceof HTMLSelectElement) return element.multiple ? null : 'select';
+    const role = choiceRole(element);
+    if (role === 'switch') return 'switch';
+    if (role === 'radio' || role === 'menuitemradio') return 'radio';
+    return role === 'checkbox' || role === 'menuitemcheckbox' ? 'checkbox' : null;
+  };
+  // An element whose click is its own: a link, a button or another field.
+  const choicePresses = (element) => (element instanceof HTMLAnchorElement && element.hasAttribute('href')) ||
+    element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLSelectElement ||
+    element instanceof HTMLTextAreaElement ||
+    /^(?:button|link|textbox|searchbox|combobox|menuitem|tab|option)$/u.test(choiceRole(element));
+  // The one choice a styled wrapper holds with nothing else to press; null for none yet, undefined for a block
+  // that holds several choices or other controls, which wraps no single box.
+  const wrapped = (element) => {
+    if (element instanceof HTMLFormElement || element instanceof HTMLFieldSetElement || element === document.body ||
+      element === document.documentElement) return undefined;
+    const inner = choiceDescendants(element);
+    const held = inner.filter((candidate) => choiceKind(candidate));
+    if (held.length > 1 || inner.some((candidate) => candidate !== held[0] && choicePresses(candidate))) return undefined;
+    return held.length === 1 ? held[0] : null;
+  };
+  // The choice a click on node toggles: the node itself, a label's control, the nearest checkbox, switch or radio
+  // around it, or the one choice a styled wrapper around it holds. A link or button owns its own click.
+  const toggledBy = (node) => {
+    if (!(node instanceof Element)) return null;
+    if (choiceKind(node)) return node;
+    if (choicePresses(node)) return null;
+    for (let current = node; current; current = choiceParent(current)) {
+      if (current !== node && choiceKind(current) && !(current instanceof HTMLSelectElement)) return current;
+      if (current instanceof HTMLLabelElement) return current.control && choiceKind(current.control) ? current.control : null;
+      if (current !== node && choicePresses(current)) return null;
+      const box = wrapped(current);
+      if (box !== null) return box || null;
+    }
+    return null;
+  };
+  const choiceShown = (element) => element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+  // The visible words under root, with blocks kept apart; fields' own text and skipped subtrees are left out.
+  const choiceText = (root, skip) => {
+    let text = '';
+    const visit = (node) => {
+      for (const child of [...(node.shadowRoot ? node.shadowRoot.childNodes : []), ...node.childNodes]) {
+        if (child instanceof Text) {
+          const holder = choiceParent(child);
+          if (holder && choiceShown(holder)) text += child.data;
+        } else if (child instanceof Element && !(child instanceof HTMLScriptElement) && !(child instanceof HTMLStyleElement) &&
+          !(child instanceof HTMLSelectElement) && !(child instanceof HTMLTextAreaElement) && !(skip && skip(child))) {
+          const block = !/^inline/u.test(getComputedStyle(child).display);
+          if (block) text += ' ';
+          visit(child);
+          if (block) text += ' ';
+        }
+      }
+    };
+    visit(root);
+    return choiceSquash(text);
+  };
+  const choiceReferenced = (element) => {
+    const root = element.getRootNode();
+    return choiceSquash((element.getAttribute('aria-labelledby') || '').split(/\s+/u).filter(Boolean)
+      .map((id) => (root.getElementById ? root.getElementById(id) : null)).filter(Boolean)
+      .map((target) => choiceText(target)).join(' '));
+  };
+  const otherField = (choice, element) => element !== choice && (choiceKind(element) !== null ||
+    element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLButtonElement);
+  // A choice's wording: what labels it, its own words for a role, or the block beside it that holds no other field.
+  const choiceLabel = (choice) => {
+    const skip = (element) => element !== choice && choiceKind(element) !== null;
+    let text = choiceReferenced(choice);
+    if (!text && choice.labels) text = choiceSquash(Array.from(choice.labels, (label) => choiceText(label, skip)).join(' '));
+    if (!text && !(choice instanceof HTMLInputElement) && !(choice instanceof HTMLSelectElement)) text = choiceText(choice, skip);
+    for (let current = choiceParent(choice), depth = 0; !text && current && depth < 4; current = choiceParent(current), depth++) {
+      if (current instanceof HTMLFormElement || current === document.body || choiceDescendants(current).some((element) => otherField(choice, element)))
+        break;
+      text = choiceText(current, skip);
+    }
+    return text || choiceSquash(choice.getAttribute('aria-label') || choice.getAttribute('title') || '') ||
+      choiceSquash((choice.getAttribute('name') || choice.id || '').replace(/[_-]+/gu, ' '));
+  };
+  // The options answering one question: same-named radios of one form or formless root, or one radiogroup's radios.
+  const choiceMembers = (choice) => {
+    if (choice instanceof HTMLInputElement) {
+      if (!choice.name) return [choice];
+      const form = choice.form;
+      const scope = form ? Array.from(Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get.call(form))
+        : Array.from(choice.getRootNode().querySelectorAll('input'));
+      return scope.filter((element) => element instanceof HTMLInputElement && element.type === 'radio' &&
+        element.name === choice.name && element.form === form);
+    }
+    for (let current = choiceParent(choice); current; current = choiceParent(current))
+      if (choiceRole(current) === 'radiogroup')
+        return choiceDescendants(current).filter((element) => choiceKind(element) === 'radio' && !(element instanceof HTMLInputElement));
+    return [choice];
+  };
+  // A radio option's question: a fieldset's legend, a radiogroup's label, or the words of the block holding every
+  // option and no other field, else of the block just before the options.
+  const choiceGroup = (choice) => {
+    const members = choiceMembers(choice);
+    const own = (element) => members.includes(element) || (element instanceof HTMLLabelElement && members.includes(element.control));
+    for (let current = choiceParent(choice); current; current = choiceParent(current)) {
+      if (current instanceof HTMLFieldSetElement) {
+        const legend = Array.from(current.children).find((element) => element instanceof HTMLLegendElement);
+        if (legend) return choiceText(legend);
+      }
+      if (choiceRole(current) === 'radiogroup' || choiceRole(current) === 'group') {
+        const named = choiceReferenced(current) || choiceSquash(current.getAttribute('aria-label') || '');
+        if (named) return named;
+      }
+      if (!members.every((member) => choiceWithin(current, member))) continue;
+      const fields = choiceDescendants(current).some((element) => !members.includes(element) && otherField(null, element));
+      if (!fields && !(current instanceof HTMLFormElement) && current !== document.body) {
+        const text = choiceText(current, own);
+        if (text) return text;
+        continue;
+      }
+      let block = members[0];
+      while (block && choiceParent(block) !== current) block = choiceParent(block);
+      for (let previous = block && block.previousElementSibling; previous; previous = previous.previousElementSibling) {
+        if (choiceKind(previous) || choiceDescendants(previous).some((element) => otherField(null, element))) break;
+        const text = choiceText(previous);
+        if (text) return text;
+      }
+      return '';
+    }
+    return '';
+  };
+  // What a click on node would toggle, as the classifier reads it.
+  const toggledChoice = (node) => {
+    const choice = toggledBy(node);
+    const kind = choice && choiceKind(choice);
+    if (!kind) return null;
+    return {
+      kind,
+      label: choiceLabel(choice),
+      ...(kind === 'radio' ? { group: choiceGroup(choice) } : {}),
+      ...(kind === 'select' ? { options: Array.from(choice.options, (option) => choiceSquash(option.label || option.text)) } : {}),
+    };
+  };
+`;
+
 const WORLD = 'gws-ea-control-facts';
 const LIBRARY = '__gwsEaControlFacts';
 /** Reading a whole document can take longer than one protocol answer. */
@@ -138,6 +327,7 @@ const READ_TIMEOUT_MS = 5_000;
  * Every prototype it calls is the isolated world's own, so page script cannot answer for it.
  */
 const librarySource = String.raw`(sources) => {
+  ${CHOICE_SOURCE}
   const re = {};
   for (const key of Object.keys(sources)) re[key] = new RegExp(sources[key], 'iu');
   const getter = (type, name) => Object.getOwnPropertyDescriptor(type.prototype, name).get;
@@ -334,6 +524,7 @@ const librarySource = String.raw`(sources) => {
       type: submitter || node instanceof HTMLSelectElement || node instanceof HTMLTextAreaElement ? node.type : node.getAttribute('type') || '',
       href: rawHref === null ? null : node.href,
       scripted: (rawHref !== null && rawHref.trim().startsWith('#')) || node.hasAttribute('onclick'),
+      toggles: toggledChoice(node),
       region: {
         dialog: Boolean(dialog),
         transaction,
@@ -415,7 +606,7 @@ const flag = (value: unknown): boolean => value === true;
 const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
 
 /** A frame that went away mid-read: it has nothing left to read. */
-function frameGone(error: unknown): boolean {
+export function frameGone(error: unknown): boolean {
   return (
     error instanceof Error &&
     /(?:No frame (?:for given id )?found|Frame with the given id was not found|Cannot find context|No node with given id)/iu.test(
@@ -467,6 +658,25 @@ function parseScan(value: unknown): FrameScan | undefined {
   };
 }
 
+const TOGGLED_KINDS: ReadonlySet<unknown> = new Set(['checkbox', 'switch', 'radio', 'select']);
+
+/** The toggled choice as read, or undefined for none; anything malformed fails the whole read. */
+function parseToggled(value: unknown): ToggledChoice | null | undefined {
+  if (value === null) return null;
+  const choice = record(value);
+  const label = text(choice?.label);
+  if (!choice || !TOGGLED_KINDS.has(choice.kind) || label === undefined) return undefined;
+  const group = text(choice.group);
+  const options = Array.isArray(choice.options) ? choice.options.map(text) : undefined;
+  if (options?.some((option) => option === undefined)) return undefined;
+  return {
+    kind: choice.kind as ToggledChoice['kind'],
+    label,
+    ...(group !== undefined ? { group } : {}),
+    ...(options ? { options: options.filter((option) => option !== undefined) } : {}),
+  };
+}
+
 function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undefined {
   const facts = record(value);
   const region = record(facts?.region);
@@ -474,7 +684,17 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
   const tag = text(facts?.tag);
   const role = text(facts?.role);
   const type = text(facts?.type);
-  if (!facts || !region || name === undefined || !tag || role === undefined || type === undefined) return undefined;
+  const toggles = parseToggled(facts?.toggles);
+  if (
+    !facts ||
+    !region ||
+    name === undefined ||
+    !tag ||
+    role === undefined ||
+    type === undefined ||
+    toggles === undefined
+  )
+    return undefined;
   const formMethod = text(facts.formMethod);
   const formAction = text(facts.formAction);
   return {
@@ -488,6 +708,7 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
     type,
     href: text(facts.href) ?? null,
     scripted: flag(facts.scripted),
+    ...(toggles ? { toggles } : {}),
     region: {
       dialog: flag(region.dialog),
       transaction: flag(region.transaction),

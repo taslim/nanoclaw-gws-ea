@@ -16,6 +16,7 @@ import {
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
 import { isSensitiveField } from './authentication-signatures.js';
+import { BrowserConsentStop, type ConsentStopView } from './consent.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import { SiteLeaseStore } from './leases.js';
 import {
@@ -42,6 +43,8 @@ export type BrowserStopReason =
   | 'purchase_control'
   | 'speaks_as_principal'
   | 'account_security'
+  | 'consent_control'
+  | 'consent_required'
   | 'secret_field'
   | 'blocked_address'
   | 'challenge'
@@ -256,7 +259,12 @@ function batchErrorReason(
   context: BrowserExecutionContext,
   page: Page,
 ): BrowserStopReason {
-  if (error instanceof BrowserBatchStop || error instanceof BrowserActivationError || error instanceof BrowserRefError)
+  if (
+    error instanceof BrowserBatchStop ||
+    error instanceof BrowserActivationError ||
+    error instanceof BrowserRefError ||
+    error instanceof BrowserConsentStop
+  )
     return error.reason;
   if (isGuardRefusal(blocked)) return blocked;
   if (error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()) return 'timeout';
@@ -301,6 +309,8 @@ async function executeBatch(
   // The guard starts each operation clean, before its readiness pass.
   const guard = await ensureBrowserNavigationGuard(page);
   let reason: BrowserStopReason | undefined;
+  /** The wordings a consent stop names, with the stop ids the job asks the principal with. */
+  let consent: readonly ConsentStopView[] | undefined;
   let repeatSafe = true;
   let refs = new Map<string, PinnedBrowserRef>();
   let navigation = 0;
@@ -512,8 +522,15 @@ async function executeBatch(
         }
       } catch (error) {
         reason = batchErrorReason(error, guard.reason(), context, page);
+        if (error instanceof BrowserConsentStop) consent = error.stops;
         await trace?.finish(reason);
-        results[index] = { index, status: 'stopped', reason, ...(trace ? { trace_index: trace.index } : {}) };
+        results[index] = {
+          index,
+          status: 'stopped',
+          reason,
+          ...(consent ? { consent } : {}),
+          ...(trace ? { trace_index: trace.index } : {}),
+        };
         break;
       }
     }
@@ -545,6 +562,7 @@ async function executeBatch(
   return {
     status: reason ? 'stopped' : 'completed',
     ...(reason ? { reason } : {}),
+    ...(consent ? { consent } : {}),
     actions: results,
     ...(images.length ? { images } : {}),
     ...(observation ? { observation } : {}),

@@ -15,6 +15,7 @@ import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
+import * as consentEngine from './consent.js';
 import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
@@ -180,9 +181,15 @@ function fixture(origin = 'https://www.shop.example') {
     },
   );
   const nativeSubmit = vi.fn(async () => undefined);
+  // The consent engine's isolated-world pass has its own native suite (open-web-native).
+  const consentPass = vi
+    .spyOn(consentEngine, 'runConsentPass')
+    .mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
   vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(
     async (_frame, _binding, assertActive) => {
       await assertActive?.();
+      // The engine's one check runs before every host submission, a sign-in's included.
+      expect(consentPass).toHaveBeenCalled();
       await nativeSubmit();
       return true;
     },

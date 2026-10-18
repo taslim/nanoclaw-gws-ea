@@ -40,6 +40,13 @@ export interface PurchaseFacts {
   reservation?: ReservationFacts;
   /** Explicit merchant evidence that a reservation has no financial commitment. Absence proves nothing. */
   noCommitmentTerms?: string;
+  /**
+   * Agreements beyond the site's own terms that the checkout's form carries, each by its frame origin and exact
+   * wording: approving the card agrees to each, standing on the site (KTD11). Absent when there are none.
+   */
+  agreements?: Array<{ origin: string; wording: string }>;
+  /** Paid extras the site keeps selected after the host unticked them: charges the card names. Absent when none. */
+  addOns?: string[];
 }
 export interface PurchaseBounds {
   reservation?: { venueId: string; partySize: number; windowStart: string; windowEnd: string };
@@ -99,6 +106,8 @@ export function materialPurchaseChange(
     ['address', 'address'],
     ['commitments', 'financial terms'],
     ['noCommitmentTerms', 'financial terms'],
+    ['agreements', 'agreements'],
+    ['addOns', 'extra charges'],
   ] as const)
     if (!same(approved[key], current[key])) return `The ${label} changed.`;
   if (bounds.reservation) {
@@ -167,6 +176,7 @@ export function isFreeReservation(facts: PurchaseFacts): boolean {
     facts.totalMinor === 0 &&
     facts.dueNowMinor === 0 &&
     facts.commitments.length === 0 &&
+    !facts.addOns?.length &&
     facts.cardEnding === null &&
     facts.noCommitmentTerms?.trim(),
   );

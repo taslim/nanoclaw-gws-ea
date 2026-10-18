@@ -17,6 +17,7 @@ import { hasBrowserAccess } from './access.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
+import { agreementsGranted } from './consent.js';
 import {
   completePurchaseFacts,
   amountMinor,
@@ -60,6 +61,7 @@ export function guaranteeCoversReservation(
     grant.revoked_at ||
     !reservation ||
     !delegated ||
+    facts.addOns?.length ||
     facts.dueNowMinor !== 0 ||
     facts.currency !== grant.currency ||
     !completePurchaseFacts(facts)
@@ -106,7 +108,9 @@ export async function deriveReservationGuaranteeAuthority(
     if (
       !guaranteeCoversReservation(grant, facts, delegatedBounds) ||
       (await store.unresolved(facts.site)).length ||
-      !grant
+      !grant ||
+      // An agreement the principal has not approved needs the card.
+      (facts.agreements?.length && !(await agreementsGranted(store.db, facts.site, facts.agreements)))
     )
       return undefined;
     const prior = await store.db.all<SpendingAuthority>(

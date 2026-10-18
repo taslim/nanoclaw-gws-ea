@@ -10,10 +10,11 @@ import {
   readControlFacts,
   type ActivationIntent,
 } from './commit-classifier.js';
+import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
-import { executeBrowserBatch } from './executor.js';
-import { browserSiteLeasesMigration } from './migration.js';
-import { OPEN_WEB, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
+import { executeBrowserBatch, type BrowserAction } from './executor.js';
+import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
+import { CONSENT, OPEN_WEB, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
 import { observePage } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 
@@ -294,5 +295,255 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
     // The trick is live: the layer, not the search, sits under the pointer.
     expect(covered).toBe('overlay');
     expect(await classify(page.locator('#search'))).toBe('ordinary');
+  });
+});
+
+describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 30_000 }, () => {
+  let fixture: OpenWebFixture;
+  let page: Page;
+  let db: SqliteDriver;
+  const JOB = 'job-consent';
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    page = await fixture.newPage();
+    db = new SqliteDriver(new Database(':memory:'));
+    await db.exec(
+      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
+    );
+    await browserSiteLeasesMigration.up(db);
+    await browserConsentMigration.up(db);
+    fixture.requests.length = 0;
+  });
+  afterEach(async () => {
+    await page?.context().close();
+    await db?.close();
+  });
+
+  const scope = () => ({ jobId: JOB, db });
+  /** A fresh page: a job's navigation guard, once installed, refuses a document loaded between its operations. */
+  const visit = async (url: string): Promise<void> => {
+    await page.context().close();
+    page = await fixture.newPage();
+    await page.goto(url, { waitUntil: 'load' });
+  };
+  /** The host's one check before a press of `target`, as every submission path runs it. */
+  async function pass(target: Locator, purchase = false): Promise<ConsentPassResult> {
+    const element = await target.elementHandle();
+    if (!element) throw new Error('Fixture control missing');
+    try {
+      return await runConsentPass(page, element, { scope: scope(), purchase });
+    } finally {
+      await element.dispose();
+    }
+  }
+  async function classify(target: Locator): Promise<string> {
+    const element = await target.elementHandle();
+    if (!element) throw new Error('Fixture control missing');
+    try {
+      return await classifyActivation(page, element);
+    } finally {
+      await element.dispose();
+    }
+  }
+  const checked = (selector: string): Promise<boolean> =>
+    page.locator(selector).evaluate((node) => (node as unknown as { checked: boolean }).checked);
+  /** One batch through the executor, as the browser agent sends it, aimed by each control's accessible name. */
+  async function act(...steps: Array<[kind: 'click' | 'key', name: string]>): Promise<Record<string, unknown>> {
+    const observation = await observePage(page);
+    const actions = steps.map(([kind, name]): BrowserAction => {
+      const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
+      const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
+      if (!ref) throw new Error(`Missing ${name} in ${observation.snapshot}`);
+      return kind === 'key'
+        ? { kind, ref, generation: observation.generation, key: 'Enter' }
+        : { kind, ref, generation: observation.generation };
+    });
+    const context = {
+      job: { id: JOB },
+      request: { id: `request-${Math.random()}` },
+      session: {},
+      store: new BrowserStore(db),
+      page: async () => page,
+      assertActive: async () => undefined,
+      wakeWaiters: async () => undefined,
+      remaining: () => 15_000,
+      signal: new AbortController().signal,
+    } as unknown as BrowserExecutionContext;
+    return executeBrowserBatch(context, { actions }, { record: false });
+  }
+  /** The query of the one request that reached `path`, or undefined when the form never submitted. */
+  const submitted = (path: string): URLSearchParams | undefined => {
+    const request = fixture.requests.find((candidate) => new URL(candidate.url).pathname === path);
+    return request && new URL(request.url).searchParams;
+  };
+  const stops = () =>
+    db.all<{ id: string; site: string; origin: string; wording: string; kind: string; status: string }>(
+      'SELECT id,site,origin,wording,kind,status FROM gws_ea_browser_consent_stops ORDER BY created_at',
+    );
+
+  it('unticks a pre-ticked offers box on a free booking with a real click on its label (AE2)', async () => {
+    await visit(CONSENT.offers);
+    expect(await checked('#offers')).toBe(true);
+    expect(await pass(page.locator('#reserve'))).toEqual({ status: 'ready', agreements: [], addOns: [] });
+    expect(await checked('#offers')).toBe(false);
+    // The box changed under a trusted click on its styled label, never a dispatched one.
+    expect(await page.locator('body').getAttribute('data-trusted')).toBe('true');
+    // The host's own press, which free commits run next, submits the booking without the offers.
+    await Promise.all([page.waitForURL('**/confirm'), page.locator('#reserve').click()]);
+    const booking = fixture.requests.find((request) => request.method === 'POST');
+    expect(new URLSearchParams(booking?.body)).toEqual(new URLSearchParams({ party: '2' }));
+    expect(await stops()).toEqual([]);
+  });
+
+  it('ticks an inverted newsletter box, which opts out, before the form submits (AE5)', async () => {
+    await visit(CONSENT.inverted);
+    await page.locator('input[name="email"]').fill('morgan.ellery@example.test');
+    expect(await act(['click', 'Sign up'])).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(submitted('/newsletter/joined')?.get('no_newsletter')).toBe('on');
+  });
+
+  it('moves a Yes/No offers question to No', async () => {
+    await visit(CONSENT.radio);
+    await act(['click', 'Continue']);
+    expect(submitted('/offers-question/joined')?.get('offers')).toBe('no');
+  });
+
+  it('turns an SMS switch off with a real click and verifies it', async () => {
+    await visit(CONSENT.sms);
+    expect(await pass(page.locator('#join-button'))).toMatchObject({ status: 'ready' });
+    expect(await page.locator('#sms').getAttribute('aria-checked')).toBe('false');
+    expect(await page.locator('#sms-value').inputValue()).toBe('off');
+  });
+
+  it('stops for a box the site ticks again, caught by the check before the press', async () => {
+    await visit(CONSENT.reticking);
+    const result = await pass(page.locator('#join-button'));
+    const [stop] = await stops();
+    expect(result).toEqual({
+      status: 'consent_required',
+      stops: [{ stop_id: stop.id, site: 'join.example', wording: 'Send me offers' }],
+    });
+    expect(stop).toMatchObject({ origin: 'https://join.example', kind: 'marketing', status: 'open' });
+    expect(await checked('#offers')).toBe(true);
+  });
+
+  it('stops for a required opt-in, and after the principal agrees ticks only that box, until the wording changes or the grant is withdrawn (AE6)', async () => {
+    await visit(CONSENT.required);
+    const stopped = await act(['click', 'Join']);
+    const [stop] = await stops();
+    expect(stopped).toMatchObject({
+      status: 'stopped',
+      reason: 'consent_required',
+      consent: [{ stop_id: stop.id, site: 'join.example', wording: 'I agree to receive marketing' }],
+      actions: [{ status: 'stopped', reason: 'consent_required' }],
+    });
+    expect(submitted('/required-marketing/joined')).toBeUndefined();
+    await recordConsentGrant(db, {
+      site: 'join.example',
+      origin: 'https://join.example',
+      wording: 'I agree to receive marketing',
+      approvalId: 'approval-1',
+      principalUserId: 'gchat:users/principal',
+    });
+    await act(['click', 'Join']);
+    expect(Object.fromEntries(submitted('/required-marketing/joined') ?? [])).toEqual({ email: '', marketing: 'on' });
+    // A later submission with the same wording needs no new card; changed wording asks again.
+    await visit(CONSENT.required);
+    expect(await pass(page.locator('#join-button'))).toMatchObject({ status: 'ready' });
+    await visit(CONSENT.required);
+    await page
+      .locator('input[name="marketing"]')
+      .evaluate(
+        (node) =>
+          ((node as unknown as { nextSibling: { textContent: string } }).nextSibling.textContent =
+            ' I agree to receive marketing texts'),
+      );
+    expect(await pass(page.locator('#join-button'))).toMatchObject({
+      status: 'consent_required',
+      stops: [{ wording: 'I agree to receive marketing texts' }],
+    });
+    await db.run("UPDATE gws_ea_browser_consent_grants SET withdrawn_at = '2026-10-17T00:00:00.000Z'");
+    await visit(CONSENT.required);
+    expect(await pass(page.locator('#join-button'))).toMatchObject({
+      status: 'consent_required',
+      stops: [{ wording: 'I agree to receive marketing' }],
+    });
+  });
+
+  it('ticks a terms box that carries no required attribute on a signup', async () => {
+    await visit(CONSENT.terms);
+    await act(['click', 'Create account']);
+    expect(submitted('/terms/joined')?.get('terms')).toBe('on');
+  });
+
+  it('stops for a bundled box, a waiver and an age attestation, naming each, and ticks none', async () => {
+    for (const [url, control, wording] of [
+      [CONSENT.bundled, '#join-button', 'I agree to the Terms and to receive marketing emails'],
+      [CONSENT.waiver, '#climb-button', 'I have read and accept the liability waiver'],
+      [CONSENT.attestation, '#enter', 'I confirm I am 21 or older'],
+    ] as const) {
+      await visit(url);
+      expect(await pass(page.locator(control))).toMatchObject({ status: 'consent_required', stops: [{ wording }] });
+      expect(
+        await page
+          .locator('input[type="checkbox"]')
+          .evaluate((node) => (node as unknown as { checked: boolean }).checked),
+      ).toBe(false);
+    }
+    expect((await stops()).map((stop) => stop.kind)).toEqual(['bundled', 'agreement', 'agreement']);
+  });
+
+  it('unticks a pre-ticked round-up, and refuses as a purchase a press the site would keep it ticked for', async () => {
+    await visit(CONSENT.donation);
+    await act(['click', 'Continue']);
+    expect(submitted('/checkout/round-up/next')?.has('round_up')).toBe(false);
+    await visit(CONSENT.redonation);
+    expect(await act(['click', 'Continue'])).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+    expect(submitted('/checkout/round-up-again/next')).toBeUndefined();
+    // Inside a purchase the kept extra is a charge for the card instead.
+    await visit(CONSENT.redonation);
+    expect(await pass(page.locator('#next'), true)).toEqual({
+      status: 'ready',
+      agreements: [],
+      addOns: ['Round up for charity ($0.58)'],
+    });
+  });
+
+  it('refuses the agent’s own click on a marketing box, its label, its words or its styled wrapper, but not on a functional box', async () => {
+    await visit(CONSENT.address);
+    for (const selector of ['#offers', '#offers-label', '#offers-words', '#sms-wrapper', '#slider'])
+      expect(await classify(page.locator(selector))).toBe('consent_control');
+    expect(await classify(page.locator('#same'))).toBe('ordinary');
+    expect(await act(['click', 'Email me offers and news'])).toMatchObject({
+      status: 'stopped',
+      reason: 'consent_control',
+    });
+    expect(await checked('#offers')).toBe(false);
+  });
+
+  it('refuses a click on an auto-saving preference toggle, which saves with no later submission', async () => {
+    await visit(CONSENT.preferences);
+    expect(await classify(page.locator('#news'))).toBe('consent_control');
+    expect(await classify(page.locator('#dark'))).toBe('ordinary');
+    expect(await act(['click', 'Email me product news'])).toMatchObject({
+      status: 'stopped',
+      reason: 'consent_control',
+    });
+    expect(await page.locator('#news').getAttribute('aria-checked')).toBe('false');
+    expect(fixture.requests.filter((request) => request.method === 'POST')).toEqual([]);
+  });
+
+  it('runs the consent pass before a form Enter submits', async () => {
+    await visit(CONSENT.classes);
+    await page.locator('#q').fill('yoga');
+    expect(await act(['key', 'Class'])).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(Object.fromEntries(submitted('/classes') ?? [])).toEqual({ q: 'yoga' });
   });
 });

@@ -67,6 +67,7 @@ const BROWSER_TOOLS = [
   'fill_secret',
   'list_watches',
   'purchase',
+  'request_consent',
   'run_recipe',
   'save_recipe',
   'sign_in_code',
@@ -80,6 +81,7 @@ const DEFAULT_ON_TOOLS = [
   'ask_user_question',
   'create_agent',
   'cancel_job',
+  'consent_grants',
   'credential_authority',
   'edit_message',
   'install_packages',
@@ -143,6 +145,7 @@ describe('NanoClaw tool server capabilities', () => {
       ['browser-delegate'],
       [
         'cancel_job',
+        'consent_grants',
         'credential_authority',
         'relay_code',
         'reservation_bounds',

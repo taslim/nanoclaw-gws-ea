@@ -12,7 +12,8 @@ import {
   type CredentialKind,
   httpsOrigin,
 } from './authentication-signatures.js';
-import { moneyTerms, readPageControlFacts, type ControlFacts } from './control-facts.js';
+import { readPageControlFacts, type ControlFacts } from './control-facts.js';
+import { BrowserConsentStop, consentClassChoice, runConsentPass, withConsentScope } from './consent.js';
 
 export type { ControlFacts, ControlRegion } from './control-facts.js';
 
@@ -22,6 +23,7 @@ export type ActionClass =
   | 'purchase_control'
   | 'speaks_as_principal'
   | 'account_security'
+  | 'consent_control'
   | 'blocked_address';
 /**
  * An activation's outcome. `unsupported_merchant` is never a classification: it is a reviewed flow's exact
@@ -131,7 +133,8 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationIntent
     (pressed && (facts.chatFrame === true || (region?.freeText === true && !region.commits)))
   )
     return 'speaks_as_principal';
-  // 4. Consent-class controls (KTD11) are decided here, before any purchase.
+  // 4. A choice the consent engine owns (KTD11), by the choice the action would toggle: the agent never makes it.
+  if (facts.toggles && consentClassChoice(facts.toggles)) return 'consent_control';
   // 5. Purchase vocabulary: a label or route naming one, paid registration, or cancelling or changing a booking
   // whose page shows a fee.
   if (
@@ -235,22 +238,6 @@ const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(
 /** The control that submits a signup's emailed verification code. */
 const verificationActivation =
   /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
-/** The site terms a delegated signup accepts with the account, and what never rides along with them. */
-const siteTerms =
-  /\b(?:terms(?:\s+(?:of\s+(?:service|use)|(?:and|&)\s+conditions))?|user\s+agreement|privacy\s+(?:policy|notice|statement))\b/iu;
-const notSiteTerms =
-  /\b(?:marketing|newsletters?|news|offers?|promotions?|promotional|partners?|third[\s-]+part(?:y|ies)|shar(?:e|ing)|advertis\w*|sponsors?|surveys?|updates|e-?mails?|sms|texts?|pay(?:ment|ments|ing)?|billing|billed|charges?|fees?|prices?|pricing|purchases?|orders?|sales?|trials?|subscri\w*|renew\w*|recurring|memberships?|plans?|cards?|credit|refunds?)\b|[$€£¥]/iu;
-
-/**
- * Whether a checkbox's label accepts only the site's terms of service, terms
- * and conditions, user agreement or privacy policy, the terms a delegated
- * signup accepts with the account. Marketing, data sharing and every money
- * term keep their own authority.
- */
-export function termsConsentLabel(label: string): boolean {
-  return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
-}
-
 /** Where a credential operation's control sits: the bound form's own control, or the step it submits. */
 export interface CredentialControlScope {
   /** The control belongs to the bound form, or both stand outside any form. */
@@ -375,6 +362,20 @@ export class BrowserActivationError extends Error {
   }
 }
 
+/**
+ * The consent engine's one check before a host-performed submission outside a purchase (KTD11): every choice
+ * in the control's form made, or a stop. An extra the press would still buy makes it a purchase.
+ */
+async function consentBeforeSubmission(
+  page: Page,
+  element: ElementHandle,
+  assertActive?: () => Promise<void>,
+): Promise<void> {
+  const consent = await runConsentPass(page, element, assertActive ? { assertActive } : {});
+  if (consent.status === 'consent_required') throw new BrowserConsentStop(consent.stops);
+  if (consent.status === 'add_on') throw new BrowserActivationError('purchase_control');
+}
+
 /** The guard refused to start an operation: a page-target setting cannot reach a live frame, so nothing ran. */
 export class BrowserFramesUnreadyError extends BrowserActivationError {
   constructor() {
@@ -422,9 +423,13 @@ export async function activateControl(
     }
   }
   if (classification !== 'ordinary') throw new BrowserActivationError(classification);
-  if (dispatch.flow) return operation();
+  if (dispatch.flow) {
+    if (presses(facts, intent.kind)) await consentBeforeSubmission(page, element, intent.assertActive);
+    return operation();
+  }
   if (dispatch.authentication) {
     const authentication = dispatch.authentication;
+    await consentBeforeSubmission(page, element, intent.assertActive);
     const guard = await ensureBrowserNavigationGuard(page);
     // The open rule decides where the submission lands.
     await guard.runWithPolicy({}, async () => {
@@ -444,6 +449,7 @@ export async function activateControl(
   }
   let url = facts.href;
   if (!url && facts.formMethod?.toLowerCase() === 'get' && facts.formAction) {
+    await consentBeforeSubmission(page, element, intent.assertActive);
     const controls = await element.evaluate(
       (node, selection) => {
         const target = node as unknown as {
@@ -729,7 +735,8 @@ export async function withBrowserJobNavigation<T>(
         return lease.acquired ? 'ordinary' : 'site_busy';
       },
     },
-    operation,
+    // Every consent stop on the page belongs to this job.
+    () => withConsentScope(page, { jobId: context.job.id, db: context.store.db }, operation),
   );
 }
 

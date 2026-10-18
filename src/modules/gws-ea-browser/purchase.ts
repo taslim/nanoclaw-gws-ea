@@ -31,6 +31,7 @@ import {
   framesUnreadyStop,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
+import { recordConsentGrant, runConsentPass, type ConsentAgreement } from './consent.js';
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
@@ -91,6 +92,40 @@ function cardPayload(card: PurchaseCard): Record<string, unknown> {
 }
 function stableId(prefix: string, value: string): string {
   return `${prefix}-${createHash('sha256').update(value).digest('hex')}`;
+}
+
+/** What the consent engine leaves a checkout's press carrying: its agreements and the extras the site keeps. */
+interface CheckoutConsent {
+  readonly agreements: readonly ConsentAgreement[];
+  readonly addOns: readonly string[];
+}
+
+/**
+ * The consent engine's pass on the checkout's form (KTD11): every choice the engine owns made, the agreements
+ * the principal approved ticked, and what only the card can approve read for it. Inside a purchase the engine
+ * never stops: its exceptions are the card's.
+ */
+async function checkoutConsent(
+  context: BrowserExecutionContext,
+  page: Page,
+  element: ElementHandle,
+): Promise<CheckoutConsent> {
+  const consent = await runConsentPass(page, element, {
+    purchase: true,
+    scope: { jobId: context.job.id, db: context.store.db },
+    assertActive: context.assertActive,
+  });
+  if (consent.status !== 'ready') throw new Error('A purchase consent pass answers only with its facts');
+  return consent;
+}
+
+/** The merchant's facts with the checkout's consent facts, which the card shows and the commit compares. */
+function withConsent(facts: PurchaseFacts, consent: CheckoutConsent): PurchaseFacts {
+  return {
+    ...facts,
+    ...(consent.agreements.length ? { agreements: [...consent.agreements] } : {}),
+    ...(consent.addOns.length ? { addOns: [...consent.addOns] } : {}),
+  };
 }
 
 /** A real calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
@@ -319,18 +354,28 @@ registerApprovalHandler(
       const authority = new PurchaseAuthorityStore();
       const id = stableId('authority', card.id);
       if (current.status !== 'open' && !(current.status === 'approved' && (await authority.get(id)))) return;
+      const facts = JSON.parse(card.facts_json) as PurchaseFacts;
       const durableAuthority = await authority.create({
         id,
         jobId: card.job_id,
         approvalId: approval.approval_id,
         cardId: card.id,
         kind: 'checkout',
-        facts: JSON.parse(card.facts_json) as PurchaseFacts,
+        facts,
         bounds: JSON.parse(card.bounds_json) as PurchaseBounds,
         exceptionIds: JSON.parse(card.exception_ids_json) as string[],
         attemptId: stableId('attempt', card.id),
         expiresAt: card.expires_at,
       });
+      // The card's agreements stand approved on the site, as a consent card's would: no second card asks again.
+      for (const agreement of facts.agreements ?? [])
+        await recordConsentGrant(getDb(), {
+          site: facts.site,
+          origin: agreement.origin,
+          wording: agreement.wording,
+          approvalId: approval.approval_id,
+          principalUserId: userId,
+        });
       await getDb().run(
         "UPDATE gws_ea_browser_purchase_cards SET status = 'approved',approval_id = ?,approval_json = ? WHERE id = ?",
         approval.approval_id,
@@ -414,14 +459,16 @@ export async function executeAuthorizedPurchase(
     }
     let marked = false;
     let watchRefusal: import('./watches.js').WatchPurchaseRefusal | undefined;
+    let facts = read.facts;
     try {
+      facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
       const approved = JSON.parse(authority.facts_json) as PurchaseFacts;
       const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
-      const change = materialPurchaseChange(approved, read.facts, bounds);
+      const change = materialPurchaseChange(approved, facts, bounds);
       if (authority.kind === 'watch' && (change || authority.expires_at <= new Date().toISOString()))
         return { status: 'outside_bounds', watchId: authority.watch_id, repeat_safe: false };
       if (change || authority.expires_at <= new Date().toISOString())
-        return requestPurchaseCard(context, read.facts, bounds, change ?? 'The previous approval expired.');
+        return requestPurchaseCard(context, facts, bounds, change ?? 'The previous approval expired.');
       // Re-read once more inside the classifier's authority callback, immediately before its only native press.
       const arrived = read.signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
       await activateControl(
@@ -448,9 +495,11 @@ export async function executeAuthorizedPurchase(
               commitClaim = checked;
             }
             await context.assertActive();
+            // The consent check immediately before the press, inside the facts `begin()` checks.
+            const consent = await checkoutConsent(context, page, read.element);
             const immediate = await readMerchantPurchase(page, read.element);
             if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
-            await store.begin(context, authority.id, immediate.facts, commitClaim);
+            await store.begin(context, authority.id, withConsent(immediate.facts, consent), commitClaim);
             marked = true;
           },
         },
@@ -500,7 +549,7 @@ export async function executeAuthorizedPurchase(
         if (error.reason === 'changed' || error.reason === 'expired')
           return requestPurchaseCard(
             context,
-            read.facts,
+            facts,
             JSON.parse(authority.bounds_json) as PurchaseBounds,
             error.message,
           );
@@ -538,9 +587,10 @@ export async function executeBrowserPurchase(
         const read = await readMerchantPurchase(page, ref?.element);
         if (read.status !== 'ready')
           return { status: read.status === 'checkout_lapsed' ? 'not_a_purchase' : read.status, repeat_safe: true };
+        const facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
         const store = new PurchaseAuthorityStore(context.store.db);
         const { prepareWatchPurchase } = await import('./watches.js');
-        const watch = await prepareWatchPurchase(context, read.facts);
+        const watch = await prepareWatchPurchase(context, facts);
         if (watch)
           return watch.status === 'ready'
             ? executeAuthorizedPurchase(context, watch.authorityId)
@@ -551,12 +601,12 @@ export async function executeBrowserPurchase(
         const child = await deriveReservationGuaranteeAuthority(
           context.job.id,
           context.request.id,
-          read.facts,
+          facts,
           bounds,
           store,
         );
         if (child) return executeAuthorizedPurchase(context, child.id);
-        return requestPurchaseCard(context, read.facts, bounds);
+        return requestPurchaseCard(context, facts, bounds);
       } finally {
         await disposeBrowserRefs(refs);
       }

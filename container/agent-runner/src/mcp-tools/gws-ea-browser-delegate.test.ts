@@ -4,6 +4,7 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 import Ajv from 'ajv';
 import {
   cancelJob,
+  consentGrants,
   credentialAuthority,
   relayCode,
   reservationGuarantee,
@@ -297,4 +298,49 @@ it("asks for the principal's release of an unresolved credential attempt by its 
   expect(JSON.stringify(await waiting)).toContain('awaiting_principal');
   for (const outcome of ['release', 'awaiting_principal', 'not_releasable'])
     expect(credentialAuthority.tool.description).toContain(outcome);
+});
+
+it("lists or withdraws the principal's standing consent grants by id alone", async () => {
+  const validate = new Ajv().compile(consentGrants.tool.inputSchema);
+  for (const fields of [
+    { operation: 'list' },
+    { operation: 'list', site: 'shop.example' },
+    { operation: 'withdraw', grant_id: 'consent-1' },
+  ])
+    expect(validate(fields)).toBe(true);
+  for (const fields of [
+    {},
+    { operation: 'grant', grant_id: 'consent-1' },
+    { operation: 'withdraw' },
+    { operation: 'withdraw', grant_id: 'consent-1', site: 'shop.example' },
+    { operation: 'list', grant_id: 'consent-1' },
+    { operation: 'list', wording: 'I agree' },
+  ])
+    expect(validate(fields)).toBe(false);
+  expect((await consentGrants.handler({ operation: 'withdraw' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  const waiting = consentGrants.handler({ operation: 'withdraw', grant_id: 'consent-1', approved: true });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({
+    action: 'consent_grants',
+    requestId: row.id,
+    operation: 'withdraw',
+    grant_id: 'consent-1',
+  });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'withdrawn', grant_id: 'consent-1' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('withdrawn');
+  for (const outcome of ['listed', 'withdrawn', 'not_found', 'grant_id', 'wording'])
+    expect(consentGrants.tool.description).toContain(outcome);
 });

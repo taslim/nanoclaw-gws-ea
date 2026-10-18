@@ -152,7 +152,33 @@ export const vaultAccess = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
+export const consentGrants = requestTool({
+  name: 'consent_grants',
+  description:
+    "Read or withdraw the principal's standing agreements to wording beyond a site's own terms, each one they approved for one site and exact wording. list returns listed with each grant's grant_id, site, origin, wording and approved_at, optionally for one site. withdraw, with a grant_id from list, ends one the principal asked to withdraw: from then on that wording waits for the principal's decision again. Returns withdrawn or not_found. Repeating either is safe.",
+  properties: {
+    operation: { type: 'string', enum: ['list', 'withdraw'] },
+    grant_id: { type: 'string', description: 'For withdraw: the grant_id list returned.' },
+    site: { type: 'string', description: "For list: only this site's grants, as a domain or an address." },
+  },
+  required: ['operation'],
+  additionalProperties: false,
+  oneOf: [
+    { properties: { operation: { const: 'list' } }, not: { required: ['grant_id'] } },
+    { properties: { operation: { const: 'withdraw' } }, required: ['grant_id'], not: { required: ['site'] } },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'list')
+      return fields.grant_id === undefined ? fields : 'list takes only an optional site.';
+    if (fields.operation !== 'withdraw') return 'operation must be list or withdraw.';
+    return typeof fields.grant_id === 'string' && fields.site === undefined
+      ? fields
+      : 'withdraw takes only the grant_id list returned.';
+  },
+  repeatable: true,
+  timeoutMs: 120_000,
+});
 registerTools(
-  [cancelJob, relayCode, reservationGuarantee, reservationBounds, vaultAccess, credentialAuthority],
+  [cancelJob, relayCode, reservationGuarantee, reservationBounds, vaultAccess, credentialAuthority, consentGrants],
   'browser-delegate',
 );

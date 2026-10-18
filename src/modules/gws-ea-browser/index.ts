@@ -10,6 +10,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
+  browserConsentMigration,
   browserCredentialAttemptsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
@@ -47,6 +48,7 @@ import {
   sweepBrowserPurchaseState,
 } from './purchase.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import { registerConsentGrantsDelivery } from './consent-approval.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
 import './watches.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
@@ -60,6 +62,7 @@ registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
 registerMigration(browserWatchReleaseMigration);
 registerMigration(browserCredentialAttemptsMigration);
+registerMigration(browserConsentMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -416,11 +419,13 @@ registerBrowserActionDelivery('credential_form', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
+registerBrowserActionDelivery('request_consent', getBrowserQueue);
 for (const name of ['watch', 'list_watches', 'cancel_watch']) registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
+registerConsentGrantsDelivery();
 registerVaultAccessDelivery();
 registerCredentialAuthorityDelivery(getBrowserQueue);
 

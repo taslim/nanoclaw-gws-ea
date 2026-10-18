@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import Ajv from 'ajv';
 
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
@@ -12,6 +13,7 @@ import {
   fillSecret,
   listWatches,
   purchase,
+  requestConsent,
   runRecipe,
   saveRecipe,
   signInCode,
@@ -58,7 +60,6 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
       username: target,
       new_password: { ref: 'e2', generation: 1 },
       confirmation: { ref: 'e3', generation: 1 },
-      accept_terms: { ref: 'e5', generation: 1 },
       activate: { ref: 'e4', generation: 1 },
     },
   ],
@@ -74,6 +75,7 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
   [credentialForm, { authority: '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b', operation: 'reconcile' }],
   [purchase, { target }],
   [purchase, { operation: 'reconcile', attempt_id: 'attempt-1', target }],
+  [requestConsent, { stop_id: '0b5c3a52-8f4e-4c1d-9a7b-2e6f1d3c4b5a' }],
   [
     saveRecipe,
     { name: 'Find a table', first_action: 0, last_action: 4, parameters: [{ name: 'party', action_index: 2 }] },
@@ -187,9 +189,17 @@ describe('the browser tools', () => {
       'nothing_arrived',
       'not_watched',
       'ambiguous',
-      'accept_terms',
+      'consent_required',
+      'request_consent',
     ])
       expect(credentialForm.tool.description).toContain(outcome);
+    // The host makes every checkbox choice: the agent names no terms box at all.
+    expect(credentialForm.tool.inputSchema.properties).not.toHaveProperty('accept_terms');
+    expect(credentialForm.tool.description).not.toContain('accept_terms');
+    for (const outcome of ['consent_control', 'consent_required', 'stop_id', 'request_consent'])
+      expect(browser.tool.description).toContain(outcome);
+    for (const outcome of ['awaiting_principal', 'approved', 'withdrawn', 'unknown_stop', 'stop_used'])
+      expect(requestConsent.tool.description).toContain(outcome);
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 
@@ -203,7 +213,6 @@ describe('the browser tools', () => {
       { authority, new_password: ref(1), code_field: ref(3), activate: ref(2) },
       { authority, operation: 'verify', code_field: ref(3) },
       { authority, operation: 'verify', new_password: ref(1), activate: ref(2) },
-      { authority, operation: 'verify', accept_terms: ref(4) },
       { authority, operation: 'reconcile', activate: ref(2) },
       { authority, operation: 'reconcile', username: ref(1) },
     ]) {
@@ -211,6 +220,23 @@ describe('the browser tools', () => {
       expect(result.isError).toBe(true);
       expect(getUndeliveredMessages()).toEqual([]);
     }
+  });
+
+  it('rejects a terms box named by the agent, and asks for consent only by a stop id', () => {
+    const credential = new Ajv().compile(credentialForm.tool.inputSchema);
+    const ref = (n: number) => ({ ref: `e${n}`, generation: 1 });
+    const signup = {
+      authority: '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+      username: ref(1),
+      new_password: ref(2),
+      activate: ref(3),
+    };
+    expect(credential(signup)).toBe(true);
+    expect(credential({ ...signup, accept_terms: ref(4) })).toBe(false);
+    const consent = new Ajv().compile(requestConsent.tool.inputSchema);
+    expect(consent({ stop_id: '0b5c3a52-8f4e-4c1d-9a7b-2e6f1d3c4b5a' })).toBe(true);
+    for (const fields of [{}, { stop_id: 'stop-1', approved: true }, { stop_id: 'stop-1', wording: 'I agree' }])
+      expect(consent(fields)).toBe(false);
   });
 
   it('names only real tools in its mechanics instructions', async () => {

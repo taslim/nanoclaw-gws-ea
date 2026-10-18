@@ -332,3 +332,43 @@ export const browserPurchaseMigration: PortableMigration & { name: ModuleMigrati
     `);
   },
 };
+
+/**
+ * Consent stops and the principal's standing grants (KTD11). A stop is one wording the engine could not agree
+ * to on its own, for one job's form; a grant is the principal's agreement to that exact wording on one site
+ * and frame origin, live until main withdraws it. Grants outlive jobs, so they name no job.
+ */
+export const browserConsentMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:consent',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_consent_stops (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        site TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        wording TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('marketing','opt_out','agreement','bundled','double_negative')),
+        form_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open','requested','approved','rejected','expired','withdrawn')),
+        approval_id TEXT UNIQUE,
+        created_at TEXT NOT NULL,
+        requested_at TEXT,
+        decided_at TEXT
+      );
+      CREATE INDEX gws_ea_browser_consent_stop_job ON gws_ea_browser_consent_stops(job_id,status);
+      CREATE TABLE gws_ea_browser_consent_grants (
+        id TEXT PRIMARY KEY,
+        site TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        wording TEXT NOT NULL,
+        approval_id TEXT NOT NULL,
+        principal_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        withdrawn_at TEXT
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_consent_grant_live ON gws_ea_browser_consent_grants(site,origin,wording) WHERE withdrawn_at IS NULL;
+    `);
+  },
+};

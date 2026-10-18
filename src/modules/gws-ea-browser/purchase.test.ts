@@ -80,6 +80,10 @@ let widgetRequests: string[];
 let signInReferers: Array<[string, string | undefined]>;
 let offerRequests: string[];
 let merchantDocuments: string[];
+/** Choices the review form also holds, for the consent engine's checkout cases. */
+let reviewChoices: string;
+/** Each order submission's body, as the merchant received it. */
+let orderBodies: string[];
 const WIDGET_ORIGIN = 'https://pay.example';
 const OFFERS_ORIGIN = 'https://offers.example';
 
@@ -89,7 +93,7 @@ function reviewHtml(): string {
 <div id="payment-information">Visa ending in 4242</div><div id="displayAddressDiv">Morgan, 10 Main St, Seattle WA 98101</div>
 <table id="subtotals-marketplace-table"><tr><td>Order total:</td><td>$${total}</td></tr></table>
 <div class="shipment"><div class="delivery-promise">Arriving Tuesday, October 20, 2026</div><div class="item-row" data-asin="B012345678"><a class="a-link-normal" href="/dp/B012345678">Tea kettle</a><span class="quantity">Qty: 1</span></div></div>
-<div id="purchase-legal-text">By placing your order, you agree to Amazon's privacy notice and conditions of use.</div>
+<div id="purchase-legal-text">By placing your order, you agree to Amazon's privacy notice and conditions of use.</div>${reviewChoices}
 <div id="placeYourOrder"><input type="submit" name="placeYourOrder1" value="Place your order"></div><button type="button">Continue</button></form></body></html>`;
 }
 function productHtml(): string {
@@ -337,6 +341,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         } else if (request.method === 'POST') {
           submitted++;
           sawPost?.();
+          let body = '';
+          request.on('data', (chunk: Buffer) => {
+            body += chunk.toString();
+          });
+          request.on('end', () => orderBodies.push(body));
           const finish = () => {
             response.writeHead(302, {
               location: `${AMAZON_RETAIL.origin}${confirmation ? '/gp/your-account/order-details?orderID=123-1234567-1234567' : AMAZON_RETAIL.confirmationPath}`,
@@ -481,6 +490,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     signInReferers = [];
     offerRequests = [];
     merchantDocuments = [];
+    reviewChoices = '';
+    orderBodies = [];
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
@@ -613,6 +624,80 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await click(approval);
     await queue.idle();
     expect(submitted).toBe(1);
+  });
+  it('puts an age attestation on the purchase card itself; approving it ticks the box and stands as a grant, with no second card', async () => {
+    reviewChoices = '<label><input type="checkbox" name="age" required> I confirm I am 21 or older</label>';
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    expect(approval.question).toContain(
+      'Agreement: "I confirm I am 21 or older". Approving agrees to it, here and whenever this exact wording appears on amazon.com again, until you withdraw it.',
+    );
+    // Nothing is agreed before the principal decides.
+    expect(await page.locator('input[name="age"]').isChecked()).toBe(false);
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(1);
+    expect(new URLSearchParams(orderBodies[0]).get('age')).toBe('on');
+    expect(sent).toHaveLength(1);
+    expect(
+      await getDb().all('SELECT site,origin,wording,approval_id,withdrawn_at FROM gws_ea_browser_consent_grants'),
+    ).toEqual([
+      {
+        site: 'amazon.com',
+        origin: AMAZON_RETAIL.origin,
+        wording: 'I confirm I am 21 or older',
+        approval_id: approval.approval_id,
+        withdrawn_at: null,
+      },
+    ]);
+  });
+  it('asks again before the commit when main withdrew an agreement the card approved', async () => {
+    reviewChoices = '<label><input type="checkbox" name="age" required> I confirm I am 21 or older</label>';
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    // Withdrawn between the approval and the commit: the grant check inside begin() refuses the press.
+    cardDuringDelivery = undefined;
+    await getDb().run(
+      "CREATE TRIGGER withdraw_after_grant AFTER INSERT ON gws_ea_browser_consent_grants BEGIN UPDATE gws_ea_browser_consent_grants SET withdrawn_at = '2026-10-17T00:00:00.000Z' WHERE id = NEW.id; END",
+    );
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(0);
+    const [fresh] = await approvals();
+    expect(fresh.approval_id).not.toBe(approval.approval_id);
+    expect(fresh.question).toContain('An agreement on this checkout is no longer approved.');
+    expect(fresh.question).toContain('Agreement: "I confirm I am 21 or older"');
+  });
+  const roundUp = (again: boolean): string =>
+    `<label><input type="checkbox" id="round-up" name="round_up" checked> Round up for charity ($0.58)</label>${
+      again
+        ? `<script>const box = document.getElementById('round-up'); box.addEventListener('change', () => { if (!box.checked) setTimeout(() => { box.checked = true; }, 50); });</script>`
+        : ''
+    }`;
+  it('unticks a pre-ticked round-up before the card, which names no charge for it', async () => {
+    reviewChoices = roundUp(false);
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    expect(approval.question).not.toContain('Round up');
+    expect(await page.locator('#round-up').isChecked()).toBe(false);
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(1);
+    expect(new URLSearchParams(orderBodies[0]).has('round_up')).toBe(false);
+  });
+  it('names a round-up the site keeps ticking as a charge on the card, which its approval covers', async () => {
+    reviewChoices = roundUp(true);
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    expect(approval.question).toContain('Extra charge the site keeps selected: "Round up for charity ($0.58)"');
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(1);
+    expect(new URLSearchParams(orderBodies[0]).get('round_up')).toBe('on');
   });
   it('keeps another job off a checkout while its principal card holds the site', async () => {
     await buy();

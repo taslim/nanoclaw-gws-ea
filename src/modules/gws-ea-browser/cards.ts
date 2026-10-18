@@ -106,6 +106,11 @@ export function renderPurchaseCard(
         ]
       : []),
     ...(bounds.neededBy ? [`Needed by: ${cardTime(bounds.neededBy, principalTimeZone)}`] : []),
+    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
+    ...(facts.agreements ?? []).map(
+      (agreement) =>
+        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
+    ),
   ];
   for (const term of facts.commitments) {
     lines.push(`Financial commitment: ${term.kind}; ${quotePurchaseText(term.terms, 700)}`);

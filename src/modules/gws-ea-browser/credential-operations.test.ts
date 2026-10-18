@@ -321,16 +321,9 @@ describe('the browser credential request', () => {
       code_field: ref(5),
       activate: ref(6),
     });
-    expect(
-      validateCredentialForm({
-        authority,
-        username: ref(1),
-        new_password: ref(2),
-        accept_terms: ref(3),
-        activate: ref(4),
-      }),
-    ).toMatchObject({ accept_terms: ref(3) });
     for (const content of [
+      // The host makes every checkbox choice; the agent never names a terms box.
+      { authority, username: ref(1), new_password: ref(2), accept_terms: ref(3), activate: ref(4) },
       { authority, operation: 'reconcile', activate: ref(4) },
       { authority, operation: 'reconcile', new_password: ref(2), activate: ref(4) },
       { authority, operation: 'verify', code_field: ref(5) },
@@ -442,7 +435,7 @@ describe('the browser credential request', () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
   });
 
-  it('never accepts a terms checkbox for a password change', async () => {
+  it('never takes a terms checkbox from the agent, for a signup or a password change', async () => {
     await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
     const { page, result } = run(String(recorded.authority), {
@@ -452,6 +445,10 @@ describe('the browser credential request', () => {
     });
     await expect(result).rejects.toMatchObject({ code: 'invalid-args' });
     expect(page).not.toHaveBeenCalled();
+    const signup = await ask({ operation: 'signup', site: ORIGIN, username: 'remy.vance@example.com' });
+    const joining = run(String(signup.authority), { username: ref(1), new_password: ref(2), accept_terms: ref(3) });
+    await expect(joining.result).rejects.toMatchObject({ code: 'invalid-args' });
+    expect(joining.page).not.toHaveBeenCalled();
   });
 
   describe('reconciliation', () => {

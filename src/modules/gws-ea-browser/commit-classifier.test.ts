@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
+import * as consentEngine from './consent.js';
 afterEach(() => vi.restoreAllMocks());
 import {
   activateControl,
   classifyActivation,
   classifyControlFacts,
   classifyCredentialControlFacts,
-  termsConsentLabel,
   classifyCredentialNavigation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
@@ -17,6 +17,7 @@ import {
   type ControlFacts,
   type ControlRegion,
 } from './commit-classifier.js';
+import { termsConsentLabel } from './consent.js';
 
 const button = (name: string, changes: Partial<ControlFacts> = {}): ControlFacts => ({
   name,
@@ -78,6 +79,49 @@ describe('the open rule', () => {
         button('Register', { tag: 'a', type: '', href: 'https://events.example/signup', moneyTerms: true }),
       ),
     ).toBe('ordinary');
+  });
+
+  it('refuses a click on a choice the consent engine owns, by the choice it would toggle (step 4)', () => {
+    const box = (label: string, changes: Partial<ControlFacts> = {}): ControlFacts =>
+      button(label, { tag: 'label', type: '', toggles: { kind: 'checkbox', label }, ...changes });
+    for (const label of [
+      'Send me offers',
+      'Tick here if you do NOT want our newsletter',
+      'I agree to the Terms of Service',
+      'I confirm I am 21 or older',
+      'Round up for charity ($0.58)',
+    ])
+      expect(classifyControlFacts(box(label))).toBe('consent_control');
+    expect(
+      classifyControlFacts(
+        button('', { tag: 'div', role: 'switch', toggles: { kind: 'switch', label: 'Text me deals' } }),
+      ),
+    ).toBe('consent_control');
+    expect(
+      classifyControlFacts(
+        button('Marketing', {
+          tag: 'select',
+          type: 'select-one',
+          toggles: { kind: 'select', label: 'Marketing emails', options: ['Yes', 'No'] },
+        }),
+        'select',
+      ),
+    ).toBe('consent_control');
+    // Functional choices stay the agent's, a priced delivery option among them.
+    expect(classifyControlFacts(box('Same as billing address'))).toBe('ordinary');
+    expect(
+      classifyControlFacts(
+        button('Express delivery, $8.00', {
+          tag: 'input',
+          type: 'radio',
+          toggles: { kind: 'radio', label: 'Express delivery, $8.00', group: 'Delivery option' },
+        }),
+      ),
+    ).toBe('ordinary');
+    // The earlier steps still decide first: a press that sends a message speaks, whatever it toggles.
+    expect(classifyControlFacts(box('Send me offers', { tag: 'button', type: 'submit', name: 'Send message' }))).toBe(
+      'speaks_as_principal',
+    );
   });
 
   it('treats a commit on a transaction page as a purchase and named preparation there as ordinary', () => {
@@ -306,7 +350,12 @@ it('submits positively identified native authentication forms without invoking a
       ],
     },
   } as unknown as NonNullable<Awaited<ReturnType<typeof nativeAuthentication.inspectNativeAuthenticationControl>>>);
+  const consentPass = vi
+    .spyOn(consentEngine, 'runConsentPass')
+    .mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
   vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(async () => {
+    // The consent engine's check runs before the native submission, never after it.
+    expect(consentPass).toHaveBeenCalledTimes(1);
     native();
     return true;
   });
