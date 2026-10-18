@@ -10,8 +10,9 @@ for a command's flags, scope, effects, prerequisites, recovery, and examples.
 print identical help. Invalid paths remain errors even with `--help`.
 See [the voice guide](gws-ea-voice.md) for optional voice installation,
 activation, and health checks, [1Password vaults](#1password-vaults) for
-assistants' saved logins, and [web alias](#web-alias) for the address an
-assistant's browser uses.
+assistants' saved logins, [web alias](#web-alias) for the address an
+assistant's browser uses, and [browser access](#browser-access) for which of
+its agents may use the browser.
 
 ## Find and inspect an assistant
 
@@ -208,6 +209,29 @@ Until the alias is verified, `status` reports setup as incomplete: its
 that continues. The alias is set up through the running assistant, so a
 stopped one pauses until `gws-ea start`. A recorded alias is not changed by
 these flags.
+
+## Browser access
+
+```sh
+# Let main and one more agent group use the browser:
+gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef \
+  --agent-group <main_agent_group_id> --agent-group <agent_group_id>
+# Back to main alone:
+gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef --main-only
+```
+
+By default only the assistant's main agent delegates browser errands. Repeat
+`--agent-group` to list exactly the agent groups that may; include main's ID to
+keep it. Before writing the list, gws-ea asks the running assistant to confirm
+that it reads access lists and has each group. The browser and external-email
+groups can never be listed. A listed group shares the one signed-in browser
+profile and the vault's logins; its purchase, consent and watch approvals still
+go to the principal, and its errands, cards and notices stay its own. A group
+removed from the list has its errands cancelled.
+
+`disable` and a plain `enable` keep the list, and `capabilities show browser`
+reports it. While a list is in place, `rollback`, and reverting an open update,
+are refused to a release that cannot read it; `--main-only` lifts that.
 
 ## Automation and streams
 

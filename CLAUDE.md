@@ -74,7 +74,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
-| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, private Chrome pipe, public-only proxy, job queue, sign-in, purchase authority, recipes and watches |
+| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, private Chrome pipe, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
 | `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning, disable and removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
@@ -146,7 +146,8 @@ chooses a tool job by peer affinity. A per-thread destination suits a tool
 agent that runs one session per delegated errand; its reports to the delegating
 agent are untrusted information, and worker-style subagents remain the normal
 pattern for other work. GWS-EA's `browser` is such a sealed tool agent; its
-reports to `main` are framed as untrusted.
+reports to the agent that delegated the errand (`main`, or a group the browser
+access setting lists) are framed as untrusted.
 
 Key files: `src/modules/agent-to-agent/db/agent-destinations.ts`,
 `src/modules/agent-to-agent/db/threaded-destinations.ts`, and
@@ -257,6 +258,43 @@ control plane's config root, each runtime token in instance secrets), outside
 snapshots and container mounts. Profile and staging data live under
 `<instance root>/browser/`, outside routine snapshot roots. There is no
 Keychain credential store, debugging TCP endpoint or takeover portal.
+
+### Host browser errands
+
+The browser runs errands on any public site; the host refuses only
+commit-class actions. Every control and navigation is classified fresh, in one
+order (`commit-classifier.ts`): blocked address, account security, speaking as
+the principal, consent-class controls, purchase vocabulary, a commit on a
+transaction page (a total or charge with a payment method in one form or
+dialog), else ordinary. Control facts are read in isolated worlds. Ordinary
+actions run as native Playwright actions with the hit-target check; during each
+one, non-GET script requests to payment processors and purchase routes are
+refused, and a document that loads between operations must be an ordinary GET
+on the job's leased site.
+
+A commit-class click answers `purchase_control`, and the agent calls
+`purchase`. A free booking is pressed by the host; a checkout with no saved
+payment method answers `card_needed` (there is no card entry); every paid
+checkout goes to the principal as a card with the host-read facts and a clipped
+picture of the checkout. Reviewed Amazon US and Resy readers keep exact facts;
+any other site uses `generic-signature.ts`. One resolve function settles every
+attempt: without page proof it is `unconfirmed`, only the next purchase on that
+merchant waits, and main records the outcome from the order email or the
+principal with `record_purchase_outcome`. A paid confirmation after an
+ordinary click is an `unapproved_commit` incident.
+
+The host makes every consent choice before a submission (`consent.ts`): site
+terms ticked, marketing and sharing opted out, and an agreement stops with
+`consent_required` until the principal grants that wording on that site. It
+rejects cookie banners before observations where a reject option shows. The
+principal's stored private values reach a site only through main's per-errand
+`record_disclosure`. Each browsing assistant's web alias (its name reversed,
+added by the operator and verified by gws-ea's probe) is its email on every
+site and one of its addresses for mail routing. Browser policy version 2 lists
+the agent groups that may delegate (`access.ts`); version 1 means main alone.
+Watches on a site without a reader record a recipe, a marked region and its
+baseline, and wake the agent only when the region changes; release checks
+follow the venue's stated schedule.
 
 ## Rebuild Workflow (Temporary)
 
