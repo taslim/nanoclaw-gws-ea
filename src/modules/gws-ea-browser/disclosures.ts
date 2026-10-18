@@ -64,7 +64,10 @@ export async function recordDisclosureRequest(
   const site = disclosureSite(named);
   if (site === undefined) throw invalidArgs('The site must be a public website, given as its address or its domain.');
   const value = await privateValueReference(valueId);
-  if (!value) throw invalidArgs('No stored private value has that id: read the ids with `ncl private-values list`.');
+  if (!value)
+    throw invalidArgs(
+      'No stored private value has that id: main reads the ids with `ncl private-values list`; another agent asks main.',
+    );
   if (value.principalAddress)
     throw forbidden(
       "The principal's email addresses go onto a site only when the host signs them in to their own account: a site gets the assistant's web address instead.",
