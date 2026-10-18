@@ -622,6 +622,56 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
   });
 });
 
+describe('recorded divergence: request-addressed conversation reminders', () => {
+  it('keeps one native task when an interrupted request is replayed and retains random identities for other callers', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'reminder-agent',
+      name: 'Robin',
+      folder: 'reminder-agent',
+      agent_provider: null,
+      created_at,
+    });
+    await db.createMessagingGroup({
+      id: 'reminder-chat',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      name: 'Trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('reminder-agent', 'reminder-chat', null, 'shared');
+    const { createScheduledTask } = await import('../modules/scheduling/create.js');
+    const task = {
+      prompt: 'Remind the group to choose a cabin.',
+      recurrence: null,
+      script: null,
+      processAfter: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const first = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
+    const replay = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
+    expect(first.row.id).toBe('chat-reminder-request-1');
+    expect(replay.row.id).toBe(first.row.id);
+    await manager.withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      expect(mailbox.listLiveTasks()).toHaveLength(1);
+      expect(mailbox.listLiveTasks()[0]?.content).toContain('"inConversation":true');
+    });
+    const ordinary = await createScheduledTask('reminder-agent', task, { session });
+    const another = await createScheduledTask('reminder-agent', task, { session });
+    expect(ordinary.row.id).not.toBe(another.row.id);
+    await manager.withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      expect(mailbox.listLiveTasks()).toHaveLength(3);
+    });
+  });
+});
+
 describe('recorded divergence: prepared module engagement and destination-free chat wirings', () => {
   it('keeps silent context, wakes only on the module decision, and orders host work in the conversation tail', async () => {
     await freshInstall();
@@ -668,7 +718,14 @@ describe('recorded divergence: prepared module engagement and destination-free c
       channelType: 'whatsapp',
       platformId: 'trip',
       threadId: null,
-      message: { id, kind: 'chat', content: JSON.stringify({ text }), timestamp: created_at, isGroup: true },
+      message: {
+        id,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        timestamp: created_at,
+        isGroup: true,
+        deduplicate: true,
+      },
     });
     external.requestWake.mockClear();
     await Promise.all([
@@ -678,6 +735,9 @@ describe('recorded divergence: prepared module engagement and destination-free c
       }),
       router.routeInbound(event('addressed', 'voice, check Thursday.')),
     ]);
+    expect(order).toEqual(['banter', 'cutover', 'addressed']);
+    expect(external.requestWake).toHaveBeenCalledTimes(1);
+    await router.routeInbound(event('addressed', 'voice, check Thursday.'));
     expect(order).toEqual(['banter', 'cutover', 'addressed']);
     expect(external.requestWake).toHaveBeenCalledTimes(1);
     const session = await db.getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-1');

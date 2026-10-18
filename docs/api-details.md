@@ -16,6 +16,14 @@ When a durable delivery row is present, each text part gets a stable row/part
 key. Attachments, cards and direct sends without a row ID retain their existing
 posting path.
 
+## Request-addressed conversation tasks
+
+`createScheduledTask(agentGroupId, task, { session, id })` accepts an optional
+caller-selected native task ID. A repeated ID returns the existing task in that
+session, including after its due time, so replaying an interrupted host action
+does not create another reminder. IDs use lowercase letters, digits and hyphens.
+Omitting `id` retains the existing generated-ID behavior.
+
 ## Channel Adapter Interface
 
 ### NanoClaw Channel Interface
@@ -126,6 +134,10 @@ A wiring with `engage_mode: 'module'` uses the channel's
 inbound preparation. The decider receives the prepared event, session, messaging
 group and wiring, so recognized speech can engage it. A false result or missing
 decider stores silent context without typing or waking an agent.
+
+Retry-safe inbound already stored in its canonical session mailbox is skipped
+before the module decider runs. A replay cannot consume a later expected reply.
+Other engagement modes retain their existing delivery behavior.
 
 `createMessagingGroupAgent(wiring, { companionDestination: false })` writes the
 wiring without a group-wide channel destination. Its sessions can still reply

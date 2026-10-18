@@ -143,18 +143,22 @@ function conversationFor(agentGroupId: string, session: Session): Session {
 /**
  * Persist a prepared task through NanoClaw's single task/session representation.
  * It runs in an isolated session of its own, or, given `session`, comes back
- * as a turn of that conversation.
+ * as a turn of that conversation. A caller-selected id reuses the first task in
+ * that session, so replaying a durable host action cannot create a second task.
  */
 export async function createScheduledTask(
   agentGroupId: string,
   task: PreparedScheduledTask,
-  options?: { status?: 'pending' | 'paused'; originSessionId?: string | null; session?: Session },
+  options?: { id?: string; status?: 'pending' | 'paused'; originSessionId?: string | null; session?: Session },
 ): Promise<{ session: { id: string; agent_group_id: string }; row: ScheduledTaskRow }> {
-  const id = makeTaskId(task.name);
+  const id = options?.id ?? makeTaskId(task.name);
+  if (!/^[a-z0-9-]+$/u.test(id)) throw new Error('task id must contain only lowercase letters, digits and hyphens');
   const conversation = options?.session ? conversationFor(agentGroupId, options.session) : undefined;
   const session = conversation ?? (await resolveTaskSession(agentGroupId, id)).session;
 
   const row = await withMailboxSession(agentGroupId, session.id, async (db) => {
+    const existing = options?.id === undefined ? undefined : db.getTask(id);
+    if (existing) return existing;
     await db.insertTask({
       id,
       seriesId: id,

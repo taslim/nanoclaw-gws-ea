@@ -200,6 +200,27 @@ describe('module engagement after preparation', () => {
     expect(decide).not.toHaveBeenCalled();
     expect(requestWake).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps a new expected reply when a retry-safe old message is delivered again', async () => {
+    await seed();
+    let waiting = false;
+    router.registerEngagementDecider(channelType, () => {
+      const expected = waiting;
+      waiting = false;
+      return expected;
+    });
+    await router.routeInbound(event('old-banter', 'Funny video.'));
+    waiting = true;
+    await router.routeInbound(event('old-banter', 'Funny video.'));
+    await router.routeInbound(event('new-answer', 'Thursday.'));
+
+    expect((await rows()).map(({ id, trigger }) => ({ id, trigger }))).toEqual([
+      { id: 'old-banter:ag-1', trigger: 0 },
+      { id: 'new-answer:ag-1', trigger: 1 },
+    ]);
+    expect(requestWake).toHaveBeenCalledTimes(1);
+    expect(startTypingRefresh).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('conversation-tail work', () => {

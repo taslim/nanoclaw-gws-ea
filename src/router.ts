@@ -39,7 +39,13 @@ import { backfillSession, fanInboundMessage } from './modules/cross-session-cont
 import { canAccessAgentGroup } from './modules/permissions/access.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { effectiveSessionMode, findSession, resolveSession, writeSessionMessage } from './session-manager.js';
+import {
+  effectiveSessionMode,
+  findSession,
+  resolveSession,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
@@ -824,6 +830,14 @@ async function deliverToAgent(
   if (prepare) event = await prepare(session);
 
   if (delivery === 'module') {
+    if (
+      event.message.deduplicate &&
+      event.message.id &&
+      (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.hasMessage(messageIdForAgent(event.message.id, agent.agent_group_id)),
+      ))
+    )
+      return;
     const decide = engagementDeciders.get(event.channelType);
     delivery = decide && (await decide({ event, session, messagingGroup: mg, wiring: agent })) ? 'wake' : 'accumulate';
   }

@@ -84,3 +84,24 @@ key path. The native outage-notice test loses the acknowledgement after Google
 accepts, retries through the real registry/bridge/Google client, and sees one
 posted message. Google documents `requestId` for user authentication in
 [messages.create](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).
+
+## Keep duplicate inbound from consuming a later expected reply
+
+For opt-in module engagement, a retry-safe inbound row already present in its
+canonical mailbox is skipped before the module decider runs. This prevents a
+delayed duplicate from consuming a new expected reply. Other engagement modes
+keep their existing path. The native routing proof reproduces the lost wake;
+the recorded-divergence test also verifies the decider is not run again.
+
+## Give an interrupted reminder request one native task
+
+`createScheduledTask` accepts an optional `options.id`. A caller can derive that
+ID from its session and durable request, and a replay returns the task already
+stored under it. Existing callers that omit the ID keep generated identities.
+This closes the gap between persisting a conversation reminder and writing the
+host action's answer, without a second task store.
+
+Evidence: the reminder test replays an action after its task was made but before
+its answer was written. The recorded-divergence test drives the native helper in
+a temporary install, observes one task on replay, and checks that omitted IDs
+still produce separate tasks.
