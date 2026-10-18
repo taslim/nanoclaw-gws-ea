@@ -12,6 +12,7 @@ import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
+  browserDisclosuresMigration,
   browserIncidentsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
@@ -51,6 +52,7 @@ import {
 } from './purchase.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { registerConsentGrantsDelivery } from './consent-approval.js';
+import { registerDisclosureDelivery } from './disclosures.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
 import './watches.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
@@ -66,6 +68,7 @@ registerMigration(browserWatchReleaseMigration);
 registerMigration(browserCredentialAttemptsMigration);
 registerMigration(browserConsentMigration);
 registerMigration(browserIncidentsMigration);
+registerMigration(browserDisclosuresMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -430,6 +433,7 @@ registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerConsentGrantsDelivery();
+registerDisclosureDelivery();
 registerVaultAccessDelivery();
 registerCredentialAuthorityDelivery(getBrowserQueue);
 

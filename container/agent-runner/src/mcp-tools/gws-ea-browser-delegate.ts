@@ -178,7 +178,30 @@ export const consentGrants = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
+export const recordDisclosure = requestTool({
+  name: 'record_disclosure',
+  description:
+    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id from `ncl private-values list`. Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up, and before the job fills the value in. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
+  properties: {
+    thread: THREAD,
+    site: { type: 'string', description: 'The site the principal named, as its address or its domain.' },
+    value_id: { type: 'string', description: 'The stored value’s id, from `ncl private-values list`.' },
+  },
+  required: ['thread', 'site', 'value_id'],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: 120_000,
+});
 registerTools(
-  [cancelJob, relayCode, reservationGuarantee, reservationBounds, vaultAccess, credentialAuthority, consentGrants],
+  [
+    cancelJob,
+    relayCode,
+    reservationGuarantee,
+    reservationBounds,
+    vaultAccess,
+    credentialAuthority,
+    consentGrants,
+    recordDisclosure,
+  ],
   'browser-delegate',
 );

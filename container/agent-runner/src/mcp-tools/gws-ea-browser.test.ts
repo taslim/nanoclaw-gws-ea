@@ -196,7 +196,7 @@ describe('the browser tools', () => {
     // The host makes every checkbox choice: the agent names no terms box at all.
     expect(credentialForm.tool.inputSchema.properties).not.toHaveProperty('accept_terms');
     expect(credentialForm.tool.description).not.toContain('accept_terms');
-    for (const outcome of ['consent_control', 'consent_required', 'stop_id', 'request_consent'])
+    for (const outcome of ['consent_control', 'consent_required', 'stop_id', 'request_consent', 'personal_data'])
       expect(browser.tool.description).toContain(outcome);
     for (const outcome of ['awaiting_principal', 'approved', 'withdrawn', 'unknown_stop', 'stop_used'])
       expect(requestConsent.tool.description).toContain(outcome);

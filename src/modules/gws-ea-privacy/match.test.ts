@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   canonicalText,
   compilePrivateValue,
+  fieldStreamOf,
   findPrivateValue,
+  givesAway,
   streamOf,
   uncheckableReason,
   type PrivateValueKind,
@@ -120,6 +122,19 @@ describe('private-value matching', () => {
     const message = streamOf(['Tuesday at 3pm works. Room 12, building 3, dial-in 555 0199.']);
     expect(findPrivateValue(compiled, message)).toBeUndefined();
     expect(findPrivateValue([], streamOf(['123 Main Street']))).toBeUndefined();
+  });
+
+  it("reads a form's fields as one text, a phone number split across them included", () => {
+    const phone = compilePrivateValue('phone', '+1 (415) 555-0134');
+    const fields = ['Morgan Ellery', '415', '555', '0134'];
+    expect(givesAway(phone, fieldStreamOf(fields))).toBe(true);
+    expect(givesAway(phone, fieldStreamOf(['(415)', '555-0134']))).toBe(true);
+    // A message's parts never run one phone-like run into the next.
+    expect(givesAway(phone, streamOf(fields))).toBe(false);
+    expect(givesAway(compilePrivateValue('address', '12 Elm Road, Springfield'), fieldStreamOf(['12 Elm', 'Rd']))).toBe(
+      true,
+    );
+    expect(givesAway(phone, fieldStreamOf(['2', '2026-10-17', '19:00', 'Window seat']))).toBe(false);
   });
 
   it('refuses values too short or too long to check reliably', () => {

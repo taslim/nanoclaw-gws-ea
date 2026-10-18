@@ -21,6 +21,7 @@ import { isSensitiveField } from './authentication-signatures.js';
 import { readConfirmation, showsCharge } from './confirmation.js';
 import { BrowserConsentStop, type ConsentStopView } from './consent.js';
 import { settleCookieBanners } from './cookie-banners.js';
+import { personalDataStop } from './disclosures.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { SiteLeaseStore } from './leases.js';
@@ -62,6 +63,7 @@ export type BrowserStopReason =
   | 'window_closed'
   | 'browser_unavailable'
   | 'alias_unavailable'
+  | 'personal_data'
   | 'interrupted';
 export type BrowserAction =
   | { kind: 'navigate'; url: string }
@@ -336,10 +338,14 @@ export async function executeBrowserBatch(
 ): Promise<Record<string, unknown>> {
   if (options.siteAccess && (!options.page || !options.readOnly))
     throw new Error('Signed-out site access requires an explicit read-only page');
+  const { actions } = validateBrowserBatch(payload);
   // Before any action runs: an address the assistant converses from never goes onto a site (KTD14).
-  const addressStop = await typedAddressStop(validateBrowserBatch(payload).actions.flatMap(typedText));
+  const addressStop = await typedAddressStop(actions.flatMap(typedText));
   if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
+  // Nor does the principal's personal data, except where main disclosed it for this errand (KTD19).
+  const dataStop = await personalDataStop(context.store.db, context.job.id, page.url(), actions);
+  if (dataStop) return { status: 'stopped', reason: dataStop, repeat_safe: true };
   let ran: { answer: Record<string, unknown>; unapproved?: UnapprovedCommit };
   try {
     ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page, options), {

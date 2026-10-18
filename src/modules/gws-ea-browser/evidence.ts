@@ -124,6 +124,7 @@ const OPERATIONAL_CODES = new Set([
   'window_closed',
   'browser_unavailable',
   'alias_unavailable',
+  'personal_data',
   'interrupted',
   'outcome_unknown',
   'awaiting_principal',

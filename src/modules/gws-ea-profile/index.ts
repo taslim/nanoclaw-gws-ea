@@ -97,6 +97,19 @@ function mainWebSentences(assistant: string, principal: string, alias: string | 
   return `${address} ${assistant} never creates an account in ${principal}'s name: ${principal}'s own accounts come only from their logins in 1Password, so when an errand needs one that the vault has no login for, ask ${principal} to add it to 1Password.`;
 }
 
+/**
+ * The principal's addresses for the browser (R34): to recognize on a page, never to give a site. Only the
+ * host puts one on a site, when it signs the principal in to their own account from their login in 1Password.
+ */
+function browserPrincipalAddressesSentence(principal: string, emails: readonly string[]): string {
+  if (emails.length === 0) return '';
+  const quoted = LIST.format(emails.map((email) => `\`${email}\``));
+  const signIn = `signing ${principal} in to their own account with their login in 1Password.`;
+  return emails.length === 1
+    ? ` ${principal}'s email address is ${quoted}, so you recognize it on a page; never type it into a site. Only the host puts it on a site, ${signIn}`
+    : ` ${principal}'s email addresses are ${quoted}, so you recognize them on a page; never type one into a site. Only the host puts one on a site, ${signIn}`;
+}
+
 /** The browser's email on every website (KTD14): the alias, never the address the assistant converses from. */
 function browserWebSentence(assistant: string, principal: string, alias: string | null): string {
   return alias === null
@@ -118,7 +131,8 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
  * reads the principal's addresses live. `external-email` writes to people
  * other than the principal, so it gets the two names and no address of
  * either. The browser gives the assistant's web alias to websites, never
- * the address it converses from. Any other group gets the addresses as of
+ * the address it converses from, and knows the principal's addresses only
+ * to recognize them (R34). Any other group gets the addresses as of
  * its container's start: the default `group` CLI scope leaves the live list
  * out of its reach.
  */
@@ -132,13 +146,12 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const audience = await projectDocAudience(group.id);
   if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
   const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
-  const theirs = principalAddressesSentence(principal, profile.principal_emails);
   const body =
     audience === 'main'
       ? `${own}${mainWebSentences(assistant, principal, profile.assistant_alias)}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`
       : audience === 'browser'
-        ? `${browserWebSentence(assistant, principal, profile.assistant_alias)}${theirs}`
-        : `${own}${theirs}`;
+        ? `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`
+        : `${own}${principalAddressesSentence(principal, profile.principal_emails)}`;
   return { name: 'Assistant Identity', body: `${names}${body}` };
 }
 

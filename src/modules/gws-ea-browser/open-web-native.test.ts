@@ -30,6 +30,7 @@ import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -45,6 +46,7 @@ import {
 } from './commit-classifier.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
+import { recordDisclosureRequest } from './disclosures.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
@@ -52,10 +54,13 @@ import {
   CONSENT,
   COOKIE_BANNERS,
   OPEN_WEB,
+  PERSONAL_DATA,
   PROCESSOR,
   openWebFixture,
   type OpenWebFixture,
+  type OpenWebRequest,
 } from './open-web-native-fixture.js';
+import { browserVault } from './onepassword.js';
 import { observePage, type BrowserObservation, type BrowserRef } from './observe.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
@@ -1120,5 +1125,230 @@ describe.skipIf(!chromePath)('cookie banners in native Chrome', { timeout: 30_00
       expect(await received()).toEqual({});
     }
     expect(fixture.requests.filter((request) => request.method !== 'GET')).toEqual([]);
+  });
+});
+
+describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { timeout: 60_000 }, () => {
+  const MOBILE = '+1 415 555 0134';
+  const HOME = '123 Main Street, Springfield';
+  let fixture: OpenWebFixture;
+  let page: Page;
+  let queue: BrowserQueue;
+  let main: Session;
+  let errand: Session;
+  let mobile: string;
+  const posts = (): OpenWebRequest[] => fixture.requests.filter((request) => request.method !== 'GET');
+  const policy = (content: Record<string, unknown>): void =>
+    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify(content), { mode: 0o600 });
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    fs.mkdirSync(`${root}/browser`, { recursive: true });
+    policy({ schemaVersion: 1, enabled: true });
+    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+    await runMigrations(await initTestDb());
+    for (const id of ['main-p', 'browser-p', 'research-p'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Juno',
+      assistantWorkspaceEmail: 'juno@assistant.example',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'America/Los_Angeles',
+      mainAgentGroupId: 'main-p',
+      principalEmails: ['morgan@example.test'],
+    });
+    await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'browser-p');
+    main = (await resolveSystemSession('main-p', 'system:test:main')).session;
+    errand = (await resolveSystemSession('browser-p', 'system:a2a:main-p:dinner')).session;
+    mobile = (await addPrivateValue({ label: 'Mobile', kind: 'phone', value: MOBILE })).id;
+    await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+    page = await fixture.newPage();
+    queue = new BrowserQueue(new BrowserStore(), {
+      pageForJob: async () => page,
+      connection: async (): Promise<never> => {
+        throw new Error('Not used');
+      },
+      closeJob: async () => undefined,
+      onDisconnected: () => () => undefined,
+    });
+    configureBrowserCancellation(queue);
+    await queue.start();
+    setBrowserAdmissionReady(true);
+    fixture.requests.length = 0;
+  });
+  afterEach(async () => {
+    setBrowserAdmissionReady(false);
+    await queue?.stop();
+    await page?.context().close();
+    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    await closeDb();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** One request through the queue, as the errand's browser agent sends it; its answer's data, without the queue's timing. */
+  async function request(
+    id: string,
+    action: string,
+    content: Record<string, unknown>,
+    from: Session = errand,
+  ): Promise<Record<string, unknown>> {
+    await queue.accept(action, content, from, id);
+    await queue.idle();
+    const row = await getDb().get<{ answer_json: string }>(
+      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
+      from.id,
+      id,
+    );
+    if (!row) throw new Error(`No answer for ${id}`);
+    const { timing: _timing, ...data } = (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
+    return data;
+  }
+  const run = (id: string, actions: BrowserAction[], from: Session = errand) =>
+    request(id, 'browser', { actions }, from);
+  /** Opens `url` and answers with the observation the navigation returned. */
+  async function open(url: string, from: Session = errand): Promise<BrowserObservation> {
+    const opened = await run(`open-${randomUUID()}`, [{ kind: 'navigate', url }], from);
+    expect(opened).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    return opened.observation as BrowserObservation;
+  }
+  const disclose = (site: string, from: Session = main, thread = errand.thread_id) =>
+    recordDisclosureRequest({ thread, site, value_id: mobile }, from);
+  const refusedBeforeTyping = { status: 'stopped', reason: 'personal_data', repeat_safe: true };
+
+  it('fills the mobile number main disclosed for the restaurant its brief names, and the booking goes through', async () => {
+    expect(await disclose('https://osteria.example/')).toMatchObject({ status: 'recorded', site: 'osteria.example' });
+    const form = await open(PERSONAL_DATA.booking);
+    expect(
+      await run('book', [
+        {
+          kind: 'form_input',
+          fields: [
+            { ...refIn(form, 'Name'), value: 'Morgan Ellery' },
+            { ...refIn(form, 'Mobile'), value: '(415) 555-0134' },
+          ],
+          submit: refIn(form, 'Reserve'),
+        },
+      ]),
+    ).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await page.locator('h1').textContent()).toBe('Your table is reserved');
+    const [booked] = posts();
+    expect(booked?.url).toBe(PERSONAL_DATA.booked);
+    expect(new URLSearchParams(booked?.body).get('mobile')).toBe('(415) 555-0134');
+  });
+
+  it('refuses the mobile number on an injected page on another site, before anything is typed', async () => {
+    await disclose('osteria.example');
+    const form = await open(PERSONAL_DATA.claim);
+    expect(
+      await run('claim', [
+        {
+          kind: 'form_input',
+          fields: [{ ...refIn(form, 'Mobile'), value: '415-555-0134' }],
+          submit: refIn(form, 'Claim upgrade'),
+        },
+      ]),
+    ).toEqual(refusedBeforeTyping);
+    expect(await page.locator('input[name="mobile"]').inputValue()).toBe('');
+    expect(posts()).toEqual([]);
+  });
+
+  it('refuses a mobile number split across area-code, exchange and line fields on a site no disclosure covers', async () => {
+    await disclose('osteria.example');
+    const form = await open(PERSONAL_DATA.callback);
+    expect(
+      await run('callback', [
+        {
+          kind: 'form_input',
+          fields: [
+            { ...refIn(form, 'Area code'), value: '415' },
+            { ...refIn(form, 'Exchange'), value: '555' },
+            { ...refIn(form, 'Line'), value: '0134' },
+          ],
+          submit: refIn(form, 'Call me'),
+        },
+      ]),
+    ).toEqual(refusedBeforeTyping);
+    for (const name of ['area', 'exchange', 'line'])
+      expect(await page.locator(`input[name="${name}"]`).inputValue()).toBe('');
+    expect(posts()).toEqual([]);
+  });
+
+  it('refuses a stored value main never disclosed on every site, the restaurant main named included', async () => {
+    await disclose('osteria.example');
+    const booking = await open(PERSONAL_DATA.booking);
+    expect(await run('booking-address', [{ kind: 'type', ...refIn(booking, 'Name'), text: '123 Main St' }])).toEqual(
+      refusedBeforeTyping,
+    );
+    const claim = await open(PERSONAL_DATA.claim);
+    expect(
+      await run('claim-address', [
+        { kind: 'type', ...refIn(claim, 'Home address'), text: '123 Main Street, Springfield' },
+      ]),
+    ).toEqual(refusedBeforeTyping);
+    expect(await page.locator('input[name="address"]').inputValue()).toBe('');
+    expect(posts()).toEqual([]);
+  });
+
+  it('refuses an address that carries the home address in its query, before the request leaves', async () => {
+    await open(PERSONAL_DATA.booking);
+    const directions = `${PERSONAL_DATA.directions}?from=${encodeURIComponent(HOME)}&to=Osteria%20del%20Ponte`;
+    expect(await run('directions', [{ kind: 'navigate', url: directions }])).toEqual(refusedBeforeTyping);
+    expect(fixture.requests.filter((sent) => sent.url.startsWith('https://maps.example'))).toEqual([]);
+    expect(page.url()).toBe(PERSONAL_DATA.booking);
+  });
+
+  it('signs the principal in to their own account with their address from 1Password, and refuses that address in a newsletter field', async () => {
+    const resolve = vi.spyOn(browserVault, 'resolve').mockResolvedValue('morgan@example.test');
+    try {
+      const signIn = await open(PERSONAL_DATA.signIn);
+      expect(
+        await request('sign-in', 'fill_secret', {
+          item_handle: 'vault_osteria',
+          field: 'username',
+          target: refIn(signIn, 'Email'),
+          submit: refIn(signIn, 'Continue'),
+        }),
+      ).toEqual({ status: 'submitted' });
+      expect(resolve).toHaveBeenCalledWith(
+        'vault_osteria',
+        'username',
+        'https://osteria.example',
+        expect.any(Function),
+      );
+      expect(posts().map((sent) => [sent.url, new URLSearchParams(sent.body).get('email')])).toEqual([
+        [PERSONAL_DATA.signIn, 'morgan@example.test'],
+      ]);
+      expect(await page.locator('h1').textContent()).toBe('Welcome back');
+    } finally {
+      resolve.mockRestore();
+    }
+    const newsletter = await open(PERSONAL_DATA.newsletter);
+    for (const text of ['morgan@example.test', 'Morgan+offers@example.test'])
+      expect(await run(`newsletter-${text}`, [{ kind: 'type', ...refIn(newsletter, 'Email'), text }]), text).toEqual(
+        refusedBeforeTyping,
+      );
+    expect(await page.locator('input[name="email"]').inputValue()).toBe('');
+    expect(posts()).toHaveLength(1);
+  });
+
+  it("never lets another group's errand use main's disclosure, nor record one against main's errand", async () => {
+    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main-p', 'research-p'] });
+    const research = (await resolveSystemSession('research-p', 'system:test:research')).session;
+    const theirs = (await resolveSystemSession('browser-p', 'system:a2a:research-p:dinner')).session;
+    expect(await disclose('osteria.example')).toMatchObject({ status: 'recorded' });
+    await expect(disclose('osteria.example', research)).rejects.toThrow(
+      'No live browser job of yours exists for that thread.',
+    );
+    const form = await open(PERSONAL_DATA.booking, theirs);
+    expect(await run('their-booking', [{ kind: 'type', ...refIn(form, 'Mobile'), text: MOBILE }], theirs)).toEqual(
+      refusedBeforeTyping,
+    );
+    expect(await page.locator('input[name="mobile"]').inputValue()).toBe('');
   });
 });

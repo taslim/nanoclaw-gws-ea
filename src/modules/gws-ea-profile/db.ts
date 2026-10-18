@@ -1,5 +1,6 @@
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
@@ -204,8 +205,8 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
   };
 }
 
-export async function listPrincipalAddresses(): Promise<PrincipalAddress[]> {
-  return getDb().all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
+export async function listPrincipalAddresses(db: DbDriver = getDb()): Promise<PrincipalAddress[]> {
+  return db.all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
 }
 
 /** The addresses the profile holds, as listed and sorted. */

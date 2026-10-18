@@ -397,3 +397,24 @@ export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrat
     `);
   },
 };
+
+/**
+ * Personal-data disclosures (KTD19): main's word that one errand may give one site one of the principal's
+ * stored private values. A row names the value by its id in the privacy store and never holds it, so no second
+ * copy exists; a value removed there leaves its rows naming nothing.
+ */
+export const browserDisclosuresMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:disclosures',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_disclosures (
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        site TEXT NOT NULL,
+        value_id TEXT NOT NULL CHECK(value_id LIKE 'pv-%'),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(job_id,site,value_id)
+      );
+    `);
+  },
+};

@@ -6,6 +6,7 @@ import {
   cancelJob,
   consentGrants,
   credentialAuthority,
+  recordDisclosure,
   relayCode,
   reservationGuarantee,
   reservationBounds,
@@ -343,4 +344,43 @@ it("lists or withdraws the principal's standing consent grants by id alone", asy
   expect(JSON.stringify(await waiting)).toContain('withdrawn');
   for (const outcome of ['listed', 'withdrawn', 'not_found', 'grant_id', 'wording'])
     expect(consentGrants.tool.description).toContain(outcome);
+});
+
+it("records a disclosure of one stored value to one site for a job, by the value's id alone", async () => {
+  const validate = new Ajv().compile(recordDisclosure.tool.inputSchema);
+  const fields = { thread: 'system:a2a:main:dinner', site: 'https://osteria.example', value_id: 'pv-1a2b3c4d5e6f' };
+  expect(validate(fields)).toBe(true);
+  for (const changed of [
+    { thread: fields.thread, site: fields.site },
+    { thread: fields.thread, value_id: fields.value_id },
+    { site: fields.site, value_id: fields.value_id },
+    { ...fields, value: '+1 415 555 0134' },
+    { ...fields, approved: true },
+  ])
+    expect(validate(changed)).toBe(false);
+  expect((await recordDisclosure.handler({ thread: fields.thread, site: fields.site })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  const waiting = recordDisclosure.handler({ ...fields, value: '+1 415 555 0134' });
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'record_disclosure', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: {
+          id: row.id,
+          ok: true,
+          data: { status: 'recorded', site: 'osteria.example', value_id: fields.value_id, kind: 'phone' },
+        },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('recorded');
+  for (const word of ['recorded', 'personal_data', 'private-values', 'value_id'])
+    expect(recordDisclosure.tool.description).toContain(word);
 });

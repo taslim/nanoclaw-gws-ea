@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Page } from 'playwright-core';
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
+import './index.js';
+import { BrowserStore } from './db.js';
 import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from './executor.js';
 import type { PinnedBrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
@@ -161,5 +164,90 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
     await recordWebAlias('onuj@corp.example');
     for (const text of ['onuj@corp.example', 'Onuj+Orders@corp.example', 'morgan@principal.example'])
       await expect(executeBrowserBatch(context, typing(text)), text).rejects.toBe(opened);
+  });
+});
+
+describe("the principal's personal data in a batch (KTD19, R34)", () => {
+  const opened = new Error('The batch reached its page');
+  /** A page on `url` the check may read the address of; anything else the batch does with it fails as `opened`. */
+  const pageOn = (url: string): Page =>
+    new Proxy({} as Page, {
+      get: (_page, key) => {
+        if (key === 'url') return () => url;
+        if (key === 'then') return undefined;
+        throw opened;
+      },
+    });
+  const context = (url: string) =>
+    ({
+      job: { id: 'job-dinner' },
+      store: new BrowserStore(),
+      page: async () => pageOn(url),
+    }) as unknown as BrowserExecutionContext;
+  const booking = {
+    actions: [
+      { kind: 'observe' },
+      {
+        kind: 'form_input',
+        fields: [
+          { ref: 'e1', generation: 1, value: 'Morgan Ellery' },
+          { ref: 'e2', generation: 1, value: '(415) 555-0134' },
+        ],
+      },
+    ],
+  };
+
+  beforeEach(async () => {
+    await runMigrations(await initTestDb());
+    const now = new Date().toISOString();
+    for (const id of ['main', 'browser'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now });
+    await createSession({
+      id: 'browser-session',
+      agent_group_id: 'browser',
+      messaging_group_id: null,
+      thread_id: 'system:a2a:main:dinner',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now,
+    });
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_jobs(id,thread_id,browser_session_id,source_agent_group_id,created_at,updated_at) VALUES('job-dinner','system:a2a:main:dinner','browser-session','main',?,?)",
+      now,
+      now,
+    );
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('stops a batch that would give a site a stored value no disclosure covers, before any action runs', async () => {
+    const mobile = await addPrivateValue({ label: 'Mobile', kind: 'phone', value: '+1 415 555 0134' });
+    expect(await executeBrowserBatch(context('https://winner.example/claim'), booking)).toEqual({
+      status: 'stopped',
+      reason: 'personal_data',
+      repeat_safe: true,
+    });
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_disclosures(job_id,site,value_id,created_at) VALUES('job-dinner','osteria.example',?,?)",
+      mobile.id,
+      new Date().toISOString(),
+    );
+    await expect(executeBrowserBatch(context('https://osteria.example/reserve'), booking)).rejects.toBe(opened);
+    expect(await executeBrowserBatch(context('https://winner.example/claim'), booking)).toMatchObject({
+      reason: 'personal_data',
+    });
+  });
+
+  it('runs a batch that gives no stored value away', async () => {
+    await addPrivateValue({ label: 'Mobile', kind: 'phone', value: '+1 415 555 0134' });
+    await expect(
+      executeBrowserBatch(context('https://winner.example/claim'), {
+        actions: [{ kind: 'type', ref: 'e1', generation: 1, text: 'Table for two at 7pm' }],
+      }),
+    ).rejects.toBe(opened);
   });
 });

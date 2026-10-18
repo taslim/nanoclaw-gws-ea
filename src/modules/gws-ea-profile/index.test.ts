@@ -790,7 +790,28 @@ describe("the assistant's web address in each identity section (KTD14)", () => {
     expect(await identity(browser)).toBe(
       `${NAMES} Juno's email on every website is \`onuj@example.test\`: give it wherever a site asks for Juno's email, ` +
         "including on a booking or checkout made for Morgan in Morgan's name, and open Juno's accounts with it, in Juno's own name. " +
-        "Morgan's email address is `morgan@example.test`.",
+        "Morgan's email address is `morgan@example.test`, so you recognize it on a page; never type it into a site. " +
+        'Only the host puts it on a site, signing Morgan in to their own account with their login in 1Password.',
+    );
+  });
+
+  it("gives the browser the principal's addresses to recognize, never to offer a form (R34)", async () => {
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Juno',
+      assistantWorkspaceEmail: 'juno@example.test',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+      principalEmails: ['morgan.ellery@home.example', 'morgan@example.test'],
+    });
+
+    expect(await identity(browser)).toContain(
+      " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`, so you recognize them on a page; " +
+        'never type one into a site. Only the host puts one on a site, signing Morgan in to their own account with their login in 1Password.',
+    );
+    // Any other group still reads them as it did.
+    expect(await identity(research)).toContain(
+      " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`.",
     );
   });
 

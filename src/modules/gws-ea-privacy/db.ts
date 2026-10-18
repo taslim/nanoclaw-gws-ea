@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { hasControlCharacters, parseLine } from '../../gws-ea/validation.js';
 import { canonicalText, PRIVATE_VALUE_KINDS, uncheckableReason, type PrivateValueKind } from './match.js';
 
@@ -47,8 +48,8 @@ function newValueId(): string {
   return `pv-${randomBytes(6).toString('hex')}`;
 }
 
-export async function listPrivateValues(): Promise<PrivateValue[]> {
-  return getDb().all<PrivateValue>(
+export async function listPrivateValues(db: DbDriver = getDb()): Promise<PrivateValue[]> {
+  return db.all<PrivateValue>(
     'SELECT id, label, kind, value, created_at FROM gws_ea_private_values ORDER BY created_at, id',
   );
 }
