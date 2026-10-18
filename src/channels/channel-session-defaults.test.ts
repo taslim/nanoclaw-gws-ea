@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from './adapter.js';
+import type { WiringDefaults } from './channel-defaults.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../types.js';
 
 /** A declaration whose `context` roots each conversation in its own thread
@@ -216,12 +217,7 @@ describe('wiring creation — resolved defaults persist onto the row', () => {
     mg: MessagingGroup,
     ag: AgentGroup,
     now: string,
-    resolved: {
-      engage_mode: 'pattern' | 'mention' | 'mention-sticky';
-      engage_pattern: string | null;
-      session_mode: 'shared' | 'per-thread';
-      threads: number | null;
-    },
+    resolved: WiringDefaults,
   ): Promise<MessagingGroupAgent> {
     const { createMessagingGroupAgent, getMessagingGroupAgent } = await import('../db/messaging-groups.js');
     await createMessagingGroupAgent({

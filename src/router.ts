@@ -238,6 +238,29 @@ export function registerInboundDelay(fn: InboundDelayFn): void {
   inboundDelays.push(fn);
 }
 
+/** A module's engagement inputs, after admitted inbound content has been prepared. */
+export interface EngagementDecisionRequest {
+  readonly event: InboundEvent;
+  readonly session: Session;
+  readonly messagingGroup: MessagingGroup;
+  readonly wiring: MessagingGroupAgent;
+}
+
+export type EngagementDecider = (request: EngagementDecisionRequest) => boolean | Promise<boolean>;
+
+const engagementDeciders = new Map<string, EngagementDecider>();
+
+/**
+ * Decide engagement for this channel's `module` wirings. Preparation may add
+ * recognized speech; the decider receives that content and the unchanged
+ * authenticated sender and message metadata. False, or no registered decider,
+ * keeps the message as silent context without typing or a container wake.
+ */
+export function registerEngagementDecider(channelType: string, decide: EngagementDecider): void {
+  if (engagementDeciders.has(channelType)) log.warn('Engagement decider overwritten', { channelType });
+  engagementDeciders.set(channelType, decide);
+}
+
 async function inboundDelay(event: InboundEvent, session: Session): Promise<InboundDelay> {
   let latest: string | null = null;
   let held = false;
@@ -257,27 +280,43 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-/**
- * Route an inbound message from a channel adapter to the correct session.
- * Creates messaging group + session if they don't exist yet.
- */
 const conversationTails = new Map<string, Promise<void>>();
 
-export async function routeInbound(event: InboundEvent): Promise<void> {
-  const conversation = JSON.stringify([event.instance ?? event.channelType, event.channelType, event.platformId]);
+/**
+ * Run host work in the conversation's inbound order. A cutover queued here
+ * waits for the message already routing, and finishes before the next starts.
+ * The caller receives its result or failure; failures never poison the tail.
+ */
+export async function runInConversationTail<T>(
+  address: Pick<InboundEvent, 'channelType' | 'instance' | 'platformId'>,
+  work: () => Promise<T>,
+): Promise<T> {
+  const conversation = JSON.stringify([
+    address.instance ?? address.channelType,
+    address.channelType,
+    address.platformId,
+  ]);
   const previous = conversationTails.get(conversation) ?? Promise.resolve();
-  const routed = previous.then(() => routeInboundOrdered(event));
+  const result = previous.then(work);
   // The caller sees routing failures, while the next event gets a settled tail.
-  const tail = routed.then(
+  const tail = result.then(
     () => undefined,
     () => undefined,
   );
   conversationTails.set(conversation, tail);
   try {
-    await routed;
+    return await result;
   } finally {
     if (conversationTails.get(conversation) === tail) conversationTails.delete(conversation);
   }
+}
+
+/**
+ * Route an inbound message from a channel adapter to the correct session.
+ * Creates messaging group + session if they don't exist yet.
+ */
+export async function routeInbound(event: InboundEvent): Promise<void> {
+  await runInConversationTail(event, () => routeInboundOrdered(event));
 }
 
 async function routeInboundOrdered(event: InboundEvent): Promise<void> {
@@ -492,12 +531,25 @@ async function routeInboundOrdered(event: InboundEvent): Promise<void> {
 
     const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
 
-    const accessOk = engages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
-    const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
+    const needsAdmission = engages !== false;
+    const accessOk =
+      needsAdmission && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
+    const scopeOk = needsAdmission && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
-    if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, 'wake', prepare);
-      engagedCount++;
+    if (needsAdmission && accessOk && scopeOk) {
+      const woke = await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        engages === undefined ? 'module' : 'wake',
+        prepare,
+      );
+      if (woke === false) accumulatedCount++;
+      else engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
       // platform's subscribed-message path carries follow-ups without
@@ -520,7 +572,7 @@ async function routeInboundOrdered(event: InboundEvent): Promise<void> {
           log.warn('adapter.subscribe failed', { channelType: event.channelType, threadId: effectiveThreadId, err });
         });
       }
-    } else if (agent.ignored_message_policy === 'accumulate' && !(engages && (!accessOk || !scopeOk))) {
+    } else if (agent.ignored_message_policy === 'accumulate' && !(needsAdmission && (!accessOk || !scopeOk))) {
       // Accumulate stores the message as silent context. We allow it when
       // engagement simply didn't fire, but NOT when engagement fired and
       // the access/scope gate refused — those refusals are security
@@ -648,8 +700,10 @@ async function evaluateEngage(
   isMention: boolean,
   mg: MessagingGroup,
   threadId: string | null,
-): Promise<boolean> {
+): Promise<boolean | undefined> {
   switch (agent.engage_mode) {
+    case 'module':
+      return undefined;
     case 'pattern': {
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
@@ -687,7 +741,7 @@ async function evaluateEngage(
  * (trigger=0) for when it next wakes, in a session created if need be; or
  * stored as context only in a session that already exists (the quiet path).
  */
-type Delivery = 'wake' | 'accumulate' | 'quiet';
+type Delivery = 'wake' | 'accumulate' | 'quiet' | 'module';
 
 async function deliverToAgent(
   agent: MessagingGroupAgent,
@@ -699,8 +753,7 @@ async function deliverToAgent(
   effectiveThreadId: string | null,
   delivery: Delivery,
   prepare?: (session: Session) => Promise<InboundEvent>,
-): Promise<void> {
-  const wake = delivery === 'wake';
+): Promise<boolean | undefined> {
   // Apply the resolved thread policy (wiring override AND channel declaration
   // AND adapter capability — resolveThreadPolicy at fanout) to the wiring's
   // session_mode.
@@ -769,6 +822,12 @@ async function deliverToAgent(
   // Admission and typed command classification used the original event.
   // Preparation replaces only content and is reused across admitted targets.
   if (prepare) event = await prepare(session);
+
+  if (delivery === 'module') {
+    const decide = engagementDeciders.get(event.channelType);
+    delivery = decide && (await decide({ event, session, messagingGroup: mg, wiring: agent })) ? 'wake' : 'accumulate';
+  }
+  const wake = delivery === 'wake';
 
   if (wake) {
     // Cross-session context backfill: a just-born or long-idle session is
@@ -883,6 +942,7 @@ async function deliverToAgent(
       timestamp: event.message.timestamp,
     });
   }
+  return wake;
 }
 
 function isDuplicateInboundMessageIdViolation(error: unknown): boolean {

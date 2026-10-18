@@ -554,6 +554,146 @@ describe('recorded divergence: a module can hold an inbound message until a time
   });
 });
 
+describe('recorded divergence: disconnected adapters keep durable sends pending', () => {
+  it('spends no attempt while disconnected and passes the same row id into the native adapter after recovery', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'principal-dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('ag-1', 'mg-1', null, 'shared');
+    await manager.writeOutboundDirect('ag-1', session.id, {
+      id: 'durable-send',
+      kind: 'chat',
+      platformId: 'principal-dm',
+      channelType: 'whatsapp',
+      threadId: null,
+      content: JSON.stringify({ text: 'Thursday works.' }),
+    });
+    const delivery = await import('../delivery.js');
+    const { ChannelNotConnectedError } = await import('../channels/adapter.js');
+    delivery.setDeliveryAdapter({
+      async deliver() {
+        throw new ChannelNotConnectedError();
+      },
+    });
+    await delivery.deliverSessionMessages(session);
+    expect(
+      await db.getDb().get('SELECT 1 FROM delivery_attempts WHERE message_id = ?', 'durable-send'),
+    ).toBeUndefined();
+    expect(await manager.withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds())).toEqual(
+      new Set(),
+    );
+
+    const registry = await import('../channels/channel-registry.js');
+    const sent: Array<string | undefined> = [];
+    registry.registerChannelAdapter('whatsapp', {
+      factory: () => ({
+        name: 'whatsapp',
+        channelType: 'whatsapp',
+        supportsThreads: false,
+        async setup() {},
+        async teardown() {},
+        isConnected: () => true,
+        async deliver(_platform, _thread, _message, messageId) {
+          sent.push(messageId);
+          return 'platform-send';
+        },
+      }),
+    });
+    await registry.initChannelAdapters(() => ({ onInbound() {}, onInboundEvent() {}, onMetadata() {}, onAction() {} }));
+    cleanups.push(() => registry.teardownChannelAdapters());
+    delivery.setDeliveryAdapter(registry.createChannelDeliveryAdapter());
+    await delivery.deliverSessionMessages(session);
+    await delivery.deliverSessionMessages(session);
+    expect(sent).toEqual(['durable-send']);
+  });
+});
+
+describe('recorded divergence: prepared module engagement and destination-free chat wirings', () => {
+  it('keeps silent context, wakes only on the module decision, and orders host work in the conversation tail', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'trip',
+      name: 'Lake trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    await db.createMessagingGroupAgent(
+      {
+        id: 'wiring',
+        messaging_group_id: 'mg-1',
+        agent_group_id: 'ag-1',
+        engage_mode: 'module',
+        engage_pattern: null,
+        sender_scope: 'all',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 0,
+        created_at,
+      },
+      { companionDestination: false },
+    );
+    expect(await db.getDb().all('SELECT * FROM agent_destinations')).toEqual([]);
+    const router = await import('../router.js');
+    const preparation = await import('../inbound-preparation.js');
+    preparation.registerInboundPreparer(({ content }) => Promise.resolve(content.replace('voice', 'Robin')));
+    const order: string[] = [];
+    router.registerEngagementDecider('whatsapp', ({ event }) => {
+      order.push(event.message.id);
+      return event.message.content.includes('Robin');
+    });
+    const event = (id: string, text: string): InboundEvent => ({
+      channelType: 'whatsapp',
+      platformId: 'trip',
+      threadId: null,
+      message: { id, kind: 'chat', content: JSON.stringify({ text }), timestamp: created_at, isGroup: true },
+    });
+    external.requestWake.mockClear();
+    await Promise.all([
+      router.routeInbound(event('banter', 'Funny video.')),
+      router.runInConversationTail({ channelType: 'whatsapp', platformId: 'trip' }, async () => {
+        order.push('cutover');
+      }),
+      router.routeInbound(event('addressed', 'voice, check Thursday.')),
+    ]);
+    expect(order).toEqual(['banter', 'cutover', 'addressed']);
+    expect(external.requestWake).toHaveBeenCalledTimes(1);
+    const session = await db.getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-1');
+    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
+    const inbound = new Database(inboundDbPath('ag-1', session!.id), { readonly: true });
+    try {
+      expect(inbound.prepare('SELECT id, trigger FROM messages_in ORDER BY seq').all()).toEqual([
+        { id: 'banter:ag-1', trigger: 0 },
+        { id: 'addressed:ag-1', trigger: 1 },
+      ]);
+    } finally {
+      inbound.close();
+    }
+  });
+});
+
 describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
   it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named, or settles it unread', async () => {
     await freshInstall();

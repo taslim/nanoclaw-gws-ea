@@ -38,7 +38,7 @@ import { normalizeOptions } from './channels/ask-question.js';
 import { requestWake } from './request-wake.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { endTypingInConversation, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import type { OutboundFile } from './channels/adapter.js';
+import { ChannelNotConnectedError, type OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
@@ -138,6 +138,8 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    /** Durable outbound row ID, when the send belongs to a mailbox row. */
+    messageId?: string,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -234,18 +236,31 @@ async function assertOutboundAllowed(send: OutboundSend): Promise<void> {
 }
 
 function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
+  const disconnected = new Map<string, { readonly until: number; readonly error: ChannelNotConnectedError }>();
   return {
-    async deliver(channelType, platformId, threadId, kind, content, files, instance) {
+    async deliver(channelType, platformId, threadId, kind, content, files, instance, messageId) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
-      const platformMessageId = await adapter.deliver(
-        channelType,
-        platformId,
-        threadId,
-        kind,
-        content,
-        files,
-        instance,
-      );
+      const key = instance ?? channelType;
+      const unavailable = disconnected.get(key);
+      if (unavailable !== undefined && unavailable.until > Date.now()) throw unavailable.error;
+      disconnected.delete(key);
+      let platformMessageId: string | undefined;
+      try {
+        platformMessageId = await adapter.deliver(
+          channelType,
+          platformId,
+          threadId,
+          kind,
+          content,
+          files,
+          instance,
+          messageId,
+        );
+      } catch (error) {
+        if (error instanceof ChannelNotConnectedError)
+          disconnected.set(key, { until: Date.now() + ACTIVE_POLL_MS, error });
+        throw error;
+      }
       // Whatever reached the conversation (a reply, a reaction, a host's
       // approval request) ends the work each turn anchored there was showing.
       endTypingInConversation(channelType, platformId, threadId, instance);
@@ -477,6 +492,7 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     } catch (err) {
+      if (err instanceof ChannelNotConnectedError) continue;
       if (err instanceof OutboundRefusedError) {
         await closeRefused(msg, session, agentGroup.id, err);
         continue;
@@ -795,6 +811,7 @@ async function deliverMessage(
     deliveredContent,
     files,
     deliverInstance,
+    msg.id,
   );
   log.info('Message delivered', {
     id: msg.id,

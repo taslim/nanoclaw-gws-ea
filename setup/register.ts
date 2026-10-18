@@ -34,6 +34,7 @@ import '../src/mailbox/compose.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import { resolveSession, writeSessionMessage } from '../src/session-manager.js';
 import { emitStatus } from './status.js';
+import type { EngageMode } from '../src/types.js';
 
 interface RegisterArgs {
   /** Platform-specific channel/group ID (Discord channel ID, Slack channel, etc.) */
@@ -55,12 +56,12 @@ interface RegisterArgs {
   /** Whether the messaging group is a multi-user chat (default: true) */
   isGroup: boolean;
   /** Explicit engage mode override; omitted = channel declaration / heuristic */
-  engageMode?: 'pattern' | 'mention' | 'mention-sticky';
+  engageMode?: EngageMode;
   /** Explicit unknown_sender_policy override; omitted = channel declaration / 'strict' */
   unknownSenderPolicy?: 'strict' | 'request_approval' | 'decline_notify' | 'public';
 }
 
-const ENGAGE_MODES = ['pattern', 'mention', 'mention-sticky'] as const;
+const ENGAGE_MODES = ['pattern', 'mention', 'mention-sticky', 'module'] as const;
 const SENDER_POLICIES = ['strict', 'request_approval', 'decline_notify', 'public'] as const;
 
 function parseArgs(args: string[]): RegisterArgs {
@@ -242,7 +243,7 @@ export async function run(args: string[]): Promise<void> {
     // 'mention' (respond when addressed), DMs 'pattern'/'.' (every message).
     const isGroup = messagingGroup.is_group === 1;
     const channelKey = messagingGroup.instance ?? messagingGroup.channel_type;
-    let engage: { engage_mode: 'pattern' | 'mention' | 'mention-sticky'; engage_pattern: string | null };
+    let engage: { engage_mode: EngageMode; engage_pattern: string | null };
     if (parsed.engageMode) {
       if (parsed.engageMode === 'pattern' && !parsed.trigger) {
         throw new Error(`--engage-mode pattern requires --trigger (use "." to match every message)`);

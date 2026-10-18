@@ -36,7 +36,7 @@ interface ChannelAdapter {
   isConnected(): boolean;
 
   // Outbound delivery
-  deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
+  deliver(platformId: string, threadId: string | null, message: OutboundMessage, messageId?: string): Promise<string | undefined>;
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
@@ -66,7 +66,7 @@ Each adapter can declare static wiring-time defaults. There are exactly two leve
 ```typescript
 // src/channels/adapter.ts
 interface ChannelContextDefaults {
-  engageMode: 'pattern' | 'mention' | 'mention-sticky';
+  engageMode: 'pattern' | 'mention' | 'mention-sticky' | 'module';
   engagePattern?: string;   // required iff engageMode='pattern'; may contain the
                             // literal token {name} — creation helpers substitute the
                             // regex-escaped agent_group name
@@ -104,6 +104,27 @@ Never returns undefined. `hasDeclaredChannelDefaults()` reports whether tiers 1�
 **Creation helpers** (`src/channels/channel-defaults.ts`): every wiring-creation path calls `resolveWiringDefaults(channelKey, isGroup, agentGroupName)` — it picks `decl.group` vs `decl.dm` by `isGroup = event.message.isGroup ?? (mg.is_group === 1)` (never `threadId !== null`), substitutes `{name}`, and downgrades `mention-sticky` → `mention` when the context's resolved threads value is false. `resolveUnknownSenderPolicy` does the same for auto-created messaging_groups rows.
 
 **Runtime thread policy**: engage mode and sender policy are creation-time snapshots; threading is the one setting consulted live. `messaging_group_agents.threads` (migration 019) is the per-wiring override: `NULL` = inherit the adapter declaration for the wiring's context, `1`/`0` = explicit. `resolveThreadPolicy(wiring.threads, decl, isGroup, supportsThreads)` hard-ANDs the result with the adapter's raw capability — a wiring can opt out of threads on a threaded platform, never opt in on a non-threaded one. When the policy is off, event-derived thread ids are nulled at router fanout (sessions collapse, replies land top-level); `event.replyTo` is operator intent from the CLI transport and is never nulled.
+
+### Module engagement and channel outages
+
+A wiring with `engage_mode: 'module'` uses the channel's
+`registerEngagementDecider(channelType, decide)` after sender admission and
+inbound preparation. The decider receives the prepared event, session, messaging
+group and wiring, so recognized speech can engage it. A false result or missing
+decider stores silent context without typing or waking an agent.
+
+`createMessagingGroupAgent(wiring, { companionDestination: false })` writes the
+wiring without a group-wide channel destination. Its sessions can still reply
+to their originating chat. `runInConversationTail(address, work)` orders a
+host cutover between inbound messages for that adapter instance and chat.
+
+A linked adapter that is temporarily disconnected throws
+`ChannelNotConnectedError`. The delivery poll keeps its rows pending without
+spending attempts and backs off that exact adapter for one active-poll interval;
+other channels and system actions continue. Ordinary send failures retain the
+existing attempt limit. The durable outbound row ID reaches the adapter as the
+optional fourth `deliver` argument, unchanged through outbound guards and the
+registry bridge, so a platform can derive its idempotency key from that ID.
 
 ### Chat SDK Bridge
 

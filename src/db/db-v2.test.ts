@@ -274,6 +274,14 @@ describe('messaging group agents', () => {
     expect(await getDestinations('ag-1')).toHaveLength(1);
   });
 
+  it('can create a wiring without granting a companion channel destination', async () => {
+    const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    await createMessagingGroupAgent(mga(), { companionDestination: false });
+
+    expect(await getMessagingGroupAgent('mga-1')).toMatchObject({ messaging_group_id: 'mg-1', agent_group_id: 'ag-1' });
+    expect(await getDestinations('ag-1')).toEqual([]);
+  });
+
   it('rolls back the wiring when its companion destination cannot be created', async () => {
     const db = getDb();
     await db.exec(`

@@ -237,8 +237,15 @@ export async function isMessagingGroupDetached(id: string): Promise<boolean> {
  * field when set, falling back to `${channel_type}-${mg_id prefix}`, with
  * a numeric suffix to break collisions within the agent's namespace. This
  * mirrors the backfill logic in migration 004.
+ *
+ * `companionDestination: false` creates only the wiring. Use it for an agent
+ * whose sessions may reply to their origin chat but must not be granted a
+ * group-wide channel destination shared by all its sessions.
  */
-export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promise<void> {
+export async function createMessagingGroupAgent(
+  mga: MessagingGroupAgent,
+  options: { readonly companionDestination?: boolean } = {},
+): Promise<void> {
   await assertWiringAdmitted({ operation: 'create', proposed: mga });
   await getDb().transaction(async () => {
     await getDb().run(
@@ -263,7 +270,7 @@ export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promi
       await getDb().run('UPDATE messaging_group_agents SET threads = ? WHERE id = ?', mga.threads, mga.id);
     }
 
-    await ensureAgentDestinationForWiring(mga);
+    if (options.companionDestination !== false) await ensureAgentDestinationForWiring(mga);
   });
 }
 

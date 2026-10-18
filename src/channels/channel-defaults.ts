@@ -17,7 +17,7 @@
 import type { ChannelDefaults } from './adapter.js';
 import { getChannelDefaults, hasDeclaredChannelDefaults } from './channel-registry.js';
 import { log } from '../log.js';
-import type { MessagingGroup } from '../types.js';
+import type { EngageMode, MessagingGroup } from '../types.js';
 
 function escapeRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -41,7 +41,7 @@ function substituteName(pattern: string, name: string): string {
  *  path stamps from the channel declaration. `threads` null = leave the
  *  column NULL (inherit the declaration at fanout time). */
 export interface WiringDefaults {
-  engage_mode: 'pattern' | 'mention' | 'mention-sticky';
+  engage_mode: EngageMode;
   engage_pattern: string | null;
   session_mode: 'shared' | 'per-thread';
   threads: number | null;
