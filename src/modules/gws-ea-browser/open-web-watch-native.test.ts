@@ -667,11 +667,33 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
   });
 
   it('books a Resy table through its reader without waking the agent', async () => {
+    // TEMPORARY CI DIAGNOSTIC: what the page did when its readiness never comes.
+    const seen: string[] = [];
+    const stamp = (): string => `${Math.round(performance.now())}ms`;
+    resy.page.on('request', (r) => seen.push(`${stamp()} -> ${r.resourceType()} ${r.method()} ${r.url()}`));
+    resy.page.on('requestfinished', (r) => seen.push(`${stamp()} ok ${r.method()} ${r.url()}`));
+    resy.page.on('requestfailed', (r) =>
+      seen.push(`${stamp()} FAILED ${r.method()} ${r.url()} ${r.failure()?.errorText}`),
+    );
+    resy.page.on('framenavigated', (f) =>
+      seen.push(`${stamp()} navigated ${f === resy.page.mainFrame() ? 'main' : 'child'} ${f.url()}`),
+    );
+    resy.page.on('pageerror', (e) => seen.push(`${stamp()} pageerror ${e.message}`));
+    resy.page.on('console', (m) => seen.push(`${stamp()} console ${m.type()} ${m.text()}`));
     // The agent recorded the route to the reservation and its booking path: a click that reached the commit.
     expect(
       await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] }),
     ).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
-    await resy.page.locator('body[data-ready="yes"]').waitFor();
+    seen.push(`${stamp()} answered`);
+    await resy.page
+      .locator('body[data-ready="yes"]')
+      .waitFor({ timeout: 15_000 })
+      .catch(async (error: unknown) => {
+        const body = await resy.page
+          .evaluate<string>("JSON.stringify(document.body.dataset) + ' ' + document.body.innerHTML.slice(0, 200)")
+          .catch((failure: unknown) => String(failure));
+        throw new Error(`${String(error)}\nurl ${resy.page.url()}\nbody ${body}\n${seen.join('\n')}`);
+      });
     const observation = await observePage(resy.page);
     expect(
       await request('browser', { actions: [{ kind: 'click', ...refIn(observation, 'Reserve Now') }] }),
