@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -5,12 +6,21 @@ import { processLock } from '../community-portal/process-lock.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
 import { browserPaths, readPrivateFile, writePrivateFile } from '../modules/gws-ea-browser/paths.js';
-import { readBrowserPolicy, SYSTEM_CHROME, type BrowserPolicyFile } from '../modules/gws-ea-browser/policy.js';
+import {
+  browserAccessOf,
+  parseBrowserPolicyFile,
+  readBrowserPolicy,
+  SYSTEM_CHROME,
+  type BrowserAccessPolicy,
+  type BrowserPolicyFile,
+} from '../modules/gws-ea-browser/policy.js';
+import { runAliasStep, type AliasStepOptions } from './alias.js';
+import type { RunEvent, StepReporter } from './events.js';
 import { runInstanceNclJson } from './ncl.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome, type SanitizedCommandOutcomeRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
-import type { NextAction } from './result.js';
+import type { NextAction, OperationData } from './result.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
@@ -39,6 +49,8 @@ export interface BrowserCapabilityObservation {
   };
   readonly isolation: { readonly status: 'not_run' | 'passed' | 'failed' | 'unknown'; readonly reason: string | null };
   readonly ready: boolean;
+  /** Who the policy grants the browser; null while it cannot be read. */
+  readonly access: BrowserAccessView | null;
 }
 export interface BrowserOperationData {
   readonly actions: typeof BROWSER_CAPABILITY.actions;
@@ -48,13 +60,36 @@ export interface BrowserOperationData {
   readonly instance_id: string;
   readonly enabled: boolean;
   readonly changed: boolean;
+  readonly access: BrowserAccessView;
+  /** What an enable's web alias step waits on the operator for (KTD13). */
+  readonly pause?: OperationData['pause'];
 }
+/** Who the browser policy grants the browser (KTD15): main alone (version 1), or exactly the listed agent groups. */
+export type BrowserAccessView =
+  | { readonly version: 1 }
+  | { readonly version: 2; readonly agent_group_ids: readonly string[] };
+/**
+ * What an enable sets about access: main alone (version 1), or exactly these
+ * agent groups (version 2). Without one, it keeps what the policy holds.
+ */
+export type BrowserAccessChange =
+  | { readonly kind: 'main' }
+  | { readonly kind: 'agent_groups'; readonly agentGroupIds: readonly string[] };
+type NclRunner = (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
 export interface BrowserCapabilityDependencies {
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
+  /** How the running host is asked; a version-2 list is written only once it vouches for it. */
+  readonly ncl?: NclRunner;
+}
+export interface BrowserEnableDependencies extends BrowserCapabilityDependencies {
+  /** The operator's word on the web alias step that follows the policy write; the step asks the host through `ncl`. */
+  readonly alias?: Pick<AliasStepOptions, 'decision'>;
+  /** Hears the alias step's progress. */
+  readonly emit?: (event: RunEvent) => void;
 }
 export interface BrowserCapabilityInspection {
   readonly check?: boolean;
-  readonly ncl?: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
+  readonly ncl?: NclRunner;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
 }
 export function instanceBrowserPolicyFile(runtime: Pick<InstanceRuntimeConfig, 'instance_root'>): string {
@@ -75,15 +110,10 @@ async function storedPolicy(file: string): Promise<BrowserPolicyFile | undefined
       'Browser policy is invalid or inaccessible. Restore its owner-only policy file before continuing.',
     );
   try {
-    // readBrowserPolicy validates the same owner-only file; retain its Chrome path even while disabled.
-    const raw: unknown = JSON.parse(await readPrivateFile(file, 16 * 1024));
-    if (!isRecord(raw) || raw.schemaVersion !== 1 || typeof raw.enabled !== 'boolean')
-      throw new GwsEaError('invalid_browser_policy', 'Browser policy changed during inspection.');
-    return {
-      schemaVersion: 1,
-      enabled: raw.enabled,
-      ...(typeof raw.chromePath === 'string' ? { chromePath: raw.chromePath } : {}),
-    };
+    // readBrowserPolicy validates the same owner-only file; retain its Chrome path and access list even while disabled.
+    const stored = parseBrowserPolicyFile(JSON.parse(await readPrivateFile(file, 16 * 1024)));
+    if (!stored) throw new GwsEaError('invalid_browser_policy', 'Browser policy changed during inspection.');
+    return stored;
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
     throw error;
@@ -111,19 +141,91 @@ export async function withAssistantLock<T>(
   }
 }
 
+function accessView(access: BrowserAccessPolicy): BrowserAccessView {
+  return access.version === 1 ? { version: 1 } : { version: 2, agent_group_ids: access.agentGroupIds };
+}
+
+/**
+ * A version-2 list is written only once the running host reports that it
+ * reads one, and when it names only agent groups that host has, none of them
+ * the browser or external-email, which can never use the browser (KTD15). A
+ * host that is not running cannot vouch for either.
+ */
+async function assertHostMayList(
+  runtime: InstanceRuntimeConfig,
+  agentGroupIds: readonly string[],
+  ncl: NclRunner,
+): Promise<void> {
+  let health: unknown;
+  try {
+    health = await ncl(runtime, ['gws-ea-browser-health']);
+  } catch (cause) {
+    throw new GwsEaError(
+      'browser_access_unverified',
+      'The running assistant could not confirm that it reads a browser access list. Start the assistant and try again.',
+      { cause },
+    );
+  }
+  if (!isRecord(health) || !Array.isArray(health.policyVersions) || !health.policyVersions.includes(2))
+    throw new GwsEaError(
+      'browser_access_unsupported',
+      "This assistant's release cannot read a browser access list. Update the assistant, then try again.",
+    );
+  const profile = await ncl(runtime, ['gws-ea-profile-get']);
+  if (!isRecord(profile)) throw new GwsEaError('invalid_child_output', 'The assistant profile could not be read.');
+  const sealed = new Map<unknown, string>([
+    [profile.browser_agent_group_id, 'browser'],
+    [profile.external_email_agent_group_id, 'external-email'],
+  ]);
+  for (const id of agentGroupIds) {
+    const agent = sealed.get(id);
+    if (agent !== undefined)
+      throw new GwsEaError('invalid_arguments', `Agent group ${id} is ${agent}, which can never use the browser.`);
+    try {
+      await ncl(runtime, ['groups', 'get', '--id', id]);
+    } catch (cause) {
+      if (!(cause instanceof GwsEaError) || cause.code !== 'ncl_failed') throw cause;
+      throw new GwsEaError('invalid_arguments', `The assistant has no agent group ${id}.`, { cause });
+    }
+  }
+}
+
+/**
+ * Enable the browser. `access` sets who may use it: main alone, or exactly
+ * the listed agent groups, which the running host must vouch for first; each
+ * listed group shares the signed-in browser profile and the vault's logins.
+ * Without it, the policy keeps whom it grants.
+ */
 export async function enableBrowserCapability(
   paths: ControlPlanePaths,
   instanceId: string,
   dependencies: BrowserCapabilityDependencies = {},
+  access?: BrowserAccessChange,
 ): Promise<BrowserOperationData> {
   return withAssistantLock(paths, instanceId, async () => {
-    const { files } = await target(paths, instanceId);
+    const { files, runtime } = await target(paths, instanceId);
     const previous = await storedPolicy(files.policyFile);
-    const policy: BrowserPolicyFile = {
-      schemaVersion: 1,
-      enabled: true,
-      ...(previous?.chromePath ? { chromePath: previous.chromePath } : {}),
-    };
+    const chrome = previous?.chromePath ? { chromePath: previous.chromePath } : {};
+    const listed =
+      access === undefined
+        ? previous?.schemaVersion === 2
+          ? previous.agentGroupIds
+          : undefined
+        : access.kind === 'agent_groups'
+          ? [...new Set(access.agentGroupIds)]
+          : undefined;
+    const policy = parseBrowserPolicyFile(
+      listed === undefined
+        ? { schemaVersion: 1, enabled: true, ...chrome }
+        : { schemaVersion: 2, enabled: true, ...chrome, agentGroupIds: listed },
+    );
+    if (!policy)
+      throw new GwsEaError(
+        'invalid_arguments',
+        'Agent group IDs have no spaces or control characters, and at most 64 groups may be listed.',
+      );
+    if (access?.kind === 'agent_groups')
+      await assertHostMayList(runtime, listed ?? [], dependencies.ncl ?? runInstanceNclJson);
     let changed = false;
     if (JSON.stringify(previous) !== JSON.stringify(policy)) {
       await dependencies.recordEffect?.(null);
@@ -131,8 +233,56 @@ export async function enableBrowserCapability(
       changed = true;
       await dependencies.recordEffect?.(true);
     }
-    return { ...BROWSER_CAPABILITY, instance_id: instanceId, enabled: true, changed };
+    return {
+      ...BROWSER_CAPABILITY,
+      instance_id: instanceId,
+      enabled: true,
+      changed,
+      access: accessView(browserAccessOf(policy)),
+    };
   });
+}
+
+/**
+ * Enable the assistant's browser, then bring it to a verified web alias
+ * (KTD13): under the assistant's lock again, and only while the policy still
+ * enables the browser. An alias that waits on the operator returns as the
+ * operation's pause, with the browser already enabled.
+ */
+export async function enableBrowserWithAlias(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  dependencies: BrowserEnableDependencies = {},
+  access?: BrowserAccessChange,
+): Promise<BrowserOperationData> {
+  const enabled = await enableBrowserCapability(paths, instanceId, dependencies, access);
+  const reporter: StepReporter = {
+    emit: (event) => {
+      if (event.type === 'domain-effect') void dependencies.recordEffect?.(event.changed);
+      dependencies.emit?.(event);
+    },
+  };
+  const alias = await withAssistantLock(paths, instanceId, async () => {
+    const { runtime, files } = await target(paths, instanceId);
+    if (!(await readBrowserPolicy(files.policyFile)).enabled) return undefined;
+    return runAliasStep(paths, instanceId, runtime, reporter, { ...dependencies.alias, ncl: dependencies.ncl });
+  });
+  if (alias?.status !== 'paused') return enabled;
+  const { settled: _settled, kind: _kind, ...pause } = alias.pause;
+  return { ...enabled, pause };
+}
+
+/** What continues an enable whose web alias waits: the pause's flag, or the input it names. */
+export function browserAliasNextActions(instanceId: string, pause: NonNullable<OperationData['pause']>): NextAction[] {
+  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  const flag = pause.resumeFlag;
+  return [
+    ...(pause.actionUrl ? [{ kind: 'external' as const, instruction: pause.message, url: pause.actionUrl }] : []),
+    ...(flag?.includes('<')
+      ? [{ kind: 'external' as const, instruction: `Supply the input requested by ${flag}.` }]
+      : []),
+    { kind: 'command', argv: flag && !flag.includes('<') ? [...command, ...flag.split(' ')] : command },
+  ];
 }
 
 export async function disableBrowserCapability(
@@ -143,18 +293,23 @@ export async function disableBrowserCapability(
   return withAssistantLock(paths, instanceId, async () => {
     const { files } = await target(paths, instanceId);
     const previous = await storedPolicy(files.policyFile);
+    // The access list stays: enabling again grants the same groups.
+    const policy: BrowserPolicyFile = previous ? { ...previous, enabled: false } : { schemaVersion: 1, enabled: false };
     let changed = false;
     // Persist disabled intent: even a stopped host must see it on its next start.
     if (!previous || previous.enabled) {
       await dependencies.recordEffect?.(null);
-      await writePrivateFile(
-        files.policyFile,
-        `${JSON.stringify({ ...previous, schemaVersion: 1, enabled: false })}\n`,
-      );
+      await writePrivateFile(files.policyFile, `${JSON.stringify(policy)}\n`);
       changed = true;
       await dependencies.recordEffect?.(true);
     }
-    return { ...BROWSER_CAPABILITY, instance_id: instanceId, enabled: false, changed };
+    return {
+      ...BROWSER_CAPABILITY,
+      instance_id: instanceId,
+      enabled: false,
+      changed,
+      access: accessView(browserAccessOf(policy)),
+    };
   });
 }
 
@@ -295,9 +450,51 @@ export async function inspectBrowserCapability(
     chrome,
     isolation,
     ready: policy.enabled && chrome.status === 'available' && isolation.status === 'passed',
+    access: policy.status === 'unavailable' ? null : accessView(policy.access),
   };
 }
 /* eslint-enable no-catch-all/no-catch-all */
+
+/** Where a release declares the browser policy versions its host reads (`BROWSER_POLICY_VERSIONS`). */
+const POLICY_VERSIONS_FILE = 'src/gws-ea/browser-compatibility.json';
+
+/** The browser policy versions a release's host reads; a release without the marker reads version 1 alone. */
+export async function releaseBrowserPolicyVersions(checkout: string): Promise<readonly number[]> {
+  let item: unknown;
+  try {
+    item = JSON.parse(await readFile(path.join(checkout, POLICY_VERSIONS_FILE), 'utf8'));
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR') || error instanceof SyntaxError) return [1];
+    throw error;
+  }
+  return isRecord(item) &&
+    item.schemaVersion === 1 &&
+    Array.isArray(item.policyVersions) &&
+    item.policyVersions.every((version) => Number.isSafeInteger(version))
+    ? (item.policyVersions as number[])
+    : [1];
+}
+
+/**
+ * Refuse a rollback to `release` (checked out at `checkout`) while the
+ * assistant's browser policy is one that release cannot read: an older host
+ * reads a version-2 access list as invalid, and the browser would be lost
+ * (KTD15). Returning the browser to main alone first allows it.
+ */
+export async function assertBrowserPolicyReadable(
+  runtime: InstanceRuntimeConfig,
+  checkout: string,
+  release: string,
+): Promise<void> {
+  const policy = await readBrowserPolicy(instanceBrowserPolicyFile(runtime));
+  if (policy.status === 'unavailable' || policy.access.version === 1) return;
+  if ((await releaseBrowserPolicyVersions(checkout)).includes(policy.access.version)) return;
+  const id = runtime.instance_id;
+  throw new GwsEaError(
+    'rollback_unavailable',
+    `Assistant ${id}'s browser access lists agent groups, which ${release} cannot read: rolled back, it would lose the browser. Return the browser to main alone with gws-ea capabilities enable browser --id ${id} --main-only (and disable it again if it should stay off), then roll back.`,
+  );
+}
 
 export function browserCapabilityNextActions(capability: BrowserCapabilityObservation): readonly NextAction[] {
   return [
@@ -314,10 +511,18 @@ export function browserCapabilityNextActions(capability: BrowserCapabilityObserv
     },
   ];
 }
+/** Who may use the browser, in the operator's words: a listed group shares its sign-ins and the vault's logins. */
+export function browserAccessLine(access: BrowserAccessView): string {
+  if (access.version === 1) return 'main alone';
+  if (access.agent_group_ids.length === 0) return 'no agent group';
+  return `agent groups ${access.agent_group_ids.join(', ')}; each shares the signed-in browser profile and the vault's logins`;
+}
+
 export function browserCapabilityLines(capability: BrowserCapabilityObservation): readonly string[] {
   return [
     `browser (assistant ${capability.instance_id}): ${capability.summary}`,
     `  Activation: ${capability.activation}`,
+    ...(capability.access === null ? [] : [`  Access: ${browserAccessLine(capability.access)}`]),
     `  Chrome: ${capability.chrome.status}; path: ${capability.chrome.path}; version: ${capability.chrome.version ?? 'not checked'}`,
     `  Isolation: ${capability.isolation.status}`,
     ...[capability.chrome.reason, capability.isolation.reason]

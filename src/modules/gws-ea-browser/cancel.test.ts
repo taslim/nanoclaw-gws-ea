@@ -26,6 +26,8 @@ import { BrowserQueue } from './queue.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
+import { deliverAction as send, refusal } from './testing/delivery-answer.js';
+import { vaultAccessGuard } from './vault-access.js';
 
 let session: Session;
 beforeEach(async () => {
@@ -265,5 +267,89 @@ describe('cancelling a job with credential attempts', () => {
     await getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'rejected'");
     await sweepBrowserJobSessions(new Date().toISOString());
     expect((await getSession(session.id))?.status).toBe('closed');
+  });
+});
+
+describe('a second agent group the browser access setting lists', () => {
+  const bounds = {
+    venue_id: 'bistro-ellery',
+    party_size: 2,
+    window_start: '2026-11-06T19:00:00-05:00',
+    window_end: '2026-11-06T21:00:00-05:00',
+  };
+
+  let main: Session;
+  let research: Session;
+  let other: Session;
+  let mainThread: string;
+  let researchThread: string;
+  beforeEach(async () => {
+    for (const id of ['research', 'other'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    const file = `${root}/browser/policy.json`;
+    fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }), {
+      mode: 0o600,
+    });
+    process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+    main = (await resolveSystemSession('main', 'system:test:main')).session;
+    research = (await resolveSystemSession('research', 'system:test:research')).session;
+    other = (await resolveSystemSession('other', 'system:test:other')).session;
+    mainThread = session.thread_id!;
+    researchThread = (await resolveSystemSession('browser', 'system:a2a:research:errand')).session.thread_id!;
+  });
+
+  it('records its jobs as its own and lets it manage them like main', async () => {
+    expect((await readBrowserJob(researchThread))?.job.source_agent_group_id).toBe('research');
+    expect(await send(research, 'reservation_bounds', { thread: researchThread, ...bounds })).toMatchObject({
+      ok: true,
+      data: { status: 'recorded', thread: researchThread },
+    });
+    expect(await send(research, 'cancel_job', { thread: researchThread })).toMatchObject({
+      ok: true,
+      data: { status: 'cancelled' },
+    });
+    expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+  });
+
+  it("never lets main reach its jobs, nor it main's", async () => {
+    for (const [from, thread] of [
+      [main, researchThread],
+      [research, mainThread],
+    ] as const) {
+      expect(refusal(await send(from, 'cancel_job', { thread }))).toBe(
+        'No delegated browser job exists for that thread.',
+      );
+      expect(refusal(await send(from, 'reservation_bounds', { thread, ...bounds }))).toBe(
+        'No live browser job of yours exists for that thread.',
+      );
+    }
+    expect(await readBrowserJob(researchThread)).toMatchObject({ state: 'idle' });
+    expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+    expect(await getDb().all('SELECT job_id FROM gws_ea_browser_reservation_bounds')).toEqual([]);
+  });
+
+  it("shares the vault's logins with it: it may share the vault with the principal, as main may", async () => {
+    for (const [agentGroupId, effect] of [
+      ['research', 'allow'],
+      ['main', 'allow'],
+      ['other', 'deny'],
+    ] as const)
+      expect(await guard(vaultAccessGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
+        effect,
+      });
+  });
+
+  it('refuses a group the setting does not list, and main once it lists only others', async () => {
+    expect(refusal(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    fs.writeFileSync(
+      `${root}/browser/policy.json`,
+      JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }),
+    );
+    expect(refusal(await send(main, 'cancel_job', { thread: mainThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
   });
 });

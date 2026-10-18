@@ -4,8 +4,10 @@
  *
  * This is the host-side source of truth. A group stores `all` or a list of
  * keys in `container_configs.capabilities`; `all` means every registered key
- * whose registry default is `on`. At spawn the host resolves the stored value
- * to an explicit list and writes it into the read-only container.json, where
+ * whose registry default is `on`. A key a module's own setting grants
+ * (`grantedTo`) is held exactly where that setting says, whatever a group
+ * stores. At spawn the host resolves both to an explicit list and writes it
+ * into the read-only container.json, where
  * the runner builds the agent's tools from it alone and treats a missing or
  * malformed list as no capabilities at all.
  *
@@ -34,6 +36,13 @@ export interface CapabilityDef {
   instructions?: readonly string[];
   /** Shared container skills that need the key. A skill no key names needs `shell`. */
   skills?: readonly string[];
+  /**
+   * For a key a module's own setting grants rather than a group's stored
+   * selection: whether that setting names `agentGroupId` now. Such a key
+   * defaults off and is held by exactly the groups the setting names,
+   * whatever they store (`grantCapabilities`).
+   */
+  grantedTo?: (agentGroupId: string) => Promise<boolean>;
 }
 
 /** Keys whose host effects core applies directly. */
@@ -53,6 +62,8 @@ export function registerCapability(key: string, def: CapabilityDef): void {
     throw new Error(`Capability key "${key}" must be lowercase letters, digits and "-", and not "all"`);
   }
   if (registry.has(key)) throw new Error(`Capability "${key}" already registered`);
+  if (def.grantedTo && def.default !== 'off')
+    throw new Error(`Capability "${key}" is granted by a setting, so it defaults off`);
   registry.set(key, def);
 }
 
@@ -182,10 +193,31 @@ export function parseCapabilitiesArg(input: string): CapabilitySelection {
   return listCapabilityKeys().filter((key) => keys.includes(key));
 }
 
+/**
+ * `resolved` (a group's stored selection, resolved) with each key a module's
+ * setting grants (`grantedTo`) held exactly where it names `agentGroupId`
+ * now: what a spawn writes, the project document teaches, and
+ * `getGroupCapabilities` reads.
+ */
+export async function grantCapabilities(resolved: readonly string[], agentGroupId: string): Promise<string[]> {
+  const held = new Set(resolved);
+  for (const [key, def] of registry) {
+    if (!def.grantedTo) continue;
+    if (await def.grantedTo(agentGroupId)) held.add(key);
+    else held.delete(key);
+  }
+  return listCapabilityKeys().filter((key) => held.has(key));
+}
+
 /** The capabilities an agent group holds now, read the way a spawn reads them. */
 export async function getGroupCapabilities(agentGroupId: string): Promise<ReadonlySet<string>> {
   const stored = (await getContainerConfig(agentGroupId))?.capabilities;
-  return new Set(resolveCapabilities(parseStoredCapabilities(stored, agentGroupId), agentGroupId));
+  return new Set(
+    await grantCapabilities(
+      resolveCapabilities(parseStoredCapabilities(stored, agentGroupId), agentGroupId),
+      agentGroupId,
+    ),
+  );
 }
 
 /**

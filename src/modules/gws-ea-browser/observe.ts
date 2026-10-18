@@ -3,6 +3,8 @@ import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { httpsOrigin, SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
+import { ControlFactsUnavailableError, pageHoldsSecretValue } from './control-facts.js';
+import type { CookieBannerReport } from './cookie-banners.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -17,6 +19,8 @@ export interface BrowserObservation {
   snapshot: string;
   delta?: { removed: string[]; added: string[] };
   site?: { origin: string; untrusted: true; [key: string]: unknown };
+  /** What the host did about a cookie banner just before this observation (R18); absent when none showed. */
+  cookie_banner?: CookieBannerReport;
 }
 export interface BrowserRef {
   ref: string;
@@ -172,9 +176,10 @@ async function collectSecretFields(page: Page): Promise<boolean> {
   return present;
 }
 
-export async function pageHasSecret(page: Page): Promise<boolean> {
+/** Whether the host inserted a secret on one of the page's current documents, or holds one not yet bound to them. */
+async function hostSecretOnPage(page: Page): Promise<boolean> {
   const state = stateFor(page);
-  if ((await collectSecretFields(page)) || state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
+  if (state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
   if (!state.secretDocumentLoaders.size) return false;
   try {
     const loaders = await documentLoaders(page);
@@ -184,7 +189,35 @@ export async function pageHasSecret(page: Page): Promise<boolean> {
   }
 }
 
-export async function observePage(page: Page, assertActive?: () => Promise<void>): Promise<BrowserObservation> {
+export async function pageHasSecret(page: Page): Promise<boolean> {
+  return (await collectSecretFields(page)) || (await hostSecretOnPage(page));
+}
+
+/**
+ * Whether a picture of the page could show a secret (KTD6): the host inserted one on the page, or an
+ * isolated-world scan of every frame, shadow roots included, finds a field holding one. A scan that cannot
+ * complete counts as finding one.
+ */
+export async function pageMayShowSecret(page: Page): Promise<boolean> {
+  if (await hostSecretOnPage(page)) return true;
+  try {
+    return await pageHoldsSecretValue(page);
+  } catch (error) {
+    if (error instanceof ControlFactsUnavailableError) return true;
+    throw error;
+  }
+}
+
+export interface ObservePageOptions {
+  /** What the host did about a cookie banner just before this observation (R18), for it to report. */
+  readonly cookieBanner?: CookieBannerReport | undefined;
+}
+
+export async function observePage(
+  page: Page,
+  assertActive?: () => Promise<void>,
+  options: ObservePageOptions = {},
+): Promise<BrowserObservation> {
   await collectSecretFields(page);
   const state = stateFor(page);
   const url = redactPageText(page, page.url());
@@ -222,7 +255,14 @@ export async function observePage(page: Page, assertActive?: () => Promise<void>
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */
   }
-  return { generation: state.generation, url, snapshot, ...(delta ? { delta } : {}), ...(site ? { site } : {}) };
+  return {
+    generation: state.generation,
+    url,
+    snapshot,
+    ...(delta ? { delta } : {}),
+    ...(site ? { site } : {}),
+    ...(options.cookieBanner ? { cookie_banner: options.cookieBanner } : {}),
+  };
 }
 
 /** Structured host checkpoints replace native refs just like agent observations do. */

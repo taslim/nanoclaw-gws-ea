@@ -21,6 +21,11 @@
  * its readers receive it: as written, as a mail client renders it, and the
  * targets of its links (`readingsOf`).
  *
+ * Websites are the browser module's to guard (KTD19): it reads what each
+ * site would receive through `loadPersonalData`, which names the values it
+ * finds by reference, and refuses each on a site main has not disclosed it
+ * to. No disclosure opens a site to one of the principal's addresses (R34).
+ *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
  * the principal's card.
@@ -33,9 +38,11 @@ import { gfm, gfmHtml } from 'micromark-extension-gfm';
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
+import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
@@ -43,6 +50,7 @@ import {
   assertMainCaller,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
+  listPrincipalAddresses,
   principalApproverUserId,
 } from '../gws-ea-profile/db.js';
 import { guardActor, requestPrincipalConfirmation } from '../gws-ea-profile/principal-confirmation.js';
@@ -50,7 +58,9 @@ import { resolveAudience, type Audience } from './audience.js';
 import { addPrivateValue, getPrivateValue, listPrivateValues, removePrivateValue, type PrivateValue } from './db.js';
 import {
   compilePrivateValue,
+  fieldStreamOf,
   findPrivateValue,
+  givesAway,
   PRIVATE_VALUE_KINDS,
   streamOf,
   type CompiledPrivateValue,
@@ -238,6 +248,87 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
 }
 
 registerOutboundGuard(PRIVACY_GUARD_ID, judgeSend);
+
+// ---------------------------------------------------------------------------
+// What the host browser gives a website (KTD19, R34)
+// ---------------------------------------------------------------------------
+
+/** A stored value as the host browser names it: by its id and kind, never its value or label. */
+export interface PrivateValueReference {
+  readonly id: string;
+  readonly kind: PrivateValueKind;
+}
+
+/** What the text one website receives gives away. */
+export interface PersonalDataReading {
+  /** The stored values it gives away. */
+  readonly values: readonly PrivateValueReference[];
+  /** Whether it gives away one of the principal's addresses. */
+  readonly principalAddress: boolean;
+}
+
+export interface PersonalData {
+  /** No stored value and no principal address: nothing a website could be given. */
+  readonly empty: boolean;
+  /** What `fields`, the text one website receives, read in order as one form's fields, give away. */
+  read(fields: readonly string[]): PersonalDataReading;
+}
+
+/** An email address as people write one in text. */
+const WRITTEN_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu;
+
+/** One mailbox in every spelling that reaches it (`identityMatchKey`): any case, any `+tag`, and Gmail's dots. */
+function mailbox(address: string): string {
+  return identityMatchKey(`email:${address.trim()}`);
+}
+
+/**
+ * The principal's personal data as the host browser reads what a website receives (KTD19, R34): each stored
+ * value, which main may disclose to one site, and each of the principal's addresses, which only the host's own
+ * sign-in to their own account gives a site. A value is found however it is written and split across the
+ * fields, a phone number across an area-code field and a number field included, and an address in any
+ * spelling that reaches the principal's mailbox. Read through `db`, the browser's handle on the central
+ * database; a reading names values by reference, so no value leaves this module.
+ */
+export async function loadPersonalData(db: DbDriver = getDb()): Promise<PersonalData> {
+  const stored = (await db.hasTable('gws_ea_private_values')) ? await listPrivateValues(db) : [];
+  const addresses = (await db.hasTable('gws_ea_principal_addresses'))
+    ? (await listPrincipalAddresses(db)).map(({ email }) => email)
+    : [];
+  const values = stored.map(({ id, kind, value }) => ({
+    reference: { id, kind },
+    compiled: compilePrivateValue(kind, value),
+  }));
+  const principal = addresses.map((address) => compilePrivateValue('email', address));
+  const mailboxes = new Set(addresses.map(mailbox));
+  return {
+    empty: values.length === 0 && addresses.length === 0,
+    read(fields) {
+      const stream = fieldStreamOf(fields);
+      return {
+        values: values.filter(({ compiled }) => givesAway(compiled, stream)).map(({ reference }) => reference),
+        principalAddress:
+          principal.some((address) => givesAway(address, stream)) ||
+          fields.some((field) =>
+            (field.match(WRITTEN_ADDRESS) ?? []).some((address) => mailboxes.has(mailbox(address))),
+          ),
+      };
+    },
+  };
+}
+
+/**
+ * A stored value as main's disclosure names it (KTD19): its id, kind and label, and whether it reaches one of
+ * the principal's mailboxes, which no disclosure may open a site to (R34). Never the value itself.
+ */
+export async function privateValueReference(
+  id: string,
+): Promise<(PrivateValueReference & { readonly label: string; readonly principalAddress: boolean }) | undefined> {
+  const value = await getPrivateValue(id);
+  if (!value) return undefined;
+  const { principalAddress } = (await loadPersonalData()).read([value.value]);
+  return { id: value.id, kind: value.kind, label: value.label, principalAddress };
+}
 
 // ---------------------------------------------------------------------------
 // Removal: held for the principal's card, because it switches a check off.

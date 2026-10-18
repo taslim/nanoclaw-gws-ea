@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import type { Browser, Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 
-import { documentGate, type GuardedPage } from './document-gate.js';
+import { documentGate, type GuardedPage, type PausedDocument } from './document-gate.js';
 
 interface Tree {
   frame: { id: string };
@@ -117,9 +117,14 @@ function fixture(
     },
   });
   let next = 0;
-  const pause = async (frameId: string, resourceType = 'Document', headers: Record<string, string> = {}) => {
+  const pause = async (
+    frameId: string,
+    resourceType = 'Document',
+    headers: Record<string, string> = {},
+    method = 'GET',
+  ) => {
     const requestId = String(next++);
-    paused?.({ requestId, frameId, resourceType, request: { url: 'https://shop.example/', headers } });
+    paused?.({ requestId, frameId, resourceType, request: { url: 'https://shop.example/', method, headers } });
     await vi.waitFor(() => expect(answers.has(requestId)).toBe(true), { timeout: 5_000 });
     return answers.get(requestId);
   };
@@ -127,13 +132,13 @@ function fixture(
 }
 
 function guardedPage() {
-  const decide = vi.fn(async () => ({ allow: true as const }));
+  const decide = vi.fn(async (_document: PausedDocument) => ({ allow: true as const }));
   const refuse = vi.fn();
   const page: GuardedPage = { capture: () => ({ decide, refuse }) };
   return { page, decide, refuse };
 }
 
-it('places main, cross-site, nested and same-process frames, and windows, with the page they belong to', async () => {
+it('places main, cross-site, nested and same-process frames, and windows, with their page, handing each its method and level', async () => {
   const { browser, pause } = fixture(
     {
       main: { type: 'page' },
@@ -147,9 +152,15 @@ it('places main, cross-site, nested and same-process frames, and windows, with t
   );
   const guarded = guardedPage();
   (await documentGate(browser)).register('main', guarded.page);
-  for (const frame of ['main', 'main-child', 'widget', 'widget-child', 'nested', 'popup'])
+  expect(await pause('main', 'Document', {}, 'POST')).toBe('continued');
+  for (const frame of ['main-child', 'widget', 'widget-child', 'nested', 'popup'])
     expect(await pause(frame)).toBe('continued');
-  expect(guarded.decide).toHaveBeenCalledTimes(6);
+  // Each document carries its method; a frame's document and a window's are their page's to decide, but never its
+  // own top-level document.
+  expect(guarded.decide.mock.calls.map(([document]) => [document.method, document.topLevel])).toEqual([
+    ['POST', true],
+    ...Array.from({ length: 5 }, () => ['GET', false]),
+  ]);
 });
 
 it('continues the documents of pages nobody guards or opened, and of the windows they open', async () => {

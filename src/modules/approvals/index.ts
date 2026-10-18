@@ -31,6 +31,7 @@ export type {
   ApprovalHandlerContext,
   ApprovalHandlerOptions,
   RequestApprovalOptions,
+  RequestPicture,
 } from './primitive.js';
 // Host-sweep hook for ghosted "Reject with reason…" holds. The re-export also
 // loads reason-capture.js, registering its message-interceptor on import.

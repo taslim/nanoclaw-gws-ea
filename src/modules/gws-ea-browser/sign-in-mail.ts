@@ -19,7 +19,6 @@ import { clearOutbox, withExistingMailboxSession } from '../../session-manager.j
 import type { Session } from '../../types.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
   cleanupSignInClaims,
   createSignInClaim,
@@ -30,6 +29,7 @@ import {
   type SignInClaim,
 } from '../gws-ea-inbox/claims.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import { authenticationFieldKind } from './authentication-signatures.js';
 import { browserDelegateGuard } from './cancel.js';
 import type { BrowserJob, BrowserRequest } from './db.js';
@@ -60,6 +60,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { signInAddress } from './web-address.js';
 
 interface SignInPayload extends Record<string, unknown> {
   from: 'assistant' | 'principal';
@@ -455,8 +456,7 @@ async function openBearerLink<T>(
         classify(url) {
           if (!httpsOrigin(url.href) || getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain)
             return 'blocked_address';
-          const classification = classifyNavigationUrl(url.href);
-          return classification === 'unsupported_merchant' ? 'ordinary' : classification;
+          return classifyNavigationUrl(url.href);
         },
         async beforeNavigate(url) {
           await context.assertActive();
@@ -532,6 +532,9 @@ export async function executeSignInCode(
         throw invalidArgs('Choose the email or one-time-code field in a supported sign-in form.');
       if (payload.from === 'principal' && kind !== 'otp')
         throw invalidArgs('Choose the principal code field after requesting their code.');
+      // The assistant signs in with its web address, never one it converses from (KTD14).
+      const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
+      if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
       const binding = await bindBrowserSecretField(
         page,
         target,
@@ -558,15 +561,8 @@ export async function executeSignInCode(
       });
       if (payload.from === 'assistant') assistantWait = awaitAssistantReply(context, claim);
       await context.assertActive();
-      if (kind === 'username') {
-        const inbox = activeInbox();
-        if (!inbox) throw forbidden('The assistant inbox is unavailable.');
-        await inbox.gmailAddress();
-        await context.assertActive();
-        const addresses = await assistantAddresses();
-        const current = (await target.element.inputValue()).trim().toLowerCase();
-        const email = addresses.has(current) ? current : [...addresses][0];
-        if (!email) throw forbidden('The assistant inbox address is unavailable.');
+      if (kind === 'username' && email !== undefined) {
+        if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
         const sent = await fillBoundBrowserSecret(context, binding, async () => email);
         if (sent.status === 'origin_mismatch') return sent;
         if (sent.status !== 'submitted' && sent.status !== 'cleared_after_submit')
@@ -672,9 +668,11 @@ export async function answerRelayCode(
   requestId: string,
   queue: BrowserQueue,
 ): Promise<Record<string, unknown> | typeof ANSWER_LATER> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may relay the principal’s code.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may relay the principal’s code.');
   const payload = relayCode(content);
+  // A code goes only to an errand this agent opened.
+  if (errandSource(payload.thread) !== session.agent_group_id) return { status: 'no_wait' };
   const claim = await waitingSignInClaim(payload.thread, 'principal');
   if (!claim || !bindings.has(claim.id)) return { status: 'no_wait' };
   const id = createHash('sha256').update(`${session.id}\0${requestId}`).digest('hex');
@@ -693,7 +691,12 @@ async function executeRelayCode(
   const payload = validateRelayPayload(content);
   let result: Record<string, unknown> = { status: 'no_wait' };
   const source = await getSession(payload.source_session_id);
-  if (!source || source.agent_group_id !== (await getMainAgentGroupId())) return result;
+  if (
+    !source ||
+    source.agent_group_id !== context.job.source_agent_group_id ||
+    !(await hasBrowserAccess(source.agent_group_id))
+  )
+    return result;
   const claim = await getSignInClaim(payload.claim_id);
   const live = bindings.get(payload.claim_id);
   try {
@@ -775,15 +778,13 @@ async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame)
   const payload = validateRelayPayload(JSON.parse(request.payload_json) as Record<string, unknown>);
   const source = await getSession(payload.source_session_id);
   const job = await getDb().get<BrowserJob>('SELECT * FROM gws_ea_browser_jobs WHERE id = ?', request.job_id);
-  const main = await getMainAgentGroupId();
   if (
     !source ||
     !job ||
-    source.agent_group_id !== main ||
-    job.source_agent_group_id !== main ||
+    source.agent_group_id !== job.source_agent_group_id ||
     job.browser_session_id !== request.session_id
   )
-    throw forbidden('The principal relay is no longer attached to its main-owned job.');
+    throw forbidden('The principal relay is no longer attached to the job its agent delegated.');
   const claim = await getSignInClaim(payload.claim_id);
   if (claim && claim.job_id !== job.id) throw forbidden('The principal relay belongs to another browser job.');
   const data = frame.ok && isRecord(frame.data) ? frame.data : undefined;

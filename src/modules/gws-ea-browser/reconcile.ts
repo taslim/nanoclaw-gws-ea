@@ -1,5 +1,6 @@
 import { getDb } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import type { AgentDestination } from '../../types.js';
 import { writeDestinations } from '../agent-to-agent/write-destinations.js';
 import {
   createDestination,
@@ -7,7 +8,8 @@ import {
   getDestinationByName,
   getDestinations,
 } from '../agent-to-agent/db/agent-destinations.js';
-import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { browserDelegators, errandSource, type BrowserDelegator } from './access.js';
 import { cancelBrowserJob } from './cancel.js';
 import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 import { readBrowserPolicy } from './policy.js';
@@ -25,92 +27,141 @@ export async function reconcileBrowserGroup(policyFile?: string): Promise<void> 
   }
 }
 
-async function reconcileDestinations(policyFile?: string): Promise<void> {
-  if (!(await getDb().hasTable('gws_ea_profile'))) return;
-  const main = await getMainAgentGroupId();
-  const policy = await readBrowserPolicy(policyFile);
-  if (!policy.enabled) {
-    const browser = await getBrowserAgentGroupId();
-    if (browser === null) return;
-    if (await getDb().hasTable('gws_ea_browser_jobs')) {
-      // A delegated thread exists before its first host-browser request creates its lazy job row.
-      for (const session of await getSessionsByAgentGroup(browser)) {
-        if (
-          main !== null &&
-          session.status === 'active' &&
-          session.messaging_group_id === null &&
-          session.thread_id?.startsWith(`system:a2a:${main}:`)
-        )
-          await cancelBrowserJob(session.thread_id);
-      }
-      const jobs = await getDb().all<{ thread_id: string }>(
-        'SELECT thread_id FROM gws_ea_browser_jobs WHERE cancelled = 0',
-      );
-      for (const job of jobs) await cancelBrowserJob(job.thread_id);
-    }
-    const rows = await getDb().all<{ agent_group_id: string; local_name: string }>(
-      "SELECT agent_group_id, local_name FROM agent_destinations WHERE agent_group_id = ? OR (target_type = 'agent' AND target_id = ?)",
-      browser,
-      browser,
-    );
-    // Retry projection even when a prior sweep deleted the central edge before
-    // its mailbox write failed. Active containers may still hold that old map.
-    const owners = new Set([browser, ...(main === null ? [] : [main]), ...rows.map((row) => row.agent_group_id)]);
-    for (const row of rows) await deleteDestination(row.agent_group_id, row.local_name);
-    for (const owner of owners) await project(owner);
-    return;
+/**
+ * Cancel every errand whose group may not delegate now, one opened before
+ * its first host-browser request included: disabling cancels them all, and
+ * removing a group from the access setting cancels its own (R28). Returns
+ * the groups whose errands remain open sessions, for projection.
+ */
+async function cancelErrandsOutside(browser: string, delegators: ReadonlySet<string>): Promise<Set<string>> {
+  const sources = new Set<string>();
+  if (!(await getDb().hasTable('gws_ea_browser_jobs'))) return sources;
+  // A delegated thread exists before its first host-browser request creates its lazy job row;
+  // one that has its row is cancelled below, once, rather than on every sweep.
+  for (const session of await getSessionsByAgentGroup(browser)) {
+    const thread = session.thread_id;
+    const source = errandSource(thread);
+    if (thread === null || source === undefined || session.status !== 'active' || session.messaging_group_id !== null)
+      continue;
+    sources.add(source);
+    if (!delegators.has(source) && !(await getDb().get('SELECT 1 FROM gws_ea_browser_jobs WHERE id = ?', thread)))
+      await cancelBrowserJob(thread);
   }
-  if (main === null) return;
-  const browser = await ensureBrowserGroup();
-  const back = await getDestinationByName(browser, 'main');
-  if (
-    back?.target_type !== 'agent' ||
-    back.target_id !== main ||
-    back.session_mode !== 'agent-shared' ||
-    back.inbound_untrusted !== 0
-  ) {
-    for (const destination of await getDestinations(browser)) await deleteDestination(browser, destination.local_name);
-    await createDestination({
+  const jobs = await getDb().all<{ thread_id: string; source_agent_group_id: string }>(
+    'SELECT thread_id, source_agent_group_id FROM gws_ea_browser_jobs WHERE cancelled = 0',
+  );
+  for (const job of jobs) if (!delegators.has(job.source_agent_group_id)) await cancelBrowserJob(job.thread_id);
+  return sources;
+}
+
+/** The edges between browser and one delegating group: its reports return trusted, its errands go out per thread. */
+function edges(browser: string, delegator: BrowserDelegator): { back: AgentDestination; out: AgentDestination } {
+  const created_at = new Date().toISOString();
+  return {
+    back: {
       agent_group_id: browser,
-      local_name: 'main',
+      local_name: delegator.name,
       target_type: 'agent',
-      target_id: main,
+      target_id: delegator.agentGroupId,
       session_mode: 'agent-shared',
       inbound_untrusted: 0,
-      created_at: new Date().toISOString(),
-    });
-  }
-  const current = await getDestinationByName(main, 'browser');
-  if (
-    !(
-      current?.target_type === 'agent' &&
-      current.target_id === browser &&
-      current.session_mode === 'per-thread' &&
-      current.inbound_untrusted === 1
-    )
-  ) {
-    // A stale or unsafe edge is replaced natively, never layered with a second route.
-    for (const destination of await getDestinations(main)) {
-      if (
-        destination.local_name === 'browser' ||
-        (destination.target_type === 'agent' && destination.target_id === browser)
-      )
-        await deleteDestination(main, destination.local_name);
-    }
-    await createDestination({
-      agent_group_id: main,
+      created_at,
+    },
+    out: {
+      agent_group_id: delegator.agentGroupId,
       local_name: 'browser',
       target_type: 'agent',
       target_id: browser,
       session_mode: 'per-thread',
       inbound_untrusted: 1,
-      created_at: new Date().toISOString(),
-    });
+      created_at,
+    },
+  };
+}
+
+function sameEdge(row: AgentDestination | undefined, wanted: AgentDestination): boolean {
+  return (
+    row?.local_name === wanted.local_name &&
+    row.target_type === wanted.target_type &&
+    row.target_id === wanted.target_id &&
+    row.session_mode === wanted.session_mode &&
+    row.inbound_untrusted === wanted.inbound_untrusted
+  );
+}
+
+async function reconcileDestinations(policyFile?: string): Promise<void> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return;
+  const policy = await readBrowserPolicy(policyFile);
+  const granted = await browserDelegators(policy);
+  const delegators = policy.enabled ? granted : [];
+  const existing = await getBrowserAgentGroupId();
+  const sources =
+    existing === null
+      ? new Set<string>()
+      : await cancelErrandsOutside(existing, new Set(delegators.map((delegator) => delegator.agentGroupId)));
+  if (delegators.length === 0) {
+    if (existing === null) return;
+    const rows = await getDb().all<{ agent_group_id: string; local_name: string }>(
+      "SELECT agent_group_id, local_name FROM agent_destinations WHERE agent_group_id = ? OR (target_type = 'agent' AND target_id = ?)",
+      existing,
+      existing,
+    );
+    // Retry projection even when a prior sweep deleted the central edge before
+    // its mailbox write failed. Active containers may still hold that old map.
+    const owners = new Set([
+      existing,
+      ...granted.map((delegator) => delegator.agentGroupId),
+      ...sources,
+      ...rows.map((row) => row.agent_group_id),
+    ]);
+    for (const row of rows) await deleteDestination(row.agent_group_id, row.local_name);
+    for (const owner of owners) await project(owner);
+    return;
+  }
+  const browser = existing ?? (await ensureBrowserGroup());
+  const wanted = delegators.map((delegator) => edges(browser, delegator));
+  const held = await getDestinations(browser);
+  if (
+    held.length !== wanted.length ||
+    wanted.some(
+      ({ back }) =>
+        !sameEdge(
+          held.find((row) => row.local_name === back.local_name),
+          back,
+        ),
+    )
+  ) {
+    for (const destination of held) await deleteDestination(browser, destination.local_name);
+    for (const { back } of wanted) await createDestination(back);
+  }
+  const owners = new Set([browser, ...sources]);
+  for (const { out } of wanted) {
+    owners.add(out.agent_group_id);
+    if (sameEdge(await getDestinationByName(out.agent_group_id, 'browser'), out)) continue;
+    // A stale or unsafe edge is replaced natively, never layered with a second route.
+    for (const destination of await getDestinations(out.agent_group_id)) {
+      if (
+        destination.local_name === 'browser' ||
+        (destination.target_type === 'agent' && destination.target_id === browser)
+      )
+        await deleteDestination(out.agent_group_id, destination.local_name);
+    }
+    await createDestination(out);
+  }
+  // A group no longer listed keeps no route to browser.
+  const listed = new Set(delegators.map((delegator) => delegator.agentGroupId));
+  for (const row of await getDb().all<{ agent_group_id: string; local_name: string }>(
+    "SELECT agent_group_id, local_name FROM agent_destinations WHERE target_type = 'agent' AND target_id = ? AND agent_group_id <> ?",
+    browser,
+    browser,
+  )) {
+    if (listed.has(row.agent_group_id)) continue;
+    await deleteDestination(row.agent_group_id, row.local_name);
+    owners.add(row.agent_group_id);
   }
   // A correct central row is not evidence that its last mailbox projection
-  // succeeded. Re-project both directions, including already-active main.
-  await project(browser);
-  await project(main);
+  // succeeded. Re-project every direction, including already-active delegators.
+  for (const owner of owners) await project(owner);
 }
 
 async function project(agentGroupId: string): Promise<void> {

@@ -213,3 +213,37 @@ describe('approval presentation and expiry', () => {
     adapter.mockRestore();
   });
 });
+
+describe('pictures on approval requests (KTD6)', () => {
+  it.each([
+    ['names none, as before: the card alone', undefined, undefined],
+    ['names one that could not be taken, with no file beside it', [null], 1],
+  ] as const)('delivers a card that %s', async (_case, pictures, named) => {
+    const deliver = vi.fn<ChannelDeliveryAdapter['deliver']>().mockResolvedValue('pm-card');
+    setDeliveryAdapter({ deliver });
+
+    const id = await requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'purchase_card',
+      payload: {},
+      title: 'Approve this purchase?',
+      question: 'Checkout at shop.example: 41.20 USD.',
+      ...(pictures === undefined ? {} : { pictures }),
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [channelType, platformId, threadId, kind, content, files] = deliver.mock.calls[0]!;
+    expect([channelType, platformId, threadId, kind, files]).toEqual([
+      DM_CHANNEL,
+      DM_PLATFORM,
+      null,
+      'chat-sdk',
+      undefined,
+    ]);
+    // JSON holds no undefined value: a card naming no picture carries no pictures field at all.
+    const card = JSON.parse(content) as Record<string, unknown>;
+    expect(card.pictures).toBe(named);
+    expect(card.questionId).toBe(id);
+  });
+});

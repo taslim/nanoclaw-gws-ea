@@ -1,9 +1,20 @@
-import { expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
+import './index.js';
 import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from './executor.js';
 import type { PinnedBrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 import { registerPageSecret } from './observe.js';
+
+// A fake page has no isolated worlds, so its scan for secret values would fail closed; native suites cover the
+// scan. The host's own secret on a page still refuses a screenshot here.
+vi.mock('./observe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./observe.js')>()),
+  pageMayShowSecret: vi.fn(async () => false),
+}));
 
 it('rejects unknown actions and clipboard shortcuts without running a partial batch', () => {
   expect(() =>
@@ -41,6 +52,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
     },
   } as unknown as Page;
   const context = {
+    job: { id: 'job' },
     page: async () => page,
     assertActive: async () => undefined,
     remaining: () => 90_000,
@@ -95,4 +107,73 @@ it('refuses ordinary typing into new, confirming and show-password-toggled crede
   ];
   for (const attributes of secret) expect(await isSecretBrowserField(field(attributes))).toBe(true);
   for (const attributes of ordinary) expect(await isSecretBrowserField(field(attributes))).toBe(false);
+});
+
+describe("the assistant's own address in a site field (KTD14, R23)", () => {
+  const opened = new Error('The batch opened its page');
+  const context = {
+    page: async () => {
+      throw opened;
+    },
+  } as unknown as BrowserExecutionContext;
+  const typing = (text: string) => ({
+    actions: [{ kind: 'observe' }, { kind: 'type', ref: 'e1', generation: 1, text }],
+  });
+  const opening = (url: string) => ({ actions: [{ kind: 'navigate', url }] });
+  const choosing = (value: string) => ({ actions: [{ kind: 'select', ref: 'e1', generation: 1, value }] });
+  const inputs = (...values: string[]) => ({
+    actions: [
+      { kind: 'form_input', fields: values.map((value, index) => ({ ref: `e${index + 1}`, generation: 1, value })) },
+    ],
+  });
+
+  beforeEach(async () => {
+    await runMigrations(await initTestDb());
+    await getDb().run(
+      'UPDATE gws_ea_profile SET assistant_display_name = ?, assistant_workspace_email = ? WHERE singleton = 1',
+      'Juno',
+      'juno@corp.example',
+    );
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('stops a batch that types, selects or opens it in any spelling: alias_unavailable without an alias, then a refusal naming the alias', async () => {
+    const giving = [
+      typing('Juno@corp.example'),
+      typing('Reach me at juno+orders@corp.example.'),
+      inputs('Juno', 'juno@corp.example'),
+      opening('https://offers.example/join?email=Juno%2Borders%40corp.example&list=weekly'),
+      opening('https://offers.example/join/juno@corp.example'),
+      choosing('juno@corp.example'),
+    ];
+    // Before any action runs: the context's page is never opened.
+    for (const payload of giving)
+      expect(await executeBrowserBatch(context, payload), JSON.stringify(payload)).toEqual({
+        status: 'stopped',
+        reason: 'alias_unavailable',
+        repeat_safe: true,
+      });
+    await recordWebAlias('onuj@corp.example');
+    for (const payload of giving)
+      await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toMatchObject({
+        code: 'invalid-args',
+        message: expect.stringContaining('onuj@corp.example'),
+      });
+  });
+
+  it('runs a batch that gives the alias in any spelling, another address or none', async () => {
+    await expect(executeBrowserBatch(context, typing('Table for four'))).rejects.toBe(opened);
+    await recordWebAlias('onuj@corp.example');
+    for (const payload of [
+      typing('onuj@corp.example'),
+      typing('Onuj+Orders@corp.example'),
+      typing('morgan@principal.example'),
+      opening('https://offers.example/join?email=onuj%40corp.example'),
+      choosing('Weekly'),
+    ])
+      await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toBe(opened);
+  });
 });

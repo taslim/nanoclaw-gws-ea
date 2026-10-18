@@ -2,7 +2,8 @@
  * The assistant's Google Chat channel (KTD1, KTD4): upstream's Chat SDK
  * adapter, signed in as the assistant's own Workspace account, with only how
  * its events arrive replaced. Everything the assistant sends, edits, or reacts with still goes
- * through upstream's adapter and its message model.
+ * through upstream's adapter and its message model, but for a message with
+ * files on it, which the SDK drops (below).
  *
  * Chat's events are pulled from Pub/Sub (delivery.ts), never pushed, so the
  * adapter declares itself polling, the bridge registers no webhook route for
@@ -23,7 +24,14 @@
  * `normalizeBotMentions`. It also overrides `editMessage`: the SDK's text edit
  * names `cards_v2` in its update mask, which Google lets only a Chat app
  * update, so an edit made as the assistant updates the text alone.
+ *
+ * The SDK's post drops files, so the channel posts a message with files on
+ * it itself, such as an approval request with its pictures (KTD6): each file
+ * uploaded to the conversation, then one message with the text and every
+ * upload.
  */
+import { randomUUID } from 'node:crypto';
+
 import { GoogleChatAdapter, type GoogleChatMessage, type WorkspaceEventNotification } from '@chat-adapter/gchat';
 import {
   convertEmojiPlaceholders,
@@ -36,10 +44,12 @@ import {
 } from 'chat';
 import { OAuth2Client } from 'google-auth-library';
 
-import type { ChannelAdapter, ChannelDefaults } from '../../channels/adapter.js';
+import type { ChannelAdapter, ChannelDefaults, OutboundFile } from '../../channels/adapter.js';
 import type { AudioSource } from '../../channels/inbound-content.js';
 import {
   createChatSdkBridge,
+  FilesNotAttachedError,
+  type FileAttacher,
   type ReactionSource,
   type ReplyContext,
   type WorkingIndicator,
@@ -89,7 +99,7 @@ export interface AssistantChatAdapterOptions {
   /** The assistant's OAuth client for Chat (hostChatAuth). */
   readonly auth: OAuth2Client;
   readonly hydrator: ChatHydrator;
-  /** The assistant's Chat token, for the calls the channel makes itself: its working 👀. */
+  /** The assistant's Chat token, for the calls the channel makes itself: its working 👀, and messages with files. */
   readonly chatToken: () => Promise<string>;
   readonly fetch?: typeof globalThis.fetch;
   /** Starts pulling Chat's events into `onChatEvent`; started when the adapter initializes, stopped when it disconnects. */
@@ -110,6 +120,8 @@ interface ReadPart {
 }
 
 const CHAT = 'https://chat.googleapis.com/v1';
+/** Where Chat takes a file's bytes (`media.upload`). */
+const CHAT_UPLOAD = 'https://chat.googleapis.com/upload/v1';
 /** How long a turn works on a message before the assistant shows 👀 on it (R6). */
 const WORKING_AFTER_MS = 3_000;
 const WORKING_EMOJI = '👀';
@@ -155,7 +167,7 @@ export function hostChatAuth(token: () => Promise<string>, fetch?: typeof global
   return client;
 }
 
-export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource, WorkingIndicator {
+export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource, WorkingIndicator, FileAttacher {
   /** Chat's events are pulled: the bridge registers no webhook route for this adapter. */
   readonly runtimeMode = 'polling';
   private readonly hydrator: ChatHydrator;
@@ -261,6 +273,70 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     } catch (error) {
       this.handleGoogleChatError(error, 'editMessage');
     }
+  }
+
+  /**
+   * Post a message with files on it as one message, the one a reaction or
+   * quote then answers (KTD6). Each file is uploaded to the conversation
+   * first, then the message is posted with its text and every upload, as the
+   * assistant. A file Chat does not take rejects with FilesNotAttachedError
+   * before any message is posted. A file's bytes go only to Google.
+   */
+  async postWithFiles(
+    threadId: string,
+    message: AdapterPostableMessage,
+    files: readonly OutboundFile[],
+  ): Promise<RawMessage<unknown>> {
+    const { spaceName, threadName } = this.decodeThreadId(threadId);
+    const attachment: Array<{ attachmentDataRef: Record<string, unknown> }> = [];
+    for (const file of files) attachment.push({ attachmentDataRef: await this.upload(spaceName, file) });
+    const reply = threadName === undefined ? '' : '?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD';
+    const posted = await googleJson(this.chatClient, `${CHAT}/${spaceName}/messages${reply}`, {
+      method: 'POST',
+      body: {
+        text: convertEmojiPlaceholders(this.formatConverter.renderPostable(message), 'gchat'),
+        attachment,
+        ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+      },
+    });
+    if (!isRecord(posted) || typeof posted.name !== 'string') {
+      throw new GoogleApiError(502, 'Chat posted a message without naming it');
+    }
+    return { id: posted.name, threadId, raw: posted };
+  }
+
+  /** Upload one file to the space (`media.upload`): its name, then its bytes. Resolves to what a message attaches. */
+  private async upload(spaceName: string, file: OutboundFile): Promise<Record<string, unknown>> {
+    const boundary = `gws-ea-${randomUUID()}`;
+    const data = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+          `${JSON.stringify({ filename: file.filename })}\r\n` +
+          `--${boundary}\r\nContent-Type: ${file.mimeType ?? 'application/octet-stream'}\r\n\r\n`,
+      ),
+      file.data,
+      Buffer.from(`\r\n--${boundary}--`),
+    ]);
+    let uploaded: unknown;
+    try {
+      uploaded = await googleJson(
+        this.chatClient,
+        `${CHAT_UPLOAD}/${spaceName}/attachments:upload?uploadType=multipart`,
+        {
+          method: 'POST',
+          content: { type: `multipart/related; boundary=${boundary}`, data },
+        },
+      );
+    } catch (error) {
+      // Its message carries Google's answer: a log shows an error's message, never its cause.
+      const why = error instanceof Error ? error.message : 'unknown failure';
+      throw new FilesNotAttachedError(`Chat did not take the file ${file.filename}: ${why}`, { cause: error });
+    }
+    const ref = isRecord(uploaded) && isRecord(uploaded.attachmentDataRef) ? uploaded.attachmentDataRef : undefined;
+    if (typeof ref?.attachmentUploadToken !== 'string') {
+      throw new FilesNotAttachedError(`Chat named no upload for the file ${file.filename}`);
+    }
+    return ref;
   }
 
   /** No request reaches this host from Google: Chat's events are pulled. */
@@ -597,8 +673,8 @@ function chatCreateTime(raw: unknown): Date | undefined {
  * The channel: the adapter behind the Chat SDK bridge. Pub/Sub may hand an
  * event out again after it was routed, so the router drops a copy already
  * queued. Google lets a user write only text, so questions and approval
- * requests post in words (R7), each remembered with the time Google
- * recorded it.
+ * requests post in words (R7), with any pictures they name attached (KTD6),
+ * each remembered with the time Google recorded it.
  */
 export function createAssistantChatChannel(adapter: AssistantChatAdapter): ChannelAdapter {
   return createChatSdkBridge({

@@ -29,8 +29,9 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
-import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
@@ -320,16 +321,9 @@ describe('the browser credential request', () => {
       code_field: ref(5),
       activate: ref(6),
     });
-    expect(
-      validateCredentialForm({
-        authority,
-        username: ref(1),
-        new_password: ref(2),
-        accept_terms: ref(3),
-        activate: ref(4),
-      }),
-    ).toMatchObject({ accept_terms: ref(3) });
     for (const content of [
+      // The host makes every checkbox choice; the agent never names a terms box.
+      { authority, username: ref(1), new_password: ref(2), accept_terms: ref(3), activate: ref(4) },
       { authority, operation: 'reconcile', activate: ref(4) },
       { authority, operation: 'reconcile', new_password: ref(2), activate: ref(4) },
       { authority, operation: 'verify', code_field: ref(5) },
@@ -441,7 +435,8 @@ describe('the browser credential request', () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
   });
 
-  it('never accepts a terms checkbox for a password change', async () => {
+  // The request's fields are the same for every credential operation, a signup's included.
+  it('never takes a terms checkbox from the agent', async () => {
     await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
     const { page, result } = run(String(recorded.authority), {
@@ -971,5 +966,44 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
     );
     expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
+  });
+});
+
+describe("a signup's account email (KTD14; R20, R23, R25)", () => {
+  const recordedAttempts = () => getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
+
+  beforeEach(async () => {
+    await getDb().run(
+      'UPDATE gws_ea_profile SET assistant_display_name = ?, assistant_workspace_email = ? WHERE singleton = 1',
+      'Juno',
+      'juno@corp.example',
+    );
+  });
+
+  it("answers alias_unavailable for one under the assistant's own address until an alias is recorded, then refuses it naming the alias, and records one only under the alias", async () => {
+    for (const username of ['juno@corp.example', 'Juno+Shop@corp.example'])
+      expect(await ask({ operation: 'signup', site: ORIGIN, username }), username).toEqual({
+        status: 'alias_unavailable',
+      });
+    expect(await recordedAttempts()).toEqual([]);
+    await recordWebAlias('onuj@corp.example');
+    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno@corp.example' })).rejects.toMatchObject({
+      code: 'invalid-args',
+      message: expect.stringContaining('onuj@corp.example'),
+    });
+    expect(await recordedAttempts()).toEqual([]);
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'onuj+shop@corp.example' })).toMatchObject({
+      status: 'recorded',
+      username: 'onuj+shop@corp.example',
+    });
+  });
+
+  it("refuses one under the principal's address in any spelling: the assistant never opens an account in their name", async () => {
+    await addPrincipalAddress('morgan@principal.example');
+    await recordWebAlias('onuj@corp.example');
+    await expect(
+      ask({ operation: 'signup', site: ORIGIN, username: 'Morgan+shop@principal.example' }),
+    ).rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/1Password/u) });
+    expect(await recordedAttempts()).toEqual([]);
   });
 });

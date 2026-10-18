@@ -127,7 +127,23 @@ function validateClaims(value: unknown, instanceId: string): ExclusiveResourceCl
   if (!ONECLI_PROJECT_PATTERN.test(onecliProject)) {
     throw new GwsEaError('invalid_claim', 'OneCLI project identity is invalid');
   }
-  return { ...gcp, gcp_account: gcpAccount, workspace_email: workspaceEmail, onecli_project: onecliProject };
+  const aliasEmail = value.alias_email === undefined ? undefined : validateAliasEmail(value.alias_email);
+  if (aliasEmail === workspaceEmail) {
+    throw new GwsEaError('invalid_claim', "The web alias is the assistant's own workspace email");
+  }
+  return {
+    ...gcp,
+    gcp_account: gcpAccount,
+    workspace_email: workspaceEmail,
+    ...(aliasEmail === undefined ? {} : { alias_email: aliasEmail }),
+    onecli_project: onecliProject,
+  };
+}
+
+function validateAliasEmail(value: unknown): string {
+  const aliasEmail = requireString(value, 'alias_email', 320).toLowerCase();
+  if (!EMAIL_PATTERN.test(aliasEmail)) throw new GwsEaError('invalid_claim', 'Web alias is invalid');
+  return aliasEmail;
 }
 
 /** A release's source, track, and commit exactly as a reservation holds them; anything else raises `invalid_state`. */
@@ -220,10 +236,24 @@ function claimKeys(instance: InstanceReservation): string[] {
     `gchat-events-topic:${claims.gchat_events_topic}`,
     `gchat-events-subscription:${claims.gchat_events_subscription}`,
     `gchat-subscriber-account:${claims.gchat_subscriber_account}`,
-    `workspace-email:${claims.workspace_email}`,
+    // An assistant's workspace email and its web alias are both mailboxes: no address is two assistants'.
+    `mailbox:${claims.workspace_email}`,
+    ...(claims.alias_email === undefined ? [] : [`mailbox:${claims.alias_email}`]),
     `onecli-project:${claims.onecli_project}`,
   ];
   return keys;
+}
+
+/** Every mailbox the other assistants on this machine hold: their workspace emails and web aliases. */
+export function otherAssistantsMailboxes(registry: InstanceRegistry, instanceId: string): ReadonlySet<string> {
+  return new Set(
+    Object.values(registry.instances)
+      .filter((instance) => instance.instance_id !== instanceId)
+      .flatMap(({ exclusive_resource_claims: claims }) => [
+        claims.workspace_email,
+        ...(claims.alias_email === undefined ? [] : [claims.alias_email]),
+      ]),
+  );
 }
 
 function assertNoClaimCollisions(instances: readonly InstanceReservation[]): void {
@@ -338,6 +368,40 @@ export async function swapInstanceRelease(
       validateRegistry({ ...registry, instances: { ...registry.instances, [instanceId]: moved } }, paths.registryFile),
     );
     return moved;
+  });
+}
+
+/**
+ * Point one assistant's web alias claim at `aliasEmail`, or drop it when
+ * undefined (KTD13). Under the machine lock, so of two assistants claiming
+ * one address only the first holds it; an address another assistant holds
+ * as its alias or workspace email is refused with `claim_conflict`. Nothing
+ * else in the registry changes, and a claim already held writes nothing.
+ */
+export async function claimInstanceAlias(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  aliasEmail: string | undefined,
+): Promise<InstanceReservation> {
+  assertInstanceId(instanceId);
+  return withMachineLock(paths, async () => {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[instanceId];
+    if (!stored) throw new GwsEaError('unknown_instance', 'Unknown instance ID');
+    const { alias_email: _previous, ...claims } = stored.exclusive_resource_claims;
+    const claimed = validateReservation({
+      ...stored,
+      exclusive_resource_claims: { ...claims, ...(aliasEmail === undefined ? {} : { alias_email: aliasEmail }) },
+    });
+    if (claimed.exclusive_resource_claims.alias_email === stored.exclusive_resource_claims.alias_email) return stored;
+    await writePrivate(
+      paths.registryFile,
+      validateRegistry(
+        { ...registry, instances: { ...registry.instances, [instanceId]: claimed } },
+        paths.registryFile,
+      ),
+    );
+    return claimed;
   });
 }
 

@@ -17,6 +17,7 @@ import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
   assertStateConsistent,
+  claimInstanceAlias,
   getInstanceReservation,
   readRegistry,
   swapInstanceRelease,
@@ -473,6 +474,88 @@ describe('instance roots', () => {
   });
 });
 
+describe('web alias claims (KTD13)', () => {
+  it("claims, moves and drops one assistant's alias, changing nothing else", async () => {
+    const paths = await testPaths();
+    const input = reservation();
+    const peer = distinctReservation();
+    await reserveInstance(paths, input);
+    await reserveInstance(paths, peer);
+    const before = await readRegistry(paths);
+
+    const claimed = await claimInstanceAlias(paths, input.instance_id, 'ONUJ@example.test');
+    expect(claimed).toEqual({
+      ...input,
+      exclusive_resource_claims: { ...input.exclusive_resource_claims, alias_email: 'onuj@example.test' },
+    });
+    await claimInstanceAlias(paths, input.instance_id, 'onuj2@example.test');
+    expect((await getInstanceReservation(paths, input.instance_id)).exclusive_resource_claims.alias_email).toBe(
+      'onuj2@example.test',
+    );
+    // Claiming what it already holds writes nothing.
+    const held = await readFile(paths.registryFile, 'utf8');
+    await claimInstanceAlias(paths, input.instance_id, 'onuj2@example.test');
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(held);
+
+    await claimInstanceAlias(paths, input.instance_id, undefined);
+    const after = await readRegistry(paths);
+    expect(after.instances[input.instance_id]).toEqual(input);
+    expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);
+  });
+
+  it('refuses an alias another assistant holds as its alias or its workspace email, or that is its own email', async () => {
+    const paths = await testPaths();
+    const input = reservation();
+    const peer = distinctReservation();
+    await reserveInstance(paths, input);
+    await reserveInstance(paths, peer);
+    await claimInstanceAlias(paths, peer.instance_id, 'onuj@example.test');
+    const before = await readFile(paths.registryFile, 'utf8');
+
+    await expect(claimInstanceAlias(paths, input.instance_id, 'onuj@example.test')).rejects.toMatchObject({
+      code: 'claim_conflict',
+    });
+    await expect(claimInstanceAlias(paths, input.instance_id, 'second@example.test')).rejects.toMatchObject({
+      code: 'claim_conflict',
+    });
+    await expect(claimInstanceAlias(paths, input.instance_id, 'assistant@example.test')).rejects.toMatchObject({
+      code: 'invalid_claim',
+    });
+    await expect(claimInstanceAlias(paths, input.instance_id, 'not an address')).rejects.toMatchObject({
+      code: 'invalid_claim',
+    });
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+  });
+
+  it("refuses a new assistant whose workspace email is another's alias", async () => {
+    const paths = await testPaths();
+    const owner = reservation();
+    await reserveInstance(paths, owner);
+    await claimInstanceAlias(paths, owner.instance_id, 'second@example.test');
+
+    await expect(reserveInstance(paths, distinctReservation())).rejects.toMatchObject({ code: 'claim_conflict' });
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([owner.instance_id]);
+  });
+
+  it('gives exactly one of two assistants claiming the same alias at once', async () => {
+    const paths = await testPaths();
+    const first = reservation();
+    const second = distinctReservation();
+    await reserveInstance(paths, first);
+    await reserveInstance(paths, second);
+
+    const results = await Promise.allSettled([
+      claimInstanceAlias(paths, first.instance_id, 'onuj@example.test'),
+      claimInstanceAlias(paths, second.instance_id, 'onuj@example.test'),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.find((result) => result.status === 'rejected')).toMatchObject({
+      reason: expect.objectContaining({ code: 'claim_conflict' }),
+    });
+  });
+});
+
 describe('release compare-and-swap and live checkout agreement', () => {
   const target = {
     source_remote: 'https://example.test/prod.git',
@@ -486,11 +569,13 @@ describe('release compare-and-swap and live checkout agreement', () => {
     const peer = distinctReservation();
     await reserveInstance(paths, input);
     await reserveInstance(paths, peer);
+    // The web alias claim is one of them.
+    const claimed = await claimInstanceAlias(paths, input.instance_id, 'onuj@example.test');
     const before = await readRegistry(paths);
 
     const moved = await swapInstanceRelease(paths, input.instance_id, releaseOf(input), target);
 
-    expect(moved).toEqual({ ...input, ...target });
+    expect(moved).toEqual({ ...claimed, ...target });
     const after = await readRegistry(paths);
     expect(after.instances[input.instance_id]).toEqual(moved);
     expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);

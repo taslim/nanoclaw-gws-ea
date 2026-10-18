@@ -75,6 +75,105 @@ const GOOGLE_CLIENT = pause({
   resumeFlag: '--google-client-file <file>',
 });
 
+const ALIAS_REQUIRED = pause({
+  phase: 'provision_alias',
+  code: 'alias_required',
+  message: 'Add onuj@example.test as an alias of juno@example.test in the Google Admin console, then confirm it.',
+  details: ['Add the alternate email onuj on example.test, then Save'],
+  actionUrl: 'https://admin.google.com/ac/users',
+  resumeFlag: '--alias-added',
+});
+
+describe("attending the web alias's pauses", () => {
+  it('shows where to add the alias, then records that it is added, taken, or named otherwise', async () => {
+    const added = prompts('added');
+    await expect(attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: added })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { alias: { kind: 'added' } },
+    });
+    expect(added.note).toHaveBeenCalledWith(
+      'Add the alternate email onuj on example.test, then Save\nOpen: https://admin.google.com/ac/users',
+      "The assistant's web alias",
+    );
+    expect(added.select).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: ALIAS_REQUIRED.message,
+        options: [
+          { value: 'added', label: 'It is added' },
+          { value: 'taken', label: 'The Admin console says it is already in use' },
+          { value: 'named', label: 'Use a name of my own' },
+        ],
+      }),
+    );
+
+    await expect(
+      attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: prompts('taken') }),
+    ).resolves.toEqual({ kind: 'continue', decisions: { alias: { kind: 'taken' } } });
+
+    const named = prompts('named');
+    named.text.mockResolvedValueOnce('postmaster').mockResolvedValueOnce(' Juno.Web ');
+    await expect(attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: named })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { alias: { kind: 'named', name: 'Juno.Web' } },
+    });
+    // A name the Admin console would refuse, or a role address, is asked for again.
+    expect(named.info).toHaveBeenCalledWith(expect.stringContaining('role address'));
+    expect(named.text).toHaveBeenCalledTimes(2);
+
+    await expect(
+      attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: prompts(CANCEL) }),
+    ).resolves.toEqual({ kind: 'stop' });
+  });
+
+  it('checks again for a test message not yet arrived, without sending another', async () => {
+    const waiting = pause({
+      phase: 'provision_alias',
+      code: 'alias_not_delivered',
+      message: 'The test message to onuj@example.test has not arrived yet.',
+      details: [],
+    });
+    const terminal = prompts('check');
+
+    await expect(attendPause(waiting, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { alias: undefined },
+    });
+    expect(terminal.select).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: [
+          { value: 'check', label: 'Check again' },
+          { value: 'taken', label: 'The Admin console says it is already in use' },
+          { value: 'named', label: 'Use a name of my own' },
+        ],
+      }),
+    );
+  });
+
+  it('asks for a name when the assistant has none to offer, and stops while its host is down', async () => {
+    const unnamed = pause({
+      phase: 'provision_alias',
+      code: 'alias_name_required',
+      message: 'Name Aaa\'s web alias: "Aaa" reads the same reversed and rotated.',
+      details: [],
+      resumeFlag: '--alias <name>',
+    });
+    await expect(attendPause(unnamed, new AbortController().signal, { prompts: prompts('aaa.web') })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { alias: { kind: 'named', name: 'aaa.web' } },
+    });
+
+    const stopped = prompts('added');
+    await expect(
+      attendPause(
+        pause({ phase: 'provision_alias', code: 'alias_host_unavailable', message: 'The host did not answer.' }),
+        new AbortController().signal,
+        { prompts: stopped },
+      ),
+    ).resolves.toEqual({ kind: 'stop' });
+    expect(stopped.select).not.toHaveBeenCalled();
+  });
+});
+
 describe('attending a pause at the terminal', () => {
   it('asks for the downloaded Google client file in place, with its instructions and link', async () => {
     const terminal = prompts('~/Downloads/client.json');

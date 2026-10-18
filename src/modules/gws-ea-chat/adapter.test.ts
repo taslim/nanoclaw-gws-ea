@@ -21,13 +21,19 @@ import {
 } from '../../channels/channel-registry.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import { createSession, getPendingApproval } from '../../db/sessions.js';
+import { log } from '../../log.js';
 import { registerMessageInterceptor, routeInbound } from '../../router.js';
+import type { Session } from '../../types.js';
 import * as typing from '../typing/index.js';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
+import { requestApproval } from '../approvals/primitive.js';
 import { RENEW_BEFORE_EXPIRY_MS } from '../gws-ea-google/tokens.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
+import { upsertUser } from '../permissions/db/users.js';
 import { startTypingRefresh, stopTypingRefresh } from '../typing/index.js';
 import {
   AssistantChatAdapter,
@@ -89,6 +95,8 @@ let sdkFetch: typeof globalThis.fetch;
 let interceptedSourceId: string | undefined;
 let awaitingInterceptedReply: boolean;
 let consumedReplies: number;
+/** The answers the channel handed the host, as onAction received them. */
+let answered: Array<Parameters<ChannelSetup['onAction']>>;
 
 // The router's native capture seam disarms after consuming a naming/rejection
 // reply. Redelivery must not then turn that same source into an ordinary turn.
@@ -115,6 +123,7 @@ beforeEach(async () => {
   interceptedSourceId = undefined;
   awaitingInterceptedReply = false;
   consumedReplies = 0;
+  answered = [];
   registerWebhookAdapter.mockClear();
 });
 
@@ -168,7 +177,9 @@ function hostSetup(): ChannelSetup {
     },
     onInboundEvent: () => undefined,
     onMetadata: () => undefined,
-    onAction: () => undefined,
+    onAction: (...answer) => {
+      answered.push(answer);
+    },
   };
 }
 
@@ -1224,6 +1235,208 @@ describe('requests', () => {
     expect(api.messages.get(name!)?.text).toContain('Approved');
     const edits = api.requests.filter((request) => request.method === 'PUT' || request.method === 'PATCH');
     expect(edits.map((request) => request.url.searchParams.get('updateMask'))).toEqual(['text']);
+  });
+});
+
+describe('a picture on an approval request (KTD6)', () => {
+  // A host module's approval request, from requestApproval through the
+  // host's delivery and the channel to Google, with a checkout's picture
+  // beside it: Chat sees one upload and one message per card.
+  const PRINCIPAL = 'gchat:users/2001';
+  const QUESTION = 'Checkout at shop.example: 41.20 USD due now, paid with the saved card ending 4242.';
+  const ORIGIN = 'From your browser errand thread-7.';
+  const HOW_TO_ANSWER =
+    'Quote this message with yes or no, or react 👍 or 👎. To say why, quote it with no and your reason.';
+  const NO_PICTURE = "I couldn't attach the picture that goes with this.";
+  /** A checkout's picture: PNG bytes, distinct enough to find wherever they might be written. */
+  const PICTURE = {
+    filename: 'checkout.png',
+    mimeType: 'image/png' as const,
+    data: Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x7f]),
+      Buffer.from('total 41.20 USD beside the Place order button'),
+    ]),
+  };
+  const UPLOAD_PATH = `${DM}/attachments:upload`;
+  const CHAT_IS_DOWN = { status: 500, message: 'Internal error encountered.' };
+
+  let session: Session;
+  /** The channel the host's registry started; the registry tears it down. */
+  let hosted: ChannelAdapter | undefined;
+
+  beforeEach(async () => {
+    const now = new Date().toISOString();
+    await createAgentGroup({
+      id: 'ag-browser',
+      name: 'browser',
+      folder: 'browser',
+      agent_provider: null,
+      created_at: now,
+    });
+    session = {
+      id: 'sess-browser',
+      agent_group_id: 'ag-browser',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: now,
+      created_at: now,
+    };
+    await createSession(session);
+    await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Juno Hale', created_at: now });
+    await createMessagingGroup({
+      id: 'mg-juno',
+      channel_type: 'gchat',
+      platform_id: `gchat:${DM}`,
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now,
+    });
+    await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-juno', resolved_at: now });
+    registerChannelAdapter('gchat', { factory: () => (hosted = build()) });
+    await initChannelAdapters(() => hostSetup());
+    setDeliveryAdapter(createChannelDeliveryAdapter());
+  });
+
+  afterEach(async () => {
+    await teardownChannelAdapters();
+    if (channel === hosted) channel = undefined;
+  });
+
+  /** The browser's purchase card for the principal, with the checkout's picture. */
+  function askToBuy(): Promise<string | null> {
+    return requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'browser_purchase',
+      payload: { cardId: 'card-1', jobId: 'job-1' },
+      title: 'Approve this purchase?',
+      question: QUESTION,
+      approverUserId: PRINCIPAL,
+      originLine: ORIGIN,
+      pictures: [PICTURE],
+    });
+  }
+
+  /** The card's text as Chat holds it, with any line it adds before how to answer it. */
+  function cardText(...lines: string[]): string {
+    return ['*Approve this purchase?*', QUESTION, ORIGIN, ...lines, HOW_TO_ANSWER].join('\n\n');
+  }
+
+  /** Whether `value` holds the picture's bytes, raw or in any text form, anywhere inside it. */
+  function holdsPicture(value: unknown, seen = new Set<unknown>()): boolean {
+    if (typeof value === 'string') {
+      const forms = ['base64', 'base64url', 'hex', 'latin1'] as const;
+      return forms.some((form) => value.includes(PICTURE.data.toString(form)));
+    }
+    if (value instanceof Uint8Array) return Buffer.from(value).includes(PICTURE.data);
+    if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+    seen.add(value);
+    if (value instanceof Error) {
+      return [value.message, value.stack, value.cause].some((part) => holdsPicture(part, seen));
+    }
+    return Object.values(value).some((part) => holdsPicture(part, seen));
+  }
+
+  /** The tables in the central database holding the picture's bytes in any row. */
+  async function tablesHoldingPicture(): Promise<string[]> {
+    const tables = await getDb().all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'");
+    const holding: string[] = [];
+    for (const { name } of tables) {
+      const rows = await getDb().all<Record<string, unknown>>(`SELECT * FROM "${name}"`);
+      if (rows.some((row) => holdsPicture(row))) holding.push(name);
+    }
+    return holding;
+  }
+
+  it('posts the card and its picture as one message, and a 👍 on it answers the request', async () => {
+    const id = await askToBuy();
+
+    expect(id).not.toBeNull();
+    expect(api.uploads).toEqual([
+      expect.objectContaining({ space: DM, filename: 'checkout.png', contentType: 'image/png', data: PICTURE.data }),
+    ]);
+    const [card, ...more] = api.posted();
+    expect(more).toEqual([]);
+    expect(card!.text).toBe(cardText());
+    expect(card!.attachment).toEqual([
+      expect.objectContaining({ contentName: 'checkout.png', contentType: 'image/png', source: 'UPLOADED_CONTENT' }),
+    ]);
+    expect((await getPendingApproval(id!))?.platform_message_id).toBe(card!.name);
+
+    reacted(`${card!.name}/reactions/r1`);
+    await deliver!(reactionEvent(`${card!.name}/reactions/r1`));
+
+    expect(answered).toEqual([
+      [
+        id,
+        'approve',
+        'users/2001',
+        { instance: 'gchat', messageId: card!.name, platformId: `gchat:${DM}` },
+        { deferResolution: true },
+      ],
+    ]);
+  });
+
+  it("shows the card's outcome on its own message, which keeps its picture", async () => {
+    const id = await askToBuy();
+    const [card] = api.posted();
+
+    await getDeliveryAdapter()!.deliver(
+      'gchat',
+      `gchat:${DM}`,
+      null,
+      'chat-sdk',
+      JSON.stringify({
+        questionId: id,
+        operation: 'edit',
+        messageId: card!.name,
+        terminalCard: { title: 'Approve this purchase?', question: QUESTION, resolution: '✅ Approved' },
+      }),
+      undefined,
+      'gchat',
+    );
+
+    expect(api.messages.get(card!.name)?.text).toBe(`*Approve this purchase?*\n\n${QUESTION}\n\n✅ Approved`);
+    expect(api.messages.get(card!.name)?.attachment).toEqual(card!.attachment);
+  });
+
+  it('still posts the card when Chat refuses its picture, saying the picture is unavailable', async () => {
+    api.failures.set(UPLOAD_PATH, CHAT_IS_DOWN);
+
+    const id = await askToBuy();
+
+    expect(id).not.toBeNull();
+    expect(api.uploads).toEqual([]);
+    const [card, ...more] = api.posted();
+    expect(more).toEqual([]);
+    expect(card!.text).toBe(cardText(NO_PICTURE));
+    expect(card!.attachment).toBeUndefined();
+    expect((await getPendingApproval(id!))?.platform_message_id).toBe(card!.name);
+  });
+
+  it('keeps the picture out of the approval row, the database and the logs', async () => {
+    const logged: unknown[] = [];
+    for (const level of ['debug', 'info', 'warn', 'error', 'fatal'] as const) {
+      vi.spyOn(log, level).mockImplementation((...line) => {
+        logged.push(line);
+      });
+    }
+
+    const attached = await askToBuy();
+    api.failures.set(UPLOAD_PATH, CHAT_IS_DOWN);
+    const refused = await askToBuy();
+
+    expect(api.uploads).toHaveLength(1);
+    expect(api.posted().map((card) => card.attachment?.length ?? 0)).toEqual([1, 0]);
+    expect(holdsPicture(await getPendingApproval(attached!))).toBe(false);
+    expect(holdsPicture(await getPendingApproval(refused!))).toBe(false);
+    expect(await tablesHoldingPicture()).toEqual([]);
+    expect(logged.length).toBeGreaterThan(0);
+    expect(holdsPicture(logged)).toBe(false);
   });
 });
 

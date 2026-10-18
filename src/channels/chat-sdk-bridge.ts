@@ -23,13 +23,21 @@ import {
   type ConcurrencyStrategy,
   type EmojiValue,
   type Message as ChatMessage,
+  type RawMessage,
   type StateAdapter,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { approveRejectRequest, normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { AuthenticatedSender, ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import type {
+  AuthenticatedSender,
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelSetup,
+  InboundMessage,
+  OutboundFile,
+} from './adapter.js';
 import { createAnswers, indexPostedRequest, POSTED_REQUEST_KEPT_MS, type Answers } from './answers.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import type { AudioSource } from './inbound-content.js';
@@ -111,6 +119,38 @@ export interface WorkingIndicator {
 function isWorkingIndicator(adapter: Adapter): adapter is Adapter & WorkingIndicator {
   const candidate = adapter as Partial<WorkingIndicator>;
   return typeof candidate.workingOn === 'function' && typeof candidate.endWorking === 'function';
+}
+
+// ---------------------------------------------------------------------------
+// Files on the message itself
+// ---------------------------------------------------------------------------
+
+/**
+ * An adapter that posts a message with files on it as one message, as the
+ * Google Chat assistant does; the SDK's own adapters may drop files they
+ * cannot send, or post them apart from the text. It attaches every file or
+ * posts nothing: a file it cannot attach rejects with FilesNotAttachedError
+ * before anything is posted, so the bridge can post the message without
+ * them. The bridge hands it the pictures a request names (KTD6).
+ */
+export interface FileAttacher {
+  readonly postWithFiles: (
+    threadId: string,
+    message: AdapterPostableMessage,
+    files: readonly OutboundFile[],
+  ) => Promise<RawMessage<unknown>>;
+}
+
+/** A file could not be attached to a message, and nothing was posted (FileAttacher). */
+export class FilesNotAttachedError extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
+    this.name = 'FilesNotAttachedError';
+  }
+}
+
+function isFileAttacher(adapter: Adapter): adapter is Adapter & FileAttacher {
+  return typeof (adapter as Partial<FileAttacher>).postWithFiles === 'function';
 }
 
 /** How much of the message reacted to the agent sees with the reaction. */
@@ -523,9 +563,43 @@ function howToAnswer(options: readonly NormalizedOption[]): string {
   return `${list}\n\nQuote this message with the number or name of your choice.`;
 }
 
-/** A question or approval request as text: its title, the question, and how to answer it. */
-function textRequest(title: string, question: string, options: readonly NormalizedOption[]): string {
-  return [`**${title}**`, question, howToAnswer(options)].filter(Boolean).join('\n\n');
+/** A question or approval request as text: its title, the question, the pictures it lacks, and how to answer it. */
+function textRequest(
+  title: string,
+  question: string,
+  options: readonly NormalizedOption[],
+  missing: string | undefined,
+): string {
+  return [`**${title}**`, question, missing, howToAnswer(options)].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The pictures a request names (KTD6), counted in its content's `pictures`.
+ * Their bytes ride beside the content as the message's files, never in it,
+ * and go with the request only when every one it names came with it. A
+ * request posted from anything kept, as after a restart, has none.
+ */
+interface RequestPictures {
+  readonly named: number;
+  readonly files?: readonly OutboundFile[];
+}
+
+function requestPictures(
+  content: Record<string, unknown>,
+  files: readonly OutboundFile[] | undefined,
+): RequestPictures {
+  const named =
+    typeof content.pictures === 'number' && Number.isSafeInteger(content.pictures) && content.pictures > 0
+      ? content.pictures
+      : 0;
+  return named > 0 && files?.length === named ? { named, files } : { named };
+}
+
+/** How a request says the pictures it names are not on it, in the first person as every request speaks. */
+function picturesMissing(named: number): string {
+  return named === 1
+    ? "I couldn't attach the picture that goes with this."
+    : "I couldn't attach the pictures that go with this.";
 }
 
 /** An answered request as text: what was asked, and its outcome where the answer was asked for. */
@@ -709,6 +783,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   const instanceKey = config.instance ?? adapter.name;
   /** The adapter's working mark, when it shows one. */
   const working = isWorkingIndicator(adapter) ? adapter : undefined;
+  /** The adapter, when it attaches files to the message it posts. */
+  const attacher = isFileAttacher(adapter) ? adapter : undefined;
   /** Set when requests are text on this platform (ChatSdkBridgeConfig.textRequests). */
   const textRequests = config.textRequests;
   let chat: Chat;
@@ -718,14 +794,39 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let answers: Answers | undefined;
   let gatewayAbort: AbortController | null = null;
 
-  /** Post a request; when requests are text, remember it, so an answer and its outcome find it. */
-  async function postRequest(
+  /**
+   * Post a request with the pictures it names on its own message (KTD6):
+   * attached when every one came with it and the adapter attaches files, and
+   * otherwise posted without them, saying so. `compose` words the request,
+   * with that line when it is given.
+   */
+  async function postWithPictures(
     tid: string,
+    pictures: RequestPictures,
+    compose: (missing?: string) => AdapterPostableMessage,
+  ): Promise<RawMessage<unknown>> {
+    if (pictures.named === 0) return adapter.postMessage(tid, compose());
+    if (attacher && pictures.files) {
+      try {
+        return await attacher.postWithFiles(tid, compose(), pictures.files);
+      } catch (error) {
+        if (!(error instanceof FilesNotAttachedError)) throw error;
+        log.warn('Posting a request without its pictures, which could not be attached', {
+          adapter: adapter.name,
+          pictures: pictures.named,
+          err: error,
+        });
+      }
+    }
+    return adapter.postMessage(tid, compose(picturesMissing(pictures.named)));
+  }
+
+  /** A request the adapter posted; when requests are text, remember it, so an answer and its outcome find it. */
+  async function rememberRequest(
     platformId: string,
     questionId: string,
-    message: AdapterPostableMessage,
+    result: RawMessage<unknown> | undefined,
   ): Promise<string | undefined> {
-    const result = await adapter.postMessage(tid, message);
     if (textRequests && result?.id) {
       const at = textRequests.postedAt(result.raw);
       const request: PostedRequest = {
@@ -1268,7 +1369,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return;
       }
 
-      // Ask question — a Card with buttons, or words when requests are text
+      // Ask question — a Card with buttons, or words when requests are text,
+      // with the pictures it names on the same message (KTD6)
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
         const title = content.title as string;
@@ -1279,34 +1381,44 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
         const render = content.requirePresentation ? await resolveQuestionRender(questionId) : undefined;
         if (render?.renderMessage) {
-          return postRequest(tid, platformId, questionId, render.renderMessage(questionId));
+          return rememberRequest(
+            platformId,
+            questionId,
+            await adapter.postMessage(tid, render.renderMessage(questionId)),
+          );
         }
         if (content.requirePresentation) throw new Error('Approval presentation adapter is unavailable');
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        const pictures = requestPictures(content, message.files);
         if (textRequests) {
-          const words = textRequest(title, typeof question === 'string' ? question : '', options);
-          return postRequest(tid, platformId, questionId, { markdown: transformText(words) });
+          const asked = typeof question === 'string' ? question : '';
+          const posted = await postWithPictures(tid, pictures, (missing) => ({
+            markdown: transformText(textRequest(title, asked, options, missing)),
+          }));
+          return rememberRequest(platformId, questionId, posted);
         }
-        const card = Card({
-          title,
-          children: [
-            CardText(question),
-            Actions(
-              // Encode button id/value with the option index rather than the
-              // full value. Telegram caps callback_data at 64 bytes, and
-              // long values (e.g. ISO datetimes, URLs) push the JSON payload
-              // well past that. The onAction handlers resolve the index back
-              // to the real value via resolveQuestionRender(questionId).
-              options.map((opt, idx) =>
-                Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
+        const result = await postWithPictures(tid, pictures, (missing) => ({
+          card: Card({
+            title,
+            children: [
+              CardText(question),
+              ...(missing === undefined ? [] : [CardText(missing)]),
+              Actions(
+                // Encode button id/value with the option index rather than the
+                // full value. Telegram caps callback_data at 64 bytes, and
+                // long values (e.g. ISO datetimes, URLs) push the JSON payload
+                // well past that. The onAction handlers resolve the index back
+                // to the real value via resolveQuestionRender(questionId).
+                options.map((opt, idx) =>
+                  Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
+                ),
               ),
-            ),
-          ],
-        });
-        const result = await adapter.postMessage(tid, {
-          card,
-          fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
-        });
+            ],
+          }),
+          fallbackText:
+            `${title}\n\n${question}${missing === undefined ? '' : `\n\n${missing}`}\n` +
+            `Options: ${options.map((o) => o.label).join(', ')}`,
+        }));
         return result?.id;
       }
 

@@ -9,13 +9,17 @@
  * - Reactions list in pages of `reactionPageSize`.
  * - What the assistant writes is its own: a message it posts, and a reaction
  *   it places, which Chat names in its answer and deletes only by that name.
+ * - A file is uploaded to a space (`media.upload`, multipart) before a
+ *   message carries it: a message may attach only what was uploaded to its
+ *   own space, each upload once.
  * - An edit may update a message's text only: a user cannot update a card,
  *   so a mask naming one is refused as Google refuses it.
  * - Chat answers only the assistant's Chat token and People only its
  *   directory token; anything else is 401.
  *
  * Every request is recorded. A test makes a resource fail (`failures`, keyed
- * by its path, such as `spaces/AAAAjuno/messages/remy.1`) until it clears it.
+ * by its path, such as `spaces/AAAAjuno/messages/remy.1`, or
+ * `spaces/AAAAjuno/attachments:upload` for an upload) until it clears it.
  */
 import { ASSISTANT_TOKEN } from './fake-google-events.js';
 
@@ -53,6 +57,16 @@ export interface FakeChatReaction {
   readonly emoji: { readonly unicode: string };
 }
 
+/** A file the assistant uploaded to a space, as Google received it. */
+export interface FakeChatUpload {
+  readonly space: string;
+  readonly filename: string;
+  readonly contentType: string;
+  readonly data: Buffer;
+  /** The token Google answered with, which a message names to carry the file. */
+  readonly token: string;
+}
+
 export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
@@ -67,6 +81,8 @@ const CARDS_NEED_APP: ChatFailure = {
   status: 403,
   message: 'This field mask requires app authentication: cards_v2 can only be updated by a Chat app.',
 };
+const INVALID_UPLOAD: ChatFailure = { status: 400, message: 'Invalid multipart upload request.' };
+const INVALID_ATTACHMENT: ChatFailure = { status: 400, message: 'Invalid attachment upload token.' };
 
 /** The URL Google's clients ask for: they call `fetch(url, init)`, never with a `Request`. */
 export function requestUrl(input: string | URL | Request): URL {
@@ -80,6 +96,38 @@ function requestBody(init: RequestInit | undefined): Record<string, unknown> {
   return typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
 }
 
+/** A write's bytes, as a client sends binary. */
+async function requestBytes(init: RequestInit | undefined): Promise<Buffer | undefined> {
+  const body = init?.body;
+  if (body instanceof Blob) return Buffer.from(await body.arrayBuffer());
+  if (body instanceof Uint8Array) return Buffer.from(body);
+  return undefined;
+}
+
+/** The parts of a `multipart/related` body, each with its type, in order; undefined when it is not one. */
+function multipartParts(
+  contentType: string | null,
+  body: Buffer | undefined,
+): Array<{ type: string; data: Buffer }> | undefined {
+  const boundary = /^multipart\/related;\s*boundary=([^;]+)$/iu.exec(contentType ?? '')?.[1];
+  if (boundary === undefined || body === undefined) return undefined;
+  const delimiter = Buffer.from(`--${boundary}`);
+  const parts: Array<{ type: string; data: Buffer }> = [];
+  let start = body.indexOf(delimiter);
+  while (start !== -1) {
+    const next = body.indexOf(delimiter, start + delimiter.length);
+    if (next === -1) break;
+    // A part runs from the line after its delimiter to the line break before the next one.
+    const part = body.subarray(start + delimiter.length + 2, next - 2);
+    const split = part.indexOf('\r\n\r\n');
+    if (split === -1) return undefined;
+    const type = /^content-type:\s*(.+)$/imu.exec(part.subarray(0, split).toString('latin1'))?.[1]?.trim() ?? '';
+    parts.push({ type, data: Buffer.from(part.subarray(split + 4)) });
+    start = next;
+  }
+  return start !== -1 && body.subarray(start).toString('latin1').startsWith(`--${boundary}--`) ? parts : undefined;
+}
+
 export class FakeChatApi {
   readonly requests: ChatRequest[] = [];
   readonly messages = new Map<string, FakeChatMessage>();
@@ -90,23 +138,32 @@ export class FakeChatApi {
   readonly people = new Map<string, string>();
   /** Each attachment's bytes, by its data reference's resource name. */
   readonly media = new Map<string, Buffer>();
+  /** Every file the assistant uploaded, in order. */
+  readonly uploads: FakeChatUpload[] = [];
   /** A resource, by its path, answers with this failure while it is set. */
   readonly failures = new Map<string, ChatFailure>();
   reactionPageSize = 200;
   /** Numbers what the assistant writes. */
   private written = 0;
+  /** Uploads no message has attached yet, by their token. */
+  private readonly unattached = new Map<string, FakeChatUpload>();
 
   readonly fetch: typeof globalThis.fetch = async (input, init) => {
     const url = requestUrl(input);
     const method = (init?.method ?? 'GET').toUpperCase();
-    const authorization = new Headers(init?.headers).get('authorization');
+    const headers = new Headers(init?.headers);
+    const authorization = headers.get('authorization');
     this.requests.push({ method, url, authorization });
-    const path = decodeURIComponent(url.pathname.replace(/^\/v1\//u, ''));
+    const upload = url.pathname.startsWith('/upload/v1/');
+    const path = decodeURIComponent(url.pathname.replace(/^\/(?:upload\/)?v1\//u, ''));
     const failure = this.failures.get(path);
     if (failure) return refusal(failure);
     switch (url.host) {
       case 'chat.googleapis.com':
         if (authorization !== `Bearer ${CHAT_TOKEN}`) return refusal(UNAUTHENTICATED);
+        if (upload && method === 'POST') {
+          return this.upload(path, url, multipartParts(headers.get('content-type'), await requestBytes(init)));
+        }
         if (method === 'POST') return this.write(path, requestBody(init));
         if (method === 'DELETE') return this.remove(path);
         if (method === 'PUT' || method === 'PATCH') return this.update(path, url, requestBody(init));
@@ -142,6 +199,36 @@ export class FakeChatApi {
     return this.requests.filter((request) => decodeURIComponent(request.url.pathname) === `/v1/${path}`);
   }
 
+  /** The messages the assistant posted, in order. */
+  posted(): FakeChatMessage[] {
+    return [...this.messages.values()].filter((message) => message.sender.name === ASSISTANT);
+  }
+
+  /** A file uploaded to a space (media.upload): its metadata names it, its media part holds it. */
+  private upload(path: string, url: URL, parts: Array<{ type: string; data: Buffer }> | undefined): Response {
+    const space = /^(spaces\/[^/]+)\/attachments:upload$/u.exec(path)?.[1];
+    if (space === undefined || !this.spaces.has(space)) return refusal(NOT_FOUND);
+    if (url.searchParams.get('uploadType') !== 'multipart' || parts?.length !== 2) return refusal(INVALID_UPLOAD);
+    const [metadata, media] = parts;
+    const filename: unknown = metadata!.type.startsWith('application/json')
+      ? (JSON.parse(metadata!.data.toString('utf8')) as Record<string, unknown>).filename
+      : undefined;
+    if (typeof filename !== 'string' || filename === '' || media!.type === '') return refusal(INVALID_UPLOAD);
+    this.written += 1;
+    const uploaded: FakeChatUpload = {
+      space,
+      filename,
+      contentType: media!.type,
+      data: media!.data,
+      token: `upload-token-${this.written}`,
+    };
+    this.uploads.push(uploaded);
+    this.unattached.set(uploaded.token, uploaded);
+    return json(200, {
+      attachmentDataRef: { resourceName: `uploaded-${this.written}`, attachmentUploadToken: uploaded.token },
+    });
+  }
+
   /** A message the assistant posts, or a reaction it places on a message. */
   private write(path: string, body: Record<string, unknown>): Response {
     this.written += 1;
@@ -161,18 +248,47 @@ export class FakeChatApi {
     const space = /^(spaces\/[^/]+)\/messages$/u.exec(path)?.[1];
     if (space !== undefined && this.spaces.has(space)) {
       const thread = body.thread as { name?: string } | undefined;
+      const name = `${space}/messages/morgan.${this.written}`;
+      const attachment = this.attach(space, name, body.attachment);
+      if (attachment === undefined) return refusal(INVALID_ATTACHMENT);
       return json(
         200,
         this.addMessage({
-          name: `${space}/messages/morgan.${this.written}`,
+          name,
           createTime: '2026-10-10T17:00:05.000000Z',
           sender: { name: ASSISTANT, type: 'HUMAN' },
           text: typeof body.text === 'string' ? body.text : '',
           thread: { name: thread?.name ?? `${space}/threads/morgan` },
+          ...(attachment.length === 0 ? {} : { attachment }),
         }),
       );
     }
     return refusal(NOT_FOUND);
+  }
+
+  /** The attachments a new message carries, as Google returns them; undefined when one names no upload to its space. */
+  private attach(space: string, message: string, requested: unknown): Array<Record<string, unknown>> | undefined {
+    if (requested === undefined) return [];
+    if (!Array.isArray(requested)) return undefined;
+    const uploads = requested.map((entry: unknown) => {
+      const ref =
+        typeof entry === 'object' && entry !== null ? (entry as Record<string, unknown>).attachmentDataRef : undefined;
+      const token =
+        typeof ref === 'object' && ref !== null ? (ref as Record<string, unknown>).attachmentUploadToken : undefined;
+      const uploaded = typeof token === 'string' ? this.unattached.get(token) : undefined;
+      return uploaded?.space === space ? uploaded : undefined;
+    });
+    if (uploads.some((uploaded) => uploaded === undefined)) return undefined;
+    return uploads.map((uploaded, index) => {
+      this.unattached.delete(uploaded!.token);
+      return {
+        name: `${message}/attachments/${index + 1}`,
+        contentName: uploaded!.filename,
+        contentType: uploaded!.contentType,
+        attachmentDataRef: { resourceName: `uploaded-${uploaded!.token}` },
+        source: 'UPLOADED_CONTENT',
+      };
+    });
   }
 
   /** Edit a message the assistant posted; only its text can change. */

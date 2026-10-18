@@ -189,9 +189,8 @@ describe('Resy route boundary', () => {
     expect(
       resyReservationSignature.classifyNavigation(new URL('https://resy.com/cities/new-york-ny/venues/lartusi-ny')),
     ).toBe('ordinary');
-    expect(resyReservationSignature.classifyNavigation(new URL('https://resy.com/unknown-submit'))).toBe(
-      'unsupported_merchant',
-    );
+    // A route the reviewed flow does not know is left to the open rule.
+    expect(resyReservationSignature.classifyNavigation(new URL('https://resy.com/unknown-submit'))).toBeUndefined();
   });
 });
 
@@ -334,8 +333,9 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
         node.textContent = 'Reserve Now';
         node.matches = () => true;
       });
-      expect(await resyReservationSignature.readPurchase(fixture.page, unknown)).toMatchObject({
-        status: 'unsupported_merchant',
+      expect(await resyReservationSignature.readPurchase(fixture.page, unknown)).toEqual({
+        status: 'facts_incomplete',
+        missing: ["the site's reviewed checkout"],
       });
       expect(fixture.submitted()).toBe(0);
     } finally {

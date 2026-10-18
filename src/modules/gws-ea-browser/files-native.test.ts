@@ -39,7 +39,7 @@ const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const invoice = Buffer.concat([Buffer.from('%PDF-1.7\nNative invoice bytes\n'), Buffer.alloc(200_003, 41)]);
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 
-describe.skipIf(!chromePath)('native Chrome file transfers', () => {
+describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }, () => {
   const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
   const sockets = new Set<Socket>();
   let server: Server;
@@ -56,11 +56,12 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     await prepareChromeProfile(paths);
     await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true, chromePath }));
     server = createServer((request, response) => {
-      if (request.method !== 'GET' || !request.url?.startsWith('http://fixture.example/')) {
+      const address = request.url ?? '';
+      if (request.method !== 'GET' || !/^http:\/\/(?:fixture|elsewhere)\.example\//u.test(address)) {
         response.writeHead(403).end();
         return;
       }
-      const url = new URL(request.url);
+      const url = new URL(address);
       documentRequests.push(url.pathname);
       if (url.pathname.startsWith('/help/')) {
         response.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><h1>${url.pathname}</h1>`);
@@ -273,6 +274,29 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     expect(fs.readdirSync(uploadRoot)).toEqual([]);
   }, 20_000);
 
+  it('refuses the checkout submit that page script sends as a file is chosen, as it does for typing', async () => {
+    const source = path.join(sessionDir(session.agent_group_id, session.id), 'documents', 'receipt.txt');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, 'A receipt to attach.');
+    await page.evaluate(`document.querySelector('input[type="file"]').addEventListener('change', () => {
+  void fetch('/api/checkout/submit', { method: 'POST', mode: 'no-cors', body: 'attached=1' }).then(
+    () => { document.body.dataset.posted = 'sent'; },
+    () => { document.body.dataset.posted = 'refused'; },
+  );
+})`);
+    const result = await executeBrowserBatch(
+      context,
+      {
+        actions: [
+          { kind: 'upload', ...(await target('Supporting document')), path: '/workspace/documents/receipt.txt' },
+        ],
+      },
+      { record: false },
+    );
+    expect(result).toMatchObject({ status: 'completed', actions: [{ status: 'completed' }] });
+    await expect.poll(() => page.locator('body').getAttribute('data-posted')).toBe('refused');
+  }, 20_000);
+
   it('refuses File System Access pickers before any native panel opens', async () => {
     // These pickers need a secure context; a routed origin provides one without the network.
     const picker = (name: string, call: string) =>
@@ -306,18 +330,15 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
   });
 
   it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {
-    for (const step of ['first', 'second'])
-      await executeBrowserBatch(
-        context,
-        { actions: [{ kind: 'navigate', url: `http://fixture.example/help/${step}` }] },
-        { record: false },
-      );
+    for (const url of ['http://elsewhere.example/help/first', 'http://fixture.example/help/second'])
+      await executeBrowserBatch(context, { actions: [{ kind: 'navigate', url }] }, { record: false });
     const guard = await ensureBrowserNavigationGuard(page);
     await page.evaluate('history.back()');
-    // Outside any errand the guard refuses every document; a restored page would have asked nothing.
-    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    // Between operations only a GET on the site the job's lease admitted the page to loads; a restored page
+    // would have asked nothing.
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('blocked_address');
     expect(documentRequests.filter((request) => request === '/help/first')).toHaveLength(1);
-    expect(page.url()).not.toBe('http://fixture.example/help/first');
+    expect(page.url()).not.toBe('http://elsewhere.example/help/first');
   }, 20_000);
 });
 

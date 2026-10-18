@@ -6,38 +6,112 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
-import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
+import { PurchaseAuthorityStore } from './authority.js';
+import { cardTime, detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
+import { formatMoney, type PurchaseFacts } from './fingerprint.js';
+import { principalClock } from './watch-policy.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
 
 export type BrowserJobState = 'idle' | 'working' | 'awaiting_principal' | 'watching' | 'cancelled';
+/** The purchase card the principal is asked: its merchant and money, and when it lapses on their clock. */
+export interface BrowserJobCard {
+  readonly site: string;
+  readonly total: string;
+  readonly due_now: string;
+  readonly expires: string;
+}
+/**
+ * A purchase of the job's with no page proof (KTD8), and the attempt id main records its outcome against: never
+ * one a browser report gives (KTD9). Its press is on the principal's clock.
+ */
+export interface BrowserJobUnconfirmed {
+  readonly attempt_id: string;
+  readonly what: string;
+  readonly total?: string;
+  readonly pressed: string;
+}
 export interface BrowserJobView {
   readonly job: BrowserJob;
   readonly state: BrowserJobState;
   readonly held_sites: readonly string[];
   readonly waiting_sign_in?: { readonly site: string; readonly origin: string; readonly expires_at: string };
+  readonly open_card?: BrowserJobCard;
+  readonly unconfirmed?: readonly BrowserJobUnconfirmed[];
   /** The delivered report's raw text; the rendering boundary frames it as untrusted. */
   readonly last_report?: { readonly at: string; readonly text: string };
 }
 
-/** An existing native main-owned thread only; job rows are lazy, session ownership is not. */
-export async function resolveBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJob | undefined> {
-  const main = await getMainAgentGroupId();
+/** The job's open card and unconfirmed purchases, as main reads them in the principal's time (KTD18). */
+async function purchaseState(
+  store: BrowserStore,
+  jobId: string,
+): Promise<{ open_card?: BrowserJobCard; unconfirmed?: BrowserJobUnconfirmed[] }> {
+  if (!(await store.db.hasTable('gws_ea_browser_purchase_cards'))) return {};
+  const card = await store.db.get<{ facts_json: string; expires_at: string }>(
+    "SELECT facts_json,expires_at FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1",
+    jobId,
+  );
+  const attempts = await new PurchaseAuthorityStore(store.db).unconfirmedOf(jobId);
+  if (!card && !attempts.length) return {};
+  const [{ attemptSummary }, zone] = await Promise.all([import('./purchase-outcome.js'), principalClock()]);
+  const facts = card ? (JSON.parse(card.facts_json) as PurchaseFacts) : undefined;
+  return {
+    ...(card && facts
+      ? {
+          open_card: {
+            site: facts.site,
+            total: formatMoney(facts.totalMinor, facts.currency),
+            due_now: formatMoney(facts.dueNowMinor, facts.currency),
+            expires: cardTime(card.expires_at, zone),
+          },
+        }
+      : {}),
+    ...(attempts.length
+      ? {
+          unconfirmed: attempts.map((attempt) => {
+            const { what, total } = attemptSummary(attempt);
+            return {
+              attempt_id: attempt.id,
+              what,
+              ...(total ? { total } : {}),
+              pressed: cardTime(attempt.attempted_at, zone),
+            };
+          }),
+        }
+      : {}),
+  };
+}
+
+/**
+ * An existing native errand thread only; job rows are lazy, session ownership
+ * is not. With `owner`, only an errand that group opened, created only while
+ * it has browser access; without, the host's own reach to any errand, as
+ * cancellation needs once a group's access ended.
+ */
+export async function resolveBrowserJob(
+  thread: string,
+  store = new BrowserStore(),
+  owner?: string,
+): Promise<BrowserJob | undefined> {
+  const source = errandSource(thread);
   const browser = await getBrowserAgentGroupId();
-  if (main === null || browser === null || !thread.startsWith(`system:a2a:${main}:`)) return undefined;
+  if (source === undefined || browser === null || (owner !== undefined && source !== owner)) return undefined;
   const existing = await store.getJob(thread);
-  if (existing) return existing.source_agent_group_id === main ? existing : undefined;
+  if (existing) return existing.source_agent_group_id === source ? existing : undefined;
   const session = await store.db.get<Session>(
     'SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ?',
     browser,
     thread,
   );
-  return session ? store.jobForSession(session) : undefined;
+  if (!session) return undefined;
+  return owner === undefined ? store.errandJob(session) : store.jobForSession(session);
 }
 
 export async function readBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJobView | undefined> {
@@ -110,6 +184,7 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
               : 'idle',
     held_sites: leases.map((lease) => lease.site),
     ...(waitingSignIn ? { waiting_sign_in: waitingSignIn } : {}),
+    ...(await purchaseState(store, job.id)),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
   };
 }
@@ -144,13 +219,17 @@ async function unresolvedWork(db: DbDriver, jobId: string): Promise<boolean> {
   return (await committing(db, jobId)) || (await heldCredentialSites(db, jobId)).size > 0;
 }
 
-/** DB-only half: callers may join authority/watch/card changes in this same transaction. */
+/**
+ * DB-only half: callers may join authority/watch/card changes in this same
+ * transaction. With `owner`, only an errand that group opened.
+ */
 export async function cancelBrowserJobInTransaction(
   thread: string,
   store = new BrowserStore(),
+  owner?: string,
 ): Promise<BrowserJobCancellation> {
-  const job = await resolveBrowserJob(thread, store);
-  if (!job) throw invalidArgs('No main-owned browser job exists for that thread.');
+  const job = await resolveBrowserJob(thread, store, owner);
+  if (!job) throw invalidArgs('No delegated browser job exists for that thread.');
   if (job.cancelled) return { status: 'already_cancelled', thread, job, waitingJobs: [] };
   const purchases = await store.db.hasTable('gws_ea_browser_authorities');
   const inProgress = await committing(store.db, job.id);
@@ -185,10 +264,14 @@ export function configureBrowserCancellation(queue: BrowserQueue): void {
   cancellationQueue = queue;
 }
 
-/** Side effects run only after the cancellation transaction commits. */
+/**
+ * Side effects run only after the cancellation transaction commits. `running` names a request that stopped its
+ * own job: it answers for itself, so it is never interrupted.
+ */
 export async function finishBrowserJobCancellation(
   result: BrowserJobCancellation,
   queue = cancellationQueue,
+  running?: string,
 ): Promise<void> {
   if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
   if (result.withdrawnCards)
@@ -201,13 +284,18 @@ export async function finishBrowserJobCancellation(
         card.approval_id,
       );
   if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
-  await queue.interruptJob(result.job.id);
-  await queue.runtime.closeJob(result.job.id);
+  await queue.interruptJob(result.job.id, running);
+  // The job is already cancelled; a window that fails to close leaves its site's waiters to be woken all the same.
+  await queue.runtime.closeJob(result.job.id).catch(() => undefined);
   await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
 }
 
-export async function cancelBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJobCancellation> {
-  const result = await store.db.transaction(() => cancelBrowserJobInTransaction(thread, store));
+export async function cancelBrowserJob(
+  thread: string,
+  store = new BrowserStore(),
+  owner?: string,
+): Promise<BrowserJobCancellation> {
+  const result = await store.db.transaction(() => cancelBrowserJobInTransaction(thread, store, owner));
   await finishBrowserJobCancellation(result);
   return result;
 }
@@ -325,11 +413,11 @@ export async function sweepBrowserJobSessions(
 export const browserDelegateGuard = defineGuardedAction({
   action: 'gws_ea_browser.delegate',
   async decide({ actor }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may manage browser jobs.');
-    if (!(await readBrowserPolicy()).enabled)
-      return DENY('The operator needs to enable the browser for this assistant.');
-    return ALLOW('Canonical main manages its own browser errands.');
+    const policy = await readBrowserPolicy();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+      return DENY('Only an agent with browser access may manage browser jobs.');
+    if (!policy.enabled) return DENY('The operator needs to enable the browser for this assistant.');
+    return ALLOW('An agent with browser access manages its own browser errands.');
   },
 });
 
@@ -337,12 +425,13 @@ export const browserDelegateGuard = defineGuardedAction({
 export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'cancel_job',
-    answeringAction('cancel_job', async (content) => {
+    answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
       if (!(await readBrowserPolicy()).enabled)
         throw forbidden('The operator needs to enable the browser for this assistant.');
       configureBrowserCancellation(queue());
-      const result = await cancelBrowserJob(content.thread);
+      // Each agent cancels only the errands it opened.
+      const result = await cancelBrowserJob(content.thread, undefined, session.agent_group_id);
       return { status: result.status, thread: result.thread };
     }),
     answeredGuard(browserDelegateGuard),

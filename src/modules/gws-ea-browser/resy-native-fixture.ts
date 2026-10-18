@@ -7,6 +7,7 @@ import { createServer as httpServer } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { connect, type Socket } from 'node:net';
 import { chromium, type Browser, type Page } from 'playwright-core';
+import { prepareAuthenticationIsolation } from './authentication-submit.js';
 export interface ResyFixtureState {
   inventory: Record<string, unknown>;
   details: Record<string, unknown>;
@@ -18,7 +19,47 @@ export interface ResyFixtureState {
   extraTerms?: string;
   bookToken?: string;
   responseToken?: string;
-  selectedPayment?: number;
+  /** The saved card the checkout selects; `null` when the diner has no card on file, so none shows or is booked. */
+  selectedPayment?: number | null;
+}
+/** A free bar-counter table at L'Artusi, as Resy's own API answers it. */
+export function freeResyTable(): ResyFixtureState {
+  return {
+    inventory: {
+      query: { day: '2026-10-17', party_size: 2 },
+      results: {
+        venues: [
+          {
+            venue: {
+              id: { resy: 25973 },
+              name: "L'Artusi",
+              currency: { code: 'USD' },
+              location: { time_zone: 'EST5EDT' },
+            },
+            slots: [
+              {
+                config: { id: 1442725, token: 'opaque-native-slot-token', type: 'Bar Counter' },
+                date: { start: '2026-10-17 11:00:00', end: '2026-10-17 12:00:00' },
+                size: { min: 2, max: 2 },
+                time: { turn: { actual: 3600 } },
+                payment: { is_paid: false, cancellation_fee: null, deposit_fee: null, is_add_on_required: false },
+                has_add_ons: false,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    policy: [],
+    details: {
+      venue: { id: 25973 },
+      user: { id: 72, payment_methods: [{ id: 101, display: '4242' }] },
+      config: { double_confirmation: false, add_ons: [] },
+      payment: { amounts: { total: 0, items: [] } },
+      cancellation: { fee: null, display: { policy: [] } },
+      book_token: { value: 'secret-book-token' },
+    },
+  };
 }
 export async function resyFixture(
   chromePath: string,
@@ -77,9 +118,12 @@ export async function resyFixture(
         return;
       }
       request.resume();
+      // The page posts its JSON bodies as simple requests, which need no CORS preflight: Chrome on Linux sometimes
+      // cancels a preflighted request while any DevTools Fetch session is enabled, as the host's document gate
+      // always is. The reader reads the bodies and Resy's JSON answers either way.
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
-      response.end(`<!doctype html><html><body><div class="SummaryPage"><div class="SummaryPage__ScrollView"><h2 class="ReservationSummary__title">L'Artusi</h2><span class="ReservationSummary__time-slot">${state.dateLabel ?? 'Sat, Oct 17, 2026 11:00 AM'}</span><span class="ReservationSummary__row-text">${state.partyLabel ?? '2 Guests, Bar Counter'}</span><div class="SummaryPage__cancellation"><ul>${state.policy.map((value) => `<li>${value}</li>`).join('')}</ul></div>${state.extraTerms ?? ''}<select name="payment_method"><option value="${state.selectedPayment ?? 101}" selected>Credit card ending in 4242</option></select></div><button data-test-id="order_summary_page-button-book">Reserve Now</button><button data-testid="reservation-button-opaque-native-slot-token">11:00 AM Bar Counter</button><button id="unknown">Continue</button></div><script>
-(async()=>{const post=(path,data)=>fetch('https://api.resy.com'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json());await post('/4/find',{venue_id:25973,day:'2026-10-17',party_size:2});await fetch('https://api.resy.com/2/user');await post('/3/details',{commit:1,config_id:'opaque-native-slot-token',day:'2026-10-17',party_size:2});document.body.dataset.ready='yes';document.querySelector('[data-test-id="order_summary_page-button-book"]').onclick=async()=>{const form=new URLSearchParams({book_token:${JSON.stringify(state.bookToken ?? 'secret-book-token')},struct_payment_method:JSON.stringify({id:${state.selectedPayment ?? 101}})});await fetch('https://api.resy.com/3/book',{method:'POST',body:form});document.body.innerHTML='<div class="ConfirmationPage"><div class="ConfirmationPage__header">Reservation Booked.</div><button data-test-id="confirmation_summary_page-button-done">Done</button></div>';};})();
+      response.end(`<!doctype html><html><body><div class="SummaryPage"><div class="SummaryPage__ScrollView"><h2 class="ReservationSummary__title">L'Artusi</h2><span class="ReservationSummary__time-slot">${state.dateLabel ?? 'Sat, Oct 17, 2026 11:00 AM'}</span><span class="ReservationSummary__row-text">${state.partyLabel ?? '2 Guests, Bar Counter'}</span><div class="SummaryPage__cancellation"><ul>${state.policy.map((value) => `<li>${value}</li>`).join('')}</ul></div>${state.extraTerms ?? ''}${state.selectedPayment === null ? '' : `<select name="payment_method"><option value="${state.selectedPayment ?? 101}" selected>Credit card ending in 4242</option></select>`}</div><button data-test-id="order_summary_page-button-book">Reserve Now</button><button data-testid="reservation-button-opaque-native-slot-token">11:00 AM Bar Counter</button><button id="unknown">Continue</button></div><script>
+(async()=>{const post=(path,data)=>fetch('https://api.resy.com'+path,{method:'POST',body:JSON.stringify(data)}).then(r=>r.json());await post('/4/find',{venue_id:25973,day:'2026-10-17',party_size:2});await fetch('https://api.resy.com/2/user');await post('/3/details',{commit:1,config_id:'opaque-native-slot-token',day:'2026-10-17',party_size:2});document.body.dataset.ready='yes';document.querySelector('[data-test-id="order_summary_page-button-book"]').onclick=async()=>{const form=new URLSearchParams({book_token:${JSON.stringify(state.bookToken ?? 'secret-book-token')}${state.selectedPayment === null ? '' : `,struct_payment_method:JSON.stringify({id:${state.selectedPayment ?? 101}})`}});const optIn=document.querySelector('input[name="venue_marketing_opt_in"]');if(optIn)form.set('venue_marketing_opt_in',optIn.checked?'1':'0');await fetch('https://api.resy.com/3/book',{method:'POST',body:form});document.body.innerHTML='<div class="ConfirmationPage"><div class="ConfirmationPage__header">Reservation Booked.</div><button data-test-id="confirmation_summary_page-button-done">Done</button></div>';};})();
 </script></body></html>`);
     },
   );
@@ -122,6 +166,8 @@ export async function resyFixture(
     args: ['--ignore-certificate-errors'],
   });
   const page = await browser.newPage();
+  // Classification reads each control in an isolated world, through the handoff a job context registers.
+  await prepareAuthenticationIsolation(page.context(), true);
   return {
     browser,
     page,

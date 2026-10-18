@@ -1,10 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { ElementHandle, Frame, Page } from 'playwright-core';
+import type { ElementHandle, Frame, Locator, Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isRecord } from '../../gws-ea/validation.js';
-import { classifyActivation, classifyNavigationUrl, readControlFacts } from './commit-classifier.js';
+import {
+  classifyActivation,
+  classifyNavigationUrl,
+  readControlFacts,
+  type ActivationIntent,
+} from './commit-classifier.js';
 import {
   browserActionRefs,
   browserKeyboardSubmitTarget,
@@ -299,11 +304,34 @@ async function captureLocator(target: PinnedBrowserRef, nodes: readonly AriaNode
   }
   throw new Error('No structured accessible locator for this target');
 }
-async function resolveLocator(
+/** The roles a host-found control can carry: what a press can be aimed at. */
+const PRESS_ROLES: readonly BrowserRole[] = ['button', 'link', 'menuitem', 'tab', 'option'];
+/**
+ * A host-found control's structured locator (KTD4): its role and accessible name as Playwright reads them, its
+ * ordinal among their matches, and its frame path, so `resolveLocator` finds it again on a later read.
+ */
+export async function captureElementLocator(element: ElementHandle): Promise<StructuredBrowserLocator> {
+  const frame = await element.ownerFrame();
+  if (!frame) throw new Error('Detached element');
+  for (const role of PRESS_ROLES) {
+    const all = frame.getByRole(role);
+    const index = await all.evaluateAll((elements, target) => elements.indexOf(target), element);
+    if (index < 0) continue;
+    const [node] = ariaNodes(await all.nth(index).ariaSnapshotJSON({ timeout: 1_000 }));
+    if (node?.role !== role) continue;
+    const name = node.name;
+    const matches = frame.getByRole(role, { name, exact: true });
+    const ordinal = await matches.evaluateAll((elements, target) => elements.indexOf(target), element);
+    if (ordinal >= 0) return { role, name, ordinal, count: await matches.count(), ...(await framePath(frame)) };
+  }
+  throw new Error('No structured accessible locator for this element');
+}
+/** The element a structured locator names, as a Playwright locator: its frames and its matches' count unchanged. */
+export async function locateStructured(
   page: Page,
   target: StructuredBrowserLocator,
   checkMainUrl = true,
-): Promise<ElementHandle> {
+): Promise<Locator> {
   let frame = page.mainFrame();
   if (checkMainUrl && checkpointUrl(frame.url()) !== target.frameUrls[0]) throw new Error('Frame changed');
   for (let index = 0; index < target.framePath.length; index++) {
@@ -313,38 +341,67 @@ async function resolveLocator(
   }
   const matches = frame.getByRole(target.role, { name: target.name, exact: true });
   if ((await matches.count()) !== target.count) throw new Error('Accessible element count changed');
-  const element = await matches.nth(target.ordinal).elementHandle({ timeout: 1_000 });
+  return matches.nth(target.ordinal);
+}
+export async function resolveLocator(
+  page: Page,
+  target: StructuredBrowserLocator,
+  checkMainUrl = true,
+): Promise<ElementHandle> {
+  const element = await (await locateStructured(page, target, checkMainUrl)).elementHandle({ timeout: 1_000 });
   if (!element) throw new Error('Element is absent');
   return element;
 }
-function readOnlyNavigation(url: string): boolean {
-  const parsed = new URL(url);
-  return (
-    classifyNavigationUrl(url) === 'ordinary' &&
-    (parsed.pathname === '/' ||
-      /^\/(?:search|s|find|browse|availability|restaurants?|r|venues?|products?|items?|dp|menu|articles?|news|blog|docs?|help|support)(?:\/|$)/iu.test(
-        parsed.pathname,
-      ))
-  );
+/**
+ * A watch's marked region (KTD20): the element's structured locator, recorded as a recipe step's target is, when its
+ * page is where `recipe` ends (the same address path and heading; inputs may change its query). `off_route` when it is
+ * elsewhere, undefined when no accessible role and name find the element again. A watch replays the recipe, then finds
+ * the region by `locateStructured`.
+ */
+export async function captureRecipeRegion(
+  page: Page,
+  target: PinnedBrowserRef,
+  recipe: BrowserRecipe,
+): Promise<StructuredBrowserLocator | 'off_route' | undefined> {
+  const snapshot = await snapshotBrowserStructure(page);
+  const end = recipe.steps.at(-1)?.after;
+  const here = checkpoint(snapshot);
+  const route = (point: RecipeCheckpoint): string => {
+    const url = new URL(point.url);
+    return JSON.stringify([url.origin, url.pathname, point.heading ?? null]);
+  };
+  if (!end || route(end) !== route(here)) return 'off_route';
+  try {
+    return await captureLocator(target, flatten(ariaNodes(snapshot.tree)));
+  } catch (error) {
+    if (error instanceof Error) return undefined;
+    throw error;
+  }
 }
-async function readOnlyTarget(page: Page, target: PinnedBrowserRef): Promise<boolean> {
+/**
+ * Whether a target only reads: an ordinary control or field, on no transaction page, outside any form that
+ * submits by anything but GET. Its replay loads GET documents only (KTD2), so a script that posts is refused.
+ */
+async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: ActivationIntent['kind']): Promise<boolean> {
   if (await isSecretBrowserField(target)) return false;
   const facts = await readControlFacts(page, target.element);
-  if (facts.transaction || (await classifyActivation(page, target.element)) !== 'ordinary') return false;
-  return (
-    (facts.tag === 'a' && Boolean(facts.href) && readOnlyNavigation(facts.href!)) ||
-    (facts.formMethod?.toLowerCase() === 'get' && Boolean(facts.formAction) && readOnlyNavigation(facts.formAction!))
-  );
+  if (facts.transaction || facts.cardEntry || (await classifyActivation(page, target.element, kind)) !== 'ordinary')
+    return false;
+  return facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get';
 }
-/** Ordinary authentication/cart controls are intentionally insufficient proof for a public watch. */
+/**
+ * A read-only replay acts by the open rule, restricted to GET navigation: watches replay these without the
+ * agent. Uploads and downloads never read only.
+ */
 export async function isReadOnlyBrowserAction(
   page: Page,
   action: BrowserAction,
   refs: ReadonlyMap<string, PinnedBrowserRef>,
 ): Promise<boolean> {
+  const targets: Array<{ ref: BrowserRef; kind: ActivationIntent['kind'] }> = [];
   switch (action.kind) {
     case 'navigate':
-      return readOnlyNavigation(action.url);
+      return classifyNavigationUrl(action.url) === 'ordinary';
     case 'observe':
     case 'wait_for':
     case 'scroll':
@@ -353,13 +410,30 @@ export async function isReadOnlyBrowserAction(
     case 'upload':
     case 'download':
       return false;
-    default:
-      for (const ref of browserActionRefs(action)) {
-        const target = refs.get(ref.ref);
-        if (!target || !(await readOnlyTarget(page, target))) return false;
-      }
-      return true;
+    case 'click':
+    case 'type':
+      targets.push({ ref: action, kind: 'click' });
+      break;
+    case 'select':
+      targets.push({ ref: action, kind: 'select' });
+      break;
+    case 'key':
+      targets.push({ ref: action, kind: /^(?:Shift\+)?Enter$/u.test(action.key) ? 'submit' : 'click' });
+      break;
+    case 'form_input':
+      targets.push(...action.fields.map((field) => ({ ref: field, kind: 'click' as const })));
+      if (action.submit) targets.push({ ref: action.submit, kind: 'submit' });
+      break;
+    default: {
+      const unknown: never = action;
+      throw new Error(`Unknown browser action ${JSON.stringify(unknown)}`);
+    }
   }
+  for (const { ref, kind } of targets) {
+    const target = refs.get(ref.ref);
+    if (!target || !(await readOnlyTarget(page, target, kind))) return false;
+  }
+  return true;
 }
 /** The original handles were all pinned before this JSON snapshot can replace their refs. */
 export async function beginBrowserActionTrace(
@@ -740,6 +814,8 @@ export async function executeRecipe(
     }
     const action = bindAction(step, refs, parameter?.kind === 'value' ? input.parameters[parameter.name] : undefined);
     const result = await executeBrowserBatch(context, { actions: [action] }, { ...options, page });
+    // A step that bought something nobody approved has stopped the job: the replay ends with it (KTD10).
+    if (result.reason === 'unapproved_commit') return { ...result, step: index, repeat_safe: false };
     if (result.repeat_safe === false) repeatSafe = false;
     observation = isRecord(result.observation)
       ? (result.observation as unknown as BrowserObservation)

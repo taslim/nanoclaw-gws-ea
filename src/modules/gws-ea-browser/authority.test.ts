@@ -62,6 +62,25 @@ describe('principal-approved material purchase bounds', () => {
     expect(materialPurchaseChange(retailFacts, later, { neededBy: '2026-10-22T23:59:59.999Z' })).toBeUndefined();
     expect(materialPurchaseChange(retailFacts, later, { neededBy: '2026-10-21T23:59:59.999Z' })).toBeTypeOf('string');
   });
+  it('reads a delivery date as a day on the principal’s clock against their needed-by deadline', () => {
+    const later = { ...retailFacts, delivery: { date: '2026-10-22', text: 'October 22' } };
+    // The end of 22 October in Tokyo.
+    const endOfDay = { neededBy: '2026-10-22T14:59:59.999Z', principalTimeZone: 'Asia/Tokyo' };
+    expect(materialPurchaseChange(retailFacts, later, endOfDay)).toBeUndefined();
+    expect(
+      materialPurchaseChange(retailFacts, { ...later, delivery: { date: '2026-10-23', text: 'October 23' } }, endOfDay),
+    ).toBeTypeOf('string');
+    // Noon that day is missed by a delivery that may come any time that day.
+    expect(
+      materialPurchaseChange(retailFacts, later, {
+        neededBy: '2026-10-22T03:00:00.000Z',
+        principalTimeZone: 'Asia/Tokyo',
+      }),
+    ).toBeTypeOf('string');
+    expect(
+      materialPurchaseChange(retailFacts, { ...later, delivery: { date: 'soon', text: 'Soon' } }, endOfDay),
+    ).toBeTypeOf('string');
+  });
   it('never treats a cheaper recurring conversion as unchanged financial terms', () => {
     const approved: PurchaseFacts = {
       ...retailFacts,

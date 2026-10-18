@@ -21,10 +21,13 @@ import { createHash } from 'node:crypto';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
 import { formatLocalTime } from '../timezone.js';
 import { taggedImageId } from './agent-image.js';
 import { releaseImageTag } from './agent-image-release.js';
+import { aliasHost } from './alias.js';
+import { instanceBrowserPolicyFile } from './browser-capability.js';
 import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
 import { MAIN_GROUP_NAME } from './identity.js';
@@ -176,6 +179,15 @@ export interface WorkspaceFacts {
   /** The Google account the assistant is signed in as. */
   readonly account: string | null;
 }
+/** The web alias an enabled browser needs (KTD13), as the running host records it; null when not observed. */
+export interface WebAliasFacts {
+  /** `not_needed` while the browser is not enabled. */
+  readonly state: 'not_needed' | 'pending' | 'verified' | null;
+  /** The verified alias, or the address the operator was asked to add. */
+  readonly address: string | null;
+  /** Whether a test message to the pending address was sent. */
+  readonly probe_sent: boolean | null;
+}
 
 export interface AssistantProbes {
   /** Optional host-wide voice, with release compatibility and actual recognition observations. */
@@ -212,6 +224,8 @@ export interface AssistantProbes {
   readonly principal: ProbeResult;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
+  /** While the browser is enabled, its verified web alias; setup is incomplete until there is one (R23). */
+  readonly web_alias: ProbeResult & WebAliasFacts;
 }
 
 export const PROBE_NAMES = [
@@ -227,6 +241,7 @@ export const PROBE_NAMES = [
   'workspace',
   'principal',
   'delivery',
+  'web_alias',
   'voice',
 ] as const satisfies readonly (keyof AssistantProbes)[];
 
@@ -861,6 +876,36 @@ function because(clause: string, reason: string | null): string {
   return reason ? `${clause}: ${redact(reason)}` : clause;
 }
 
+/** The command that continues the web alias's setup, with `--alias-added` once there is an address to add. */
+function webAliasArgv(instanceId: string, facts: WebAliasFacts): string[] {
+  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  return facts.address !== null && facts.probe_sent === false ? [...command, '--alias-added'] : command;
+}
+
+/**
+ * The web alias an enabled browser needs (KTD13): not needed while the
+ * browser is not enabled, which the policy file says without asking the
+ * host; otherwise the setup the running host records. Until the alias is
+ * verified, setup is incomplete (R23), with what finishes it.
+ */
+async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFacts> {
+  const runtime = requireRuntime(subject.runtime);
+  if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) {
+    return { ...OK, state: 'not_needed', address: null, probe_sent: null };
+  }
+  const setup = await aliasHost((args) => subject.observers.ncl(runtime, args)).setup();
+  if (setup.alias !== null) return { ...OK, state: 'verified', address: setup.alias, probe_sent: setup.probeSent };
+  const facts: WebAliasFacts = { state: 'pending', address: setup.candidate, probe_sent: setup.probeSent };
+  const continueWith = webAliasArgv(subject.reservation.instance_id, facts).join(' ');
+  const reason =
+    setup.candidate === null
+      ? `the browser is enabled, but the assistant has no web alias yet. Run ${continueWith} to choose one.`
+      : setup.probeSent
+        ? `the web alias ${setup.candidate} is not verified yet, as its test message has not arrived. Check again with ${continueWith}.`
+        : `the web alias ${setup.candidate} is not added yet. Add it in the Google Admin console, then run ${continueWith}.`;
+  return { status: 'degraded', reason: `Setup is incomplete: ${reason}`, ...facts };
+}
+
 /**
  * The assistant's inbox as the running host reports it: polling Gmail without
  * failing, and calendar notifications on for the principal's calendars. Each
@@ -1121,6 +1166,7 @@ export async function observeAssistantStatus(
     workspace,
     principal,
     delivery,
+    webAlias,
     voice,
     rollback,
   ] = await Promise.all([
@@ -1148,6 +1194,7 @@ export async function observeAssistantStatus(
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
+    probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null, probe_sent: null }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
       () => observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl),
       {
@@ -1180,6 +1227,7 @@ export async function observeAssistantStatus(
       workspace,
       principal,
       delivery,
+      web_alias: webAlias,
       voice,
     },
   };
@@ -1387,6 +1435,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       const last = probes.delivery.last;
       return last ? `${last.status} ${formatLocalTime(last.at, timezone)} (${last.message_out_id})` : '';
     }
+    case 'web_alias':
+      return webAliasSummary(probes.web_alias);
     case 'voice': {
       const voice = probes.voice;
       const enabled =
@@ -1411,6 +1461,12 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
     case 'principal':
       return '';
   }
+}
+
+/** The web alias as one phrase: its state and address. */
+function webAliasSummary(alias: WebAliasFacts): string {
+  if (alias.state === null) return 'unknown';
+  return alias.address === null ? alias.state.replace('_', ' ') : `${alias.state} ${alias.address}`;
 }
 
 /** Receiving Chat's line: until when its subscription runs, and when a pull last returned. */
@@ -1514,6 +1570,9 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  Account: ${status.registry.account}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
     `  Conversation: ${conversationSummary(status)}`,
+    ...(status.probes.web_alias.state === 'not_needed'
+      ? []
+      : [`  Web alias: ${webAliasSummary(status.probes.web_alias)}`]),
     `  Phase: ${phaseDetail(status.phase)}`,
     `  Release: ${status.registry.track} ${shortCommit(status.release.deployed_commit)}; ${status.release.behind_tool_release === null ? 'tool comparison unknown (see --details)' : status.release.behind_tool_release ? 'tool release is newer' : 'not behind tool release'}`,
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
@@ -1547,7 +1606,10 @@ function statusActions(status: AssistantStatus): NextAction[] {
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
-  if (PROBE_NAMES.some((name) => name !== 'voice' && status.probes[name].status !== 'ok'))
+  if (status.probes.web_alias.state === 'pending')
+    actions.push({ kind: 'command', argv: webAliasArgv(status.instance_id, status.probes.web_alias) });
+  // Voice is optional, and a web alias still pending is setup to finish: neither sends the operator to the logs.
+  if (PROBE_NAMES.some((name) => name !== 'voice' && name !== 'web_alias' && status.probes[name].status !== 'ok'))
     actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });
   return actions;
 }

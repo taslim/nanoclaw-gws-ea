@@ -82,6 +82,18 @@ export const browserWatchesMigration: PortableMigration & { name: ModuleMigratio
   },
 };
 
+/**
+ * A venue's release schedule, written once when its watch is created and outside the
+ * bounds the principal approves. Watches set before it have none.
+ */
+export const browserWatchReleaseMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watch-release',
+  async up(db) {
+    await db.exec('ALTER TABLE gws_ea_browser_watches ADD COLUMN release_json TEXT;');
+  },
+};
+
 /** A recipe id is immutable; saving the same task appends a version for future errands. */
 export const browserRecipesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -316,6 +328,173 @@ export const browserPurchaseMigration: PortableMigration & { name: ModuleMigrati
       CREATE TABLE gws_ea_browser_purchase_blocks (
         site TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
+      );
+    `);
+  },
+};
+
+/**
+ * Consent stops and the principal's standing grants (KTD11). A stop is one wording the engine could not agree
+ * to on its own, for one job's form; a grant is the principal's agreement to that exact wording on one site
+ * and frame origin, live until main withdraws it. Grants outlive jobs, so they name no job.
+ */
+export const browserConsentMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:consent',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_consent_stops (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        site TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        wording TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('marketing','opt_out','agreement','bundled','double_negative')),
+        form_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open','requested','approved','rejected','expired','withdrawn')),
+        approval_id TEXT UNIQUE,
+        created_at TEXT NOT NULL,
+        requested_at TEXT,
+        decided_at TEXT
+      );
+      CREATE INDEX gws_ea_browser_consent_stop_job ON gws_ea_browser_consent_stops(job_id,status);
+      CREATE TABLE gws_ea_browser_consent_grants (
+        id TEXT PRIMARY KEY,
+        site TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        wording TEXT NOT NULL,
+        approval_id TEXT NOT NULL,
+        principal_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        withdrawn_at TEXT
+      );
+      CREATE UNIQUE INDEX gws_ea_browser_consent_grant_live ON gws_ea_browser_consent_grants(site,origin,wording) WHERE withdrawn_at IS NULL;
+    `);
+  },
+};
+
+/**
+ * Incidents (KTD10): spending that may have slipped past the host, each recorded with its job's stop. A job
+ * records one incident per kind and evidence; an incident from a page names no purchase attempt, and a late
+ * confirmation names the attempt main had recorded not placed.
+ */
+export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:incidents',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_incidents (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('unapproved_commit','late_confirmation')),
+        site TEXT NOT NULL,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        attempt_id TEXT,
+        evidence_key TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        notified_at TEXT,
+        UNIQUE(job_id,kind,evidence_key)
+      );
+    `);
+  },
+};
+
+/**
+ * Personal-data disclosures (KTD19): main's word that one errand may give one site one of the principal's
+ * stored private values. A row names the value by its id in the privacy store and never holds it, so no second
+ * copy exists; a value removed there leaves its rows naming nothing.
+ */
+export const browserDisclosuresMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:disclosures',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_disclosures (
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        site TEXT NOT NULL,
+        value_id TEXT NOT NULL CHECK(value_id LIKE 'pv-%'),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(job_id,site,value_id)
+      );
+    `);
+  },
+};
+
+/**
+ * Checkouts on any site (KTD3, KTD5, KTD7): a free commit's money-less attempt, each paid attempt's payment
+ * platform and contact-email account key, and the change a replacement card names, which the change cap counts.
+ * Free attempts outlive jobs, so `job_id` is deliberately not a foreign key.
+ */
+export const browserGenericCheckoutMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:generic-checkout',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_free_attempts (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        site TEXT NOT NULL,
+        platform TEXT,
+        account_key TEXT,
+        facts_json TEXT NOT NULL,
+        attempted_at TEXT NOT NULL,
+        resolution TEXT CHECK(resolution IN ('committed','not_committed')),
+        evidence_json TEXT,
+        merchant_record_id TEXT,
+        reconciled_at TEXT
+      );
+      CREATE INDEX gws_ea_browser_free_attempts_site ON gws_ea_browser_free_attempts(site,resolution);
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN platform TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN account_key TEXT;
+      ALTER TABLE gws_ea_browser_purchase_cards ADD COLUMN change_text TEXT;
+    `);
+  },
+};
+
+/**
+ * Wake-on-change watches (KTD20): on a site with no reader, the region the agent marked, its normalized text as
+ * the agent last saw it, when it was marked, and since when the host has not found it. Reader watches leave them
+ * null. Wakes are the watch's own notices, so they need no table of their own.
+ */
+export const browserWatchRegionMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watch-region',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_json TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_baseline TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_marked_at TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_missing_since TEXT;
+    `);
+  },
+};
+
+/**
+ * Purchase outcomes (KTD8, KTD9): where each attempt's outcome came from (its page, a step of its checkout, the
+ * merchant's email or the principal), when it became unconfirmed and when its delegating group heard so, and
+ * the card that showed main's recorded "not placed". A job a `purchase` answered waiting-on-earlier waits on its
+ * site until no attempt there is unresolved; `released_at` marks one whose wake is still to be told.
+ */
+export const browserPurchaseOutcomesMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:purchase-outcomes',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN resolution_source TEXT CHECK(resolution_source IN ('page','email','principal','step'));
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN unconfirmed_at TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN notified_at TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN answer_card_id TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN resolution_source TEXT CHECK(resolution_source IN ('page','email','principal','step'));
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN unconfirmed_at TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN notified_at TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN answer_card_id TEXT;
+      CREATE TABLE gws_ea_browser_purchase_waiters (
+        site TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        released_at TEXT,
+        PRIMARY KEY(site,job_id)
       );
     `);
   },

@@ -4,11 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getEmoji, Message, parseMarkdown, type Adapter, type AdapterPostableMessage, type RawMessage } from 'chat';
 
-import type { ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelSetup, InboundMessage, OutboundFile } from './adapter.js';
 import {
   createChatSdkBridge,
   readPostedRequest,
   splitForLimit,
+  type FileAttacher,
   type InboundReaction,
   type ReactionSource,
   type WorkingIndicator,
@@ -1358,6 +1359,163 @@ describe('createChatSdkBridge — requests as text', () => {
       expect(edits).toEqual([]);
     } finally {
       await bridge.teardown();
+    }
+  });
+});
+
+describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
+  // A request may name pictures that go with it, such as a checkout's total
+  // and its commit control; their bytes ride beside its content as the
+  // message's files. They go on the request's own message only through an
+  // adapter that attaches files to it (FileAttacher). Otherwise the request
+  // posts without them and says so, as it does when their bytes did not come
+  // with it: a re-post from anything kept after a restart has none.
+  const DM = 'fixture:spaces/AAAAjuno';
+  const TITLE = 'Approve this purchase?';
+  const QUESTION = 'Checkout at shop.example: 41.20 USD due now, paid with the saved card ending 4242.';
+  const OPTIONS = [
+    { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+    { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+  ];
+  const HOW_TO_ANSWER = 'Quote this message with yes or no, or react 👍 or 👎.';
+  const NO_PICTURE = "I couldn't attach the picture that goes with this.";
+  const PICTURE: OutboundFile = { filename: 'checkout.png', mimeType: 'image/png', data: Buffer.from('png bytes') };
+
+  type Attaching = 'attaches' | 'fails';
+  interface AttachCall {
+    threadId: string;
+    message: AdapterPostableMessage;
+    files: readonly OutboundFile[];
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  /** A bridge whose adapter attaches files as told, or cannot attach any when told nothing. */
+  async function pictureBridge(attaching?: Attaching, textRequests = true) {
+    const posts: PostCall[] = [];
+    const attached: AttachCall[] = [];
+    let written = 0;
+    const posted = (threadId: string): RawMessage<unknown> => {
+      written += 1;
+      return {
+        id: `spaces/AAAAjuno/messages/morgan.${written}`,
+        threadId,
+        raw: { createTime: '2026-10-10T17:00:05Z' },
+      };
+    };
+    const adapter = stubAdapter({
+      name: 'fixture',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+      postMessage: async (threadId, message) => {
+        posts.push({ threadId, message });
+        return posted(threadId);
+      },
+    });
+    const attacher: FileAttacher = {
+      postWithFiles: async (threadId, message, files) => {
+        attached.push({ threadId, message, files });
+        if (attaching === 'fails') throw new Error('Chat could not be reached');
+        return posted(threadId);
+      },
+    };
+    const bridge = createChatSdkBridge({
+      adapter: attaching === undefined ? adapter : Object.assign(adapter, attacher),
+      supportsThreads: true,
+      ...(textRequests
+        ? { textRequests: { postedAt: (raw: unknown) => new Date((raw as { createTime: string }).createTime) } }
+        : {}),
+    });
+    await bridge.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: vi.fn() });
+    return { bridge, posts, attached };
+  }
+
+  /** The approval request, naming `pictures` when given, with `files` beside it when given. */
+  function ask(pictures?: number, files?: OutboundFile[]) {
+    return {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-1',
+        title: TITLE,
+        question: QUESTION,
+        options: OPTIONS,
+        ...(pictures === undefined ? {} : { pictures }),
+      },
+      ...(files === undefined ? {} : { files }),
+    };
+  }
+
+  function words(...lines: string[]): AdapterPostableMessage {
+    return { markdown: [`**${TITLE}**`, QUESTION, ...lines, HOW_TO_ANSWER].join('\n\n') };
+  }
+
+  it('fails the request as any failed post does when the adapter fails for another reason', async () => {
+    const desk = await pictureBridge('fails');
+    try {
+      await expect(desk.bridge.deliver(DM, null, ask(1, [PICTURE]))).rejects.toThrow(/could not be reached/u);
+      expect(desk.posts).toEqual([]);
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it('says so on a card too, where requests post as cards', async () => {
+    const desk = await pictureBridge(undefined, false);
+    try {
+      await desk.bridge.deliver(DM, null, ask(1, [PICTURE]));
+
+      expect(desk.posts).toHaveLength(1);
+      const card = desk.posts[0]!.message as {
+        card: { children: Array<{ type: string; content?: string }> };
+        fallbackText: string;
+        files?: unknown;
+      };
+      expect(card.card.children.map((child) => child.content ?? child.type)).toEqual([QUESTION, NO_PICTURE, 'actions']);
+      expect(card.fallbackText).toContain(NO_PICTURE);
+      expect(card.files).toBeUndefined();
+    } finally {
+      await desk.bridge.teardown();
+    }
+  });
+
+  it.each([
+    ['the adapter cannot attach files', undefined, 1, [PICTURE], NO_PICTURE],
+    ['its bytes did not come with it, as on a re-post after a restart', 'attaches', 1, undefined, NO_PICTURE],
+    ['only some of them came with it', 'attaches', 2, [PICTURE], "I couldn't attach the pictures that go with this."],
+  ] as const)(
+    'says the pictures a request names are unavailable when %s',
+    async (_when, attaching, pictures, files, line) => {
+      const desk = await pictureBridge(attaching);
+      try {
+        await desk.bridge.deliver(DM, null, ask(pictures, files === undefined ? undefined : [...files]));
+
+        expect(desk.attached).toEqual([]);
+        expect(desk.posts).toEqual([{ threadId: DM, message: words(line) }]);
+      } finally {
+        await desk.bridge.teardown();
+      }
+    },
+  );
+
+  it('posts a request that names no picture as before, attaching no file sent with it', async () => {
+    const desk = await pictureBridge('attaches');
+    try {
+      await desk.bridge.deliver(DM, null, ask(undefined, [PICTURE]));
+
+      expect(desk.attached).toEqual([]);
+      expect(desk.posts).toEqual([{ threadId: DM, message: words() }]);
+    } finally {
+      await desk.bridge.teardown();
     }
   });
 });

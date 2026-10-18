@@ -30,6 +30,7 @@ import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
 import { deriveGcpClaims } from './gcp-identity.js';
+import { enableBrowserCapability } from './browser-capability.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
@@ -765,6 +766,82 @@ describe('status', () => {
     for (const name of Object.keys(missing.status.probes).filter((probe) => probe !== 'external_email')) {
       expect(missing.status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it('reports the web alias an enabled browser needs: not needed, pending with what to do, then verified', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const id = reservation.instance_id;
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const asked: string[] = [];
+    const reporting =
+      (setup: unknown): StatusObservers['ncl'] =>
+      async (runtime, args) => {
+        asked.push(args.join(' '));
+        return args.join(' ') === 'gws-ea-alias get' ? setup : healthy.ncl(runtime, args);
+      };
+    const observe = (setup: unknown) => statusJson(host, state, id, { ...healthy, ncl: reporting(setup) });
+    const enable = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', id];
+
+    const disabled = await observe({ alias: null, candidate: null, probe_sent: false });
+    expect(disabled.status.probes.web_alias).toEqual({
+      status: 'ok',
+      reason: null,
+      state: 'not_needed',
+      address: null,
+      probe_sent: null,
+    });
+    expect(asked).not.toContain('gws-ea-alias get');
+
+    await enableBrowserCapability(host.paths, id);
+    const unchosen = await observe({ alias: null, candidate: null, probe_sent: false });
+    expect(unchosen.status.probes.web_alias).toEqual({
+      status: 'degraded',
+      reason: `Setup is incomplete: the browser is enabled, but the assistant has no web alias yet. Run gws-ea capabilities enable browser --id ${id} to choose one.`,
+      state: 'pending',
+      address: null,
+      probe_sent: false,
+    });
+    expect(unchosen.nextActions).toContainEqual({ kind: 'command', argv: enable });
+
+    const unadded = await observe({ alias: null, candidate: 'onuj@example.test', probe_sent: false });
+    expect(unadded.status.probes.web_alias).toMatchObject({
+      status: 'degraded',
+      reason: `Setup is incomplete: the web alias onuj@example.test is not added yet. Add it in the Google Admin console, then run gws-ea capabilities enable browser --id ${id} --alias-added.`,
+      address: 'onuj@example.test',
+    });
+    expect(unadded.nextActions).toContainEqual({ kind: 'command', argv: [...enable, '--alias-added'] });
+    // A pending alias is setup to finish, not an error in the host's logs.
+    expect(unadded.nextActions).not.toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'logs', '--id', id, '--errors'],
+    });
+
+    const unverified = await observe({ alias: null, candidate: 'onuj@example.test', probe_sent: true });
+    expect(unverified.status.probes.web_alias).toMatchObject({
+      status: 'degraded',
+      reason: `Setup is incomplete: the web alias onuj@example.test is not verified yet, as its test message has not arrived. Check again with gws-ea capabilities enable browser --id ${id}.`,
+      probe_sent: true,
+    });
+    expect(unverified.nextActions).toContainEqual({ kind: 'command', argv: enable });
+
+    const verified = await observe({ alias: 'onuj@example.test', candidate: null, probe_sent: false });
+    expect(verified.status.probes.web_alias).toEqual({
+      status: 'ok',
+      reason: null,
+      state: 'verified',
+      address: 'onuj@example.test',
+      probe_sent: false,
+    });
+    expect(verified.nextActions).toEqual([]);
+
+    const { runtime, output } = command(host, state, {
+      ...healthy,
+      ncl: reporting({ alias: null, candidate: 'onuj@example.test', probe_sent: false }),
+    });
+    expect(await runStatusCommand(runtime, { instanceId: id, json: false })).toBe(0);
+    expect(output.stdout).toContain('  Web alias: pending onuj@example.test');
   });
 
   it('reports the inbox as the host reports it, degraded while it fails, while calendar news is not on yet, or when its report is invalid', async () => {

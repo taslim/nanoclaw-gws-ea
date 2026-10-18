@@ -103,17 +103,19 @@ export function resolvePrincipalAddress(address: string, listed: readonly string
 
 /**
  * Why `email` cannot be one of the principal's addresses beside `listed`, or
- * undefined when it can (R3): it is the assistant's own in any spelling that
- * reaches the assistant's mailbox (`identityMatchKey`, which widens a
+ * undefined when it can (R3): it is one of the `assistant`'s own addresses
+ * (its Workspace email and, once verified, its web alias) in any spelling
+ * that reaches the assistant's mailbox (`identityMatchKey`, which widens a
  * refusal), or another spelling of a listed address under R1. The same
  * spelling again is no conflict.
  */
 export function principalAddressConflict(
   email: string,
   listed: readonly string[],
-  assistant: string | null,
+  assistant: readonly string[],
 ): string | undefined {
-  if (assistant !== null && identityMatchKey(`email:${email}`) === identityMatchKey(`email:${assistant}`)) {
+  const key = identityMatchKey(`email:${email}`);
+  if (assistant.some((own) => identityMatchKey(`email:${own}`) === key)) {
     return `${email} is the assistant's own address, not one of the principal's`;
   }
   const match = resolvePrincipalAddress(email, listed);
@@ -123,7 +125,10 @@ export function principalAddressConflict(
 }
 
 /** The first conflict (`principalAddressConflict`) in a list of addresses, each judged against those before it. */
-export function principalAddressesConflict(emails: readonly string[], assistant: string | null): string | undefined {
+export function principalAddressesConflict(
+  emails: readonly string[],
+  assistant: readonly string[],
+): string | undefined {
   for (const [index, email] of emails.entries()) {
     const conflict = principalAddressConflict(email, emails.slice(0, index), assistant);
     if (conflict !== undefined) return conflict;

@@ -49,7 +49,16 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-inbox/index.js';
-import { audienceForAddresses, checkOutbound, listPrivateValues, registerRecipientResolver } from './index.js';
+import { SqliteDriver } from '../../db/drivers/sqlite.js';
+import { addPrivateValue } from './db.js';
+import {
+  audienceForAddresses,
+  checkOutbound,
+  listPrivateValues,
+  loadPersonalData,
+  privateValueReference,
+  registerRecipientResolver,
+} from './index.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-privacy';
 const PRINCIPAL = 'gchat:users/principal';
@@ -593,5 +602,64 @@ describe('the shared check', () => {
     expect(await audienceForAddresses(['Pat.Lee+trip@googlemail.com', 'PAT@example.com'])).toBe('principal');
     expect(await audienceForAddresses(['pat+trip@example.com'])).toBe('others');
     expect(await audienceForAddresses(['patlee@gmail.com.evil.example'])).toBe('others');
+  });
+});
+
+describe("the host browser's reading of what a website receives (KTD19, R34)", () => {
+  it('names each stored value a site would receive by its id and kind, never by its value or label', async () => {
+    const home = await addHome();
+    const cell = (await addPrivateValue({ label: 'Cell', kind: 'phone', value: '+1 415 555 0134' })).id;
+    const data = await loadPersonalData();
+    expect(data.empty).toBe(false);
+    expect(data.read(['Pat Doe', '415', '555', '0134'])).toEqual({
+      values: [{ id: cell, kind: 'phone' }],
+      principalAddress: false,
+    });
+    expect(data.read(['https://maps.example/?q=123%20Main%20Street'])).toEqual({
+      values: [{ id: home, kind: 'address' }],
+      principalAddress: false,
+    });
+    expect(JSON.stringify(data.read(['123 Main Street', '(415) 555-0134']))).not.toMatch(/Main|415|0134|Home|Cell/u);
+    expect(data.read(['Table for two', 'Window seat, please'])).toEqual({ values: [], principalAddress: false });
+  });
+
+  it("finds the principal's address in any spelling that reaches their mailbox, split across fields or encoded", async () => {
+    await addPrincipalAddress('patlee@gmail.com');
+    const data = await loadPersonalData();
+    for (const fields of [
+      ['PAT@example.com'],
+      ['pat+news@example.com'],
+      ['Pat.Lee+deals@googlemail.com'],
+      ['pat', 'example.com'],
+      ['https://join.example/?email=pat%40example.com'],
+    ])
+      expect(data.read(fields).principalAddress, fields.join(' ')).toBe(true);
+    expect(data.read(['juno@example.com', 'patrick@example.com', 'Pat']).principalAddress).toBe(false);
+  });
+
+  it('reads through the handle it is given, and finds nothing where neither store exists', async () => {
+    const elsewhere = new SqliteDriver(new Database(':memory:'));
+    try {
+      const data = await loadPersonalData(elsewhere);
+      expect(data.empty).toBe(true);
+      expect(data.read(['pat@example.com', '123 Main Street'])).toEqual({ values: [], principalAddress: false });
+    } finally {
+      await elsewhere.close();
+    }
+  });
+
+  it("names a stored value for a disclosure by its id, kind and label, and says when it reaches the principal's mailbox", async () => {
+    const home = await addHome();
+    const personal = (await addPrivateValue({ label: 'Personal', kind: 'email', value: 'Pat+home@example.com' })).id;
+    const partner = (await addPrivateValue({ label: 'Partner', kind: 'email', value: 'remy@example.net' })).id;
+    expect(await privateValueReference(home)).toEqual({
+      id: home,
+      kind: 'address',
+      label: HOME_LABEL,
+      principalAddress: false,
+    });
+    expect(await privateValueReference(personal)).toMatchObject({ kind: 'email', principalAddress: true });
+    expect(await privateValueReference(partner)).toMatchObject({ kind: 'email', principalAddress: false });
+    expect(await privateValueReference('pv-000000000000')).toBeUndefined();
   });
 });

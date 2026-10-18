@@ -69,10 +69,16 @@ export const reservationGuarantee = requestTool({
 export const reservationBounds = requestTool({
   name: 'reservation_bounds',
   description:
-    'Record the principal’s delegated venue, party size and time window for one direct reservation errand. Use the exact browser thread before asking it to commit under an existing standing guarantee. The browser cannot set or widen these bounds. This tool grants no financial permission; absent bounds require the usual principal purchase approval. One errand can use a standing guarantee for at most one booking. Repeating identical bounds is safe; changed bounds need a new errand after authority exists.',
+    'Record the principal’s delegated venue, party size and time window for one direct reservation errand, on any site. Use the exact browser thread before asking it to commit under an existing standing guarantee. The browser cannot set or widen these bounds. This tool grants no financial permission; absent bounds require the usual principal purchase approval. One errand can use a standing guarantee for at most one booking. Repeating identical bounds is safe; changed bounds need a new errand after authority exists.',
   properties: {
     thread: THREAD,
-    venue_id: { type: 'string', minLength: 1, maxLength: 256 },
+    venue_id: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 256,
+      description:
+        'On Resy, the venue’s Resy id. On any other site, the venue’s name exactly as its booking page shows it: the host matches it against the page.',
+    },
     party_size: { type: 'integer', minimum: 1 },
     window_start: {
       type: 'string',
@@ -91,7 +97,7 @@ export const reservationBounds = requestTool({
 export const credentialAuthority = requestTool({
   name: 'credential_authority',
   description:
-    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when an earlier signup or change of that account is still open or unsettled, vault_unavailable or rate_limited. Repeating the same request returns the same authority. " +
+    "Record the principal's delegation of one account signup, or one password change, for a browser job's exact thread, site and account username, before the job submits it. The host generates and saves the password in the assistant's 1Password vault; no password passes through you. change_password applies only to a login the assistant created or saved itself and nobody has since edited. Returns recorded with the authority id to send the job, not_owned with reason no_record or changed, busy when an earlier signup or change of that account is still open or unsettled, alias_unavailable when a signup needs the assistant's web address and none is set up yet, vault_unavailable or rate_limited. Repeating the same request returns the same authority. " +
     "release, with the job's thread and the authority it recorded, asks the principal directly to end an attempt the job could not settle (its outcome unknown, or its email verification never completed), one whose login was left as edited in 1Password, or one still pending because 1Password is out of reach. For a pending one the host first tries to finish it, and if it can, answers with the job's outcome instead (account_created or password_changed with its vault state). Otherwise it returns awaiting_principal, or not_releasable when the attempt is settled or its own step settles it; the principal's decision reaches you as a note. Release changes nothing in 1Password.",
   properties: {
     thread: THREAD,
@@ -152,7 +158,79 @@ export const vaultAccess = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
+export const consentGrants = requestTool({
+  name: 'consent_grants',
+  description:
+    "Read or withdraw the principal's standing agreements to wording beyond a site's own terms, each one they approved for one site and exact wording. list returns listed with each grant's grant_id, site, origin, wording and approved_at, optionally for one site. withdraw, with a grant_id from list, ends one the principal asked to withdraw: from then on that wording waits for the principal's decision again. Returns withdrawn or not_found. Repeating either is safe.",
+  properties: {
+    operation: { type: 'string', enum: ['list', 'withdraw'] },
+    grant_id: { type: 'string', description: 'For withdraw: the grant_id list returned.' },
+    site: { type: 'string', description: "For list: only this site's grants, as a domain or an address." },
+  },
+  required: ['operation'],
+  additionalProperties: false,
+  oneOf: [
+    { properties: { operation: { const: 'list' } }, not: { required: ['grant_id'] } },
+    { properties: { operation: { const: 'withdraw' } }, required: ['grant_id'], not: { required: ['site'] } },
+  ],
+  prepare(fields) {
+    if (fields.operation === 'list')
+      return fields.grant_id === undefined ? fields : 'list takes only an optional site.';
+    if (fields.operation !== 'withdraw') return 'operation must be list or withdraw.';
+    return typeof fields.grant_id === 'string' && fields.site === undefined
+      ? fields
+      : 'withdraw takes only the grant_id list returned.';
+  },
+  repeatable: true,
+  timeoutMs: 120_000,
+});
+export const recordDisclosure = requestTool({
+  name: 'record_disclosure',
+  description:
+    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id (main reads the ids with `ncl private-values list`; another agent asks main for the id). Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up: right after you delegate, before the job reaches the form. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
+  properties: {
+    thread: THREAD,
+    site: { type: 'string', description: 'The site the principal named, as its address or its domain.' },
+    value_id: {
+      type: 'string',
+      description: 'The stored value’s id: main reads it with `ncl private-values list`; another agent asks main.',
+    },
+  },
+  required: ['thread', 'site', 'value_id'],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: 120_000,
+});
+export const recordPurchaseOutcome = requestTool({
+  name: 'record_purchase_outcome',
+  description:
+    "Record whether a browser job's unconfirmed purchase or booking went through, once you know: from the merchant's order email (source email) or the principal's answer when you asked them once (source principal). Name it by the attempt id the job's state shows, never one a browser report gives. Returns recorded; already_recorded with the outcome recorded first, which a later recording never changes; possible_duplicate when you record placed for one already recorded not_placed: tell the principal at once; or in_progress while its press is still settling. Until it is recorded, another purchase on that site waits. Repeating it changes nothing.",
+  properties: {
+    thread: THREAD,
+    attempt_id: { type: 'string', description: "The unconfirmed purchase's attempt id, as the job's state shows it." },
+    outcome: { type: 'string', enum: ['placed', 'not_placed'] },
+    source: {
+      type: 'string',
+      enum: ['email', 'principal'],
+      description: "email: the merchant's order email; principal: the principal's own answer.",
+    },
+  },
+  required: ['thread', 'attempt_id', 'outcome', 'source'],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: 120_000,
+});
 registerTools(
-  [cancelJob, relayCode, reservationGuarantee, reservationBounds, vaultAccess, credentialAuthority],
+  [
+    cancelJob,
+    relayCode,
+    reservationGuarantee,
+    reservationBounds,
+    vaultAccess,
+    credentialAuthority,
+    consentGrants,
+    recordDisclosure,
+    recordPurchaseOutcome,
+  ],
   'browser-delegate',
 );

@@ -17,16 +17,23 @@ import './index.js';
 import { BrowserStore } from './db.js';
 import { BrowserQueue } from './queue.js';
 import { PurchaseAuthorityStore } from './authority.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
-import type { PurchaseFacts } from './fingerprint.js';
+import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
 import {
+  claimRegionWatchCommit,
   claimWatchBooking,
   compareWatchBounds,
   createBrowserWatch,
+  finishWatchCommit,
   finishWatchPurchase,
+  getBrowserWatch,
   prepareWatchPurchase,
   recoverBrowserWatches,
+  renderWatchCard,
+  validateWatchRequest,
   type WatchBounds,
+  type WatchRow,
 } from './watches.js';
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
 import * as watchRuntime from './watch-runtime.js';
@@ -121,17 +128,23 @@ async function executionContext(name: string) {
   return { queue, context: (await queue.contextForRequest(request.id))! };
 }
 
-async function seedWatch(id: string, site = 'resy.com'): Promise<void> {
+/** An armed watch of the job: a reader watch on `watched`, a site, or a region watch (KTD20) with those bounds. */
+async function seedWatch(id: string, watched: string | WatchBounds = 'resy.com'): Promise<void> {
   const at = '2026-10-15T12:00:00.000Z';
+  const region = typeof watched === 'string' ? undefined : watched;
+  const site = typeof watched === 'string' ? watched : watched.site;
   await getDb().run(
     `INSERT INTO gws_ea_browser_watches
-    (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at)
-    VALUES(?,?,?,'recipe',1,'{}',?,?, 'armed',?,?,?)`,
+    (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+    VALUES(?,?,?,'recipe',1,'{}',?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
     site,
     id,
-    JSON.stringify({ ...bounds, site }),
+    JSON.stringify(region ?? { ...bounds, site }),
+    region ? '{}' : null,
+    region ? 'No tables' : null,
+    region ? at : null,
     at,
     at,
     at,
@@ -140,6 +153,31 @@ async function seedWatch(id: string, site = 'resy.com'): Promise<void> {
     "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT(job_id) DO NOTHING",
     jobId,
   );
+}
+
+async function bindPrincipal(): Promise<string[]> {
+  const principal = 'gchat:users/watch-principal';
+  const at = new Date().toISOString();
+  await createMessagingGroup({
+    id: 'watch-dm',
+    channel_type: 'gchat',
+    platform_id: 'spaces/watch-principal',
+    name: 'Principal',
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: at,
+  });
+  await upsertUser({ id: principal, kind: 'gchat', display_name: 'Principal', created_at: at });
+  await upsertUserDm({ user_id: principal, channel_type: 'gchat', messaging_group_id: 'watch-dm', resolved_at: at });
+  await bindVerifiedPrincipalUser(principal, at);
+  const cards: string[] = [];
+  setDeliveryAdapter({
+    async deliver(_type, _platform, _thread, _kind, content) {
+      cards.push(content);
+      return `watch-card-${cards.length}`;
+    },
+  });
+  return cards;
 }
 
 describe('native watch bounds and one booking claim', () => {
@@ -191,7 +229,7 @@ describe('native watch bounds and one booking claim', () => {
         }),
       ),
     ).rejects.toThrow('already claimed');
-    await finishWatchPurchase(getDb(), 'friday', 'attempt', { status: 'booked' });
+    await finishWatchPurchase(getDb(), 'friday', 'attempt', true, 'page');
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'saturday')).toEqual({
       status: 'cancelled',
     });
@@ -282,11 +320,13 @@ describe('native watch bounds and one booking claim', () => {
       status: 'booking',
     });
     expect(await cancelBrowserJob(jobId)).toMatchObject({ status: 'in_progress' });
-    await authorityStore.conclude(
-      authority.id,
-      { status: 'booked', evidence: { recordId: 'reservation-1', account: 'principal' } },
-      true,
-    );
+    await authorityStore.resolve(authority.attempt_id, {
+      placed: true,
+      source: 'page',
+      evidence: { recordId: 'reservation-1' },
+      record: { id: 'reservation-1', account: 'principal' },
+      outcome: { status: 'booked' },
+    });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'friday')).toEqual({
       status: 'booked',
     });
@@ -447,27 +487,8 @@ describe('native watch bounds and one booking claim', () => {
     await queue.stop();
   });
   it('arms a financial watch only through its native principal card, with restart-safe replay and exact host policy', async () => {
-    const principal = 'gchat:users/watch-principal';
     const at = new Date().toISOString();
-    await createMessagingGroup({
-      id: 'watch-dm',
-      channel_type: 'gchat',
-      platform_id: 'spaces/watch-principal',
-      name: 'Principal',
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: at,
-    });
-    await upsertUser({ id: principal, kind: 'gchat', display_name: 'Principal', created_at: at });
-    await upsertUserDm({ user_id: principal, channel_type: 'gchat', messaging_group_id: 'watch-dm', resolved_at: at });
-    await bindVerifiedPrincipalUser(principal, at);
-    const cards: string[] = [];
-    setDeliveryAdapter({
-      async deliver(_type, _platform, _thread, _kind, content) {
-        cards.push(content);
-        return `watch-card-${cards.length}`;
-      },
-    });
+    const cards = await bindPrincipal();
     const { context } = await executionContext('setup');
     const terms = '$12.50 per guest for cancellation within 24 hours or no-show';
     vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
@@ -533,6 +554,9 @@ describe('native watch bounds and one booking claim', () => {
         "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
       )
     )[0];
+    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+    expect(approval.question).not.toContain(jobId);
     await handleApprovalsResponse({
       questionId: approval.approval_id,
       value: 'approve',
@@ -628,11 +652,13 @@ describe('native watch bounds and one booking claim', () => {
         at: new Date().toISOString(),
       }),
     );
-    await store.conclude(
-      authority.id,
-      { status: 'booked', evidence: { recordId: 'reservation-recipe', account: 'principal' } },
-      true,
-    );
+    await store.resolve(authority.attempt_id, {
+      placed: true,
+      source: 'page',
+      evidence: { recordId: 'reservation-recipe' },
+      record: { id: 'reservation-recipe', account: 'principal' },
+      outcome: { status: 'booked' },
+    });
     expect(
       await getDb().all('SELECT booking_recipe_id,source_attempt_id FROM gws_ea_browser_watch_recipe_links'),
     ).toEqual([{ booking_recipe_id: saved.recipe_id, source_attempt_id: 'recipe-attempt' }]);
@@ -694,5 +720,444 @@ describe('native watch bounds and one booking claim', () => {
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'second')).toEqual({
       status: 'armed',
     });
+  });
+});
+
+/** The agent's request for a free watch of the Bistro on Resy, checked with the `check-recipe` recipe. */
+const free = {
+  site: 'https://resy.com/search',
+  recipe_id: 'check-recipe',
+  parameters: {},
+  venue: bounds.venue,
+  party_size: 4,
+  windows: bounds.windows,
+  financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+  until: bounds.until,
+};
+
+describe('venue release schedules and card times', () => {
+  it('reads a release rule apart from the bounds and refuses one it could not schedule', () => {
+    const wording = 'Tables released 30 days ahead at 10:00';
+    expect(validateWatchRequest({ ...free, release: { days_ahead: 30, time: '10:00', wording } })).toMatchObject({
+      release: { schedule: { kind: 'days_ahead', days: 30 }, time: '10:00', wording },
+    });
+    expect(
+      validateWatchRequest({
+        ...free,
+        release: { day_of_month: 1, months_ahead: 1, time: '12:00', wording, time_zone: 'europe/paris' },
+      }).release,
+    ).toEqual({
+      schedule: { kind: 'monthly', day: 1, monthsAhead: 1 },
+      time: '12:00',
+      wording,
+      timeZone: 'Europe/Paris',
+    });
+    for (const time_zone of ['Mars/Olympus', '+09:00', 'JST-9'])
+      expect(() =>
+        validateWatchRequest({ ...free, release: { days_ahead: 30, time: '10:00', wording, time_zone } }),
+      ).toThrow('IANA');
+    for (const release of [
+      { days_ahead: 30, day_of_month: 1, months_ahead: 1, time: '10:00', wording },
+      { day_of_month: 1, time: '10:00', wording },
+      { time: '10:00', wording },
+      { days_ahead: -1, time: '10:00', wording },
+      { days_ahead: 30, time: '24:00', wording },
+      { days_ahead: 30, time: '9:00', wording },
+      { days_ahead: 30, time: '10:00', wording: ' ' },
+      { days_ahead: 30, time: '10:00' },
+      { days_ahead: 30, time: '10:00', wording, until: bounds.until },
+      'Tables released 30 days ahead at 10:00',
+    ])
+      expect(() => validateWatchRequest({ ...free, release })).toThrow('A release rule needs');
+  });
+
+  it("stores the rule once, on the venue's clock as the host reads it, outside the bounds the principal approves", async () => {
+    await getDb().run(
+      "UPDATE gws_ea_profile SET principal_display_name = 'Morgan Ellery',principal_timezone = 'America/Los_Angeles' WHERE singleton = 1",
+    );
+    const cards = await bindPrincipal();
+    const { context } = await executionContext('release-setup');
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+      jobId,
+      new Date().toISOString(),
+    );
+    const terms = '¥5,000 per guest for cancellation within 24 hours or no-show';
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      availability: {
+        status: 'ready',
+        site: 'resy.com',
+        venue: bounds.venue,
+        partySize: 4,
+        currency: 'JPY',
+        timeZone: 'Asia/Tokyo',
+        slots: [],
+      },
+      policy: {
+        currency: 'JPY',
+        dueNowMinor: 0,
+        commitments: [
+          {
+            kind: 'conditional_fee',
+            terms,
+            amountMinor: 5000,
+            perPerson: true,
+            trigger: 'Late cancellation or no-show',
+            conditionalTrigger: 'cancellation',
+            cancellationTerms: 'Cancel at least 24 hours before arrival',
+            cancellationBeforeMs: 86_400_000,
+          },
+        ],
+      },
+    });
+    const request = {
+      ...free,
+      windows: [{ start: '2026-11-24T19:00:00+09:00', end: '2026-11-24T21:00:00+09:00' }],
+      financial: { currency: 'JPY', max_total: '20000', terms },
+      until: '2026-11-24T00:00:00Z',
+    };
+    const created = await createBrowserWatch(context, {
+      ...request,
+      // The host's own read of the venue's zone outranks the agent's.
+      release: {
+        days_ahead: 30,
+        time: '10:00',
+        wording: 'Tables released 30 days ahead at 10:00',
+        time_zone: 'Asia/Seoul',
+      },
+    });
+    expect(created).toMatchObject({ status: 'awaiting_principal' });
+    const id = created.watch_id as string;
+    const stored = {
+      schedule: { kind: 'days_ahead', days: 30 },
+      time: '10:00',
+      timeZone: 'Asia/Tokyo',
+      wording: 'Tables released 30 days ahead at 10:00',
+    };
+    const watch = (await getBrowserWatch(id))!;
+    expect(JSON.parse(watch.release_json!)).toEqual(stored);
+    const approval = (
+      await getDb().all<import('../../types.js').PendingApproval>(
+        "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
+      )
+    )[0];
+    const approved = JSON.parse(approval.payload) as { bounds: WatchBounds };
+    expect(approved.bounds).toEqual(JSON.parse(watch.bounds_json));
+    expect(JSON.stringify(approved)).not.toContain('release');
+    expect(cards[0]).toContain(
+      'Arrival window: Nov 24, 2026, 7:00 PM through 9:00 PM Tokyo time (Nov 24, 2026, 2:00 AM through 4:00 AM Los Angeles time)',
+    );
+    expect(cards[0]).toContain('Watch deadline: Nov 23, 2026, 4:00 PM Los Angeles time');
+    // A repeat of the request cannot change the rule, nor can the principal's approval.
+    await createBrowserWatch(context, {
+      ...request,
+      release: { day_of_month: 1, months_ahead: 2, time: '09:00', wording: 'Opens on the 1st' },
+    });
+    await getDb().run("UPDATE pending_approvals SET status='approved' WHERE approval_id=?", approval.approval_id);
+    await resumeApprovedApprovals();
+    expect(await getDb().get('SELECT status,release_json FROM gws_ea_browser_watches WHERE id=?', id)).toEqual({
+      status: 'armed',
+      release_json: JSON.stringify(stored),
+    });
+  });
+
+  it('prints a trial conversion on the principal’s clock, labelled, never as raw ISO', () => {
+    const watch = {
+      id: 'trial-watch',
+      site: 'resy.com',
+      bounds_json: JSON.stringify({
+        ...bounds,
+        financial: {
+          freeOnly: false,
+          currency: 'USD',
+          maxTotalMinor: 2000,
+          maxDueNowMinor: 0,
+          policy: {
+            currency: 'USD',
+            dueNowMinor: 0,
+            commitments: [
+              {
+                kind: 'trial',
+                terms: 'Free for 30 days, then $20 monthly',
+                amountMinor: 2000,
+                trigger: 'Trial ends',
+                cancellationTerms: 'Cancel before the trial ends',
+                cancellationBeforeMs: 0,
+                conversionAt: '2026-11-15T08:00:00.000Z',
+                frequency: 'monthly',
+              },
+            ],
+          },
+        },
+      }),
+    } as WatchRow;
+    const card = renderWatchCard(watch, 'UTC', 'America/Los_Angeles');
+    expect(card).toContain('converts Nov 15, 2026, 12:00 AM Los Angeles time');
+    expect(card).not.toContain('2026-11-15T08:00:00');
+  });
+});
+
+describe('watches on sites with no reader (KTD20)', () => {
+  const regionBounds: WatchBounds = {
+    kind: 'region',
+    site: 'larder.example',
+    venue: { id: 'the-larder', name: 'The Larder' },
+    partySize: 2,
+    windows: [{ start: '2026-10-17T02:00:00.000Z', end: '2026-10-17T04:00:00.000Z' }],
+    financial: { freeOnly: false, currency: 'USD', maxTotalMinor: 5000, maxDueNowMinor: 5000 },
+    until: '2026-10-16T19:00:00.000Z',
+  };
+  /** A deposit booking on The Larder's own checkout, as the generic signature reads it. */
+  function depositFacts(deposit = 4000, booking: Record<string, unknown> = {}): PurchaseFacts {
+    return {
+      flowId: GENERIC_FLOW_ID,
+      site: 'larder.example',
+      origin: 'https://larder.example',
+      control: {
+        label: 'Reserve now',
+        locator: {
+          role: 'button',
+          name: 'Reserve now',
+          ordinal: 0,
+          count: 1,
+          framePath: [],
+          frameUrls: ['https://larder.example/book'],
+        },
+      },
+      account: 'guest checkout',
+      items: [],
+      currency: 'USD',
+      totalMinor: deposit,
+      dueNowMinor: deposit,
+      cardEnding: '4242',
+      address: null,
+      commitments: [{ kind: 'deposit', terms: 'Deposit charged when you book', amountMinor: deposit }],
+      generic: {
+        guest: true,
+        contactEmail: 'aya.web@example.test',
+        items: ['Table for 2'],
+        payment: 'Card on file: Visa ending in 4242',
+        booking: { venue: 'The Larder', partySize: 2, at: '2026-10-16T19:30:00-07:00', timeZone: '-07:00', ...booking },
+      },
+    };
+  }
+  /** The agent's request for a free watch of The Larder's tables, checked with the `larder-recipe` recipe. */
+  const regionRequest = {
+    site: 'https://larder.example/tables',
+    recipe_id: 'larder-recipe',
+    parameters: {},
+    venue: { id: 'the-larder', name: 'The Larder' },
+    party_size: 2,
+    windows: regionBounds.windows,
+    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+    until: regionBounds.until,
+  };
+
+  it('covers a booking the site’s own checkout reads within the merchant, venue, party, window and maximum', () => {
+    const now = '2026-10-15T12:00:00.000Z';
+    expect(compareWatchBounds(regionBounds, depositFacts(), now)).toEqual({ status: 'within_bounds' });
+    // The page's venue reads as the principal named it, case and apostrophes aside.
+    expect(compareWatchBounds(regionBounds, depositFacts(4000, { venue: 'THE LARDER' }), now).status).toBe(
+      'within_bounds',
+    );
+    const outside: Array<[PurchaseFacts, string, string?]> = [
+      [depositFacts(), 'deadline', regionBounds.until],
+      [{ ...depositFacts(), site: 'tables.example' }, 'merchant'],
+      [depositFacts(4000, { venue: 'The Larder Annex' }), 'venue_or_party'],
+      [depositFacts(4000, { partySize: 4 }), 'venue_or_party'],
+      [depositFacts(4000, { at: undefined }), 'venue_or_party'],
+      [depositFacts(4000, { at: '2026-10-16T22:00:00-07:00' }), 'time'],
+      [depositFacts(8000), 'financial_limit'],
+      [{ ...depositFacts(), currency: 'EUR' }, 'currency_or_total'],
+      [
+        {
+          ...depositFacts(),
+          commitments: [
+            { kind: 'subscription', terms: 'Supper club, $10 monthly', amountMinor: 1000, frequency: 'monthly' },
+          ],
+        },
+        'financial_terms',
+      ],
+      [{ ...depositFacts(), addOns: ['Wine pairing'] }, 'financial_terms'],
+      // A no-show fee per guest counts for every guest against the maximum.
+      [
+        {
+          ...depositFacts(0),
+          commitments: [
+            {
+              kind: 'conditional_fee',
+              terms: 'No-show fee $30 per person',
+              amountMinor: 3000,
+              perPerson: true,
+              conditionalTrigger: 'no_show',
+            },
+          ],
+        },
+        'financial_limit',
+      ],
+    ];
+    for (const [facts, reason, at = now] of outside)
+      expect(compareWatchBounds(regionBounds, facts, at)).toEqual({ status: 'outside_bounds', reason });
+  });
+
+  it('lets a free commit or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
+    await seedWatch('larder', regionBounds);
+    await seedWatch('elsewhere', { ...regionBounds, site: 'tables.example' });
+    const at = new Date().toISOString();
+    // A commit on another site touches nothing.
+    await claimRegionWatchCommit(getDb(), {
+      jobId,
+      site: 'bistro.example',
+      attemptId: 'other',
+      requestId: 'r0',
+      at,
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+    await claimRegionWatchCommit(getDb(), { jobId, site: 'larder.example', attemptId: 'free', requestId: 'r1', at });
+    expect(await getDb().get('SELECT state,watch_id,attempt_id FROM gws_ea_browser_watch_job_claims')).toEqual({
+      state: 'committing',
+      watch_id: 'larder',
+      attempt_id: 'free',
+    });
+    expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
+    // The claim is spent: a second commit leaves the other watch armed.
+    await claimRegionWatchCommit(getDb(), { jobId, site: 'tables.example', attemptId: 'again', requestId: 'r2', at });
+    expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'armed' });
+    await finishWatchCommit(getDb(), jobId, 'other', true, 'page');
+    expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
+    await finishWatchCommit(getDb(), jobId, 'free', true, 'page');
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
+    expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booked' });
+    // The job's other watches end with it.
+    expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'cancelled' });
+  });
+
+  // A free booking spends only a watch its page's venue, party and start do not fall outside; a fact the page leaves
+  // unstated may be the watched table, so it spends the first watch it may be.
+  it.each<[string, GenericBookingFacts, 'early' | 'larder' | null]>([
+    ['another venue', { venue: 'The Larder Annex', partySize: 2, at: '2026-10-16T19:30:00-07:00' }, null],
+    ['another party size', { venue: 'The Larder', partySize: 4, at: '2026-10-16T19:30:00-07:00' }, null],
+    ['a start outside both windows', { venue: 'The Larder', partySize: 2, at: '2026-10-16T22:15:00-07:00' }, null],
+    ['the later watch’s window', { venue: 'THE LARDER', partySize: 2, at: '2026-10-16T19:30:00-07:00' }, 'larder'],
+    ['no stated party or time', { venue: 'The Larder', timeText: 'Saturday evening' }, 'early'],
+  ])('lets a free booking for %s spend the watch it falls within', async (_case, booking, spent) => {
+    await seedWatch('early', {
+      ...regionBounds,
+      windows: [{ start: '2026-10-17T00:00:00.000Z', end: '2026-10-17T01:00:00.000Z' }],
+    });
+    await seedWatch('larder', regionBounds);
+    await claimRegionWatchCommit(getDb(), {
+      jobId,
+      site: 'larder.example',
+      attemptId: 'free',
+      requestId: 'free',
+      at: new Date().toISOString(),
+      booking,
+    });
+    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual(
+      spent ? { state: 'committing', watch_id: spent } : { state: 'available', watch_id: null },
+    );
+    expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual(
+      ['early', 'larder'].map((id) => ({ id, status: id === spent ? 'booking' : 'armed' })),
+    );
+  });
+
+  it('asks for a region only where the host has no reader, and refuses one where it reads the venue itself', async () => {
+    const { context } = await executionContext('region-setup');
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('larder-recipe','larder.example','Tables',1,?,0,0,'[]','[]',1,?),('resy-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+      jobId,
+      new Date().toISOString(),
+      jobId,
+      new Date().toISOString(),
+    );
+    expect(await createBrowserWatch(context, regionRequest)).toEqual({ status: 'refused', reason: 'region_required' });
+    const region = { ref: 'e5', generation: 1 };
+    expect(
+      await createBrowserWatch(context, {
+        ...regionRequest,
+        site: 'https://www.resy.com/',
+        recipe_id: 'resy-recipe',
+        region,
+      }),
+    ).toEqual({ status: 'refused', reason: 'site_has_reader' });
+    // A release on a site with no reader needs the venue's zone from the agent.
+    expect(
+      await createBrowserWatch(context, {
+        ...regionRequest,
+        region,
+        release: { days_ahead: 30, time: '10:00', wording: 'Tables open 30 days ahead at 10:00' },
+      }),
+    ).toEqual({ status: 'refused', reason: 'release_zone_unknown' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
+  });
+
+  it('reads a region and the watch to mark again, and keeps a queued release readable when it runs', async () => {
+    expect(validateWatchRequest({ ...regionRequest, region: { ref: 'f1e7', generation: 3 } }).region).toEqual({
+      ref: 'f1e7',
+      generation: 3,
+    });
+    expect(() => validateWatchRequest({ ...regionRequest, region: { ref: 'button', generation: 3 } })).toThrow(
+      'region',
+    );
+    expect(() => validateWatchRequest({ ...regionRequest, watch_id: 'watch-1' })).toThrow('watch_id');
+    // The queue keeps the agent's own fields, so the run reads a release rule as the agent sent it.
+    const { queue } = await executionContext('queued-release');
+    await queue.start();
+    try {
+      await getDb().run(
+        "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+        jobId,
+        new Date().toISOString(),
+      );
+      vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+        availability: {
+          status: 'ready',
+          site: 'resy.com',
+          venue: bounds.venue,
+          partySize: 4,
+          currency: 'USD',
+          timeZone: 'America/New_York',
+          slots: [],
+        },
+      });
+      const job = (await new BrowserStore().getJob(jobId))!;
+      const { getSession } = await import('../../db/sessions.js');
+      const session = (await getSession(job.browser_session_id))!;
+      await queue.accept(
+        'watch',
+        {
+          action: 'watch',
+          requestId: 'queued',
+          ...free,
+          release: { days_ahead: 30, time: '10:00', wording: 'Tables released 30 days ahead at 10:00' },
+        },
+        session,
+        'queued',
+      );
+      await queue.idle();
+      const answer = await getDb().get<{ answer_json: string }>(
+        "SELECT answer_json FROM gws_ea_browser_requests WHERE request_id = 'queued'",
+      );
+      expect(JSON.parse(answer!.answer_json)).toMatchObject({ ok: true, data: { status: 'armed' } });
+      expect(await getDb().get('SELECT release_json FROM gws_ea_browser_watches')).toEqual({
+        release_json: expect.stringContaining('"timeZone":"America/New_York"') as unknown,
+      });
+    } finally {
+      await queue.stop();
+    }
+  });
+
+  it('shows the principal the maximum the host enforces, not terms it cannot check in advance', () => {
+    const card = renderWatchCard(
+      { id: 'larder', site: 'larder.example', bounds_json: JSON.stringify(regionBounds) } as WatchRow,
+      'America/Los_Angeles',
+      'America/Los_Angeles',
+    );
+    expect(card).toContain('Venue: "The Larder"');
+    expect(card).toContain('Maximum total exposure, all guests and fees: $50.00 (USD)');
+    expect(card).toContain('Arrival window: Oct 16, 2026, 7:00 PM through 9:00 PM Los Angeles time');
+    expect(card).toContain('Any other booking, a recurring charge included, comes to you on its own card.');
+    expect(card).not.toContain('merchant identity');
   });
 });

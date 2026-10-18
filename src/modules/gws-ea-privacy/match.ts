@@ -230,6 +230,15 @@ export function streamOf(parts: readonly string[]): TextStream {
   };
 }
 
+/**
+ * The fields one website receives (a form's values, an address's parameters), read in order as one text.
+ * Unlike a message's parts, a phone-like run continues from one field into the next, so a number split across
+ * an area-code field and a number field is read whole.
+ */
+export function fieldStreamOf(fields: readonly string[]): TextStream {
+  return streamOf([fields.join(' ')]);
+}
+
 // ---------------------------------------------------------------------------
 // Values
 // ---------------------------------------------------------------------------
@@ -276,14 +285,17 @@ export function compilePrivateValue(kind: PrivateValueKind, value: string): Comp
   }
 }
 
+/** Whether `text` gives `value` away. */
+export function givesAway({ words: patterns, digits }: CompiledPrivateValue, text: TextStream): boolean {
+  const words = ` ${text.words}`;
+  if (patterns.some((pattern) => pattern !== '' && words.includes(` ${pattern}`))) return true;
+  return digits !== null && digits !== '' && text.phoneRuns.some((run) => run.includes(digits));
+}
+
 /** The first value `text` gives away. */
 export function findPrivateValue(
   values: readonly CompiledPrivateValue[],
   text: TextStream,
 ): CompiledPrivateValue | undefined {
-  const words = ` ${text.words}`;
-  return values.find(({ words: patterns, digits }) => {
-    if (patterns.some((pattern) => pattern !== '' && words.includes(` ${pattern}`))) return true;
-    return digits !== null && digits !== '' && text.phoneRuns.some((run) => run.includes(digits));
-  });
+  return values.find((value) => givesAway(value, text));
 }

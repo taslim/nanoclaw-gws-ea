@@ -5,13 +5,14 @@
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Frame, Page, Request, Response } from 'playwright-core';
 import { isRecord } from '../../gws-ea/validation.js';
-import type { ActivationClass, ControlFacts } from './commit-classifier.js';
+import type { ActionClass, ControlFacts } from './commit-classifier.js';
 import { amountMinor, currencyExponent, type PurchaseFacts, type ReservationFacts } from './fingerprint.js';
-import type {
-  MerchantPurchaseEvidence,
-  MerchantSignature,
-  ReservationAvailability,
-  ReservationPolicy,
+import {
+  REVIEWED_CHECKOUT_MISSING,
+  type MerchantPurchaseEvidence,
+  type MerchantSignature,
+  type ReservationAvailability,
+  type ReservationPolicy,
 } from './merchant-contract.js';
 import { bindPageSecretDocuments, registerPageRedaction, registerPageSecret, releasePageSecret } from './observe.js';
 
@@ -673,7 +674,7 @@ async function readPurchase(
   if (candidates.length !== 1) return { status: 'checkout_lapsed' };
   const element = candidates[0],
     frame = await commitFrame(page, element);
-  if (!frame) return { status: 'unsupported_merchant' };
+  if (!frame) return REVIEWED_CHECKOUT_MISSING;
   const details = state.captures.get('/3/details');
   if (!fresh(details) || details.frame !== frame || details.request.commit !== 1)
     return { status: 'terms_unavailable' };
@@ -754,6 +755,8 @@ async function readPurchase(
     bookToken,
     readSequence: state.sequence,
   };
+  // No picture regions: this document holds the booking bearer the host tracks as a secret, so no picture of it
+  // is ever taken, and its card says the picture is unavailable (KTD6).
   return { status: 'ready', facts, element };
 }
 function parsedPayment(value: unknown): Record<string, unknown> | undefined {
@@ -831,10 +834,10 @@ export const resyReservationSignature: MerchantSignature = {
   async verifyPurchaseControl(page, element) {
     return Boolean(await commitFrame(page, element));
   },
-  async classifyControl(page, element, facts: ControlFacts): Promise<ActivationClass> {
+  async classifyControl(page, element, facts: ControlFacts): Promise<ActionClass | undefined> {
     if (await commitFrame(page, element)) return 'purchase_control';
     const frame = await element.ownerFrame();
-    if (!frame || !trusted(frame.url())) return 'unsupported_merchant';
+    if (!frame || !trusted(frame.url())) return undefined;
     if (facts.tag === 'a' && facts.href) return this.classifyNavigation(new URL(facts.href));
     const state = await settled(page),
       find = state.captures.get('/4/find');
@@ -866,16 +869,16 @@ export const resyReservationSignature: MerchantSignature = {
       /^\/cities\/[^/]+\/venues\/[^/]+$/u.test(route(frame.url()) ?? '')
     )
       return 'ordinary';
-    return 'unsupported_merchant';
+    return undefined;
   },
   classifyNavigation(url) {
     if (url.origin === API) {
       if (url.pathname === '/3/book') return 'purchase_control';
       return (METHODS.has(url.pathname) && url.pathname !== '/3/book') || url.pathname === '/2/config'
         ? 'ordinary'
-        : 'unsupported_merchant';
+        : undefined;
     }
-    if (!ORIGINS.some((origin) => origin === url.origin)) return 'unsupported_merchant';
+    if (!ORIGINS.some((origin) => origin === url.origin)) return undefined;
     const path = route(url.href) ?? '';
     if (/\/(?:cancel|change|payment-methods|profile|security|add-payment)(?:\/|$)/iu.test(path))
       return 'account_security';
@@ -893,7 +896,7 @@ export const resyReservationSignature: MerchantSignature = {
       /^\/account\/reservations-and-notify\/[^/]+$/u.test(path)
     )
       return 'ordinary';
-    return 'unsupported_merchant';
+    return undefined;
   },
   readPurchase,
   async readAvailability(page, expected): Promise<ReservationAvailability> {

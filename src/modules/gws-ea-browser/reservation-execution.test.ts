@@ -19,58 +19,22 @@ vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../gws-ea-meetings/calendar-facts.js', () => ({ findPrincipalCalendarConflicts: calendar }));
+import type { OutboundFile } from '../../channels/adapter.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getDeliveryAction } from '../../delivery.js';
+import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
 import { BrowserQueue } from './queue.js';
-import { observePage } from './observe.js';
-import { resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
+import { observePage, pageMayShowSecret } from './observe.js';
+import { principalReachable, seedPrincipal } from './principal-fixture.js';
+import { freeResyTable, resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import type { WatchBounds } from './watches.js';
 import type { Session } from '../../types.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-function state(): ResyFixtureState {
-  return {
-    inventory: {
-      query: { day: '2026-10-17', party_size: 2 },
-      results: {
-        venues: [
-          {
-            venue: {
-              id: { resy: 25973 },
-              name: "L'Artusi",
-              currency: { code: 'USD' },
-              location: { time_zone: 'EST5EDT' },
-            },
-            slots: [
-              {
-                config: { id: 1442725, token: 'opaque-native-slot-token', type: 'Bar Counter' },
-                date: { start: '2026-10-17 11:00:00', end: '2026-10-17 12:00:00' },
-                size: { min: 2, max: 2 },
-                time: { turn: { actual: 3600 } },
-                payment: { is_paid: false, cancellation_fee: null, deposit_fee: null, is_add_on_required: false },
-                has_add_ons: false,
-              },
-            ],
-          },
-        ],
-      },
-    },
-    policy: [],
-    details: {
-      venue: { id: 25973 },
-      user: { id: 72, payment_methods: [{ id: 101, display: '4242' }] },
-      config: { double_confirmation: false, add_ons: [] },
-      payment: { amounts: { total: 0, items: [] } },
-      cancellation: { fee: null, display: { policy: [] } },
-      book_token: { value: 'secret-book-token' },
-    },
-  };
-}
-describe.skipIf(!chromePath)('native reservation through the common purchase executor', () => {
+describe.skipIf(!chromePath)('native reservation through the common purchase executor', { timeout: 30_000 }, () => {
   let fixture: Awaited<ReturnType<typeof resyFixture>>;
   let fixtureState: ResyFixtureState;
   let queue: BrowserQueue;
@@ -122,7 +86,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       mode: 0o600,
     });
     process.env.GWS_EA_BROWSER_POLICY_FILE = policyFile;
-    fixtureState = state();
+    fixtureState = freeResyTable();
     fixture = await resyFixture(chromePath, fixtureState);
     await resyReservationSignature.preparePage?.(fixture.page);
     await load();
@@ -237,14 +201,84 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     expect(fixture.submitted()).toBe(0);
     expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
   });
-  it('blocks the whole site when a submitted reservation has no bound native confirmation', async () => {
+  it('leaves a submitted reservation with no bound native confirmation unconfirmed, holding back the next purchase on the site', async () => {
     fixtureState.responseToken = '';
     const outcome = await purchase('unknown');
-    expect(outcome).toMatchObject({ status: 'outcome_unknown', purchase_blocked: true });
+    expect(outcome).toMatchObject({ status: 'unconfirmed', attempt_id: expect.any(String) });
     expect(fixture.submitted()).toBe(1);
     expect(await getDb().get('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual({ site: 'resy.com' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
       state: 'unknown',
     });
   }, 15_000);
+  describe('an errand with no watch', () => {
+    /** Each card posted to the principal, with the files that went with it. */
+    let cards: Array<{ card: Record<string, unknown>; files: readonly OutboundFile[] | undefined }>;
+    beforeEach(async () => {
+      await getDb().run('DELETE FROM gws_ea_browser_watches');
+      await getDb().run('DELETE FROM gws_ea_browser_watch_job_claims');
+      // The principal who answers purchase cards, in their direct message.
+      await seedPrincipal();
+      await principalReachable();
+      cards = [];
+      setDeliveryAdapter({
+        async deliver(_type, _platformId, _thread, _kind, content, files) {
+          const card = JSON.parse(content) as Record<string, unknown>;
+          if (card.type === 'ask_question') cards.push({ card, files });
+          return `message-${cards.length}`;
+        },
+      });
+    });
+    it('books a free reservation with no card on file itself, with no card, as a money-less attempt (R3)', async () => {
+      fixtureState.selectedPayment = null;
+      fixtureState.details.user = { id: 72, payment_methods: [] };
+      // The booking sends this box's state, and Resy's reviewed record proves only a booking with it unticked.
+      fixtureState.extraTerms =
+        '<label><input type="checkbox" name="venue_marketing_opt_in" checked> Send me news and offers from L&#39;Artusi</label>';
+      await load();
+      expect(await purchase('free')).toMatchObject({ status: 'booked', order_number: '90123', repeat_safe: false });
+      expect(fixture.submitted()).toBe(1);
+      expect(cards).toEqual([]);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM pending_approvals')).toEqual({ count: 0 });
+      expect(
+        await getDb().all(
+          'SELECT site,platform,account_key,resolution,resolution_source,merchant_record_id FROM gws_ea_browser_free_attempts',
+        ),
+      ).toEqual([
+        {
+          site: 'resy.com',
+          platform: null,
+          // The reviewed merchant's account keys its reservation numbers, as a paid attempt's does.
+          account_key: 'resy:72',
+          resolution: 'committed',
+          resolution_source: 'page',
+          merchant_record_id: '90123',
+        },
+      ]);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_authorities')).toEqual({ count: 0 });
+    });
+    it('sends a card and presses nothing for a reservation with a card on file, or with a fee', async () => {
+      expect(await purchase('card-on-file')).toMatchObject({ status: 'awaiting_principal' });
+      fixtureState.policy = [
+        'We have a 24-hour cancellation/no-show policy of $25 per person for guests booking with us.',
+      ];
+      const inventory = fixtureState.inventory as {
+        results: { venues: Array<{ slots: Array<{ payment: Record<string, unknown> }> }> };
+      };
+      inventory.results.venues[0].slots[0].payment.cancellation_fee = 25;
+      fixtureState.details.cancellation = { fee: { amount: 25 }, display: { policy: fixtureState.policy } };
+      await load();
+      expect(await purchase('fee')).toMatchObject({ status: 'awaiting_principal' });
+      expect(fixture.submitted()).toBe(0);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_free_attempts')).toEqual({ count: 0 });
+      // Resy's checkout document holds a booking bearer the host tracks as a secret, so its reader places no
+      // picture: each card names one with none beside it, which the card says is unavailable (KTD6).
+      expect(await pageMayShowSecret(fixture.page)).toBe(true);
+      expect(cards.map(({ card, files }) => ({ pictures: card.pictures, files }))).toEqual([
+        { pictures: 1, files: undefined },
+        { pictures: 1, files: undefined },
+      ]);
+    });
+  });
 });

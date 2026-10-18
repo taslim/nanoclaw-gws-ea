@@ -172,13 +172,15 @@ export interface AuthenticatedSender {
 export interface OutboundFile {
   filename: string;
   data: Buffer;
+  /** Its MIME type, when the sender knows it; a platform that needs one infers it from the name otherwise. */
+  mimeType?: string;
 }
 
 /** Outbound message from host to adapter. */
 export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
-  files?: OutboundFile[]; // file attachments from the session outbox
+  files?: OutboundFile[]; // file attachments from the session outbox, or a host request's pictures
 }
 
 /** Discovered conversation info (from syncConversations). */

@@ -1,3 +1,9 @@
+import { zonedInstant } from './iso-time.js';
+import type { StructuredBrowserLocator } from './recipes.js';
+
+/** The generic signature's flow (KTD4): any checkout no reviewed signature reads. */
+export const GENERIC_FLOW_ID = 'generic-checkout-v1';
+
 export interface FinancialCommitment {
   kind: 'retail' | 'hold' | 'deposit' | 'prepayment' | 'conditional_fee' | 'trial' | 'subscription';
   terms: string;
@@ -20,11 +26,59 @@ export interface ReservationFacts {
   endAt: string;
   timeZone: string;
 }
+/** A booking as an unreviewed page states it (KTD21): each fact only when the host read it. */
+export interface GenericBookingFacts {
+  /** The venue's name as the page shows it. */
+  venue?: string;
+  partySize?: number;
+  /** The booking's start, when the page states it with its zone or UTC offset. */
+  at?: string;
+  /** The venue's clock: an IANA zone or a UTC offset. */
+  timeZone?: string;
+  /** The time as the page words it. */
+  timeText?: string;
+}
+/** The generic floor's own facts (KTD5). */
+export interface GenericCheckoutFacts {
+  /** The checkout origin's registrable domain where it is not the merchant's: a payment platform or booking frame (KTD7). */
+  platform?: string;
+  /** No account is signed in. */
+  guest: boolean;
+  /** The contact email, lowercased: also the account key an order number is unique within. */
+  contactEmail: string;
+  /** The items, as the page shows them. */
+  items: string[];
+  /** The saved payment method, as the page shows it. */
+  payment: string;
+  /** A note that rides along with the order or booking (R4). */
+  note?: string;
+  booking?: GenericBookingFacts;
+}
+/** What the host read of a free commit (KTD3): a booking or sign-up that states no money. */
+export interface FreeCommitFacts {
+  flowId: string;
+  /** The merchant (KTD7). */
+  site: string;
+  /** The checkout origin. */
+  origin: string;
+  platform?: string;
+  control: { label: string; locator: StructuredBrowserLocator };
+  /** The account as the page names it, or `guest checkout`. */
+  account: string;
+  guest: boolean;
+  items: string[];
+  contactEmail?: string;
+  note?: string;
+  booking?: GenericBookingFacts;
+}
 export interface PurchaseFacts {
   flowId: string;
+  /** The merchant: the registrable domain of the top-level page the job entered checkout from (KTD7). */
   site: string;
+  /** The checkout origin: the origin of the document the commit control is in. */
   origin: string;
-  control: { selector: string; label: string; formAction: string };
+  /** A reviewed flow's control by selector and form action; a generic one's by its structured locator. */
+  control: { selector?: string; label: string; formAction?: string; locator?: StructuredBrowserLocator };
   account: string;
   items: Array<{ id: string; title: string; quantity: number }>;
   currency: string;
@@ -38,11 +92,22 @@ export interface PurchaseFacts {
   reservation?: ReservationFacts;
   /** Explicit merchant evidence that a reservation has no financial commitment. Absence proves nothing. */
   noCommitmentTerms?: string;
+  /**
+   * Agreements beyond the site's own terms that the checkout's form carries, each by its frame origin and exact
+   * wording: approving the card agrees to each, standing on the site (KTD11). Absent when there are none.
+   */
+  agreements?: Array<{ origin: string; wording: string }>;
+  /** Paid extras the site keeps selected after the host unticked them: charges the card names. Absent when none. */
+  addOns?: string[];
+  /** The generic floor's own facts; present only on an unreviewed checkout. */
+  generic?: GenericCheckoutFacts;
 }
 export interface PurchaseBounds {
   reservation?: { venueId: string; partySize: number; windowStart: string; windowEnd: string };
   deliveryWindow?: { start: string; end: string };
   neededBy?: string;
+  /** The principal's clock when the needed-by was set: a quoted delivery date is a day on it. */
+  principalTimeZone?: string;
 }
 
 const currencies = new Set(Intl.supportedValuesOf('currency'));
@@ -74,13 +139,87 @@ export function moneyMinor(value: string): number | undefined {
   if (!match) return undefined;
   return amountMinor(match[1].replaceAll(',', ''), 'USD');
 }
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+/** A venue as a delegated bound and a page both name it: case, spacing and apostrophes aside. */
+export function venueKey(venue: string): string {
+  return venue.normalize('NFKC').replace(/[’‘]/gu, "'").replace(/\s+/gu, ' ').trim().toLowerCase();
+}
+
+/**
+ * The reservation a purchase books, for the delegated bounds and the standing guarantee (KTD21): a reviewed
+ * signature's, or a generic booking whose venue, party size and time the host read. Undefined otherwise.
+ */
+export function bookedReservation(
+  facts: PurchaseFacts,
+): { venueId: string; partySize: number; at: string } | undefined {
+  if (facts.reservation) return facts.reservation;
+  const booking = facts.generic?.booking;
+  return booking?.venue && booking.partySize !== undefined && booking.at
+    ? { venueId: booking.venue, partySize: booking.partySize, at: booking.at }
+    : undefined;
+}
+
+/** Whether a booked reservation falls within main's recorded bounds. */
+export function withinReservationBounds(
+  reservation: { venueId: string; partySize: number; at: string } | undefined,
+  bounds: NonNullable<PurchaseBounds['reservation']>,
+): boolean {
+  return Boolean(
+    reservation &&
+    venueKey(reservation.venueId) === venueKey(bounds.venueId) &&
+    reservation.partySize === bounds.partySize &&
+    Date.parse(reservation.at) >= Date.parse(bounds.windowStart) &&
+    Date.parse(reservation.at) <= Date.parse(bounds.windowEnd),
+  );
+}
+
+/**
+ * The generic floor's material change (KTD5): a total or due-now increase, the currency, the items, the payment
+ * method, the terms, the contact email, the note, the checkout origin, the booking and the consent facts. The
+ * commit label is not one: a checkout's next step names its own. Volatile text never reaches these facts.
+ */
+function genericMaterialChange(
+  approved: PurchaseFacts,
+  current: PurchaseFacts,
+  bounds: PurchaseBounds,
+): string | undefined {
+  if (approved.flowId !== current.flowId || !approved.generic || !current.generic) return 'The merchant flow changed.';
+  if (approved.currency !== current.currency) return 'The currency changed.';
+  if (current.totalMinor > approved.totalMinor)
+    return `The total rose to ${formatMoney(current.totalMinor, current.currency)}, from ${formatMoney(approved.totalMinor, approved.currency)}.`;
+  if (current.dueNowMinor > approved.dueNowMinor)
+    return `The amount due now rose to ${formatMoney(current.dueNowMinor, current.currency)}, from ${formatMoney(approved.dueNowMinor, approved.currency)}.`;
+  for (const [changed, label] of [
+    [approved.site !== current.site, 'site'],
+    [approved.origin !== current.origin, 'checkout origin'],
+    [!same(approved.generic.items, current.generic.items), 'items'],
+    [
+      approved.generic.payment !== current.generic.payment || approved.cardEnding !== current.cardEnding,
+      'payment method',
+    ],
+    [!same(approved.commitments, current.commitments), 'financial terms'],
+    [approved.generic.contactEmail !== current.generic.contactEmail, 'contact email'],
+    [approved.generic.note !== current.generic.note, 'note'],
+    [!same(approved.agreements, current.agreements), 'agreements'],
+    [!same(approved.addOns, current.addOns), 'extra charges'],
+  ] as const)
+    if (changed) return `The ${label} changed.`;
+  if (bounds.reservation) {
+    if (!withinReservationBounds(bookedReservation(current), bounds.reservation))
+      return 'The reservation is outside the delegated bounds.';
+  } else if (!same(approved.generic.booking, current.generic.booking)) return 'The booking changed.';
+  return undefined;
+}
+
 /** Compare material facts, never a byte hash: ordinary retail due-now tracks a falling total. */
 export function materialPurchaseChange(
   approved: PurchaseFacts,
   current: PurchaseFacts,
   bounds: PurchaseBounds,
 ): string | undefined {
-  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+  if (approved.flowId === GENERIC_FLOW_ID || current.flowId === GENERIC_FLOW_ID)
+    return genericMaterialChange(approved, current, bounds);
   if (approved.currency !== current.currency) return 'The currency changed.';
   if (current.totalMinor > approved.totalMinor)
     return `The total rose to ${formatMoney(current.totalMinor, current.currency)}, from ${formatMoney(approved.totalMinor, approved.currency)}.`;
@@ -95,6 +234,8 @@ export function materialPurchaseChange(
     ['address', 'address'],
     ['commitments', 'financial terms'],
     ['noCommitmentTerms', 'financial terms'],
+    ['agreements', 'agreements'],
+    ['addOns', 'extra charges'],
   ] as const)
     if (!same(approved[key], current[key])) return `The ${label} changed.`;
   if (bounds.reservation) {
@@ -123,7 +264,10 @@ export function materialPurchaseChange(
         return 'The delivery date is outside the approved window.';
     } else if (!bounds.neededBy && approved.delivery && date > approved.delivery.date)
       return 'The delivery date is later than the approved date.';
-    if (bounds.neededBy && `${date}T23:59:59.999Z` > bounds.neededBy)
+    if (
+      bounds.neededBy &&
+      !(zonedInstant(`${date}T23:59:59.999`, bounds.principalTimeZone ?? 'UTC') <= Date.parse(bounds.neededBy))
+    )
       return 'Delivery misses the approved needed-by deadline.';
   } else if (bounds.deliveryWindow || bounds.neededBy) return 'The delivery date is unavailable.';
   return undefined;
@@ -160,13 +304,43 @@ export function isFreeReservation(facts: PurchaseFacts): boolean {
     facts.totalMinor === 0 &&
     facts.dueNowMinor === 0 &&
     facts.commitments.length === 0 &&
+    !facts.addOns?.length &&
     facts.cardEnding === null &&
     facts.noCommitmentTerms?.trim(),
   );
 }
 
-/** Complete host facts are mandatory even for a zero-due-now commitment. */
+/** An email address, whole. */
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
+
+/**
+ * The generic floor (KTD5): the merchant and checkout origin, the commit label and locator, the total, currency
+ * and amount due now, the saved payment method, the contact email, the items, and every term readable. No
+ * address, item id or form action is required.
+ */
+function completeGenericFacts(facts: PurchaseFacts): boolean {
+  const generic = facts.generic;
+  if (!generic || !facts.site || !facts.origin || !facts.account || !facts.control.label || !facts.control.locator)
+    return false;
+  if (!generic.items.length || !generic.items.every((item) => item.trim()) || !generic.payment.trim()) return false;
+  if (!EMAIL.test(generic.contactEmail) || generic.contactEmail !== generic.contactEmail.toLowerCase()) return false;
+  if (currencyExponent(facts.currency) === undefined) return false;
+  if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
+  if (facts.cardEnding !== null && !/^\d{4}$/u.test(facts.cardEnding)) return false;
+  return facts.commitments.every(
+    (term) =>
+      term.terms.trim() &&
+      term.amountMinor !== undefined &&
+      Number.isSafeInteger(term.amountMinor) &&
+      term.amountMinor >= 0 &&
+      ((term.kind !== 'subscription' && term.kind !== 'trial') || Boolean(term.frequency)) &&
+      (term.kind !== 'trial' || (term.conversionAt !== undefined && Number.isFinite(Date.parse(term.conversionAt)))),
+  );
+}
+
+/** Complete host facts are mandatory even for a zero-due-now commitment. Each signature has its own floor. */
 export function completePurchaseFacts(facts: PurchaseFacts): boolean {
+  if (facts.flowId === GENERIC_FLOW_ID) return completeGenericFacts(facts);
   if (!facts.items.length || !facts.account || currencyExponent(facts.currency) === undefined) return false;
   if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
   if (!facts.control.label || !facts.control.selector || !facts.control.formAction) return false;

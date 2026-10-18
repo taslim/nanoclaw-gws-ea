@@ -1,6 +1,8 @@
 import { getDb } from '../../db/connection.js';
 import type { MailboxSession } from '../../mailbox/types.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
+import { errandSource, hasBrowserAccess } from './access.js';
+import { OPERATIONAL_CODES } from './operational-codes.js';
 
 /** Metadata only. This boundary deliberately does not expose browser or mailbox content. */
 export interface BrowserEvidence {
@@ -90,105 +92,20 @@ const ACTIONS = new Set([
   'watch',
   'list_watches',
   'cancel_watch',
+  'request_consent',
   'browser_watch_book',
   'browser_purchase_commit',
   'browser_relay_sign_in',
 ]);
-const OPERATIONAL_CODES = new Set([
-  'completed',
-  'stopped',
-  'not_executed',
-  'error',
-  'stale_ref',
-  'not_actionable',
-  'timeout',
-  'navigated',
-  'purchase_control',
-  'speaks_as_principal',
-  'account_security',
-  'secret_field',
-  'blocked_address',
-  'challenge',
-  'sign_in_wall',
-  'site_busy',
-  'unsupported_merchant',
-  'window_closed',
-  'browser_unavailable',
-  'interrupted',
-  'outcome_unknown',
-  'awaiting_principal',
-  'withdrawn',
-  'approved',
-  'rejected',
-  'expired',
-  'superseded',
-  'terms_unavailable',
-  'checkout_lapsed',
-  'not_a_purchase',
-  'site_purchase_blocked',
-  'outside_bounds',
-  'authority_unavailable',
-  'changed',
-  'purchase_blocked',
-  'inconclusive',
-  'committed',
-  'not_committed',
-  'placed',
-  'booked',
-  'submitted',
-  'cleared_after_submit',
-  'origin_mismatch',
-  'no_item_for_site',
-  'vault_unavailable',
-  'rate_limited',
-  'awaiting_code',
-  'nothing_arrived',
-  'ambiguous',
-  'link_opened',
-  'code_filled',
-  'no_wait',
-  'saved',
-  'checkpoint_failed',
-  'reached_commit_point',
-  'armed',
-  'checking',
-  'preparing',
-  'booking',
-  'blocked',
-  'cancelled',
-  'in_progress',
-  'calendar_conflict',
-  'calendar_unavailable',
-  'available',
+const CHECK_OUTCOMES = new Set([
   'ready',
+  'region_read',
+  'region_missing',
+  'blocked',
   'failed',
-  'unavailable',
-  'continued',
-  'account_created',
-  'password_changed',
-  'account_exists',
-  'password_rejected',
-  'current_password_rejected',
-  'verification_requested',
-  'not_owned',
-  'refused',
-  'no_authority',
-  'unsupported_form',
-  'form_changed',
-  'unsupported_control',
-  'login_changed',
-  'unsupported_flow',
-  'no_secret_fields',
-  'invalid_request',
-  'not_configured',
-  'unknown-command',
-  'invalid-args',
-  'forbidden',
-  'approval-pending',
-  'handler-error',
-  'transport-error',
+  'site_busy',
+  'interrupted',
 ]);
-const CHECK_OUTCOMES = new Set(['ready', 'blocked', 'failed', 'site_busy', 'interrupted']);
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -246,12 +163,15 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
             s.agent_group_id AS browser_agent_group_id
        FROM gws_ea_browser_jobs j
        JOIN sessions s ON s.id=j.browser_session_id AND s.thread_id=j.thread_id
-       JOIN gws_ea_profile p ON p.singleton=1 AND p.main_agent_group_id=j.source_agent_group_id
-                               AND p.browser_agent_group_id=s.agent_group_id
+       JOIN gws_ea_profile p ON p.singleton=1 AND p.browser_agent_group_id=s.agent_group_id
       WHERE j.id=? AND j.id=j.thread_id AND s.status='active' AND s.messaging_group_id IS NULL`,
     thread,
   );
-  if (!job || !job.thread_id.startsWith(`system:a2a:${job.source_agent_group_id}:`))
+  if (
+    !job ||
+    errandSource(job.thread_id) !== job.source_agent_group_id ||
+    !(await hasBrowserAccess(job.source_agent_group_id))
+  )
     throw new Error('Browser job not found');
   const [requests, downloads, watchChecks, openCards, attempts, nextWatch] = await Promise.all([
     db.all<EvidenceRequest>(

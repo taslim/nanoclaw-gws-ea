@@ -347,7 +347,7 @@ export class BrowserQueue {
       await this.finish(
         started,
         controller.signal.aborted && latest?.commit_started_at
-          ? stopped('outcome_unknown', false)
+          ? stopped('unconfirmed', false)
           : won
             ? result
             : ((await actions.get(request.action)?.recover?.(started)) ?? result),
@@ -357,7 +357,7 @@ export class BrowserQueue {
       await this.finish(
         started,
         latest?.commit_started_at
-          ? stopped('outcome_unknown', false)
+          ? stopped('unconfirmed', false)
           : error instanceof ActionRefusal
             ? error
             : ((await actions.get(request.action)?.recover?.(started)) ?? stopped('browser_unavailable', false)),
@@ -400,11 +400,11 @@ export class BrowserQueue {
 
   /**
    * The answer for a request its worker can no longer answer from its own
-   * result: uncertain after a purchase commit marker, else the action's own
+   * result: unconfirmed after a purchase commit marker, else the action's own
    * recorded outcome, else interrupted.
    */
   async interruptedAnswer(request: BrowserRequest, repeatSafe: boolean): Promise<Record<string, unknown>> {
-    if (request.commit_started_at) return stopped('outcome_unknown', false);
+    if (request.commit_started_at) return stopped('unconfirmed', false);
     return (await actions.get(request.action)?.recover?.(request)) ?? stopped('interrupted', repeatSafe);
   }
 
@@ -438,7 +438,7 @@ export class BrowserQueue {
     if (
       latest.commit_started_at &&
       !(result instanceof ActionRefusal) &&
-      (result.status === 'outcome_unknown' || result.reason === 'outcome_unknown')
+      (result.status === 'unconfirmed' || result.reason === 'unconfirmed')
     ) {
       const { recordUnknownBrowserPurchaseRequest } = await import('./purchase.js');
       await recordUnknownBrowserPurchaseRequest(request.id);
@@ -483,9 +483,10 @@ export class BrowserQueue {
     for (const request of await this.store.pending()) this.wake(request.job_id);
   }
 
-  /** Call after the cancellation transaction, outside every DB lock. */
-  async interruptJob(jobId: string): Promise<void> {
+  /** Call after the cancellation transaction, outside every DB lock. `running` answers for itself. */
+  async interruptJob(jobId: string, running?: string): Promise<void> {
     for (const request of await this.store.pending(jobId)) {
+      if (request.id === running) continue;
       this.running.get(request.id)?.abort('interrupted');
       await this.runtime.closeJob(jobId).catch(() => undefined);
       await this.finish(request, await this.interruptedAnswer(request, !request.started_at));

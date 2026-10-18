@@ -30,7 +30,7 @@
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import type { Frame, Page } from 'playwright-core';
+import type { ElementHandle, Frame, Page } from 'playwright-core';
 
 import { ActionRefusal, answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
@@ -41,7 +41,8 @@ import type { Session } from '../../types.js';
 import { DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import type { ApprovalHandlerContext } from '../approvals/primitive.js';
-import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 import {
   credentialFieldFits,
   httpsOrigin,
@@ -68,11 +69,10 @@ import {
   classifyCredentialActivation,
   classifyCredentialNavigation,
   ensureBrowserNavigationGuard,
-  readControlFacts,
-  termsConsentLabel,
   withBrowserJobNavigation,
-  type ActivationClass,
+  type CredentialActivationClass,
 } from './commit-classifier.js';
+import { runConsentPass } from './consent.js';
 import type { BrowserRequest } from './db.js';
 import {
   CredentialAttemptError,
@@ -108,6 +108,7 @@ import {
   openVerificationLink,
   takeSignupVerification,
 } from './sign-in-mail.js';
+import { signupAccountStop } from './web-address.js';
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
@@ -149,20 +150,21 @@ function vaultOutcome(reason: BrowserVaultReason): Outcome {
 }
 
 /**
- * Canonical main records the principal's delegation of one signup or one
- * password change for an exact job, site and account. A change binds the
- * Login this host saved for that site and username, checked fresh against
- * its ownership record (R18); any other Login, an edited one, or an account
- * with no saved Login is refused here, before the browser can act. Sign-in
- * email, phone, two-factor and payment-method changes have no operation.
+ * An agent with browser access records the principal's delegation of one
+ * signup or one password change for an exact job of its own, site and
+ * account. A change binds the Login this host saved for that site and
+ * username, checked fresh against its ownership record (R18); any other
+ * Login, an edited one, or an account with no saved Login is refused here,
+ * before the browser can act. Sign-in email, phone, two-factor and
+ * payment-method changes have no operation.
  */
 export async function credentialAuthorityRequest(
   content: Record<string, unknown>,
   session: Session,
   dependencies: CredentialOperationDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<Outcome> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may delegate an account signup or password change.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may delegate an account signup or password change.');
   if (Object.keys(content).some((key) => !AUTHORITY_FIELDS.has(key)))
     throw invalidArgs('Unknown credential_authority field.');
   if (content.operation === 'release') return credentialReleaseRequest(content, session, dependencies);
@@ -180,7 +182,7 @@ export async function credentialAuthorityRequest(
   const origin = httpsOrigin(site)?.origin;
   const domain = origin && registrableDomain(origin);
   if (!origin || !domain) throw invalidArgs('The site must be a public HTTPS address.');
-  const job = await resolveBrowserJob(thread);
+  const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
   const cancelling =
     job &&
     (await getDb().get<{ cancel_requested: number }>(
@@ -188,7 +190,7 @@ export async function credentialAuthorityRequest(
       job.id,
     ));
   if (!job || job.cancelled || cancelling?.cancel_requested)
-    throw forbidden('No live main-owned browser job exists for that thread.');
+    throw forbidden('No live browser job of yours exists for that thread.');
   const kind: CredentialKind = operation === 'signup' ? 'signup' : 'rotation';
   const { attempts } = dependencies;
   const unresolved = await attempts.unresolved();
@@ -202,6 +204,9 @@ export async function credentialAuthorityRequest(
   );
   if (open) return recorded(open, job.thread_id);
   if (kind === 'signup') {
+    // The account is the assistant's own, under its web address (KTD14).
+    const stop = await signupAccountStop(username);
+    if (stop) return { status: stop };
     // A signup that may have reached the site is settled through its own job, never retried (KTD8).
     if (
       unresolved.some(
@@ -249,8 +254,8 @@ export const credentialReleaseGuard = defineGuardedAction({
   grantActionName: CREDENTIAL_RELEASE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor, payload }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may ask the principal to release a credential attempt.');
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+      return DENY('Only an agent with browser access may ask the principal to release a credential attempt.');
     const attempt = typeof payload.attemptId === 'string' ? await credentialAttempts.get(payload.attemptId) : undefined;
     if (!attempt || attempt.job_id !== payload.jobId || !RELEASABLE_PHASES.includes(attempt.phase))
       return DENY('That credential attempt is settled, or its own step settles it.');
@@ -392,8 +397,8 @@ async function credentialReleaseRequest(
     content.username !== undefined
   )
     throw invalidArgs('release needs only the job thread and the credential authority it recorded.');
-  const job = await resolveBrowserJob(thread);
-  if (!job) throw forbidden('No main-owned browser job exists for that thread.');
+  const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
+  if (!job) throw forbidden('No browser job of yours exists for that thread.');
   const found = await attempts.get(authority);
   if (!found || found.job_id !== job.id || !RELEASABLE_PHASES.includes(found.phase))
     return { status: 'not_releasable' };
@@ -574,7 +579,7 @@ export function registerCredentialAuthorityDelivery(
 
 const ROLES: readonly CredentialFormField[] = ['username', 'current_password', 'new_password', 'confirmation'];
 const REQUEST_FIELDS = ['action', 'requestId', 'budget_ms', 'authority', 'operation'];
-const FORM_FIELDS: ReadonlySet<string> = new Set([...REQUEST_FIELDS, 'activate', 'accept_terms', ...ROLES]);
+const FORM_FIELDS: ReadonlySet<string> = new Set([...REQUEST_FIELDS, 'activate', ...ROLES]);
 const VERIFY_FIELDS: ReadonlySet<string> = new Set([...REQUEST_FIELDS, 'code_field', 'activate']);
 const RECONCILE_FIELDS: ReadonlySet<string> = new Set(REQUEST_FIELDS);
 const AUTHORITY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -587,8 +592,6 @@ export interface CredentialSubmitPayload extends Record<string, unknown> {
   current_password?: BrowserRef;
   new_password?: BrowserRef;
   confirmation?: BrowserRef;
-  /** A signup's required terms-of-service checkbox in the same form. */
-  accept_terms?: BrowserRef;
   activate: BrowserRef;
 }
 /** A signup's email verification: the code field and its control when the site asks for a code. */
@@ -640,9 +643,8 @@ export function validateCredentialForm(content: Record<string, unknown>): Creden
   }
   const payload: CredentialSubmitPayload = { authority, activate: readBrowserRef(content.activate, REF_MESSAGE) };
   for (const role of ROLES) if (content[role] !== undefined) payload[role] = readBrowserRef(content[role], REF_MESSAGE);
-  if (content.accept_terms !== undefined) payload.accept_terms = readBrowserRef(content.accept_terms, REF_MESSAGE);
   const named = ROLES.flatMap((role) => payload[role]?.ref ?? []);
-  const refs = [...named, ...(payload.accept_terms ? [payload.accept_terms.ref] : []), payload.activate.ref];
+  const refs = [...named, payload.activate.ref];
   if (
     named.length < 1 ||
     new Set(refs).size !== refs.length ||
@@ -727,8 +729,8 @@ export async function executeCredentialForm(
   }
   if (attempt.kind === 'signup' && payload.current_password)
     throw invalidArgs('A signup has no current password to fill.');
-  if (attempt.kind === 'rotation' && (!payload.new_password || payload.username || payload.accept_terms))
-    throw invalidArgs('A password change fills the current and new password fields, never a username or terms.');
+  if (attempt.kind === 'rotation' && (!payload.new_password || payload.username))
+    throw invalidArgs('A password change fills the current and new password fields, never a username.');
   const settled = await settledOutcome(attempt, attempts, context.assertActive);
   if (settled) return settled;
   return onSitePage(context, (page) => runStep(context, page, attempt, payload, attempts));
@@ -752,17 +754,15 @@ type StepRefusal =
   | 'not_actionable'
   | 'origin_mismatch'
   | 'unsupported_form'
-  | 'unsupported_terms'
   | 'form_changed'
-  | 'unsupported_control'
-  | Exclude<ActivationClass, 'ordinary' | 'unsupported_merchant'>;
+  | Exclude<CredentialActivationClass, 'ordinary'>;
 class StepStop extends Error {
   constructor(readonly reason: StepRefusal) {
     super(reason);
   }
 }
-const stopFor = (classification: Exclude<ActivationClass, 'ordinary'>): StepStop =>
-  new StepStop(classification === 'unsupported_merchant' ? 'unsupported_control' : classification);
+const stopFor = (classification: Exclude<CredentialActivationClass, 'ordinary'>): StepStop =>
+  new StepStop(classification);
 
 /** A field the host fills: one of the account's, or the code a signup's verification email carried. */
 type FieldRole = CredentialFormField | 'code';
@@ -775,10 +775,9 @@ interface BoundField {
   readonly pinned: PinnedBrowserRef;
   readonly binding: NativeCredentialBinding;
 }
-/** What else a binding covers: the step it submits, and a signup's terms checkbox. */
+/** The step a binding submits. */
 interface BindingScope {
   readonly step: 'credentials' | 'verification';
-  readonly terms?: BrowserRef;
 }
 const fieldsOf = (payload: CredentialSubmitPayload): ChosenField[] =>
   ROLES.flatMap((role) => {
@@ -791,6 +790,8 @@ interface CredentialGroup {
   readonly frame: Frame;
   readonly fields: readonly BoundField[];
   readonly native: NativeCredentialGroup;
+  /** The activation control's own handle, whose form the consent engine reads before each submission. */
+  readonly element: ElementHandle;
 }
 
 const FINANCIAL_FIELD = /(?:cc-|credit.?card|card.?number|cvc|cvv|iban|routing)/iu;
@@ -927,8 +928,6 @@ async function bindGroup(
     if (attempt.kind === 'signup' && others?.some((field) => namesAccount(field) && field.holds === 'other'))
       throw new StepStop('unsupported_form');
   }
-  const terms =
-    scope.terms && (await bindTerms(page, attempt, pinned(scope.terms), controlBinding, form, origin.origin));
   const activation = await classifyCredentialActivation(page, control.element, attempt.kind, attempt.site, {
     formControl: controlBinding.formBackendNodeId === form,
     step: scope.step,
@@ -936,40 +935,32 @@ async function bindGroup(
   if (activation !== 'ordinary') throw stopFor(activation);
   return {
     ...group,
-    native: { fields: fields.map((field) => field.binding), control: controlBinding, ...(terms ? { terms } : {}) },
+    native: { fields: fields.map((field) => field.binding), control: controlBinding },
+    element: control.element,
   };
 }
 
 /**
- * A signup's terms checkbox, which the host alone checks just before the
- * activation: a required box in the same form, frame and document, named for
- * the site's terms of service, terms and conditions, user agreement or
- * privacy policy alone. Marketing, data sharing and money terms are refused.
+ * The consent engine's check before a credential submission (KTD11): it accepts the site's own terms, opts
+ * out of marketing and stops for any other agreement. An outcome only when the submission must not go ahead.
  */
-async function bindTerms(
+async function consentStop(
+  context: BrowserExecutionContext,
   page: Page,
-  attempt: CredentialAttempt,
-  box: PinnedBrowserRef,
-  control: NativeCredentialBinding,
-  form: number | null,
-  origin: string,
-): Promise<NativeCredentialBinding> {
-  if (attempt.kind !== 'signup' || (await box.element.ownerFrame()) !== box.frame)
-    throw new StepStop('unsupported_terms');
-  const binding = await inspectNativeCredentialControl(box.element, box.frame);
-  if (
-    !binding ||
-    binding.frameId !== control.frameId ||
-    binding.loaderId !== control.loaderId ||
-    binding.formBackendNodeId !== form ||
-    binding.facts.origin !== origin ||
-    binding.facts.tag !== 'INPUT' ||
-    binding.facts.type !== 'checkbox' ||
-    !binding.facts.required ||
-    !termsConsentLabel((await readControlFacts(page, box.element)).name)
-  )
-    throw new StepStop('unsupported_terms');
-  return binding;
+  group: CredentialGroup,
+): Promise<Outcome | undefined> {
+  const consent = await runConsentPass(page, group.element, {
+    scope: { jobId: context.job.id, db: context.store.db },
+    assertActive: context.assertActive,
+  });
+  switch (consent.status) {
+    case 'ready':
+      return undefined;
+    case 'consent_required':
+      return { ...refused('consent_required'), consent: consent.stops };
+    case 'add_on':
+      return refused('purchase_control');
+  }
 }
 
 /** Nothing the browser chose may move between the binding and the disclosure; enabling a control is not a move. */
@@ -1148,13 +1139,16 @@ async function runStep(
 ): Promise<Outcome> {
   await context.assertActive();
   const fields = fieldsOf(payload);
-  const scope: BindingScope = { step: 'credentials', ...(payload.accept_terms ? { terms: payload.accept_terms } : {}) };
-  const chosen = [...fields.map((field) => field.ref), ...(scope.terms ? [scope.terms] : []), payload.activate];
+  const scope: BindingScope = { step: 'credentials' };
+  const chosen = [...fields.map((field) => field.ref), payload.activate];
   return boundStep(page, chosen, async (refs) => {
     const bind = (current: CredentialAttempt): Promise<CredentialGroup> =>
       bindGroup(page, current, fields, payload.activate, refs, scope);
     const group = await bind(attempt);
     await leaseSite(context, group);
+    // The form's choices are made, or stopped for, before anything is saved or disclosed.
+    const stopped = await consentStop(context, page, group);
+    if (stopped) return stopped;
     // Only a new password is a disclosure; a username-only step of a multi-step signup reveals nothing.
     return payload.new_password
       ? await disclosingStep(context, page, attempt, bind, group, attempts)
@@ -1215,6 +1209,9 @@ async function usernameStep(
   await context.assertActive();
   const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
   if (filled === 'not_inserted') return refused('form_changed');
+  // The check again just before the press: a controlled form may have reset a choice as it took the values.
+  const stopped = await consentStop(context, page, group);
+  if (stopped) return stopped;
   return activateWithin(context, page, group, values, [], async (activation) => {
     if (activation === 'uncertain') return { status: 'outcome_unknown' };
     if (activation !== 'activated') return refused('form_changed');
@@ -1401,6 +1398,13 @@ async function disclosingStep(
       // Proven: nothing reached the page, so no website could have acted on it.
       await rejectExposed(attempts, saved.id, evidence('none', filled, 'none'));
       return refused('form_changed');
+    }
+    // The check again just before the press. The values are in the page by now, so a stop here leaves the
+    // attempt unknown, as any activation that did not run does.
+    const stopped = await consentStop(context, page, group);
+    if (stopped) {
+      await settle(() => attempts.markUnknown(saved.id, evidence('consent', filled, 'none')));
+      return { ...stopped, status: 'outcome_unknown' };
     }
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
       if (activation === 'activated') await attempts.markAwaitingVerification(saved.id);
@@ -1639,7 +1643,10 @@ async function verify(
         step: 'verification',
       });
       await leaseSite(context, group);
-      return enterCode(context, page, attempt, group, reply.value, attempts);
+      // The answer stays for the next verify when the form's choices stop the code's submission.
+      return (
+        (await consentStop(context, page, group)) ?? enterCode(context, page, attempt, group, reply.value, attempts)
+      );
     }),
   );
 }

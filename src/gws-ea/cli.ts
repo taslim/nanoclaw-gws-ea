@@ -6,11 +6,14 @@ import {
   voiceCapabilityNextActions,
   browserCapabilityCatalog,
 } from './capabilities.js';
+import { aliasDecision, type AliasDecision } from './alias.js';
 import {
+  browserAccessLine,
   browserCapabilityLines,
   browserCapabilityNextActions,
+  browserAliasNextActions,
   disableBrowserCapability,
-  enableBrowserCapability,
+  enableBrowserWithAlias,
   inspectBrowserCapability,
   type BrowserCapabilityInspection,
   type BrowserCapabilityObservation,
@@ -255,6 +258,7 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
+  /** How the browser commands reach Chrome and the assistant's host, its web alias step included; tests substitute it. */
   browserInspection?: BrowserCapabilityInspection;
   /** How the 1Password CLI is found and run; tests substitute the runner. */
   onePassword?: OnePasswordCliSeams;
@@ -352,6 +356,15 @@ function nextActionLines(actions: readonly NextAction[]): string[] {
       ? action.instruction
       : `Next: ${action.argv.map((value) => (/^[a-zA-Z0-9_-]+$/u.test(value) ? value : shellQuote(value))).join(' ')}`,
   );
+}
+
+/** The web alias decision `--alias-added`, `--alias-taken` and `--alias <name>` make (KTD13). */
+function aliasDecisionOf(options: CommandOptions): AliasDecision | undefined {
+  return aliasDecision({
+    added: options['alias-added'] === 'true',
+    taken: options['alias-taken'] === 'true',
+    name: options.alias,
+  });
 }
 
 /** `--billing-account`: the billing account a pause offered, as Google names it. */
@@ -558,6 +571,7 @@ class Cli {
       case 'resume': {
         const instanceId = targetInstance(options);
         const billingAccount = parseBillingAccount(options['billing-account']);
+        const alias = aliasDecisionOf(options);
         return () =>
           this.#attempt({
             command,
@@ -567,6 +581,7 @@ class Cli {
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
               ...(billingAccount ? { billingAccount } : {}),
+              ...(alias ? { alias } : {}),
               ...(options['google-client-file']
                 ? { googleClientFile: path.resolve(options['google-client-file']) }
                 : {}),
@@ -2458,7 +2473,49 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
           }
           if (command === 'enable') {
-            data = await enableBrowserCapability(paths, instanceId, dependencies);
+            const agentGroupIds = invocation.repeated['agent-group'] ?? [];
+            if (agentGroupIds.length > 0 && options['main-only'] === 'true')
+              throw new GwsEaError('invalid_arguments', 'Use --agent-group or --main-only, not both.');
+            const decision = aliasDecisionOf(options);
+            const enabled = await enableBrowserWithAlias(
+              paths,
+              instanceId,
+              {
+                ...dependencies,
+                ncl: runtime.browserInspection?.ncl,
+                alias: { decision },
+                emit: (event) => presenter.event(event),
+              },
+              agentGroupIds.length > 0
+                ? { kind: 'agent_groups', agentGroupIds }
+                : options['main-only'] === 'true'
+                  ? { kind: 'main' }
+                  : undefined,
+            );
+            data = enabled;
+            if (enabled.pause) {
+              const pause = enabled.pause;
+              const next = browserAliasNextActions(instanceId, pause);
+              presenter.report({
+                outcome: 'paused',
+                headline: `Browser enabled for assistant ${instanceId}; its web alias waits: ${pause.message}`,
+                details: [
+                  ...(pause.details ?? []).map((detail) => `  ${detail}`),
+                  ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
+                  ...nextActionLines(next.filter((action) => action.kind === 'command')),
+                ],
+              });
+              emitResult(
+                managedResult(invocation.definition.path.join(' '), {
+                  outcome: 'paused',
+                  changed,
+                  data,
+                  error: new GwsEaError(pause.code, pause.message),
+                  next_actions: next,
+                }),
+              );
+              return EXIT_CODES.paused;
+            }
           } else if (command === 'disable') {
             data = await disableBrowserCapability(paths, instanceId, dependencies);
           } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
@@ -2466,7 +2523,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           presenter.report({
             outcome: 'ready',
             headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
-            details: nextActionLines(actions),
+            details: [`Access: ${browserAccessLine(data.access)}.`, ...nextActionLines(actions)],
           });
           emitResult(
             managedResult(invocation.definition.path.join(' '), {

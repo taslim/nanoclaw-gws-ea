@@ -5,7 +5,12 @@
  */
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
-import { getGwsEaProfile, loadPrincipalRecognizer, type GwsEaProfile } from '../gws-ea-profile/db.js';
+import {
+  assistantOwnAddresses,
+  getGwsEaProfile,
+  loadPrincipalRecognizer,
+  type GwsEaProfile,
+} from '../gws-ea-profile/db.js';
 import type { GmailApi } from './gmail-api.js';
 import { threadAddresses } from './thread-map.js';
 
@@ -41,16 +46,21 @@ export function activeInbox(): InboxRuntime | undefined {
   return active;
 }
 
-/** The assistant's own addresses: never a recipient, and never "someone else" on a message. */
+/**
+ * The assistant's own addresses: never a recipient, and never "someone else"
+ * on a message. Its web alias is one of them (KTD14), so mail to it routes
+ * as mail to the assistant does, with no route of its own.
+ */
 export async function assistantAddresses(): Promise<ReadonlySet<string>> {
   return assistantAddressesOf((await getDb().hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined);
 }
 
-/** The assistant's own addresses, from a profile already read: the one it names, and the one Gmail reported. */
+/**
+ * The assistant's own addresses, from a profile already read: the ones it
+ * names (its Workspace email and its web alias), and the one Gmail reported.
+ */
 export function assistantAddressesOf(profile: GwsEaProfile | undefined): ReadonlySet<string> {
-  const addresses = new Set<string>();
-  const email = profile?.assistant_workspace_email;
-  if (email) addresses.add(email.toLowerCase());
+  const addresses = new Set(assistantOwnAddresses(profile).map((address) => address.toLowerCase()));
   const known = active?.knownGmailAddress();
   if (known) addresses.add(known.toLowerCase());
   return addresses;

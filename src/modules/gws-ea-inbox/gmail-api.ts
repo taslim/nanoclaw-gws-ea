@@ -120,7 +120,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * a write applies only to the version of the resource that etag names, and
  * Google refuses it with 412 when the resource has changed since. With
  * `signal`, the call ends when it aborts instead of after 30 seconds, as a
- * long-poll that Google may hold open longer needs.
+ * long-poll that Google may hold open longer needs. With `content`, the
+ * request sends those bytes as they are, under their own type, in place of
+ * a JSON `body`: an upload's.
  */
 export async function googleJson(
   options: GoogleClientOptions,
@@ -128,6 +130,7 @@ export async function googleJson(
   init: {
     readonly method?: string;
     readonly body?: unknown;
+    readonly content?: { readonly type: string; readonly data: Uint8Array };
     readonly allowNotFound?: boolean;
     readonly ifMatch?: string;
     readonly signal?: AbortSignal;
@@ -135,16 +138,19 @@ export async function googleJson(
 ): Promise<unknown> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const token = await options.token();
+  const sent =
+    init.content ??
+    (init.body === undefined ? undefined : { type: 'application/json', data: JSON.stringify(init.body) });
   let response: Response;
   try {
     response = await fetchImpl(url, {
       method: init.method ?? 'GET',
       headers: {
         authorization: `Bearer ${token}`,
-        ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(sent === undefined ? {} : { 'content-type': sent.type }),
         ...(init.ifMatch === undefined ? {} : { 'if-match': init.ifMatch }),
       },
-      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      ...(sent === undefined ? {} : { body: sent.data }),
       signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {

@@ -10,15 +10,23 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { browserHealth } from './health.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
+  browserConsentMigration,
   browserCredentialAttemptsMigration,
+  browserDisclosuresMigration,
+  browserGenericCheckoutMigration,
+  browserIncidentsMigration,
   browserPurchaseMigration,
+  browserPurchaseOutcomesMigration,
   browserReservationBoundsMigration,
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
+  browserWatchRegionMigration,
+  browserWatchReleaseMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
+import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './recipes.js';
@@ -37,7 +45,7 @@ import {
 import { reconcileBrowserGroup } from './reconcile.js';
 import { browserSignInMigration } from './sign-in-migration.js';
 import { cleanupBrowserSignInMail, recoverBrowserSignInMail, registerSignInMailDelivery } from './sign-in-mail.js';
-import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
+import { DEFAULT_BROWSER_POLICY, readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 import {
@@ -45,7 +53,10 @@ import {
   resumeBrowserPurchaseCommits,
   sweepBrowserPurchaseState,
 } from './purchase.js';
+import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
+import { registerConsentGrantsDelivery } from './consent-approval.js';
+import { registerDisclosureDelivery } from './disclosures.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
 import './watches.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
@@ -57,7 +68,14 @@ registerMigration(browserReservationBoundsMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
+registerMigration(browserWatchReleaseMigration);
 registerMigration(browserCredentialAttemptsMigration);
+registerMigration(browserConsentMigration);
+registerMigration(browserIncidentsMigration);
+registerMigration(browserDisclosuresMigration);
+registerMigration(browserGenericCheckoutMigration);
+registerMigration(browserWatchRegionMigration);
+registerMigration(browserPurchaseOutcomesMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -69,7 +87,7 @@ export class BrowserUnavailableError extends Error {
 type EnabledPolicy = Extract<BrowserPolicy, { enabled: true }>;
 
 export class BrowserRuntime {
-  private policy: BrowserPolicy = { status: 'disabled', enabled: false, reason: 'operator-enablement-required' };
+  private policy: BrowserPolicy = DEFAULT_BROWSER_POLICY;
   private proxy: PublicBrowserProxy | undefined;
   private attached: ChromeConnection | undefined;
   private windows: JobWindows | undefined;
@@ -379,6 +397,7 @@ onHostStart(async ({ signal }) => {
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
       () => sweepBrowserPurchaseState(activeQueue),
+      () => notifyPendingIncidents(),
     ])
       await optional(task);
   };
@@ -414,11 +433,15 @@ registerBrowserActionDelivery('credential_form', getBrowserQueue);
 registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
+registerBrowserActionDelivery('request_consent', getBrowserQueue);
 for (const name of ['watch', 'list_watches', 'cancel_watch']) registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
+registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
+registerConsentGrantsDelivery();
+registerDisclosureDelivery();
 registerVaultAccessDelivery();
 registerCredentialAuthorityDelivery(getBrowserQueue);
 
@@ -440,7 +463,6 @@ export {
   classifyActivation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
-  registerReviewedMerchantFlow,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
 export {

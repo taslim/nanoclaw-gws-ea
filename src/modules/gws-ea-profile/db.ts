@@ -1,10 +1,12 @@
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import type { DbDriver } from '../../db/driver.js';
 import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   EMAIL_PATTERN,
   hasControlCharacters,
+  identityMatchKey,
   normalizePrincipalEmail,
   principalAddressConflict,
   principalAddressesConflict,
@@ -19,6 +21,8 @@ import { upsertUser } from '../permissions/db/users.js';
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
   readonly assistant_workspace_email: string | null;
+  /** The assistant's verified web alias, one of its own addresses (KTD14), or null until one is recorded. */
+  readonly assistant_alias: string | null;
   readonly principal_display_name: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
@@ -32,10 +36,11 @@ export interface GwsEaProfile {
 
 /**
  * Who a project document is written for (KTD14): `main` reads live pointers,
- * `external-email` gets nothing but names and its guidance, and any other
- * group what its capabilities allow.
+ * `external-email` gets nothing but names and its guidance, `browser` gives
+ * the assistant's web alias to websites, and any other group what its
+ * capabilities allow.
  */
-export type ProjectDocAudience = 'main' | 'external-email' | 'other';
+export type ProjectDocAudience = 'main' | 'external-email' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -163,15 +168,15 @@ function principalEmail(value: string): string {
  * The assistant and the principal are separate people, so no address is
  * both, and an address is listed in one spelling (R3).
  */
-function assertMayList(email: string, listed: readonly string[], assistantWorkspaceEmail: string | null): void {
-  const conflict = principalAddressConflict(email, listed, assistantWorkspaceEmail);
+function assertMayList(email: string, listed: readonly string[], assistant: readonly string[]): void {
+  const conflict = principalAddressConflict(email, listed, assistant);
   if (conflict !== undefined) throw new Error(conflict);
 }
 
 function principalEmails(values: readonly string[], assistantWorkspaceEmail: string): readonly string[] {
   const emails = [...new Set(values.map(principalEmail))];
   if (emails.length === 0) throw new Error('The principal needs at least one email address');
-  const conflict = principalAddressesConflict(emails, assistantWorkspaceEmail);
+  const conflict = principalAddressesConflict(emails, [assistantWorkspaceEmail]);
   if (conflict !== undefined) throw new Error(conflict);
   return emails;
 }
@@ -200,8 +205,8 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
   };
 }
 
-export async function listPrincipalAddresses(): Promise<PrincipalAddress[]> {
-  return getDb().all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
+export async function listPrincipalAddresses(db: DbDriver = getDb()): Promise<PrincipalAddress[]> {
+  return db.all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
 }
 
 /** The addresses the profile holds, as listed and sorted. */
@@ -325,23 +330,38 @@ export async function recordExternalEmailAgentGroupId(agentGroupId: string): Pro
 /** Whom `agentGroupId`'s project document is written for. Without a profile every group is `other`. */
 export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
-  const row = await getDb().get<{ main_agent_group_id: string | null; external_email_agent_group_id: string | null }>(
-    'SELECT main_agent_group_id, external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  const row = await getDb().get<
+    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+  >(
+    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   if (row?.main_agent_group_id === agentGroupId) return 'main';
   if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  if (row?.browser_agent_group_id === agentGroupId) return 'browser';
   return 'other';
 }
 
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
-    `SELECT assistant_display_name, assistant_workspace_email, principal_display_name,
+    `SELECT assistant_display_name, assistant_workspace_email, assistant_alias, principal_display_name,
             principal_timezone, main_agent_group_id, external_email_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
   return { ...profile, principal_emails: await heldAddresses() };
+}
+
+/**
+ * The addresses the profile names as the assistant's own (KTD14): its
+ * Workspace email and, once verified, its web alias.
+ */
+export function assistantOwnAddresses(
+  profile: Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'> | undefined,
+): string[] {
+  return [profile?.assistant_workspace_email, profile?.assistant_alias].filter(
+    (address): address is string => typeof address === 'string' && address !== '',
+  );
 }
 
 /** Mail from an address speaks as the identity `email:<address>`, as the inbox names every sender. */
@@ -514,6 +534,15 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
   return profile?.assistant_workspace_email ?? null;
 }
 
+/** The assistant's own addresses as the profile holds them now (`assistantOwnAddresses`). */
+async function heldAssistantAddresses(): Promise<string[]> {
+  return assistantOwnAddresses(
+    await getDb().get<Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'>>(
+      'SELECT assistant_workspace_email, assistant_alias FROM gws_ea_profile WHERE singleton = 1',
+    ),
+  );
+}
+
 /**
  * `value` as the profile would hold it, refused when it is malformed, the
  * assistant's own address, or another spelling of one the profile holds;
@@ -524,8 +553,101 @@ export async function proposedPrincipalAddress(
 ): Promise<{ readonly email: string; readonly held: boolean }> {
   const email = principalEmail(value);
   const held = await heldAddresses();
-  assertMayList(email, held, await assistantWorkspaceEmail());
+  assertMayList(email, held, await heldAssistantAddresses());
   return { email, held: held.includes(email) };
+}
+
+// ---------------------------------------------------------------------------
+// The web alias (KTD13)
+// ---------------------------------------------------------------------------
+
+/**
+ * The assistant's web alias as its setup stands: the alias once a probe
+ * verified it, and until then the address the operator was asked to add and
+ * the Message-ID of the latest probe sent to it.
+ */
+export interface AliasSetup {
+  readonly alias: string | null;
+  readonly candidate: string | null;
+  readonly probe_message_id: string | null;
+}
+
+export async function getAliasSetup(): Promise<AliasSetup> {
+  const row = await getDb().get<AliasSetup>(
+    `SELECT assistant_alias AS alias, alias_candidate AS candidate, alias_probe_message_id AS probe_message_id
+       FROM gws_ea_profile
+      WHERE singleton = 1`,
+  );
+  if (!row) throw new Error('GWS-EA profile singleton is missing');
+  return row;
+}
+
+/**
+ * Make `address` the alias the operator is asked to add, or ask for none.
+ * A new candidate forgets the previous one's probe, so that probe can never
+ * record it; the same candidate keeps its probe. Refused once an alias is
+ * verified, and for the assistant's own address or one of the principal's,
+ * which no probe may reach.
+ */
+export async function proposeAliasCandidate(address: string | null): Promise<AliasSetup> {
+  const candidate = address === null ? null : normalizePrincipalEmail(address);
+  if (candidate === undefined) throw new Error(`The web alias is not an email address: ${JSON.stringify(address)}`);
+  const db = getDb();
+  return db.transaction(async () => {
+    const setup = await getAliasSetup();
+    if (setup.alias !== null) throw new Error(`The assistant's web alias is already ${setup.alias}`);
+    if (candidate !== null) {
+      const own = await assistantWorkspaceEmail();
+      if (own !== null && identityMatchKey(`email:${candidate}`) === identityMatchKey(`email:${own}`)) {
+        throw new Error(`${candidate} is the assistant's own address, not an alias`);
+      }
+      if (principalRecognizer(await heldAddresses()).has(candidate)) {
+        throw new Error(`${candidate} is the principal's address, not the assistant's`);
+      }
+    }
+    if (setup.candidate === candidate) return setup;
+    await db.run(
+      `UPDATE gws_ea_profile
+          SET alias_candidate = ?, alias_probe_message_id = NULL, updated_at = ?
+        WHERE singleton = 1`,
+      candidate,
+      new Date().toISOString(),
+    );
+    return getAliasSetup();
+  });
+}
+
+/** Record the probe sent to `candidate`, only while it is still the candidate. True when recorded. */
+export async function recordAliasProbe(candidate: string, messageId: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_profile
+        SET alias_probe_message_id = ?
+      WHERE singleton = 1 AND assistant_alias IS NULL AND alias_candidate = ?`,
+    messageId,
+    candidate,
+  );
+  return result.changes > 0;
+}
+
+/**
+ * Record `candidate` as the assistant's alias once probe `messageId` reached
+ * it: in one compare-and-set, only while it is still the candidate and that
+ * is still its probe, so a late probe for an earlier candidate records
+ * nothing. True when recorded.
+ */
+export async function recordVerifiedAlias(candidate: string, messageId: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_profile
+        SET assistant_alias = alias_candidate,
+            alias_candidate = NULL,
+            alias_probe_message_id = NULL,
+            updated_at = ?
+      WHERE singleton = 1 AND assistant_alias IS NULL AND alias_candidate = ? AND alias_probe_message_id = ?`,
+    new Date().toISOString(),
+    candidate,
+    messageId,
+  );
+  return result.changes > 0;
 }
 
 /** A verified principal identity and its direct message with the assistant. */
@@ -574,7 +696,7 @@ export async function addPrincipalAddress(value: string): Promise<{ readonly ema
   const email = principalEmail(value);
   const db = getDb();
   return db.transaction(async () => {
-    assertMayList(email, await heldAddresses(), await assistantWorkspaceEmail());
+    assertMayList(email, await heldAddresses(), await heldAssistantAddresses());
     const added = await holdPrincipalAddress(email, new Date().toISOString());
     await syncPrincipalMembers();
     return { email, added };

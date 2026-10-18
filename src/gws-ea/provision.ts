@@ -115,6 +115,9 @@ import {
   provisionAssistantVault,
   type OnePasswordCliSeams,
 } from './onepassword.js';
+import { runAliasStep, type AliasStepOptions } from './alias.js';
+import { instanceBrowserPolicyFile } from './browser-capability.js';
+import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -1428,11 +1431,14 @@ export async function runProductionProvision(
       ...(interaction ? { signIn: () => interaction.signInToGoogleCloud(gcpAccount) } : {}),
     },
   );
+  const alias = interaction?.decisions.alias;
   return result.status === 'ready'
-    ? provisionAssistantResources(operation, provisionRuntime, {
-        ...options.onePassword,
-        upsertEnvVars: options.upsertEnvVars,
-      })
+    ? provisionAssistantResources(
+        operation,
+        provisionRuntime,
+        { ...options.onePassword, upsertEnvVars: options.upsertEnvVars },
+        alias ? { decision: alias } : {},
+      )
     : result;
 }
 
@@ -1443,16 +1449,46 @@ const ONEPASSWORD_STEP = {
 } as const;
 
 /**
- * Once every step is complete: the optional resources the operator's host
- * enablement gives each new compatible assistant, today its 1Password vault
- * (KTD3). The assistant is already talkable, so what waits here waits on the
- * operator, with the cause and the command that clears it; a resume of an
- * assistant already provisioned costs no request and no prompt.
+ * Once every step is complete: the optional resources the operator's
+ * enablement gives an assistant, its 1Password vault (KTD3), then, while its
+ * browser is enabled, its verified web alias (KTD13). The assistant is
+ * already talkable, so what waits here waits on the operator, with the cause
+ * and the command that clears it; a resume of an assistant already
+ * provisioned costs no request and no prompt.
  */
 export async function provisionAssistantResources(
   operation: InstanceOperation,
   reporter: StepReporter,
   onePassword: { readonly cli?: OnePasswordCliSeams; readonly upsertEnvVars?: UpsertEnvVars } = {},
+  alias: AliasStepOptions = {},
+): Promise<ProvisionResult> {
+  const vault = await provisionAssistantVaultStep(operation, reporter, onePassword);
+  return vault.status === 'ready' ? provisionBrowserAlias(operation, reporter, alias) : vault;
+}
+
+/** The web alias, once the assistant's browser is enabled; an assistant that never browses is not held up. */
+async function provisionBrowserAlias(
+  operation: InstanceOperation,
+  reporter: StepReporter,
+  alias: AliasStepOptions,
+): Promise<ProvisionResult> {
+  const { paths, instanceId } = operation;
+  let runtime: InstanceRuntimeConfig;
+  try {
+    runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
+  } catch (error) {
+    // Without a runtime record no browser was ever enabled for it.
+    if (isErrno(error, 'ENOENT')) return { status: 'ready' };
+    throw error;
+  }
+  if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) return { status: 'ready' };
+  return runAliasStep(paths, instanceId, runtime, reporter, alias);
+}
+
+async function provisionAssistantVaultStep(
+  operation: InstanceOperation,
+  reporter: StepReporter,
+  onePassword: { readonly cli?: OnePasswordCliSeams; readonly upsertEnvVars?: UpsertEnvVars },
 ): Promise<ProvisionResult> {
   if (!(await onePasswordEnabled(operation.paths))) return { status: 'ready' };
   return runStep(

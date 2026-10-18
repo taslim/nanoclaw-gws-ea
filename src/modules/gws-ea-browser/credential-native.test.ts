@@ -59,7 +59,11 @@ import { CredentialAttempts, type CredentialAttempt } from './credential-attempt
 import { executeCredentialForm } from './credential-operations.js';
 import { executeBrowserBatch } from './executor.js';
 import './index.js';
-import { browserCredentialAttemptsMigration, browserSiteLeasesMigration } from './migration.js';
+import {
+  browserConsentMigration,
+  browserCredentialAttemptsMigration,
+  browserSiteLeasesMigration,
+} from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
 import {
@@ -153,22 +157,16 @@ const PAGES: Record<string, string> = {
   '/order-total': `${nativeForm('/signup')}<p>Order total $10.00 due today, charged to your Visa card ending 4242.</p>`,
   '/ambiguous': nativeForm('/signup', 'Go'),
   '/get-signup': nativeForm('/signup').replace('method="post"', 'method="get"'),
-  '/terms-signup': nativeForm(
-    '/signup',
-    'Create account',
-    `${checkbox('terms', 'I agree to the Terms of Service', ' required')}${checkbox('news', 'Send me news and special offers', '')}`,
-  ),
   '/marketing-terms': nativeForm(
     '/signup',
     'Create account',
     checkbox('consent', 'I agree to the Terms and to receive marketing emails', ' required'),
   ),
-  '/paid-terms': nativeForm(
+  '/offers-signup': nativeForm(
     '/signup',
     'Create account',
-    checkbox('member', 'I accept the membership terms and recurring billing', ' required'),
+    `${checkbox('terms', 'I agree to the Terms of Service', ' required')}${checkbox('news', 'Send me news and special offers', ' checked')}`,
   ),
-  '/optional-terms': nativeForm('/signup', 'Create account', checkbox('terms', 'I agree to the Terms of Service', '')),
   '/js-terms': `<h1>Join</h1><form id="join">${signupFields}${checkbox('terms', 'I agree to the Terms of Service', ' aria-required="true"')}<button id="go" type="submit" disabled>Create account</button></form><div id="result"></div><script>
     const state = {};
     const go = document.getElementById('go');
@@ -196,7 +194,7 @@ const PAGES: Record<string, string> = {
   '/verify-email-quiet': '<h1>Shop</h1><p>Browse the catalogue.</p>',
 };
 
-describe.skipIf(!chromePath)('native authorized signup and password change', () => {
+describe.skipIf(!chromePath)('native authorized signup and password change', { timeout: 30_000 }, () => {
   let root: string;
   let proxy: HttpServer;
   let server: HttpsServer;
@@ -330,6 +328,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     const db = await initSqliteTestDb();
     await browserSiteLeasesMigration.up(db);
     await browserCredentialAttemptsMigration.up(db);
+    // Consent stops name their job; this suite's job needs no other row.
+    await db.exec(
+      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
+    );
+    await browserConsentMigration.up(db);
     const directory = await realpath(await mkdtemp(join(root, 'vault-')));
     const files = await writeVaultFixture(directory);
     onePasswordPolicyFile = files.onePasswordPolicyFile;
@@ -881,21 +884,19 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(await batch(({ password }) => ({ kind: 'key', ...password, key: 'Enter' }))).toEqual(
         stopped('secret_field'),
       );
-      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('unsupported_merchant'));
-      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(
-        stopped('unsupported_merchant'),
-      );
+      // A form that holds password fields is submitted only by the credential operation itself.
+      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('secret_field'));
+      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(stopped('secret_field'));
       expect(posts).toEqual([]);
     }, 30_000);
   });
 
-  describe('accepting the site terms during signup', () => {
-    const TERMS = { ...SIGNUP, accept_terms: 'I agree to the Terms of Service' };
+  describe('the consent engine during signup', () => {
     const anyChecked = async (): Promise<unknown> =>
       page.evaluate("Array.from(document.querySelectorAll('input[type=checkbox]')).some((box) => box.checked)");
 
-    it('checks the required terms box of the bound form just before activation, and no other box', async () => {
-      const { result, password } = await signUp('/terms-signup', TERMS);
+    it('ticks the terms box of the bound form and unticks its pre-ticked offers box before the activation', async () => {
+      const { result, password } = await signUp('/offers-signup', SIGNUP);
       expect(result).toEqual({ status: 'account_created', vault: 'saved' });
       expect(posts).toEqual([
         {
@@ -911,36 +912,40 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       ]);
     }, 30_000);
 
-    it('checks it in a controlled JS form whose submit control waits for it', async () => {
-      const { result, password } = await signUp('/js-terms', TERMS);
+    it('ticks it in a controlled JS form whose submit control waits for it, through the form’s own handlers', async () => {
+      const { result, password } = await signUp('/js-terms', SIGNUP);
       expect(result).toEqual({ status: 'account_created', vault: 'saved' });
-      expect(posts).toEqual([
+      // The tick reached the controlled form's own state, which is what it posts; the stop test below proves the
+      // engine decides before anything is disclosed.
+      expect(posts.map(({ host, path, body }) => ({ host, path, body: JSON.parse(body) as unknown }))).toEqual([
         {
           host: 'accounts.shop.example',
           path: '/api/signup',
-          body: JSON.stringify({ email: USERNAME, password, password_confirmation: password, terms: true }),
+          body: { email: USERNAME, password, password_confirmation: password, terms: true },
         },
       ]);
     }, 30_000);
 
-    for (const [path, label] of [
-      ['/marketing-terms', 'I agree to the Terms and to receive marketing emails'],
-      ['/paid-terms', 'I accept the membership terms and recurring billing'],
-      ['/optional-terms', 'I agree to the Terms of Service'],
-      ['/terms-signup', 'Send me news and special offers'],
-    ] as const)
-      it(`refuses "${label}" on ${path} before anything is saved or disclosed`, async () => {
-        await page.goto(`${SITE}${path}`);
-        const authority = await signupAuthority();
-        expect(await fill(authority, await refs({ ...SIGNUP, accept_terms: label }))).toEqual({
-          status: 'refused',
-          reason: 'unsupported_terms',
-        });
-        expect(posts).toEqual([]);
-        expect(fake.calls).not.toContain('create');
-        expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
-        expect(await anyChecked()).toBe(false);
-      }, 30_000);
+    // Which wordings stop is the consent engine's own decision (consent.test.ts); this is the signup's path to it.
+    it('stops for a terms box bundled with marketing with a stop for the principal, before anything is saved or disclosed', async () => {
+      const label = 'I agree to the Terms and to receive marketing emails';
+      await page.goto(`${SITE}/marketing-terms`);
+      const authority = await signupAuthority();
+      const result = await fill(authority, await refs(SIGNUP));
+      const stops = await getDb().all<{ id: string; job_id: string; site: string; wording: string }>(
+        'SELECT id,job_id,site,wording FROM gws_ea_browser_consent_stops',
+      );
+      expect(stops).toEqual([{ id: expect.any(String), job_id: JOB, site: 'shop.example', wording: label }]);
+      expect(result).toEqual({
+        status: 'refused',
+        reason: 'consent_required',
+        consent: [{ stop_id: stops[0].id, site: 'shop.example', wording: label }],
+      });
+      expect(posts).toEqual([]);
+      expect(fake.calls).not.toContain('create');
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
+      expect(await anyChecked()).toBe(false);
+    }, 30_000);
 
     it("takes a signup form's own agree-and-create control as its activation", async () => {
       const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });

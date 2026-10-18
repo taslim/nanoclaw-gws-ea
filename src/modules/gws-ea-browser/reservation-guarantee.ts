@@ -12,15 +12,19 @@ import {
   requestApproval,
 } from '../approvals/index.js';
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
-import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
+import { agreementsGranted } from './consent.js';
 import {
+  bookedReservation,
   completePurchaseFacts,
   amountMinor,
   currencyExponent,
   formatMoney,
+  withinReservationBounds,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
@@ -47,30 +51,31 @@ interface GuaranteeProposal {
   status: 'open' | 'approved' | 'withdrawn' | 'expired' | 'rejected';
   created_at: string;
 }
+/**
+ * Whether the standing guarantee covers a booking (R38, KTD21): its venue, party size and time read and within
+ * main's recorded bounds, nothing due now, and only cancellation or no-show fees whose whole exposure is within
+ * the guarantee's limit. An unreviewed booking must also state its fee terms.
+ */
 export function guaranteeCoversReservation(
   grant: Pick<StandingGuarantee, 'currency' | 'max_total_minor' | 'revoked_at'> | undefined,
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
 ): boolean {
-  const reservation = facts.reservation;
+  const reservation = bookedReservation(facts);
   const delegated = bounds.reservation;
   if (
     !grant ||
     grant.revoked_at ||
     !reservation ||
     !delegated ||
+    facts.addOns?.length ||
     facts.dueNowMinor !== 0 ||
     facts.currency !== grant.currency ||
+    (facts.generic && !facts.commitments.length) ||
     !completePurchaseFacts(facts)
   )
     return false;
-  if (
-    reservation.venueId !== delegated.venueId ||
-    reservation.partySize !== delegated.partySize ||
-    reservation.at < delegated.windowStart ||
-    reservation.at > delegated.windowEnd
-  )
-    return false;
+  if (!withinReservationBounds(reservation, delegated)) return false;
   if (
     !facts.commitments.every(
       (term) =>
@@ -105,7 +110,9 @@ export async function deriveReservationGuaranteeAuthority(
     if (
       !guaranteeCoversReservation(grant, facts, delegatedBounds) ||
       (await store.unresolved(facts.site)).length ||
-      !grant
+      !grant ||
+      // An agreement the principal has not approved needs the card.
+      (facts.agreements?.length && !(await agreementsGranted(store.db, facts.site, facts.agreements)))
     )
       return undefined;
     const prior = await store.db.all<SpendingAuthority>(
@@ -147,13 +154,13 @@ export async function readDelegatedReservationBounds(
   return row ? (JSON.parse(row.bounds_json) as NonNullable<PurchaseBounds['reservation']>) : undefined;
 }
 
-/** Main records the principal's errand scope; this grants no financial authority by itself. */
+/** A delegating agent records the principal's errand scope; this grants no financial authority by itself. */
 async function reservationBoundsRequest(
   content: Record<string, unknown>,
   session: Session,
 ): Promise<Record<string, unknown>> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may record reservation bounds.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may record reservation bounds.');
   if (
     Object.keys(content).some(
       (key) => !['action', 'requestId', 'thread', 'venue_id', 'party_size', 'window_start', 'window_end'].includes(key),
@@ -182,8 +189,8 @@ async function reservationBoundsRequest(
   };
   if (bounds.windowEnd <= bounds.windowStart) throw invalidArgs('The reservation window must end after it starts.');
   return getDb().transaction(async () => {
-    const job = await resolveBrowserJob(content.thread as string);
-    if (!job || job.cancelled) throw forbidden('No live main-owned browser job exists for that thread.');
+    const job = await resolveBrowserJob(content.thread as string, undefined, session.agent_group_id);
+    if (!job || job.cancelled) throw forbidden('No live browser job of yours exists for that thread.');
     const encoded = JSON.stringify(bounds);
     const existing = await readDelegatedReservationBounds(job.id);
     if (existing && JSON.stringify(existing) === encoded)
@@ -208,9 +215,10 @@ const guaranteeGuard = defineGuardedAction({
   grantActionName: GUARANTEE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may propose a reservation guarantee.');
-    if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    const policy = await readBrowserPolicy();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+      return DENY('Only an agent with browser access may propose a reservation guarantee.');
+    if (!policy.enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal can authorize a standing reservation guarantee.', principal)
@@ -285,9 +293,10 @@ export async function reservationGuaranteeRequest(
   session: Session,
   requestId: string,
 ): Promise<Record<string, unknown>> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may manage reservation guarantees.');
-  if (!(await readBrowserPolicy()).enabled) throw forbidden('Browser is disabled.');
+  const policy = await readBrowserPolicy();
+  if (!(await hasBrowserAccess(session.agent_group_id, policy)))
+    throw forbidden('Only an agent with browser access may manage reservation guarantees.');
+  if (!policy.enabled) throw forbidden('Browser is disabled.');
   if (Object.keys(content).some((key) => !['action', 'requestId', 'operation', 'currency', 'max_total'].includes(key)))
     throw invalidArgs('Unknown reservation_guarantee field.');
   const operation = content.operation;

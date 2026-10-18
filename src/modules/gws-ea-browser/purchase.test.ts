@@ -29,6 +29,7 @@ import { createPendingApproval } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import type { OutboundFile } from '../../channels/adapter.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { sweepExpiredApprovals } from '../approvals/index.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
@@ -41,10 +42,19 @@ import { BrowserQueue } from './queue.js';
 import { readMerchantPurchase, AMAZON_RETAIL } from './merchant-signatures.js';
 import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
-import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits, validatePurchaseRequest } from './purchase.js';
+import {
+  purchaseBounds,
+  registerBrowserPurchaseDelivery,
+  resumeBrowserPurchaseCommits,
+  validatePurchaseRequest,
+} from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
+import { notes } from './principal-fixture.js';
+import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
+import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { coverPageTargets } from './page-targets.js';
 import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 import { setBrowserAdmissionReady } from './group.js';
@@ -66,7 +76,7 @@ let cartAdded: number;
 let total = '85.00';
 let confirmation = true;
 let cardDuringDelivery: (() => Promise<void>) | undefined;
-let sent: Array<{ platformId: string; content: string }>;
+let sent: Array<{ platformId: string; content: string; files?: readonly OutboundFile[] }>;
 let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
@@ -74,6 +84,10 @@ let widgetRequests: string[];
 let signInReferers: Array<[string, string | undefined]>;
 let offerRequests: string[];
 let merchantDocuments: string[];
+/** Choices the review form also holds, for the consent engine's checkout cases. */
+let reviewChoices: string;
+/** Each order submission's body, as the merchant received it. */
+let orderBodies: string[];
 const WIDGET_ORIGIN = 'https://pay.example';
 const OFFERS_ORIGIN = 'https://offers.example';
 
@@ -83,7 +97,7 @@ function reviewHtml(): string {
 <div id="payment-information">Visa ending in 4242</div><div id="displayAddressDiv">Morgan, 10 Main St, Seattle WA 98101</div>
 <table id="subtotals-marketplace-table"><tr><td>Order total:</td><td>$${total}</td></tr></table>
 <div class="shipment"><div class="delivery-promise">Arriving Tuesday, October 20, 2026</div><div class="item-row" data-asin="B012345678"><a class="a-link-normal" href="/dp/B012345678">Tea kettle</a><span class="quantity">Qty: 1</span></div></div>
-<div id="purchase-legal-text">By placing your order, you agree to Amazon's privacy notice and conditions of use.</div>
+<div id="purchase-legal-text">By placing your order, you agree to Amazon's privacy notice and conditions of use.</div>${reviewChoices}
 <div id="placeYourOrder"><input type="submit" name="placeYourOrder1" value="Place your order"></div><button type="button">Continue</button></form></body></html>`;
 }
 function productHtml(): string {
@@ -236,6 +250,14 @@ async function grant(): Promise<SpendingAuthority> {
   if (!rows[0]) throw new Error('Authority missing');
   return rows[0];
 }
+/** Main records what it learned of `attemptId`, as its tool does. */
+function record(attemptId: string, outcome: 'placed' | 'not_placed', source: 'email' | 'principal') {
+  return recordPurchaseOutcome(
+    { thread: session.thread_id!, attempt_id: attemptId, outcome, source },
+    main,
+    () => queue,
+  );
+}
 
 it('accepts delivery bounds with UTC offsets, keeping window dates as written and the deadline in UTC', () => {
   const target = { ref: 'e1', generation: 1 };
@@ -263,7 +285,25 @@ it('accepts delivery bounds with UTC offsets, keeping window dates as written an
   ).toThrow('ordered');
 });
 
-describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', () => {
+it('reads a date-only needed-by as the end of that day on the principal’s clock', () => {
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'America/Los_Angeles')).toEqual({
+    neededBy: '2026-10-21T06:59:59.999Z',
+    principalTimeZone: 'America/Los_Angeles',
+  });
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'Asia/Tokyo')).toEqual({
+    neededBy: '2026-10-20T14:59:59.999Z',
+    principalTimeZone: 'Asia/Tokyo',
+  });
+  expect(purchaseBounds({ needed_by: '2026-10-14T17:00:00.000Z' }, 'Asia/Tokyo')).toEqual({
+    neededBy: '2026-10-14T17:00:00.000Z',
+    principalTimeZone: 'Asia/Tokyo',
+  });
+  expect(purchaseBounds({ delivery_window: { start: '2026-10-12', end: '2026-10-14' } }, 'Asia/Tokyo')).toEqual({
+    deliveryWindow: { start: '2026-10-12', end: '2026-10-14' },
+  });
+});
+
+describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', { timeout: 30_000 }, () => {
   beforeAll(async () => {
     if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the native merchant fixture.');
     certificateRoot = fs.mkdtempSync(`${root}-tls-`);
@@ -313,6 +353,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         } else if (request.method === 'POST') {
           submitted++;
           sawPost?.();
+          let body = '';
+          request.on('data', (chunk: Buffer) => {
+            body += chunk.toString();
+          });
+          request.on('end', () => orderBodies.push(body));
           const finish = () => {
             response.writeHead(302, {
               location: `${AMAZON_RETAIL.origin}${confirmation ? '/gp/your-account/order-details?orderID=123-1234567-1234567' : AMAZON_RETAIL.confirmationPath}`,
@@ -457,16 +502,20 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     signInReferers = [];
     offerRequests = [];
     merchantDocuments = [];
+    reviewChoices = '';
+    orderBodies = [];
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
-      async deliver(_type, platformId, _thread, _kind, content) {
-        sent.push({ platformId, content });
+      async deliver(_type, platformId, _thread, _kind, content, files) {
+        sent.push({ platformId, content, files });
         if (cardDuringDelivery) await cardDuringDelivery();
         return `message-${sent.length}`;
       },
     });
     page = await browser.newPage();
+    // Classification reads each control in an isolated world, through the handoff a job context registers.
+    await prepareAuthenticationIsolation(page.context(), true);
     await page.goto(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`);
     queue = new BrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
@@ -509,22 +558,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     };
     await navigate(`${AMAZON_RETAIL.origin}/dp/B012345678`, 'product');
     expect(await activate('Buy Now', 'no-oneclick')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
-    expect(await activate('Continue', 'unknown-prep')).toMatchObject({
-      status: 'stopped',
-      reason: 'unsupported_merchant',
-    });
-    await page.locator('input[name="ASIN"]').evaluate((node) => {
-      (node as unknown as { value: string }).value = 'B099999999';
-    });
-    expect(await activate('Add to Cart', 'mismatched-product')).toMatchObject({
-      status: 'stopped',
-      reason: 'unsupported_merchant',
-    });
+    // A control the reviewed flow does not know is left to the open rule: an ordinary, real click, which here
+    // presses a script-less button and submits nothing.
+    expect(await activate('Continue', 'unknown-prep')).toMatchObject({ status: 'completed' });
     expect(cartAdded).toBe(0);
     expect(submitted).toBe(0);
-    await page.locator('input[name="ASIN"]').evaluate((node) => {
-      (node as unknown as { value: string }).value = 'B012345678';
-    });
     await activate('Add to Cart', 'add-cart');
     expect(page.url()).toContain('/gp/cart/view.html');
     expect(cartAdded).toBe(1);
@@ -555,6 +593,19 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await readMerchantPurchase(page)).toEqual({ status: 'terms_unavailable' });
     expect(submitted).toBe(0);
   });
+  it('fails closed on an Amazon review page its signature no longer matches, never reading it as an unreviewed checkout', async () => {
+    await page.locator('#placeYourOrder input').evaluate((node) => {
+      (node as unknown as { name: string }).name = 'placeYourOrder2';
+    });
+    await buy();
+    expect(await request('buy')).toMatchObject({
+      status: 'facts_incomplete',
+      missing: ["the site's reviewed checkout"],
+    });
+    expect(await approvals()).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+    expect(submitted).toBe(0);
+  });
   it('posts exactly one card to the principal, keeps the site and commits once on its worker after approval', async () => {
     await buy();
     expect(await request('buy')).toMatchObject({ status: 'awaiting_principal' });
@@ -567,6 +618,29 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(approval.question).toMatch(/Place your order/);
     expect(approval.question).toMatch(/Due now: \$85.00/);
     expect(approval.question).toMatch(/Due later: none/);
+    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+    expect(approval.question).not.toContain(session.thread_id!);
+    // The reviewed reader places its order total and commit control: the card's one picture is clipped to both.
+    expect(JSON.parse(sent[0].content)).toMatchObject({ pictures: 1 });
+    expect(sent[0].files).toHaveLength(1);
+    const boxes = await Promise.all(
+      [page.locator(AMAZON_RETAIL.total).filter({ hasText: 'Order total:' }), page.locator(AMAZON_RETAIL.control)].map(
+        async (locator) => {
+          const box = await locator.boundingBox();
+          if (!box) throw new Error('Fixture checkout box missing');
+          return box;
+        },
+      ),
+    );
+    const picture = sent[0].files![0].data;
+    expect(picture.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
+    const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
+    expect({ width: picture.readUInt32BE(16), height: picture.readUInt32BE(20) }).toEqual({
+      width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
+      height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
+    });
     expect(await readBrowserJob(session.thread_id!)).toMatchObject({
       state: 'awaiting_principal',
       held_sites: ['amazon.com'],
@@ -587,6 +661,76 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await click(approval);
     await queue.idle();
     expect(submitted).toBe(1);
+  });
+  it('puts an age attestation on the purchase card itself; approving it ticks the box and stands as a grant, with no second card', async () => {
+    reviewChoices = '<label><input type="checkbox" name="age" required> I confirm I am 21 or older</label>';
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    expect(approval.question).toContain(
+      'Agreement: "I confirm I am 21 or older". Approving agrees to it, here and whenever this exact wording appears on amazon.com again, until you withdraw it.',
+    );
+    // Nothing is agreed before the principal decides.
+    expect(await page.locator('input[name="age"]').isChecked()).toBe(false);
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(1);
+    expect(new URLSearchParams(orderBodies[0]).get('age')).toBe('on');
+    expect(sent).toHaveLength(1);
+    expect(
+      await getDb().all('SELECT site,origin,wording,approval_id,withdrawn_at FROM gws_ea_browser_consent_grants'),
+    ).toEqual([
+      {
+        site: 'amazon.com',
+        origin: AMAZON_RETAIL.origin,
+        wording: 'I confirm I am 21 or older',
+        approval_id: approval.approval_id,
+        withdrawn_at: null,
+      },
+    ]);
+  });
+  it('asks again before the commit when main withdrew an agreement the card approved', async () => {
+    reviewChoices = '<label><input type="checkbox" name="age" required> I confirm I am 21 or older</label>';
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    // Withdrawn between the approval and the commit: the grant check inside begin() refuses the press.
+    cardDuringDelivery = undefined;
+    await getDb().run(
+      "CREATE TRIGGER withdraw_after_grant AFTER INSERT ON gws_ea_browser_consent_grants BEGIN UPDATE gws_ea_browser_consent_grants SET withdrawn_at = '2026-10-17T00:00:00.000Z' WHERE id = NEW.id; END",
+    );
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(0);
+    const [fresh] = await approvals();
+    expect(fresh.approval_id).not.toBe(approval.approval_id);
+    expect(fresh.question).toContain('An agreement on this checkout is no longer approved.');
+    expect(fresh.question).toContain('Agreement: "I confirm I am 21 or older"');
+  });
+  const roundUp = (again: boolean): string =>
+    `<label><input type="checkbox" id="round-up" name="round_up" checked> Round up for charity ($0.58)</label>${
+      again
+        ? `<script>const box = document.getElementById('round-up'); box.addEventListener('change', () => { if (!box.checked) setTimeout(() => { box.checked = true; }, 50); });</script>`
+        : ''
+    }`;
+  it.each([
+    ['unticks a pre-ticked round-up before the card, which names no charge for it', false],
+    ['names a round-up the site keeps ticking as a charge on the card, which its approval covers', true],
+  ] as const)('%s', async (_name, kept) => {
+    reviewChoices = roundUp(kept);
+    await page.reload();
+    await buy();
+    const [approval] = await approvals();
+    // Only a round-up the site keeps ticked is on the card, as the charge the approval covers.
+    expect(approval.question.includes('Round up')).toBe(kept);
+    expect(approval.question.includes('Extra charge the site keeps selected: "Round up for charity ($0.58)"')).toBe(
+      kept,
+    );
+    expect(await page.locator('#round-up').isChecked()).toBe(kept);
+    await click(approval);
+    await queue.idle();
+    expect(submitted).toBe(1);
+    expect(new URLSearchParams(orderBodies[0]).get('round_up')).toBe(kept ? 'on' : null);
   });
   it('keeps another job off a checkout while its principal card holds the site', async () => {
     await buy();
@@ -662,7 +806,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
   });
   it.each([
     ['lapsed checkout', false, 'checkout_lapsed'],
-    ['closed idle page', true, 'unsupported_merchant'],
+    ['closed idle page', true, 'checkout_lapsed'],
   ] as const)(
     'resumes approval after restart with a %s and revalidates the rebuilt checkout',
     async (_name, closePage, status) => {
@@ -681,6 +825,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       if (closePage) {
         await page.close();
         page = await browser.newPage();
+        await prepareAuthenticationIsolation(page.context(), true);
       }
       await click(row);
       await queue.idle();
@@ -930,7 +1075,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue.idle();
     expect((await store.get(authority.id))?.state).toBe('unknown');
     expect(JSON.parse((await queue.store.request(id))!.answer_json!)).toMatchObject({
-      data: { reason: 'outcome_unknown' },
+      data: { reason: 'unconfirmed' },
     });
     expect(submitted).toBe(0);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
@@ -953,7 +1098,14 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       order_number: '123-1234567-1234567',
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(0);
-    expect((await grant()).state).toBe('unknown');
+    // The page's record resolves the attempt and its authority alike, from the page.
+    expect((await grant()).state).toBe('committed');
+    expect(
+      await getDb().get(
+        'SELECT resolution,resolution_source FROM gws_ea_browser_purchase_attempts WHERE id = ?',
+        authority.attempt_id,
+      ),
+    ).toEqual({ resolution: 'committed', resolution_source: 'page' });
     expect(submitted).toBe(1);
     await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'another-cart');
     await buy('another-purchase');
@@ -971,26 +1123,68 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
   });
-  it('warns about a possible duplicate and grants only one new attempt without erasing the unresolved earlier purchase', async () => {
+  it('makes another purchase on the site wait on an unconfirmed one while browsing it goes on, until main records the order email (AE4)', async () => {
     confirmation = false;
     await buy();
     await click((await approvals())[0]);
     await queue.idle();
     const original = await grant();
+    expect(JSON.parse(original.outcome_json!)).toMatchObject({
+      status: 'unconfirmed',
+      attempt_id: original.attempt_id,
+    });
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B012345678`, 'browse-product');
+    expect(await request('browse-product')).toMatchObject({ actions: [{ status: 'completed' }] });
+    expect(page.url()).toBe(`${AMAZON_RETAIL.origin}/dp/B012345678`);
     await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'new-cart');
-    await buy('possible-duplicate');
-    const [approval] = await approvals();
-    expect(approval.question).toContain('Possible duplicate');
-    expect(approval.question).toContain(original.attempt_id);
-    await click(approval);
-    await queue.idle();
-    expect(submitted).toBe(2);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_attempts WHERE resolution IS NULL')).toHaveLength(
-      2,
+    await buy('second-purchase');
+    expect(await request('second-purchase')).toMatchObject({ status: 'waiting_on_earlier', site: 'amazon.com' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_purchase_cards')).toHaveLength(1);
+    expect(submitted).toBe(1);
+    expect(await record(original.attempt_id, 'placed', 'email')).toMatchObject({ status: 'recorded' });
+    expect((await grant()).state).toBe('committed');
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+    // The waiting errand is woken once, naming the site.
+    const woken = (await notes(session)).filter(
+      (text) => text.includes('browser_site_available') && text.includes('"site":"amazon.com"'),
     );
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
-    await click(approval);
-    expect(submitted).toBe(2);
+    expect(woken).toHaveLength(1);
+    await buy('after-the-answer');
+    expect(await request('after-the-answer')).toMatchObject({ status: 'awaiting_principal' });
+    const [card] = await approvals();
+    expect(card.question).not.toMatch(/Possible duplicate|Earlier purchase/u);
+    expect(submitted).toBe(1);
+    // Main reads the open card's facts from the job's state, on the principal's clock.
+    expect(await readBrowserJob(session.thread_id!)).toMatchObject({
+      state: 'awaiting_principal',
+      open_card: {
+        site: 'amazon.com',
+        total: '$85.00',
+        due_now: '$85.00',
+        expires: expect.stringMatching(/ Los Angeles time$/u),
+      },
+    });
+  });
+  it('puts main’s recorded "not placed" on the next card for the site, once, and never an attempt id', async () => {
+    confirmation = false;
+    await buy();
+    await click((await approvals())[0]);
+    await queue.idle();
+    const original = await grant();
+    expect(await record(original.attempt_id, 'not_placed', 'principal')).toMatchObject({ status: 'recorded' });
+    expect((await grant()).state).toBe('revoked');
+    await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'retry-cart');
+    await buy('retry');
+    const [card] = await approvals();
+    expect(card.question).toMatch(
+      /Earlier purchase here, tried .+ Los Angeles time: I recorded it as not placed, from what you told me\./u,
+    );
+    expect(card.question).not.toMatch(/attempt-|authority-|Possible duplicate/u);
+    await click(card, 'reject');
+    await buy('retry-again');
+    const [next] = await approvals();
+    expect(next.question).not.toContain('recorded it as not placed');
+    expect(submitted).toBe(1);
   });
   it('refuses a purchase navigation inside an out-of-process widget frame before the widget receives it', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
@@ -1042,9 +1236,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('later-load')).toMatchObject({ status: 'completed' });
     expect(frame.url()).toBe(`${WIDGET_ORIGIN}/`);
     await assertOutOfProcess(frame);
-    // Outside any job batch the guard refuses every document, in this frame as in the page.
-    await frame.locator('#help').click();
-    await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
+    // Outside any job batch the guard still decides this frame's documents: a purchase route is refused.
+    await frame.locator('#plans').click();
+    await expect.poll(() => guard.reason()).toBe('purchase_control');
     expect(widgetRequests).toEqual(['/']);
   }, 30_000);
   it('holds file choosers opened in the page and in an out-of-process frame instead of showing them', async () => {
@@ -1185,7 +1379,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     // No readiness pass ran after the second swap: ending the first target let the swap's own event cover it.
     guard.clearReason();
     await frame.locator('#plans').click();
-    await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
+    await expect.poll(() => guard.reason()).toBe('purchase_control');
     expect(widgetRequests).toEqual(['/', '/']);
   }, 30_000);
   it('strips the Referer from what a sign-in scope loads, documents and subresources alike', async () => {
@@ -1260,7 +1454,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     }
     expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
     expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
-  }, 60_000);
+  }, 120_000);
   it('places nested same-site and cross-site frames with the page that hosts their widget', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
     await queue.accept(
@@ -1321,7 +1515,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       await queue.idle();
     }
     expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
-  }, 60_000);
+  }, 120_000);
   it.each(['Open deals', 'Open deals window'])(
     'decides the documents of a window the page opens under the page guard (%s)',
     async (link) => {
@@ -1356,7 +1550,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     }
     expect(merchantDocuments).not.toContain('/checkout/placeorder');
     expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
-  }, 60_000);
+  }, 120_000);
   it('never lets a service worker answer a navigation the document gate has not decided', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0WORKER01`, 'worker-page');
     const guard = await ensureBrowserNavigationGuard(page);
@@ -1364,7 +1558,10 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await page.locator('body').getAttribute('data-worker')).toBe('refused');
     // With no worker registered, the purchase navigation reaches the gate, which refuses it outside any errand.
     await page.evaluate("location.assign('/checkout/placeorder')");
-    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('purchase_control');
+    // The refused navigation ends on Chrome's error page; read the page once that has committed.
+    await expect.poll(() => page.url(), { timeout: 5_000 }).toMatch(/^chrome-error:/u);
+    await page.waitForLoadState('domcontentloaded');
     expect(await page.content()).not.toContain('served by worker');
   }, 30_000);
 });

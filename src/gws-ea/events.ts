@@ -5,6 +5,7 @@
  * nothing here imports setup/.
  */
 import type { GoogleGrant } from '../modules/gws-ea-google/grant.js';
+import type { AliasDecision } from './alias.js';
 import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
 import { describeSecretInput, SECRET_INPUTS, type SecretInput, type SecretSource } from './create-input.js';
 import { signInAsAssistant, type GoogleOAuthClient } from './google-oauth.js';
@@ -136,6 +137,8 @@ export interface HumanDecisions {
   readonly googleClientFile?: string;
   /** `--billing-account`: the billing account the operator chose to pay for the assistant's project. */
   readonly billingAccount?: string;
+  /** `--alias-added`, `--alias-taken`, `--alias <name>`: the operator's word on the web alias (KTD13). */
+  readonly alias?: AliasDecision;
 }
 
 /** The resume flag a billing-account choice is passed with. */

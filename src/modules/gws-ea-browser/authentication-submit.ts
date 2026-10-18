@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { selectors, type BrowserContext, type CDPSession, type ElementHandle, type Frame } from 'playwright-core';
 
+import { attachFrameTarget, frameTreeFrames } from './page-targets.js';
+
 const worldName = 'gws-ea-native-authentication';
 // Unlike ElementHandle.evaluate/dispatchEvent, a contentScript selector runs in
 // Playwright's isolated utility world. The selector receives the exact handle as
@@ -37,6 +39,11 @@ export async function prepareAuthenticationIsolation(
     contextSelectors.set(context, registered);
   }
   await registered;
+}
+
+/** The exact-node handoff selector registered for a prepared context; undefined until it is prepared. */
+export function isolationSelector(context: BrowserContext): Promise<string> | undefined {
+  return contextSelectors.get(context);
 }
 
 export interface NativeAuthenticationFacts {
@@ -133,21 +140,6 @@ const readControlSource = `
     };
   };`;
 
-async function attachFrameSession(frame: Frame): Promise<{ session: CDPSession; owner: Frame }> {
-  let owner = frame;
-  for (;;) {
-    try {
-      return { session: await frame.page().context().newCDPSession(owner), owner };
-    } catch (error) {
-      const parent = owner.parentFrame();
-      if (!parent || !(error instanceof Error) || !error.message.includes('does not have a separate CDP session'))
-        throw error;
-      // In-process frames belong to their nearest independently targeted ancestor.
-      owner = parent;
-    }
-  }
-}
-
 /**
  * Every native write and activation runs here: a CDP session on the frame's
  * own target, the bound document still loaded, and the bound nodes resolved
@@ -162,21 +154,22 @@ async function withBoundNodes<T>(
   refused: T,
   operation: (session: CDPSession, objectIds: readonly string[]) => Promise<T>,
 ): Promise<T> {
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  let attached: Awaited<ReturnType<typeof attachFrameTarget>>;
   try {
-    attached = await attachFrameSession(frame);
+    attached = await attachFrameTarget(frame);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Renderer errors refuse the operation without exposing protocol prose.
   } catch (_error) {
     return refused;
   }
+  if (!attached) return refused;
   const { session } = attached;
   const objectGroup = `gws-ea-auth-${randomUUID()}`;
   try {
     const objectIds: string[] = [];
     try {
       const { frameTree } = await session.send('Page.getFrameTree');
-      const selected = findFrame(frameTree, document.frameId);
-      if (!selected || selected.frame.loaderId !== document.loaderId) return refused;
+      const selected = frameTreeFrames(frameTree).find((listed) => listed.id === document.frameId);
+      if (!selected || selected.loaderId !== document.loaderId) return refused;
       const { executionContextId } = await session.send('Page.createIsolatedWorld', {
         frameId: document.frameId,
         worldName,
@@ -263,8 +256,6 @@ export type CredentialActivationResult = 'activated' | 'disabled' | 'changed' | 
 export interface NativeCredentialGroup {
   readonly fields: readonly NativeCredentialBinding[];
   readonly control: NativeCredentialBinding;
-  /** A signup's required terms checkbox in the same form, checked just before activation. */
-  readonly terms?: NativeCredentialBinding;
 }
 
 /** Shared by the fill and the activation: the bound document, origin, nodes and facts, all unchanged. */
@@ -277,33 +268,26 @@ const credentialGroupSource = `
       : key === 'type' && value === 'text' ? 'password' : value);
   const same = (left, right) => shape(left) === shape(right);
   const valueOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-  const checkedOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
-  const bound = (control, expectedControl, expectedFields, form, fields, expectedTerms, terms) =>
+  const bound = (control, expectedControl, expectedFields, form, fields) =>
     location.protocol === 'https:' && control.ownerDocument === document &&
     same(readCredentialNode(control), expectedControl) &&
     fields.length === expectedFields.length &&
     fields.every((field, index) => field instanceof HTMLInputElement && field.ownerDocument === document &&
       !field.matches(':disabled') && !field.readOnly && formFor(field) === form &&
-      same(readCredentialNode(field), expectedFields[index])) &&
-    (expectedTerms === null ? terms === null
-      : terms instanceof HTMLInputElement && terms.ownerDocument === document && terms.type === 'checkbox' &&
-        !terms.matches(':disabled') && formFor(terms) === form && same(readCredentialNode(terms), expectedTerms));
+      same(readCredentialNode(field), expectedFields[index]));
   const holds = (fields, values) => fields.every((field, index) => valueOf.get.call(field) === values[index]);`;
-const credentialParameters = 'expectedControl, expectedFields, values, expectedTerms, form, terms, ...fields';
+const credentialParameters = 'expectedControl, expectedFields, values, form, ...fields';
 
-/** Resolved as `credentialNodes` orders them: the control, the shared form and terms box when there are any, then each field. */
+/** Resolved as `credentialNodes` orders them: the control, the shared form when there is one, then each field. */
 function credentialArguments(group: NativeCredentialGroup, values: readonly string[], objects: readonly string[]) {
   const formless = group.fields[0].formBackendNodeId === null;
   let next = 1;
   const form = formless ? { value: null } : { objectId: objects[next++] };
-  const terms = group.terms ? { objectId: objects[next++] } : { value: null };
   return [
     { value: group.control.facts },
     { value: group.fields.map((field) => field.facts) },
     { value: values },
-    { value: group.terms?.facts ?? null },
     form,
-    terms,
     ...objects.slice(next).map((objectId) => ({ objectId })),
   ];
 }
@@ -312,7 +296,7 @@ function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
   const [first] = group.fields;
   if (
     !first ||
-    [...group.fields, ...(group.terms ? [group.terms] : [])].some(
+    group.fields.some(
       (field) =>
         field.frameId !== group.control.frameId ||
         field.loaderId !== group.control.loaderId ||
@@ -325,7 +309,6 @@ function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
   return [
     group.control.controlBackendNodeId,
     ...(first.formBackendNodeId === null ? [] : [first.formBackendNodeId]),
-    ...(group.terms ? [group.terms.controlBackendNodeId] : []),
     ...group.fields.map((field) => field.controlBackendNodeId),
   ];
 }
@@ -357,7 +340,7 @@ export async function fillNativeCredentialGroup(
         arguments: credentialArguments(group, values, objects),
         functionDeclaration: `function (${credentialParameters}) {
           ${credentialGroupSource}
-          const intact = () => bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms);
+          const intact = () => bound(this, expectedControl, expectedFields, form, fields);
           if (!intact()) return 'not_inserted';
           fields.forEach((field, index) => valueOf.set.call(field, values[index]));
           if (!holds(fields, values)) return 'changed';
@@ -382,43 +365,12 @@ export async function fillNativeCredentialGroup(
 }
 
 /**
- * Checks a signup's bound terms box through its own click, once, when it is
- * not already checked, so the site's handlers see the acceptance; then
- * verifies the box holds it. Any other box is never touched.
- */
-async function checkTermsBox(
-  session: CDPSession,
-  group: NativeCredentialGroup,
-  values: readonly string[],
-  objects: readonly string[],
-): Promise<boolean> {
-  try {
-    const result = await session.send('Runtime.callFunctionOn', {
-      objectId: objects[0],
-      returnByValue: true,
-      arguments: credentialArguments(group, values, objects),
-      functionDeclaration: `function (${credentialParameters}) {
-        ${credentialGroupSource}
-        if (!terms || !bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms) ||
-            !holds(fields, values)) return false;
-        if (!checkedOf.get.call(terms)) HTMLElement.prototype.click.call(terms);
-        return checkedOf.get.call(terms) === true;
-      }`,
-    });
-    return !result.exceptionDetails && result.result.value === true;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a credential value.
-  } catch (_error) {
-    return false;
-  }
-}
-
-/**
  * Activates the bound control exactly once, by its own node and through the
  * isolated world's click, after revalidating the group and that every field
- * still holds its value; a bound terms box is checked just before, in its own
- * call, so the site sees it first. A native form submits natively; a
- * JS-controlled or no-form control runs its own handlers. `uncertain` means
- * the click may have run; `disabled` and `changed` mean it did not.
+ * still holds its value. The consent engine made the form's choices before
+ * (consent.ts). A native form submits natively; a JS-controlled or no-form
+ * control runs its own handlers. `uncertain` means the click may have run;
+ * `disabled` and `changed` mean it did not.
  */
 export async function activateNativeCredentialControl(
   frame: Frame,
@@ -430,8 +382,6 @@ export async function activateNativeCredentialControl(
   if (!nodes || values.length !== group.fields.length) return 'changed';
   return withBoundNodes(frame, group.control, nodes, 'changed', async (session, objects) => {
     await assertActive();
-    if (group.terms && !(await checkTermsBox(session, group, values, objects))) return 'changed';
-    await assertActive();
     try {
       const result = await session.send('Runtime.callFunctionOn', {
         objectId: objects[0],
@@ -439,8 +389,7 @@ export async function activateNativeCredentialControl(
         arguments: credentialArguments(group, values, objects),
         functionDeclaration: `function (${credentialParameters}) {
           ${credentialGroupSource}
-          if (!bound(this, expectedControl, expectedFields, form, fields, expectedTerms, terms) || !holds(fields, values) ||
-              (terms && checkedOf.get.call(terms) !== true)) return 'changed';
+          if (!bound(this, expectedControl, expectedFields, form, fields) || !holds(fields, values)) return 'changed';
           if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true') return 'disabled';
           // A native GET submission would carry the values in its address; one no page handler took over is cancelled.
           const address = (event) => {
@@ -541,15 +490,6 @@ function chosenFrame(tree: NativeFrameTree, frame: Frame, owner: Frame): NativeF
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
-function findFrame(tree: NativeFrameTree, id: string): NativeFrameTree | undefined {
-  if (tree.frame.id === id) return tree;
-  for (const child of tree.childFrames ?? []) {
-    const found = findFrame(child, id);
-    if (found) return found;
-  }
-  return undefined;
-}
-
 interface InspectedNode<Facts> {
   frameId: string;
   loaderId: string;
@@ -567,13 +507,14 @@ async function inspectNativeNode<Facts>(
   const registered = contextSelectors.get(frame.page().context());
   if (!registered) return undefined;
   const selectorName = await registered;
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  let attached: Awaited<ReturnType<typeof attachFrameTarget>>;
   try {
-    attached = await attachFrameSession(frame);
+    attached = await attachFrameTarget(frame);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Protocol errors refuse authentication without exposing page prose.
   } catch (_error) {
     return undefined;
   }
+  if (!attached) return undefined;
   const { session, owner } = attached;
   const eventName = `gws-ea-auth-${randomUUID()}`;
   let contextId: number | undefined;

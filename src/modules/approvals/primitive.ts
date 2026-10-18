@@ -21,6 +21,7 @@
  * exposing just user-roles/user-dms) is more churn than it's worth. Revisit
  * if either module becomes genuinely optional (see REFACTOR_PLAN open q #3).
  */
+import type { OutboundFile } from '../../channels/adapter.js';
 import {
   APPROVE_OPTION,
   normalizeOptions,
@@ -288,6 +289,21 @@ export interface RequestApprovalOptions {
   expiresAt?: string;
   /** Host-authored context replacing the inferred conversation origin. */
   originLine?: string;
+  /**
+   * Pictures that go with the card (KTD6), such as a checkout's total and
+   * its commit control, posted on the card's own message where the channel
+   * attaches files. Their bytes live only for this one posting: never in the
+   * approval row, the database or the logs. `null` is a picture meant for
+   * the card that could not be taken. A card whose pictures do not all reach
+   * its message, as one posted from anything kept after a restart, says
+   * they are unavailable.
+   */
+  pictures?: readonly (RequestPicture | null)[];
+}
+
+/** A picture that goes with a card: PNG bytes held only in memory (RequestApprovalOptions.pictures). */
+export interface RequestPicture extends OutboundFile {
+  mimeType: 'image/png';
 }
 
 /**
@@ -341,6 +357,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
+    // The card names its pictures; their bytes ride beside it for this one delivery.
+    const pictures = opts.pictures ?? [];
+    const taken = pictures.filter((picture): picture is RequestPicture => picture !== null);
     let messageId: string | void;
     try {
       messageId = await adapter.deliver(
@@ -354,8 +373,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
           title,
           question,
           options: APPROVAL_OPTIONS,
+          ...(pictures.length === 0 ? {} : { pictures: pictures.length }),
         }),
-        undefined,
+        taken.length === 0 ? undefined : taken,
         target.messagingGroup.instance,
       );
     } catch (err) {

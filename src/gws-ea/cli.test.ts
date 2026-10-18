@@ -930,6 +930,52 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(chosen).toHaveLength(1);
   });
 
+  it("resumes with the operator's word on the web alias, and refuses flags that contradict it", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const decided: unknown[] = [];
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { interaction }) => {
+      decided.push(interaction.decisions.alias);
+      return { status: 'ready' };
+    };
+    const resume = async (...flags: string[]) => {
+      const io = lines();
+      const exit = await runCli(['resume', '--id', input.instance_id, ...flags], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      });
+      return { exit, err: io.err.join('\n') };
+    };
+
+    expect((await resume()).exit).toBe(0);
+    expect((await resume('--alias-added')).exit).toBe(0);
+    expect((await resume('--alias-taken')).exit).toBe(0);
+    expect((await resume('--alias', 'Juno.Web')).exit).toBe(0);
+    expect((await resume('--alias', 'juno.web', '--alias-added')).exit).toBe(0);
+    expect(decided).toEqual([
+      undefined,
+      { kind: 'added' },
+      { kind: 'taken' },
+      { kind: 'named', name: 'Juno.Web' },
+      { kind: 'added', name: 'juno.web' },
+    ]);
+
+    for (const flags of [
+      ['--alias-taken', '--alias-added'],
+      ['--alias-taken', '--alias', 'juno.web'],
+    ]) {
+      const contradicted = await resume(...flags);
+      expect(contradicted.exit, flags.join(' ')).not.toBe(0);
+      expect(contradicted.err, flags.join(' ')).toContain('--alias-taken cannot be combined');
+    }
+    const role = await resume('--alias', 'postmaster');
+    expect(role.exit).not.toBe(0);
+    expect(role.err).toContain('role address');
+    expect(decided).toHaveLength(5);
+  });
+
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
@@ -959,10 +1005,11 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(io.out.join('\n')).not.toContain('Paused at');
   });
 
-  it('reports a pause the person stops at, logged against the step that paused', async () => {
+  it('reports a pause the person stops at, where to act, and the step that paused in its log', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
     const io = lines();
+    const pause = { ...CHAT_PAUSE, actionUrl: 'https://console.cloud.google.com/apis/api/chat.googleapis.com' };
 
     expect(
       await runCli(['resume', '--id', input.instance_id], {
@@ -973,11 +1020,12 @@ describe('gws-ea stop summaries and exit codes', () => {
         advanceProvision: async (_operation, { runtime }) => {
           // A later runtime check runs after the step that paused, as before a real human pause.
           await runStep(runtime, { id: 'start_nanoclaw' }, async () => undefined);
-          return { status: 'paused', pause: CHAT_PAUSE };
+          return { status: 'paused', pause };
         },
       }),
     ).toBe(10);
     expect(io.out).toContain(`Paused at configure_channel: ${CHAT_PAUSE.message}`);
+    expect(io.out).toContain(`Open: ${pause.actionUrl}`);
     expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id} --chat-configured`);
     const log = io.out.at(-1)?.replace(/^Log: /u, '') ?? '';
     expect(await readFile(log, 'utf8')).toMatch(/· paused at configure_channel \(chat_configuration_required\)\n$/u);

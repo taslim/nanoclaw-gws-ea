@@ -116,7 +116,7 @@ it('preserves a sanitized native refusal before commit and uncertainty after a c
         requestId: 'refused-after',
         frame: expect.objectContaining({
           ok: true,
-          data: expect.objectContaining({ reason: 'outcome_unknown', repeat_safe: false }),
+          data: expect.objectContaining({ reason: 'unconfirmed', repeat_safe: false }),
         }),
       }),
     ]),
@@ -324,7 +324,7 @@ it('answers pre-crash requests interrupted or unknown once before new workers st
       expect.objectContaining({
         requestId: 'r-unknown',
         frame: expect.objectContaining({
-          data: expect.objectContaining({ reason: 'outcome_unknown', repeat_safe: false }),
+          data: expect.objectContaining({ reason: 'unconfirmed', repeat_safe: false }),
         }),
       }),
     ]),
@@ -466,7 +466,7 @@ it('recovers orphaned started requests without executing them or spinning the dr
       expect.objectContaining({
         requestId: 'orphan-marked',
         frame: expect.objectContaining({
-          data: expect.objectContaining({ reason: 'outcome_unknown', repeat_safe: false }),
+          data: expect.objectContaining({ reason: 'unconfirmed', repeat_safe: false }),
         }),
       }),
     ]),

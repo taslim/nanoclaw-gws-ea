@@ -39,6 +39,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { peopleForgetHandoffFile, writePeopleForgetHandoff } from '../modules/gws-ea-people/forget-handoff.js';
 import { formatLocalTime } from '../timezone.js';
 import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.js';
+import { assertBrowserPolicyReadable } from './browser-capability.js';
 import { committedTree } from './checkout.js';
 import {
   assistantImageDocker,
@@ -913,7 +914,7 @@ async function rolledBack(
  * started (`targetMayHaveStarted`) is rolled back by the rollback rules, from
  * the snapshot it took, the rollback replacing its record in one write so the
  * gate never lifts. One with no release to return to is refused: it is fixed
- * forward.
+ * forward, as is one whose release cannot read the browser policy.
  */
 async function revertOpenUpdate(
   operation: InstanceOperation,
@@ -929,6 +930,11 @@ async function revertOpenUpdate(
     );
   }
   const host = await openCutoverHost(operation, dependencies);
+  await assertBrowserPolicyReadable(
+    host.runtime,
+    host.layout.release(releaseName(update.from.deployed_commit)),
+    releaseLine(update.from),
+  );
   if (!targetMayHaveStarted(update)) {
     await serveLeftRelease(host, update);
     await discardOperation(operation);
@@ -944,8 +950,9 @@ async function revertOpenUpdate(
 /**
  * Roll the committed release back to the rollback point (KTD4). Every
  * refusal comes before anything changes: no rollback point, its release not
- * kept whole, the assistant not running the release the registry names, or a
- * snapshot restore nobody can confirm. The release's agent image is provided
+ * kept whole, the assistant not running the release the registry names, a
+ * browser policy that release cannot read, or a snapshot restore nobody can
+ * confirm. The release's agent image is provided
  * first, rebuilt hermetically when it is gone (KTD6).
  */
 async function rollBackCommitted(
@@ -968,6 +975,7 @@ async function rollBackCommitted(
   }
   const name = releaseName(to.deployed_commit);
   if (!(await isReleaseComplete(layout, name))) throw unavailable(`no longer keeps ${releaseLine(to)} whole`);
+  await assertBrowserPolicyReadable(runtime, layout.release(name), releaseLine(to));
   await runStep(
     host.reporter,
     { id: 'prepare_agent_image', label: "Preparing the previous release's agent image…" },

@@ -1,10 +1,10 @@
 /**
  * The principal's access to the assistant's 1Password vault (KTD4, R4-R6,
- * R16). Canonical main alone asks, through its host request and guard. The
- * host binds the account and vault from its own records and shares only with
- * the principal's exact, confirmed 1Password user, through the host
- * management service account, which may grant access only on the vaults it
- * created. Actual access is read before any grant and after it, so a repeat
+ * R16). An agent with browser access asks, through its host request and
+ * guard. The host binds the account and vault from its own records and
+ * shares only with the principal's exact, confirmed 1Password user, through
+ * the host management service account, which may grant access only on the
+ * vaults it created. Actual access is read before any grant and after it, so a repeat
  * is safe and an unknown outcome is observed before anything is granted
  * again. A share answers with the link to the account's sign-in address and
  * the vault's exact name, which 1Password lists in the account's sidebar:
@@ -28,12 +28,13 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import {
+  assistantOwnAddresses,
   getGwsEaProfile,
-  getMainAgentGroupId,
   isVerifiedPrincipalUser,
   listPrincipalAddresses,
   principalApproverUserId,
 } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 import {
   OnePasswordCli,
   type OnePasswordFailureReason,
@@ -127,21 +128,22 @@ const DEFAULT_DEPENDENCIES: VaultAccessDependencies = {
   openProvider: cliSharingProvider,
 };
 
-async function isCanonicalMain(actor: GuardActor): Promise<boolean> {
-  return actor.kind === 'agent' && actor.agentGroupId === (await getMainAgentGroupId());
+/** An agent the browser access setting names: it uses the vault's logins, so it may share them with the principal. */
+async function mayManageVault(actor: GuardActor): Promise<boolean> {
+  return actor.kind === 'agent' && (await hasBrowserAccess(actor.agentGroupId));
 }
 
 function agentActor(session: Session): GuardActor {
   return { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id };
 }
 
-/** Canonical main serves only the principal's own conversation, so its request carries their intent. */
+/** The vault is shared only with the principal's own 1Password user, whichever agent with browser access asks. */
 export const vaultAccessGuard = defineGuardedAction({
   action: 'gws_ea_browser.vault_access',
   async decide({ actor }) {
-    return (await isCanonicalMain(actor))
-      ? ALLOW("Canonical main serves only the principal's conversation.")
-      : DENY("Only main manages the principal's access to the assistant's 1Password vault.");
+    return (await mayManageVault(actor))
+      ? ALLOW("An agent with browser access asks to share the vault with the principal's own 1Password user.")
+      : DENY("Only an agent with browser access manages the principal's access to the assistant's 1Password vault.");
   },
 });
 
@@ -154,8 +156,10 @@ const vaultEmailGuard = defineGuardedAction({
   grantCoversRequest: (grant, input) =>
     typeof input.payload.email === 'string' && grant.payload === JSON.stringify(emailPayload(input.payload.email)),
   async decide({ actor }) {
-    if (!(await isCanonicalMain(actor)))
-      return DENY("Only main manages the principal's access to the assistant's 1Password vault.");
+    if (!(await mayManageVault(actor)))
+      return DENY(
+        "Only an agent with browser access manages the principal's access to the assistant's 1Password vault.",
+      );
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal confirms an email that is not one of their addresses.', principal)
@@ -350,8 +354,8 @@ async function recipient(value: unknown): Promise<Recipient> {
   const email = typeof value === 'string' ? normalizePrincipalEmail(value) : undefined;
   // Never read as a flag by the provider's CLI.
   if (email === undefined || email.startsWith('-')) throw invalidArgs('email must be one email address.');
-  const assistant = (await getGwsEaProfile()).assistant_workspace_email;
-  if (assistant !== null && identityMatchKey(`email:${email}`) === identityMatchKey(`email:${assistant}`))
+  const key = identityMatchKey(`email:${email}`);
+  if (assistantOwnAddresses(await getGwsEaProfile()).some((own) => identityMatchKey(`email:${own}`) === key))
     throw forbidden("That is the assistant's own address: the vault is shared only with the principal.");
   return { kind: resolvePrincipalAddress(email, listed) === undefined ? 'other' : 'principal', email };
 }

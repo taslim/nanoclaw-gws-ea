@@ -106,6 +106,11 @@ const probes = object({
     last: nullable(object({ status: text, message_out_id: text, at: time })),
     retrying: nullable(count),
   }),
+  web_alias: probe({
+    state: nullable(choices('not_needed', 'pending', 'verified')),
+    address: nullable(text),
+    probe_sent: effect,
+  }),
   voice: probe({
     enabled: effect,
     assets: choices('verified', 'absent', 'invalid', 'unknown'),
@@ -221,11 +226,26 @@ export const VOICE_CAPABILITY_SCHEMA = object({
   unknown_assistant_ids: array(text),
   future_compatible_assistants: { const: true },
 });
+const pause = object(
+  {
+    phase: PROVISION_PHASE_SCHEMA,
+    code: ERROR_CODE_SCHEMA,
+    message: text,
+    details: array(text),
+    actionUrl: text,
+    resumeFlag: RESUME_FLAGS_SCHEMA,
+    choices: array(object({ id: text, label: text })),
+  },
+  ['phase', 'code', 'message'],
+);
 const browserMetadata = {
   name: { const: 'browser' },
   scope: { const: 'assistant' },
   actions: array(choices(...BROWSER_CAPABILITY.actions)),
   summary: text,
+};
+const browserAccess = {
+  oneOf: [object({ version: { const: 1 } }), object({ version: { const: 2 }, agent_group_ids: array(text) })],
 };
 export const BROWSER_CAPABILITY_SCHEMA = object({
   ...browserMetadata,
@@ -241,13 +261,12 @@ export const BROWSER_CAPABILITY_SCHEMA = object({
   }),
   isolation: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
   ready: bool,
+  access: nullable(browserAccess),
 });
-export const BROWSER_OPERATION_SCHEMA = object({
-  ...browserMetadata,
-  instance_id: text,
-  enabled: bool,
-  changed: bool,
-});
+export const BROWSER_OPERATION_SCHEMA = object(
+  { ...browserMetadata, instance_id: text, enabled: bool, changed: bool, access: browserAccess, pause },
+  [...Object.keys(browserMetadata), 'instance_id', 'enabled', 'changed', 'access'],
+);
 const onePasswordMetadata = {
   name: { const: 'onepassword' },
   scope: { const: 'host' },
@@ -364,18 +383,6 @@ export const VOICE_OPERATION_SCHEMA = object(
     future_compatible_assistants: { const: true },
   },
   ['name', 'scope'],
-);
-const pause = object(
-  {
-    phase: PROVISION_PHASE_SCHEMA,
-    code: ERROR_CODE_SCHEMA,
-    message: text,
-    details: array(text),
-    actionUrl: text,
-    resumeFlag: RESUME_FLAGS_SCHEMA,
-    choices: array(object({ id: text, label: text })),
-  },
-  ['phase', 'code', 'message'],
 );
 const cleanup = object(
   { checkout: text, removed: array(text), incomplete: bool, error: object({ code: ERROR_CODE_SCHEMA, message: text }) },

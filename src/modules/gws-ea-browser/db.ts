@@ -4,6 +4,8 @@ import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import type { Session } from '../../types.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 
 export interface BrowserJob {
   id: string;
@@ -56,17 +58,24 @@ export class BrowserStore {
     return this.db.get<BrowserJob>('SELECT * FROM gws_ea_browser_jobs WHERE id = ?', id);
   }
 
+  /** The live job of an errand from a group that may use the browser; its row is created on first use. */
   async jobForSession(session: Session, create = true): Promise<BrowserJob | undefined> {
-    const profile = await this.db.get<{ main_agent_group_id: string | null; browser_agent_group_id: string | null }>(
-      'SELECT main_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
-    );
-    const main = profile?.main_agent_group_id;
+    return (await hasBrowserAccess(errandSource(session.thread_id))) ? this.errandJob(session, create) : undefined;
+  }
+
+  /**
+   * The live job of a browser errand, whichever group opened it: the host
+   * cancels the errands of a group whose access ended through this.
+   */
+  async errandJob(session: Session, create = true): Promise<BrowserJob | undefined> {
+    const thread = session.thread_id;
+    const source = errandSource(thread);
     if (
-      !main ||
-      session.agent_group_id !== profile.browser_agent_group_id ||
+      thread === null ||
+      source === undefined ||
+      session.agent_group_id !== (await getBrowserAgentGroupId()) ||
       session.status !== 'active' ||
-      session.messaging_group_id !== null ||
-      !session.thread_id?.startsWith(`system:a2a:${main}:`)
+      session.messaging_group_id !== null
     )
       return undefined;
     const current = await this.db.get<Session>('SELECT * FROM sessions WHERE id = ?', session.id);
@@ -74,7 +83,7 @@ export class BrowserStore {
       !current ||
       current.status !== 'active' ||
       current.agent_group_id !== session.agent_group_id ||
-      current.thread_id !== session.thread_id ||
+      current.thread_id !== thread ||
       current.messaging_group_id !== null
     )
       return undefined;
@@ -83,15 +92,15 @@ export class BrowserStore {
       await this.db.run(
         `INSERT INTO gws_ea_browser_jobs(id,thread_id,browser_session_id,source_agent_group_id,created_at,updated_at)
          VALUES(?,?,?,?,?,?) ON CONFLICT(thread_id) DO NOTHING`,
-        session.thread_id,
-        session.thread_id,
+        thread,
+        thread,
         session.id,
-        main,
+        source,
         now,
         now,
       );
     }
-    const job = await this.getJob(session.thread_id);
+    const job = await this.getJob(thread);
     return job?.browser_session_id === session.id && job.cancelled === 0 ? job : undefined;
   }
 

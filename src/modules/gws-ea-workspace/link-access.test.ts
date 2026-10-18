@@ -21,7 +21,11 @@ import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError }
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { audienceForAddresses } from '../gws-ea-privacy/audience.js';
 import { addPrincipalAddress, principalRecognizer } from '../gws-ea-profile/db.js';
-import { gwsEaPrincipalAddressesMigration, gwsEaProfileMigration } from '../gws-ea-profile/migration.js';
+import {
+  gwsEaPrincipalAddressesMigration,
+  gwsEaProfileMigration,
+  gwsEaWebAliasMigration,
+} from '../gws-ea-profile/migration.js';
 import {
   checkLinksOpenable,
   createLinkAccess,
@@ -46,9 +50,11 @@ const DECK_TYPE = 'application/vnd.google-apps.presentation';
 const RSVP = 'https://docs.google.com/forms/d/e/1FAIpQLSdRsvpSpring/viewform';
 const OPERATOR = "the assistant's Google sign-in doesn't include Drive yet; the operator needs to reconnect it";
 
-// The profile's tables alone, so the host's own check reads the principal's addresses as the privacy check does.
+// The profile's tables alone, so the host's own check reads the principal's addresses as the privacy check does;
+// adding one reads the assistant's own addresses, its web alias among them.
 registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
+registerMigration(gwsEaWebAliasMigration);
 
 const docUrl = (id: string) => `https://docs.google.com/document/d/${id}/edit`;
 const deckUrl = (id: string) => `https://docs.google.com/presentation/d/${id}/edit`;

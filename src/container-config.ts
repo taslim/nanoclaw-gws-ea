@@ -11,7 +11,12 @@
 import fs from 'fs';
 import path from 'path';
 
-import { MCP_SERVERS_CAPABILITY, parseStoredCapabilities, resolveCapabilities } from './capabilities.js';
+import {
+  grantCapabilities,
+  MCP_SERVERS_CAPABILITY,
+  parseStoredCapabilities,
+  resolveCapabilities,
+} from './capabilities.js';
 import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -425,7 +430,9 @@ export async function materializeContainerJson(agentGroupId: string): Promise<Co
   const row = await getContainerConfig(agentGroupId);
   if (!row) throw new Error(`Container config not found for agent group: ${agentGroupId}`);
 
-  const config = configFromDb(row, group);
+  const stored = configFromDb(row, group);
+  // The keys a module's setting grants are decided now, beside what the group stores.
+  const config = { ...stored, capabilities: await grantCapabilities(stored.capabilities, group.id) };
 
   const p = path.join(GROUPS_DIR, group.folder, 'container.json');
   const dir = path.dirname(p);

@@ -43,6 +43,11 @@ export function withinTime<T>(work: Promise<T>, ms: number): Promise<T> {
   ]).finally(() => clearTimeout(timer));
 }
 
+/** A protocol read, bounded by PROTOCOL_READ_TIMEOUT_MS unless `ms` says otherwise. */
+export function bounded<T>(work: Promise<T>, ms = PROTOCOL_READ_TIMEOUT_MS): Promise<T> {
+  return withinTime(work, ms);
+}
+
 /**
  * Every frame the page's targets host now, each mapped to the target hosting it, read through any
  * setting's sessions; undefined when the page's targets cannot all be read.
@@ -75,9 +80,165 @@ export async function ensurePageTargets(page: Page): Promise<void> {
   await pending;
 }
 
-interface FrameTreeNode {
-  frame: { id: string };
+/** A frame as a target's frame tree lists it. */
+export interface TreeFrame {
+  id: string;
+  parentId?: string;
+  loaderId: string;
+  url: string;
+}
+export interface FrameTreeNode {
+  frame: TreeFrame;
   childFrames?: FrameTreeNode[];
+}
+
+/** Every frame a target's frame tree lists: its own frame first, each frame before the frames it holds. */
+export function frameTreeFrames(tree: FrameTreeNode): TreeFrame[] {
+  return [tree.frame, ...(tree.childFrames ?? []).flatMap(frameTreeFrames)];
+}
+
+/** Playwright opens no CDP session for an in-process frame: its local root's session hosts it. */
+export function sharesTargetSession(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('does not have a separate CDP session');
+}
+
+/**
+ * A CDP session on the target hosting `frame`: its own, or for an in-process frame its nearest ancestor's,
+ * with the frame that target is. Undefined when no frame up to the page has a session of its own. `ms`
+ * bounds each attempt.
+ */
+export async function attachFrameTarget(
+  frame: Frame,
+  ms?: number,
+): Promise<{ session: CDPSession; owner: Frame } | undefined> {
+  for (let owner: Frame | null = frame; owner; owner = owner.parentFrame()) {
+    try {
+      const opening = frame.page().context().newCDPSession(owner);
+      return { session: await (ms === undefined ? opening : withinTime(opening, ms)), owner };
+    } catch (error) {
+      if (!sharesTargetSession(error)) throw error;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * One CDP session per target, opened together: the page's, first and under its main frame, and each
+ * out-of-process frame's; an in-process frame shares its local root's. Any other frame that cannot be opened
+ * fails the opening unless `leaveOut` leaves it unread; the page's own session never can be. Undefined on a
+ * failure, every session opened detached again.
+ */
+export async function openTargetSessions(
+  page: Page,
+  leaveOut: (frame: Frame) => boolean,
+): Promise<Map<Frame, CDPSession> | undefined> {
+  const frames = page.frames().filter((frame) => frame !== page.mainFrame());
+  const opened = await Promise.allSettled([
+    bounded(page.context().newCDPSession(page)),
+    ...frames.map((frame) => bounded(page.context().newCDPSession(frame))),
+  ]);
+  const sessions = new Map<Frame, CDPSession>();
+  let failed = false;
+  opened.forEach((attempt, index) => {
+    const frame = index === 0 ? page.mainFrame() : frames[index - 1];
+    if (attempt.status === 'fulfilled') sessions.set(frame, attempt.value);
+    else if (index === 0 || !(sharesTargetSession(attempt.reason) || leaveOut(frame))) failed = true;
+  });
+  if (!failed) return sessions;
+  await Promise.all([...sessions.values()].map((session) => session.detach().catch(() => undefined)));
+  return undefined;
+}
+
+/** A reader the host installs in a fresh isolated world of each frame it reads, as a global there. */
+export interface IsolatedReader {
+  readonly world: string;
+  readonly global: string;
+  /** Plain JavaScript that evaluates to the reader. */
+  readonly source: string;
+}
+
+/**
+ * Installs the reader in a fresh isolated world of the frame, so page script cannot answer for it: the world's
+ * context, or undefined when the reader did not install.
+ */
+export async function installReader(
+  session: CDPSession,
+  frameId: string,
+  reader: IsolatedReader,
+): Promise<number | undefined> {
+  const { executionContextId } = await bounded(
+    session.send('Page.createIsolatedWorld', { frameId, worldName: reader.world }),
+  );
+  const installed = await bounded(
+    session.send('Runtime.evaluate', {
+      contextId: executionContextId,
+      expression: `globalThis.${reader.global} = ${reader.source}; true`,
+      returnByValue: true,
+    }),
+  );
+  return installed.exceptionDetails || installed.result.value !== true ? undefined : executionContextId;
+}
+
+/** A frame one of a read's sessions hosts, with the isolated world its reader is installed in. */
+export interface HostedFrame {
+  readonly id: string;
+  readonly parentId?: string;
+  readonly url: string;
+  readonly session: CDPSession;
+  readonly context: number;
+}
+
+/** Which failures leave part of a read unread, rather than failing the read. */
+export interface ReadTolerance {
+  /** Whether a frame session whose frame tree cannot be read leaves its frames unread; the page's tree never can. */
+  readonly unreadTree: boolean;
+  /** Whether a frame the reader could not be installed in, for this failure, is left unread. */
+  readonly unreadFrame: (error: unknown) => boolean;
+}
+
+/**
+ * The reader, installed in a fresh isolated world of every frame the sessions host (the page's session first),
+ * each frame read through the first session whose tree lists it; with the page's main frame as its tree lists it.
+ */
+export async function installReaders(
+  sessions: Iterable<CDPSession>,
+  reader: IsolatedReader,
+  tolerance: ReadTolerance,
+): Promise<{ main?: TreeFrame; frames: Map<string, HostedFrame> }> {
+  const listed = new Map<string, Omit<HostedFrame, 'context'>>();
+  let main: TreeFrame | undefined;
+  for (const session of sessions) {
+    let frameTree: FrameTreeNode;
+    try {
+      ({ frameTree } = await bounded(session.send('Page.getFrameTree')));
+    } catch (error) {
+      // The page's own tree, read first, is always required.
+      if (!main || !tolerance.unreadTree) throw error;
+      continue;
+    }
+    main ??= frameTree.frame;
+    for (const frame of frameTreeFrames(frameTree))
+      if (!listed.has(frame.id))
+        listed.set(frame.id, {
+          id: frame.id,
+          ...(frame.parentId ? { parentId: frame.parentId } : {}),
+          url: frame.url,
+          session,
+        });
+  }
+  const frames = new Map<string, HostedFrame>();
+  await Promise.all(
+    [...listed.values()].map(async (hosted) => {
+      try {
+        const context = await installReader(hosted.session, hosted.id, reader);
+        if (context === undefined) throw new Error('The reader did not install');
+        frames.set(hosted.id, { ...hosted, context });
+      } catch (error) {
+        if (!tolerance.unreadFrame(error)) throw error;
+      }
+    }),
+  );
+  return { ...(main ? { main } : {}), frames };
 }
 
 /**
@@ -112,10 +273,9 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
         frameSession = await page.context().newCDPSession(frame);
         // eslint-disable-next-line no-catch-all/no-catch-all -- Any other attach failure is retried, then reported uncovered.
       } catch (error) {
-        const message = error instanceof Error ? error.message : '';
         // Playwright opens no session for an in-process frame, which its local root's session already covers.
-        if (message.includes('does not have a separate CDP session')) return 'shared';
-        if (message.includes('No target with given id found')) return 'gone';
+        if (sharesTargetSession(error)) return 'shared';
+        if (error instanceof Error && error.message.includes('No target with given id found')) return 'gone';
         continue;
       }
       let live = true;
@@ -191,11 +351,7 @@ export async function coverPageTargets(page: Page, setup: (session: CDPSession) 
       if (tree === null) continue;
       // A session's tree is rooted at its own target: the page, or an out-of-process frame.
       const host = tree.frame.id;
-      const visit = (node: FrameTreeNode): void => {
-        hosts.set(node.frame.id, host);
-        node.childFrames?.forEach(visit);
-      };
-      visit(tree);
+      for (const frame of frameTreeFrames(tree)) hosts.set(frame.id, host);
     }
     return hosts;
   };
