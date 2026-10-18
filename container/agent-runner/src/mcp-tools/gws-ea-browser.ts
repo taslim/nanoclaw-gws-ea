@@ -389,6 +389,44 @@ export const watch = requestTool({
       additionalProperties: false,
     },
     until: { ...DATE_TIME, description: 'The deadline at which checking ends and the job is notified.' },
+    release: {
+      type: 'object',
+      description:
+        'The venue’s own release schedule, only when it states one: the host checks just after each release on the venue’s clock, then often for a few minutes. Recorded once; it cannot change later.',
+      properties: {
+        wording: { type: 'string', minLength: 1, maxLength: 500, description: 'The venue’s words, quoted.' },
+        days_ahead: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 366,
+          description: 'Tables for a date open this many days before it.',
+        },
+        day_of_month: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 31,
+          description: 'Tables open on this day of the month, with months_ahead.',
+        },
+        months_ahead: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 12,
+          description: 'How many months before the date’s month that day falls.',
+        },
+        time: {
+          type: 'string',
+          pattern: '^(?:[01]\\d|2[0-3]):[0-5]\\d$',
+          description: 'The release time, 24-hour HH:MM on the venue’s clock.',
+        },
+        time_zone: {
+          type: 'string',
+          description: 'The venue’s IANA timezone, such as Asia/Tokyo; the host’s own reading of the site comes first.',
+        },
+      },
+      required: ['wording', 'time'],
+      oneOf: [{ required: ['days_ahead'] }, { required: ['day_of_month', 'months_ahead'] }],
+      additionalProperties: false,
+    },
   },
   required: ['site', 'recipe_id', 'parameters', 'venue', 'party_size', 'windows', 'financial', 'until'],
   additionalProperties: false,

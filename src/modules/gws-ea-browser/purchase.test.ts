@@ -41,7 +41,12 @@ import { BrowserQueue } from './queue.js';
 import { readMerchantPurchase, AMAZON_RETAIL } from './merchant-signatures.js';
 import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
-import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits, validatePurchaseRequest } from './purchase.js';
+import {
+  purchaseBounds,
+  registerBrowserPurchaseDelivery,
+  resumeBrowserPurchaseCommits,
+  validatePurchaseRequest,
+} from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
@@ -261,6 +266,24 @@ it('accepts delivery bounds with UTC offsets, keeping window dates as written an
       delivery_window: { start: '2026-10-14T00:00:00Z', end: '2026-10-12T00:00:00Z' },
     }),
   ).toThrow('ordered');
+});
+
+it('reads a date-only needed-by as the end of that day on the principal’s clock', () => {
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'America/Los_Angeles')).toEqual({
+    neededBy: '2026-10-21T06:59:59.999Z',
+    principalTimeZone: 'America/Los_Angeles',
+  });
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'Asia/Tokyo')).toEqual({
+    neededBy: '2026-10-20T14:59:59.999Z',
+    principalTimeZone: 'Asia/Tokyo',
+  });
+  expect(purchaseBounds({ needed_by: '2026-10-14T17:00:00.000Z' }, 'Asia/Tokyo')).toEqual({
+    neededBy: '2026-10-14T17:00:00.000Z',
+    principalTimeZone: 'Asia/Tokyo',
+  });
+  expect(purchaseBounds({ delivery_window: { start: '2026-10-12', end: '2026-10-14' } }, 'Asia/Tokyo')).toEqual({
+    deliveryWindow: { start: '2026-10-12', end: '2026-10-14' },
+  });
 });
 
 describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', () => {

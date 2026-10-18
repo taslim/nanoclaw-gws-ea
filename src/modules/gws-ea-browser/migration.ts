@@ -82,6 +82,18 @@ export const browserWatchesMigration: PortableMigration & { name: ModuleMigratio
   },
 };
 
+/**
+ * A venue's release schedule, written once when its watch is created and outside the
+ * bounds the principal approves. Watches set before it have none.
+ */
+export const browserWatchReleaseMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watch-release',
+  async up(db) {
+    await db.exec('ALTER TABLE gws_ea_browser_watches ADD COLUMN release_json TEXT;');
+  },
+};
+
 /** A recipe id is immutable; saving the same task appends a version for future errands. */
 export const browserRecipesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,

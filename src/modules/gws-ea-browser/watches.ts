@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { TIMEZONE } from '../../config.js';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -9,7 +8,7 @@ import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { requestWake } from '../../request-wake.js';
 import { writeBrowserNotice } from './notices.js';
-import { formatLocalTime } from '../../timezone.js';
+import { ianaTimezone } from '../../timezone.js';
 import type { PendingApproval } from '../../types.js';
 import {
   detachApproval,
@@ -22,7 +21,7 @@ import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-fact
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
-import { quotePurchaseText } from './cards.js';
+import { cardEventSpan, cardTime, quotePurchaseText } from './cards.js';
 import { browserSite } from './leases.js';
 import {
   amountMinor,
@@ -37,7 +36,13 @@ import type { ReservationPolicy } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
 import { loadRecipe, recipeCheckKey, executeRecipe, type BrowserRecipe } from './recipes.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
-import { principalClock, watchQuietUntil, watchSitePolicy } from './watch-policy.js';
+import {
+  principalClock,
+  releaseInstants,
+  watchSitePolicy,
+  watchStartAt,
+  type WatchReleaseRule,
+} from './watch-policy.js';
 
 export interface WatchFinancialBounds {
   freeOnly: boolean;
@@ -82,6 +87,8 @@ export interface WatchRow {
   pending_request_id: string | null;
   booking_recipe_id: string | null;
   booking_recipe_version: number | null;
+  /** The venue's release schedule, written once at creation; null when the venue states none. */
+  release_json: string | null;
   created_at: string;
   updated_at: string;
   next_check_at: string;
@@ -113,6 +120,17 @@ export function watchSlotKey(slot: ReservationFacts): string {
 }
 export const getBrowserWatch = (id: string, db: DbDriver = getDb()): Promise<WatchRow | undefined> =>
   db.get<WatchRow>('SELECT * FROM gws_ea_browser_watches WHERE id = ?', id);
+/** The release instants a watch's recorded rule sets for its windows; none without a rule. */
+export function watchReleases(watch: WatchRow): number[] {
+  if (!watch.release_json) return [];
+  const bounds = boundsOf(watch);
+  return releaseInstants(
+    JSON.parse(watch.release_json) as WatchReleaseRule,
+    bounds.windows,
+    Date.parse(watch.created_at),
+    Date.parse(bounds.until),
+  );
+}
 
 /** Start windows constrain arrival; the full host-read duration is checked against the calendar. */
 export function compareWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now: string): WatchBoundResult {
@@ -574,6 +592,13 @@ export async function linkWatchBookingRecipe(context: BrowserExecutionContext, r
   }
 }
 
+interface WatchReleaseInput {
+  schedule: WatchReleaseRule['schedule'];
+  time: string;
+  wording: string;
+  /** The agent's reading of the venue's zone; the host's own read outranks it. */
+  timeZone?: string;
+}
 interface WatchInput extends Record<string, unknown> {
   site: string;
   recipe_id: string;
@@ -583,11 +608,48 @@ interface WatchInput extends Record<string, unknown> {
   windows: Array<{ start: string; end: string }>;
   financial: { currency: string; max_total: string; terms: string };
   until: string;
+  release?: WatchReleaseInput;
 }
 function offsetInstant(value: unknown): string {
   const parsed = readIsoTime(value, 'required');
   if (!parsed) throw invalidArgs('Watch times need real ISO dates and times with explicit UTC offsets.');
   return parsed;
+}
+const RELEASE_FIELDS = ['wording', 'time', 'time_zone', 'days_ahead', 'day_of_month', 'months_ahead'];
+const RELEASE_RULE =
+  'A release rule needs the venue’s own wording, a time as HH:MM on its clock, and days_ahead, or day_of_month with months_ahead.';
+const wholeBetween = (value: unknown, min: number, max: number): value is number =>
+  Number.isSafeInteger(value) && Number(value) >= min && Number(value) <= max;
+function validateRelease(raw: unknown): WatchReleaseInput {
+  if (
+    !isRecord(raw) ||
+    Object.keys(raw).some((key) => !RELEASE_FIELDS.includes(key)) ||
+    typeof raw.wording !== 'string' ||
+    !raw.wording.trim() ||
+    raw.wording.length > 500 ||
+    typeof raw.time !== 'string' ||
+    !/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(raw.time)
+  )
+    throw invalidArgs(RELEASE_RULE);
+  let schedule: WatchReleaseRule['schedule'];
+  if (raw.day_of_month === undefined && raw.months_ahead === undefined && wholeBetween(raw.days_ahead, 0, 366))
+    schedule = { kind: 'days_ahead', days: raw.days_ahead };
+  else if (
+    raw.days_ahead === undefined &&
+    wholeBetween(raw.day_of_month, 1, 31) &&
+    wholeBetween(raw.months_ahead, 0, 12)
+  )
+    schedule = { kind: 'monthly', day: raw.day_of_month, monthsAhead: raw.months_ahead };
+  else throw invalidArgs(RELEASE_RULE);
+  const timeZone = typeof raw.time_zone === 'string' ? ianaTimezone(raw.time_zone) : undefined;
+  if (raw.time_zone !== undefined && !timeZone)
+    throw invalidArgs('A release time_zone must be an IANA zone, such as Asia/Tokyo.');
+  return { schedule, time: raw.time, wording: raw.wording.trim(), ...(timeZone ? { timeZone } : {}) };
+}
+/** The rule as stored: on the venue's zone as the host read it from the site, or else as the agent gave it. */
+function watchReleaseRule(input: WatchReleaseInput, hostTimeZone: string | undefined): WatchReleaseRule | undefined {
+  const timeZone = hostTimeZone ?? input.timeZone;
+  return timeZone ? { schedule: input.schedule, time: input.time, timeZone, wording: input.wording } : undefined;
 }
 export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
   if (
@@ -604,6 +666,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
           'windows',
           'financial',
           'until',
+          'release',
           'budget_ms',
         ].includes(key),
     )
@@ -652,6 +715,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
   });
   const until = offsetInstant(raw.until);
   if (until <= new Date().toISOString()) throw invalidArgs('Watch deadline has already passed.');
+  const release = raw.release === undefined ? undefined : validateRelease(raw.release);
   return {
     site: raw.site,
     recipe_id: raw.recipe_id,
@@ -661,6 +725,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     windows,
     financial: { currency: financial.currency, max_total: financial.max_total, terms: financial.terms },
     until,
+    ...(release ? { release } : {}),
   };
 }
 const watchSetupGuard = defineGuardedAction({
@@ -698,7 +763,8 @@ const watchSetupGuard = defineGuardedAction({
       : DENY('No verified principal can approve the watch.');
   },
 });
-function renderWatchCard(watch: WatchRow): string {
+/** Arrival windows read on the venue's clock; conversions and the deadline on the principal's. */
+export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principalTimeZone: string): string {
   const bounds = boundsOf(watch),
     financial = bounds.financial;
   return [
@@ -707,16 +773,15 @@ function renderWatchCard(watch: WatchRow): string {
     `Venue: ${quotePurchaseText(bounds.venue.name)}; merchant identity ${quotePurchaseText(bounds.venue.id)}`,
     `Party size: ${bounds.partySize}`,
     ...bounds.windows.map(
-      (window) =>
-        `Arrival window: ${formatLocalTime(window.start, TIMEZONE)} through ${formatLocalTime(window.end, TIMEZONE)}`,
+      (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
     ),
     `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
     `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
     ...financial.policy!.commitments.map(
       (term) =>
-        `Merchant financial terms: ${quotePurchaseText(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quotePurchaseText(term.trigger ?? '')}; cancellation ${quotePurchaseText(term.cancellationTerms ?? '')}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quotePurchaseText(term.frequency)}` : ''}${term.conversionAt ? `; converts ${term.conversionAt}` : ''}`,
+        `Merchant financial terms: ${quotePurchaseText(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quotePurchaseText(term.trigger ?? '')}; cancellation ${quotePurchaseText(term.cancellationTerms ?? '')}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quotePurchaseText(term.frequency)}` : ''}${term.conversionAt ? `; converts ${cardTime(term.conversionAt, principalTimeZone)}` : ''}`,
     ),
-    `Watch deadline: ${formatLocalTime(bounds.until, TIMEZONE)}`,
+    `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
   ].join('\n');
 }
 export async function createBrowserWatch(
@@ -752,6 +817,8 @@ export async function createBrowserWatch(
     setup.availability.currency !== input.financial.currency
   )
     return { status: 'refused', reason: 'venue_unavailable' };
+  const release = input.release && watchReleaseRule(input.release, setup.availability.timeZone);
+  if (input.release && !release) return { status: 'refused', reason: 'release_zone_unknown' };
   const maxTotalMinor = amountMinor(input.financial.max_total, input.financial.currency)!;
   const freeOnly = maxTotalMinor === 0;
   const policy = setup.policy;
@@ -811,7 +878,7 @@ export async function createBrowserWatch(
       context.job.id,
     );
     await db.run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id,
       context.job.id,
       site,
@@ -820,6 +887,7 @@ export async function createBrowserWatch(
       JSON.stringify(input.parameters),
       recipeCheckKey(recipe, input.parameters),
       JSON.stringify(bounds),
+      release ? JSON.stringify(release) : null,
       freeOnly ? 'armed' : 'awaiting_principal',
       at,
       at,
@@ -858,13 +926,14 @@ export async function createBrowserWatch(
     await db.run("UPDATE gws_ea_browser_watches SET status = 'cancelled' WHERE id = ?", id);
     return { status: 'refused', reason: 'principal_unavailable' };
   }
+  const question = renderWatchCard(watch, setup.availability.timeZone, await principalClock());
   const approvalId = await requestApproval({
     session: context.session,
     agentName: 'browser',
     action: APPROVAL_ACTION,
     payload: approvalPayload,
     title: 'Approve this reservation watch?',
-    question: renderWatchCard(watch),
+    question,
     approverUserId: decision.approverUserId,
     expiresAt: bounds.until,
     originLine: `From your browser errand ${context.job.thread_id}.`,
@@ -1056,13 +1125,15 @@ registerBrowserQueuedAction('list_watches', {
         id: watch.id,
         status: watch.status,
         bounds: boundsOf(watch),
-        // An armed check also waits out the principal's night, on their clock as it is now.
+        release: watch.release_json ? (JSON.parse(watch.release_json) as WatchReleaseRule) : null,
+        // An armed check also waits out the principal's night, on their clock as it is now, unless a release comes first.
         next_check_at:
           watch.status === 'armed'
             ? new Date(
-                watchQuietUntil(
+                watchStartAt(
                   watchSitePolicy(watch.site),
                   Math.max(Date.parse(watch.next_check_at), now),
+                  watchReleases(watch),
                   principalTimeZone,
                 ),
               ).toISOString()

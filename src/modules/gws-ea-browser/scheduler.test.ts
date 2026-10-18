@@ -22,7 +22,7 @@ import { browserWatchesMigration } from './migration.js';
 import { createBrowserWatchScheduler } from './scheduler.js';
 import type { WatchBounds } from './watches.js';
 import type { ReservationAvailability } from './merchant-contract.js';
-import { watchInterval, watchSitePolicy } from './watch-policy.js';
+import { nextWatchCheck, watchSitePolicy, type WatchReleaseRule, type WatchSitePolicy } from './watch-policy.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
 import * as profile from '../gws-ea-profile/db.js';
 import { setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
@@ -456,14 +456,17 @@ it('keeps hourly and daily caps shared across parameters, and never repeats an i
   expect(checks).toBe(1);
   let previous: number | null = null;
   for (let i = 0; i < 20; i++) {
-    const interval = watchInterval(policy, now, now + 60_000, previous, () => 0);
+    const { interval } = nextWatchCheck(policy, now, now + 60_000, [], previous, () => 0);
     expect(interval).toBeGreaterThanOrEqual(policy.floorMs);
     expect(interval).not.toBe(previous);
     previous = interval;
   }
 });
 
-function countingScheduler(): { scheduler: ReturnType<typeof createBrowserWatchScheduler>; checks: () => number } {
+function countingScheduler(policy?: (site: string) => WatchSitePolicy): {
+  scheduler: ReturnType<typeof createBrowserWatchScheduler>;
+  checks: () => number;
+} {
   let checks = 0;
   const empty = availability();
   empty.slots = [];
@@ -474,6 +477,7 @@ function countingScheduler(): { scheduler: ReturnType<typeof createBrowserWatchS
     },
     calendar: freeCalendar,
     random: () => 0.5,
+    ...(policy ? { policy } : {}),
   });
   return { scheduler, checks: () => checks };
 }
@@ -617,4 +621,85 @@ it('uses an authenticated notify only once within the floor and site caps', asyn
   await scheduler.tick();
   expect(checks).toBe(2);
   expect(await getDb().all('SELECT outcome_json FROM gws_ea_browser_watch_notices')).toEqual([]);
+});
+
+// "Tables released 30 days ahead at 10:00" at a Tokyo venue, watched for dinner on 24 November, 40 days out.
+const tokyoRelease: WatchReleaseRule = {
+  schedule: { kind: 'days_ahead', days: 30 },
+  time: '10:00',
+  timeZone: 'Asia/Tokyo',
+  wording: 'Tables released 30 days ahead at 10:00',
+};
+async function armTokyoDinner(id: string, site: string, release: WatchReleaseRule | null): Promise<void> {
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,1,'{}',?,?,?,'armed',?,?,?)`,
+    id,
+    jobId,
+    site,
+    `recipe:${site}`,
+    id,
+    JSON.stringify({
+      ...bounds,
+      site,
+      windows: [{ start: '2026-11-24T10:00:00.000Z', end: '2026-11-24T12:00:00.000Z' }],
+      until: '2026-11-24T00:00:00.000Z',
+    }),
+    release ? JSON.stringify(release) : null,
+    at,
+    at,
+    at,
+  );
+}
+/** Ticks every five seconds through the principal's night of 25 October, around 10:00 in Tokyo. */
+async function tickThroughRelease(scheduler: ReturnType<typeof createBrowserWatchScheduler>): Promise<void> {
+  for (let at = Date.parse('2026-10-25T00:55:00Z'); at <= Date.parse('2026-10-25T01:30:00Z'); at += 5_000) {
+    vi.setSystemTime(new Date(at));
+    await scheduler.tick();
+  }
+}
+async function checksStarted(site: string): Promise<string[]> {
+  return (
+    await getDb().all<{ started_at: string }>(
+      'SELECT started_at FROM gws_ea_browser_watch_checks WHERE site=? AND started_at>? ORDER BY started_at',
+      site,
+      '2026-10-20T00:00:00Z',
+    )
+  ).map((row) => row.started_at);
+}
+
+it("checks a few seconds after the venue's release and at the floor through its burst, during the principal's night", async () => {
+  // 01:00 UTC is 05:00 in Dubai, inside the principal's night, and 10:00 in Tokyo.
+  await seedPrincipal('Asia/Dubai');
+  await armTokyoDinner('release', 'resy.com', tokyoRelease);
+  await armTokyoDinner('ordinary', 'opentable.com', null);
+  const { scheduler, checks } = countingScheduler();
+  await scheduler.tick();
+  expect(checks()).toBe(2);
+  await tickThroughRelease(scheduler);
+  const started = await checksStarted('resy.com');
+  expect(started[0]).toBe('2026-10-25T01:00:05.000Z');
+  // At the floor, and only inside the burst; the night holds the rest until morning.
+  for (let i = 1; i < started.length; i++) {
+    const gap = Date.parse(started[i]) - Date.parse(started[i - 1]);
+    expect(gap).toBeGreaterThanOrEqual(watchSitePolicy('resy.com').floorMs);
+    expect(gap).toBeLessThan(watchSitePolicy('resy.com').floorMs + 10_000);
+  }
+  expect(started.length).toBeGreaterThanOrEqual(9);
+  expect(started.at(-1)! < '2026-10-25T01:10:05.000Z').toBe(true);
+  // A watch without a rule keeps the ordinary cadence, which waits out the night.
+  expect(await checksStarted('opentable.com')).toEqual([]);
+});
+
+it('runs a release burst in the principal’s night within the site’s hourly cap', async () => {
+  await seedPrincipal('Asia/Dubai');
+  await armTokyoDinner('release', 'resy.com', tokyoRelease);
+  const { scheduler } = countingScheduler((site) => ({ ...watchSitePolicy(site), hourlyCap: 4 }));
+  await scheduler.tick();
+  await tickThroughRelease(scheduler);
+  const started = await checksStarted('resy.com');
+  expect(started[0]).toBe('2026-10-25T01:00:05.000Z');
+  expect(started).toHaveLength(4);
+  // The cap, not the burst, sets the next check: an hour after the first of the four.
+  expect(Date.parse((await nextCheck('release'))!)).toBe(Date.parse(started[0]) + 3_600_000 + 1);
 });

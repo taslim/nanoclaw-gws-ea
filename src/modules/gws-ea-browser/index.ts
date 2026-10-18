@@ -16,6 +16,7 @@ import {
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
+  browserWatchReleaseMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
@@ -57,6 +58,7 @@ registerMigration(browserReservationBoundsMigration);
 registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
+registerMigration(browserWatchReleaseMigration);
 registerMigration(browserCredentialAttemptsMigration);
 
 export class BrowserUnavailableError extends Error {

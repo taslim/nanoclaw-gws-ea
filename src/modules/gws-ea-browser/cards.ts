@@ -1,10 +1,9 @@
-import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
 import { writeBrowserNotice } from './notices.js';
 import { requestWake } from '../../request-wake.js';
-import { formatLocalTime } from '../../timezone.js';
+import { formatLocalTime, resolveTimezone } from '../../timezone.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import type { PendingApproval } from '../../types.js';
 import { formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
@@ -34,10 +33,43 @@ export function quotePurchaseText(text: string, limit = 360): string {
     .trim();
   return JSON.stringify(clean.length > limit ? `${clean.slice(0, limit)}…` : clean);
 }
+/** A zone named as people say it: its city, or the zone's own short name at `at` when it has none. */
+function zoneLabel(timeZone: string, at: string): string {
+  const zone = resolveTimezone(timeZone);
+  const city = /^(?!Etc\/)[A-Za-z]+\/(?:[^/]+\/)?([^/]+)$/u.exec(zone)?.[1];
+  return city
+    ? `${city.replaceAll('_', ' ')} time`
+    : (new Intl.DateTimeFormat('en-US', { timeZone: zone, timeZoneName: 'short' })
+        .formatToParts(new Date(at))
+        .find((part) => part.type === 'timeZoneName')?.value ?? zone);
+}
+/** A moment on the clock of `timeZone`, labelled with it. */
+export function cardTime(at: string, timeZone: string): string {
+  return `${formatLocalTime(at, timeZone)} ${zoneLabel(timeZone, at)}`;
+}
+function cardSpan(start: string, end: string, timeZone: string): string {
+  const from = formatLocalTime(start, timeZone),
+    to = formatLocalTime(end, timeZone);
+  const day = from.slice(0, from.lastIndexOf(', ') + 2);
+  return `${from} through ${to.startsWith(day) ? to.slice(day.length) : to} ${zoneLabel(timeZone, start)}`;
+}
+/**
+ * An event's span on the venue's clock, where it happens, with the principal's equivalent
+ * alongside when their clocks read differently: a 7 PM dinner in Tokyo never reads as 3 AM.
+ */
+export function cardEventSpan(start: string, end: string, venueTimeZone: string, principalTimeZone: string): string {
+  const venue = cardSpan(start, end, venueTimeZone);
+  const sameClock = [start, end].every(
+    (at) => formatLocalTime(at, venueTimeZone) === formatLocalTime(at, principalTimeZone),
+  );
+  return sameClock ? venue : `${venue} (${cardSpan(start, end, principalTimeZone)})`;
+}
+/** Deadlines, charge dates and conversions read on the principal's clock; events on the venue's. */
 export function renderPurchaseCard(
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
   exceptions: readonly string[],
+  principalTimeZone: string,
   change?: string,
 ): string {
   const money = (amount: number): string => formatMoney(amount, facts.currency);
@@ -62,8 +94,7 @@ export function renderPurchaseCard(
       ? [
           `Venue: ${quotePurchaseText(facts.reservation.venueName)}; merchant id ${quotePurchaseText(facts.reservation.venueId)}`,
           `Party size: ${facts.reservation.partySize}`,
-          `Reservation time: ${formatLocalTime(facts.reservation.at, TIMEZONE)} through ${formatLocalTime(facts.reservation.endAt, TIMEZONE)}`,
-          `Venue timezone: ${quotePurchaseText(facts.reservation.timeZone)}`,
+          `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, principalTimeZone)}`,
         ]
       : []),
     facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
@@ -74,7 +105,7 @@ export function renderPurchaseCard(
           `Approved delivery window: ${quotePurchaseText(bounds.deliveryWindow.start)} through ${quotePurchaseText(bounds.deliveryWindow.end)}`,
         ]
       : []),
-    ...(bounds.neededBy ? [`Needed by: ${formatLocalTime(bounds.neededBy, TIMEZONE)}`] : []),
+    ...(bounds.neededBy ? [`Needed by: ${cardTime(bounds.neededBy, principalTimeZone)}`] : []),
   ];
   for (const term of facts.commitments) {
     lines.push(`Financial commitment: ${term.kind}; ${quotePurchaseText(term.terms, 700)}`);
@@ -84,9 +115,9 @@ export function renderPurchaseCard(
       );
     if (term.trigger) lines.push(`Trigger: ${quotePurchaseText(term.trigger)}`);
     if (term.cancellationDeadline)
-      lines.push(`Cancellation deadline: ${formatLocalTime(term.cancellationDeadline, TIMEZONE)}`);
+      lines.push(`Cancellation deadline: ${cardTime(term.cancellationDeadline, principalTimeZone)}`);
     if (term.cancellationTerms) lines.push(`Cancellation terms: ${quotePurchaseText(term.cancellationTerms, 700)}`);
-    if (term.conversionAt) lines.push(`Trial conversion: ${formatLocalTime(term.conversionAt, TIMEZONE)}`);
+    if (term.conversionAt) lines.push(`Trial conversion: ${cardTime(term.conversionAt, principalTimeZone)}`);
     if (term.frequency) lines.push(`Recurring frequency: ${quotePurchaseText(term.frequency)}`);
   }
   if (facts.noCommitmentTerms)

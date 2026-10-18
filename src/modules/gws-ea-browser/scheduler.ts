@@ -12,17 +12,12 @@ import {
   deliverWatchNotices,
   emitWatchNotice,
   expireBrowserWatches,
+  watchReleases,
   watchSlotKey,
   type WatchBounds,
   type WatchRow,
 } from './watches.js';
-import {
-  principalClock,
-  watchInterval,
-  watchQuietUntil,
-  watchSitePolicy,
-  type WatchSitePolicy,
-} from './watch-policy.js';
+import { nextWatchCheck, principalClock, watchSitePolicy, watchStartAt, type WatchSitePolicy } from './watch-policy.js';
 
 export interface BrowserWatchCheckInput {
   id: string;
@@ -189,9 +184,11 @@ export class BrowserWatchScheduler {
       );
       if (Date.parse(first.next_check_at) > now && !notify) continue;
       const policy = this.deps.policy(first.site);
+      // A shared check serves every member's venue release.
+      const releases = watches.flatMap(watchReleases);
       // A due check waits out the principal's night on their clock as it is now, so a timezone they
-      // change holds at once, whichever way it moves the night.
-      if (watchQuietUntil(policy, now, await principalClock()) > now) continue;
+      // change holds at once, whichever way it moves the night; a release burst does not wait.
+      if (watchStartAt(policy, now, releases, await principalClock()) > now) continue;
       const state = await this.reserveCheck(db, watches, policy, Boolean(notify));
       if (!state) continue;
       const id = `watch-check-${randomUUID()}`;
@@ -250,8 +247,8 @@ export class BrowserWatchScheduler {
           ? Date.now() + Math.min(24 * 60 * 60_000, policy.floorMs * 2 ** Math.min(blocks, 20))
           : 0;
       const arrival = Math.min(...bounds.windows.map((window) => Date.parse(window.start)));
-      const interval = watchInterval(policy, Date.now(), arrival, state.last_interval_ms, this.deps.random);
-      const next = new Date(Math.max(Date.now() + interval, backoff)).toISOString();
+      const plan = nextWatchCheck(policy, Date.now(), arrival, releases, state.last_interval_ms, this.deps.random);
+      const next = new Date(Math.max(plan.at, backoff)).toISOString();
       await db.transaction(async () => {
         await db.run(
           'UPDATE gws_ea_browser_watch_checks SET finished_at=?,outcome=?,next_check_at=?,backoff_until=? WHERE id=?',
@@ -266,7 +263,7 @@ export class BrowserWatchScheduler {
           blocks,
           result.status === 'blocked' ? Math.max(1 / policy.dailyCap, state.budget_scale / 2) : state.budget_scale,
           backoff ? new Date(backoff).toISOString() : null,
-          interval,
+          plan.interval,
           new Date(Math.max(Date.now() + policy.floorMs, backoff)).toISOString(),
           first.site,
         );

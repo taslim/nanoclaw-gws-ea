@@ -34,7 +34,7 @@ import {
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
-import { readIsoTime } from './iso-time.js';
+import { readIsoTime, zonedInstant } from './iso-time.js';
 import { readMerchantPurchase, readMerchantPurchaseEvidence } from './merchant-signatures.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
@@ -47,6 +47,7 @@ import {
 } from './queue.js';
 import { evidenceMatchesAttempt, reconcilePurchaseAttempt, type PurchaseAttempt } from './reconciliation.js';
 import { deriveReservationGuaranteeAuthority } from './reservation-guarantee.js';
+import { principalClock } from './watch-policy.js';
 
 export const PURCHASE_APPROVAL = 'browser_purchase';
 export const PURCHASE_CARD_LIFE_MS = 24 * 60 * 60 * 1000;
@@ -155,17 +156,20 @@ export function validatePurchaseRequest(content: Record<string, unknown>): Recor
     ...(neededBy ? { needed_by: neededBy } : {}),
   };
 }
-function boundsOf(payload: Record<string, unknown>): PurchaseBounds {
+/** A date-only needed-by is the end of that day on the principal's clock. */
+export function purchaseBounds(payload: Record<string, unknown>, principalTimeZone: string): PurchaseBounds {
   return {
     ...(isRecord(payload.delivery_window)
       ? { deliveryWindow: payload.delivery_window as { start: string; end: string } }
       : {}),
     ...(typeof payload.needed_by === 'string'
       ? {
-          neededBy:
+          neededBy: new Date(
             payload.needed_by.length === 10
-              ? `${payload.needed_by}T23:59:59.999Z`
-              : new Date(payload.needed_by).toISOString(),
+              ? zonedInstant(`${payload.needed_by}T23:59:59.999`, principalTimeZone)
+              : Date.parse(payload.needed_by),
+          ).toISOString(),
+          principalTimeZone,
         }
       : {}),
   };
@@ -236,13 +240,14 @@ async function requestPurchaseCard(
     detached.cards,
     'Withdrawn: the checkout changed. A fresh card contains the current facts.',
   );
+  const question = renderPurchaseCard(facts, bounds, exceptions, await principalClock(), change);
   const approvalId = await requestApproval({
     session: context.session,
     agentName: 'browser',
     action: PURCHASE_APPROVAL,
     payload,
     title: 'Approve this purchase?',
-    question: renderPurchaseCard(facts, bounds, exceptions, change),
+    question,
     approverUserId: decision.approverUserId,
     expiresAt: expires,
     originLine: `From your browser errand ${context.job.thread_id}.`,
@@ -542,15 +547,16 @@ export async function executeBrowserPurchase(
             : { ...watch, repeat_safe: false };
         const live = await store.liveForJob(context.job.id);
         if (live) return executeAuthorizedPurchase(context, live.id);
+        const bounds = purchaseBounds(payload, await principalClock());
         const child = await deriveReservationGuaranteeAuthority(
           context.job.id,
           context.request.id,
           read.facts,
-          boundsOf(payload),
+          bounds,
           store,
         );
         if (child) return executeAuthorizedPurchase(context, child.id);
-        return requestPurchaseCard(context, read.facts, boundsOf(payload));
+        return requestPurchaseCard(context, read.facts, bounds);
       } finally {
         await disposeBrowserRefs(refs);
       }

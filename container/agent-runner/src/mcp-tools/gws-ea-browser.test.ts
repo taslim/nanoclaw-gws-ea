@@ -94,6 +94,12 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
         terms: 'Conditional no-show fee only; nothing due at booking.',
       },
       until: '2026-10-16T18:00:00-07:00',
+      release: {
+        wording: 'Tables are released 30 days ahead at 10:00',
+        days_ahead: 30,
+        time: '10:00',
+        time_zone: 'America/Los_Angeles',
+      },
     },
   ],
   [listWatches, {}],

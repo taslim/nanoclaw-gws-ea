@@ -24,9 +24,13 @@ import {
   compareWatchBounds,
   createBrowserWatch,
   finishWatchPurchase,
+  getBrowserWatch,
   prepareWatchPurchase,
   recoverBrowserWatches,
+  renderWatchCard,
+  validateWatchRequest,
   type WatchBounds,
+  type WatchRow,
 } from './watches.js';
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
 import * as watchRuntime from './watch-runtime.js';
@@ -140,6 +144,31 @@ async function seedWatch(id: string, site = 'resy.com'): Promise<void> {
     "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT(job_id) DO NOTHING",
     jobId,
   );
+}
+
+async function bindPrincipal(): Promise<string[]> {
+  const principal = 'gchat:users/watch-principal';
+  const at = new Date().toISOString();
+  await createMessagingGroup({
+    id: 'watch-dm',
+    channel_type: 'gchat',
+    platform_id: 'spaces/watch-principal',
+    name: 'Principal',
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: at,
+  });
+  await upsertUser({ id: principal, kind: 'gchat', display_name: 'Principal', created_at: at });
+  await upsertUserDm({ user_id: principal, channel_type: 'gchat', messaging_group_id: 'watch-dm', resolved_at: at });
+  await bindVerifiedPrincipalUser(principal, at);
+  const cards: string[] = [];
+  setDeliveryAdapter({
+    async deliver(_type, _platform, _thread, _kind, content) {
+      cards.push(content);
+      return `watch-card-${cards.length}`;
+    },
+  });
+  return cards;
 }
 
 describe('native watch bounds and one booking claim', () => {
@@ -447,27 +476,8 @@ describe('native watch bounds and one booking claim', () => {
     await queue.stop();
   });
   it('arms a financial watch only through its native principal card, with restart-safe replay and exact host policy', async () => {
-    const principal = 'gchat:users/watch-principal';
     const at = new Date().toISOString();
-    await createMessagingGroup({
-      id: 'watch-dm',
-      channel_type: 'gchat',
-      platform_id: 'spaces/watch-principal',
-      name: 'Principal',
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: at,
-    });
-    await upsertUser({ id: principal, kind: 'gchat', display_name: 'Principal', created_at: at });
-    await upsertUserDm({ user_id: principal, channel_type: 'gchat', messaging_group_id: 'watch-dm', resolved_at: at });
-    await bindVerifiedPrincipalUser(principal, at);
-    const cards: string[] = [];
-    setDeliveryAdapter({
-      async deliver(_type, _platform, _thread, _kind, content) {
-        cards.push(content);
-        return `watch-card-${cards.length}`;
-      },
-    });
+    const cards = await bindPrincipal();
     const { context } = await executionContext('setup');
     const terms = '$12.50 per guest for cancellation within 24 hours or no-show';
     vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
@@ -694,5 +704,180 @@ describe('native watch bounds and one booking claim', () => {
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'second')).toEqual({
       status: 'armed',
     });
+  });
+});
+
+describe('venue release schedules and card times', () => {
+  const free = {
+    site: 'https://resy.com/search',
+    recipe_id: 'check-recipe',
+    parameters: {},
+    venue: bounds.venue,
+    party_size: 4,
+    windows: bounds.windows,
+    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+    until: bounds.until,
+  };
+  it('reads a release rule apart from the bounds and refuses one it could not schedule', () => {
+    const wording = 'Tables released 30 days ahead at 10:00';
+    expect(validateWatchRequest({ ...free, release: { days_ahead: 30, time: '10:00', wording } })).toMatchObject({
+      release: { schedule: { kind: 'days_ahead', days: 30 }, time: '10:00', wording },
+    });
+    expect(
+      validateWatchRequest({
+        ...free,
+        release: { day_of_month: 1, months_ahead: 1, time: '12:00', wording, time_zone: 'europe/paris' },
+      }).release,
+    ).toEqual({
+      schedule: { kind: 'monthly', day: 1, monthsAhead: 1 },
+      time: '12:00',
+      wording,
+      timeZone: 'Europe/Paris',
+    });
+    for (const time_zone of ['Mars/Olympus', '+09:00', 'JST-9'])
+      expect(() =>
+        validateWatchRequest({ ...free, release: { days_ahead: 30, time: '10:00', wording, time_zone } }),
+      ).toThrow('IANA');
+    for (const release of [
+      { days_ahead: 30, day_of_month: 1, months_ahead: 1, time: '10:00', wording },
+      { day_of_month: 1, time: '10:00', wording },
+      { time: '10:00', wording },
+      { days_ahead: -1, time: '10:00', wording },
+      { days_ahead: 30, time: '24:00', wording },
+      { days_ahead: 30, time: '9:00', wording },
+      { days_ahead: 30, time: '10:00', wording: ' ' },
+      { days_ahead: 30, time: '10:00' },
+      { days_ahead: 30, time: '10:00', wording, until: bounds.until },
+      'Tables released 30 days ahead at 10:00',
+    ])
+      expect(() => validateWatchRequest({ ...free, release })).toThrow();
+  });
+
+  it("stores the rule once, on the venue's clock as the host reads it, outside the bounds the principal approves", async () => {
+    await getDb().run(
+      "UPDATE gws_ea_profile SET principal_display_name = 'Morgan Ellery',principal_timezone = 'America/Los_Angeles' WHERE singleton = 1",
+    );
+    const cards = await bindPrincipal();
+    const { context } = await executionContext('release-setup');
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+      jobId,
+      new Date().toISOString(),
+    );
+    const terms = '¥5,000 per guest for cancellation within 24 hours or no-show';
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      availability: {
+        status: 'ready',
+        site: 'resy.com',
+        venue: bounds.venue,
+        partySize: 4,
+        currency: 'JPY',
+        timeZone: 'Asia/Tokyo',
+        slots: [],
+      },
+      policy: {
+        currency: 'JPY',
+        dueNowMinor: 0,
+        commitments: [
+          {
+            kind: 'conditional_fee',
+            terms,
+            amountMinor: 5000,
+            perPerson: true,
+            trigger: 'Late cancellation or no-show',
+            conditionalTrigger: 'cancellation',
+            cancellationTerms: 'Cancel at least 24 hours before arrival',
+            cancellationBeforeMs: 86_400_000,
+          },
+        ],
+      },
+    });
+    const request = {
+      ...free,
+      windows: [{ start: '2026-11-24T19:00:00+09:00', end: '2026-11-24T21:00:00+09:00' }],
+      financial: { currency: 'JPY', max_total: '20000', terms },
+      until: '2026-11-24T00:00:00Z',
+    };
+    const created = await createBrowserWatch(context, {
+      ...request,
+      // The host's own read of the venue's zone outranks the agent's.
+      release: {
+        days_ahead: 30,
+        time: '10:00',
+        wording: 'Tables released 30 days ahead at 10:00',
+        time_zone: 'Asia/Seoul',
+      },
+    });
+    expect(created).toMatchObject({ status: 'awaiting_principal' });
+    const id = created.watch_id as string;
+    const stored = {
+      schedule: { kind: 'days_ahead', days: 30 },
+      time: '10:00',
+      timeZone: 'Asia/Tokyo',
+      wording: 'Tables released 30 days ahead at 10:00',
+    };
+    const watch = (await getBrowserWatch(id))!;
+    expect(JSON.parse(watch.release_json!)).toEqual(stored);
+    const approval = (
+      await getDb().all<import('../../types.js').PendingApproval>(
+        "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
+      )
+    )[0];
+    const approved = JSON.parse(approval.payload) as { bounds: WatchBounds };
+    expect(approved.bounds).toEqual(JSON.parse(watch.bounds_json));
+    expect(JSON.stringify(approved)).not.toContain('release');
+    expect(cards[0]).toContain(
+      'Arrival window: Nov 24, 2026, 7:00 PM through 9:00 PM Tokyo time (Nov 24, 2026, 2:00 AM through 4:00 AM Los Angeles time)',
+    );
+    expect(cards[0]).toContain('Watch deadline: Nov 23, 2026, 4:00 PM Los Angeles time');
+    // A repeat of the request cannot change the rule, nor can the principal's approval.
+    await createBrowserWatch(context, {
+      ...request,
+      release: { day_of_month: 1, months_ahead: 2, time: '09:00', wording: 'Opens on the 1st' },
+    });
+    await getDb().run("UPDATE pending_approvals SET status='approved' WHERE approval_id=?", approval.approval_id);
+    await resumeApprovedApprovals();
+    expect(await getDb().get('SELECT status,release_json FROM gws_ea_browser_watches WHERE id=?', id)).toEqual({
+      status: 'armed',
+      release_json: JSON.stringify(stored),
+    });
+  });
+
+  it('prints a trial conversion on the principal’s clock, labelled, never as raw ISO', () => {
+    const watch = {
+      id: 'trial-watch',
+      site: 'resy.com',
+      bounds_json: JSON.stringify({
+        ...bounds,
+        financial: {
+          freeOnly: false,
+          currency: 'USD',
+          maxTotalMinor: 2000,
+          maxDueNowMinor: 0,
+          policy: {
+            currency: 'USD',
+            dueNowMinor: 0,
+            commitments: [
+              {
+                kind: 'trial',
+                terms: 'Free for 30 days, then $20 monthly',
+                amountMinor: 2000,
+                trigger: 'Trial ends',
+                cancellationTerms: 'Cancel before the trial ends',
+                cancellationBeforeMs: 0,
+                conversionAt: '2026-11-15T08:00:00.000Z',
+                frequency: 'monthly',
+              },
+            ],
+          },
+        },
+      }),
+    } as WatchRow;
+    const card = renderWatchCard(watch, 'UTC', 'America/Los_Angeles');
+    expect(card).toContain('converts Nov 15, 2026, 12:00 AM Los Angeles time');
+    expect(card).not.toContain('2026-11-15T08:00:00');
+    expect(card).toContain(
+      'Arrival window: Oct 16, 2026, 7:00 PM through 9:00 PM UTC (Oct 16, 2026, 12:00 PM through 2:00 PM Los Angeles time)',
+    );
   });
 });

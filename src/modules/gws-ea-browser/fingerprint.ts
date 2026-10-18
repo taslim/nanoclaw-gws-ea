@@ -1,3 +1,5 @@
+import { zonedInstant } from './iso-time.js';
+
 export interface FinancialCommitment {
   kind: 'retail' | 'hold' | 'deposit' | 'prepayment' | 'conditional_fee' | 'trial' | 'subscription';
   terms: string;
@@ -43,6 +45,8 @@ export interface PurchaseBounds {
   reservation?: { venueId: string; partySize: number; windowStart: string; windowEnd: string };
   deliveryWindow?: { start: string; end: string };
   neededBy?: string;
+  /** The principal's clock when the needed-by was set: a quoted delivery date is a day on it. */
+  principalTimeZone?: string;
 }
 
 const currencies = new Set(Intl.supportedValuesOf('currency'));
@@ -123,7 +127,10 @@ export function materialPurchaseChange(
         return 'The delivery date is outside the approved window.';
     } else if (!bounds.neededBy && approved.delivery && date > approved.delivery.date)
       return 'The delivery date is later than the approved date.';
-    if (bounds.neededBy && `${date}T23:59:59.999Z` > bounds.neededBy)
+    if (
+      bounds.neededBy &&
+      !(zonedInstant(`${date}T23:59:59.999`, bounds.principalTimeZone ?? 'UTC') <= Date.parse(bounds.neededBy))
+    )
       return 'Delivery misses the approved needed-by deadline.';
   } else if (bounds.deliveryWindow || bounds.neededBy) return 'The delivery date is unavailable.';
   return undefined;
