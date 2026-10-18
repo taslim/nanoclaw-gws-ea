@@ -61,17 +61,16 @@ import { createHash } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter, registerDeliveryAction, registerDeliveryFailedHook } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { InboundOrigin, OutboundMessage } from '../../mailbox/index.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
-import { requestWake } from '../../request-wake.js';
-import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { errandSource, hasBrowserAccess } from '../gws-ea-browser/access.js';
+import { tellDelegator, type BrowserErrand } from '../gws-ea-browser/notices.js';
 import { conversationPeople, EMAIL_CHANNEL_TYPE, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import { markLookFailed } from '../gws-ea-matters/db.js';
 import { lookSeries } from '../gws-ea-matters/looks.js';
@@ -82,13 +81,7 @@ import {
   isVerifiedPrincipalUser,
   principalContact,
 } from '../gws-ea-profile/db.js';
-import {
-  isDuplicateNote,
-  noteNames,
-  writeNoteForMain,
-  type NoteNames,
-  type NotePiece,
-} from '../gws-ea-profile/main-note.js';
+import { noteNames, writeNoteForMain, type NoteNames, type NotePiece } from '../gws-ea-profile/main-note.js';
 import { gwsEaNoticesMigration } from './migration.js';
 
 registerMigration(gwsEaNoticesMigration);
@@ -156,13 +149,6 @@ async function deliverToPrincipal(text: string, route: Route | undefined, notice
     return false;
   }
   /* eslint-enable no-catch-all/no-catch-all */
-}
-
-/** A browser errand: its job thread, the browser session working it, and the agent group that delegated it. */
-interface BrowserErrand {
-  readonly job: string;
-  readonly session: Session;
-  readonly source: string;
 }
 
 /**
@@ -336,45 +322,13 @@ async function tellOfBrowserJob(cause: Cause, errand: BrowserErrand, failed: rea
     'turn-failed': 'its turn failed before it finished, so the errand may be left undone.',
   };
   const thread = errand.job;
-  const id = factId(`browser-${cause}`, [thread, ...[...failed].sort()]);
-  const timestamp = new Date().toISOString();
-  const text = `Browser job ${thread}: ${words[cause]}`;
-  if (errand.source === (await getMainAgentGroupId())) {
-    const result = await writeNoteForMain({
-      id,
-      timestamp,
-      text,
-      wake: true,
-      pieces: [{ kind: 'job', reference: thread }],
-    });
-    if (result === 'no-main' || result === 'no-principal')
-      log.warn('Nobody to tell of a browser job failure', { thread, cause, result });
-    return;
-  }
-  const delegatedFrom = await withExistingMailboxSession(errand.session.agent_group_id, errand.session.id, (mailbox) =>
-    mailbox.getMostRecentPeerSourceSessionId(errand.source),
-  );
-  const session = delegatedFrom ? await getSession(delegatedFrom) : undefined;
-  if (session?.agent_group_id !== errand.source || session.status !== 'active') {
-    log.warn('Nobody to tell of a browser job failure', { thread, cause, result: 'no-delegating-session' });
-    return;
-  }
-  try {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id,
-      kind: 'chat',
-      timestamp,
-      platformId: session.agent_group_id,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-    });
-  } catch (error) {
-    if (!isDuplicateNote(error)) throw error;
-    return;
-  }
-  const fresh = await getSession(session.id);
-  if (fresh) await requestWake(fresh, 'inbound-message');
+  const result = await tellDelegator(errand, {
+    id: factId(`browser-${cause}`, [thread, ...[...failed].sort()]),
+    timestamp: new Date().toISOString(),
+    text: `Browser job ${thread}: ${words[cause]}`,
+  });
+  if (result === 'no-main' || result === 'no-principal' || result === 'no-delegating-session')
+    log.warn('Nobody to tell of a browser job failure', { thread, cause, result });
 }
 
 /** What main reads of a failure in its own conversation that the principal has nothing to resend for. */

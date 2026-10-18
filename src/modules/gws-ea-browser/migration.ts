@@ -372,3 +372,28 @@ export const browserConsentMigration: PortableMigration & { name: ModuleMigratio
     `);
   },
 };
+
+/**
+ * Incidents (KTD10): spending that may have slipped past the host, each recorded with its job's stop. A job
+ * records one incident per kind and evidence; an incident from a page names no purchase attempt.
+ */
+export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:incidents',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_incidents (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('unapproved_commit')),
+        site TEXT NOT NULL,
+        job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
+        attempt_id TEXT,
+        evidence_key TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        notified_at TEXT,
+        UNIQUE(job_id,kind,evidence_key)
+      );
+    `);
+  },
+};

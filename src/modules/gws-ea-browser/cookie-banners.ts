@@ -17,7 +17,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { CDPSession, ElementHandle, Page } from 'playwright-core';
 
 import { isolationSelector } from './authentication-submit.js';
-import { classifyActivation } from './commit-classifier.js';
+import { activateControl, BrowserActivationError } from './commit-classifier.js';
 import { frameGone } from './control-facts.js';
 import { PROTOCOL_READ_TIMEOUT_MS, withinTime } from './page-targets.js';
 
@@ -813,8 +813,9 @@ function loadFor(page: Page, loader: string): CookieBannerLoad {
 }
 
 /**
- * A real click on the control: found and confirmed in the isolated world, read as ordinary by the classifier,
- * then pressed with Playwright's hit-target check, never forced or dispatched.
+ * A real click on the control: found and confirmed in the isolated world, then pressed through the one
+ * activation boundary every host press takes, which reads it fresh as ordinary and keeps Playwright's
+ * hit-target check, never forced or dispatched.
  */
 async function press(
   page: Page,
@@ -825,15 +826,23 @@ async function press(
 ): Promise<'pressed' | 'refused' | 'failed'> {
   let element: ElementHandle | undefined;
   try {
-    element = await round.handle(banner, control);
-    if (!element) return 'failed';
-    if ((await classifyActivation(page, element, 'click')) !== 'ordinary') return 'refused';
-    await assertActive?.();
-    await element.click({ timeout: PRESS_TIMEOUT_MS });
+    const target = await round.handle(banner, control);
+    element = target;
+    if (!target) return 'failed';
+    await activateControl(
+      page,
+      target,
+      async () => {
+        await assertActive?.();
+        await target.click({ timeout: PRESS_TIMEOUT_MS });
+      },
+      undefined,
+      { kind: 'click', assertActive, remaining: () => PRESS_TIMEOUT_MS },
+    );
     return 'pressed';
     // eslint-disable-next-line no-catch-all/no-catch-all -- a press that cannot complete is a reject that failed
-  } catch (_error) {
-    return 'failed';
+  } catch (error) {
+    return error instanceof BrowserActivationError ? 'refused' : 'failed';
   } finally {
     await element?.dispose().catch(() => undefined);
   }

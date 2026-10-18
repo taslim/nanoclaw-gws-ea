@@ -494,7 +494,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
         { recipe_id: saved.recipe_id, parameters: { party: '4' } },
         { page, readOnly: true, record: false },
       ),
-    ).toMatchObject({ status: 'checkpoint_failed', found: { reason: 'unsupported_merchant' } });
+    ).toMatchObject({ status: 'checkpoint_failed', found: { reason: 'read_only' } });
     await page
       .getByRole('textbox', { name: 'Party size', exact: true })
       .evaluate((input) => input.setAttribute('type', 'password'));

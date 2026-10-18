@@ -12,6 +12,7 @@ import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
+  browserIncidentsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
   browserQueueMigration,
@@ -21,6 +22,7 @@ import {
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
+import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import './executor.js';
 import './recipes.js';
@@ -63,6 +65,7 @@ registerMigration(browserWatchesMigration);
 registerMigration(browserWatchReleaseMigration);
 registerMigration(browserCredentialAttemptsMigration);
 registerMigration(browserConsentMigration);
+registerMigration(browserIncidentsMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -384,6 +387,7 @@ onHostStart(async ({ signal }) => {
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
       () => sweepBrowserPurchaseState(activeQueue),
+      () => notifyPendingIncidents(),
     ])
       await optional(task);
   };

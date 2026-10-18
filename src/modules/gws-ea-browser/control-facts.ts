@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 
+import { SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
 import { isolationSelector } from './authentication-submit.js';
 import { PROTOCOL_READ_TIMEOUT_MS, withinTime } from './page-targets.js';
 
@@ -29,6 +30,11 @@ export interface ControlRegion {
   readonly commits: boolean;
   /** The region holds email, phone, password or payment fields. */
   readonly accountFields: boolean;
+  /**
+   * The control's form holds a field for a password, a code or payment details: only the host's own sign-in and
+   * credential paths submit such a form.
+   */
+  readonly secretFields: boolean;
 }
 
 /**
@@ -71,11 +77,19 @@ export interface ControlFacts {
   region?: ControlRegion;
   /** The choice the action would toggle, when it toggles one. */
   toggles?: ToggledChoice;
+  /**
+   * The control is a field for payment details (a card number, security code or expiry, by its own name, label or
+   * autocomplete), or any field inside a processor's payment frame. Nothing is ever typed or chosen there (R12).
+   */
+  cardEntry?: boolean;
 }
 
 /** Prices, recurring charges, trials and billing, in a label or anywhere on a page. */
 export const moneyTerms =
   /(?:[$€£¥]\s?\d|\b\d+(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|dollars?|euros?|pounds?)\b|\bper\s+(?:month|year|week|day)\b|\/\s?(?:mo|month|yr|year)\b|\b(?:subscriptions?|free\s+trial|trial\s+period|billing|billed|recurring|auto-?renew\w*|membership\s+fees?)\b)/iu;
+
+/** Input types that take no typed or chosen text. */
+const NO_TEXT_ENTRY = /^(?:hidden|submit|button|reset|image|checkbox|radio|file|range|color)$/u;
 
 /**
  * What the host recognizes in a page's text, fields and controls. Vocabulary is data: widen or narrow it
@@ -96,6 +110,19 @@ const PAGE_VOCABULARY = {
   /** A card-entry field, by its name, id or autocomplete token. */
   cardField:
     /(?:^|[^a-z])(?:cc-(?:number|csc|exp(?:-month|-year)?)|card.?(?:number|num|cvc|cvv)|cardnumber|cvc|cvv)(?:[^a-z]|$)/iu,
+  /**
+   * A field for payment details, by its name, id, autocomplete, label or placeholder: a card's number, holder,
+   * security code or expiry. Wider than `cardField`, which proves a payment method is on the page.
+   */
+  cardEntry:
+    /(?:^|[^a-z])(?:cc-[a-z-]+|card.?(?:number|num|no|holder|cvc|cvv|csc|code|security|expir\w*|exp)|cardnumber|(?:credit|debit).?card|cvc|cvv2?|csc|exp-?date|mm\s*\/\s*yy)(?:[^a-z]|$)/iu,
+  /** A gift card's or voucher's code, which a checkout applies like a coupon: no card details. */
+  giftCard: /gift|voucher/iu,
+  /** Input types that take no typed or chosen text. */
+  noTextEntry: NO_TEXT_ENTRY,
+  /** What marks a field's value as a credential, code or payment secret (authentication-signatures owns these). */
+  secretAutocomplete: SECRET_AUTOCOMPLETE,
+  secretField: SECRET_DESCRIPTION,
   /** An express-pay button. Pay Later messaging is text, never a button, so it is no payment method. */
   expressPay:
     /\b(?:apple|google|shop|amazon|samsung)\s?pay\b|\bg\s?pay\b|\bpaypal\b|\bvenmo\b|\bklarna\b|\bafterpay\b|\baffirm\b|\bpay\s+with\s+link\b/iu,
@@ -400,6 +427,17 @@ const librarySource = String.raw`(sources) => {
     element.getAttribute('aria-label'), element.getAttribute('placeholder')].filter(Boolean).join(' ');
   const cardField = (element) => element instanceof HTMLInputElement && element.type !== 'hidden' && visible(element) &&
     re.cardField.test([element.name, element.id, element.getAttribute('autocomplete')].join(' '));
+  // A field that takes typed or chosen text: no button, box or file input.
+  const textEntry = (element) => (element instanceof HTMLInputElement && !re.noTextEntry.test(element.type)) ||
+    element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement;
+  const labelsOf = (element) => (element.labels ? Array.from(element.labels, (label) => label.textContent).join(' ') : '');
+  const cardEntryField = (element) => {
+    const said = [describe(element), labelsOf(element)].join(' ');
+    return textEntry(element) && re.cardEntry.test(said) && !re.giftCard.test(said);
+  };
+  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete or names.
+  const secretField = (element) => textEntry(element) && (element.type === 'password' ||
+    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') || re.secretField.test(describe(element)));
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';
@@ -525,6 +563,7 @@ const librarySource = String.raw`(sources) => {
       href: rawHref === null ? null : node.href,
       scripted: (rawHref !== null && rawHref.trim().startsWith('#')) || node.hasAttribute('onclick'),
       toggles: toggledChoice(node),
+      cardEntry: cardEntryField(node),
       region: {
         dialog: Boolean(dialog),
         transaction,
@@ -533,6 +572,7 @@ const librarySource = String.raw`(sources) => {
         commits: transaction || members.some(bookingField) || re.commitName.test(nameOf(node)) ||
           members.some((element) => element.matches(BUTTON) && visible(element) && re.commitName.test(nameOf(element))),
         accountFields: members.some(accountField),
+        secretFields: fields.some(secretField),
       },
     };
   };
@@ -709,6 +749,7 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
     href: text(facts.href) ?? null,
     scripted: flag(facts.scripted),
     ...(toggles ? { toggles } : {}),
+    cardEntry: flag(facts.cardEntry),
     region: {
       dialog: flag(region.dialog),
       transaction: flag(region.transaction),
@@ -716,6 +757,7 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
       freeText: flag(region.freeText),
       commits: flag(region.commits),
       accountFields: flag(region.accountFields),
+      secretFields: flag(region.secretFields),
     },
   };
 }
@@ -908,8 +950,19 @@ export async function readPageControlFacts(page: Page, element: ElementHandle): 
       chain.push(current);
       current = frames.get(current.parentId);
     }
+    // A field inside a processor's payment frame takes payment details, whatever it is called.
+    const paymentFrame = chain.some((candidate) => {
+      const address = hostAndPath(candidate.url);
+      return address !== undefined && PAYMENT_FRAME.test(address);
+    });
     return {
       ...facts,
+      cardEntry:
+        facts.cardEntry === true ||
+        (paymentFrame &&
+          (facts.tag === 'select' ||
+            facts.tag === 'textarea' ||
+            (facts.tag === 'input' && !NO_TEXT_ENTRY.test(facts.type)))),
       transaction: scans.some((scan) => scan.transaction),
       moneyTerms: scans.some((scan) => scan.moneyTerms),
       feeTerms: scans.some((scan) => scan.feeTerms),

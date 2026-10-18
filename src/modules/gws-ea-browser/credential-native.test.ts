@@ -895,10 +895,9 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       expect(await batch(({ password }) => ({ kind: 'key', ...password, key: 'Enter' }))).toEqual(
         stopped('secret_field'),
       );
-      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('unsupported_merchant'));
-      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(
-        stopped('unsupported_merchant'),
-      );
+      // A form that holds password fields is submitted only by the credential operation itself.
+      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('secret_field'));
+      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(stopped('secret_field'));
       expect(posts).toEqual([]);
     }, 30_000);
   });

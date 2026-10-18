@@ -483,9 +483,10 @@ export class BrowserQueue {
     for (const request of await this.store.pending()) this.wake(request.job_id);
   }
 
-  /** Call after the cancellation transaction, outside every DB lock. */
-  async interruptJob(jobId: string): Promise<void> {
+  /** Call after the cancellation transaction, outside every DB lock. `running` answers for itself. */
+  async interruptJob(jobId: string, running?: string): Promise<void> {
     for (const request of await this.store.pending(jobId)) {
+      if (request.id === running) continue;
       this.running.get(request.id)?.abort('interrupted');
       await this.runtime.closeJob(jobId).catch(() => undefined);
       await this.finish(request, await this.interruptedAnswer(request, !request.started_at));

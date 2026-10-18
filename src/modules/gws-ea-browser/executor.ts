@@ -8,17 +8,21 @@ import {
   activateControl,
   BrowserActivationError,
   BrowserSiteBusyError,
-  classifyActivation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
+  readControlFacts,
+  registrableSite,
   withBrowserJobNavigation,
+  type ActivationIntent,
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
 import { isSensitiveField } from './authentication-signatures.js';
+import { readConfirmation, showsCharge } from './confirmation.js';
 import { BrowserConsentStop, type ConsentStopView } from './consent.js';
 import { settleCookieBanners } from './cookie-banners.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
+import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { SiteLeaseStore } from './leases.js';
 import {
   BrowserRefError,
@@ -47,6 +51,9 @@ export type BrowserStopReason =
   | 'consent_control'
   | 'consent_required'
   | 'secret_field'
+  | 'card_field'
+  | 'read_only'
+  | 'unapproved_commit'
   | 'blocked_address'
   | 'challenge'
   | 'sign_in_wall'
@@ -225,6 +232,12 @@ export async function isSecretBrowserField(target: Pick<PinnedBrowserRef, 'eleme
   return isSensitiveField(facts);
 }
 
+/** Payment details are never entered (R12); passwords and codes only through the host's own fills. */
+async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<void> {
+  if ((await readControlFacts(page, target.element)).cardEntry === true) throw new BrowserBatchStop('card_field');
+  if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
+}
+
 async function fieldInput(context: BrowserExecutionContext, target: PinnedBrowserRef, value: string): Promise<void> {
   if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
   await context.assertActive();
@@ -235,6 +248,55 @@ class BrowserBatchStop extends Error {
   constructor(readonly reason: BrowserStopReason) {
     super(reason);
   }
+}
+
+/** An ordinary press landed on a confirmation that shows a charge: it bought something nobody approved (KTD10). */
+class UnapprovedCommitStop extends BrowserBatchStop {
+  constructor(readonly commit: UnapprovedCommit) {
+    super('unapproved_commit');
+  }
+}
+
+/** How long Playwright retries an action's checks, the hit-target check included, before the control is not actionable. */
+const ACTIONABLE_WAIT_MS = 5_000;
+/** How long a press's resulting document may take to parse before its confirmation check reads it. */
+const CONFIRMATION_LOAD_MS = 5_000;
+
+/**
+ * A native action on its element (KTD1): never forced or dispatched, so a control another element covers is
+ * not pressed through its cover. It never waits on a navigation it starts; the action's window does.
+ */
+async function nativeAction(
+  context: BrowserExecutionContext,
+  act: (options: { timeout: number; noWaitAfter: true }) => Promise<void>,
+): Promise<void> {
+  await context.assertActive();
+  try {
+    await act({ timeout: Math.min(ACTIONABLE_WAIT_MS, context.remaining()), noWaitAfter: true });
+  } catch (error) {
+    // With no wait after it, an action that timed out never ran: its control stayed covered, hidden or disabled.
+    if (error instanceof errors.TimeoutError && context.remaining() > 0 && !context.signal.aborted)
+      throw new BrowserBatchStop('not_actionable');
+    throw error;
+  }
+}
+
+/**
+ * After an ordinary press: a confirmation showing a charge means it bought something nobody approved (KTD10).
+ * `site` is the merchant, the page's site when it was pressed.
+ */
+async function unapprovedCommit(
+  context: BrowserExecutionContext,
+  page: Page,
+  site: string | undefined,
+): Promise<UnapprovedCommit | undefined> {
+  if (page.isClosed()) return undefined;
+  await page
+    .waitForLoadState('domcontentloaded', { timeout: Math.min(CONFIRMATION_LOAD_MS, context.remaining()) })
+    .catch(() => undefined);
+  const evidence = await readConfirmation(page);
+  if (!evidence || !showsCharge(evidence)) return undefined;
+  return { site: site ?? registrableSite(evidence.source) ?? new URL(evidence.source).hostname, evidence };
 }
 
 /** The keyboard and recipe paths must identify the very same native submit control. */
@@ -249,11 +311,6 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
 
 type GuardReason = ReturnType<BrowserNavigationGuard['reason']>;
 
-/** Whether the navigation guard refused a navigation: an ordinary reading is no refusal. */
-function isGuardRefusal(blocked: GuardReason): blocked is Exclude<GuardReason, 'ordinary' | undefined> {
-  return blocked !== undefined && blocked !== 'ordinary';
-}
-
 function batchErrorReason(
   error: unknown,
   blocked: GuardReason,
@@ -267,7 +324,7 @@ function batchErrorReason(
     error instanceof BrowserConsentStop
   )
     return error.reason;
-  if (isGuardRefusal(blocked)) return blocked;
+  if (blocked) return blocked;
   if (error instanceof errors.TimeoutError || context.signal.aborted || !context.remaining()) return 'timeout';
   return page.isClosed() ? 'window_closed' : 'not_actionable';
 }
@@ -283,19 +340,22 @@ export async function executeBrowserBatch(
   const addressStop = await typedAddressStop(validateBrowserBatch(payload).actions.flatMap(typedText));
   if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
+  let ran: { answer: Record<string, unknown>; unapproved?: UnapprovedCommit };
   try {
-    return await withBrowserJobNavigation(
-      context,
-      page,
-      () => executeBatch(context, payload, page, options),
-      options.siteAccess,
-    );
+    ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page, options), {
+      ...(options.siteAccess ? { siteAccess: options.siteAccess } : {}),
+      ...(options.readOnly ? { readOnly: true } : {}),
+    });
   } catch (error) {
     if (error instanceof BrowserSiteBusyError) return { status: 'stopped', reason: 'site_busy', repeat_safe: true };
     const refused = framesUnreadyStop(error);
     if (refused) return refused;
     throw error;
   }
+  // Spending nobody approved stops the job, once its operation has ended (KTD10).
+  return ran.unapproved
+    ? { ...ran.answer, incident: await stopForUnapprovedCommit(context, ran.unapproved) }
+    : ran.answer;
 }
 
 async function executeBatch(
@@ -303,7 +363,7 @@ async function executeBatch(
   payload: Record<string, unknown>,
   page: Page,
   options: BrowserBatchOptions,
-): Promise<Record<string, unknown>> {
+): Promise<{ answer: Record<string, unknown>; unapproved?: UnapprovedCommit }> {
   const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
   const images: Array<{ mime_type: 'image/png'; data: string }> = [];
@@ -312,20 +372,31 @@ async function executeBatch(
   let reason: BrowserStopReason | undefined;
   /** The wordings a consent stop names, with the stop ids the job asks the principal with. */
   let consent: readonly ConsentStopView[] | undefined;
+  let unapproved: UnapprovedCommit | undefined;
   let repeatSafe = true;
   let refs = new Map<string, PinnedBrowserRef>();
   let navigation = 0;
   const navigated = (frame: ReturnType<Page['mainFrame']>): void => {
     if (frame === page.mainFrame()) ++navigation;
   };
+  /** Every activation carries the request's own deadline checks and budget. */
+  const intent = (kind: ActivationIntent['kind']): ActivationIntent => ({
+    kind,
+    assertActive: context.assertActive,
+    remaining: context.remaining,
+  });
   page.on('framenavigated', navigated);
   try {
     refs = await pinBrowserRefs(page, actions.flatMap(browserActionRefs));
     for (let index = 0; index < actions.length; index++) {
       const action = actions[index];
       const before = navigation;
+      // The merchant an ordinary press acts for: the page's site when it is pressed.
+      const site = registrableSite(page.url());
       let data: Record<string, unknown> = {};
       let trace: Awaited<ReturnType<typeof beginBrowserActionTrace>> | undefined;
+      // Whether an ordinary press ran, whose result the confirmation check reads (KTD10).
+      let pressed = false;
       try {
         await context.assertActive();
         if (action.kind !== 'navigate' && /^https?:/u.test(page.url())) {
@@ -340,7 +411,7 @@ async function executeBatch(
           data.trace_index = trace.index;
         }
         if (options.readOnly && !(await isReadOnlyBrowserAction(page, action, refs)))
-          throw new BrowserBatchStop('unsupported_merchant');
+          throw new BrowserBatchStop('read_only');
         await context.assertActive();
         const target = 'ref' in action ? refs.get(action.ref) : undefined;
         if (['click', 'type', 'select', 'key', 'form_input', 'upload', 'download'].includes(action.kind))
@@ -361,61 +432,63 @@ async function executeBatch(
           }
           case 'click':
             if (target)
-              await activateControl(
+              ({ ordinaryPress: pressed } = await activateControl(
                 page,
                 target.element,
-                async () => {
-                  await context.assertActive();
-                  await target.element.click({ timeout: context.remaining() });
-                },
+                () => nativeAction(context, (options) => target.element.click(options)),
                 undefined,
-                { kind: 'click', assertActive: context.assertActive },
-              );
+                intent('click'),
+              ));
             break;
           case 'type':
-            if (target) await fieldInput(context, target, action.text);
+            if (target) {
+              await refuseFieldEntry(page, target);
+              await fieldInput(context, target, action.text);
+            }
             break;
           case 'select':
-            if (target)
+            if (target) {
+              await refuseFieldEntry(page, target);
               await activateControl(
                 page,
                 target.element,
-                async () => {
-                  await context.assertActive();
-                  await target.element.selectOption(action.value, { timeout: context.remaining() });
-                },
+                () =>
+                  nativeAction(context, async (options) => {
+                    await target.element.selectOption(action.value, options);
+                  }),
                 undefined,
-                { kind: 'select', value: action.value, assertActive: context.assertActive },
+                intent('select'),
               );
+            }
             break;
           case 'key':
             if (target) {
               if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
-              const press = async (): Promise<void> => {
-                await context.assertActive();
-                await target.element.press(action.key, { timeout: context.remaining() });
-              };
+              const press = (): Promise<void> =>
+                nativeAction(context, (options) => target.element.press(action.key, options));
               if (/^(?:Shift\+)?Enter$/u.test(action.key)) {
                 const formSubmit = await browserKeyboardSubmitTarget(target.element);
                 try {
-                  const submit = formSubmit.asElement();
-                  if (!submit) {
-                    // A formless field's Enter is the field's own press: classified, though not yet carried out.
-                    const classification = await classifyActivation(page, target.element, 'submit');
-                    throw new BrowserBatchStop(classification === 'ordinary' ? 'unsupported_merchant' : classification);
-                  }
-                  await activateControl(page, submit, press, undefined, {
-                    kind: 'submit',
-                    assertActive: context.assertActive,
-                  });
+                  // A field's Enter submits its form through the form's own submit control; a formless field's
+                  // Enter is the field's own press.
+                  ({ ordinaryPress: pressed } = await activateControl(
+                    page,
+                    formSubmit.asElement() ?? target.element,
+                    press,
+                    undefined,
+                    intent('submit'),
+                  ));
                 } finally {
                   await formSubmit.dispose();
                 }
               } else if (/^(?:Shift\+)?Space$/u.test(action.key))
-                await activateControl(page, target.element, press, undefined, {
-                  kind: 'click',
-                  assertActive: context.assertActive,
-                });
+                ({ ordinaryPress: pressed } = await activateControl(
+                  page,
+                  target.element,
+                  press,
+                  undefined,
+                  intent('click'),
+                ));
               else await press();
             }
             break;
@@ -438,21 +511,18 @@ async function executeBatch(
             for (const field of action.fields) {
               const pinned = refs.get(field.ref);
               if (!pinned) throw new BrowserBatchStop('stale_ref');
-              if (await isSecretBrowserField(pinned)) throw new BrowserBatchStop('secret_field');
+              await refuseFieldEntry(page, pinned);
             }
             for (const field of action.fields) await fieldInput(context, refs.get(field.ref)!, field.value);
             if (action.submit) {
               const submit = refs.get(action.submit.ref)!;
-              await activateControl(
+              ({ ordinaryPress: pressed } = await activateControl(
                 page,
                 submit.element,
-                async () => {
-                  await context.assertActive();
-                  await submit.element.click({ timeout: context.remaining() });
-                },
+                () => nativeAction(context, (options) => submit.element.click(options)),
                 undefined,
-                { kind: 'submit', assertActive: context.assertActive },
-              );
+                intent('submit'),
+              ));
             }
             break;
           }
@@ -498,23 +568,25 @@ async function executeBatch(
                 page,
                 path.join(policy.paths.stagingDir, 'downloads'),
                 index,
-                () =>
-                  activateControl(
+                async () => {
+                  await activateControl(
                     page,
                     target.element,
-                    async () => {
-                      await context.assertActive();
-                      await target.element.click({ timeout: context.remaining() });
-                    },
+                    () => nativeAction(context, (options) => target.element.click(options)),
                     undefined,
-                    { kind: 'download', assertActive: context.assertActive },
-                  ),
+                    intent('download'),
+                  );
+                },
               );
             }
             break;
         }
         const blocked = guard.reason();
-        if (isGuardRefusal(blocked)) throw new BrowserBatchStop(blocked);
+        if (blocked) throw new BrowserBatchStop(blocked);
+        if (pressed) {
+          const commit = await unapprovedCommit(context, page, site);
+          if (commit) throw new UnapprovedCommitStop(commit);
+        }
         await trace?.finish();
         results[index] = { index, status: 'completed', ...data, ...(trace ? { trace_index: trace.index } : {}) };
         if (navigation !== before) {
@@ -524,6 +596,7 @@ async function executeBatch(
       } catch (error) {
         reason = batchErrorReason(error, guard.reason(), context, page);
         if (error instanceof BrowserConsentStop) consent = error.stops;
+        if (error instanceof UnapprovedCommitStop) unapproved = error.commit;
         await trace?.finish(reason);
         results[index] = {
           index,
@@ -554,7 +627,7 @@ async function executeBatch(
   }
   // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
   const blocked = guard.reason();
-  if (!reason && isGuardRefusal(blocked)) reason = blocked;
+  if (!reason && blocked) reason = blocked;
   if (observation && !reason && hasBrowserChallenge(observation.snapshot)) reason = 'challenge';
   if (
     observation &&
@@ -563,13 +636,16 @@ async function executeBatch(
   )
     reason = 'sign_in_wall';
   return {
-    status: reason ? 'stopped' : 'completed',
-    ...(reason ? { reason } : {}),
-    ...(consent ? { consent } : {}),
-    actions: results,
-    ...(images.length ? { images } : {}),
-    ...(observation ? { observation } : {}),
-    repeat_safe: repeatSafe,
+    answer: {
+      status: reason ? 'stopped' : 'completed',
+      ...(reason ? { reason } : {}),
+      ...(consent ? { consent } : {}),
+      actions: results,
+      ...(images.length ? { images } : {}),
+      ...(observation ? { observation } : {}),
+      repeat_safe: repeatSafe,
+    },
+    ...(unapproved ? { unapproved } : {}),
   };
 }
 

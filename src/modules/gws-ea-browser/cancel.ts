@@ -200,10 +200,14 @@ export function configureBrowserCancellation(queue: BrowserQueue): void {
   cancellationQueue = queue;
 }
 
-/** Side effects run only after the cancellation transaction commits. */
+/**
+ * Side effects run only after the cancellation transaction commits. `running` names a request that stopped its
+ * own job: it answers for itself, so it is never interrupted.
+ */
 export async function finishBrowserJobCancellation(
   result: BrowserJobCancellation,
   queue = cancellationQueue,
+  running?: string,
 ): Promise<void> {
   if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
   if (result.withdrawnCards)
@@ -216,7 +220,7 @@ export async function finishBrowserJobCancellation(
         card.approval_id,
       );
   if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
-  await queue.interruptJob(result.job.id);
+  await queue.interruptJob(result.job.id, running);
   await queue.runtime.closeJob(result.job.id);
   await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
 }

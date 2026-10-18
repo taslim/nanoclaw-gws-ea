@@ -12,6 +12,7 @@ import {
   classifyCredentialNavigation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
+  refusedScriptRequest,
   registerReviewedMerchantFlow,
   type ActionClass,
   type ControlFacts,
@@ -36,6 +37,7 @@ const region = (changes: Partial<ControlRegion> = {}): ControlRegion => ({
   freeText: false,
   commits: false,
   accountFields: false,
+  secretFields: false,
   ...changes,
 });
 
@@ -683,4 +685,60 @@ it('decides a document under the purchase press that was approved when it paused
   );
   place();
   await vi.waitFor(() => expect(fixture.answers.get('receipt')).toBe('continued'));
+});
+
+it('lets a document no operation asked for load only as a GET on the leased site, judging a frame by its page', async () => {
+  const fixture = guardedPageFixture('https://shop.example/deals', {
+    frame: { id: 'fixture-page' },
+    childFrames: [{ frame: { id: 'widget-frame' } }],
+  });
+  const guard = await ensureBrowserNavigationGuard(fixture.page);
+  let next = 0;
+  const pause = async (url: string, method = 'GET', frameId = 'fixture-page'): Promise<string | undefined> => {
+    const requestId = `document-${next++}`;
+    fixture.gateEvents.get('Fetch.requestPaused')?.({
+      requestId,
+      frameId,
+      resourceType: 'Document',
+      request: { url, method, headers: {} },
+    });
+    await vi.waitFor(() => expect(fixture.answers.has(requestId)).toBe(true));
+    return fixture.answers.get(requestId);
+  };
+  // Until a job's lease admitted the page to a site, nothing loads between operations.
+  expect(await pause('https://shop.example/deals/today')).toBe('refused');
+  await guard.runWithPolicy({ leasedSite: 'shop.example' }, async () => undefined);
+  expect(await pause('https://shop.example/deals/today')).toBe('continued');
+  expect(await pause('https://shop.example/deals/saved', 'POST')).toBe('refused');
+  expect(guard.reason()).toBe('blocked_address');
+  expect(await pause('https://partner.example/offer')).toBe('refused');
+  expect(await pause('https://shop.example/checkout/placeorder')).toBe('refused');
+  expect(guard.reason()).toBe('purchase_control');
+  // A frame's document is judged by its page's site, whatever its own.
+  expect(await pause('https://widgets.example/poll', 'GET', 'widget-frame')).toBe('continued');
+  expect(await pause('https://widgets.example/vote', 'POST', 'widget-frame')).toBe('refused');
+  // A read-only replay's scope follows GET navigation only.
+  await guard.runWithPolicy({ readOnly: true }, async () => {
+    expect(await pause('https://shop.example/deals/today')).toBe('continued');
+    expect(await pause('https://shop.example/deals/saved', 'POST')).toBe('refused');
+    expect(guard.reason()).toBe('read_only');
+  });
+});
+
+it('refuses only script requests that are no GET, to a payment processor or a purchase route', () => {
+  for (const [method, url] of [
+    ['POST', 'https://api.stripe.com/v1/payment_intents/pi_1/confirm'],
+    ['POST', 'https://www.paypal.com/smart/api/order'],
+    ['PUT', 'https://checkoutshopper-live.adyen.com/checkoutshopper/v1/payments'],
+    ['POST', 'https://pay.shopify.com/session'],
+    ['POST', 'https://shop.example/api/checkout/submit'],
+  ])
+    expect(refusedScriptRequest({ method, url })).toBe(true);
+  for (const [method, url] of [
+    ['GET', 'https://api.stripe.com/v1/elements/sessions'],
+    ['POST', 'https://shop.example/api/cart/add'],
+    ['POST', 'https://notstripe.com/collect'],
+    ['POST', 'https://www.google.com/recaptcha/api2/reload'],
+  ])
+    expect(refusedScriptRequest({ method, url })).toBe(false);
 });

@@ -56,11 +56,12 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     await prepareChromeProfile(paths);
     await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true, chromePath }));
     server = createServer((request, response) => {
-      if (request.method !== 'GET' || !request.url?.startsWith('http://fixture.example/')) {
+      const address = request.url ?? '';
+      if (request.method !== 'GET' || !/^http:\/\/(?:fixture|elsewhere)\.example\//u.test(address)) {
         response.writeHead(403).end();
         return;
       }
-      const url = new URL(request.url);
+      const url = new URL(address);
       documentRequests.push(url.pathname);
       if (url.pathname.startsWith('/help/')) {
         response.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><h1>${url.pathname}</h1>`);
@@ -306,18 +307,15 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
   });
 
   it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {
-    for (const step of ['first', 'second'])
-      await executeBrowserBatch(
-        context,
-        { actions: [{ kind: 'navigate', url: `http://fixture.example/help/${step}` }] },
-        { record: false },
-      );
+    for (const url of ['http://elsewhere.example/help/first', 'http://fixture.example/help/second'])
+      await executeBrowserBatch(context, { actions: [{ kind: 'navigate', url }] }, { record: false });
     const guard = await ensureBrowserNavigationGuard(page);
     await page.evaluate('history.back()');
-    // Outside any errand the guard refuses every document; a restored page would have asked nothing.
-    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    // Between operations only a GET on the site the job's lease admitted the page to loads; a restored page
+    // would have asked nothing.
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('blocked_address');
     expect(documentRequests.filter((request) => request === '/help/first')).toHaveLength(1);
-    expect(page.url()).not.toBe('http://fixture.example/help/first');
+    expect(page.url()).not.toBe('http://elsewhere.example/help/first');
   }, 20_000);
 });
 

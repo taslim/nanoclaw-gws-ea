@@ -11,7 +11,14 @@ import {
 /** A paused document request as the gate hands it to its page. */
 export interface PausedDocument {
   url: string;
+  /** The request's HTTP method, as Chrome sends it. */
+  method: string;
   headers: Record<string, string>;
+  /**
+   * The document is the guarded page's own top-level document. A frame's document, or a window's the page
+   * opened, is not: its page decides it, by that page's site.
+   */
+  topLevel: boolean;
 }
 /** A page's answer for one of its documents; `headers` replaces the request's headers when given. */
 export type DocumentDecision = { allow: true; headers?: Array<{ name: string; value: string }> } | { allow: false };
@@ -204,7 +211,8 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
     // Every guard's policy is taken as it stood at the pause, before placement can await.
     const captured = new Map<GuardedPage, CapturedPolicy>();
     for (const page of guarded()) captured.set(page, page.capture());
-    const document = { url: event.request.url, headers: event.request.headers };
+    // A page's target id is its main frame's id: only a document there is the page's own top-level document.
+    const topOf = pages.get(event.frameId);
     const decide = async (): Promise<DocumentDecision> => {
       const owner = await ownerOf(event.frameId);
       if (owner === 'unguarded') return { allow: true };
@@ -212,6 +220,12 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
         for (const page of owner.refuse) captured.get(page)?.refuse();
         return { allow: false };
       }
+      const document: PausedDocument = {
+        url: event.request.url,
+        method: event.request.method,
+        headers: event.request.headers,
+        topLevel: topOf === owner.page,
+      };
       // A page whose guard registered after this request paused had none when it paused.
       return captured.get(owner.page)?.decide(document) ?? { allow: true };
     };

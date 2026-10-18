@@ -1,22 +1,64 @@
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+
 import Database from 'better-sqlite3';
 import type { Locator, Page } from 'playwright-core';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { root } = await vi.hoisted(async () => {
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return { root: join(tmpdir(), 'nanoclaw-open-web-native-tests') };
+});
+vi.mock('../../config.js', async () => ({
+  ...(await vi.importActual<typeof import('../../config.js')>('../../config.js')),
+  DATA_DIR: root,
+  GROUPS_DIR: `${root}/groups`,
+}));
+vi.mock('../../container-runner.js', () => ({
+  getContainerStartedAtMs: vi.fn(() => Date.now()),
+  isContainerRunning: vi.fn(() => false),
+  killContainer: vi.fn(),
+  registerSessionAdmissionPolicy: vi.fn(),
+  wakeContainer: vi.fn(async () => true),
+}));
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
+
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
+import { requestWake } from '../../request-wake.js';
+import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
+import type { Session } from '../../types.js';
+import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import { upsertUser } from '../permissions/db/users.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
+import '../gws-ea-profile/index.js';
+import './index.js';
+import { configureBrowserCancellation } from './cancel.js';
 import {
   classifyActivation,
   classifyNavigationUrl,
+  ensureBrowserNavigationGuard,
   readControlFacts,
   type ActivationIntent,
 } from './commit-classifier.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
-import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
-import { CONSENT, COOKIE_BANNERS, OPEN_WEB, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
-import { observePage, type BrowserObservation } from './observe.js';
-import type { BrowserExecutionContext } from './queue.js';
+import { setBrowserAdmissionReady } from './group.js';
+import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
+import {
+  CONSENT,
+  COOKIE_BANNERS,
+  OPEN_WEB,
+  PROCESSOR,
+  openWebFixture,
+  type OpenWebFixture,
+} from './open-web-native-fixture.js';
+import { observePage, type BrowserObservation, type BrowserRef } from './observe.js';
+import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -545,6 +587,394 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     await page.locator('#q').fill('yoga');
     expect(await act(['key', 'Class'])).toMatchObject({ status: 'stopped', reason: 'navigated' });
     expect(Object.fromEntries(submitted('/classes') ?? [])).toEqual({ q: 'yoga' });
+  });
+});
+
+/** The aria ref of the one control named `name` in an observation, with its generation. */
+function refIn(observation: { snapshot: string; generation: number }, name: string): BrowserRef {
+  const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
+  const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
+  if (!ref) throw new Error(`Missing ${name} in ${observation.snapshot}`);
+  return { ref, generation: observation.generation };
+}
+
+describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_000 }, () => {
+  let fixture: OpenWebFixture;
+  let db: SqliteDriver;
+  let pages: Page[];
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    pages = [];
+    db = new SqliteDriver(new Database(':memory:'));
+    await db.exec(
+      "CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('job-a'),('job-b');",
+    );
+    await browserSiteLeasesMigration.up(db);
+    await browserConsentMigration.up(db);
+    await browserRecipesMigration.up(db);
+    fixture.requests.length = 0;
+  });
+  afterEach(async () => {
+    for (const page of pages) await page.context().close();
+    await db?.close();
+  });
+
+  const open = async (): Promise<Page> => {
+    const page = await fixture.newPage();
+    pages.push(page);
+    return page;
+  };
+  /** A job's request context over the fixture's page, as the queue builds one. */
+  const context = (page: Page, job = 'job-a'): BrowserExecutionContext =>
+    ({
+      job: { id: job, thread_id: job },
+      request: { id: `request-${randomUUID()}` },
+      session: {},
+      store: new BrowserStore(db),
+      page: async () => page,
+      assertActive: async () => undefined,
+      wakeWaiters: async () => undefined,
+      remaining: () => 30_000,
+      signal: new AbortController().signal,
+    }) as unknown as BrowserExecutionContext;
+  const batch = (page: Page, actions: BrowserAction[], job = 'job-a'): Promise<Record<string, unknown>> =>
+    executeBrowserBatch(context(page, job), { actions }, { record: false });
+  const go = (page: Page, url: string, job = 'job-a'): Promise<Record<string, unknown>> =>
+    batch(page, [{ kind: 'navigate', url }], job);
+  /** A click on each named control, in one batch, aimed from one fresh observation. */
+  const click = async (page: Page, ...names: string[]): Promise<Record<string, unknown>> => {
+    const observation = await observePage(page);
+    return batch(
+      page,
+      names.map((name) => ({ kind: 'click', ...refIn(observation, name) })),
+    );
+  };
+  const posts = (): string[] =>
+    fixture.requests.filter((request) => request.method !== 'GET').map((request) => request.url);
+
+  it('runs a script button, a box, a radio choice and a select as real actions', async () => {
+    const page = await open();
+    expect(await go(page, OPEN_WEB.faq)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    const observation = await observePage(page);
+    expect(
+      await batch(page, [
+        { kind: 'click', ...refIn(observation, 'Show delivery times') },
+        { kind: 'click', ...refIn(observation, 'This is a gift') },
+        { kind: 'click', ...refIn(observation, 'Cloth') },
+        { kind: 'select', ...refIn(observation, 'Country'), value: 'Canada' },
+      ]),
+    ).toMatchObject({ status: 'completed' });
+    expect(await page.locator('#times').isVisible()).toBe(true);
+    expect(await page.locator('#toggle').getAttribute('aria-expanded')).toBe('true');
+    expect(await page.locator('#gift').isChecked()).toBe(true);
+    expect(await page.locator('#cloth').isChecked()).toBe(true);
+    expect(await page.locator('#country').inputValue()).toBe('Canada');
+    expect(posts()).toEqual([]);
+  });
+
+  it('fails a click on a control an overlay covers, instead of pressing the overlay', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.overlay);
+    expect(await click(page, 'Search')).toMatchObject({
+      status: 'stopped',
+      reason: 'not_actionable',
+      actions: [{ status: 'stopped', reason: 'not_actionable' }],
+    });
+    expect(posts()).toEqual([]);
+    expect(page.url()).toBe(OPEN_WEB.overlay);
+  });
+
+  it('refuses a page timer that posts after the batch, follows its GET on the leased site, and refuses one to another site', async () => {
+    const page = await open();
+    const guard = await ensureBrowserNavigationGuard(page);
+    /** A refused load ends on Chrome's own error page. */
+    const refused = async (): Promise<void> => {
+      await expect.poll(() => guard.reason(), { timeout: 10_000 }).toBe('blocked_address');
+      await expect.poll(() => page.url(), { timeout: 10_000 }).toMatch(/^chrome-error:/u);
+    };
+    await go(page, OPEN_WEB.timers);
+    expect(await click(page, 'Save for later')).toMatchObject({ status: 'completed' });
+    await refused();
+    expect(posts()).toEqual([]);
+    // The next operation navigates again.
+    expect(await go(page, OPEN_WEB.timers)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await click(page, 'Refresh deals')).toMatchObject({ status: 'completed' });
+    await page.waitForURL('https://shop.example/deals/today', { timeout: 10_000 });
+    expect(guard.reason()).toBeUndefined();
+    await go(page, OPEN_WEB.timers);
+    expect(await click(page, 'See partner offer')).toMatchObject({ status: 'completed' });
+    await refused();
+    expect(fixture.requests.filter((request) => request.url.startsWith('https://partner.example'))).toEqual([]);
+    expect(await go(page, OPEN_WEB.timers)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(page.url()).toBe(OPEN_WEB.timers);
+  });
+
+  it('refuses script posts to a payment processor or a checkout route during an ordinary click, from the page and its payment frame', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.scripted);
+    const frame = page.frames().find((candidate) => candidate.url() === PROCESSOR.frame);
+    if (!frame) throw new Error('The payment frame did not load');
+    // The payment frame runs out of process: its requests leave from its own target.
+    await (await page.context().newCDPSession(frame)).detach();
+    for (const name of ['Show delivery estimate', 'Check stock', 'Update cart', 'Show wallet options'])
+      expect(await click(page, name)).toMatchObject({ status: 'completed' });
+    expect(posts()).toEqual([]);
+    // The awaited GET went out; only the post after it was refused.
+    expect(fixture.requests.map((request) => request.url)).toContain('https://shop.example/api/stock');
+    expect(await page.locator('#status').textContent()).toBe('refused');
+    // Outside an action nothing is paused: the page's own post reaches the processor.
+    await page.evaluate(`fetch('${PROCESSOR.confirm}', { method: 'POST', mode: 'no-cors', body: 'outside' })`);
+    await expect.poll(posts).toEqual([PROCESSOR.confirm]);
+  });
+
+  it('never slows a widget polling with GETs, during an action or after it', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.live);
+    const clock = (): Promise<number> => page.evaluate(() => performance.now());
+    const started = await clock();
+    expect(await click(page, 'Show more')).toMatchObject({ status: 'completed' });
+    const ended = await clock();
+    await page.waitForTimeout(1_000);
+    const polls = (await page.evaluate('window.polls')) as Array<{ at: number; ok: boolean; ms: number }>;
+    expect(polls.every((poll) => poll.ok)).toBe(true);
+    expect(Math.max(...polls.map((poll) => poll.ms))).toBeLessThan(250);
+    // The widget kept its pace through the action's window and after it.
+    expect(polls.filter((poll) => poll.at >= started && poll.at <= ended).length).toBeGreaterThanOrEqual(
+      Math.floor((ended - started) / 200),
+    );
+    expect(polls.filter((poll) => poll.at > ended).length).toBeGreaterThanOrEqual(5);
+    expect(await page.locator('#extra').isVisible()).toBe(true);
+  });
+
+  it('replays a read-only recipe along GET links on an unreviewed site, and refuses its POST', async () => {
+    const page = await open();
+    const recording = context(page);
+    const record = (actions: BrowserAction[]) => executeBrowserBatch(recording, { actions });
+    await record([{ kind: 'navigate', url: OPEN_WEB.article }]);
+    await record([{ kind: 'click', ...refIn(await observePage(page), 'About us') }]);
+    const about = await saveBrowserRecipe(recording, {
+      name: 'About',
+      first_action: 0,
+      last_action: 1,
+      parameters: [],
+    });
+    expect(about).toMatchObject({ status: 'saved', read_only: true });
+    expect(
+      await executeRecipe(
+        context(page),
+        { recipe_id: about.recipe_id, parameters: {} },
+        { page, readOnly: true, record: false },
+      ),
+    ).toMatchObject({ status: 'completed' });
+    expect(page.url()).toBe(OPEN_WEB.about);
+    await record([{ kind: 'navigate', url: OPEN_WEB.availability }]);
+    await record([{ kind: 'click', ...refIn(await observePage(page), 'Refresh availability') }]);
+    expect(posts()).toEqual(['https://bistro.example/availability/hold']);
+    const hold = await saveBrowserRecipe(recording, {
+      name: 'Tables',
+      first_action: 2,
+      last_action: 3,
+      parameters: [],
+    });
+    expect(hold).toMatchObject({ status: 'saved', read_only: true });
+    expect(
+      await executeRecipe(
+        context(page),
+        { recipe_id: hold.recipe_id, parameters: {} },
+        { page, readOnly: true, record: false },
+      ),
+    ).toMatchObject({ status: 'checkpoint_failed', step: 1, found: { reason: 'read_only' } });
+    expect(posts()).toEqual(['https://bistro.example/availability/hold']);
+  });
+
+  it('stops typing into a card field with card_field, on the page and inside a processor frame', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.platform);
+    const typed = async (name: string): Promise<unknown> =>
+      batch(page, [{ kind: 'type', ...refIn(await observePage(page), name), text: '4242 4242 4242 4242' }]);
+    expect(await typed('Card number')).toMatchObject({ status: 'stopped', reason: 'card_field' });
+    expect(await typed('Expiry')).toMatchObject({ status: 'stopped', reason: 'card_field' });
+    expect(await page.locator('input[name="cardnumber"]').inputValue()).toBe('');
+    // A gift card's number is no card entry: the secret rule keeps it out of ordinary typing.
+    expect(await typed('Gift card number')).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+    await go(page, OPEN_WEB.hostedCard);
+    await page.frameLocator('#card-frame').locator('input[name="cardnumber"]').waitFor();
+    for (const name of ['Card number', 'CVC']) expect(await typed(name)).toMatchObject({ reason: 'card_field' });
+    expect(await page.frameLocator('#card-frame').locator('input[name="cardnumber"]').inputValue()).toBe('');
+  });
+
+  it('lets two jobs whose pages embed the same third-party frame each load it: a frame takes no lease', async () => {
+    const [first, second] = [await open(), await open()];
+    expect(await go(first, OPEN_WEB.product, 'job-a')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    await first.frameLocator('#pay-later').locator('text=Pay in 4').waitFor();
+    expect(await go(second, OPEN_WEB.giftCards, 'job-b')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    await second.frameLocator('#pay-later').locator('text=Pay in 4').waitFor();
+    expect(await db.all('SELECT site, job_id FROM gws_ea_browser_site_leases ORDER BY site')).toEqual([
+      { site: 'bistro.example', job_id: 'job-b' },
+      { site: 'shop.example', job_id: 'job-a' },
+    ]);
+  });
+});
+
+describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { timeout: 60_000 }, () => {
+  const PRINCIPAL = 'gchat:users/principal';
+  let fixture: OpenWebFixture;
+  let page: Page;
+  let queue: BrowserQueue;
+  let session: Session;
+  let main: Session;
+  let closed: number;
+  const posts = (): string[] =>
+    fixture.requests.filter((request) => request.method !== 'GET').map((request) => request.url);
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    fs.mkdirSync(`${root}/browser`, { recursive: true });
+    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+      mode: 0o600,
+    });
+    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+    await runMigrations(await initTestDb());
+    for (const id of ['main-p', 'browser-p'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    await createMessagingGroup({
+      id: 'mg-principal',
+      channel_type: 'gchat',
+      platform_id: 'spaces/principal',
+      name: 'principal',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: new Date().toISOString(),
+    });
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'America/Los_Angeles',
+      mainAgentGroupId: 'main-p',
+      principalEmails: ['morgan@example.test'],
+    });
+    await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'browser-p');
+    await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
+    await upsertUserDm({
+      user_id: PRINCIPAL,
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-principal',
+      resolved_at: new Date().toISOString(),
+    });
+    await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
+    main = (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
+    session = (await resolveSystemSession('browser-p', 'system:a2a:main-p:reorder')).session;
+    page = await fixture.newPage();
+    closed = 0;
+    queue = new BrowserQueue(new BrowserStore(), {
+      pageForJob: async () => page,
+      connection: async (): Promise<never> => {
+        throw new Error('Not used');
+      },
+      closeJob: async () => {
+        closed++;
+      },
+      onDisconnected: () => () => undefined,
+    });
+    configureBrowserCancellation(queue);
+    await queue.start();
+    setBrowserAdmissionReady(true);
+    fixture.requests.length = 0;
+    vi.mocked(requestWake).mockClear();
+  });
+  afterEach(async () => {
+    setBrowserAdmissionReady(false);
+    await queue?.stop();
+    await page?.context().close();
+    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    await closeDb();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** One browser request through the queue, as the browser agent sends it; its answer's data. */
+  async function run(id: string, actions: BrowserAction[]): Promise<Record<string, unknown>> {
+    await queue.accept('browser', { actions }, session, id);
+    await queue.idle();
+    const row = await getDb().get<{ answer_json: string }>(
+      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
+      session.id,
+      id,
+    );
+    if (!row) throw new Error(`No answer for ${id}`);
+    return (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
+  }
+  /** Opens `url`, then presses the control named `name` from the observation the navigation answered with. */
+  async function press(url: string, name: string): Promise<Record<string, unknown>> {
+    const opened = await run(`open-${name}`, [{ kind: 'navigate', url }]);
+    const observation = opened.observation as { snapshot: string; generation: number };
+    return run(`press-${name}`, [{ kind: 'click', ...refIn(observation, name) }]);
+  }
+  const incidents = () =>
+    getDb().all<{ kind: string; site: string; job_id: string; attempt_id: string | null; notified_at: string | null }>(
+      'SELECT kind, site, job_id, attempt_id, notified_at FROM gws_ea_browser_incidents',
+    );
+  /** What the host wrote in main's conversation. */
+  const mainNotes = (): Promise<string[]> =>
+    withExistingMailboxSession('main-p', main.id, (mailbox) =>
+      mailbox.getInboundHistory(20).map((message) => message.content),
+    ).then((contents) => contents ?? []);
+
+  it('stops the job, records an incident and tells main at once when an ordinary Submit lands on a paid order confirmation', async () => {
+    const answer = await press(OPEN_WEB.reorder, 'Submit');
+    expect(answer).toMatchObject({
+      status: 'stopped',
+      reason: 'unapproved_commit',
+      incident: { site: 'shop.example', reference: 'SO-48213', charged: '$42.00' },
+      actions: [{ status: 'stopped', reason: 'unapproved_commit' }],
+      repeat_safe: false,
+    });
+    expect(posts()).toEqual(['https://shop.example/reorder/submit']);
+    const [incident] = await incidents();
+    expect(incident).toMatchObject({
+      kind: 'unapproved_commit',
+      site: 'shop.example',
+      job_id: session.thread_id,
+      attempt_id: null,
+      notified_at: expect.any(String),
+    });
+    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+      cancelled: 1,
+    });
+    expect(closed).toBeGreaterThan(0);
+    const notes = await mainNotes();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('SO-48213');
+    expect(notes[0]).toContain('$42.00');
+    expect(notes[0]).toContain(String(session.thread_id));
+    expect(vi.mocked(requestWake).mock.calls.some(([woken]) => woken.id === main.id)).toBe(true);
+    // The job is over: its next request is refused before it runs.
+    await expect(run('after', [{ kind: 'observe' }])).rejects.toThrow();
+  });
+
+  it('raises nothing for a waitlist number or a $0.00 registration', async () => {
+    expect(await press(OPEN_WEB.waitlist, 'Join')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await page.locator('h1').textContent()).toBe("You're on the waitlist");
+    expect(await press(OPEN_WEB.rsvp, 'RSVP')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await page.locator('h1').textContent()).toBe('Registration confirmed');
+    expect(await incidents()).toEqual([]);
+    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+      cancelled: 0,
+    });
+    expect(await mainNotes()).toEqual([]);
   });
 });
 

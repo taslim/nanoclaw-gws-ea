@@ -64,7 +64,26 @@ export const OPEN_WEB = {
   help: 'https://shop.example/help',
   account: 'https://shop.example/account/settings',
   overlay: 'https://shop.example/deals',
+  faq: 'https://shop.example/delivery-faq',
+  timers: 'https://shop.example/deals/timers',
+  scripted: 'https://shop.example/express-delivery',
+  live: 'https://shop.example/live',
+  giftCards: 'https://bistro.example/gift-cards',
+  availability: 'https://bistro.example/availability',
+  reorder: 'https://shop.example/reorder',
+  waitlist: 'https://bistro.example/waitlist',
+  rsvp: 'https://events.example/talks/autumn',
 } as const;
+
+/** Where a payment processor's API and its card frame live in the fixture: stand-ins for Stripe's. */
+export const PROCESSOR = {
+  confirm: 'https://api.stripe.com/v1/payment_intents/pi_fixture/confirm',
+  methods: 'https://api.stripe.com/v1/payment_methods',
+  frame: 'https://js.stripe.com/v3/elements-inner-payment-fixture.html',
+} as const;
+
+/** How long a page timer waits before it acts: longer than a batch's action, its settle and its observation. */
+export const PAGE_TIMER_MS = 3_000;
 
 const document = (title: string, body: string, script = ''): string =>
   `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${script ? `<script>${script}</script>` : ''}</body></html>`;
@@ -195,7 +214,8 @@ export function platformPage(): string {
     'Pay Linen & Co',
     `<h1>Pay Linen &amp; Co</h1><form method="post" action="/session/cs_fixture_42/confirm"><p>Total due</p><p>$42.00</p>
 <label>Card number <input name="cardnumber" autocomplete="cc-number"></label> <label>Expiry <input name="exp" autocomplete="cc-exp"></label>
-<label>CVC <input name="cvc" autocomplete="cc-csc"></label><button type="submit" id="pay">Pay $42.00</button> <button type="button" id="continue">Continue</button></form>
+<label>CVC <input name="cvc" autocomplete="cc-csc"></label><label>Gift card number <input name="gift_card_number"></label>
+<button type="submit" id="pay">Pay $42.00</button> <button type="button" id="continue">Continue</button></form>
 <a id="back" href="https://shop.example/cart">Back to Linen &amp; Co</a>`,
   );
 }
@@ -345,6 +365,172 @@ export function overlayPage(): string {
     `${shopHeader}<h1>Deals</h1><form method="get" action="/search"><input type="search" name="q" aria-label="Search deals"><button id="search">Search</button></form>
 <form id="buy" method="post" action="/checkout/complete"><input type="hidden" name="sku" value="apron"></form>
 <div id="overlay" onclick="document.getElementById('buy').submit()" style="position:fixed;inset:0;opacity:0.01;z-index:10"></div>`,
+  );
+}
+
+/** A page whose ordinary controls run page script: a disclosure button, a box, a radio choice and a select. */
+export function faqPage(): string {
+  return document(
+    'Delivery questions',
+    `${shopHeader}<h1>Delivery questions</h1>
+<button type="button" id="toggle" aria-expanded="false" aria-controls="times">Show delivery times</button>
+<div id="times" hidden><p>Orders placed before 2pm arrive the next day.</p></div>
+<label><input type="checkbox" id="gift"> This is a gift</label>
+<fieldset><legend>Wrapping</legend><label><input type="radio" name="wrap" value="paper" checked> Paper</label>
+<label><input type="radio" name="wrap" value="cloth" id="cloth"> Cloth</label></fieldset>
+<label>Country <select id="country"><option>United States</option><option>Canada</option></select></label>`,
+    `const toggle = document.getElementById('toggle');
+toggle.addEventListener('click', () => {
+  const times = document.getElementById('times');
+  times.hidden = !times.hidden;
+  toggle.setAttribute('aria-expanded', String(!times.hidden));
+});`,
+  );
+}
+
+/**
+ * Buttons whose page timers act after the batch that pressed them has ended: one posts a form, one loads
+ * another page on the same site, one loads a page on another site.
+ */
+export function timersPage(): string {
+  return document(
+    'Deals',
+    `${shopHeader}<h1>Today's deals</h1><form id="later" method="post" action="/deals/saved"><input type="hidden" name="sku" value="apron"></form>
+<button type="button" id="save">Save for later</button> <button type="button" id="refresh">Refresh deals</button>
+<button type="button" id="partner">See partner offer</button>`,
+    `const later = (work) => () => setTimeout(work, ${PAGE_TIMER_MS});
+document.getElementById('save').addEventListener('click', later(() => document.getElementById('later').submit()));
+document.getElementById('refresh').addEventListener('click', later(() => location.assign('/deals/today')));
+document.getElementById('partner').addEventListener('click', later(() => location.assign('https://partner.example/offer')));`,
+  );
+}
+
+/**
+ * Ordinary-looking buttons whose script posts to a payment processor: at once, after an awaited fetch, and
+ * through a cross-site payment frame, plus one that posts to the site's own checkout route.
+ */
+export function scriptedPage(): string {
+  return document(
+    'Express delivery',
+    `${shopHeader}<h1>Express delivery</h1><p id="status">Ready</p>
+<button type="button" id="estimate">Show delivery estimate</button> <button type="button" id="stock">Check stock</button>
+<button type="button" id="cart">Update cart</button> <button type="button" id="wallet">Show wallet options</button>
+<iframe id="pay" title="Payment" src="${PROCESSOR.frame}" style="width:360px;height:60px;border:0"></iframe>`,
+    `const post = (url, body) => fetch(url, { method: 'POST', mode: 'no-cors', body }).then(
+  () => 'sent',
+  () => 'refused',
+).then((outcome) => { document.getElementById('status').textContent = outcome; });
+document.getElementById('estimate').addEventListener('click', () => { void post('${PROCESSOR.confirm}', 'payment_method=pm_card'); });
+document.getElementById('stock').addEventListener('click', async () => {
+  await fetch('/api/stock').then((response) => response.text());
+  void post('${PROCESSOR.confirm}', 'after=stock');
+});
+document.getElementById('cart').addEventListener('click', () => { void post('/api/checkout/submit', 'sku=apron'); });
+document.getElementById('wallet').addEventListener('click', () => {
+  document.getElementById('pay').contentWindow.postMessage('confirm', '*');
+});`,
+  );
+}
+
+/** A processor's payment frame that posts to its own API when its page asks. */
+export function processorPaymentFrame(): string {
+  return document(
+    'Payment',
+    '<p>Card payments</p>',
+    `addEventListener('message', (event) => {
+  if (event.data === 'confirm') void fetch('${PROCESSOR.methods}', { method: 'POST', mode: 'no-cors', body: 'type=card' }).catch(() => undefined);
+});`,
+  );
+}
+
+/** A live page whose widget polls its server with a GET every 100 ms, recording how each poll went. */
+export function livePage(): string {
+  return document(
+    'Live',
+    `${shopHeader}<h1>Live stock</h1><button type="button" id="more" aria-expanded="false">Show more</button><div id="extra" hidden>More stock</div>`,
+    `window.polls = [];
+let poll = 0;
+setInterval(() => {
+  const started = performance.now();
+  fetch('/api/live?n=' + poll++).then(
+    () => window.polls.push({ at: started, ok: true, ms: performance.now() - started }),
+    () => window.polls.push({ at: started, ok: false, ms: performance.now() - started }),
+  );
+}, 100);
+document.getElementById('more').addEventListener('click', () => { document.getElementById('extra').hidden = false; });`,
+  );
+}
+
+/** Another site embedding the same third-party message frame as the product page. */
+export function giftCardsPage(): string {
+  return document(
+    'Gift cards',
+    `<h1>Bistro Juno gift cards</h1><iframe id="pay-later" title="PayPal Pay Later message" src="https://www.paypal.com/credit-presentment/smart/message?amount=50.00" style="width:320px;height:40px;border:0"></iframe>`,
+  );
+}
+
+/** An availability view whose formless refresh button posts a hold behind the scenes. */
+export function availabilityPage(): string {
+  return document(
+    'Availability',
+    `<h1>Tables this week</h1><p>Saturday 7:00 PM</p><form id="hold" method="post" action="/availability/hold"><input type="hidden" name="slot" value="sat-1900"></form>
+<button type="button" id="refresh">Refresh availability</button>`,
+    `document.getElementById('refresh').addEventListener('click', () => document.getElementById('hold').submit());`,
+  );
+}
+
+/** A one-tap reorder: no total or payment method on the page, while its server charges the saved card. */
+export function reorderPage(): string {
+  return document(
+    'Reorder',
+    `${shopHeader}<h1>Reorder your last items</h1><form id="reorder" method="post" action="/reorder/submit">
+<label>Item <select name="item"><option>Linen apron</option></select></label><button type="submit" id="submit">Submit</button></form>`,
+  );
+}
+
+/** What the reorder's server answers: an order confirmation that shows the charge, with its schema.org Order. */
+export function orderConfirmationPage(): string {
+  const order = {
+    '@context': 'https://schema.org',
+    '@type': 'Order',
+    orderNumber: 'SO-48213',
+    priceCurrency: 'USD',
+    price: '42.00',
+  };
+  return document(
+    'Order confirmed',
+    `${shopHeader}<h1>Thank you for your order!</h1><p>Order number: SO-48213</p><table><tr><td>Order total</td><td>$42.00</td></tr></table>
+<p>Charged to Visa ending in 4242.</p><script type="application/ld+json">${JSON.stringify(order)}</script>`,
+  );
+}
+
+export function waitlistPage(): string {
+  return document(
+    'Waitlist',
+    `<h1>Bistro Juno</h1><p>No tables tonight.</p><form id="waitlist" method="post" action="/waitlist/join">
+<label>Party size <select name="party"><option>2</option><option>4</option></select></label><button type="submit" id="join">Join</button></form>`,
+  );
+}
+
+export function waitlistJoinedPage(): string {
+  return document(
+    'On the waitlist',
+    "<h1>You're on the waitlist</h1><p>Confirmation #W123</p><p>We'll text you when your table is ready.</p>",
+  );
+}
+
+export function rsvpPage(): string {
+  return document(
+    'Autumn talks',
+    `<h1>Autumn talks</h1><p>An evening of short talks at the library.</p><form id="rsvp" method="post" action="/talks/autumn/rsvp">
+<label>Name <input name="name" autocomplete="name"></label><button type="submit" id="rsvp-button">RSVP</button></form>`,
+  );
+}
+
+export function rsvpConfirmedPage(): string {
+  return document(
+    'Registered',
+    '<h1>Registration confirmed</h1><p>Thank you, Remy Vance.</p><p>Confirmation number EV-2026-118</p><p>Total: $0.00</p>',
   );
 }
 
@@ -830,6 +1016,28 @@ export function openWebPages(): Record<string, OpenWebRoute> {
     'https://chat.example/widget': chatWidget(),
     [OPEN_WEB.account]: accountPage(),
     [OPEN_WEB.overlay]: overlayPage(),
+    [OPEN_WEB.faq]: faqPage(),
+    [OPEN_WEB.timers]: timersPage(),
+    'https://shop.example/deals/saved': document('Saved', '<h1>Saved for later</h1>'),
+    'https://shop.example/deals/today': document('Today', '<h1>Deals of the day</h1>'),
+    'https://partner.example/offer': document('Offer', '<h1>A partner offer</h1>'),
+    [OPEN_WEB.scripted]: scriptedPage(),
+    [PROCESSOR.frame]: processorPaymentFrame(),
+    [PROCESSOR.confirm]: () => ({ headers: { 'content-type': 'application/json' }, body: '{"status":"succeeded"}' }),
+    [PROCESSOR.methods]: () => ({ headers: { 'content-type': 'application/json' }, body: '{"id":"pm_fixture"}' }),
+    'https://shop.example/api/stock': () => ({ headers: { 'content-type': 'application/json' }, body: '{"stock":3}' }),
+    'https://shop.example/api/checkout/submit': () => ({ headers: { 'content-type': 'application/json' }, body: '{}' }),
+    [OPEN_WEB.live]: livePage(),
+    'https://shop.example/api/live': () => ({ headers: { 'content-type': 'application/json' }, body: '{"stock":3}' }),
+    [OPEN_WEB.giftCards]: giftCardsPage(),
+    [OPEN_WEB.availability]: availabilityPage(),
+    'https://bistro.example/availability/hold': document('Held', '<h1>Your table is held</h1>'),
+    [OPEN_WEB.reorder]: reorderPage(),
+    'https://shop.example/reorder/submit': orderConfirmationPage(),
+    [OPEN_WEB.waitlist]: waitlistPage(),
+    'https://bistro.example/waitlist/join': waitlistJoinedPage(),
+    [OPEN_WEB.rsvp]: rsvpPage(),
+    'https://events.example/talks/autumn/rsvp': rsvpConfirmedPage(),
     ...consentPages(),
     ...cookieBannerPages(),
   };

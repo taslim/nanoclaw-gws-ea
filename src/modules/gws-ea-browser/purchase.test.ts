@@ -546,22 +546,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     };
     await navigate(`${AMAZON_RETAIL.origin}/dp/B012345678`, 'product');
     expect(await activate('Buy Now', 'no-oneclick')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
-    expect(await activate('Continue', 'unknown-prep')).toMatchObject({
-      status: 'stopped',
-      reason: 'unsupported_merchant',
-    });
-    await page.locator('input[name="ASIN"]').evaluate((node) => {
-      (node as unknown as { value: string }).value = 'B099999999';
-    });
-    expect(await activate('Add to Cart', 'mismatched-product')).toMatchObject({
-      status: 'stopped',
-      reason: 'unsupported_merchant',
-    });
+    // A control the reviewed flow does not know is left to the open rule: an ordinary, real click, which here
+    // presses a script-less button and submits nothing.
+    expect(await activate('Continue', 'unknown-prep')).toMatchObject({ status: 'completed' });
     expect(cartAdded).toBe(0);
     expect(submitted).toBe(0);
-    await page.locator('input[name="ASIN"]').evaluate((node) => {
-      (node as unknown as { value: string }).value = 'B012345678';
-    });
     await activate('Add to Cart', 'add-cart');
     expect(page.url()).toContain('/gp/cart/view.html');
     expect(cartAdded).toBe(1);
@@ -1154,9 +1143,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('later-load')).toMatchObject({ status: 'completed' });
     expect(frame.url()).toBe(`${WIDGET_ORIGIN}/`);
     await assertOutOfProcess(frame);
-    // Outside any job batch the guard refuses every document, in this frame as in the page.
-    await frame.locator('#help').click();
-    await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
+    // Outside any job batch the guard still decides this frame's documents: a purchase route is refused.
+    await frame.locator('#plans').click();
+    await expect.poll(() => guard.reason()).toBe('purchase_control');
     expect(widgetRequests).toEqual(['/']);
   }, 30_000);
   it('holds file choosers opened in the page and in an out-of-process frame instead of showing them', async () => {
@@ -1297,7 +1286,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     // No readiness pass ran after the second swap: ending the first target let the swap's own event cover it.
     guard.clearReason();
     await frame.locator('#plans').click();
-    await expect.poll(() => guard.reason()).toBe('unsupported_merchant');
+    await expect.poll(() => guard.reason()).toBe('purchase_control');
     expect(widgetRequests).toEqual(['/', '/']);
   }, 30_000);
   it('strips the Referer from what a sign-in scope loads, documents and subresources alike', async () => {
@@ -1476,7 +1465,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await page.locator('body').getAttribute('data-worker')).toBe('refused');
     // With no worker registered, the purchase navigation reaches the gate, which refuses it outside any errand.
     await page.evaluate("location.assign('/checkout/placeorder')");
-    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('unsupported_merchant');
+    await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('purchase_control');
     expect(await page.content()).not.toContain('served by worker');
   }, 30_000);
 });
