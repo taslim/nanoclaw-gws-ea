@@ -23,7 +23,7 @@ interface Fixture {
 // The native-world boundary needs a real Chromium renderer. CI can opt in with its
 // Chromium executable; local acceptance uses the same headed Chrome as production.
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-describe.skipIf(!chromePath)('native authentication submission', () => {
+describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_000 }, () => {
   let root: string;
   let connection: ChromeConnection;
 

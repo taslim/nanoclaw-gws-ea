@@ -39,7 +39,7 @@ const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const invoice = Buffer.concat([Buffer.from('%PDF-1.7\nNative invoice bytes\n'), Buffer.alloc(200_003, 41)]);
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 
-describe.skipIf(!chromePath)('native Chrome file transfers', () => {
+describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }, () => {
   const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
   const sockets = new Set<Socket>();
   let server: Server;

@@ -194,7 +194,7 @@ const PAGES: Record<string, string> = {
   '/verify-email-quiet': '<h1>Shop</h1><p>Browse the catalogue.</p>',
 };
 
-describe.skipIf(!chromePath)('native authorized signup and password change', () => {
+describe.skipIf(!chromePath)('native authorized signup and password change', { timeout: 30_000 }, () => {
   let root: string;
   let proxy: HttpServer;
   let server: HttpsServer;

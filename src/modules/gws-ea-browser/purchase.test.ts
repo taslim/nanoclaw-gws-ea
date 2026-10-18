@@ -303,7 +303,7 @@ it('reads a date-only needed-by as the end of that day on the principal’s cloc
   });
 });
 
-describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', () => {
+describe.skipIf(!chromePath)('reviewed merchant purchases through native host delivery', { timeout: 30_000 }, () => {
   beforeAll(async () => {
     if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the native merchant fixture.');
     certificateRoot = fs.mkdtempSync(`${root}-tls-`);

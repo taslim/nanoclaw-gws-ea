@@ -34,7 +34,7 @@ import { resyReservationSignature } from './resy-signature.js';
 import type { WatchBounds } from './watches.js';
 import type { Session } from '../../types.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-describe.skipIf(!chromePath)('native reservation through the common purchase executor', () => {
+describe.skipIf(!chromePath)('native reservation through the common purchase executor', { timeout: 30_000 }, () => {
   let fixture: Awaited<ReturnType<typeof resyFixture>>;
   let fixtureState: ResyFixtureState;
   let queue: BrowserQueue;

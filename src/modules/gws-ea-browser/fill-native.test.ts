@@ -23,7 +23,7 @@ import type { BrowserExecutionContext } from './queue.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const secret = 'host-only-cross-origin-fixture-value';
-describe.skipIf(!chromePath)('native host secret fill', () => {
+describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () => {
   let root: string;
   let proxy: HttpServer;
   let server: HttpsServer;

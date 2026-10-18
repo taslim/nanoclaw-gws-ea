@@ -11,7 +11,7 @@ import { browserPaths } from './paths.js';
 import { withSignedOutBrowserPage } from './signed-out.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-describe.skipIf(!chromePath)('native signed-out watch pages', () => {
+describe.skipIf(!chromePath)('native signed-out watch pages', { timeout: 30_000 }, () => {
   let root: string;
   let connection: ChromeConnection;
 
