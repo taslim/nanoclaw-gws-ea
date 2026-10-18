@@ -72,9 +72,6 @@ import {
   type WatchedSiteState,
 } from './open-web-native-fixture.js';
 import { observePage } from './observe.js';
-// TEMPORARY CI DIAGNOSTIC imports.
-import { ensureBrowserNavigationGuard } from './commit-classifier.js';
-import { ensurePageTargets } from './page-targets.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { freeResyTable, resyFixture } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
@@ -560,52 +557,11 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
   });
 
   it('books a Resy table through its reader without waking the agent', async () => {
-    // TEMPORARY CI DIAGNOSTIC: what the page did when its readiness never comes.
-    const seen: string[] = [];
-    const stamp = (): string => `${Math.round(performance.now())}ms`;
-    resy.page.on('request', (r) => seen.push(`${stamp()} -> ${r.resourceType()} ${r.method()} ${r.url()}`));
-    resy.page.on('requestfinished', (r) => seen.push(`${stamp()} ok ${r.method()} ${r.url()}`));
-    resy.page.on('requestfailed', (r) =>
-      seen.push(`${stamp()} FAILED ${r.method()} ${r.url()} ${r.failure()?.errorText}`),
-    );
-    resy.page.on('framenavigated', (f) =>
-      seen.push(`${stamp()} navigated ${f === resy.page.mainFrame() ? 'main' : 'child'} ${f.url()}`),
-    );
-    resy.page.on('pageerror', (e) => seen.push(`${stamp()} pageerror ${e.message}`));
-    resy.page.on('console', (m) => seen.push(`${stamp()} console ${m.type()} ${m.text()}`));
-    resy.page.on('crash', () => seen.push(`${stamp()} crash`));
-    const network = await resy.page.context().newCDPSession(resy.page);
-    await network.send('Network.enable');
-    network.on('Network.requestWillBeSent', (e) =>
-      seen.push(`${stamp()} cdp sent ${e.requestId} ${e.type ?? '?'} ${e.request.method} ${e.request.url}`),
-    );
-    network.on('Network.loadingFailed', (e) => seen.push(`${stamp()} cdp failed ${JSON.stringify(e)}`));
-    network.on('Network.responseReceived', (e) =>
-      seen.push(`${stamp()} cdp response ${e.requestId} ${e.type} ${e.response.status} ${e.response.url}`),
-    );
-    const browserSession = await resy.browser.newBrowserCDPSession();
-    await browserSession.send('Target.setDiscoverTargets', { discover: true });
-    browserSession.on('Target.targetCreated', (e) =>
-      seen.push(`${stamp()} target+ ${e.targetInfo.type} ${e.targetInfo.url}`),
-    );
-    browserSession.on('Target.targetDestroyed', (e) => seen.push(`${stamp()} target- ${e.targetId}`));
-    browserSession.on('Target.targetCrashed', (e) => seen.push(`${stamp()} target crashed ${e.targetId}`));
     // The agent recorded the route to the reservation and its booking path: a click that reached the commit.
     expect(
       await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] }),
     ).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
-    seen.push(`${stamp()} answered`);
-    await resy.page
-      .locator('body[data-ready="yes"]')
-      .waitFor({ timeout: 15_000 })
-      .catch(async (error: unknown) => {
-        const body = await resy.page
-          .evaluate<string>("JSON.stringify(document.body.dataset) + ' ' + document.body.innerHTML.slice(0, 200)")
-          .catch((failure: unknown) => String(failure));
-        throw new Error(
-          `${String(error)}\nchrome ${resy.browser.version()}\nurl ${resy.page.url()}\nbody ${body}\n${seen.join('\n')}`,
-        );
-      });
+    await resy.page.locator('body[data-ready="yes"]').waitFor();
     const observation = await observePage(resy.page);
     expect(
       await request('browser', { actions: [{ kind: 'click', ...refIn(observation, 'Reserve Now') }] }),
@@ -652,60 +608,4 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     expect(await getDb().all('SELECT event_key FROM gws_ea_browser_watch_notices')).toEqual([]);
     expect(vi.mocked(requestWake).mock.calls.map(([, reason]) => reason)).not.toContain('browser-watch');
   });
-
-  // TEMPORARY CI DIAGNOSTIC: which step after a navigation aborts the Resy page's own API calls on CI.
-  it('TEMPORARY: reports which navigation step aborts the Resy page API calls', async () => {
-    if (!chromePath) throw new Error('Chrome required');
-    const address = 'https://resy.com/reservation-details';
-    const load = (page: Page) => page.goto(address, { waitUntil: 'domcontentloaded' });
-    const paused: string[] = [];
-    // A browser-level Fetch session of the test's own, pausing only `resourceType` and continuing everything.
-    const own = async (page: Page, resourceType: 'Other' | 'Document'): Promise<void> => {
-      const session = await resy.browser.newBrowserCDPSession();
-      session.on('Fetch.requestPaused', (event) => {
-        paused.push(event.request.method);
-        void session.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => undefined);
-      });
-      await session.send('Fetch.enable', { patterns: [{ requestStage: 'Request', resourceType }] });
-      await load(page);
-    };
-    const variants: Array<[string, (page: Page) => Promise<unknown>]> = [
-      ['plain', load],
-      ['fetch-other', (page) => own(page, 'Other')],
-      ['fetch-document', (page) => own(page, 'Document')],
-      [
-        'page-targets',
-        async (page) => {
-          await ensurePageTargets(page);
-          await load(page);
-        },
-      ],
-      ['gate', async (page) => (await ensureBrowserNavigationGuard(page)).runWithPolicy({}, () => load(page))],
-    ];
-    const results: string[] = [];
-    for (const [name, run] of variants)
-      for (let trial = 0; trial < 8; trial++) {
-        await resy.close();
-        resy = await resyFixture(chromePath, freeResyTable());
-        await resyReservationSignature.preparePage?.(resy.page);
-        const failed: string[] = [];
-        resy.page.on('requestfailed', (r) =>
-          failed.push(`${r.method()} ${new URL(r.url()).pathname} ${r.failure()?.errorText ?? ''}`),
-        );
-        const outcome = await run(resy.page).then(
-          () => 'ran',
-          (error: unknown) => `threw ${String(error).slice(0, 80)}`,
-        );
-        const ready = await resy.page
-          .locator('body[data-ready="yes"]')
-          .waitFor({ timeout: 8_000 })
-          .then(
-            () => 'ready',
-            () => 'NOT READY',
-          );
-        results.push(`${name}#${trial} ${outcome} ${ready} paused=${paused.join('+')} ${failed.join(', ')}`);
-        paused.length = 0;
-      }
-    throw new Error(`RESY ABORT DIAGNOSTIC\n${results.join('\n')}`);
-  }, 600_000);
 });
