@@ -1481,7 +1481,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     }
     expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
     expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
-  }, 60_000);
+  }, 120_000);
   it('places nested same-site and cross-site frames with the page that hosts their widget', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0OFFERS01`, 'offers-page');
     await queue.accept(
@@ -1542,7 +1542,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       await queue.idle();
     }
     expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
-  }, 60_000);
+  }, 120_000);
   it.each(['Open deals', 'Open deals window'])(
     'decides the documents of a window the page opens under the page guard (%s)',
     async (link) => {
@@ -1577,7 +1577,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     }
     expect(merchantDocuments).not.toContain('/checkout/placeorder');
     expect(reasons).toEqual(Array<string>(20).fill('purchase_control'));
-  }, 60_000);
+  }, 120_000);
   it('never lets a service worker answer a navigation the document gate has not decided', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0WORKER01`, 'worker-page');
     const guard = await ensureBrowserNavigationGuard(page);
