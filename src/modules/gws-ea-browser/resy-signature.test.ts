@@ -333,8 +333,9 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
         node.textContent = 'Reserve Now';
         node.matches = () => true;
       });
-      expect(await resyReservationSignature.readPurchase(fixture.page, unknown)).toMatchObject({
-        status: 'unsupported_merchant',
+      expect(await resyReservationSignature.readPurchase(fixture.page, unknown)).toEqual({
+        status: 'facts_incomplete',
+        missing: ["the site's reviewed checkout"],
       });
       expect(fixture.submitted()).toBe(0);
     } finally {

@@ -7,11 +7,12 @@ import type { ElementHandle, Frame, Page, Request, Response } from 'playwright-c
 import { isRecord } from '../../gws-ea/validation.js';
 import type { ActionClass, ControlFacts } from './commit-classifier.js';
 import { amountMinor, currencyExponent, type PurchaseFacts, type ReservationFacts } from './fingerprint.js';
-import type {
-  MerchantPurchaseEvidence,
-  MerchantSignature,
-  ReservationAvailability,
-  ReservationPolicy,
+import {
+  REVIEWED_CHECKOUT_MISSING,
+  type MerchantPurchaseEvidence,
+  type MerchantSignature,
+  type ReservationAvailability,
+  type ReservationPolicy,
 } from './merchant-contract.js';
 import { bindPageSecretDocuments, registerPageRedaction, registerPageSecret, releasePageSecret } from './observe.js';
 
@@ -673,7 +674,7 @@ async function readPurchase(
   if (candidates.length !== 1) return { status: 'checkout_lapsed' };
   const element = candidates[0],
     frame = await commitFrame(page, element);
-  if (!frame) return { status: 'unsupported_merchant' };
+  if (!frame) return REVIEWED_CHECKOUT_MISSING;
   const details = state.captures.get('/3/details');
   if (!fresh(details) || details.frame !== frame || details.request.commit !== 1)
     return { status: 'terms_unavailable' };

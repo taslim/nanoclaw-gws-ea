@@ -129,3 +129,123 @@ it('shows a needed-by deadline and a trial conversion on the principal’s clock
   expect(card).toContain('Needed by: Oct 20, 2026, 11:59 PM Los Angeles time');
   expect(card).toContain('Trial conversion: Nov 15, 2026, 12:00 AM Los Angeles time');
 });
+
+/** An unreviewed venue's own booking with a no-show fee, as the generic signature reads it. */
+const booking: PurchaseFacts = {
+  flowId: 'generic-checkout-v1',
+  site: 'trattoria.example',
+  origin: 'https://trattoria.example',
+  control: {
+    label: 'Reserve now',
+    locator: {
+      role: 'button',
+      name: 'Reserve now',
+      ordinal: 0,
+      count: 1,
+      framePath: [],
+      frameUrls: ['https://trattoria.example/book'],
+    },
+  },
+  account: 'guest checkout',
+  items: [],
+  currency: 'USD',
+  totalMinor: 0,
+  dueNowMinor: 0,
+  cardEnding: '4242',
+  address: null,
+  commitments: [
+    {
+      kind: 'conditional_fee',
+      terms: 'No-show fee: $25 per person, charged if you miss your reservation.',
+      amountMinor: 2500,
+      trigger: 'No-show fee: $25 per person, charged if you miss your reservation.',
+      conditionalTrigger: 'no_show',
+      cancellationTerms: 'No-show fee: $25 per person, charged if you miss your reservation.',
+      perPerson: true,
+    },
+  ],
+  generic: {
+    guest: true,
+    contactEmail: 'aya.web@example.test',
+    items: ['Party size 2'],
+    payment: 'Card on file: Visa ending in 4242',
+    note: 'One guest is allergic to peanuts',
+    booking: {
+      venue: 'Trattoria Remy',
+      partySize: 2,
+      at: '2026-10-25T02:00:00.000Z',
+      timeZone: '-07:00',
+      timeText: 'Saturday, October 24, 7:00 PM',
+    },
+  },
+};
+
+it("shows an unreviewed booking's account, quoted items, note and time, naming the assistant's address and no internal id", async () => {
+  const { renderPurchaseCard } = await import('./cards.js');
+  const card = renderPurchaseCard(booking, {}, ['attempt-1a2b'], 'America/New_York', undefined, {
+    alias: 'Aya.Web@example.test',
+  });
+  for (const line of [
+    'Site: trattoria.example',
+    'Account: guest checkout',
+    "Contact email: your assistant's email",
+    'Item: "Party size 2"',
+    'Total: $0.00 (USD)',
+    'Due now: $0.00',
+    'Payment: "Card on file: Visa ending in 4242"',
+    'Note: "One guest is allergic to peanuts"',
+    'Venue: "Trattoria Remy"',
+    'Party size: 2',
+    'Time: Oct 24, 2026, 7:00 PM GMT-7 (Oct 24, 2026, 10:00 PM New York time)',
+    'Amount due later/exposure: $25.00 per person × 2',
+    'Possible duplicate: An earlier purchase on this site has no recorded outcome.',
+  ])
+    expect(card).toContain(line);
+  expect(card).not.toContain('attempt-1a2b');
+  expect(card).not.toContain('aya.web@example.test');
+  const signedIn = renderPurchaseCard(
+    { ...booking, account: 'aya.web+tables@example.test', generic: { ...booking.generic!, guest: false } },
+    {},
+    [],
+    'America/New_York',
+    undefined,
+    { alias: 'aya.web@example.test' },
+  );
+  expect(signedIn).toContain("Account: your assistant's account");
+  expect(
+    renderPurchaseCard(
+      { ...booking, account: 'Morgan Ellery', generic: { ...booking.generic!, guest: false } },
+      {},
+      [],
+      'America/New_York',
+    ),
+  ).toContain('Account: "Morgan Ellery"');
+});
+
+it('covers an unreviewed booking under the standing guarantee only when its venue, party size, time and fee are read within bounds', async () => {
+  const { guaranteeCoversReservation } = await import('./reservation-guarantee.js');
+  const grant = { currency: 'USD', max_total_minor: 5000, revoked_at: null };
+  const bounds = {
+    reservation: {
+      venueId: 'trattoria remy',
+      partySize: 2,
+      windowStart: '2026-10-25T01:00:00.000Z',
+      windowEnd: '2026-10-25T04:00:00.000Z',
+    },
+  };
+  expect(completePurchaseFacts(booking)).toBe(true);
+  expect(guaranteeCoversReservation(grant, booking, bounds)).toBe(true);
+  const without = (key: 'venue' | 'partySize' | 'at'): PurchaseFacts => {
+    const { [key]: _omitted, ...rest } = booking.generic!.booking!;
+    return { ...booking, generic: { ...booking.generic!, booking: rest } };
+  };
+  for (const key of ['venue', 'partySize', 'at'] as const)
+    expect(guaranteeCoversReservation(grant, without(key), bounds)).toBe(false);
+  expect(guaranteeCoversReservation({ ...grant, max_total_minor: 4999 }, booking, bounds)).toBe(false);
+  expect(guaranteeCoversReservation(grant, { ...booking, commitments: [] }, bounds)).toBe(false);
+  expect(
+    guaranteeCoversReservation(grant, booking, {
+      reservation: { ...bounds.reservation, venueId: 'Trattoria Juno' },
+    }),
+  ).toBe(false);
+});

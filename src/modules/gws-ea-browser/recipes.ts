@@ -304,7 +304,29 @@ async function captureLocator(target: PinnedBrowserRef, nodes: readonly AriaNode
   }
   throw new Error('No structured accessible locator for this target');
 }
-async function resolveLocator(
+/** The roles a host-found control can carry: what a press can be aimed at. */
+const PRESS_ROLES: readonly BrowserRole[] = ['button', 'link', 'menuitem', 'tab', 'option'];
+/**
+ * A host-found control's structured locator (KTD4): its role and accessible name as Playwright reads them, its
+ * ordinal among their matches, and its frame path, so `resolveLocator` finds it again on a later read.
+ */
+export async function captureElementLocator(element: ElementHandle): Promise<StructuredBrowserLocator> {
+  const frame = await element.ownerFrame();
+  if (!frame) throw new Error('Detached element');
+  for (const role of PRESS_ROLES) {
+    const all = frame.getByRole(role);
+    const index = await all.evaluateAll((elements, target) => elements.indexOf(target), element);
+    if (index < 0) continue;
+    const [node] = ariaNodes(await all.nth(index).ariaSnapshotJSON({ timeout: 1_000 }));
+    if (node?.role !== role) continue;
+    const name = node.name;
+    const matches = frame.getByRole(role, { name, exact: true });
+    const ordinal = await matches.evaluateAll((elements, target) => elements.indexOf(target), element);
+    if (ordinal >= 0) return { role, name, ordinal, count: await matches.count(), ...(await framePath(frame)) };
+  }
+  throw new Error('No structured accessible locator for this element');
+}
+export async function resolveLocator(
   page: Page,
   target: StructuredBrowserLocator,
   checkMainUrl = true,

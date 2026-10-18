@@ -6,7 +6,8 @@ import { requestWake } from '../../request-wake.js';
 import { formatLocalTime, resolveTimezone } from '../../timezone.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import type { PendingApproval } from '../../types.js';
-import { formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import { identityMatchKey } from '../../gws-ea/validation.js';
+import { bookedReservation, formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
 
 export interface PurchaseCard {
   id: string;
@@ -64,6 +65,103 @@ export function cardEventSpan(start: string, end: string, venueTimeZone: string,
   );
   return sameClock ? venue : `${venue} (${cardSpan(start, end, principalTimeZone)})`;
 }
+/**
+ * A moment on the venue's clock, where it happens, with the principal's equivalent alongside when their clocks
+ * read differently.
+ */
+export function cardEventTime(at: string, venueTimeZone: string, principalTimeZone: string): string {
+  const venue = cardTime(at, venueTimeZone);
+  return formatLocalTime(at, venueTimeZone) === formatLocalTime(at, principalTimeZone)
+    ? venue
+    : `${venue} (${cardTime(at, principalTimeZone)})`;
+}
+/** Earlier attempts on the site with no recorded outcome, by their count: an attempt's id means nothing to the principal. */
+function duplicateWarning(exceptions: readonly string[]): string[] {
+  if (!exceptions.length) return [];
+  const earlier =
+    exceptions.length > 1
+      ? `${exceptions.length} earlier purchases on this site have`
+      : 'An earlier purchase on this site has';
+  return [
+    `Possible duplicate: ${earlier} no recorded outcome. Approving permits exactly one new attempt and may buy the same thing twice.`,
+  ];
+}
+/** Who the card shows for the assistant's web address: the principal knows it as their assistant's. */
+export interface CardIdentity {
+  readonly alias?: string | null;
+}
+/** The terms a card lists, each with its amounts, trigger and dates. */
+function termLines(
+  facts: PurchaseFacts,
+  partySize: number | undefined,
+  money: (amount: number) => string,
+  principalTimeZone: string,
+): string[] {
+  const lines: string[] = [];
+  for (const term of facts.commitments) {
+    lines.push(`Financial commitment: ${term.kind}; ${quotePurchaseText(term.terms, 700)}`);
+    if (term.amountMinor !== undefined)
+      lines.push(
+        `Amount due later/exposure: ${money(term.amountMinor)}${term.perPerson ? ` per person × ${partySize ?? 'unknown party size'}` : ' total'}`,
+      );
+    if (term.trigger) lines.push(`Trigger: ${quotePurchaseText(term.trigger)}`);
+    if (term.cancellationDeadline)
+      lines.push(`Cancellation deadline: ${cardTime(term.cancellationDeadline, principalTimeZone)}`);
+    if (term.cancellationTerms) lines.push(`Cancellation terms: ${quotePurchaseText(term.cancellationTerms, 700)}`);
+    if (term.conversionAt) lines.push(`Trial conversion: ${cardTime(term.conversionAt, principalTimeZone)}`);
+    if (term.frequency) lines.push(`Recurring frequency: ${quotePurchaseText(term.frequency)}`);
+  }
+  return lines;
+}
+/**
+ * An unreviewed checkout's card (KTD5, R8): the site and any payment platform, the account or that it is a guest
+ * checkout, the items quoted as shown, the money, the saved payment method, the contact email and any note.
+ * The assistant's own web address reads as the assistant's; no internal id appears.
+ */
+function renderGenericCard(
+  facts: PurchaseFacts,
+  exceptions: readonly string[],
+  principalTimeZone: string,
+  change: string | undefined,
+  identity: CardIdentity,
+): string {
+  const generic = facts.generic;
+  if (!generic) throw new Error('A generic card needs the generic facts');
+  const money = (amount: number): string => formatMoney(amount, facts.currency);
+  const assistant = (address: string): boolean =>
+    Boolean(identity.alias) && identityMatchKey(`email:${address}`) === identityMatchKey(`email:${identity.alias}`);
+  const booking = generic.booking;
+  const lines = [
+    "I'd like to place this purchase using the facts I read from the checkout.",
+    ...(change ? [change] : []),
+    ...duplicateWarning(exceptions),
+    `Site: ${facts.site}`,
+    ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
+    `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quotePurchaseText(facts.account)}`,
+    `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quotePurchaseText(generic.contactEmail)}`,
+    ...generic.items.map((item) => `Item: ${quotePurchaseText(item)}`),
+    `Total: ${money(facts.totalMinor)} (${facts.currency})`,
+    `Due now: ${money(facts.dueNowMinor)}`,
+    `Payment: ${quotePurchaseText(generic.payment)}`,
+    ...(generic.note ? [`Note: ${quotePurchaseText(generic.note, 700)}`] : []),
+    ...(booking?.venue ? [`Venue: ${quotePurchaseText(booking.venue)}`] : []),
+    ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
+    ...(booking?.at && booking.timeZone
+      ? [`Time: ${cardEventTime(booking.at, booking.timeZone, principalTimeZone)}`]
+      : booking?.timeText
+        ? [`Time as the page shows it: ${quotePurchaseText(booking.timeText)}`]
+        : []),
+    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
+    ...(facts.agreements ?? []).map(
+      (agreement) =>
+        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
+    ),
+    ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, principalTimeZone),
+  ];
+  if (!facts.commitments.length)
+    lines.push('Due later: none shown. The checkout states no hold, deposit, fee, trial or subscription.');
+  return lines.join('\n');
+}
 /** Deadlines, charge dates and conversions read on the principal's clock; events on the venue's. */
 export function renderPurchaseCard(
   facts: PurchaseFacts,
@@ -71,7 +169,9 @@ export function renderPurchaseCard(
   exceptions: readonly string[],
   principalTimeZone: string,
   change?: string,
+  identity: CardIdentity = {},
 ): string {
+  if (facts.generic) return renderGenericCard(facts, exceptions, principalTimeZone, change, identity);
   const money = (amount: number): string => formatMoney(amount, facts.currency);
   const lines = [
     "I'd like to place this purchase using the facts I read from the merchant's review page.",
@@ -111,20 +211,8 @@ export function renderPurchaseCard(
       (agreement) =>
         `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
     ),
+    ...termLines(facts, facts.reservation?.partySize, money, principalTimeZone),
   ];
-  for (const term of facts.commitments) {
-    lines.push(`Financial commitment: ${term.kind}; ${quotePurchaseText(term.terms, 700)}`);
-    if (term.amountMinor !== undefined)
-      lines.push(
-        `Amount due later/exposure: ${money(term.amountMinor)}${term.perPerson ? ` per person × ${facts.reservation?.partySize ?? 'unknown party size'}` : ' total'}`,
-      );
-    if (term.trigger) lines.push(`Trigger: ${quotePurchaseText(term.trigger)}`);
-    if (term.cancellationDeadline)
-      lines.push(`Cancellation deadline: ${cardTime(term.cancellationDeadline, principalTimeZone)}`);
-    if (term.cancellationTerms) lines.push(`Cancellation terms: ${quotePurchaseText(term.cancellationTerms, 700)}`);
-    if (term.conversionAt) lines.push(`Trial conversion: ${cardTime(term.conversionAt, principalTimeZone)}`);
-    if (term.frequency) lines.push(`Recurring frequency: ${quotePurchaseText(term.frequency)}`);
-  }
   if (facts.noCommitmentTerms)
     lines.push(`No financial commitment: ${quotePurchaseText(facts.noCommitmentTerms, 1200)}`);
   if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))

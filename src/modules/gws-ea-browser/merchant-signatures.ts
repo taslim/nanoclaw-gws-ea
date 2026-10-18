@@ -5,7 +5,13 @@
 import type { ElementHandle, Locator, Page } from 'playwright-core';
 import type { ActionClass, ControlFacts, ReviewedMerchantFlow } from './commit-classifier.js';
 import { completePurchaseFacts, moneyMinor, type PurchaseFacts } from './fingerprint.js';
-import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
+import {
+  REVIEWED_CHECKOUT_MISSING,
+  type MerchantCheckoutRead,
+  type MerchantPurchaseEvidence,
+  type MerchantSignature,
+} from './merchant-contract.js';
+import { genericCheckoutSignature } from './generic-signature.js';
 import { resyReservationSignature } from './resy-signature.js';
 export type { MerchantPurchaseEvidence } from './merchant-contract.js';
 
@@ -276,17 +282,17 @@ export type MerchantPurchaseRead =
 /** Every value comes from visible host-selected DOM, and the activating element must match the signature. */
 async function readAmazonPurchase(page: Page, target?: ElementHandle): Promise<MerchantCheckoutRead> {
   const url = new URL(page.url());
-  if (!sameOrigin(url)) return { status: 'unsupported_merchant' };
+  if (!sameOrigin(url)) return REVIEWED_CHECKOUT_MISSING;
   if (!review(url)) return { status: 'checkout_lapsed' };
   if (
     (await page.locator(AMAZON_RETAIL.form).count()) !== 1 ||
     (await page.locator(AMAZON_RETAIL.control).count()) !== 1
   )
-    return { status: 'unsupported_merchant' };
+    return REVIEWED_CHECKOUT_MISSING;
   const element = target ?? (await page.locator(AMAZON_RETAIL.control).elementHandle());
   if (!element || !(await isAmazonRetailCommit(page, element))) {
     if (!target) await element?.dispose();
-    return { status: 'unsupported_merchant' };
+    return REVIEWED_CHECKOUT_MISSING;
   }
   const refuse = async (status: 'terms_unavailable'): Promise<MerchantCheckoutRead> => {
     if (!target) await element.dispose();
@@ -421,23 +427,38 @@ export const amazonRetailSignature: MerchantSignature = {
   },
   readEvidence: readAmazonEvidence,
 };
-/** This closed list is host-reviewed code, never model or recipe registration. */
+/**
+ * This closed list is host-reviewed code, never model or recipe registration. The generic signature is never
+ * one of them: a flow that matched every page would press any control directly (KTD4).
+ */
 export const merchantSignatures: readonly MerchantSignature[] = [amazonRetailSignature, resyReservationSignature];
+/** The page's reviewed signature, which keeps precedence on its site, else the generic one for any web page. */
 export function merchantSignatureFor(page: Page): MerchantSignature | undefined {
   try {
     const url = new URL(page.url());
-    return merchantSignatures.find((signature) => signature.matches(url));
+    return (
+      merchantSignatures.find((signature) => signature.matches(url)) ??
+      (genericCheckoutSignature.matches(url) ? genericCheckoutSignature : undefined)
+    );
   } catch {
     return undefined;
   }
 }
 export async function prepareMerchantPage(page: Page): Promise<void> {
-  for (const signature of merchantSignatures) await signature.preparePage?.(page);
+  for (const signature of [...merchantSignatures, genericCheckoutSignature]) await signature.preparePage?.(page);
 }
-export async function readMerchantPurchase(page: Page, target?: ElementHandle): Promise<MerchantPurchaseRead> {
+/**
+ * Reads the page's checkout with its signature. A reviewed flow that no longer matches its page fails closed
+ * for that flow; it never falls back to the generic one.
+ */
+export async function readMerchantPurchase(
+  page: Page,
+  target?: ElementHandle,
+  expected?: PurchaseFacts,
+): Promise<MerchantPurchaseRead> {
   const signature = merchantSignatureFor(page);
-  if (!signature) return { status: 'unsupported_merchant' };
-  const read = await signature.readPurchase(page, target);
+  if (!signature) return { status: 'checkout_lapsed' };
+  const read = await signature.readPurchase(page, target, expected);
   return read.status === 'ready' ? { ...read, signature } : read;
 }
 export async function readMerchantPurchaseEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined> {

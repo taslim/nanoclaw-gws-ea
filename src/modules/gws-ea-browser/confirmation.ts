@@ -61,7 +61,7 @@ function charge(currency: string, whole: string, fraction = ''): ConfirmationCha
 }
 
 /** Every amount a line states, with its currency. */
-function amounts(line: string): ConfirmationCharge[] {
+export function statedAmounts(line: string): ConfirmationCharge[] {
   const found: ConfirmationCharge[] = [];
   for (const match of line.matchAll(AMOUNT)) {
     const [, symbol, code, whole, fraction, trailingWhole, trailingFraction, trailingSymbol, trailingCode] = match;
@@ -82,14 +82,14 @@ function textCharges(lines: readonly string[]): ConfirmationCharge[] {
   const found: ConfirmationCharge[] = [];
   lines.forEach((line, index) => {
     if (!CONFIRMATION_VOCABULARY.charge.test(line)) return;
-    const own = amounts(line);
+    const own = statedAmounts(line);
     if (own.length) {
       found.push(...own);
       return;
     }
     const next = lines[index + 1];
     if (line.split(/\s+/u).length <= LABEL_WORDS && next !== undefined) {
-      const following = amounts(next);
+      const following = statedAmounts(next);
       if (following.length === 1 && next.replace(AMOUNT, '').trim() === '') found.push(following[0]);
     }
   });
@@ -203,6 +203,23 @@ async function readFrame(frame: Frame): Promise<ConfirmationEvidence | undefined
     return undefined;
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/** The visible lines of every document on the page, the main document first; a document that cannot be read has none. */
+export async function readPageLines(page: Page): Promise<string[]> {
+  const read = async (frame: Frame): Promise<string[]> => {
+    /* eslint-disable no-catch-all/no-catch-all -- a document that went away or never answered within its bound shows nothing */
+    try {
+      return (await frame.locator('body').innerText({ timeout: READ_TIMEOUT_MS }))
+        .split('\n')
+        .map((line) => line.replace(/\s+/gu, ' ').trim())
+        .filter(Boolean);
+    } catch (_error) {
+      return [];
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  };
+  return (await Promise.all(page.frames().map(read))).flat();
 }
 
 /** Whether evidence shows a charge: a nonzero total, payment or deposit. */

@@ -19,10 +19,12 @@ import { readIsoTime } from './iso-time.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
 import { agreementsGranted } from './consent.js';
 import {
+  bookedReservation,
   completePurchaseFacts,
   amountMinor,
   currencyExponent,
   formatMoney,
+  withinReservationBounds,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
@@ -49,12 +51,17 @@ interface GuaranteeProposal {
   status: 'open' | 'approved' | 'withdrawn' | 'expired' | 'rejected';
   created_at: string;
 }
+/**
+ * Whether the standing guarantee covers a booking (R38, KTD21): its venue, party size and time read and within
+ * main's recorded bounds, nothing due now, and only cancellation or no-show fees whose whole exposure is within
+ * the guarantee's limit. An unreviewed booking must also state its fee terms.
+ */
 export function guaranteeCoversReservation(
   grant: Pick<StandingGuarantee, 'currency' | 'max_total_minor' | 'revoked_at'> | undefined,
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
 ): boolean {
-  const reservation = facts.reservation;
+  const reservation = bookedReservation(facts);
   const delegated = bounds.reservation;
   if (
     !grant ||
@@ -64,16 +71,11 @@ export function guaranteeCoversReservation(
     facts.addOns?.length ||
     facts.dueNowMinor !== 0 ||
     facts.currency !== grant.currency ||
+    (facts.generic && !facts.commitments.length) ||
     !completePurchaseFacts(facts)
   )
     return false;
-  if (
-    reservation.venueId !== delegated.venueId ||
-    reservation.partySize !== delegated.partySize ||
-    reservation.at < delegated.windowStart ||
-    reservation.at > delegated.windowEnd
-  )
-    return false;
+  if (!withinReservationBounds(reservation, delegated)) return false;
   if (
     !facts.commitments.every(
       (term) =>

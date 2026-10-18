@@ -230,33 +230,7 @@ export class PurchaseAuthorityStore {
       );
       if (!job || job.cancelled || job.cancel_requested) throw new PurchaseAuthorityError('cancelled');
       if (authority.expires_at <= at) throw new PurchaseAuthorityError('expired');
-      const change = materialPurchaseChange(
-        JSON.parse(authority.facts_json) as PurchaseFacts,
-        current,
-        JSON.parse(authority.bounds_json) as PurchaseBounds,
-      );
-      if (change) throw new PurchaseAuthorityError('changed', change);
-      if (!completePurchaseFacts(current))
-        throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
-      // Every agreement the press carries stands approved, none withdrawn since the card (KTD11).
-      if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
-        throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
-      if (authority.guarantee_id) {
-        const { guaranteeCoversReservation, readDelegatedReservationBounds } =
-          await import('./reservation-guarantee.js');
-        const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
-          'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
-          authority.guarantee_id,
-        );
-        const reservation = await readDelegatedReservationBounds(context.job.id, this.db);
-        const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
-        if (
-          !reservation ||
-          JSON.stringify(bounds.reservation) !== JSON.stringify(reservation) ||
-          !guaranteeCoversReservation(grant, current, { ...bounds, reservation })
-        )
-          throw new PurchaseAuthorityError('authority_unavailable');
-      }
+      await this.checkCurrentFacts(authority, current, context.job.id);
       const unresolved = await this.unresolved(current.site);
       const exceptions = JSON.parse(authority.exception_ids_json) as string[];
       const block = await this.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', current.site);
@@ -285,18 +259,116 @@ export class PurchaseAuthorityStore {
       );
       if (!changed.changes) throw new PurchaseAuthorityError('authority_unavailable');
       await markBrowserRequestCommitStarted(this.db, context.request.id, at);
-      // The attempted facts include a lower actual retail total, rather than the card's ceiling.
+      // The attempted facts include a lower actual retail total, rather than the card's ceiling. A generic
+      // checkout's attempt names its payment platform, and its contact email keys its order numbers (KTD5, KTD7).
       await this.db.run(
-        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at)
-        VALUES(?,?,?,?,?,?)`,
+        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at,platform,account_key)
+        VALUES(?,?,?,?,?,?,?,?)`,
         authority.attempt_id,
         authority.id,
         authority.job_id,
         current.site,
         JSON.stringify(current),
         at,
+        current.generic?.platform ?? null,
+        current.generic?.contactEmail ?? null,
       );
       return { ...authority, state: 'committing', commit_started_at: at, commit_request_id: context.request.id };
+    });
+  }
+  /**
+   * The facts a press carries against its authority: nothing material changed, the facts complete, every
+   * agreement still granted (KTD11), and a standing guarantee still covering them.
+   */
+  private async checkCurrentFacts(authority: SpendingAuthority, current: PurchaseFacts, jobId: string): Promise<void> {
+    const change = materialPurchaseChange(
+      JSON.parse(authority.facts_json) as PurchaseFacts,
+      current,
+      JSON.parse(authority.bounds_json) as PurchaseBounds,
+    );
+    if (change) throw new PurchaseAuthorityError('changed', change);
+    if (!completePurchaseFacts(current))
+      throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
+    // Every agreement the press carries stands approved, none withdrawn since the card (KTD11).
+    if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
+      throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
+    if (authority.guarantee_id) {
+      const { guaranteeCoversReservation, readDelegatedReservationBounds } = await import('./reservation-guarantee.js');
+      const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
+        'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
+        authority.guarantee_id,
+      );
+      const reservation = await readDelegatedReservationBounds(jobId, this.db);
+      const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
+      if (
+        !reservation ||
+        JSON.stringify(bounds.reservation) !== JSON.stringify(reservation) ||
+        !guaranteeCoversReservation(grant, current, { ...bounds, reservation })
+      )
+        throw new PurchaseAuthorityError('authority_unavailable');
+    }
+  }
+  /**
+   * A further press of the same checkout under its approval, after the one `begin()` marked moved it to another
+   * step (KTD3): the same request, nothing material changed. The attempt stays one, holding the latest facts.
+   */
+  async continueCommit(context: BrowserExecutionContext, authorityId: string, current: PurchaseFacts): Promise<void> {
+    await context.assertActive();
+    await this.db.transaction(async () => {
+      const authority = await this.get(authorityId);
+      if (
+        !authority ||
+        authority.state !== 'committing' ||
+        authority.job_id !== context.job.id ||
+        authority.commit_request_id !== context.request.id
+      )
+        throw new PurchaseAuthorityError('authority_unavailable');
+      const job = await this.db.get<{ cancelled: number; cancel_requested: number }>(
+        'SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
+        context.job.id,
+      );
+      if (!job || job.cancelled || job.cancel_requested) throw new PurchaseAuthorityError('cancelled');
+      await this.checkCurrentFacts(authority, current, context.job.id);
+      await this.db.run(
+        'UPDATE gws_ea_browser_purchase_attempts SET facts_json = ? WHERE authority_id = ? AND resolution IS NULL',
+        JSON.stringify(current),
+        authority.id,
+      );
+    });
+  }
+  /**
+   * An attempt the page proves was not placed (KTD3): a decline on the step that was pressed, or a checkout that
+   * moved on to a step asking again. The authority is spent; no purchase block remains for it.
+   */
+  async concludeNotPlaced(
+    id: string,
+    outcome: Record<string, unknown>,
+    evidence: Record<string, unknown>,
+  ): Promise<void> {
+    await this.db.transaction(async () => {
+      const authority = await this.get(id);
+      if (!authority || authority.state !== 'committing') return;
+      const at = new Date().toISOString();
+      await this.db.run(
+        "UPDATE gws_ea_browser_authorities SET state = 'revoked',outcome_json = ?,notified_at = NULL WHERE id = ?",
+        JSON.stringify(outcome),
+        id,
+      );
+      await this.db.run(
+        "UPDATE gws_ea_browser_purchase_attempts SET resolution = 'not_committed',evidence_json = ?,reconciled_at = ? WHERE authority_id = ? AND resolution IS NULL",
+        JSON.stringify(evidence),
+        at,
+        id,
+      );
+      const facts = JSON.parse(authority.facts_json) as PurchaseFacts;
+      if (!(await this.unresolved(facts.site)).length)
+        await this.db.run('DELETE FROM gws_ea_browser_purchase_blocks WHERE site = ?', facts.site);
+      if (authority.watch_id) {
+        const { finishWatchPurchase } = await import('./watches.js');
+        await finishWatchPurchase(this.db, authority.watch_id, authority.attempt_id, outcome);
+      }
+      await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', id);
+      await this.settleRequestedCancellation(authority.job_id, at);
     });
   }
   async conclude(id: string, outcome: Record<string, unknown>, certain: boolean): Promise<void> {
@@ -338,18 +410,22 @@ export class PurchaseAuthorityStore {
         await finishWatchPurchase(this.db, authority.watch_id, authority.attempt_id, outcome);
       }
       await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', id);
-      const committing = await this.db.get(
-        "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
-        authority.job_id,
-      );
-      // An unresolved credential attempt keeps a requested cancellation waiting too.
-      if (!committing && (await heldCredentialSites(this.db, authority.job_id)).size === 0)
-        await this.db.run(
-          'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
-          at,
-          authority.job_id,
-        );
+      await this.settleRequestedCancellation(authority.job_id, at);
     });
+  }
+  /** A cancellation that waited for the job's commits completes once none is in progress. Caller's transaction. */
+  private async settleRequestedCancellation(jobId: string, at: string): Promise<void> {
+    const committing = await this.db.get(
+      "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
+      jobId,
+    );
+    // An unresolved credential attempt keeps a requested cancellation waiting too.
+    if (!committing && (await heldCredentialSites(this.db, jobId)).size === 0)
+      await this.db.run(
+        'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
+        at,
+        jobId,
+      );
   }
 }
 

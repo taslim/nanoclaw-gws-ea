@@ -144,12 +144,58 @@ const PAGE_VOCABULARY = {
   chatOwner: /\b(?:chat|messenger|messaging|live\s*chat|conversations?|support\s+widget)\b/iu,
 } as const satisfies Record<string, RegExp>;
 
+/** A saved payment method as a page shows it, and an express-pay button's name, as the classifier reads both. */
+export const PAYMENT_VOCABULARY = {
+  savedCard: PAGE_VOCABULARY.savedCard,
+  expressPay: PAGE_VOCABULARY.expressPay,
+} as const;
+
 /**
  * Processor frames that take payment details or an express payment, by host and path. Metrics, messaging,
  * address and sign-in frames from the same processors are not payment methods.
  */
 const PAYMENT_FRAME =
   /^(?:js\.stripe\.com\/v3\/elements-inner-(?![\w-]*(?:messag|address|authentication|affirm|afterpay|klarna))|checkout\.stripe\.com\/|[\w-]+\.adyen\.com\/checkoutshopper\/(?:securedfields|assets\/html)\/|assets\.braintreegateway\.com\/web\/[\w.-]+\/html\/hosted-fields-frame|(?:www\.)?paypal\.com\/smart\/(?:card-fields|buttons))/iu;
+/**
+ * Payment processors, by registrable domain or host: their APIs take a payment from page script, a payment
+ * frame's included, and their own pages take a merchant's payment. Vocabulary is data: widen or narrow it here.
+ */
+const PAYMENT_PROCESSORS: readonly string[] = [
+  'stripe.com',
+  'stripe.network',
+  'adyen.com',
+  'adyenpayments.com',
+  'braintreegateway.com',
+  'braintree-api.com',
+  'paypal.com',
+  'squareup.com',
+  'squareupsandbox.com',
+  'checkout.com',
+  'klarna.com',
+  'klarnaservices.com',
+  'affirm.com',
+  'afterpay.com',
+  'clearpay.co.uk',
+  'authorize.net',
+  'worldpay.com',
+  'cybersource.com',
+  'mollie.com',
+  'razorpay.com',
+  'shop.app',
+  'pay.shopify.com',
+  'pay.google.com',
+  'payments.google.com',
+  'pay.amazon.com',
+  'payments.amazon.com',
+  'pay-api.amazon.com',
+];
+
+/** Whether a host belongs to a payment processor. */
+export function paymentProcessorHost(host: string): boolean {
+  const name = host.toLowerCase();
+  return PAYMENT_PROCESSORS.some((processor) => name === processor || name.endsWith(`.${processor}`));
+}
+
 /** Chat-widget providers, recognized for a child frame only. */
 const CHAT_PROVIDERS: ReadonlySet<string> = new Set([
   'intercom.io',
@@ -474,7 +520,50 @@ const librarySource = String.raw`(sources) => {
     };
   };
   const formFields = (form) => Array.from(formProperty(form, 'elements'));
-  const scan = (frameOwners, framePayments) => {
+  const box = (element) => {
+    const rect = element.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  };
+  // The visible lines under root, block by block, each with the block it sits in. A control's own words name
+  // the control, not a fact, so buttons are left out; a visible select contributes its chosen option.
+  const lines = (root, limit) => {
+    const list = [];
+    let current = null;
+    const flush = () => {
+      if (current && current.text) list.push(current);
+      current = null;
+    };
+    const add = (text, block) => {
+      if (!text) return;
+      if (current) current.text += ' ' + text;
+      else current = { text, block };
+    };
+    const visit = (node, block) => {
+      for (const child of children(node)) {
+        if (list.length >= limit) return;
+        if (child instanceof Text) {
+          const holder = parentOf(child);
+          if (holder && visible(holder)) add(squash(child.data), block);
+        } else if (!(child instanceof Element) || child instanceof HTMLScriptElement || child instanceof HTMLStyleElement ||
+          child instanceof HTMLTemplateElement || child.matches(BUTTON)) continue;
+        else if (child instanceof HTMLSelectElement) {
+          if (visible(child)) for (const option of child.selectedOptions) add(squash(option.text), block);
+        } else {
+          const inline = /^inline/u.test(getComputedStyle(child).display);
+          if (!inline) flush();
+          visit(child, inline ? block : child);
+          if (!inline) flush();
+        }
+      }
+    };
+    visit(root, root);
+    flush();
+    return list.slice(0, limit);
+  };
+  const structuredData = () => elements(document)
+    .filter((element) => element instanceof HTMLScriptElement && /^application\/ld\+json$/iu.test(element.type))
+    .map((element) => (element.textContent || '').slice(0, 20000));
+  const scan = (frameOwners, framePayments, detailed) => {
     owners = frameOwners;
     payments = framePayments;
     const all = elements(document);
@@ -486,6 +575,7 @@ const librarySource = String.raw`(sources) => {
     const text = chunks(document);
     const named = (element) => element instanceof HTMLAnchorElement || element.matches(BUTTON) ||
       /^(?:link|menuitem)$/iu.test(element.getAttribute('role') || '');
+    const heading = all.find((element) => element.tagName === 'H1' && visible(element));
     return {
       transaction: containers.some((facts) => facts.transaction),
       moneyTerms: re.moneyTerms.test(text.join('\n')),
@@ -497,6 +587,15 @@ const librarySource = String.raw`(sources) => {
         all.some((element) => /^H[12]$/u.test(element.tagName) && visible(element) && re.accountHeading.test(textOf(element))),
       chatOwners: frameOwners.map((owner) => re.chatOwner.test([owner.getAttribute('title'), owner.getAttribute('name'),
         owner.id, owner.getAttribute('aria-label')].filter(Boolean).join(' '))),
+      // What a checkout read needs of the whole document: its words, wallets and payment entry, and its name.
+      ...(detailed ? {
+        lines: lines(document, 600).map((line) => line.text.slice(0, 500)),
+        expressPay: all.filter((element) => element.matches(BUTTON) && visible(element) && re.expressPay.test(nameOf(element)))
+          .map(nameOf),
+        paymentEntry: all.some(cardField) || owners.some((owner, index) => payments[index] && frameShown(owner)),
+        heading: heading ? squash(heading.textContent) : null,
+        structured: structuredData(),
+      } : {}),
     };
   };
   const searchLike = (element) => element.type === 'search' ||
@@ -600,12 +699,117 @@ const librarySource = String.raw`(sources) => {
     const slot = slots.get(eventName);
     return slot && slot.count === 1 && slot.node ? control(slot.node) : null;
   };
-  return { scan, arm, disarm, received, read };
+  // A field as a checkout read reports it. A secret's or a card field's value is never read.
+  const checkoutField = (element) => {
+    const withheld = secretField(element) || cardEntryField(element);
+    const choice = element instanceof HTMLInputElement && /^(?:checkbox|radio)$/u.test(element.type);
+    const typed = element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement;
+    return {
+      tag: element.tagName.toLowerCase(),
+      type: typed ? element.type : '',
+      name: element.getAttribute('name') || '',
+      autocomplete: element.getAttribute('autocomplete') || '',
+      label: squash(labelsOf(element)) || squash(element.getAttribute('aria-label')) || squash(element.getAttribute('placeholder')),
+      value: withheld ? null
+        : element instanceof HTMLSelectElement ? squash(Array.from(element.selectedOptions, (option) => option.text).join(' '))
+        : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value
+        : squash(element.innerText),
+      card: cardEntryField(element),
+      secret: secretField(element),
+      checked: choice ? element.checked : null,
+    };
+  };
+  // The checkout around the handed control: its form, else the open dialog around it, else its document. Its
+  // lines carry the box of the block each sits in, on this document's viewport.
+  const checkout = (eventName) => {
+    const slot = slots.get(eventName);
+    const node = slot && slot.count === 1 ? slot.node : null;
+    if (!(node instanceof Element) || !node.isConnected) return null;
+    const form = formOf(node);
+    const dialog = ancestry(node).find(openDialog) || null;
+    const root = form || dialog || document.body || document.documentElement;
+    const members = form ? [...new Set([...elements(form), ...formFields(form)])] : elements(root);
+    return {
+      kind: form ? 'form' : dialog ? 'dialog' : 'document',
+      label: nameOf(node),
+      controlBox: box(node),
+      lines: lines(root, 400).map((line) => ({ text: line.text.slice(0, 2000), box: box(line.block) })),
+      fields: members.filter((element) => (isField(element) || editableRoot(element)) && visible(element) &&
+        !(element instanceof HTMLInputElement && /^(?:hidden|submit|button|reset|image|file|range|color)$/u.test(element.type)))
+        .map(checkoutField),
+      times: elements(root).filter((element) => element.tagName === 'TIME' && visible(element))
+        .map((element) => ({ datetime: element.getAttribute('datetime') || '', text: squash(element.textContent) })),
+    };
+  };
+  return { scan, arm, disarm, received, read, checkout };
 }`;
 
 const vocabularySources: Readonly<Record<string, string>> = Object.fromEntries(
   Object.entries(PAGE_VOCABULARY).map(([key, pattern]) => [key, pattern.source]),
 );
+
+/** A box on its document's viewport, in CSS pixels. */
+export interface CheckoutBox {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+/** One visible line of a checkout, with the box of the block it sits in. */
+export interface CheckoutLine {
+  readonly text: string;
+  readonly box: CheckoutBox;
+}
+/** A field in a checkout. A secret's or a card field's value is never read (null). */
+export interface CheckoutField {
+  readonly tag: string;
+  readonly type: string;
+  readonly name: string;
+  readonly autocomplete: string;
+  readonly label: string;
+  readonly value: string | null;
+  readonly card: boolean;
+  readonly secret: boolean;
+  /** A box's or a radio option's state; null for any other field. */
+  readonly checked: boolean | null;
+}
+/** The checkout around a control: its form, else the open dialog around it, else its document (KTD3). */
+export interface CheckoutRegion {
+  readonly kind: 'form' | 'dialog' | 'document';
+  /** The control's own accessible name. */
+  readonly label: string;
+  /** The control's box on its document's viewport. */
+  readonly controlBox: CheckoutBox;
+  readonly lines: readonly CheckoutLine[];
+  readonly fields: readonly CheckoutField[];
+  /** Each visible `time` element: its machine-readable datetime and its words. */
+  readonly times: ReadonlyArray<{ readonly datetime: string; readonly text: string }>;
+}
+/** What one frame's document shows, for a checkout read. */
+export interface CheckoutFrame {
+  readonly url: string;
+  /** The page's own top-level document. */
+  readonly top: boolean;
+  readonly lines: readonly string[];
+  /** The names of its visible express-pay buttons. */
+  readonly expressPay: readonly string[];
+  /** It holds a visible card field or a visible processor payment frame. */
+  readonly paymentEntry: boolean;
+  /** It shows a sign-out control. */
+  readonly signedIn: boolean;
+  /** Its first visible top-level heading. */
+  readonly heading: string | null;
+  /** Its schema.org JSON-LD, as text. */
+  readonly structured: readonly string[];
+}
+/** A checkout as the host reads it around a control, every part in an isolated world. */
+export interface CheckoutRead {
+  readonly facts: ControlFacts;
+  readonly region: CheckoutRegion;
+  /** The address of the control's frame. */
+  readonly frameUrl: string;
+  readonly frames: readonly CheckoutFrame[];
+}
 
 /** What one frame's document shows, read in its isolated world. */
 interface FrameScan {
@@ -616,6 +820,8 @@ interface FrameScan {
   readonly signedIn: boolean;
   readonly accountHeading: boolean;
   readonly chatOwners: readonly boolean[];
+  /** The whole document's facts a checkout read needs; read only for one. */
+  readonly page?: Omit<CheckoutFrame, 'url' | 'top' | 'signedIn'>;
 }
 /** A frame one of the read's sessions hosts, with the isolated world the reader is installed in. */
 interface HostedFrame {
@@ -684,9 +890,16 @@ function accountPath(raw: string): boolean {
   }
 }
 
-function parseScan(value: unknown): FrameScan | undefined {
+const texts = (value: unknown): string[] | undefined =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string') ? (value as string[]) : undefined;
+
+function parseScan(value: unknown, detailed: boolean): FrameScan | undefined {
   const scan = record(value);
   if (!scan || !Array.isArray(scan.chatOwners)) return undefined;
+  const lines = texts(scan.lines);
+  const expressPay = texts(scan.expressPay);
+  const structured = texts(scan.structured);
+  if (detailed && (!lines || !expressPay || !structured)) return undefined;
   return {
     transaction: flag(scan.transaction),
     moneyTerms: flag(scan.moneyTerms),
@@ -695,6 +908,87 @@ function parseScan(value: unknown): FrameScan | undefined {
     signedIn: flag(scan.signedIn),
     accountHeading: flag(scan.accountHeading),
     chatOwners: scan.chatOwners.map(flag),
+    ...(detailed && lines && expressPay && structured
+      ? {
+          page: {
+            lines,
+            expressPay,
+            paymentEntry: flag(scan.paymentEntry),
+            heading: text(scan.heading) ?? null,
+            structured,
+          },
+        }
+      : {}),
+  };
+}
+
+function parseBox(value: unknown): CheckoutBox | undefined {
+  const raw = record(value);
+  const numbers = [raw?.x, raw?.y, raw?.width, raw?.height];
+  if (!numbers.every((number): number is number => typeof number === 'number' && Number.isFinite(number)))
+    return undefined;
+  const [x, y, width, height] = numbers;
+  return { x, y, width, height };
+}
+
+function parseField(value: unknown): CheckoutField | undefined {
+  const field = record(value);
+  const strings = [field?.tag, field?.type, field?.name, field?.autocomplete, field?.label].map(text);
+  if (!field || strings.some((item) => item === undefined)) return undefined;
+  const [tag, type, name, autocomplete, label] = strings as string[];
+  const fieldValue = field.value === null ? null : text(field.value);
+  const checked = field.checked === null ? null : typeof field.checked === 'boolean' ? field.checked : undefined;
+  if (fieldValue === undefined || checked === undefined) return undefined;
+  return {
+    tag,
+    type,
+    name,
+    autocomplete,
+    label,
+    value: fieldValue,
+    card: flag(field.card),
+    secret: flag(field.secret),
+    checked,
+  };
+}
+
+/** The checkout region as read, or undefined; anything malformed fails the whole read. */
+function parseRegion(value: unknown): CheckoutRegion | undefined {
+  const region = record(value);
+  const kind = region?.kind;
+  const label = text(region?.label);
+  const controlBox = parseBox(region?.controlBox);
+  if (
+    !region ||
+    (kind !== 'form' && kind !== 'dialog' && kind !== 'document') ||
+    label === undefined ||
+    !controlBox ||
+    !Array.isArray(region.lines) ||
+    !Array.isArray(region.fields) ||
+    !Array.isArray(region.times)
+  )
+    return undefined;
+  const lines = region.lines.map((raw) => {
+    const line = record(raw);
+    const words = text(line?.text);
+    const lineBox = parseBox(line?.box);
+    return words !== undefined && lineBox ? { text: words, box: lineBox } : undefined;
+  });
+  const fields = region.fields.map(parseField);
+  const times = region.times.map((raw) => {
+    const time = record(raw);
+    const datetime = text(time?.datetime);
+    const words = text(time?.text);
+    return datetime !== undefined && words !== undefined ? { datetime, text: words } : undefined;
+  });
+  if (lines.some((line) => !line) || fields.some((field) => !field) || times.some((time) => !time)) return undefined;
+  return {
+    kind,
+    label,
+    controlBox,
+    lines: lines.filter((line) => line !== undefined),
+    fields: fields.filter((field) => field !== undefined),
+    times: times.filter((time) => time !== undefined),
   };
 }
 
@@ -835,8 +1129,15 @@ async function hostedFrames(sessions: Iterable<CDPSession>): Promise<Map<string,
   return frames;
 }
 
-/** Scans every frame, children before parents, so each parent knows which of its frames take payment. */
-async function scanFrames(frames: ReadonlyMap<string, HostedFrame>, objectGroup: string): Promise<void> {
+/**
+ * Scans every frame, children before parents, so each parent knows which of its frames take payment. `detailed`
+ * reads each whole document for a checkout too.
+ */
+async function scanFrames(
+  frames: ReadonlyMap<string, HostedFrame>,
+  objectGroup: string,
+  detailed: boolean,
+): Promise<void> {
   const depth = (hosted: HostedFrame): number => {
     let levels = 0;
     for (let parent = hosted.parentId; parent; parent = frames.get(parent)?.parentId) levels++;
@@ -865,13 +1166,13 @@ async function scanFrames(frames: ReadonlyMap<string, HostedFrame>, objectGroup:
     const result = await bounded(
       hosted.session.send('Runtime.callFunctionOn', {
         executionContextId: hosted.context,
-        functionDeclaration: `function (payments, ...owners) { return globalThis.${LIBRARY}.scan(owners, payments); }`,
-        arguments: [{ value: payments }, ...owners.map(({ objectId }) => ({ objectId }))],
+        functionDeclaration: `function (payments, detailed, ...owners) { return globalThis.${LIBRARY}.scan(owners, payments, detailed); }`,
+        arguments: [{ value: payments }, { value: detailed }, ...owners.map(({ objectId }) => ({ objectId }))],
         returnByValue: true,
       }),
       READ_TIMEOUT_MS,
     );
-    const scan = result.exceptionDetails ? undefined : parseScan(result.result.value);
+    const scan = result.exceptionDetails ? undefined : parseScan(result.result.value, detailed);
     if (!scan) throw new ControlFactsUnavailableError();
     hosted.scan = scan;
     owners.forEach(({ child }, index) => {
@@ -890,21 +1191,22 @@ async function readHandedControl(
   sessions: ReadonlyMap<Frame, CDPSession>,
   frames: ReadonlyMap<string, HostedFrame>,
   selector: string,
-): Promise<{ hosted: HostedFrame; facts: Omit<ControlFacts, 'transaction'> }> {
+  checkout: boolean,
+): Promise<{ hosted: HostedFrame; facts: Omit<ControlFacts, 'transaction'>; region?: CheckoutRegion }> {
   let owner: Frame | null = frame;
   while (owner && !sessions.has(owner)) owner = owner.parentFrame();
   const session = owner ? sessions.get(owner) : undefined;
   const candidates = [...frames.values()].filter((hosted) => hosted.session === session);
   if (!session || !candidates.length) throw new ControlFactsUnavailableError();
   const eventName = `gws-ea-auth-${randomUUID()}`;
-  const call = (hosted: HostedFrame, method: 'arm' | 'disarm' | 'received' | 'read') =>
+  const call = (hosted: HostedFrame, method: 'arm' | 'disarm' | 'received' | 'read' | 'checkout') =>
     bounded(
       session.send('Runtime.evaluate', {
         contextId: hosted.context,
         expression: `globalThis.${LIBRARY}.${method}(${JSON.stringify(eventName)})`,
         returnByValue: true,
       }),
-      method === 'read' ? READ_TIMEOUT_MS : PROTOCOL_READ_TIMEOUT_MS,
+      method === 'read' || method === 'checkout' ? READ_TIMEOUT_MS : PROTOCOL_READ_TIMEOUT_MS,
     );
   try {
     for (const hosted of candidates) await call(hosted, 'arm');
@@ -921,7 +1223,11 @@ async function readHandedControl(
     const answer = await call(held[0].hosted, 'read');
     const facts = answer.exceptionDetails ? undefined : parseControl(answer.result.value);
     if (!facts) throw new ControlFactsUnavailableError();
-    return { hosted: held[0].hosted, facts };
+    if (!checkout) return { hosted: held[0].hosted, facts };
+    const read = await call(held[0].hosted, 'checkout');
+    const region = read.exceptionDetails ? undefined : parseRegion(read.result.value);
+    if (!region) throw new ControlFactsUnavailableError();
+    return { hosted: held[0].hosted, facts, region };
   } finally {
     await Promise.all(candidates.map((hosted) => call(hosted, 'disarm').catch(() => undefined)));
   }
@@ -933,6 +1239,25 @@ async function readHandedControl(
  * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
  */
 export async function readPageControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
+  return (await readIsolated(page, element, false)).facts;
+}
+
+/**
+ * Reads a checkout around a control (KTD4): the control's facts, its form, dialog or document line by line with
+ * its fields, and every frame's words, wallets and payment entry, all in isolated worlds. Throws
+ * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
+ */
+export async function readCheckoutRegion(page: Page, element: ElementHandle): Promise<CheckoutRead> {
+  const read = await readIsolated(page, element, true);
+  if (!read.checkout) throw new ControlFactsUnavailableError();
+  return { facts: read.facts, ...read.checkout };
+}
+
+async function readIsolated(
+  page: Page,
+  element: ElementHandle,
+  checkout: boolean,
+): Promise<{ facts: ControlFacts; checkout?: Omit<CheckoutRead, 'facts'> }> {
   const selector = isolationSelector(page.context());
   const frame = await element.ownerFrame();
   if (!selector || !frame || frame.page() !== page) throw new ControlFactsUnavailableError();
@@ -940,8 +1265,15 @@ export async function readPageControlFacts(page: Page, element: ElementHandle): 
   const sessions = await openSessions(page);
   try {
     const frames = await hostedFrames(sessions.values());
-    await scanFrames(frames, objectGroup);
-    const { hosted, facts } = await readHandedControl(element, frame, sessions, frames, await selector);
+    await scanFrames(frames, objectGroup, checkout);
+    const { hosted, facts, region } = await readHandedControl(
+      element,
+      frame,
+      sessions,
+      frames,
+      await selector,
+      checkout,
+    );
     const scans = [...frames.values()].flatMap((candidate) => (candidate.scan ? [candidate.scan] : []));
     // The control's frame and every frame around it below the page: a chat widget anywhere there speaks.
     const chain: HostedFrame[] = [];
@@ -955,7 +1287,7 @@ export async function readPageControlFacts(page: Page, element: ElementHandle): 
       const address = hostAndPath(candidate.url);
       return address !== undefined && PAYMENT_FRAME.test(address);
     });
-    return {
+    const controlFacts: ControlFacts = {
       ...facts,
       cardEntry:
         facts.cardEntry === true ||
@@ -969,6 +1301,13 @@ export async function readPageControlFacts(page: Page, element: ElementHandle): 
       accountPage: hosted.scan?.signedIn === true && (accountPath(hosted.url) || hosted.scan.accountHeading),
       chatFrame: chain.some((candidate) => candidate.chatOwner === true || chatProvider(candidate.url)),
     };
+    if (!region) return { facts: controlFacts };
+    const checkoutFrames = [...frames.values()].map((candidate): CheckoutFrame => {
+      const read = candidate.scan?.page;
+      if (!candidate.scan || !read) throw new ControlFactsUnavailableError();
+      return { url: candidate.url, top: !candidate.parentId, signedIn: candidate.scan.signedIn, ...read };
+    });
+    return { facts: controlFacts, checkout: { region, frameUrl: hosted.url, frames: checkoutFrames } };
   } catch (_error) {
     // Any read that cannot complete leaves the control unknown, never guessed.
     throw new ControlFactsUnavailableError();

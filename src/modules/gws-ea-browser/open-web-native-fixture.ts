@@ -1068,6 +1068,199 @@ export function personalDataPages(): Record<string, OpenWebRoute> {
   };
 }
 
+/** Where the unreviewed checkouts live (KTD4): a pottery shop, its payment platform, and booking pages. */
+export const GENERIC = {
+  review: 'https://pottery.example/checkout/review',
+  steps: 'https://pottery.example/checkout/steps',
+  stepsNext: 'https://pottery.example/checkout/steps/next',
+  placed: 'https://pottery.example/checkout/placed',
+  /** A purchase route the open rule refuses: only an approved press of its own checkout loads it. */
+  placeOrder: 'https://pottery.example/checkout/placeorder',
+  guest: 'https://pottery.example/checkout/guest',
+  club: 'https://pottery.example/club/join',
+  held: 'https://pottery.example/checkout/held',
+  toPlatform: 'https://pottery.example/checkout/to-payment',
+  platform: 'https://pay.example/c/pottery-42',
+  platformPaid: 'https://pay.example/c/pottery-42/paid',
+  freeTable: 'https://table.example/book/r-8',
+  walletTable: 'https://table.example/book/r-9',
+  cardTable: 'https://table.example/book/r-10',
+  booked: 'https://table.example/book/booked',
+  feeTable: 'https://trattoria.example/book',
+  feeBooked: 'https://trattoria.example/book/confirmed',
+  depositHost: 'https://osteria.example/',
+  depositWidget: 'https://tables.example/widget/osteria',
+  depositBooked: 'https://tables.example/widget/osteria/booked',
+} as const;
+
+/** What one unreviewed checkout step shows, inside its one form. */
+export interface CheckoutPageOptions {
+  readonly title?: string;
+  readonly action: string;
+  readonly commit: string;
+  readonly items?: readonly string[];
+  readonly total?: string;
+  /** A saved payment method as the page shows it. */
+  readonly payment?: string;
+  /** The contact email field's value. */
+  readonly email?: string;
+  /** A field for a note to the merchant, under this label. */
+  readonly note?: string;
+  /** Further lines inside the form: terms, a hold countdown, an error. */
+  readonly lines?: readonly string[];
+  /** HTML outside the form. */
+  readonly outside?: string;
+  /** The account the page is signed in with, shown in its header. */
+  readonly signedIn?: string;
+}
+
+/** One step of the pottery shop's own checkout: its items, total, payment and contact email in one form. */
+export function checkoutPage(options: CheckoutPageOptions): string {
+  const header = options.signedIn
+    ? `<header><a href="/">Hale Pottery</a> <span>Signed in as ${options.signedIn}</span> <a href="/account/sign-out">Sign out</a></header>`
+    : '<header><a href="/">Hale Pottery</a> <a href="/account/sign-in">Sign in</a></header>';
+  return document(
+    options.title ?? 'Checkout',
+    `${header}<h1>${options.title ?? 'Checkout'}</h1><form id="checkout" method="post" action="${options.action}">
+<section><h2>Your order</h2>${(options.items ?? []).map((item) => `<p class="item">${item}</p>`).join('')}</section>
+${options.payment ? `<section><h2>Payment</h2><p>${options.payment}</p></section>` : ''}
+${options.email !== undefined ? `<label>Email <input type="email" name="email" value="${options.email}"></label>` : ''}
+${options.note ? `<label>${options.note} <textarea name="note"></textarea></label>` : ''}
+${(options.lines ?? []).map((line) => `<p>${line}</p>`).join('\n')}
+${options.total ? `<p>Order total <strong>${options.total}</strong></p>` : ''}
+<button type="submit" id="commit">${options.commit}</button></form>${options.outside ?? ''}`,
+  );
+}
+
+/** A merchant's own confirmation: thank-you wording, an order number and the total charged. */
+export function placedPage(reference: string, total: string): string {
+  return document(
+    'Order confirmed',
+    `<h1>Thank you for your order!</h1><p>Order number: ${reference}</p><p>Order total ${total}</p>`,
+  );
+}
+
+/** A free table's booking step; `extra` adds what else the form shows, `outside` what the page shows beside it. */
+export function tableBookingPage(extra = '', outside = ''): string {
+  return document(
+    'Book a table',
+    `<h1>Bistro Juno</h1><form id="book" method="post" action="/book/booked"><label>Party size <select name="party"><option>2</option><option>4</option></select></label>
+<p>No payment is needed to reserve.</p>${extra}<button type="submit" id="reserve">Reserve now</button></form>${outside}`,
+  );
+}
+
+/**
+ * A venue's own booking step with a no-show fee guaranteed by a saved card. With `party` false the page shows
+ * no party size the host can read.
+ */
+export function feeTablePage(party = true): string {
+  return document(
+    'Book at Trattoria Remy',
+    `<h1>Trattoria Remy</h1><form id="book" method="post" action="/book/confirmed">
+${party ? '<label>Party size <select name="party"><option selected>2</option><option>4</option></select></label>' : ''}
+<p>Dinner on <time datetime="2026-10-24T19:00:00-07:00">Saturday, October 24, 7:00 PM</time></p>
+<p>No-show fee: $25 per person, charged if you miss your reservation.</p>
+<p>Card on file: Visa ending in 4242</p><label>Email <input type="email" name="email" value="aya.web@example.test"></label>
+<button type="submit" id="reserve">Reserve now</button></form>`,
+  );
+}
+
+/** A booking provider's widget, framed by the venue, that takes a deposit on a saved card. */
+export function depositWidget(): string {
+  return document(
+    'Reserve',
+    `<form id="book" method="post" action="/widget/osteria/booked"><label>Party size <select name="party"><option selected>4</option></select></label>
+<p>Table for 4 on Friday</p><p>Deposit: $50.00 charged when you book</p><p>Paying with Mastercard ending in 4444</p>
+<label>Email <input type="email" name="email" value="aya.web@example.test"></label><button type="submit" id="book-now">Book now</button></form>`,
+  );
+}
+
+/** The pottery shop's checkout pages and the booking pages, by address. */
+export function genericCheckoutPages(): Record<string, OpenWebRoute> {
+  const items = ['Celadon mug × 2', 'Ash glaze bowl × 1'];
+  const card = 'Visa ending in 4242';
+  const email = 'aya.web@example.test';
+  return {
+    [GENERIC.review]: checkoutPage({
+      action: '/checkout/placed',
+      commit: 'Place order',
+      items,
+      total: '$42.00',
+      payment: card,
+      email,
+      note: 'Delivery instructions',
+    }),
+    [GENERIC.placed]: placedPage('HP-1042', '$42.00'),
+    [GENERIC.placeOrder]: placedPage('HP-1043', '$42.00'),
+    [GENERIC.steps]: checkoutPage({
+      action: '/checkout/steps/next',
+      commit: 'Continue',
+      items,
+      total: '$42.00',
+      payment: card,
+      email,
+    }),
+    [GENERIC.stepsNext]: checkoutPage({
+      title: 'Review your order',
+      action: '/checkout/placeorder',
+      commit: 'Place order',
+      items,
+      total: '$42.00',
+      payment: card,
+      email,
+    }),
+    [GENERIC.guest]: checkoutPage({ action: '/checkout/placed', commit: 'Place order', items, total: '$42.00', email }),
+    [GENERIC.club]: checkoutPage({
+      title: 'Join the clay club',
+      action: '/club/joined',
+      commit: 'Subscribe',
+      items: ['Clay club membership × 1'],
+      total: '$12.00',
+      payment: card,
+      email,
+      lines: ['Membership: $12.00/month, renews automatically until you cancel.'],
+    }),
+    [GENERIC.held]: checkoutPage({
+      action: '/checkout/placed',
+      commit: 'Place order',
+      items,
+      total: '$42.00',
+      payment: card,
+      email,
+      lines: ['We are holding your items for 9:59'],
+    }),
+    [GENERIC.toPlatform]: () => ({ status: 302, headers: { location: GENERIC.platform } }),
+    [GENERIC.platform]: document(
+      'Pay Hale Pottery',
+      `<h1>Pay Hale Pottery</h1><form method="post" action="/c/pottery-42/paid"><p class="item">Celadon mug × 2</p>
+<p>Pay with Visa ending in 4242</p><label>Email <input type="email" name="email" value="${email}"></label>
+<p>Total due $42.00</p><button type="submit" id="pay">Pay $42.00</button></form>`,
+    ),
+    [GENERIC.platformPaid]: placedPage('PX-77', '$42.00'),
+    [GENERIC.freeTable]: tableBookingPage(
+      '',
+      '<p>No credit card required to browse our menus.</p><a href="/gift-cards">Gift cards</a>',
+    ),
+    [GENERIC.walletTable]: tableBookingPage('', '<button type="button" id="gpay">Google Pay</button>'),
+    [GENERIC.cardTable]: tableBookingPage('', '<p>Saved card: Visa ending in 4242</p>'),
+    [GENERIC.booked]: document('Booked', "<h1>You're booked</h1><p>Confirmation #T-2210</p>"),
+    [GENERIC.feeTable]: feeTablePage(),
+    [GENERIC.feeBooked]: document(
+      'Booked',
+      "<h1>You're booked at Trattoria Remy</h1><p>Reservation number TR-5531</p>",
+    ),
+    [GENERIC.depositHost]: document(
+      'Osteria Juno',
+      `<h1>Osteria Juno</h1><iframe id="booking" title="Reservations" src="${GENERIC.depositWidget}" style="width:420px;height:360px;border:0"></iframe>`,
+    ),
+    [GENERIC.depositWidget]: depositWidget(),
+    [GENERIC.depositBooked]: document(
+      'Booked',
+      '<h1>Your booking is confirmed</h1><p>Booking reference OJ-818</p><p>Deposit paid $50.00</p>',
+    ),
+  };
+}
+
 /** The shared open-web pages, by address. */
 export function openWebPages(): Record<string, OpenWebRoute> {
   return {
@@ -1128,6 +1321,7 @@ export function openWebPages(): Record<string, OpenWebRoute> {
     ...consentPages(),
     ...cookieBannerPages(),
     ...personalDataPages(),
+    ...genericCheckoutPages(),
   };
 }
 

@@ -13,6 +13,7 @@ import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
   browserDisclosuresMigration,
+  browserGenericCheckoutMigration,
   browserIncidentsMigration,
   browserPurchaseMigration,
   browserReservationBoundsMigration,
@@ -69,6 +70,7 @@ registerMigration(browserCredentialAttemptsMigration);
 registerMigration(browserConsentMigration);
 registerMigration(browserIncidentsMigration);
 registerMigration(browserDisclosuresMigration);
+registerMigration(browserGenericCheckoutMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';

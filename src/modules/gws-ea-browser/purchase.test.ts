@@ -581,6 +581,19 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await readMerchantPurchase(page)).toEqual({ status: 'terms_unavailable' });
     expect(submitted).toBe(0);
   });
+  it('fails closed on an Amazon review page its signature no longer matches, never reading it as an unreviewed checkout', async () => {
+    await page.locator('#placeYourOrder input').evaluate((node) => {
+      (node as unknown as { name: string }).name = 'placeYourOrder2';
+    });
+    await buy();
+    expect(await request('buy')).toMatchObject({
+      status: 'facts_incomplete',
+      missing: ["the site's reviewed checkout"],
+    });
+    expect(await approvals()).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+    expect(submitted).toBe(0);
+  });
   it('posts exactly one card to the principal, keeps the site and commits once on its worker after approval', async () => {
     await buy();
     expect(await request('buy')).toMatchObject({ status: 'awaiting_principal' });
@@ -762,7 +775,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
   });
   it.each([
     ['lapsed checkout', false, 'checkout_lapsed'],
-    ['closed idle page', true, 'unsupported_merchant'],
+    ['closed idle page', true, 'checkout_lapsed'],
   ] as const)(
     'resumes approval after restart with a %s and revalidates the rebuilt checkout',
     async (_name, closePage, status) => {

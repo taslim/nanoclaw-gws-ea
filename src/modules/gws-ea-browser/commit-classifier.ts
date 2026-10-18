@@ -1,5 +1,6 @@
 import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
+import { genericCheckoutSignature } from './generic-signature.js';
 import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import { documentGate, type PausedDocument } from './document-gate.js';
@@ -12,7 +13,7 @@ import {
   type CredentialKind,
   httpsOrigin,
 } from './authentication-signatures.js';
-import { readPageControlFacts, type ControlFacts } from './control-facts.js';
+import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { BrowserConsentStop, consentClassChoice, runConsentPass, withConsentScope } from './consent.js';
 
 export type { ControlFacts, ControlRegion } from './control-facts.js';
@@ -26,17 +27,12 @@ export type ActionClass =
   | 'consent_control'
   | 'blocked_address';
 /**
- * An activation's outcome. `unsupported_merchant` is never a classification: it is a reviewed flow's exact
- * check failing during an approved purchase.
- */
-export type ActivationClass = ActionClass | 'unsupported_merchant';
-/**
  * Why an activation was refused: its class, or a submission of a form holding a password, code or payment
  * field, which only the host's own sign-in and credential paths make.
  */
-export type ActivationRefusal = Exclude<ActivationClass, 'ordinary'> | 'secret_field';
+export type ActivationRefusal = Exclude<ActionClass, 'ordinary'> | 'secret_field';
 /** Why the navigation guard refused a document: its class, a site another job holds, or a read-only replay's non-GET. */
-export type NavigationRefusal = Exclude<ActivationClass, 'ordinary'> | 'site_busy' | 'read_only';
+export type NavigationRefusal = Exclude<ActionClass, 'ordinary'> | 'site_busy' | 'read_only';
 /** A credential operation's own strict outcome: anything outside its vocabulary is an unsupported control. */
 export type CredentialActivationClass = ActionClass | 'unsupported_control';
 export interface ReviewedMerchantFlow {
@@ -397,7 +393,62 @@ export function framesUnreadyStop(error: unknown): Record<string, unknown> | und
     : undefined;
 }
 
-const approvedPresses = new WeakMap<Page, { origin: string; flow: ReviewedMerchantFlow }>();
+/** An approved purchase's own press (KTD4): the documents it may load while it runs, beyond the open rule. */
+interface ApprovedPress {
+  /** The origin of the document the approved control commits from. */
+  readonly origin: string;
+  /** Whether a document belongs to the press's own flow. */
+  matches(url: URL): boolean;
+  /** The flow's reading of its own route; undefined for a route it does not know, which stays refused. */
+  classify(url: URL): ActionClass | undefined;
+}
+const approvedPresses = new WeakMap<Page, ApprovedPress>();
+
+/** What an approved purchase's press carries into the activation boundary. */
+export interface PurchaseAuthorityPress {
+  /** Runs immediately before the press: the last re-read and the commit marker. */
+  commitStarted(): Promise<void>;
+  /**
+   * A generic checkout's origin (KTD4), for a page no reviewed flow reads: its control must sit in a document of
+   * this origin, and the press loads its own routes there.
+   */
+  readonly checkout?: { readonly origin: string };
+}
+
+/**
+ * The press an approval admits: a reviewed flow's exact control on its page, or a generic checkout's control in
+ * its checkout origin. A reviewed flow's page never takes the generic verifier: that flow fails closed.
+ */
+async function approvedPress(
+  page: Page,
+  element: ElementHandle,
+  flow: ReviewedMerchantFlow | undefined,
+  authority: PurchaseAuthorityPress,
+): Promise<ApprovedPress | undefined> {
+  if (flow) {
+    if (!flow.verifyPurchaseControl || !(await flow.verifyPurchaseControl(page, element))) return undefined;
+    return {
+      origin: new URL(page.url()).origin,
+      matches: (url) => flow.matches(url),
+      classify: (url) => flow.classifyNavigation(url),
+    };
+  }
+  const checkout = authority.checkout;
+  const frame = await element.ownerFrame();
+  if (
+    !checkout ||
+    !frame ||
+    !URL.canParse(frame.url()) ||
+    new URL(frame.url()).origin !== checkout.origin ||
+    !(await genericCheckoutSignature.verifyPurchaseControl?.(page, element))
+  )
+    return undefined;
+  return {
+    origin: checkout.origin,
+    matches: (url) => url.origin === checkout.origin,
+    classify: (url) => classifyNavigationUrl(url.href),
+  };
+}
 
 /** All recipes, fills, watches and tool activations use this single boundary. */
 export interface ActivationIntent {
@@ -437,18 +488,20 @@ export async function activateControl(
   page: Page,
   element: ElementHandle,
   operation: () => Promise<void>,
-  authority?: { commitStarted(): Promise<void> },
+  authority?: PurchaseAuthorityPress,
   intent: ActivationIntent = { kind: 'click' },
 ): Promise<ActivationResult> {
   const dispatch = await activationDispatch(page, element, intent.kind);
   const { classification, facts } = dispatch;
-  if (classification === 'purchase_control' && authority) {
-    const source = new URL(page.url());
-    const flow = dispatch.flow;
-    if (!flow?.verifyPurchaseControl || !(await flow.verifyPurchaseControl(page, element)))
-      throw new BrowserActivationError('unsupported_merchant');
+  if (authority) {
+    // An approval covers a commit's press: a control that no longer reads as one, or that its approval does not
+    // cover, is refused before the commit marker, never pressed another way.
+    if (classification !== 'purchase_control')
+      throw new BrowserActivationError(classification === 'ordinary' ? 'purchase_control' : classification);
+    const approved = await approvedPress(page, element, dispatch.flow, authority);
+    if (!approved) throw new BrowserActivationError('purchase_control');
     await authority.commitStarted();
-    approvedPresses.set(page, { origin: source.origin, flow });
+    approvedPresses.set(page, approved);
     try {
       await operation();
     } finally {
@@ -493,9 +546,9 @@ export interface BrowserNavigationPolicy {
    * site, replacing the generic one; undefined leaves the generic rules. Only
    * an authorized credential operation installs one, for its activation.
    */
-  decide?(url: URL): ActivationClass | undefined;
+  decide?(url: URL): ActionClass | undefined;
   /** A host-owned sign-in scope may recognize an otherwise unsupported bearer-link route. */
-  classify?(url: URL): ActivationClass;
+  classify?(url: URL): ActionClass;
   stripReferrer?: boolean;
   /** A read-only replay's scope: every document it loads must be a GET, or it is refused as `read_only` (KTD2). */
   readOnly?: boolean;
@@ -546,7 +599,7 @@ function decideIdleDocument(
   document: NavigationDocument,
   pageUrl: string,
   leasedSite: string | undefined,
-): ActivationClass {
+): ActionClass {
   const classification = classifyNavigationUrl(url);
   if (classification !== 'ordinary') return classification;
   const site = registrableSite(document.topLevel ? url : pageUrl);
@@ -561,11 +614,13 @@ async function decideNavigation(
   url: string,
   document: NavigationDocument,
   scopes: readonly BrowserNavigationPolicy[],
-  approved: { origin: string; flow: ReviewedMerchantFlow } | undefined,
-  idle: () => ActivationClass,
-): Promise<ActivationClass | 'site_busy' | 'read_only'> {
-  let classification: ActivationClass = classifyNavigationUrl(url);
+  approved: ApprovedPress | undefined,
+  idle: () => ActionClass,
+): Promise<ActionClass | 'site_busy' | 'read_only'> {
+  let classification: ActionClass = classifyNavigationUrl(url);
   const target = URL.canParse(url) ? new URL(url) : undefined;
+  // Whether the approved press refused a route its flow does not know: a sign-in scope's own reading replaces it.
+  let pressRefused = false;
   if (
     approved &&
     target &&
@@ -573,14 +628,15 @@ async function decideNavigation(
     classification !== 'account_security' &&
     classification !== 'speaks_as_principal' &&
     target.origin === approved.origin &&
-    approved.flow.matches(target)
+    approved.matches(target)
   ) {
-    // During its approved press a reviewed flow's own route is ordinary; a route it does not know is refused.
-    const known = approved.flow.classifyNavigation(target);
-    classification = known === 'purchase_control' ? 'ordinary' : (known ?? 'unsupported_merchant');
+    // During its approved press the flow's own purchase route is ordinary; a route it does not know is refused.
+    const known = approved.classify(target);
+    classification = known === 'purchase_control' ? 'ordinary' : (known ?? 'purchase_control');
+    pressRefused = known === undefined;
   } else if (!scopes.length) classification = idle();
   for (const policy of scopes) {
-    let decided: ActivationClass | undefined;
+    let decided: ActionClass | undefined;
     try {
       decided = policy.decide?.(new URL(url));
       // eslint-disable-next-line no-catch-all/no-catch-all -- a scope that cannot classify a document blocks it
@@ -591,13 +647,13 @@ async function decideNavigation(
   }
   for (const policy of scopes) {
     if (!policy.classify) continue;
-    let scoped: ActivationClass;
+    let scoped: ActionClass;
     try {
       scoped = policy.classify(new URL(url));
     } catch (_error) {
       scoped = 'blocked_address';
     }
-    if (scoped !== 'ordinary' || classification === 'unsupported_merchant') classification = scoped;
+    if (scoped !== 'ordinary' || pressRefused) classification = scoped;
   }
   if (classification !== 'ordinary') return classification;
   // A read-only replay follows GET navigation only.
@@ -611,39 +667,6 @@ async function decideNavigation(
 
 /** Script request types an ordinary action's window checks: what page script sends, a beacon included. */
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
-/**
- * Payment processors, by registrable domain or host: their APIs take a payment from page script, a payment
- * frame's included. Vocabulary is data: widen or narrow it here.
- */
-const PAYMENT_PROCESSORS: readonly string[] = [
-  'stripe.com',
-  'stripe.network',
-  'adyen.com',
-  'adyenpayments.com',
-  'braintreegateway.com',
-  'braintree-api.com',
-  'paypal.com',
-  'squareup.com',
-  'squareupsandbox.com',
-  'checkout.com',
-  'klarna.com',
-  'klarnaservices.com',
-  'affirm.com',
-  'afterpay.com',
-  'clearpay.co.uk',
-  'authorize.net',
-  'worldpay.com',
-  'cybersource.com',
-  'mollie.com',
-  'razorpay.com',
-  'shop.app',
-  'pay.shopify.com',
-  'pay.google.com',
-  'payments.google.com',
-  'pay.amazon.com',
-  'payments.amazon.com',
-  'pay-api.amazon.com',
-];
 /** How long an ordinary action's window stays open after the action: a handler that awaits one round trip, then posts. */
 const ACTION_SETTLE_MS = 1_000;
 const NAVIGATION_POLL_MS = 50;
@@ -654,10 +677,7 @@ export function refusedScriptRequest(request: { method: string; url: string }): 
   if (!URL.canParse(request.url)) return true;
   const url = new URL(request.url);
   const host = url.hostname.toLowerCase();
-  return (
-    PAYMENT_PROCESSORS.some((processor) => host === processor || host.endsWith(`.${processor}`)) ||
-    classifyNavigationUrl(url.href) === 'purchase_control'
-  );
+  return paymentProcessorHost(host) || classifyNavigationUrl(url.href) === 'purchase_control';
 }
 
 // Every request type but Document: documents are decided, and stripped, at the document gate. These are
@@ -732,7 +752,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       };
       return {
         async decide(document) {
-          let classification: ActivationClass | 'site_busy' | 'read_only';
+          let classification: ActionClass | 'site_busy' | 'read_only';
           try {
             classification = await decideNavigation(document.url, document, scopes, approved, () =>
               decideIdleDocument(document.url, document, pageUrl, leased),

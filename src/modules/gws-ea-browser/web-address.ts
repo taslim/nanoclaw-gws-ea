@@ -101,3 +101,8 @@ export async function signInAddress(current: string): Promise<string | undefined
   const held = current.trim().toLowerCase();
   return mailbox(held) === mailbox(alias) ? held : alias;
 }
+
+/** The assistant's verified web address, or null until gws-ea records one: a card names it as the assistant's. */
+export async function assistantWebAddress(): Promise<string | null> {
+  return (await webIdentity()).alias;
+}

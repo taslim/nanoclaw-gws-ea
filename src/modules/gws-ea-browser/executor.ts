@@ -59,7 +59,6 @@ export type BrowserStopReason =
   | 'challenge'
   | 'sign_in_wall'
   | 'site_busy'
-  | 'unsupported_merchant'
   | 'window_closed'
   | 'browser_unavailable'
   | 'alias_unavailable'

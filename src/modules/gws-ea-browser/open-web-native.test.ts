@@ -27,9 +27,11 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }
 
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
+import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
-import type { Session } from '../../types.js';
+import type { PendingApproval, Session } from '../../types.js';
+import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -49,21 +51,28 @@ import { BrowserStore } from './db.js';
 import { recordDisclosureRequest } from './disclosures.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
 import { setBrowserAdmissionReady } from './group.js';
+import { prepareMerchantPage, readMerchantPurchase } from './merchant-signatures.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import {
   CONSENT,
   COOKIE_BANNERS,
+  GENERIC,
   OPEN_WEB,
   PERSONAL_DATA,
   PROCESSOR,
+  checkoutPage,
+  feeTablePage,
   openWebFixture,
+  placedPage,
   type OpenWebFixture,
   type OpenWebRequest,
 } from './open-web-native-fixture.js';
 import { browserVault } from './onepassword.js';
 import { observePage, type BrowserObservation, type BrowserRef } from './observe.js';
+import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
+import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -1350,5 +1359,436 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
       refusedBeforeTyping,
     );
     expect(await page.locator('input[name="mobile"]').inputValue()).toBe('');
+  });
+});
+
+describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', { timeout: 60_000 }, () => {
+  const PRINCIPAL = 'gchat:users/principal';
+  const ALIAS = 'aya.web@example.test';
+  let fixture: OpenWebFixture;
+  let page: Page;
+  let queue: BrowserQueue;
+  let session: Session;
+  let main: Session;
+  let sent: string[];
+  const posts = (): string[] =>
+    fixture.requests.filter((request) => request.method !== 'GET').map((request) => request.url);
+
+  beforeAll(async () => {
+    if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
+    fixture = await openWebFixture(chromePath);
+  }, 30_000);
+  afterAll(async () => {
+    await fixture?.close();
+  });
+  beforeEach(async () => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.mkdirSync(`${root}/browser`, { recursive: true });
+    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+      mode: 0o600,
+    });
+    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+    await runMigrations(await initTestDb());
+    for (const id of ['main-p', 'browser-p'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    await createMessagingGroup({
+      id: 'mg-principal',
+      channel_type: 'gchat',
+      platform_id: 'spaces/principal',
+      name: 'principal',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: new Date().toISOString(),
+    });
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'America/Los_Angeles',
+      mainAgentGroupId: 'main-p',
+      principalEmails: ['morgan@example.test'],
+    });
+    await getDb().run(
+      'UPDATE gws_ea_profile SET browser_agent_group_id = ?, assistant_alias = ? WHERE singleton = 1',
+      'browser-p',
+      ALIAS,
+    );
+    await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
+    await upsertUserDm({
+      user_id: PRINCIPAL,
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-principal',
+      resolved_at: new Date().toISOString(),
+    });
+    await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
+    main = (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
+    session = (await resolveSystemSession('browser-p', 'system:a2a:main-p:checkout')).session;
+    sent = [];
+    setDeliveryAdapter({
+      async deliver(_type, _platformId, _thread, _kind, content) {
+        sent.push(content);
+        return `message-${sent.length}`;
+      },
+    });
+    page = await fixture.newPage();
+    await prepareMerchantPage(page);
+    queue = new BrowserQueue(new BrowserStore(), {
+      pageForJob: async () => page,
+      connection: async (): Promise<never> => {
+        throw new Error('Not used');
+      },
+      closeJob: async () => undefined,
+      onDisconnected: () => () => undefined,
+    });
+    configureBrowserCancellation(queue);
+    registerBrowserPurchaseDelivery(() => queue);
+    if (!getDeliveryAction('reservation_bounds')) registerReservationGuaranteeDelivery();
+    await queue.start();
+    await resumeBrowserPurchaseCommits(queue);
+    setBrowserAdmissionReady(true);
+    fixture.requests.length = 0;
+  });
+  afterEach(async () => {
+    setBrowserAdmissionReady(false);
+    await queue?.stop();
+    await page?.context().close();
+    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    await closeDb();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** One browser request through the queue, as the browser agent sends it; its answer's data. */
+  async function answer(id: string): Promise<Record<string, unknown>> {
+    const row = await getDb().get<{ answer_json: string }>(
+      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
+      session.id,
+      id,
+    );
+    if (!row) throw new Error(`No answer for ${id}`);
+    return (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
+  }
+  async function run(id: string, actions: BrowserAction[]): Promise<Record<string, unknown>> {
+    await queue.accept('browser', { actions }, session, id);
+    await queue.idle();
+    return answer(id);
+  }
+  const open = (url: string): Promise<Record<string, unknown>> =>
+    run(`open-${randomUUID()}`, [{ kind: 'navigate', url }]);
+  /** The agent's purchase of the control named `name`, aimed from a fresh observation. */
+  async function purchase(name: string, id = `purchase-${randomUUID()}`): Promise<Record<string, unknown>> {
+    const handler = getDeliveryAction('purchase');
+    if (!handler) throw new Error('purchase delivery missing');
+    await handler({ action: 'purchase', requestId: id, target: refIn(await observePage(page), name) }, session);
+    await queue.idle();
+    return answer(id);
+  }
+  const approvals = (): Promise<PendingApproval[]> =>
+    getDb().all<PendingApproval>('SELECT * FROM pending_approvals ORDER BY created_at');
+  async function approve(approval: PendingApproval): Promise<void> {
+    await handleApprovalsResponse({
+      questionId: approval.approval_id,
+      value: 'approve',
+      userId: PRINCIPAL,
+      channelType: 'gchat',
+      platformId: 'spaces/principal',
+      threadId: null,
+    });
+    await queue.idle();
+  }
+  const authorities = () =>
+    getDb().all<{ state: string; facts_json: string; outcome_json: string | null }>(
+      'SELECT state,facts_json,outcome_json FROM gws_ea_browser_authorities ORDER BY created_at',
+    );
+  const attempts = () =>
+    getDb().all<{
+      site: string;
+      platform: string | null;
+      account_key: string | null;
+      resolution: string | null;
+      merchant_record_id: string | null;
+    }>(
+      'SELECT site,platform,account_key,resolution,merchant_record_id FROM gws_ea_browser_purchase_attempts ORDER BY attempted_at',
+    );
+  /** Main's recorded bounds for this errand's table, and the principal's standing guarantee up to $100. */
+  async function standingGuarantee(): Promise<void> {
+    const bounds = getDeliveryAction('reservation_bounds');
+    if (!bounds) throw new Error('reservation_bounds delivery missing');
+    await bounds(
+      {
+        action: 'reservation_bounds',
+        requestId: 'bounds',
+        thread: session.thread_id!,
+        venue_id: 'Trattoria Remy',
+        party_size: 2,
+        window_start: '2026-10-24T18:00:00-07:00',
+        window_end: '2026-10-24T21:00:00-07:00',
+      },
+      main,
+    );
+    await getDb().run(
+      'INSERT INTO gws_ea_browser_reservation_guarantees(id,approval_id,principal_user_id,currency,max_total_minor,created_at) VALUES(?,?,?,?,?,?)',
+      'standing',
+      'principal-approved',
+      PRINCIPAL,
+      'USD',
+      10_000,
+      new Date().toISOString(),
+    );
+  }
+  const read = async (selector: string, frame?: string) => {
+    const scope = frame ? page.frameLocator(frame) : page;
+    const element = await scope.locator(selector).elementHandle();
+    if (!element) throw new Error(`Fixture control missing: ${selector}`);
+    const result = await readMerchantPurchase(page, element);
+    if ('element' in result) await result.element.dispose();
+    return result;
+  };
+
+  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed (AE3)', async () => {
+    await open(GENERIC.review);
+    await run('note', [
+      { kind: 'type', ...refIn(await observePage(page), 'Delivery instructions'), text: 'Leave it with the porter' },
+    ]);
+    expect(await purchase('Place order', 'ae3')).toMatchObject({ status: 'awaiting_principal' });
+    expect(posts()).toEqual([]);
+    const [approval] = await approvals();
+    expect(sent).toHaveLength(1);
+    for (const line of [
+      'Site: pottery.example',
+      'Account: guest checkout',
+      "Contact email: your assistant's email",
+      'Item: "Celadon mug × 2"',
+      'Item: "Ash glaze bowl × 1"',
+      'Total: $42.00 (USD)',
+      'Due now: $42.00',
+      'Payment: "Visa ending in 4242"',
+      'Note: "Leave it with the porter"',
+    ])
+      expect(approval.question).toContain(line);
+    expect(approval.question).not.toContain(ALIAS);
+    expect(approval.question).not.toMatch(/attempt-|card-|authority-/u);
+    await approve(approval);
+    expect(posts()).toEqual([GENERIC.placed]);
+    const [authority] = await authorities();
+    expect(authority.state).toBe('committed');
+    expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'placed', order_number: 'HP-1042' });
+    expect(await attempts()).toEqual([
+      {
+        site: 'pottery.example',
+        platform: null,
+        account_key: ALIAS,
+        resolution: 'committed',
+        merchant_record_id: 'HP-1042',
+      },
+    ]);
+  });
+
+  it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt (AE2)', async () => {
+    fixture.serve('https://table.example/book/r-7/confirm', placedPage('T-7731', '$0.00'));
+    await open(CONSENT.offers);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-7731' });
+    expect(await approvals()).toEqual([]);
+    expect(sent).toEqual([]);
+    const booking = fixture.requests.find((request) => request.method === 'POST');
+    expect(new URLSearchParams(booking?.body)).toEqual(new URLSearchParams({ party: '2' }));
+    expect(await getDb().all('SELECT site,resolution,merchant_record_id FROM gws_ea_browser_free_attempts')).toEqual([
+      { site: 'table.example', resolution: 'committed', merchant_record_id: 'T-7731' },
+    ]);
+    expect(await attempts()).toEqual([]);
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+  });
+
+  it('keeps a booking free past "No credit card required" and a Gift cards link outside its form, but not beside Google Pay or a saved card', async () => {
+    await open(GENERIC.freeTable);
+    expect(await read('#reserve')).toMatchObject({ status: 'free' });
+    await open(GENERIC.walletTable);
+    expect(await read('#reserve')).toMatchObject({ status: 'card_needed' });
+    await open(GENERIC.cardTable);
+    expect((await read('#reserve')).status).not.toBe('free');
+    expect(posts()).toEqual([]);
+  });
+
+  it('answers card_needed with the site, account, items and total when no payment method is saved', async () => {
+    await open(GENERIC.guest);
+    expect(await purchase('Place order')).toMatchObject({
+      status: 'card_needed',
+      site: 'pottery.example',
+      account: 'guest checkout',
+      items: ['Celadon mug × 2', 'Ash glaze bowl × 1'],
+      total: '$42.00',
+      repeat_safe: true,
+    });
+    expect(await approvals()).toEqual([]);
+    expect(posts()).toEqual([]);
+  });
+
+  it('puts readable recurring terms on the card, and stops naming an unreadable frequency', async () => {
+    await open(GENERIC.club);
+    const club = await read('#commit');
+    expect(club).toMatchObject({
+      status: 'ready',
+      facts: { totalMinor: 1200, commitments: [{ kind: 'subscription', amountMinor: 1200, frequency: 'monthly' }] },
+    });
+    await page
+      .locator('#checkout p:not(.item)')
+      .filter({ hasText: 'Membership' })
+      .evaluate((node) => {
+        (node as unknown as { textContent: string }).textContent =
+          'Membership: $12.00, renews automatically until you cancel.';
+      });
+    expect(await purchase('Subscribe')).toMatchObject({
+      status: 'facts_incomplete',
+      missing: ['the recurring frequency'],
+      repeat_safe: true,
+    });
+    expect(await approvals()).toEqual([]);
+  });
+
+  it('presses Continue then Place order under one card, as one attempt', async () => {
+    expect(classifyNavigationUrl(GENERIC.placeOrder)).toBe('purchase_control');
+    await open(GENERIC.steps);
+    expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
+    await approve((await approvals())[0]);
+    // The approved press loads its own checkout's purchase route, which the open rule refuses otherwise.
+    expect(posts()).toEqual([GENERIC.stepsNext, GENERIC.placeOrder]);
+    expect(sent).toHaveLength(1);
+    expect(await attempts()).toMatchObject([{ resolution: 'committed', merchant_record_id: 'HP-1043' }]);
+  });
+
+  it('sends a new card when the total rises between steps, and stops the job at the fourth change', async () => {
+    // Each step posts to the next one's own address and names its own commit, and each shows a higher total.
+    let total = 42;
+    fixture.serve(GENERIC.stepsNext, () => {
+      total += 1;
+      return {
+        body: checkoutPage({
+          title: 'Review your order',
+          action: `/checkout/steps/next?step=${total - 41}`,
+          commit: `Continue to step ${total - 41}`,
+          items: ['Celadon mug × 2', 'Ash glaze bowl × 1'],
+          total: `$${total}.00`,
+          payment: 'Visa ending in 4242',
+          email: ALIAS,
+        }),
+      };
+    });
+    await open(GENERIC.steps);
+    expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
+    for (let change = 1; change <= 3; change++) {
+      await approve((await approvals())[0]);
+      const [card] = await approvals();
+      expect(card.question).toContain(`The total rose to $${42 + change}.00`);
+    }
+    await approve((await approvals())[0]);
+    expect(await approvals()).toEqual([]);
+    expect(sent).toHaveLength(4);
+    const notices = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundHistory(100).map((message) => message.content),
+    );
+    expect(notices?.some((content) => content.includes('checkout_changing'))).toBe(true);
+    expect(await attempts()).toMatchObject(Array(4).fill({ resolution: 'not_committed' }));
+  });
+
+  it('presses Place order once when the same step comes back, and leaves the attempt unconfirmed', async () => {
+    fixture.serve(GENERIC.placed, () => ({
+      body: checkoutPage({
+        action: '/checkout/placed',
+        commit: 'Place order',
+        items: ['Celadon mug × 2', 'Ash glaze bowl × 1'],
+        total: '$42.00',
+        payment: 'Visa ending in 4242',
+        email: ALIAS,
+      }),
+    }));
+    await open(GENERIC.review);
+    await purchase('Place order');
+    await approve((await approvals())[0]);
+    expect(posts()).toEqual([GENERIC.placed]);
+    const [authority] = await authorities();
+    expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'outcome_unknown', purchase_blocked: true });
+    expect(await attempts()).toMatchObject([{ resolution: null }]);
+    expect(await getDb().all('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual([{ site: 'pottery.example' }]);
+  });
+
+  it('keeps the merchant’s lease and block through a payment platform’s own page, binding the platform origin', async () => {
+    await open(GENERIC.toPlatform);
+    expect(page.url()).toBe(GENERIC.platform);
+    expect(await purchase('Pay $42.00')).toMatchObject({ status: 'awaiting_principal' });
+    const [approval] = await approvals();
+    expect(approval.question).toContain('Site: pottery.example');
+    expect(approval.question).toContain('Checkout on: pay.example');
+    expect(
+      await getDb().all('SELECT site,state FROM gws_ea_browser_site_leases WHERE job_id = ?', session.thread_id),
+    ).toEqual([{ site: 'pottery.example', state: 'purchase' }]);
+    await approve(approval);
+    const [authority] = await authorities();
+    expect(JSON.parse(authority.facts_json)).toMatchObject({ site: 'pottery.example', origin: 'https://pay.example' });
+    expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'placed', order_number: 'PX-77' });
+    expect(await attempts()).toMatchObject([{ site: 'pottery.example', platform: 'pay.example' }]);
+  });
+
+  it('blocks the merchant, not the payment platform, when a platform press has no page proof', async () => {
+    fixture.serve(GENERIC.platformPaid, '<!doctype html><title>Processing</title><p>Processing your payment</p>');
+    await open(GENERIC.toPlatform);
+    await purchase('Pay $42.00');
+    await approve((await approvals())[0]);
+    expect(posts()).toEqual([GENERIC.platformPaid]);
+    expect(await attempts()).toMatchObject([{ site: 'pottery.example', platform: 'pay.example', resolution: null }]);
+    expect(await getDb().all('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual([{ site: 'pottery.example' }]);
+  });
+
+  it('ignores a hold countdown that changes between the card and the press', async () => {
+    await open(GENERIC.held);
+    await purchase('Place order');
+    await page
+      .locator('#checkout p')
+      .filter({ hasText: 'holding' })
+      .evaluate((node) => {
+        (node as unknown as { textContent: string }).textContent = 'We are holding your items for 7:42';
+      });
+    await approve((await approvals())[0]);
+    expect(sent).toHaveLength(1);
+    expect(posts()).toEqual([GENERIC.placed]);
+  });
+
+  it('puts a no-show fee on the card, and books under the standing guarantee when every booking fact is read', async () => {
+    await open(GENERIC.feeTable);
+    const fee = await read('#reserve');
+    expect(fee).toMatchObject({
+      status: 'ready',
+      facts: {
+        totalMinor: 0,
+        dueNowMinor: 0,
+        commitments: [{ kind: 'conditional_fee', conditionalTrigger: 'no_show', amountMinor: 2500, perPerson: true }],
+      },
+    });
+    await standingGuarantee();
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'TR-5531' });
+    expect(await approvals()).toEqual([]);
+    expect(await authorities()).toMatchObject([{ state: 'committed' }]);
+  });
+
+  it('sends a card for a fee booking whose party size it cannot read, whatever the guarantee covers', async () => {
+    fixture.serve(GENERIC.feeTable, feeTablePage(false));
+    await open(GENERIC.feeTable);
+    await standingGuarantee();
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'awaiting_principal' });
+    const [approval] = await approvals();
+    expect(approval.question).toContain('No-show fee: $25 per person');
+    expect(posts()).toEqual([]);
+  });
+
+  it('records an embedded booking frame’s domain as the attempt’s platform for a deposit', async () => {
+    await open(GENERIC.depositHost);
+    await page.frameLocator('#booking').locator('#book-now').waitFor();
+    expect(await read('#book-now', '#booking')).toMatchObject({
+      status: 'ready',
+      facts: { site: 'osteria.example', origin: 'https://tables.example', dueNowMinor: 5000 },
+    });
+    expect(await purchase('Book now')).toMatchObject({ status: 'awaiting_principal' });
+    await approve((await approvals())[0]);
+    expect(await attempts()).toMatchObject([
+      { site: 'osteria.example', platform: 'tables.example', resolution: 'committed', merchant_record_id: 'OJ-818' },
+    ]);
   });
 });

@@ -418,3 +418,35 @@ export const browserDisclosuresMigration: PortableMigration & { name: ModuleMigr
     `);
   },
 };
+
+/**
+ * Checkouts on any site (KTD3, KTD5, KTD7): a free commit's money-less attempt, each paid attempt's payment
+ * platform and contact-email account key, and the change a replacement card names, which the change cap counts.
+ * Free attempts outlive jobs, so `job_id` is deliberately not a foreign key.
+ */
+export const browserGenericCheckoutMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:generic-checkout',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_free_attempts (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        site TEXT NOT NULL,
+        platform TEXT,
+        account_key TEXT,
+        facts_json TEXT NOT NULL,
+        attempted_at TEXT NOT NULL,
+        resolution TEXT CHECK(resolution IN ('committed','not_committed')),
+        evidence_json TEXT,
+        merchant_record_id TEXT,
+        reconciled_at TEXT
+      );
+      CREATE INDEX gws_ea_browser_free_attempts_site ON gws_ea_browser_free_attempts(site,resolution);
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN platform TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN account_key TEXT;
+      ALTER TABLE gws_ea_browser_purchase_cards ADD COLUMN change_text TEXT;
+    `);
+  },
+};
