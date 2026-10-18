@@ -21,6 +21,17 @@ async function changedAccount() {
   return adapter;
 }
 
+it('retains the completed send receipt after host delivery cleanup and a later account change', async () => {
+  const first = await h.start();
+  const message = { kind: 'chat', content: { text: 'Already delivered before the snapshot restore' } };
+  const id = await first.deliver('team@g.us', null, message, 'completed-before-account-change');
+  first.completeDelivery('completed-before-account-change');
+  await first.teardown();
+  const fresh = await changedAccount();
+  expect(await fresh.deliver('team@g.us', null, message, 'completed-before-account-change')).toBe(id);
+  expect(h.socket().sends).toHaveLength(0);
+});
+
 it('keeps an accepted logical row globally handed off after an account change but refuses an old unaccepted row', async () => {
   const first = await h.start();
   const content = { kind: 'chat', content: { text: 'One delivery' } };

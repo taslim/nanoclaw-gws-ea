@@ -41,6 +41,19 @@ interface SendRow {
   message_id: string;
 }
 
+function sendRecord(row: SendRow | undefined): PendingSend | undefined {
+  return row === undefined
+    ? undefined
+    : {
+        rowId: row.row_id,
+        account: row.account,
+        chat: row.chat,
+        createdAt: row.created_at,
+        accepted: row.accepted === 1,
+        messageId: row.message_id,
+      };
+}
+
 export class WhatsAppIndex {
   private readonly db: Database.Database;
   constructor(
@@ -56,6 +69,7 @@ export class WhatsAppIndex {
       CREATE TABLE IF NOT EXISTS messages(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,from_me INTEGER NOT NULL,forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,PRIMARY KEY(account,chat,id));
       CREATE INDEX IF NOT EXISTS messages_prune ON messages(at) WHERE from_me=0 AND routed=1;
       CREATE TABLE IF NOT EXISTS pending_sends(row_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS completed_sends(row_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL CHECK(accepted=1),message_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS requests(account TEXT NOT NULL,message_id TEXT NOT NULL,chat TEXT NOT NULL,question_id TEXT NOT NULL,posted_at TEXT,PRIMARY KEY(account,message_id));
       CREATE TABLE IF NOT EXISTS aliases(account TEXT NOT NULL,phone TEXT NOT NULL,lid TEXT NOT NULL,PRIMARY KEY(account,phone),UNIQUE(account,lid));
       CREATE TABLE IF NOT EXISTS names(account TEXT NOT NULL,jid TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(account,jid));
@@ -194,25 +208,21 @@ export class WhatsAppIndex {
   }
   pending(rowId: string): PendingSend | undefined {
     const row = this.db.prepare('SELECT * FROM pending_sends WHERE row_id=?').get(rowId) as SendRow | undefined;
-    return row === undefined
-      ? undefined
-      : {
-          rowId: row.row_id,
-          account: row.account,
-          chat: row.chat,
-          createdAt: row.created_at,
-          accepted: row.accepted === 1,
-          messageId: row.message_id,
-        };
+    return sendRecord(row);
   }
   prepare(rowId: string, chat: string, messageId: string, at: number): PendingSend {
     const account = this.account();
     this.db
       .prepare(
-        'INSERT INTO pending_sends(row_id,account,chat,message_id,created_at) VALUES(?,?,?,?,?) ON CONFLICT(row_id) DO NOTHING',
+        'INSERT INTO pending_sends(row_id,account,chat,message_id,created_at) SELECT ?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM completed_sends WHERE row_id=?) ON CONFLICT(row_id) DO NOTHING',
       )
-      .run(rowId, account, chat, messageId, at);
-    const held = this.pending(rowId);
+      .run(rowId, account, chat, messageId, at, rowId);
+    const row = this.db
+      .prepare(
+        'SELECT * FROM pending_sends WHERE row_id=? UNION ALL SELECT * FROM completed_sends WHERE row_id=? LIMIT 1',
+      )
+      .get(rowId, rowId) as SendRow | undefined;
+    const held = sendRecord(row);
     if (!held || held.chat !== chat || held.messageId !== messageId)
       throw new Error('WhatsApp outbound row changed address');
     if (held.account !== account && !held.accepted)
@@ -226,7 +236,14 @@ export class WhatsAppIndex {
     this.db.prepare('UPDATE pending_sends SET accepted=1 WHERE row_id=?').run(rowId);
   }
   complete(rowId: string): void {
-    this.db.prepare('DELETE FROM pending_sends WHERE row_id=?').run(rowId);
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          'INSERT INTO completed_sends SELECT * FROM pending_sends WHERE row_id=? AND accepted=1 ON CONFLICT(row_id) DO NOTHING',
+        )
+        .run(rowId);
+      this.db.prepare('DELETE FROM pending_sends WHERE row_id=?').run(rowId);
+    })();
   }
   alias(lid: string, phone: string): void {
     const account = this.account();
