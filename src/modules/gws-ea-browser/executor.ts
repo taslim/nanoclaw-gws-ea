@@ -30,6 +30,7 @@ import {
   disposeBrowserRefs,
   observePage,
   pageHasSecret,
+  pageMayShowSecret,
   pinBrowserRefs,
   readBrowserRef,
   hasBrowserChallenge,
@@ -532,7 +533,9 @@ async function executeBatch(
             break;
           }
           case 'screenshot':
-            if (await pageHasSecret(page)) throw new BrowserBatchStop('secret_field');
+            // The same isolated-world scan as the card's picture, shadow roots included (KTD6).
+            if ((await pageHasSecret(page)) || (await pageMayShowSecret(page)))
+              throw new BrowserBatchStop('secret_field');
             else {
               const image = {
                 mime_type: 'image/png',

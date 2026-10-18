@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
@@ -10,6 +10,13 @@ import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from 
 import type { PinnedBrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 import { registerPageSecret } from './observe.js';
+
+// A fake page has no isolated worlds, so its scan for secret values would fail closed; native suites cover the
+// scan. The host's own secret on a page still refuses a screenshot here.
+vi.mock('./observe.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./observe.js')>()),
+  pageMayShowSecret: vi.fn(async () => false),
+}));
 
 it('rejects unknown actions and clipboard shortcuts without running a partial batch', () => {
   expect(() =>

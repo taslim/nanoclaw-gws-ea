@@ -1714,6 +1714,11 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
       expect(cards().at(-1), `${mode} root, ${value ? 'filled' : 'empty'}`).toMatchObject(
         pictured ? { pictures: 1, files: [{ mimeType: 'image/png' }] } : { pictures: 1, files: undefined },
       );
+      // The agent's own screenshot meets the same scan: a secret in a shadow root never reaches it either.
+      const shot = await run(`shot-${index}`, [{ kind: 'screenshot' }]);
+      expect(shot, `${mode} root screenshot`).toMatchObject(
+        pictured ? { status: 'completed' } : { status: 'stopped', reason: 'secret_field' },
+      );
     }
   });
 
