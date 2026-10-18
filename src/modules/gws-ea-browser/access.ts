@@ -37,6 +37,11 @@ export async function hasBrowserAccess(
   return typeof agentGroupId === 'string' && (await browserAccessGroups(policy)).includes(agentGroupId);
 }
 
+/** Whether `agentGroupId` is main's: the one group a browser check names, besides those it grants. */
+export async function isMainAgentGroup(agentGroupId: string): Promise<boolean> {
+  return agentGroupId === (await getMainAgentGroupId());
+}
+
 /** A group with browser access, and what the browser calls it. */
 export interface BrowserDelegator {
   readonly agentGroupId: string;

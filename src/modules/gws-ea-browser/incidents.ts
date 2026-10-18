@@ -11,13 +11,12 @@ import { randomUUID } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
-import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { cancelBrowserJobInTransaction, finishBrowserJobCancellation, type BrowserJobCancellation } from './cancel.js';
 import { showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore } from './db.js';
 import { formatMoney } from './fingerprint.js';
-import { tellOfPurchase } from './notices.js';
+import { tellOfPurchaseOnce } from './notices.js';
 import type { BrowserExecutionContext } from './queue.js';
 
 export type IncidentKind = 'unapproved_commit' | 'late_confirmation';
@@ -112,26 +111,12 @@ function noticeText(incident: BrowserIncident, thread: string): string {
 export async function notifyIncident(id: string, db: DbDriver = getDb()): Promise<void> {
   const incident = await db.get<BrowserIncident>('SELECT * FROM gws_ea_browser_incidents WHERE id = ?', id);
   if (!incident || incident.notified_at) return;
-  const job = await new BrowserStore(db).getJob(incident.job_id);
-  const session = job ? await getSession(job.browser_session_id) : undefined;
-  if (!job || !session) return;
-  const told = await tellOfPurchase(
-    { job: job.thread_id, session, source: job.source_agent_group_id },
-    {
-      id: `browser-incident-${incident.id}`,
-      timestamp: new Date().toISOString(),
-      text: noticeText(incident, job.thread_id),
-    },
-  );
-  if (told !== 'written' && told !== 'already-written') {
-    log.warn('Nobody to tell of a browser incident yet', { incident: incident.id, result: told });
-    return;
-  }
-  await db.run(
-    'UPDATE gws_ea_browser_incidents SET notified_at = ? WHERE id = ? AND notified_at IS NULL',
-    new Date().toISOString(),
-    incident.id,
-  );
+  await tellOfPurchaseOnce(db, incident, {
+    table: 'gws_ea_browser_incidents',
+    noteId: `browser-incident-${incident.id}`,
+    text: (job) => noticeText(incident, job.thread_id),
+    unsent: { message: 'Nobody to tell of a browser incident yet', kind: 'incident' },
+  });
 }
 
 /** The host's sweep: every incident whose notice has not gone out yet. */

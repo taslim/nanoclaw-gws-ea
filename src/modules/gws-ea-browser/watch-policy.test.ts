@@ -115,7 +115,7 @@ it('checks a few seconds after the release, then at the floor through the burst,
   const release = Date.parse('2026-10-25T01:00:00Z');
   const arrival = Date.parse(dinner[0].start);
   const next = (at: string, releases: readonly number[] = [release]): { at: string; interval: number } => {
-    const plan = nextWatchCheck(policy, Date.parse(at), arrival, releases, null, () => 0.5);
+    const plan = nextWatchCheck(policy, { now: Date.parse(at), arrival, releases, previous: null, random: () => 0.5 });
     return { at: iso(plan.at), interval: plan.interval };
   };
   // An ordinary check close before the release gives way to the release check at 10:00:05 in Tokyo.
@@ -146,7 +146,14 @@ it('slows a watch whose changes keep matching nothing, to at most an hour, but n
   const release = Date.parse('2026-10-25T01:00:00Z');
   const arrival = Date.parse(dinner[0].start);
   const plan = (at: string, unmatched: number, releases: readonly number[] = []) =>
-    nextWatchCheck(policy, Date.parse(at), arrival, releases, null, () => 0.5, watchSlowdown(unmatched));
+    nextWatchCheck(policy, {
+      now: Date.parse(at),
+      arrival,
+      releases,
+      previous: null,
+      random: () => 0.5,
+      slowdown: watchSlowdown(unmatched),
+    });
   // A month out the cadence is five minutes; each change that booked nothing doubles it, up to an hour.
   expect([0, 1, 2, 3, 4, 5, 9].map((unmatched) => plan('2026-10-17T12:00:00Z', unmatched).interval / 60_000)).toEqual([
     5, 10, 20, 40, 60, 60, 60,

@@ -13,13 +13,11 @@
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
-import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
-import { errandSource, hasBrowserAccess } from './access.js';
+import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import { PurchaseAuthorityStore, type PurchaseAttemptRow, type ResolutionSource } from './authority.js';
 import { finishBrowserJobCancellation } from './cancel.js';
 import { cardTime } from './cards.js';
@@ -27,7 +25,7 @@ import { BrowserStore, type BrowserJob } from './db.js';
 import { formatMoney, type FreeCommitFacts, type PurchaseFacts } from './fingerprint.js';
 import { freeCommitBooks } from './generic-signature.js';
 import { notifyIncident, recordIncidentWithStop } from './incidents.js';
-import { tellOfPurchase } from './notices.js';
+import { tellOfPurchaseOnce } from './notices.js';
 import type { BrowserQueue } from './queue.js';
 import { principalClock } from './watch-policy.js';
 
@@ -62,26 +60,12 @@ async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Pr
 export async function notifyUnconfirmedPurchase(attemptId: string, db: DbDriver = getDb()): Promise<void> {
   const attempt = await new PurchaseAuthorityStore(db).attempt(attemptId);
   if (!attempt || attempt.resolution || !attempt.unconfirmed_at || attempt.notified_at) return;
-  const job = await new BrowserStore(db).getJob(attempt.job_id);
-  const session = job ? await getSession(job.browser_session_id) : undefined;
-  if (!job || !session) return;
-  const told = await tellOfPurchase(
-    { job: job.thread_id, session, source: job.source_agent_group_id },
-    {
-      id: `browser-unconfirmed-${attempt.id}`,
-      timestamp: new Date().toISOString(),
-      text: await unconfirmedText(job, attempt),
-    },
-  );
-  if (told !== 'written' && told !== 'already-written') {
-    log.warn('Nobody to tell of an unconfirmed purchase yet', { attempt: attempt.id, result: told });
-    return;
-  }
-  await db.run(
-    `UPDATE ${attempt.kind === 'paid' ? 'gws_ea_browser_purchase_attempts' : 'gws_ea_browser_free_attempts'} SET notified_at = ? WHERE id = ? AND notified_at IS NULL`,
-    new Date().toISOString(),
-    attempt.id,
-  );
+  await tellOfPurchaseOnce(db, attempt, {
+    table: attempt.kind === 'paid' ? 'gws_ea_browser_purchase_attempts' : 'gws_ea_browser_free_attempts',
+    noteId: `browser-unconfirmed-${attempt.id}`,
+    text: (job) => unconfirmedText(job, attempt),
+    unsent: { message: 'Nobody to tell of an unconfirmed purchase yet', kind: 'attempt' },
+  });
 }
 
 /** The host's sweep: every unconfirmed attempt whose delegating group has not heard of it yet. */
@@ -98,7 +82,7 @@ export const purchaseOutcomeGuard = defineGuardedAction({
   action: 'gws_ea_browser.purchase_outcome',
   async decide({ actor }) {
     if (actor.kind !== 'agent') return DENY('Only an agent records a purchase outcome.');
-    if (actor.agentGroupId === (await getMainAgentGroupId()) || (await hasBrowserAccess(actor.agentGroupId)))
+    if ((await isMainAgentGroup(actor.agentGroupId)) || (await hasBrowserAccess(actor.agentGroupId)))
       return ALLOW('A delegating agent records what it learned of its own errand’s purchase.');
     return DENY('Only an agent with browser access records a purchase outcome.');
   },
@@ -107,7 +91,7 @@ export const purchaseOutcomeGuard = defineGuardedAction({
 /** An errand's own group records its attempts; main records those of a group whose browser access was removed. */
 async function mayRecord(caller: string, owner: string): Promise<boolean> {
   if (caller === owner) return true;
-  return caller === (await getMainAgentGroupId()) && !(await hasBrowserAccess(owner));
+  return (await isMainAgentGroup(caller)) && !(await hasBrowserAccess(owner));
 }
 
 const OUTCOME_FIELDS: ReadonlySet<string> = new Set([

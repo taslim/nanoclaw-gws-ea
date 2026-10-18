@@ -1,9 +1,11 @@
+import type { DbDriver } from '../../db/driver.js';
 import { getSession } from '../../db/sessions.js';
+import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
-import { hasBrowserAccess } from './access.js';
+import { hasBrowserAccess, isMainAgentGroup } from './access.js';
+import { BrowserStore, type BrowserJob } from './db.js';
 
 /** Browser continuations are host chat turns; system rows are reserved for tool answers. */
 export function writeBrowserNotice(session: Session, id: string, eventJson: string): Promise<void> {
@@ -40,7 +42,7 @@ export async function tellDelegator(
 ): Promise<DelegatorNotice> {
   // Loaded on use: main's notes bring the matters graph, which the browser's own modules never need.
   const { isDuplicateNote, writeNoteForMain } = await import('../gws-ea-profile/main-note.js');
-  if (errand.source === (await getMainAgentGroupId()))
+  if (await isMainAgentGroup(errand.source))
     return writeNoteForMain({ ...note, wake: true, pieces: [{ kind: 'job', reference: errand.job }] });
   const delegatedFrom = await withExistingMailboxSession(errand.session.agent_group_id, errand.session.id, (mailbox) =>
     mailbox.getMostRecentPeerSourceSessionId(errand.source),
@@ -71,11 +73,48 @@ export async function tellDelegator(
  * browser access was removed, main hears instead, since main is the one left to record the purchase's outcome
  * (KTD9). The note names no job: main never holds another group's errand.
  */
-export async function tellOfPurchase(
+async function tellOfPurchase(
   errand: BrowserErrand,
   note: { readonly id: string; readonly timestamp: string; readonly text: string },
 ): Promise<DelegatorNotice> {
   if (await hasBrowserAccess(errand.source)) return tellDelegator(errand, note);
   const { writeNoteForMain } = await import('../gws-ea-profile/main-note.js');
   return writeNoteForMain({ ...note, wake: true });
+}
+
+/** A purchase notice its browser job's delegating group hears once (KTD9, KTD10). */
+export interface OncePurchaseNotice {
+  /** The table whose `notified_at` marks the record told. */
+  readonly table: string;
+  readonly noteId: string;
+  readonly text: (job: BrowserJob) => string | Promise<string>;
+  /** What the host logs, under the record's kind, while nobody can be told yet. */
+  readonly unsent: { readonly message: string; readonly kind: 'attempt' | 'incident' };
+}
+
+/**
+ * Tells the delegating group of `record`'s job of it, as `tellOfPurchase` does, then marks it told with a
+ * compare-and-set; a notice that cannot go out yet stays owed for the host's sweep.
+ */
+export async function tellOfPurchaseOnce(
+  db: DbDriver,
+  record: { readonly id: string; readonly job_id: string },
+  notice: OncePurchaseNotice,
+): Promise<void> {
+  const job = await new BrowserStore(db).getJob(record.job_id);
+  const session = job ? await getSession(job.browser_session_id) : undefined;
+  if (!job || !session) return;
+  const told = await tellOfPurchase(
+    { job: job.thread_id, session, source: job.source_agent_group_id },
+    { id: notice.noteId, timestamp: new Date().toISOString(), text: await notice.text(job) },
+  );
+  if (told !== 'written' && told !== 'already-written') {
+    log.warn(notice.unsent.message, { [notice.unsent.kind]: record.id, result: told });
+    return;
+  }
+  await db.run(
+    `UPDATE ${notice.table} SET notified_at = ? WHERE id = ? AND notified_at IS NULL`,
+    new Date().toISOString(),
+    record.id,
+  );
 }

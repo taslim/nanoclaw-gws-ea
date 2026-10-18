@@ -158,6 +158,19 @@ export const WATCH_SLOWED_INTERVAL_MS = 60 * 60_000;
 export function watchSlowdown(unmatched: number): number {
   return 2 ** Math.min(Math.max(0, unmatched), WATCH_HOURLY_WAKES);
 }
+/** What a watch's next check is planned from. */
+export interface WatchCheckPlanInput {
+  /** When the check just made ran. */
+  readonly now: number;
+  /** The earliest arrival the watch's windows allow. */
+  readonly arrival: number;
+  readonly releases: readonly number[];
+  /** The interval the site's last plan chose, which this one never repeats. */
+  readonly previous: number | null;
+  readonly random?: () => number;
+  /** How much slower the watch checks, from `watchSlowdown`. */
+  readonly slowdown?: number;
+}
 /**
  * The one source of a watch's next check, after one at `now`: the floor inside a release
  * burst, otherwise a cadence that quickens as arrival nears, slowed by `slowdown` to at most an hour
@@ -167,12 +180,7 @@ export function watchSlowdown(unmatched: number): number {
  */
 export function nextWatchCheck(
   policy: WatchSitePolicy,
-  now: number,
-  arrival: number,
-  releases: readonly number[],
-  previous: number | null,
-  random: () => number = Math.random,
-  slowdown = 1,
+  { now, arrival, releases, previous, random = Math.random, slowdown = 1 }: WatchCheckPlanInput,
 ): { at: number; interval: number } {
   const remaining = arrival - now;
   const cadence = Math.min(

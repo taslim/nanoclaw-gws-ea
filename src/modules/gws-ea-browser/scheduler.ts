@@ -260,15 +260,14 @@ export class BrowserWatchScheduler {
           ? Date.now() + Math.min(24 * 60 * 60_000, policy.floorMs * 2 ** Math.min(blocks, 20))
           : 0;
       const arrival = Math.min(...bounds.windows.map((window) => Date.parse(window.start)));
-      const plan = nextWatchCheck(
-        policy,
-        Date.now(),
+      const plan = nextWatchCheck(policy, {
+        now: Date.now(),
         arrival,
         releases,
-        state.last_interval_ms,
-        this.deps.random,
-        await regionWatchSlowdown(db, watches),
-      );
+        previous: state.last_interval_ms,
+        random: this.deps.random,
+        slowdown: await regionWatchSlowdown(db, watches),
+      });
       const next = new Date(Math.max(plan.at, backoff)).toISOString();
       await db.transaction(async () => {
         await db.run(

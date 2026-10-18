@@ -36,6 +36,9 @@ const READ_TIMEOUT_MS = 2_000;
 /** A label alone on its line, whose amount stands on the next: "Order total", then "$42.00". */
 const LABEL_WORDS = 4;
 
+/** "Total", never "subtotal": a pattern fragment the checkout reader's vocabulary shares. */
+export const TOTAL_WORD = String.raw`(?<!\bsub[\s-]?)\btotal\b`;
+
 /** What the reader recognizes in a document's words. Vocabulary is data: widen or narrow it here. */
 const CONFIRMATION_VOCABULARY = {
   confirmed:
@@ -44,7 +47,7 @@ const CONFIRMATION_VOCABULARY = {
   reference:
     /\b(?:order|confirmation|booking|reservation|reference|receipt|transaction|ticket|registration)\s*(?:number|no\.?|num|#|id|code)?\s*[:#]?\s*#?\s*((?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{2,39})\b/iu,
   /** What was charged: a total, a payment, or what was paid, charged or put down as a deposit. A subtotal is none. */
-  charge: /(?<!\bsub[\s-]?)\btotal\b|\b(?:paid|charged|payment|deposit)\b/iu,
+  charge: new RegExp(String.raw`${TOTAL_WORD}|\b(?:paid|charged|payment|deposit)\b`, 'iu'),
 } as const satisfies Record<string, RegExp>;
 
 const SYMBOLS: Readonly<Record<string, string>> = { $: 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
@@ -75,6 +78,14 @@ export function statedAmounts(line: string): ConfirmationCharge[] {
     if (parsed) found.push(parsed);
   }
   return found;
+}
+
+/** A document's visible text as its nonblank lines, each with its spacing collapsed. */
+function toLines(text: string): string[] {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/\s+/gu, ' ').trim())
+    .filter(Boolean);
 }
 
 /** The amounts a document's lines say were charged: on a charge line, or alone on the line after a short label. */
@@ -169,10 +180,7 @@ export function confirmationEvidence(
   text: string,
   structuredSources: readonly string[],
 ): ConfirmationEvidence | undefined {
-  const lines = text
-    .split('\n')
-    .map((line) => line.replace(/\s+/gu, ' ').trim())
-    .filter(Boolean);
+  const lines = toLines(text);
   const structured = structuredEvidence(structuredSources);
   const worded = lines.some((line) => CONFIRMATION_VOCABULARY.confirmed.test(line));
   const textReference = lines
@@ -210,10 +218,7 @@ export async function readPageLines(page: Page): Promise<string[]> {
   const read = async (frame: Frame): Promise<string[]> => {
     /* eslint-disable no-catch-all/no-catch-all -- a document that went away or never answered within its bound shows nothing */
     try {
-      return (await frame.locator('body').innerText({ timeout: READ_TIMEOUT_MS }))
-        .split('\n')
-        .map((line) => line.replace(/\s+/gu, ' ').trim())
-        .filter(Boolean);
+      return toLines(await frame.locator('body').innerText({ timeout: READ_TIMEOUT_MS }));
     } catch (_error) {
       return [];
     }

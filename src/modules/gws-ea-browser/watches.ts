@@ -30,6 +30,7 @@ import {
   formatMoney,
   materialPurchaseChange,
   venueKey,
+  type FinancialCommitment,
   type PurchaseBounds,
   type PurchaseFacts,
   type ReservationFacts,
@@ -138,6 +139,20 @@ const boundsOf = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json)
  * hours a table is usually held.
  */
 const GENERIC_BOOKING_SPAN_MS = 2 * 60 * 60_000;
+/** The most a booking's terms can charge: each for every guest it is per, an unread amount without bound. */
+function financialExposure(
+  commitments: ReadonlyArray<Pick<FinancialCommitment, 'amountMinor' | 'perPerson'>>,
+  partySize: number,
+): number {
+  return commitments.reduce((sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? partySize : 1), 0);
+}
+/** Whether a checkout's total or its terms' most passes the watch's maximum, or its amount due now the most due now. */
+function exceedsFinancialLimit(facts: PurchaseFacts, partySize: number, financial: WatchFinancialBounds): boolean {
+  return (
+    Math.max(facts.totalMinor, financialExposure(facts.commitments, partySize)) > financial.maxTotalMinor ||
+    facts.dueNowMinor > financial.maxDueNowMinor
+  );
+}
 /** The reservation a purchase books: a reviewed reader's, or a generic booking whose venue, party and start it read. */
 function bookedSlot(facts: PurchaseFacts): ReservationFacts | undefined {
   if (facts.reservation) return facts.reservation;
@@ -205,11 +220,7 @@ function compareRegionWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now
     facts.commitments.some((term) => term.kind === 'subscription' || term.kind === 'trial')
   )
     return refuse('financial_terms');
-  const exposure = facts.commitments.reduce(
-    (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? slot.partySize : 1),
-    0,
-  );
-  return Math.max(facts.totalMinor, exposure) > financial.maxTotalMinor || facts.dueNowMinor > financial.maxDueNowMinor
+  return exceedsFinancialLimit(facts, slot.partySize, financial)
     ? refuse('financial_limit')
     : { status: 'within_bounds' };
 }
@@ -250,12 +261,7 @@ export function compareWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, no
     ![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)
   )
     return refuse('currency_or_total');
-  const exposure = facts.commitments.reduce(
-    (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? slot.partySize : 1),
-    0,
-  );
-  if (Math.max(facts.totalMinor, exposure) > financial.maxTotalMinor || facts.dueNowMinor > financial.maxDueNowMinor)
-    return refuse('financial_limit');
+  if (exceedsFinancialLimit(facts, slot.partySize, financial)) return refuse('financial_limit');
   if (financial.freeOnly)
     return facts.totalMinor === 0 &&
       facts.dueNowMinor === 0 &&
@@ -1151,11 +1157,7 @@ async function prepareReaderWatch(
   const policy = setup.policy;
   if (!freeOnly) {
     const expectedTerms = policy?.commitments.map((term) => term.terms).join('; ');
-    const exposure =
-      policy?.commitments.reduce(
-        (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? input.party_size : 1),
-        0,
-      ) ?? Infinity;
+    const exposure = policy ? financialExposure(policy.commitments, input.party_size) : Infinity;
     if (
       !policy ||
       policy.currency !== input.financial.currency ||

@@ -215,9 +215,10 @@ const guaranteeGuard = defineGuardedAction({
   grantActionName: GUARANTEE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor }) {
-    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+    const policy = await readBrowserPolicy();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
       return DENY('Only an agent with browser access may propose a reservation guarantee.');
-    if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    if (!policy.enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal can authorize a standing reservation guarantee.', principal)
@@ -292,9 +293,10 @@ export async function reservationGuaranteeRequest(
   session: Session,
   requestId: string,
 ): Promise<Record<string, unknown>> {
-  if (!(await hasBrowserAccess(session.agent_group_id)))
+  const policy = await readBrowserPolicy();
+  if (!(await hasBrowserAccess(session.agent_group_id, policy)))
     throw forbidden('Only an agent with browser access may manage reservation guarantees.');
-  if (!(await readBrowserPolicy()).enabled) throw forbidden('Browser is disabled.');
+  if (!policy.enabled) throw forbidden('Browser is disabled.');
   if (Object.keys(content).some((key) => !['action', 'requestId', 'operation', 'currency', 'max_total'].includes(key)))
     throw invalidArgs('Unknown reservation_guarantee field.');
   const operation = content.operation;

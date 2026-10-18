@@ -10,7 +10,13 @@
 import type { ElementHandle, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 
-import { readConfirmation, statedAmounts, type ConfirmationCharge, type ConfirmationEvidence } from './confirmation.js';
+import {
+  readConfirmation,
+  statedAmounts,
+  TOTAL_WORD,
+  type ConfirmationCharge,
+  type ConfirmationEvidence,
+} from './confirmation.js';
 import {
   ControlFactsUnavailableError,
   PAYMENT_VOCABULARY,
@@ -40,8 +46,10 @@ import type { StructuredBrowserLocator } from './recipes.js';
 
 const VOCABULARY = {
   /** A total, an amount due or what will be paid; a subtotal is none. */
-  total:
-    /(?<!\bsub[\s-]?)\btotal\b|\bamount\s+(?:due|to\s+pay|payable)\b|\bbalance\s+due\b|\byou(?:'ll|’ll|\s+will)\s+pay\b/iu,
+  total: new RegExp(
+    String.raw`${TOTAL_WORD}|\bamount\s+(?:due|to\s+pay|payable)\b|\bbalance\s+due\b|\byou(?:'ll|’ll|\s+will)\s+pay\b`,
+    'iu',
+  ),
   /** A total that is not the whole: before tax, or the items' alone. */
   partialTotal: /\b(?:before|excl(?:uding|\.)?|pre-?)\s*tax(?:es)?\b|\bitems?\s+total\b/iu,
   /** What is charged now, as opposed to later. */
@@ -153,16 +161,20 @@ const positive = (text: string): ConfirmationCharge[] => statedAmounts(text).fil
 const distinct = <T>(values: readonly T[]): T[] => [
   ...new Map(values.map((value) => [JSON.stringify(value), value])).values(),
 ];
-const union = (boxes: readonly CheckoutBox[]): CheckoutBox => {
-  const left = Math.min(...boxes.map((box) => box.x));
-  const top = Math.min(...boxes.map((box) => box.y));
+/** The smallest box around every box given; with `wholePixels`, the smallest whole-pixel one. */
+export function union(boxes: readonly CheckoutBox[], { wholePixels = false } = {}): CheckoutBox {
+  const same = (edge: number): number => edge;
+  // Whole pixels widen the box: its left and top edges round down, its right and bottom edges up.
+  const [down, up] = wholePixels ? [Math.floor, Math.ceil] : [same, same];
+  const left = down(Math.min(...boxes.map((box) => box.x)));
+  const top = down(Math.min(...boxes.map((box) => box.y)));
   return {
     x: left,
     y: top,
-    width: Math.max(...boxes.map((box) => box.x + box.width)) - left,
-    height: Math.max(...boxes.map((box) => box.y + box.height)) - top,
+    width: up(Math.max(...boxes.map((box) => box.x + box.width))) - left,
+    height: up(Math.max(...boxes.map((box) => box.y + box.height))) - top,
   };
-};
+}
 
 /** The registrable domain of a web address, or undefined for anything but HTTP(S). */
 function siteOf(raw: string): string | undefined {
@@ -201,20 +213,20 @@ function labelled(
   return { money: [], boxes: [] };
 }
 
+/** The period a frequency's unit names, the first that matches; any other unit it reads is a quarter. */
+const FREQUENCY_UNITS: ReadonlyArray<readonly [RegExp, 'month' | 'year' | 'week' | 'day']> = [
+  [/^(?:month|mo|monthly)$/u, 'month'],
+  [/^(?:year|yr|annum|annually|yearly)$/u, 'year'],
+  [/^(?:week|wk|weekly)$/u, 'week'],
+  [/^(?:day|daily)$/u, 'day'],
+];
+
 /** A recurring frequency as people say it, or undefined when the words name none. */
 function frequencyOf(text: string): string | undefined {
   const match = VOCABULARY.frequency.exec(text);
   if (!match) return undefined;
   const unit = (match[2] ?? match[3] ?? '').toLowerCase();
-  const word = /^(?:month|mo|monthly)$/u.test(unit)
-    ? 'month'
-    : /^(?:year|yr|annum|annually|yearly)$/u.test(unit)
-      ? 'year'
-      : /^(?:week|wk|weekly)$/u.test(unit)
-        ? 'week'
-        : /^(?:day|daily)$/u.test(unit)
-          ? 'day'
-          : 'quarter';
+  const word = FREQUENCY_UNITS.find(([pattern]) => pattern.test(unit))?.[1] ?? 'quarter';
   const every = match[1] ? Number(match[1]) : 1;
   if (every > 1) return `every ${every} ${word}s`;
   return { month: 'monthly', year: 'yearly', week: 'weekly', day: 'daily', quarter: 'quarterly' }[word];
@@ -314,6 +326,24 @@ function readBooking(read: CheckoutRead, lines: readonly Line[], label: string):
   };
 }
 
+/**
+ * A term's kind: the first whose wording its line shows, undenied. A period ("per month") names a subscription
+ * only beside a price.
+ */
+const TERM_KINDS: ReadonlyArray<{
+  readonly wording: RegExp;
+  readonly kind: FinancialCommitment['kind'];
+  readonly priced?: true;
+}> = [
+  { wording: VOCABULARY.trial, kind: 'trial' },
+  { wording: VOCABULARY.renewal, kind: 'subscription' },
+  { wording: VOCABULARY.period, kind: 'subscription', priced: true },
+  { wording: VOCABULARY.hold, kind: 'hold' },
+  { wording: VOCABULARY.deposit, kind: 'deposit' },
+  { wording: VOCABULARY.prepayment, kind: 'prepayment' },
+  { wording: VOCABULARY.conditionalFee, kind: 'conditional_fee' },
+];
+
 /** The terms a checkout states (R13): each with its amount, or what about it cannot be read. */
 function readTerms(
   lines: readonly Line[],
@@ -328,19 +358,7 @@ function readTerms(
   for (let index = 0; index < lines.length; index++) {
     let line = lines[index];
     const words = undenied(line.text);
-    const kind: FinancialCommitment['kind'] | undefined = VOCABULARY.trial.test(words)
-      ? 'trial'
-      : VOCABULARY.renewal.test(words) || (VOCABULARY.period.test(words) && line.money.length > 0)
-        ? 'subscription'
-        : VOCABULARY.hold.test(words)
-          ? 'hold'
-          : VOCABULARY.deposit.test(words)
-            ? 'deposit'
-            : VOCABULARY.prepayment.test(words)
-              ? 'prepayment'
-              : VOCABULARY.conditionalFee.test(words)
-                ? 'conditional_fee'
-                : undefined;
+    const kind = TERM_KINDS.find((term) => term.wording.test(words) && (!term.priced || line.money.length > 0))?.kind;
     if (!kind) continue;
     // A label alone on its line, whose terms stand on the next: "Cancellation fee", then "$25 per person…".
     const next = lines[index + 1];
@@ -727,7 +745,7 @@ async function prepareGenericPage(page: Page): Promise<void> {
 }
 
 /** The merchant a page's checkout belongs to (KTD7): where the job entered checkout from, else the page's site. */
-export function checkoutMerchant(page: Page): string | undefined {
+function checkoutMerchant(page: Page): string | undefined {
   const site = siteOf(page.url());
   const entry = entries.get(page);
   return entry?.site === site && entry?.merchant ? entry.merchant : site;
@@ -745,7 +763,7 @@ async function locate(page: Page, locator: StructuredBrowserLocator): Promise<El
  * The page's one commit control: the visible, enabled presses the classifier calls a purchase, which must all
  * carry the same name. Two different ones leave no next step to press.
  */
-export async function findGenericCommit(page: Page): Promise<ElementHandle | undefined> {
+async function findGenericCommit(page: Page): Promise<ElementHandle | undefined> {
   const { classifyControlFacts, readControlFacts } = await import('./commit-classifier.js');
   const found: Array<{ element: ElementHandle; name: string }> = [];
   const discard = async (element: ElementHandle): Promise<void> => {

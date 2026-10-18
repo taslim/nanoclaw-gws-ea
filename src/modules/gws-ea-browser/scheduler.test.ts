@@ -457,7 +457,13 @@ it('keeps hourly and daily caps shared across parameters, and never repeats an i
   expect(checks).toBe(1);
   let previous: number | null = null;
   for (let i = 0; i < 20; i++) {
-    const { interval } = nextWatchCheck(policy, now, now + 60_000, [], previous, () => 0);
+    const { interval } = nextWatchCheck(policy, {
+      now,
+      arrival: now + 60_000,
+      releases: [],
+      previous,
+      random: () => 0,
+    });
     expect(interval).toBeGreaterThanOrEqual(policy.floorMs);
     expect(interval).not.toBe(previous);
     previous = interval;

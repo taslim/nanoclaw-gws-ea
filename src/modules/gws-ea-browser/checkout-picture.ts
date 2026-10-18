@@ -7,24 +7,13 @@ import { log } from '../../log.js';
 import type { RequestPicture } from '../approvals/index.js';
 import type { CheckoutBox } from './control-facts.js';
 import type { PurchaseFacts } from './fingerprint.js';
+import { union } from './generic-signature.js';
 import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-signatures.js';
 import { pageMayShowSecret } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
 
 const PICTURE_TIMEOUT_MS = 10_000;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-/** The smallest whole-pixel box around every box given. */
-function enclosing(boxes: readonly CheckoutBox[]): CheckoutBox {
-  const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
-  const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
-  return {
-    x: left,
-    y: top,
-    width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
-    height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
-  };
-}
 
 /** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } | undefined {
@@ -59,7 +48,7 @@ export async function checkoutPicture(
       x: box.x + moved.x - control.x,
       y: box.y + moved.y - control.y,
     });
-    const clip = enclosing([moved, shift(total)]);
+    const clip = union([moved, shift(total)], { wholePixels: true });
     // Immediately before the capture: nothing on the page may hold a secret, whoever put it there.
     if (await pageMayShowSecret(page)) return null;
     const data = await page.screenshot({

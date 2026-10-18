@@ -348,7 +348,7 @@ export async function executeBrowserBatch(
   if (dataStop) return { status: 'stopped', reason: dataStop, repeat_safe: true };
   let ran: { answer: Record<string, unknown>; unapproved?: UnapprovedCommit };
   try {
-    ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, payload, page, options), {
+    ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, actions, page, options), {
       ...(options.siteAccess ? { siteAccess: options.siteAccess } : {}),
       ...(options.readOnly ? { readOnly: true } : {}),
     });
@@ -366,11 +366,10 @@ export async function executeBrowserBatch(
 
 async function executeBatch(
   context: BrowserExecutionContext,
-  payload: Record<string, unknown>,
+  actions: readonly BrowserAction[],
   page: Page,
   options: BrowserBatchOptions,
 ): Promise<{ answer: Record<string, unknown>; unapproved?: UnapprovedCommit }> {
-  const { actions } = validateBrowserBatch(payload);
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
   const images: Array<{ mime_type: 'image/png'; data: string }> = [];
   // The guard starts each operation clean, before its readiness pass.
