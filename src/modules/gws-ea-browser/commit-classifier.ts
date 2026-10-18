@@ -491,6 +491,9 @@ export async function activateControl(
   authority?: PurchaseAuthorityPress,
   intent: ActivationIntent = { kind: 'click' },
 ): Promise<ActivationResult> {
+  // An approved press makes the very payment requests an ordinary action's window refuses: it is read and
+  // pressed only once every such window on the page has closed.
+  if (authority) await (await ensureBrowserNavigationGuard(page)).actionsSettled();
   const dispatch = await activationDispatch(page, element, intent.kind);
   const { classification, facts } = dispatch;
   if (authority) {
@@ -565,9 +568,13 @@ export interface BrowserNavigationGuard {
    * Runs one ordinary action inside its script-request window (KTD2): from the action's start, through a short
    * settle, until any navigation it started commits, capped by `budgetMs`. Inside the window, the page's and
    * every out-of-process frame's non-GET fetch, XHR and beacon requests to payment processors and purchase
-   * routes are refused; outside it nothing is paused.
+   * routes are refused; outside it nothing is paused. The caller goes on once every navigation the action
+   * started has committed and, unless the page's own document was replaced, its requests have gone quiet or the
+   * settle has ended; the rest of the window runs on in the background.
    */
   duringAction<T>(budgetMs: number, action: () => Promise<T>): Promise<T>;
+  /** Resolves once every ordinary action's script-request window on the page has closed. */
+  actionsSettled(): Promise<void>;
 }
 const navigationGuards = new WeakMap<Page, Promise<BrowserNavigationGuard>>();
 
@@ -669,6 +676,13 @@ async function decideNavigation(
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
 /** How long an ordinary action's window stays open after the action: a handler that awaits one round trip, then posts. */
 const ACTION_SETTLE_MS = 1_000;
+/**
+ * How long the page must stay quiet before the action's caller goes on: after the action, and after each request
+ * the action set off. A native submit or a link navigates at once, and page script that submits by fetch navigates
+ * as its response returns. A page that keeps sending holds the caller only until the settle ends; a navigation
+ * that begins after the caller went on is still inside the window.
+ */
+const NAVIGATION_START_MS = 250;
 const NAVIGATION_POLL_MS = 50;
 
 /** A script request an ordinary action may not send: anything but a GET, to a payment processor or a purchase route. */
@@ -777,10 +791,18 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     },
   });
   // Script requests during an ordinary action (KTD2), on the page and on every out-of-process frame, since a
-  // payment frame sends its own. Their sessions are set up on the first action; between actions nothing pauses.
+  // payment frame sends its own. Their sessions are set up on the first action; outside every action's window
+  // nothing pauses.
   const scriptSessions = new Set<CDPSession>();
   let actions = 0;
   let covering: Promise<void> | undefined;
+  // Each window that outlasts its action's return: the rest of its settle, then its cleanup.
+  const settling = new Set<Promise<void>>();
+  /** Waits while `open` holds, until `until`; a closed page ends every wait. */
+  const waitWhile = async (open: () => boolean, until: number): Promise<void> => {
+    while (open() && !page.isClosed() && Date.now() < until)
+      await sleep(Math.min(NAVIGATION_POLL_MS, until - Date.now()));
+  };
   const pauseScripts = (session: CDPSession): Promise<unknown> =>
     session.send('Fetch.enable', {
       patterns: SCRIPT_REQUEST_TYPES.map((resourceType) => ({ requestStage: 'Request' as const, resourceType })),
@@ -847,14 +869,25 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       await coverScripts();
       // The navigations the action starts, until each commits or ends.
       const navigations = new Set<Request>();
+      // Every request it sets off, a frame's included, until each finishes or fails; and when the last one did.
+      const requests = new Set<Request>();
+      let lastEnded = 0;
+      // Whether a navigation it started replaced the page's own document.
+      let replaced = false;
       const started = (request: Request): void => {
+        requests.add(request);
         if (request.isNavigationRequest()) navigations.add(request);
       };
       const ended = (request: Request): void => {
         navigations.delete(request);
+        if (requests.delete(request)) lastEnded = Date.now();
       };
       const committed = (frame: Frame): void => {
-        for (const request of navigations) if (request.frame() === frame) navigations.delete(request);
+        for (const request of navigations)
+          if (request.frame() === frame) {
+            navigations.delete(request);
+            if (frame === page.mainFrame()) replaced = true;
+          }
       };
       page.on('request', started);
       page.on('requestfailed', ended);
@@ -863,20 +896,43 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       // A session that cannot take the setting is closing with its target.
       if (actions++ === 0)
         await Promise.all([...scriptSessions].map((session) => pauseScripts(session).catch(() => undefined)));
-      try {
-        const result = await action();
-        await sleep(Math.min(ACTION_SETTLE_MS, Math.max(0, deadline - Date.now())));
-        while (navigations.size && Date.now() < deadline)
-          await sleep(Math.min(NAVIGATION_POLL_MS, Math.max(0, deadline - Date.now())));
-        return result;
-      } finally {
+      const close = async (): Promise<void> => {
         page.off('request', started);
         page.off('requestfailed', ended);
         page.off('requestfinished', ended);
         page.off('framenavigated', committed);
         if (--actions === 0)
           await Promise.all([...scriptSessions].map((session) => session.send('Fetch.disable').catch(() => undefined)));
+      };
+      let result: Awaited<ReturnType<typeof action>>;
+      try {
+        result = await action();
+      } catch (error) {
+        await close();
+        throw error;
       }
+      const done = Date.now();
+      // The caller goes on once every navigation the action started has committed or ended, and the page's
+      // document was replaced or the action's requests have stayed quiet for a moment, at most until the settle ends.
+      const busy = (): boolean =>
+        !replaced &&
+        Date.now() < done + ACTION_SETTLE_MS &&
+        (requests.size > 0 || Date.now() < Math.max(done, lastEnded) + NAVIGATION_START_MS);
+      await waitWhile(() => navigations.size > 0 || busy(), deadline);
+      // The window itself stays open through the settle and until each navigation it saw commits or ends; an
+      // action that starts meanwhile keeps the requests paused without a gap.
+      const rest: Promise<void> = waitWhile(
+        () => navigations.size > 0 || Date.now() < done + ACTION_SETTLE_MS,
+        deadline,
+      )
+        .then(close)
+        .catch(() => undefined)
+        .finally(() => settling.delete(rest));
+      settling.add(rest);
+      return result;
+    },
+    async actionsSettled() {
+      while (settling.size) await Promise.all(settling);
     },
   };
 }

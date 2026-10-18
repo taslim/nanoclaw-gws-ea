@@ -42,10 +42,12 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import { configureBrowserCancellation, readBrowserJob } from './cancel.js';
 import {
+  activateControl,
   classifyActivation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   readControlFacts,
+  withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
@@ -67,6 +69,7 @@ import {
   feeTablePage,
   genericCheckoutPages,
   openWebFixture,
+  orderConfirmationPage,
   placedPage,
   type OpenWebFixture,
   type OpenWebRequest,
@@ -772,9 +775,46 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     // The awaited GET went out; only the post after it was refused.
     expect(fixture.requests.map((request) => request.url)).toContain('https://shop.example/api/stock');
     expect(await page.locator('#status').textContent()).toBe('refused');
-    // Outside an action nothing is paused: the page's own post reaches the processor.
+    // Once the last action's window has closed nothing is paused: the page's own post reaches the processor.
+    await (await ensureBrowserNavigationGuard(page)).actionsSettled();
     await page.evaluate(`fetch('${PROCESSOR.confirm}', { method: 'POST', mode: 'no-cors', body: 'outside' })`);
     await expect.poll(posts).toEqual([PROCESSOR.confirm]);
+  });
+
+  it('returns an ordinary click well before its window closes, and still refuses the payment post its page sends later', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.scripted);
+    // Page script that posts to the payment processor 700 ms after the click, inside the old one-second hold.
+    await page.evaluate(`(() => {
+  const later = document.createElement('button');
+  later.type = 'button';
+  later.textContent = 'Show estimate later';
+  later.addEventListener('click', () => {
+    window.clickedAt = performance.now();
+    setTimeout(() => { window.posted = true; void post('${PROCESSOR.confirm}', 'after=delay'); }, 700);
+  });
+  document.body.append(later);
+})()`);
+    const element = await page.getByRole('button', { name: 'Show estimate later' }).elementHandle();
+    if (!element) throw new Error('Fixture control missing');
+    try {
+      // The activation boundary alone, inside the job's operation: a batch goes on to observe the page.
+      const pressed = await withBrowserJobNavigation(context(page), page, () =>
+        activateControl(page, element, () => element.click({ noWaitAfter: true })),
+      );
+      expect(pressed).toEqual({ ordinaryPress: true });
+    } finally {
+      await element.dispose();
+    }
+    const returned = (await page.evaluate(
+      '({ elapsed: performance.now() - window.clickedAt, posted: window.posted === true })',
+    )) as { elapsed: number; posted: boolean };
+    // The click returned before its page posted, not a second after it.
+    expect(returned.posted).toBe(false);
+    expect(returned.elapsed).toBeLessThan(700);
+    // The post still fell inside the click's window.
+    await expect.poll(() => page.locator('#status').textContent()).toBe('refused');
+    expect(posts()).toEqual([]);
   });
 
   it('never slows a widget polling with GETs, during an action or after it', async () => {
@@ -1006,6 +1046,48 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     expect(vi.mocked(requestWake).mock.calls.some(([woken]) => woken.id === main.id)).toBe(true);
     // The job is over: its next request is refused before it runs.
     await expect(run('after', [{ kind: 'observe' }])).rejects.toThrow();
+  });
+
+  it('waits out a press whose script posts to the merchant’s own API and then loads a paid confirmation, and stops the job', async () => {
+    const quick = 'https://shop.example/quick-reorder';
+    fixture.serve(
+      quick,
+      `<!doctype html><html><head><title>Quick reorder</title></head><body><h1>Reorder your last items</h1>
+<button type="button" id="reorder">Reorder</button>
+<script>document.getElementById('reorder').addEventListener('click', async () => {
+  await fetch('/api/quick-reorder', { method: 'POST', body: 'item=apron' });
+  location.assign('/orders/placed');
+});</script></body></html>`,
+    );
+    fixture.serve('https://shop.example/api/quick-reorder', () => ({
+      headers: { 'content-type': 'application/json' },
+      body: '{"status":"accepted"}',
+    }));
+    fixture.serve('https://shop.example/orders/placed', orderConfirmationPage());
+    // The merchant's API answers 400 ms after the press, as a server charging a saved card might: the fetch is held
+    // at the network layer, so the page navigates only once it returns.
+    const slow = await page.context().newCDPSession(page);
+    slow.on('Fetch.requestPaused', (event) => {
+      setTimeout(() => {
+        void slow.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => undefined);
+      }, 400);
+    });
+    await slow.send('Fetch.enable', { patterns: [{ urlPattern: '*/api/quick-reorder', requestStage: 'Request' }] });
+    try {
+      const answer = await press(quick, 'Reorder');
+      expect(answer).toMatchObject({
+        status: 'stopped',
+        reason: 'unapproved_commit',
+        incident: { site: 'shop.example', reference: 'SO-48213', charged: '$42.00' },
+        actions: [{ status: 'stopped', reason: 'unapproved_commit' }],
+      });
+      // The press waited for the navigation its script started, and read the confirmation on the new page.
+      expect(page.url()).toBe('https://shop.example/orders/placed');
+      expect(posts()).toEqual(['https://shop.example/api/quick-reorder']);
+      expect(await incidents()).toMatchObject([{ kind: 'unapproved_commit', site: 'shop.example' }]);
+    } finally {
+      await slow.detach().catch(() => undefined);
+    }
   });
 
   it('raises nothing for a waitlist number or a $0.00 registration', async () => {

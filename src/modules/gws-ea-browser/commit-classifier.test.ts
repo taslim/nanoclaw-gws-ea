@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
 import * as nativeAuthentication from './authentication-submit.js';
@@ -722,6 +723,186 @@ it('lets a document no operation asked for load only as a GET on the leased site
     expect(await pause('https://shop.example/deals/today')).toBe('continued');
     expect(await pause('https://shop.example/deals/saved', 'POST')).toBe('refused');
     expect(guard.reason()).toBe('read_only');
+  });
+});
+
+describe("an ordinary action's script-request window", () => {
+  afterEach(() => vi.useRealTimers());
+
+  /** A guarded page whose page events are real, so the window's listeners can be seen coming and going. */
+  async function windowFixture(host: string) {
+    const fixture = guardedPageFixture(`https://${host}/`, { frame: { id: 'fixture-page' } });
+    const events = new EventEmitter();
+    let closed = false;
+    type Listener = (...args: unknown[]) => void;
+    Object.assign(fixture.page, {
+      on: (name: string, listener: Listener) => events.on(name, listener),
+      once: (name: string, listener: Listener) => events.once(name, listener),
+      off: (name: string, listener: Listener) => events.off(name, listener),
+      isClosed: () => closed,
+    });
+    const guard = await ensureBrowserNavigationGuard(fixture.page);
+    return {
+      ...fixture,
+      guard,
+      events,
+      /** What the script-request setting was told, in order. */
+      armed: () =>
+        fixture.sends.map((send) => send.method).filter((method) => /^Fetch\.(?:enable|disable)$/u.test(method)),
+      /** The request listeners a window still holds on the page. */
+      listening: () =>
+        ['request', 'requestfailed', 'requestfinished'].reduce((count, name) => count + events.listenerCount(name), 0),
+      close() {
+        closed = true;
+        events.emit('close');
+      },
+    };
+  }
+
+  it('returns an action that sends no requests at 250 ms, before its window closes, and keeps the window armed into the next action without a gap', async () => {
+    const window = await windowFixture('settle.example');
+    vi.useFakeTimers();
+    const returned: string[] = [];
+    const first = window.guard.duringAction(10_000, async () => 'first').then((value) => returned.push(value));
+    // A quiet page holds the caller only for a navigation to begin.
+    await vi.advanceTimersByTimeAsync(249);
+    expect(returned).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await first;
+    expect(returned).toEqual(['first']);
+    expect(window.armed()).toEqual(['Fetch.enable']);
+    // A second action inside the first one's settle: the first window closes inside the second, with no gap.
+    await vi.advanceTimersByTimeAsync(350);
+    const second = window.guard.duringAction(10_000, async () => 'second').then((value) => returned.push(value));
+    await vi.advanceTimersByTimeAsync(250);
+    await second;
+    await vi.advanceTimersByTimeAsync(749);
+    expect(window.armed()).toEqual(['Fetch.enable']);
+    // The second window closes a full settle after its own action.
+    await vi.advanceTimersByTimeAsync(1);
+    await window.guard.actionsSettled();
+    expect(returned).toEqual(['first', 'second']);
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+  });
+
+  it('holds the caller while the action’s requests are in flight and a moment after the last, never past the settle', async () => {
+    const window = await windowFixture('quiet.example');
+    vi.useFakeTimers();
+    const submit = { isNavigationRequest: () => false };
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', submit);
+      })
+      .then(() => {
+        returned = true;
+      });
+    // A script submit in flight: its response may navigate the page.
+    await vi.advanceTimersByTimeAsync(300);
+    expect(returned).toBe(false);
+    window.events.emit('requestfinished', submit);
+    await vi.advanceTimersByTimeAsync(249);
+    expect(returned).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await pressed;
+    expect(returned).toBe(true);
+
+    // A stream that never ends holds the caller only until the settle ends.
+    returned = false;
+    const streaming = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => false });
+      })
+      .then(() => {
+        returned = true;
+      });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(returned).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await streaming;
+    expect(returned).toBe(true);
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+  });
+
+  it('holds the caller until a navigation the action started commits, and ends a window at once when its action throws or its page closes', async () => {
+    const window = await windowFixture('navigate.example');
+    const frame = window.page.mainFrame();
+    vi.useFakeTimers();
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => true, frame: () => frame });
+      })
+      .then(() => {
+        returned = true;
+      });
+    // A navigation that has not committed holds the caller, and keeps the window open past its settle.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(returned).toBe(false);
+    expect(window.armed()).toEqual(['Fetch.enable']);
+    window.events.emit('framenavigated', frame);
+    await vi.advanceTimersByTimeAsync(50);
+    await pressed;
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+
+    // An action that throws closes its window before its error reaches the caller, with no settle.
+    await expect(
+      window.guard.duringAction(10_000, async () => {
+        throw new Error('not actionable');
+      }),
+    ).rejects.toThrow('not actionable');
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable', 'Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+
+    // A page that closes ends the window its action outlasted, well inside the settle.
+    const last = window.guard.duringAction(10_000, async () => undefined);
+    await vi.advanceTimersByTimeAsync(250);
+    await last;
+    window.close();
+    let settled = false;
+    void window.guard.actionsSettled().then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(settled).toBe(true);
+    expect(window.armed()).toHaveLength(6);
+    expect(window.listening()).toBe(0);
+  });
+
+  it('starts an approved press only once every ordinary window on its page has closed', async () => {
+    registerReviewedMerchantFlow({
+      id: 'settled-press-fixture',
+      matches: (url) => url.hostname === 'settled-press.example',
+      classifyControl: async () => 'purchase_control',
+      classifyNavigation: () => 'purchase_control',
+      verifyPurchaseControl: async () => true,
+    });
+    const window = await windowFixture('settled-press.example');
+    const element = { ownerFrame: async () => window.page.mainFrame() } as unknown as ElementHandle;
+    vi.spyOn(isolatedFacts, 'readPageControlFacts').mockResolvedValue(button('Place order'));
+    vi.useFakeTimers();
+    const ordinary = window.guard.duringAction(10_000, async () => undefined);
+    await vi.advanceTimersByTimeAsync(250);
+    await ordinary;
+    let armedAtCommit: string[] | undefined;
+    const press = vi.fn(async () => undefined);
+    const approved = activateControl(window.page, element, press, {
+      commitStarted: async () => {
+        armedAtCommit = window.armed();
+      },
+    });
+    await vi.advanceTimersByTimeAsync(749);
+    expect(armedAtCommit).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await approved).toEqual({ ordinaryPress: false });
+    // The ordinary window closed before the commit marker, so the press's own payment requests go out.
+    expect(armedAtCommit).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(press).toHaveBeenCalledTimes(1);
   });
 });
 
