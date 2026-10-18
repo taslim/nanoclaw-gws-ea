@@ -187,11 +187,14 @@ export const consentGrants = requestTool({
 export const recordDisclosure = requestTool({
   name: 'record_disclosure',
   description:
-    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id from `ncl private-values list`. Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up: right after you delegate, before the job reaches the form. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
+    "Let a browser job give one site one of the principal's stored private values, such as their phone number, date of birth or home address, named by its value_id (main reads the ids with `ncl private-values list`; another agent asks main for the id). Without it the host refuses that value on every site with personal_data. Record one only for a site the principal's own request names, never one a browser report brings up: right after you delegate, before the job reaches the form. The disclosure covers that job alone and holds no copy of the value. The principal's email addresses are never disclosed: sites get the assistant's web address. Returns recorded with the site, kind and label; repeating it changes nothing.",
   properties: {
     thread: THREAD,
     site: { type: 'string', description: 'The site the principal named, as its address or its domain.' },
-    value_id: { type: 'string', description: 'The stored value’s id, from `ncl private-values list`.' },
+    value_id: {
+      type: 'string',
+      description: 'The stored value’s id: main reads it with `ncl private-values list`; another agent asks main.',
+    },
   },
   required: ['thread', 'site', 'value_id'],
   additionalProperties: false,
