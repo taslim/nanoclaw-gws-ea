@@ -543,6 +543,10 @@ export const CONSENT = {
   reticking: 'https://join.example/reticking',
   required: 'https://join.example/required-marketing',
   bundled: 'https://join.example/bundled',
+  namedTerms: 'https://join.example/pay-later',
+  linkedTerms: 'https://join.example/linked-terms',
+  framedTerms: 'https://shop.example/checkout/pay-later',
+  framedTermsFrame: 'https://js.klarna.example/checkout/terms',
   waiver: 'https://climb.example/waiver',
   attestation: 'https://cellar.example/age',
   donation: 'https://give.example/checkout/round-up',
@@ -636,6 +640,52 @@ export function bundledPage(): string {
     'Join',
     `<form id="join" method="get" action="/bundled/joined">${signupFields}
 ${box('consent', 'I agree to the Terms and to receive marketing emails', 'required')}<button type="submit" id="join-button">Create account</button></form>`,
+  );
+}
+
+/** A signup whose one required box agrees to another company's terms. */
+export function namedTermsPage(): string {
+  return document(
+    'Pay later',
+    `<form id="join" method="get" action="/pay-later/joined">${signupFields}
+${box('pay_later', "I agree to Klarna's Terms of Service", 'required')}<button type="submit" id="join-button">Continue</button></form>`,
+  );
+}
+
+/**
+ * A signup with three terms boxes: the site's own terms linked on the site, a wallet's user agreement linked on
+ * the wallet's site, and a privacy policy whose description links to that wallet.
+ */
+export function linkedTermsPage(): string {
+  return document(
+    'Join',
+    `<form id="join" method="get" action="/linked-terms/joined">${signupFields}
+<label><input type="checkbox" name="terms" required> I agree to the <a href="/legal/terms">Terms of Service</a></label>
+<label><input type="checkbox" name="wallet"> I accept the <a href="https://wallet.example/legal/user-agreement">User Agreement</a></label>
+<label><input type="checkbox" name="privacy" aria-describedby="privacy-note"> I accept the Privacy Policy</label>
+<p id="privacy-note">Payments are handled by <a href="https://wallet.example/privacy">our wallet provider</a>.</p>
+<button type="submit" id="join-button">Create account</button></form>`,
+  );
+}
+
+/**
+ * A checkout step whose pay-later option is a cross-site frame. The frame's box names the frame's own company,
+ * which is still another company's terms to the shop the page belongs to.
+ */
+export function framedTermsPage(): string {
+  return document(
+    'Checkout: payment',
+    `<h1>Hale Pottery checkout</h1><p>Total: $48.00</p>
+<iframe id="pay-later" title="Pay later" src="${CONSENT.framedTermsFrame}" style="width:420px;height:200px;border:0"></iframe>`,
+  );
+}
+
+/** The pay-later frame's own document: its terms box and the button that continues. */
+export function framedTermsFrame(): string {
+  return document(
+    'Pay later',
+    `<form id="pay-later" method="get" action="/checkout/terms/accepted">
+${box('pay_later_terms', "I agree to Klarna's Terms of Service", 'required')}<button type="submit" id="continue">Continue</button></form>`,
   );
 }
 
@@ -733,6 +783,13 @@ export function consentPages(): Record<string, OpenWebRoute> {
     'https://join.example/required-marketing/joined': done,
     [CONSENT.bundled]: bundledPage(),
     'https://join.example/bundled/joined': done,
+    [CONSENT.namedTerms]: namedTermsPage(),
+    'https://join.example/pay-later/joined': done,
+    [CONSENT.linkedTerms]: linkedTermsPage(),
+    'https://join.example/linked-terms/joined': done,
+    [CONSENT.framedTerms]: framedTermsPage(),
+    [CONSENT.framedTermsFrame]: framedTermsFrame(),
+    'https://js.klarna.example/checkout/terms/accepted': done,
     [CONSENT.waiver]: waiverPage(),
     'https://climb.example/waiver/booked': done,
     [CONSENT.attestation]: attestationPage(),

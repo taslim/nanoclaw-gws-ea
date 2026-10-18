@@ -227,8 +227,8 @@ const ACCOUNT_PATH =
 /**
  * How an isolated world reads a choice, shared by the classifier's reader and the consent engine's
  * (consent.ts), so both read the same wording for the same box. Plain JavaScript statements: a choice's kind,
- * the choice a click toggles, and its wording as the page shows it. Visible text only; a box with none is
- * named by its accessible name, then its field name.
+ * the choice a click toggles, its wording as the page shows it, and where that wording links. Visible text only;
+ * a box with none is named by its accessible name, then its field name.
  */
 export const CHOICE_SOURCE = String.raw`
   const choiceParent = (node) => (node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentElement);
@@ -314,28 +314,41 @@ export const CHOICE_SOURCE = String.raw`
     visit(root);
     return choiceSquash(text);
   };
-  const choiceReferenced = (element) => {
+  // The elements an attribute such as aria-labelledby names by id.
+  const choiceNamed = (element, attribute) => {
     const root = element.getRootNode();
-    return choiceSquash((element.getAttribute('aria-labelledby') || '').split(/\s+/u).filter(Boolean)
-      .map((id) => (root.getElementById ? root.getElementById(id) : null)).filter(Boolean)
-      .map((target) => choiceText(target)).join(' '));
+    return (element.getAttribute(attribute) || '').split(/\s+/u).filter(Boolean)
+      .map((id) => (root.getElementById ? root.getElementById(id) : null)).filter(Boolean);
   };
+  const choiceReferenced = (element) =>
+    choiceSquash(choiceNamed(element, 'aria-labelledby').map((target) => choiceText(target)).join(' '));
   const otherField = (choice, element) => element !== choice && (choiceKind(element) !== null ||
     element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLButtonElement);
-  // A choice's wording: what labels it, its own words for a role, or the block beside it that holds no other field.
-  const choiceLabel = (choice) => {
+  // A choice's wording and the elements it is read from: what labels it, its own words for a role, or the block
+  // beside it that holds no other field. Wording from its attributes alone is read from no element.
+  const choiceWording = (choice) => {
     const skip = (element) => element !== choice && choiceKind(element) !== null;
+    let from = choiceNamed(choice, 'aria-labelledby');
     let text = choiceReferenced(choice);
-    if (!text && choice.labels) text = choiceSquash(Array.from(choice.labels, (label) => choiceText(label, skip)).join(' '));
-    if (!text && !(choice instanceof HTMLInputElement) && !(choice instanceof HTMLSelectElement)) text = choiceText(choice, skip);
+    if (!text && choice.labels) {
+      from = Array.from(choice.labels);
+      text = choiceSquash(from.map((label) => choiceText(label, skip)).join(' '));
+    }
+    if (!text && !(choice instanceof HTMLInputElement) && !(choice instanceof HTMLSelectElement)) {
+      from = [choice];
+      text = choiceText(choice, skip);
+    }
     for (let current = choiceParent(choice), depth = 0; !text && current && depth < 4; current = choiceParent(current), depth++) {
       if (current instanceof HTMLFormElement || current === document.body || choiceDescendants(current).some((element) => otherField(choice, element)))
         break;
+      from = [current];
       text = choiceText(current, skip);
     }
-    return text || choiceSquash(choice.getAttribute('aria-label') || choice.getAttribute('title') || '') ||
-      choiceSquash((choice.getAttribute('name') || choice.id || '').replace(/[_-]+/gu, ' '));
+    if (text) return { text, from };
+    return { text: choiceSquash(choice.getAttribute('aria-label') || choice.getAttribute('title') || '') ||
+      choiceSquash((choice.getAttribute('name') || choice.id || '').replace(/[_-]+/gu, ' ')), from: [] };
   };
+  const choiceLabel = (choice) => choiceWording(choice).text;
   // The options answering one question: same-named radios of one form or formless root, or one radiogroup's radios.
   const choiceMembers = (choice) => {
     if (choice instanceof HTMLInputElement) {
@@ -351,25 +364,27 @@ export const CHOICE_SOURCE = String.raw`
         return choiceDescendants(current).filter((element) => choiceKind(element) === 'radio' && !(element instanceof HTMLInputElement));
     return [choice];
   };
-  // A radio option's question: a fieldset's legend, a radiogroup's label, or the words of the block holding every
-  // option and no other field, else of the block just before the options.
-  const choiceGroup = (choice) => {
+  // A radio option's question and the elements it is read from: a fieldset's legend, a radiogroup's label, or the
+  // words of the block holding every option and no other field, else of the block just before the options.
+  const choiceQuestion = (choice) => {
     const members = choiceMembers(choice);
     const own = (element) => members.includes(element) || (element instanceof HTMLLabelElement && members.includes(element.control));
     for (let current = choiceParent(choice); current; current = choiceParent(current)) {
       if (current instanceof HTMLFieldSetElement) {
         const legend = Array.from(current.children).find((element) => element instanceof HTMLLegendElement);
-        if (legend) return choiceText(legend);
+        if (legend) return { text: choiceText(legend), from: [legend] };
       }
       if (choiceRole(current) === 'radiogroup' || choiceRole(current) === 'group') {
-        const named = choiceReferenced(current) || choiceSquash(current.getAttribute('aria-label') || '');
-        if (named) return named;
+        const referenced = choiceReferenced(current);
+        if (referenced) return { text: referenced, from: choiceNamed(current, 'aria-labelledby') };
+        const named = choiceSquash(current.getAttribute('aria-label') || '');
+        if (named) return { text: named, from: [] };
       }
       if (!members.every((member) => choiceWithin(current, member))) continue;
       const fields = choiceDescendants(current).some((element) => !members.includes(element) && otherField(null, element));
       if (!fields && !(current instanceof HTMLFormElement) && current !== document.body) {
         const text = choiceText(current, own);
-        if (text) return text;
+        if (text) return { text, from: [current] };
         continue;
       }
       let block = members[0];
@@ -377,11 +392,23 @@ export const CHOICE_SOURCE = String.raw`
       for (let previous = block && block.previousElementSibling; previous; previous = previous.previousElementSibling) {
         if (choiceKind(previous) || choiceDescendants(previous).some((element) => otherField(null, element))) break;
         const text = choiceText(previous);
-        if (text) return text;
+        if (text) return { text, from: [previous] };
       }
-      return '';
+      return { text: '', from: [] };
     }
-    return '';
+    return { text: '', from: [] };
+  };
+  const choiceGroup = (choice) => choiceQuestion(choice).text;
+  // Where a choice's wording, its question and its description link to, as absolute addresses: whose terms a box
+  // accepts (consent.ts).
+  const choiceLinks = (choice) => {
+    const from = [...choiceWording(choice).from, ...choiceNamed(choice, 'aria-describedby'),
+      ...(choiceKind(choice) === 'radio' ? choiceQuestion(choice).from : [])];
+    const links = new Set();
+    for (const element of from.flatMap((source) => [source, ...choiceDescendants(source)]))
+      if ((element instanceof HTMLAnchorElement || element instanceof HTMLAreaElement) && element.hasAttribute('href'))
+        links.add(element.href);
+    return [...links];
   };
   // What a click on node would toggle, as the classifier reads it.
   const toggledChoice = (node) => {

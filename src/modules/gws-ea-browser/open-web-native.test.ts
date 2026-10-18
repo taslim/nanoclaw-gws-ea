@@ -532,11 +532,12 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     });
   });
 
-  it('stops for a bundled box, a waiver and an age attestation, naming each, and ticks none', async () => {
+  it('stops for a bundled box, a waiver, an age attestation and another company’s terms, naming each, and ticks none', async () => {
     for (const [url, control, wording] of [
       [CONSENT.bundled, '#join-button', 'I agree to the Terms and to receive marketing emails'],
       [CONSENT.waiver, '#climb-button', 'I have read and accept the liability waiver'],
       [CONSENT.attestation, '#enter', 'I confirm I am 21 or older'],
+      [CONSENT.namedTerms, '#join-button', "I agree to Klarna's Terms of Service"],
     ] as const) {
       await visit(url);
       expect(await pass(page.locator(control))).toMatchObject({ status: 'consent_required', stops: [{ wording }] });
@@ -546,7 +547,41 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
           .evaluate((node) => (node as unknown as { checked: boolean }).checked),
       ).toBe(false);
     }
-    expect((await stops()).map((stop) => stop.kind)).toEqual(['bundled', 'agreement', 'agreement']);
+    expect((await stops()).map((stop) => stop.kind)).toEqual(['bundled', 'agreement', 'agreement', 'agreement']);
+  });
+
+  it('stops for terms linked to another site from a box’s label or its description, and not for terms linked within the site', async () => {
+    await visit(CONSENT.linkedTerms);
+    expect(await pass(page.locator('#join-button'))).toMatchObject({
+      status: 'consent_required',
+      stops: [
+        { site: 'join.example', wording: 'I accept the User Agreement' },
+        { site: 'join.example', wording: 'I accept the Privacy Policy' },
+      ],
+    });
+    expect((await stops()).map(({ origin, kind }) => ({ origin, kind }))).toEqual([
+      { origin: 'https://join.example', kind: 'agreement' },
+      { origin: 'https://join.example', kind: 'agreement' },
+    ]);
+    for (const name of ['terms', 'wallet', 'privacy']) expect(await checked(`input[name="${name}"]`)).toBe(false);
+  });
+
+  it('stops for a box naming its own company inside a cross-site frame, another company’s terms to the page’s site', async () => {
+    await visit(CONSENT.framedTerms);
+    const frame = page.frameLocator('#pay-later');
+    expect(await pass(frame.locator('#continue'))).toMatchObject({
+      status: 'consent_required',
+      stops: [{ site: 'shop.example', wording: "I agree to Klarna's Terms of Service" }],
+    });
+    // The stop is the page's site's to approve, keyed with the frame it was found in.
+    expect(await stops()).toMatchObject([
+      { site: 'shop.example', origin: 'https://js.klarna.example', kind: 'agreement', status: 'open' },
+    ]);
+    expect(
+      await frame
+        .locator('input[name="pay_later_terms"]')
+        .evaluate((node) => (node as unknown as { checked: boolean }).checked),
+    ).toBe(false);
   });
 
   it('unticks a pre-ticked round-up, and refuses as a purchase a press the site would keep it ticked for', async () => {

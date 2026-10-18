@@ -3,14 +3,15 @@
  * form before any submission it performs or lets run, and the principal approves the exceptions.
  *
  * An isolated world lists every choice in the target form, or in a formless control's region (the region the
- * classifier reads), with its wording and state. The engine reads each wording for its meaning: a box that only
- * accepts the site's own terms is ticked, whatever its `required` attribute says; marketing, newsletters,
+ * classifier reads), with its wording, state and links. The engine reads each wording for its meaning: a box that
+ * only accepts the site's own terms is ticked, whatever its `required` attribute says; marketing, newsletters,
  * partner sharing, SMS and offers end opted out, inverted wording included; paid extras and donations are
- * unticked; and an agreement beyond the site's terms (a waiver, an attestation, a fee acknowledgement, a box
- * bundling the terms with anything, a double negative, or an opt-in the site requires) stops with
- * `consent_required` unless the principal approved that exact wording on that site before. Functional choices
- * stay the agent's. The host acts with real clicks on the box or its label, then reads again after the page
- * settles: a choice the site will not keep stops, so the check before the press is what the page holds then.
+ * unticked; and an agreement beyond the site's terms (another party's terms, named or linked, a waiver, an
+ * attestation, a fee acknowledgement, a box bundling the terms with anything, a double negative, or an opt-in the
+ * site requires) stops with `consent_required` unless the principal approved that exact wording on that site
+ * before. Functional choices stay the agent's. The host acts with real clicks on the box or its label, then reads
+ * again after the page settles: a choice the site will not keep stops, so the check before the press is what the
+ * page holds then.
  *
  * Inside a purchase the agreements go on the purchase card instead, and an extra the site keeps selected
  * joins the facts the card shows as a charge.
@@ -19,7 +20,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { ElementHandle, Frame, Page } from 'playwright-core';
-import { getDomain } from 'tldts';
+import { getDomain, getDomainWithoutSuffix } from 'tldts';
 
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -60,6 +61,42 @@ const siteTerms =
 /** What never rides along with a site's terms. */
 const notSiteTerms =
   /\b(?:marketing|newsletters?|news|offers?|promotions?|promotional|partners?|third[\s-]+part(?:y|ies)|shar(?:e|ing)|advertis\w*|sponsors?|surveys?|updates|e-?mails?|sms|texts?|pay(?:ment|ments|ing)?|billing|billed|charges?|fees?|prices?|pricing|purchases?|orders?|sales?|trials?|subscri\w*|renew\w*|recurring|memberships?|plans?|cards?|credit|refunds?)\b|[$€£¥]/iu;
+
+/** Every document a terms box names, to read whose each one is: terms, conditions, agreements, policies, notices. */
+const termsDocuments =
+  /\b(?:terms(?:\s+of\s+(?:service|use))?|conditions(?:\s+of\s+use)?|agreements?|polic(?:y|ies)|notices?|statements?)\b/giu;
+
+/**
+ * The words around a document a terms box names that say whose it is. A name is a capitalized word that is neither
+ * one every sentence has nor one describing the document. Vocabulary is data: widen or narrow it here.
+ */
+const TERMS_OWNER_VOCABULARY = {
+  /** A possessive, kept apart from the contractions that look like one. */
+  possessive: /^(.+?)(?:'s|')$/u,
+  contraction: /^(?:it|that|there|here|what|who|where|he|she|let)$/iu,
+  /** The site naming itself: "our terms", "of your service". */
+  selfPronoun: /^(?:our|your)$/iu,
+  /** The site naming itself: "the site's terms", "the terms of the Company". */
+  selfNoun: /^(?:site|website|store|shop|app|service|platform|company)$/iu,
+  /** Another party named only by a pronoun. */
+  otherPronoun: /^(?:their|its|his|her)$/iu,
+  /** What follows "of" before whose document it is: "the terms of the …". */
+  determiner: /^(?:the|this|these)$/iu,
+  /** A word of a name: capitalized, or a brand's inner capital ("eBay"). */
+  name: /^[\p{Lu}\p{N}]|^\p{Ll}+\p{Lu}/u,
+  /** Capitalized words that are not names: what a sentence says around one. */
+  notName:
+    /^(?:the|a|an|this|these|that|those|our|your|my|i|we|you|to|and|or|of|with|by|for|in|on|at|from|as|under|per|all|any|both|each|every|please|yes|agree[ds]?|accept(?:s|ed)?|acknowledge[sd]?|consent|read|have|has|understood|understand|review(?:ed)?|confirm|view|see|open)$/iu,
+  /** Capitalized words that describe a document, not whose it is. */
+  descriptor:
+    /^(?:general|standard|full|updated|current|latest|new|revised|applicable|following|relevant|complete|additional|supplemental|important|acceptable|end|website|web|site|online|services?|customers?|users?|members?|bookings?|reservations?|account|legal|platform|app|store|shop|community|global|master|basic|main|tickets?|events?|guests?|rental|hire|delivery|shipping|returns?|use|sale|carriage|business|entry|access|admission|participation|stay|licen[cs]es?|conditions|agreement|policy|privacy|cookies?|data)$/iu,
+  /** What joins the words of one name. */
+  joiner: /^[&+]$/u,
+  /** A company's legal form after its name. */
+  legalForm: /^(?:inc|llc|ltd|limited|corp|corporation|co|company|gmbh|plc|ag|sa|ab|bv|nv|pty|llp|lp)$/iu,
+  /** Punctuation that ends a clause, which a name never crosses. */
+  clauseEnd: /[,;:!?]/u,
+} as const satisfies Record<string, RegExp>;
 
 // Vocabulary is data: widen or narrow it here, never by changing the order the engine decides in.
 const CONSENT_VOCABULARY = {
@@ -115,6 +152,124 @@ function termsConsentLabel(label: string): boolean {
   return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
 }
 
+/** The words of a stretch of wording, without the quotes, brackets and full stops around them. */
+function wordsOf(text: string): string[] {
+  return text
+    .split(/\s+/u)
+    .map((token) => token.replace(/^[("'“[]+|[)"”\].]+$/gu, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Whose terms a wording names: a possessive just before a document it names ("Klarna's Terms", "the seller's
+ * terms"), a name directly before it ("the PayPal User Agreement"), or a name after "of" ("the terms of Afterpay").
+ * The site naming itself ("our terms", "the site's terms", "the terms of this site") names no one; another party
+ * named only as "their" is ''.
+ */
+function termsOwners(words: string): string[] {
+  const vocabulary = TERMS_OWNER_VOCABULARY;
+  /** Whom a word names as owner ("Klarna" in "Klarna's"); none for a contraction or any other word. */
+  const possessorOf = (token: string): string | undefined => {
+    const possessor = vocabulary.possessive.exec(token)?.[1];
+    return possessor !== undefined && !vocabulary.contraction.test(possessor) ? possessor : undefined;
+  };
+  /** The words of one name, read away from the document: capitalized words, joined by & or +. */
+  const nameRun = (tokens: readonly string[]): string[] => {
+    const run: string[] = [];
+    for (const token of tokens) {
+      const joins = vocabulary.joiner.test(token) && run.length > 0;
+      if (!joins && (!vocabulary.name.test(token) || vocabulary.notName.test(token))) break;
+      run.push(token);
+    }
+    while (run.length && vocabulary.joiner.test(run[run.length - 1])) run.pop();
+    return run;
+  };
+  /** A run's name without the words describing the document, or none when nothing else is left. */
+  const named = (run: readonly string[]): string | undefined => {
+    const name = run.filter((token) => !vocabulary.descriptor.test(token));
+    return name.some((token) => !vocabulary.joiner.test(token)) ? name.join(' ') : undefined;
+  };
+  const owners: string[] = [];
+  for (const match of words.matchAll(termsDocuments)) {
+    const back = wordsOf(words.slice(0, match.index).split(vocabulary.clauseEnd).at(-1) ?? '').reverse();
+    const ahead = wordsOf(words.slice(match.index + match[0].length).split(vocabulary.clauseEnd)[0] ?? '');
+    // A possessive or another's pronoun within three words before it, else a name directly before it.
+    const near = back
+      .slice(0, 3)
+      .findIndex((token) => vocabulary.otherPronoun.test(token) || possessorOf(token) !== undefined);
+    const possessor = near === -1 ? undefined : possessorOf(back[near]);
+    if (near === -1) {
+      const before = named(nameRun(back).reverse());
+      if (before !== undefined) owners.push(before);
+    } else if (possessor === undefined) owners.push('');
+    else if (!vocabulary.selfNoun.test(possessor)) {
+      const name = nameRun([possessor, ...back.slice(near + 1)]).reverse();
+      owners.push(name.length ? name.join(' ') : possessor);
+    }
+    // A name after "of".
+    if (ahead[0]?.toLowerCase() !== 'of') continue;
+    const after = vocabulary.determiner.test(ahead[1] ?? '') ? ahead.slice(2) : ahead.slice(1);
+    if (vocabulary.otherPronoun.test(after[0] ?? '')) owners.push('');
+    else if (!vocabulary.selfPronoun.test(after[0] ?? '') && !vocabulary.selfNoun.test(after[0] ?? '')) {
+      const name = named(nameRun(after));
+      if (name !== undefined) owners.push(name);
+    }
+  }
+  return owners;
+}
+
+/** Whether a party a wording names is the site: its name, legal form aside, is the site's own name. */
+function siteNamed(owner: string, site: string): boolean {
+  const own = getDomainWithoutSuffix(site, { allowPrivateDomains: true });
+  if (!own || !owner) return false;
+  const { legalForm, joiner } = TERMS_OWNER_VOCABULARY;
+  const squash = (text: string): string => text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const words = owner.split(' ').map((token) => token.replace(/\.$/u, ''));
+  const name = [...words];
+  while (name.length > 1 && [legalForm, joiner].some((form) => form.test(name.at(-1) ?? ''))) name.pop();
+  return [words, name]
+    .flatMap((form) => [form.join(' '), form.join(' ').replace(/[&+]/gu, ' and ')])
+    .some((form) => squash(form) === squash(own));
+}
+
+/** A registrable domain, as the principal sees a site; a host with none, such as an address, is itself. */
+function registrableSite(hostname: string): string {
+  return getDomain(hostname, { allowPrivateDomains: true }) ?? hostname;
+}
+
+/** The site a link leads to, or none for a link that leads to no site (a script or a mail address). */
+function linkedSite(link: string): string | undefined {
+  try {
+    const url = new URL(link);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? registrableSite(url.hostname) : undefined;
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    return undefined;
+  }
+}
+
+/** Where a choice is read: the page's site, and the addresses its wording, question and description link to. */
+export interface ConsentPlace {
+  /** The site the page belongs to, whatever frame holds the choice (KTD7). */
+  readonly site: string;
+  readonly links: readonly string[];
+}
+
+/**
+ * Whether terms are the site's own (R15): every party the wording names is the site, and every link in the
+ * wording or its description stays on the site. Read with no site, any named party is another's.
+ */
+function siteOwnTerms(words: string, place: ConsentPlace | undefined): boolean {
+  const site = place?.site ?? '';
+  return (
+    termsOwners(words).every((owner) => siteNamed(owner, site)) &&
+    (place?.links ?? []).every((link) => {
+      const linked = linkedSite(link);
+      return linked === undefined || linked === site;
+    })
+  );
+}
+
 function negations(label: string): number {
   return [...label.replace(/\bno[\s-]?shows?\b/giu, 'noshow').matchAll(CONSENT_VOCABULARY.negation)].length;
 }
@@ -122,9 +277,10 @@ function negations(label: string): number {
 /**
  * What a box's wording asks, read for its meaning (KTD11). The order decides the most binding reading first:
  * a double negative or a box bundling the site's terms with anything else cannot be read safely, an agreement
- * outranks an extra, an extra outranks marketing, and a box with no consent vocabulary is functional.
+ * outranks an extra, an extra outranks marketing, and a box with no consent vocabulary is functional. Terms
+ * that name or link to another party than the site the page belongs to are an agreement.
  */
-export function classifyConsentLabel(label: string): ConsentLabelKind {
+export function classifyConsentLabel(label: string, place?: ConsentPlace): ConsentLabelKind {
   const words = readable(label);
   const vocabulary = CONSENT_VOCABULARY;
   const terms = siteTerms.test(words);
@@ -142,7 +298,10 @@ export function classifyConsentLabel(label: string): ConsentLabelKind {
   if (!terms && !marketing && !money && !binding && !consenting) return 'functional';
   const negated = negations(words);
   if (negated >= 2 || (terms && negated > 0) || (money && !binding && negated > 0)) return 'double_negative';
-  if (terms) return binding || marketing || money || !termsConsentLabel(words) ? 'bundled' : 'terms';
+  if (terms) {
+    if (binding || marketing || money || !termsConsentLabel(words)) return 'bundled';
+    return siteOwnTerms(words, place) ? 'terms' : 'agreement';
+  }
   if (binding) return 'agreement';
   if (money) return 'add_on';
   if (marketing) return negated ? 'opt_out' : 'marketing';
@@ -150,12 +309,12 @@ export function classifyConsentLabel(label: string): ConsentLabelKind {
 }
 
 /** What a group of options asks, from its question, or from its options' own wording when the question says nothing. */
-function classifyGroup(question: string, options: readonly string[]): ConsentLabelKind {
-  const asked = classifyConsentLabel(question);
+function classifyGroup(question: string, options: readonly string[], place?: ConsentPlace): ConsentLabelKind {
+  const asked = classifyConsentLabel(question, place);
   const kinds =
     asked === 'functional'
       ? options.map((option) => {
-          const kind = classifyConsentLabel(option);
+          const kind = classifyConsentLabel(option, place);
           return kind === 'add_on' && !CONSENT_VOCABULARY.donation.test(readable(option)) ? 'functional' : kind;
         })
       : [asked === 'add_on' && !CONSENT_VOCABULARY.donation.test(readable(question)) ? 'functional' : asked];
@@ -200,6 +359,8 @@ export interface ConsentChoice {
   readonly group?: string;
   /** The radio group the option answers with its siblings. */
   readonly name?: string;
+  /** The addresses its wording, question and description link to. */
+  readonly links: readonly string[];
   readonly checked: boolean;
   readonly required: boolean;
   readonly disabled: boolean;
@@ -230,6 +391,11 @@ export type ConsentDecision =
 export interface ConsentContext {
   /** The wordings the principal agreed to on this site and frame origin. */
   readonly granted: ReadonlySet<string>;
+  /**
+   * The site the page belongs to, its top document's registrable domain: the only party whose own terms a box may
+   * accept, even inside another party's frame (R15, KTD7).
+   */
+  readonly site: string;
   readonly purchase: boolean;
   /** Choices the host already set that did not hold. */
   readonly kept?: ReadonlySet<number>;
@@ -259,10 +425,11 @@ export function decideConsent(choices: readonly ConsentChoice[], context: Consen
   const agreed = (wording: string): void => {
     if (context.purchase) agreements.push(wording);
   };
+  const { site } = context;
   const decidedGroups = new Set<string>();
   for (const choice of choices) {
     if (choice.kind === 'checkbox' || choice.kind === 'switch') {
-      const kind = classifyConsentLabel(choice.label);
+      const kind = classifyConsentLabel(choice.label, { site, links: choice.links });
       const wording = normalizeConsentWording(choice.label);
       const granted = context.granted.has(wording);
       let want: boolean;
@@ -320,6 +487,7 @@ export function decideConsent(choices: readonly ConsentChoice[], context: Consen
     const kind = classifyGroup(
       question,
       options.map((option) => option.label),
+      { site, links: group.flatMap((option) => option.links) },
     );
     if (kind === 'functional') continue;
     const affirming = single(options, affirms);
@@ -492,6 +660,7 @@ const librarySource = String.raw`(() => {
           id,
           kind,
           label: choiceLabel(choice),
+          links: choiceLinks(choice),
           ...(kind === 'radio' ? { group: choiceGroup(choice), name: groupName(choice) } : {}),
           ...(kind === 'select' ? { options: Array.from(choice.options, (option) => ({
             label: choiceSquash(option.label || option.text), selected: option.selected })) } : {}),
@@ -603,12 +772,16 @@ function parseRead(value: unknown): ConsentRead | undefined {
     const choice = record(raw);
     const id = integer(choice?.id);
     const label = text(choice?.label);
+    const links: unknown = choice?.links;
+    const linkList = Array.isArray(links) ? links.map((link: unknown) => text(link)) : undefined;
     const hint = parseHint(choice?.hint);
     if (
       !choice ||
       id === undefined ||
       !KINDS.has(choice.kind) ||
       label === undefined ||
+      !linkList ||
+      linkList.some((link) => link === undefined) ||
       !hint ||
       typeof choice.checked !== 'boolean' ||
       typeof choice.required !== 'boolean' ||
@@ -631,6 +804,7 @@ function parseRead(value: unknown): ConsentRead | undefined {
       id,
       kind: choice.kind as ConsentChoice['kind'],
       label,
+      links: linkList.filter((link) => link !== undefined),
       ...(group !== undefined ? { group } : {}),
       ...(name !== undefined ? { name } : {}),
       checked: choice.checked,
@@ -880,8 +1054,7 @@ export async function withConsentScope<T>(page: Page, scope: ConsentScope, opera
 /** The site a page belongs to: its top document's registrable domain, as the principal sees it. */
 function siteOf(page: Page): string {
   try {
-    const hostname = new URL(page.mainFrame().url()).hostname;
-    return getDomain(hostname, { allowPrivateDomains: true }) ?? hostname;
+    return registrableSite(new URL(page.mainFrame().url()).hostname);
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
     throw new ControlFactsUnavailableError();
@@ -917,6 +1090,7 @@ export async function runConsentPass(
     decideConsent(round.read.choices, {
       granted: await liveConsentGrants(scope?.db ?? getDb(), site, round.read.origin),
       purchase,
+      site,
       ...(kept ? { kept } : {}),
     });
   const answer = async (round: ConsentRound, decision: ConsentDecision): Promise<ConsentPassResult> => {
