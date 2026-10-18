@@ -78,7 +78,7 @@ export async function notifyPendingUnconfirmed(db: DbDriver = getDb()): Promise<
 }
 
 /** Who may record an attempt's outcome: an agent with browser access, and main whatever the setting lists. */
-export const purchaseOutcomeGuard = defineGuardedAction({
+const purchaseOutcomeGuard = defineGuardedAction({
   action: 'gws_ea_browser.purchase_outcome',
   async decide({ actor }) {
     if (actor.kind !== 'agent') return DENY('Only an agent records a purchase outcome.');
@@ -119,7 +119,7 @@ function recordedAs(attempt: PurchaseAttemptRow): {
 export async function recordPurchaseOutcome(
   content: Record<string, unknown>,
   session: Session,
-  queue?: () => BrowserQueue,
+  queue: () => BrowserQueue,
 ): Promise<Record<string, unknown>> {
   if (Object.keys(content).some((key) => !OUTCOME_FIELDS.has(key)))
     throw invalidArgs('Unknown record_purchase_outcome field.');
@@ -166,7 +166,7 @@ export async function recordPurchaseOutcome(
     case 'already_resolved': {
       const recorded = recordedAs(result.attempt);
       if (placed && recorded.outcome === 'not_placed') {
-        await lateConfirmation(job, result.attempt, source, queue?.());
+        await lateConfirmation(job, result.attempt, source, queue());
         return { status: 'possible_duplicate', thread: job.thread_id, recorded };
       }
       return { status: 'already_recorded', thread: job.thread_id, ...recorded };
@@ -189,7 +189,7 @@ async function lateConfirmation(
   job: BrowserJob,
   attempt: PurchaseAttemptRow,
   source: 'email' | 'principal',
-  queue: BrowserQueue | undefined,
+  queue: BrowserQueue,
 ): Promise<void> {
   const { incident, stop } = await recordIncidentWithStop(new BrowserStore(), job.thread_id, {
     kind: 'late_confirmation',

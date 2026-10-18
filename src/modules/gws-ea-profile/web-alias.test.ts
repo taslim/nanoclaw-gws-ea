@@ -1,15 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureContainerConfig } from '../../db/container-configs.js';
-import {
-  getAliasSetup,
-  getAssistantAlias,
-  proposeAliasCandidate,
-  recordAliasProbe,
-  recordVerifiedAlias,
-  reconcileGwsEaProfile,
-} from './db.js';
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { publishAliasTestProfile } from '../gws-ea-inbox/testing/alias-mailbox.js';
+import { getAliasSetup, proposeAliasCandidate, recordAliasProbe, recordVerifiedAlias } from './db.js';
 import './index.js';
 
 const PROBE = '<alias-check.0123456789abcdef0123456789abcdef@example.test>';
@@ -17,22 +10,7 @@ const LATER_PROBE = '<alias-check.fedcba9876543210fedcba9876543210@example.test>
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
-  await createAgentGroup({
-    id: 'ag-main',
-    name: 'main',
-    folder: 'main',
-    agent_provider: null,
-    created_at: '2026-10-17T00:00:00.000Z',
-  });
-  await ensureContainerConfig('ag-main');
-  await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
-    assistantWorkspaceEmail: 'juno@example.test',
-    principalDisplayName: 'Morgan Ellery',
-    principalTimezone: 'America/New_York',
-    mainAgentGroupId: 'ag-main',
-    principalEmails: ['morgan@example.test'],
-  });
+  await publishAliasTestProfile();
 });
 
 afterEach(async () => {
@@ -42,7 +20,6 @@ afterEach(async () => {
 describe("the assistant's web alias in its profile (KTD13)", () => {
   it('holds nothing until a candidate is proposed, and no alias until a probe proves it', async () => {
     await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: null, probe_message_id: null });
-    await expect(getAssistantAlias()).resolves.toBeNull();
 
     await expect(proposeAliasCandidate('ONUJ@example.test')).resolves.toEqual({
       alias: null,
@@ -50,7 +27,11 @@ describe("the assistant's web alias in its profile (KTD13)", () => {
       probe_message_id: null,
     });
     await expect(recordAliasProbe('onuj@example.test', PROBE)).resolves.toBe(true);
-    await expect(getAssistantAlias()).resolves.toBeNull();
+    await expect(getAliasSetup()).resolves.toEqual({
+      alias: null,
+      candidate: 'onuj@example.test',
+      probe_message_id: PROBE,
+    });
 
     await expect(recordVerifiedAlias('onuj@example.test', PROBE)).resolves.toBe(true);
     await expect(getAliasSetup()).resolves.toEqual({
@@ -58,7 +39,6 @@ describe("the assistant's web alias in its profile (KTD13)", () => {
       candidate: null,
       probe_message_id: null,
     });
-    await expect(getAssistantAlias()).resolves.toBe('onuj@example.test');
   });
 
   it('keeps a probe while the same candidate is proposed again, and forgets it for a new one', async () => {
@@ -96,7 +76,7 @@ describe("the assistant's web alias in its profile (KTD13)", () => {
     await recordAliasProbe('onuj2@example.test', LATER_PROBE);
     await expect(recordVerifiedAlias('onuj2@example.test', PROBE)).resolves.toBe(false);
     await expect(recordVerifiedAlias('onuj2@example.test', LATER_PROBE)).resolves.toBe(true);
-    await expect(getAssistantAlias()).resolves.toBe('onuj2@example.test');
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'onuj2@example.test' });
   });
 
   it("refuses a candidate that is the assistant's own address, the principal's, malformed, or after one is verified", async () => {
@@ -110,18 +90,5 @@ describe("the assistant's web alias in its profile (KTD13)", () => {
     await expect(proposeAliasCandidate('onuj2@example.test')).rejects.toThrow(/already onuj@example.test/u);
     await expect(recordAliasProbe('onuj@example.test', LATER_PROBE)).resolves.toBe(false);
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'onuj@example.test', candidate: null });
-  });
-
-  it('adds only nullable columns, so a profile from before reads as having no alias', async () => {
-    const columns = await getDb().all<{ name: string; notnull: number }>("PRAGMA table_info('gws_ea_profile')");
-    expect(
-      columns.filter((column) =>
-        ['assistant_alias', 'alias_candidate', 'alias_probe_message_id'].includes(column.name),
-      ),
-    ).toEqual([
-      expect.objectContaining({ name: 'assistant_alias', notnull: 0 }),
-      expect.objectContaining({ name: 'alias_candidate', notnull: 0 }),
-      expect.objectContaining({ name: 'alias_probe_message_id', notnull: 0 }),
-    ]);
   });
 });

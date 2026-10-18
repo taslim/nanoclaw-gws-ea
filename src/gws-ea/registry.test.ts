@@ -569,11 +569,13 @@ describe('release compare-and-swap and live checkout agreement', () => {
     const peer = distinctReservation();
     await reserveInstance(paths, input);
     await reserveInstance(paths, peer);
+    // The web alias claim is one of them.
+    const claimed = await claimInstanceAlias(paths, input.instance_id, 'onuj@example.test');
     const before = await readRegistry(paths);
 
     const moved = await swapInstanceRelease(paths, input.instance_id, releaseOf(input), target);
 
-    expect(moved).toEqual({ ...input, ...target });
+    expect(moved).toEqual({ ...claimed, ...target });
     const after = await readRegistry(paths);
     expect(after.instances[input.instance_id]).toEqual(moved);
     expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);
@@ -629,21 +631,6 @@ describe('release compare-and-swap and live checkout agreement', () => {
     const after = await readRegistry(paths);
     expect(after.instances[first.instance_id]).toEqual({ ...first, ...target });
     expect(after.instances[second.instance_id]).toEqual({ ...second, ...target });
-  });
-
-  it("keeps an assistant's web alias claim through a release swap", async () => {
-    const paths = await testPaths();
-    const input = reservation();
-    await reserveInstance(paths, input);
-    await claimInstanceAlias(paths, input.instance_id, 'onuj@example.test');
-
-    const moved = await swapInstanceRelease(paths, input.instance_id, releaseOf(input), target);
-
-    expect(moved.exclusive_resource_claims.alias_email).toBe('onuj@example.test');
-    expect((await getInstanceReservation(paths, input.instance_id)).exclusive_resource_claims).toEqual({
-      ...input.exclusive_resource_claims,
-      alias_email: 'onuj@example.test',
-    });
   });
 
   it('finds a missing state consistent, and a present one only with its own marker', async () => {

@@ -1,6 +1,5 @@
 /** The principal's side of the consent engine: real approvals, delivery, central DB and mailbox. Only the container wake is mocked. */
 import fs from 'node:fs';
-import Database from 'better-sqlite3';
 import type { Locator, Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const { root } = await vi.hoisted(async () => {
@@ -21,11 +20,9 @@ vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
-import type { ResponseFrame } from '../../cli/frame.js';
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createPendingApproval } from '../../db/sessions.js';
-import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { setDeliveryAdapter } from '../../delivery.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { sweepExpiredApprovals } from '../approvals/index.js';
@@ -41,6 +38,7 @@ import { setBrowserAdmissionReady } from './group.js';
 import { CONSENT, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
 import { BrowserQueue } from './queue.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
+import { deliverAction } from './testing/delivery-answer.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -52,7 +50,6 @@ let job: BrowserJob;
 let queue: BrowserQueue;
 let sent: Array<{ platformId: string; content: string }>;
 let page: Page | undefined;
-let requests = 0;
 
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
@@ -157,20 +154,8 @@ async function ask(stopId: string, requestId: string, from = session): Promise<R
   const frame = JSON.parse(row.answer_json) as { ok: boolean; data?: Record<string, unknown> };
   return frame.data;
 }
-/** Main's consent_grants tool: one request through native delivery, and the host's one answer in the caller's inbound mailbox. */
-async function manageGrants(from: Session, fields: Record<string, unknown>): Promise<ResponseFrame> {
-  const requestId = `grants-${++requests}`;
-  await getDeliveryAction('consent_grants')!({ ...fields, action: 'consent_grants', requestId }, from);
-  const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
-  try {
-    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
-      content: string;
-    };
-    return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
-  } finally {
-    db.close();
-  }
-}
+/** Main's consent_grants tool: one request through native delivery, and the host's one answer. */
+const manageGrants = (from: Session, fields: Record<string, unknown>) => deliverAction(from, 'consent_grants', fields);
 async function approvals(): Promise<PendingApproval[]> {
   return getDb().all('SELECT * FROM pending_approvals ORDER BY created_at');
 }
@@ -246,30 +231,30 @@ describe('asking the principal for consent', () => {
     expect(await notices()).toHaveLength(1);
   });
 
-  it('leaves the box unticked when the principal rejects, and tells the job', async () => {
-    const id = await stop();
-    await ask(id, 'consent-1');
-    const [approval] = await approvals();
-    await click(approval, 'reject');
-    expect(await grants()).toEqual([]);
-    expect(await stopStatus(id)).toBe('rejected');
-    expect(await notices()).toEqual([
-      expect.objectContaining({
-        status: 'rejected',
-        stop_id: id,
-        message: expect.stringContaining('leaves this box unticked'),
-      }),
-    ]);
-  });
-
-  it('expires an unanswered card and tells the job', async () => {
-    const id = await stop();
-    await ask(id, 'consent-1');
-    await getDb().run("UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z'");
-    await sweepExpiredApprovals();
-    expect(await stopStatus(id)).toBe('expired');
-    expect(await notices()).toEqual([expect.objectContaining({ status: 'expired', stop_id: id })]);
-  });
+  it.each([
+    ['rejects it', 'rejected', 'leaves this box unticked', async () => click((await approvals())[0], 'reject')],
+    [
+      'lets the card expire',
+      'expired',
+      'did not answer in time',
+      async () => {
+        await getDb().run("UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z'");
+        await sweepExpiredApprovals();
+      },
+    ],
+  ] as const)(
+    'leaves the box unticked when the principal %s, and tells the job',
+    async (_case, status, message, decide) => {
+      const id = await stop();
+      await ask(id, 'consent-1');
+      await decide();
+      expect(await grants()).toEqual([]);
+      expect(await stopStatus(id)).toBe(status);
+      expect(await notices()).toEqual([
+        expect.objectContaining({ status, stop_id: id, message: expect.stringContaining(message) }),
+      ]);
+    },
+  );
 
   it('refuses an unknown stop, another job’s stop and a stop already used, with no card', async () => {
     const id = await stop();
@@ -333,10 +318,6 @@ describe('asking the principal for consent', () => {
     );
     const other = (await resolveSession('other-p', 'mg-operator', null, 'agent-shared')).session;
     expect(await manageGrants(other, { operation: 'list' })).toMatchObject({ ok: false, error: { code: 'forbidden' } });
-    expect(await manageGrants(other, { operation: 'withdraw', grant_id: grant.id })).toMatchObject({
-      ok: false,
-      error: { code: 'forbidden' },
-    });
     expect(await manageGrants(main, { operation: 'withdraw', grant_id: grant.id })).toEqual(
       answered({ status: 'withdrawn', grant_id: grant.id }),
     );

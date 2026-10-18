@@ -50,7 +50,7 @@ function disclosureSite(named: string): string | undefined {
  * stored values, named by its id. None of the principal's addresses is ever disclosed (R34): a site gets the
  * assistant's web address. A repeat changes nothing.
  */
-export async function recordDisclosureRequest(
+async function recordDisclosureRequest(
   content: Record<string, unknown>,
   session: Session,
 ): Promise<Record<string, unknown>> {

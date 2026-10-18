@@ -55,11 +55,6 @@ describe('version 1', () => {
       expect(await hasBrowserAccess('ag-research', policy)).toBe(false);
     }
   });
-
-  it('refuses a list it does not read', async () => {
-    write({ schemaVersion: 1, enabled: true, agentGroupIds: ['ag-research'] });
-    expect(await readBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
-  });
 });
 
 describe('version 2', () => {
@@ -97,19 +92,23 @@ describe('version 2', () => {
     expect(await browserAccessGroups(policy)).toEqual(['ag-main']);
     expect(await hasBrowserAccess('ag-external', policy)).toBe(false);
   });
+});
 
-  it.each([
-    ['a repeated group', { schemaVersion: 2, enabled: true, agentGroupIds: ['ag-main', 'ag-main'] }],
-    ['an ID with whitespace', { schemaVersion: 2, enabled: true, agentGroupIds: ['ag main'] }],
-    ['an empty ID', { schemaVersion: 2, enabled: true, agentGroupIds: [''] }],
-    ['no list', { schemaVersion: 2, enabled: true }],
-    ['a list that is not one', { schemaVersion: 2, enabled: true, agentGroupIds: 'ag-main' }],
-    ['an unknown field', { schemaVersion: 2, enabled: true, agentGroupIds: [], profileDir: '/personal' }],
-    ['a version this host does not read', { schemaVersion: 3, enabled: true, agentGroupIds: [] }],
-  ])('reads %s as invalid', async (_case, policy) => {
-    write(policy);
-    expect(await readBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
-  });
+it.each([
+  [
+    'a version-1 file with a list it does not read',
+    { schemaVersion: 1, enabled: true, agentGroupIds: ['ag-research'] },
+  ],
+  ['a repeated group', { schemaVersion: 2, enabled: true, agentGroupIds: ['ag-main', 'ag-main'] }],
+  ['an ID with whitespace', { schemaVersion: 2, enabled: true, agentGroupIds: ['ag main'] }],
+  ['an empty ID', { schemaVersion: 2, enabled: true, agentGroupIds: [''] }],
+  ['no list', { schemaVersion: 2, enabled: true }],
+  ['a list that is not one', { schemaVersion: 2, enabled: true, agentGroupIds: 'ag-main' }],
+  ['an unknown field', { schemaVersion: 2, enabled: true, agentGroupIds: [], profileDir: '/personal' }],
+  ['a version this host does not read', { schemaVersion: 3, enabled: true, agentGroupIds: [] }],
+])('reads %s as invalid', async (_case, policy) => {
+  write(policy);
+  expect(await readBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
 });
 
 it('names each delegator as the browser addresses it: main as main, any other group by its own name', async () => {

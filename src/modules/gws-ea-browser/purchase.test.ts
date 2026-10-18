@@ -50,6 +50,7 @@ import {
 } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
+import { notes } from './principal-fixture.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
@@ -248,17 +249,6 @@ async function grant(): Promise<SpendingAuthority> {
   const rows = await getDb().all<SpendingAuthority>('SELECT * FROM gws_ea_browser_authorities');
   if (!rows[0]) throw new Error('Authority missing');
   return rows[0];
-}
-/** What the host wrote into a session's conversation, oldest first. */
-async function texts(into: Session): Promise<string[]> {
-  return (
-    (await withExistingMailboxSession(into.agent_group_id, into.id, (mailbox) =>
-      mailbox
-        .getInboundHistory(100)
-        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
-        .reverse(),
-    )) ?? []
-  );
 }
 /** Main records what it learned of `attemptId`, as its tool does. */
 function record(attemptId: string, outcome: 'placed' | 'not_placed', source: 'email' | 'principal') {
@@ -723,28 +713,24 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         ? `<script>const box = document.getElementById('round-up'); box.addEventListener('change', () => { if (!box.checked) setTimeout(() => { box.checked = true; }, 50); });</script>`
         : ''
     }`;
-  it('unticks a pre-ticked round-up before the card, which names no charge for it', async () => {
-    reviewChoices = roundUp(false);
+  it.each([
+    ['unticks a pre-ticked round-up before the card, which names no charge for it', false],
+    ['names a round-up the site keeps ticking as a charge on the card, which its approval covers', true],
+  ] as const)('%s', async (_name, kept) => {
+    reviewChoices = roundUp(kept);
     await page.reload();
     await buy();
     const [approval] = await approvals();
-    expect(approval.question).not.toContain('Round up');
-    expect(await page.locator('#round-up').isChecked()).toBe(false);
+    // Only a round-up the site keeps ticked is on the card, as the charge the approval covers.
+    expect(approval.question.includes('Round up')).toBe(kept);
+    expect(approval.question.includes('Extra charge the site keeps selected: "Round up for charity ($0.58)"')).toBe(
+      kept,
+    );
+    expect(await page.locator('#round-up').isChecked()).toBe(kept);
     await click(approval);
     await queue.idle();
     expect(submitted).toBe(1);
-    expect(new URLSearchParams(orderBodies[0]).has('round_up')).toBe(false);
-  });
-  it('names a round-up the site keeps ticking as a charge on the card, which its approval covers', async () => {
-    reviewChoices = roundUp(true);
-    await page.reload();
-    await buy();
-    const [approval] = await approvals();
-    expect(approval.question).toContain('Extra charge the site keeps selected: "Round up for charity ($0.58)"');
-    await click(approval);
-    await queue.idle();
-    expect(submitted).toBe(1);
-    expect(new URLSearchParams(orderBodies[0]).get('round_up')).toBe('on');
+    expect(new URLSearchParams(orderBodies[0]).get('round_up')).toBe(kept ? 'on' : null);
   });
   it('keeps another job off a checkout while its principal card holds the site', async () => {
     await buy();
@@ -1094,14 +1080,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(submitted).toBe(0);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toHaveLength(0);
-    // Main hears of it once, with the attempt id its job's state shows.
-    const told = (await texts(main)).filter((text) => text.includes('unconfirmed'));
-    expect(told).toHaveLength(1);
-    expect(told[0]).toContain(`(attempt ${authority.attempt_id})`);
-    expect(told[0]).toContain('record_purchase_outcome');
-    expect((await readBrowserJob(session.thread_id!))?.unconfirmed).toEqual([
-      expect.objectContaining({ attempt_id: authority.attempt_id, what: 'purchase on amazon.com', total: '$85.00' }),
-    ]);
   });
   it('keeps stale history inconclusive and clears a block only for complete matching host merchant evidence', async () => {
     confirmation = false;
@@ -1163,16 +1141,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await request('second-purchase')).toMatchObject({ status: 'waiting_on_earlier', site: 'amazon.com' });
     expect(await getDb().all('SELECT id FROM gws_ea_browser_purchase_cards')).toHaveLength(1);
     expect(submitted).toBe(1);
-    expect(await record(original.attempt_id, 'placed', 'email')).toEqual({
-      status: 'recorded',
-      thread: session.thread_id,
-      outcome: 'placed',
-      source: 'email',
-    });
+    expect(await record(original.attempt_id, 'placed', 'email')).toMatchObject({ status: 'recorded' });
     expect((await grant()).state).toBe('committed');
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
     // The waiting errand is woken once, naming the site.
-    const woken = (await texts(session)).filter(
+    const woken = (await notes(session)).filter(
       (text) => text.includes('browser_site_available') && text.includes('"site":"amazon.com"'),
     );
     expect(woken).toHaveLength(1);

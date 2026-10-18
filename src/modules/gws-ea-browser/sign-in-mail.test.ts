@@ -63,6 +63,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
+import { writeBrowserAccess } from './testing/browser-access.js';
 
 registerMigration(gwsEaInboxMigration);
 registerSignInMailDelivery(() => {
@@ -363,18 +364,16 @@ it('returns ambiguity when the interpreter cannot identify one credential', asyn
 });
 
 describe("the assistant's email on a sign-in form (KTD14)", () => {
-  it('signs in with the alias, never an address the assistant converses from, even one the site filled in (R26)', async () => {
-    const f = fixture(true, 'Assistant@example.com');
+  it.each([
+    // Never an address the assistant converses from, even one the site filled in (R26).
+    ['an address it converses from', 'Assistant@example.com', ALIAS],
+    // The +tag spelling of the alias an account was registered with.
+    ['a +tag of the alias', ' Tnatsissa+Shop@example.com ', 'tnatsissa+shop@example.com'],
+  ])('signs in with the alias when the field holds %s', async (_case, current, email) => {
+    const f = fixture(true, current);
     await observePage(f.page);
     expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
-    expect(f.values).toEqual([ALIAS, '642981']);
-  });
-
-  it('keeps the +tag spelling of the alias an account was registered with', async () => {
-    const f = fixture(true, ' Tnatsissa+Shop@example.com ');
-    await observePage(f.page);
-    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
-    expect(f.values).toEqual(['tnatsissa+shop@example.com', '642981']);
+    expect(f.values).toEqual([email, '642981']);
   });
 
   it('stops with alias_unavailable while no alias is recorded, before any wait or send (R23)', async () => {
@@ -619,12 +618,7 @@ it.each(['fill', 'restart'] as const)(
       'browser',
     );
     // The setting lists a second group: it may use the browser, but its relays reach only its own errands (R28, KTD15).
-    const policy = `${root}/browser/policy.json`;
-    fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }), {
-      mode: 0o600,
-    });
-    vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', policy);
+    writeBrowserAccess(`${root}/browser/policy.json`, { agentGroupIds: ['main', 'research'] });
     const source = (await resolveSystemSession('main', 'system:principal')).session;
     const research = (await resolveSystemSession('research', 'system:principal')).session;
     const browser = (await resolveSystemSession('browser', 'system:a2a:main:job')).session;

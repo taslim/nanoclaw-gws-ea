@@ -582,11 +582,6 @@ export async function getAliasSetup(): Promise<AliasSetup> {
   return row;
 }
 
-/** The assistant's verified web alias, one of its own addresses (KTD14), or null until one is recorded. */
-export async function getAssistantAlias(): Promise<string | null> {
-  return (await getAliasSetup()).alias;
-}
-
 /**
  * Make `address` the alias the operator is asked to add, or ask for none.
  * A new candidate forgets the previous one's probe, so that probe can never

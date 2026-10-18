@@ -151,26 +151,20 @@ describe('choosing banners in a frame', () => {
   });
 });
 
-describe('the host’s next step on a page load', () => {
+it('takes the host’s next step on a page load: one reject before any second layer, one second layer, then only reports', () => {
   const layered = { settings: 3 };
   const rejecting = { reject: 7 };
-
-  it('presses a reject before it opens any second layer', () => {
-    expect(nextCookieBannerStep([], { opened: false })).toEqual({ kind: 'none' });
-    expect(nextCookieBannerStep([layered, rejecting], { opened: false })).toEqual({
-      kind: 'reject',
-      banner: rejecting,
-      control: 7,
-    });
-  });
-
-  it('opens a second layer once per page load, then leaves the banner to the agent', () => {
-    expect(nextCookieBannerStep([layered], { opened: false })).toEqual({ kind: 'open', banner: layered, control: 3 });
-    expect(nextCookieBannerStep([layered], { opened: true })).toEqual({ kind: 'report', status: 'no_reject_option' });
-  });
-
-  it('after its one reject on a page load, only reports a banner, even one it could reject again', () => {
-    for (const after of ['reappeared', 'reject_failed', 'no_reject_option'] as const)
-      expect(nextCookieBannerStep([rejecting], { after, opened: false })).toEqual({ kind: 'report', status: after });
-  });
+  const cases: Array<[Parameters<typeof nextCookieBannerStep>, ReturnType<typeof nextCookieBannerStep>]> = [
+    [[[], { opened: false }], { kind: 'none' }],
+    [[[layered, rejecting], { opened: false }], { kind: 'reject', banner: rejecting, control: 7 }],
+    [[[layered], { opened: false }], { kind: 'open', banner: layered, control: 3 }],
+    [[[layered], { opened: true }], { kind: 'report', status: 'no_reject_option' }],
+    // After its one reject on a page load, a banner is only reported, even one it could reject again.
+    ...(['reappeared', 'reject_failed', 'no_reject_option'] as const).map((after): (typeof cases)[number] => [
+      [[rejecting], { after, opened: false }],
+      { kind: 'report', status: after },
+    ]),
+  ];
+  for (const [[banners, load], step] of cases)
+    expect(nextCookieBannerStep(banners, load), JSON.stringify(load)).toEqual(step);
 });

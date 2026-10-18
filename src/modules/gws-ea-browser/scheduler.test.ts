@@ -76,10 +76,22 @@ const bounds: WatchBounds = {
   financial: { freeOnly: true, currency: 'USD', maxTotalMinor: 0, maxDueNowMinor: 0 },
   until: '2026-10-16T18:00:00Z',
 };
-async function arm(id: string, key: string, party = 4, version = 1, site = bounds.site): Promise<void> {
+/**
+ * An armed watch of the job. `watch` sets its bounds apart from the shared ones, its venue's release rule, and, for a
+ * region watch (KTD20), its marked region's baseline text.
+ */
+async function arm(
+  id: string,
+  key: string,
+  party = 4,
+  version = 1,
+  site = bounds.site,
+  watch: { bounds?: Partial<WatchBounds>; release?: WatchReleaseRule; baseline?: string } = {},
+): Promise<void> {
   const at = new Date().toISOString();
+  const region = watch.baseline !== undefined;
   await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,'armed',?,?,?)`,
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
     site,
@@ -87,7 +99,13 @@ async function arm(id: string, key: string, party = 4, version = 1, site = bound
     version,
     JSON.stringify({ party: String(party) }),
     key,
-    JSON.stringify({ ...bounds, site, partySize: party }),
+    JSON.stringify({ ...bounds, site, partySize: party, ...watch.bounds }),
+    watch.release ? JSON.stringify(watch.release) : null,
+    region
+      ? JSON.stringify({ role: 'region', name: 'Available tables', ordinal: 0, count: 1, framePath: [], frameUrls: [] })
+      : null,
+    watch.baseline ?? null,
+    region ? at : null,
     at,
     at,
     at,
@@ -637,27 +655,14 @@ const tokyoRelease: WatchReleaseRule = {
   timeZone: 'Asia/Tokyo',
   wording: 'Tables released 30 days ahead at 10:00',
 };
-async function armTokyoDinner(id: string, site: string, release: WatchReleaseRule | null): Promise<void> {
-  const at = new Date().toISOString();
-  await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,1,'{}',?,?,?,'armed',?,?,?)`,
-    id,
-    jobId,
-    site,
-    `recipe:${site}`,
-    id,
-    JSON.stringify({
-      ...bounds,
-      site,
+const armTokyoDinner = (id: string, site: string, release?: WatchReleaseRule): Promise<void> =>
+  arm(id, id, 4, 1, site, {
+    bounds: {
       windows: [{ start: '2026-11-24T10:00:00.000Z', end: '2026-11-24T12:00:00.000Z' }],
       until: '2026-11-24T00:00:00.000Z',
-    }),
-    release ? JSON.stringify(release) : null,
-    at,
-    at,
-    at,
-  );
-}
+    },
+    release,
+  });
 /** Ticks every five seconds through the principal's night of 25 October, around 10:00 in Tokyo. */
 async function tickThroughRelease(scheduler: ReturnType<typeof createBrowserWatchScheduler>): Promise<void> {
   for (let at = Date.parse('2026-10-25T00:55:00Z'); at <= Date.parse('2026-10-25T01:30:00Z'); at += 5_000) {
@@ -675,14 +680,18 @@ async function checksStarted(site: string): Promise<string[]> {
   ).map((row) => row.started_at);
 }
 
-it("checks a few seconds after the venue's release and at the floor through its burst, during the principal's night", async () => {
+it("checks a few seconds after the venue's release, at the floor through its burst and within the site's hourly cap, during the principal's night", async () => {
   // 01:00 UTC is 05:00 in Dubai, inside the principal's night, and 10:00 in Tokyo.
   await seedPrincipal('Asia/Dubai');
   await armTokyoDinner('release', 'resy.com', tokyoRelease);
-  await armTokyoDinner('ordinary', 'opentable.com', null);
-  const { scheduler, checks } = countingScheduler();
+  await armTokyoDinner('capped', 'exploretock.com', tokyoRelease);
+  await armTokyoDinner('ordinary', 'opentable.com');
+  const { scheduler, checks } = countingScheduler((site) => ({
+    ...watchSitePolicy(site),
+    ...(site === 'exploretock.com' ? { hourlyCap: 4 } : {}),
+  }));
   await scheduler.tick();
-  expect(checks()).toBe(2);
+  expect(checks()).toBe(3);
   await tickThroughRelease(scheduler);
   const started = await checksStarted('resy.com');
   expect(started[0]).toBe('2026-10-25T01:00:05.000Z');
@@ -694,44 +703,21 @@ it("checks a few seconds after the venue's release and at the floor through its 
   }
   expect(started.length).toBeGreaterThanOrEqual(9);
   expect(started.at(-1)! < '2026-10-25T01:10:05.000Z').toBe(true);
+  // On a site whose hourly cap is four, the burst runs four, and the cap sets the next: an hour after the first.
+  const capped = await checksStarted('exploretock.com');
+  expect(capped[0]).toBe('2026-10-25T01:00:05.000Z');
+  expect(capped).toHaveLength(4);
+  expect(Date.parse((await nextCheck('capped'))!)).toBe(Date.parse(capped[0]) + 3_600_000 + 1);
   // A watch without a rule keeps the ordinary cadence, which waits out the night.
   expect(await checksStarted('opentable.com')).toEqual([]);
 });
 
-it('runs a release burst in the principal’s night within the site’s hourly cap', async () => {
-  await seedPrincipal('Asia/Dubai');
-  await armTokyoDinner('release', 'resy.com', tokyoRelease);
-  const { scheduler } = countingScheduler((site) => ({ ...watchSitePolicy(site), hourlyCap: 4 }));
-  await scheduler.tick();
-  await tickThroughRelease(scheduler);
-  const started = await checksStarted('resy.com');
-  expect(started[0]).toBe('2026-10-25T01:00:05.000Z');
-  expect(started).toHaveLength(4);
-  // The cap, not the burst, sets the next check: an hour after the first of the four.
-  expect(Date.parse((await nextCheck('release'))!)).toBe(Date.parse(started[0]) + 3_600_000 + 1);
-});
-
 /** A region watch (KTD20) on an unreviewed site, its slot list marked with `baseline` as its text. */
-async function armRegion(id: string, baseline: string): Promise<void> {
-  const at = new Date().toISOString();
-  await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,'larder.example','recipe:larder',1,'{}',?,?,?,?,?,'armed',?,?,?)`,
-    id,
-    jobId,
-    id,
-    JSON.stringify({ ...bounds, kind: 'region', site: 'larder.example', venue: { id: 'larder', name: 'The Larder' } }),
-    JSON.stringify({ role: 'region', name: 'Available tables', ordinal: 0, count: 1, framePath: [], frameUrls: [] }),
+const armRegion = (id: string, baseline: string): Promise<void> =>
+  arm(id, id, 4, 1, 'larder.example', {
+    bounds: { kind: 'region', venue: { id: 'larder', name: 'The Larder' } },
     baseline,
-    at,
-    at,
-    at,
-    at,
-  );
-  await getDb().run(
-    "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT DO NOTHING",
-    jobId,
-  );
-}
+  });
 const regionWakes = (): number =>
   vi.mocked(requestWake).mock.calls.filter(([, reason]) => reason === 'browser-watch').length;
 /** Runs the scheduler to its watch's next check, `checks` times. */
@@ -742,12 +728,8 @@ async function checkRegion(scheduler: ReturnType<typeof createBrowserWatchSchedu
     await scheduler.tick();
   }
 }
-const regionInterval = async (): Promise<number> =>
-  (Date.parse(
-    (await getDb().get<{ next_check_at: string }>('SELECT next_check_at FROM gws_ea_browser_watches'))!.next_check_at,
-  ) -
-    Date.now()) /
-  60_000;
+const regionInterval = async (id: string): Promise<number> =>
+  (Date.parse((await nextCheck(id))!) - Date.now()) / 60_000;
 
 it('makes no model wakes over a simulated day for a watch on a static page', async () => {
   vi.mocked(requestWake).mockClear();
@@ -792,7 +774,7 @@ it('wakes the agent with each change and books nothing itself; a step toward a b
     await checkRegion(scheduler);
   }
   expect(regionWakes()).toBe(2);
-  expect(await regionInterval()).toBe(16);
+  expect(await regionInterval('changing')).toBe(16);
   expect(
     (
       await getDb().all<{ outcome_json: string }>(
@@ -816,7 +798,42 @@ it('wakes the agent with each change and books nothing itself; a step toward a b
   );
   await checkRegion(scheduler);
   expect(regionWakes()).toBe(3);
-  expect(await regionInterval()).toBe(4);
+  expect(await regionInterval('changing')).toBe(4);
+});
+
+it('holds a sixth change in an hour, keeping its baseline, until the hour allows its wake', async () => {
+  vi.mocked(requestWake).mockClear();
+  await armRegion('capped', 'No tables');
+  let text = 'No tables';
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => ({ status: 'region_read', text }),
+    random: () => 0.5,
+  });
+  /** One check of `next`, due now, ahead of the slowed cadence and the site's floor. */
+  async function changeTo(next: string): Promise<void> {
+    text = next;
+    await getDb().run('UPDATE gws_ea_browser_watches SET next_check_at = ?', new Date().toISOString());
+    await getDb().run('UPDATE gws_ea_browser_watch_site_state SET next_allowed_at = NULL,last_check_at = NULL');
+    await scheduler.tick();
+  }
+  for (const change of ['10:15 PM', '10:30 PM', '10:45 PM', '4:00 PM', '4:30 PM']) await changeTo(change);
+  expect(regionWakes()).toBe(5);
+  await changeTo('4:45 PM');
+  expect(regionWakes()).toBe(5);
+  expect(await getDb().get('SELECT region_baseline FROM gws_ea_browser_watches')).toEqual({
+    region_baseline: '4:30 PM',
+  });
+  vi.setSystemTime(Date.now() + 61 * 60_000);
+  await changeTo('4:45 PM');
+  expect(regionWakes()).toBe(6);
+  const notices = await getDb().all<{ outcome_json: string }>(
+    'SELECT outcome_json FROM gws_ea_browser_watch_notices ORDER BY created_at',
+  );
+  expect((JSON.parse(notices.at(-1)!.outcome_json) as { region: unknown }).region).toEqual({
+    untrusted: true,
+    before: '4:30 PM',
+    after: '4:45 PM',
+  });
 });
 
 it('wakes the agent once to mark the region again when two checks running miss it, and starts over when it is found', async () => {

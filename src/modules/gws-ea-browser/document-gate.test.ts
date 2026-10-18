@@ -138,7 +138,7 @@ function guardedPage() {
   return { page, decide, refuse };
 }
 
-it('places main, cross-site, nested and same-process frames, and windows, with the page they belong to', async () => {
+it('places main, cross-site, nested and same-process frames, and windows, with their page, handing each its method and level', async () => {
   const { browser, pause } = fixture(
     {
       main: { type: 'page' },
@@ -152,30 +152,14 @@ it('places main, cross-site, nested and same-process frames, and windows, with t
   );
   const guarded = guardedPage();
   (await documentGate(browser)).register('main', guarded.page);
-  for (const frame of ['main', 'main-child', 'widget', 'widget-child', 'nested', 'popup'])
-    expect(await pause(frame)).toBe('continued');
-  expect(guarded.decide).toHaveBeenCalledTimes(6);
-});
-
-it("hands each document its method, and whether it is the guarded page's own top-level document", async () => {
-  const { browser, pause } = fixture(
-    {
-      main: { type: 'page' },
-      widget: { type: 'iframe', parentFrameId: 'main' },
-      popup: { type: 'page', openerId: 'main' },
-    },
-    [{ tree: tree('main', 'main-child'), frames: [tree('widget')] }, { tree: tree('popup') }],
-  );
-  const guarded = guardedPage();
-  (await documentGate(browser)).register('main', guarded.page);
   expect(await pause('main', 'Document', {}, 'POST')).toBe('continued');
-  for (const frame of ['main-child', 'widget', 'popup']) expect(await pause(frame)).toBe('continued');
-  // A frame's document and a window's are their page's to decide, but never its own top-level document.
+  for (const frame of ['main-child', 'widget', 'widget-child', 'nested', 'popup'])
+    expect(await pause(frame)).toBe('continued');
+  // Each document carries its method; a frame's document and a window's are their page's to decide, but never its
+  // own top-level document.
   expect(guarded.decide.mock.calls.map(([document]) => [document.method, document.topLevel])).toEqual([
     ['POST', true],
-    ['GET', false],
-    ['GET', false],
-    ['GET', false],
+    ...Array.from({ length: 5 }, () => ['GET', false]),
   ]);
 });
 

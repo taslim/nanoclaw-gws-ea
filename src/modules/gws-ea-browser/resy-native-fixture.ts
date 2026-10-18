@@ -22,6 +22,45 @@ export interface ResyFixtureState {
   /** The saved card the checkout selects; `null` when the diner has no card on file, so none shows or is booked. */
   selectedPayment?: number | null;
 }
+/** A free bar-counter table at L'Artusi, as Resy's own API answers it. */
+export function freeResyTable(): ResyFixtureState {
+  return {
+    inventory: {
+      query: { day: '2026-10-17', party_size: 2 },
+      results: {
+        venues: [
+          {
+            venue: {
+              id: { resy: 25973 },
+              name: "L'Artusi",
+              currency: { code: 'USD' },
+              location: { time_zone: 'EST5EDT' },
+            },
+            slots: [
+              {
+                config: { id: 1442725, token: 'opaque-native-slot-token', type: 'Bar Counter' },
+                date: { start: '2026-10-17 11:00:00', end: '2026-10-17 12:00:00' },
+                size: { min: 2, max: 2 },
+                time: { turn: { actual: 3600 } },
+                payment: { is_paid: false, cancellation_fee: null, deposit_fee: null, is_add_on_required: false },
+                has_add_ons: false,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    policy: [],
+    details: {
+      venue: { id: 25973 },
+      user: { id: 72, payment_methods: [{ id: 101, display: '4242' }] },
+      config: { double_confirmation: false, add_ons: [] },
+      payment: { amounts: { total: 0, items: [] } },
+      cancellation: { fee: null, display: { policy: [] } },
+      book_token: { value: 'secret-book-token' },
+    },
+  };
+}
 export async function resyFixture(
   chromePath: string,
   state: ResyFixtureState,

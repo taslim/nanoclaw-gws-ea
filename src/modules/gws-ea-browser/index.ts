@@ -463,7 +463,6 @@ export {
   classifyActivation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
-  registerReviewedMerchantFlow,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
 export {

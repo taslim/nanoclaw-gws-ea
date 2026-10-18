@@ -143,6 +143,16 @@ function termLines(
   }
   return lines;
 }
+/** The extras a site keeps selected and the agreements approving the card makes, as every card lists them. */
+function choiceLines(facts: PurchaseFacts): string[] {
+  return [
+    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
+    ...(facts.agreements ?? []).map(
+      (agreement) =>
+        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
+    ),
+  ];
+}
 /**
  * An unreviewed checkout's card (KTD5, R8): the site and any payment platform, the account or that it is a guest
  * checkout, the items quoted as shown, the money, the saved payment method, the contact email and any note.
@@ -180,11 +190,7 @@ function renderGenericCard(
       : booking?.timeText
         ? [`Time as the page shows it: ${quotePurchaseText(booking.timeText)}`]
         : []),
-    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
-    ...(facts.agreements ?? []).map(
-      (agreement) =>
-        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
-    ),
+    ...choiceLines(facts),
     ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, principalTimeZone),
   ];
   if (!facts.commitments.length)
@@ -231,11 +237,7 @@ export function renderPurchaseCard(
         ]
       : []),
     ...(bounds.neededBy ? [`Needed by: ${cardTime(bounds.neededBy, principalTimeZone)}`] : []),
-    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
-    ...(facts.agreements ?? []).map(
-      (agreement) =>
-        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
-    ),
+    ...choiceLines(facts),
     ...termLines(facts, facts.reservation?.partySize, money, principalTimeZone),
   ];
   if (facts.noCommitmentTerms)

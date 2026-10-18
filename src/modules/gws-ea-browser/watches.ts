@@ -479,11 +479,8 @@ async function latestBookingStep(db: DbDriver, jobId: string): Promise<number> {
  * followed (a free commit, a purchase card or an authority) matched nothing, and each such wake this hour doubles the
  * cadence; a booking step resets it. A shared check keeps its least-slowed member's pace; a reader watch never slows.
  */
-export async function regionWatchSlowdown(
-  db: DbDriver,
-  watches: readonly WatchRow[],
-  now = Date.now(),
-): Promise<number> {
+export async function regionWatchSlowdown(db: DbDriver, watches: readonly WatchRow[]): Promise<number> {
+  const now = Date.now();
   let slowdown = Infinity;
   for (const watch of watches) {
     if (!watch.region_json) return 1;
@@ -510,8 +507,8 @@ export async function recordRegionCheck(
   watch: WatchRow,
   checkId: string,
   read: RegionCheckRead,
-  now = Date.now(),
 ): Promise<void> {
+  const now = Date.now();
   const at = new Date(now).toISOString();
   await db.transaction(async () => {
     const current = await getBrowserWatch(watch.id, db);

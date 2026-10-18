@@ -119,6 +119,13 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
   const typing = (text: string) => ({
     actions: [{ kind: 'observe' }, { kind: 'type', ref: 'e1', generation: 1, text }],
   });
+  const opening = (url: string) => ({ actions: [{ kind: 'navigate', url }] });
+  const choosing = (value: string) => ({ actions: [{ kind: 'select', ref: 'e1', generation: 1, value }] });
+  const inputs = (...values: string[]) => ({
+    actions: [
+      { kind: 'form_input', fields: values.map((value, index) => ({ ref: `e${index + 1}`, generation: 1, value })) },
+    ],
+  });
 
   beforeEach(async () => {
     await runMigrations(await initTestDb());
@@ -133,52 +140,16 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
     await closeDb();
   });
 
-  it('stops a batch that would give it to a site with alias_unavailable while no alias is recorded, before any action runs', async () => {
-    for (const payload of [
+  it('stops a batch that types, selects or opens it in any spelling: alias_unavailable without an alias, then a refusal naming the alias', async () => {
+    const giving = [
       typing('Juno@corp.example'),
       typing('Reach me at juno+orders@corp.example.'),
-      {
-        actions: [
-          {
-            kind: 'form_input',
-            fields: [
-              { ref: 'e1', generation: 1, value: 'Juno' },
-              { ref: 'e2', generation: 1, value: 'juno@corp.example' },
-            ],
-          },
-        ],
-      },
-    ])
-      expect(await executeBrowserBatch(context, payload)).toEqual({
-        status: 'stopped',
-        reason: 'alias_unavailable',
-        repeat_safe: true,
-      });
-  });
-
-  it('refuses it once an alias is recorded, naming the alias to give instead', async () => {
-    await recordWebAlias('onuj@corp.example');
-    await expect(executeBrowserBatch(context, typing('juno@corp.example'))).rejects.toMatchObject({
-      code: 'invalid-args',
-      message: expect.stringContaining('onuj@corp.example'),
-    });
-  });
-
-  it('runs a batch that types the alias in any spelling, another address or none', async () => {
-    await expect(executeBrowserBatch(context, typing('Table for four'))).rejects.toBe(opened);
-    await recordWebAlias('onuj@corp.example');
-    for (const text of ['onuj@corp.example', 'Onuj+Orders@corp.example', 'morgan@principal.example'])
-      await expect(executeBrowserBatch(context, typing(text)), text).rejects.toBe(opened);
-  });
-
-  it('reads the addresses a batch opens, their query decoded, and the options it selects, the same way', async () => {
-    const opening = (url: string) => ({ actions: [{ kind: 'navigate', url }] });
-    const choosing = (value: string) => ({ actions: [{ kind: 'select', ref: 'e1', generation: 1, value }] });
-    const giving = [
+      inputs('Juno', 'juno@corp.example'),
       opening('https://offers.example/join?email=Juno%2Borders%40corp.example&list=weekly'),
       opening('https://offers.example/join/juno@corp.example'),
       choosing('juno@corp.example'),
     ];
+    // Before any action runs: the context's page is never opened.
     for (const payload of giving)
       expect(await executeBrowserBatch(context, payload), JSON.stringify(payload)).toEqual({
         status: 'stopped',
@@ -191,7 +162,18 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
         code: 'invalid-args',
         message: expect.stringContaining('onuj@corp.example'),
       });
-    for (const payload of [opening('https://offers.example/join?email=onuj%40corp.example'), choosing('Weekly')])
+  });
+
+  it('runs a batch that gives the alias in any spelling, another address or none', async () => {
+    await expect(executeBrowserBatch(context, typing('Table for four'))).rejects.toBe(opened);
+    await recordWebAlias('onuj@corp.example');
+    for (const payload of [
+      typing('onuj@corp.example'),
+      typing('Onuj+Orders@corp.example'),
+      typing('morgan@principal.example'),
+      opening('https://offers.example/join?email=onuj%40corp.example'),
+      choosing('Weekly'),
+    ])
       await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toBe(opened);
   });
 });

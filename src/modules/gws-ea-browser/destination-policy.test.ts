@@ -7,6 +7,7 @@ import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import { assertWiringAdmitted } from '../../db/wiring-admission.js';
 import '../gws-ea-profile/index.js';
 import './destination-policy.js';
+import { writeBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
@@ -77,12 +78,7 @@ it('refuses direct channel wiring to the browser even from a trusted host caller
 it('admits the edge pair of each group a version-2 list names, and no other', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-destination-policy-'));
   try {
-    fs.mkdirSync(path.join(root, 'browser'), { mode: 0o700 });
-    const file = path.join(root, 'browser', 'policy.json');
-    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, enabled: false, agentGroupIds: ['external'] }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+    writeBrowserAccess(path.join(root, 'browser', 'policy.json'), { agentGroupIds: ['external'], enabled: false });
     const out = {
       agent_group_id: 'external',
       local_name: 'browser',

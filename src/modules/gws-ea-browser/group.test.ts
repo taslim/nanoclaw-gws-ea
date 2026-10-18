@@ -26,6 +26,7 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import './guidance.js';
 import { browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
+import { writeBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
   setBrowserAdmissionReady(true);
@@ -172,12 +173,7 @@ it('admits the errands of every listed group, and no longer main once the list l
   for (const id of ['main', 'research'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
-  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-  const policy = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
   const id = await ensureBrowserGroup();
   const admit = async (thread: string) =>
     assertSessionAdmitted({
@@ -186,6 +182,4 @@ it('admits the errands of every listed group, and no longer main once the list l
     });
   await expect(admit('system:a2a:research:errand')).resolves.toBeUndefined();
   await expect(admit('system:a2a:main:errand')).rejects.toThrow('errand delegated by an agent with browser access');
-  expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(true);
-  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
 });

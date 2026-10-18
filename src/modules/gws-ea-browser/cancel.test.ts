@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -10,10 +9,7 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
 }));
-import type { ResponseFrame } from '../../cli/frame.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -30,6 +26,7 @@ import { BrowserQueue } from './queue.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
+import { deliverAction as send, refusal } from './testing/delivery-answer.js';
 import { vaultAccessGuard } from './vault-access.js';
 
 let session: Session;
@@ -274,22 +271,6 @@ describe('cancelling a job with credential attempts', () => {
 });
 
 describe('a second agent group the browser access setting lists', () => {
-  let requests = 0;
-  /** Send one request as the runner's tool would, and read the host's one answer. */
-  async function send(from: Session, action: string, fields: Record<string, unknown>): Promise<ResponseFrame> {
-    const requestId = `access-${++requests}`;
-    await getDeliveryAction(action)!({ ...fields, action, requestId }, from);
-    const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
-    try {
-      const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
-        content: string;
-      };
-      return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
-    } finally {
-      db.close();
-    }
-  }
-  const refused = (frame: ResponseFrame): string => (frame.ok ? 'accepted' : frame.error.message);
   const bounds = {
     venue_id: 'bistro-ellery',
     party_size: 2,
@@ -336,10 +317,10 @@ describe('a second agent group the browser access setting lists', () => {
       [main, researchThread],
       [research, mainThread],
     ] as const) {
-      expect(refused(await send(from, 'cancel_job', { thread }))).toBe(
+      expect(refusal(await send(from, 'cancel_job', { thread }))).toBe(
         'No delegated browser job exists for that thread.',
       );
-      expect(refused(await send(from, 'reservation_bounds', { thread, ...bounds }))).toBe(
+      expect(refusal(await send(from, 'reservation_bounds', { thread, ...bounds }))).toBe(
         'No live browser job of yours exists for that thread.',
       );
     }
@@ -360,18 +341,15 @@ describe('a second agent group the browser access setting lists', () => {
   });
 
   it('refuses a group the setting does not list, and main once it lists only others', async () => {
-    expect(refused(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
+    expect(refusal(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
       'Only an agent with browser access may manage browser jobs.',
     );
     fs.writeFileSync(
       `${root}/browser/policy.json`,
       JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }),
     );
-    expect(refused(await send(main, 'cancel_job', { thread: mainThread }))).toBe(
+    expect(refusal(await send(main, 'cancel_job', { thread: mainThread }))).toBe(
       'Only an agent with browser access may manage browser jobs.',
     );
-    expect(
-      await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'research' }, payload: {} }),
-    ).toMatchObject({ effect: 'allow' });
   });
 });

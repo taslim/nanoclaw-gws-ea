@@ -22,26 +22,18 @@ vi.mock('../../container-runner.js', () => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { requestWake } from '../../request-wake.js';
-import {
-  resolveSession,
-  resolveSystemSession,
-  withExistingMailboxSession,
-  writeSessionMessage,
-} from '../../session-manager.js';
+import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
-import { upsertUser } from '../permissions/db/users.js';
-import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import type { ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { notifyPendingIncidents, recordIncidentWithStop, stopForUnapprovedCommit } from './incidents.js';
+import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
 import type { BrowserExecutionContext } from './queue.js';
 
-const PRINCIPAL = 'gchat:users/principal';
 const EVIDENCE: ConfirmationEvidence = {
   source: 'https://shop.example/reorder/submit',
   reference: 'SO-48213',
@@ -51,40 +43,9 @@ const EVIDENCE: ConfirmationEvidence = {
 
 let main: Session;
 
-async function policy(agentGroupIds?: readonly string[]): Promise<void> {
-  fs.mkdirSync(`${root}/browser`, { recursive: true });
-  fs.writeFileSync(
-    `${root}/browser/policy.json`,
-    JSON.stringify(
-      agentGroupIds ? { schemaVersion: 2, enabled: true, agentGroupIds } : { schemaVersion: 1, enabled: true },
-    ),
-    { mode: 0o600 },
-  );
-}
-
-/** A live errand that `source` opened, with its lazily created job. */
-async function errand(source: string, name: string): Promise<{ session: Session; job: BrowserJob }> {
-  const session = (await resolveSystemSession('browser-p', `system:a2a:${source}:${name}`)).session;
-  const job = await new BrowserStore().jobForSession(session);
-  if (!job) throw new Error('The errand was not admitted');
-  return { session, job };
-}
-
 /** The request context an executor stops its job from. */
 const context = (job: BrowserJob): BrowserExecutionContext =>
   ({ job, request: { id: `request-${job.id}` }, store: new BrowserStore() }) as unknown as BrowserExecutionContext;
-
-/** What the host wrote into a session, oldest first. */
-async function notes(session: Session): Promise<string[]> {
-  return (
-    (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox
-        .getInboundHistory(20)
-        .map((message) => (JSON.parse(message.content) as { text: string }).text)
-        .reverse(),
-    )) ?? []
-  );
-}
 
 const incidents = () =>
   getDb().all<{ kind: string; site: string; job_id: string; notified_at: string | null }>(
@@ -93,31 +54,9 @@ const incidents = () =>
 
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
-  await policy();
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/browser/policy.json`);
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', writeBrowserPolicy(root));
   await runMigrations(await initTestDb());
-  for (const id of ['main-p', 'browser-p', 'desk-p'])
-    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
-  await createMessagingGroup({
-    id: 'mg-principal',
-    channel_type: 'gchat',
-    platform_id: 'spaces/principal',
-    name: 'principal',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: new Date().toISOString(),
-  });
-  await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
-    assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
-    principalTimezone: 'America/Los_Angeles',
-    mainAgentGroupId: 'main-p',
-    principalEmails: ['morgan@example.test'],
-  });
-  await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'browser-p');
-  await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
-  main = (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
+  main = await seedAssistant();
   vi.mocked(requestWake).mockClear();
 });
 
@@ -126,17 +65,6 @@ afterEach(async () => {
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
-
-/** The principal's direct message, through which main's notes reach them. */
-async function principalReachable(): Promise<void> {
-  await upsertUserDm({
-    user_id: PRINCIPAL,
-    channel_type: 'gchat',
-    messaging_group_id: 'mg-principal',
-    resolved_at: new Date().toISOString(),
-  });
-  await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
-}
 
 describe('an unapproved commit', () => {
   it('is recorded with its job stop in one transaction and told to main at once, once', async () => {
@@ -174,7 +102,7 @@ describe('an unapproved commit', () => {
 
   it('is told to another group with browser access in the session it delegated from, never main', async () => {
     await principalReachable();
-    await policy(['main-p', 'desk-p']);
+    writeBrowserPolicy(root, ['main-p', 'desk-p']);
     const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
     const { session, job } = await errand('desk-p', 'restock');
     await writeSessionMessage('browser-p', session.id, {

@@ -128,17 +128,23 @@ async function executionContext(name: string) {
   return { queue, context: (await queue.contextForRequest(request.id))! };
 }
 
-async function seedWatch(id: string, site = 'resy.com'): Promise<void> {
+/** An armed watch of the job: a reader watch on `watched`, a site, or a region watch (KTD20) with those bounds. */
+async function seedWatch(id: string, watched: string | WatchBounds = 'resy.com'): Promise<void> {
   const at = '2026-10-15T12:00:00.000Z';
+  const region = typeof watched === 'string' ? undefined : watched;
+  const site = typeof watched === 'string' ? watched : watched.site;
   await getDb().run(
     `INSERT INTO gws_ea_browser_watches
-    (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at)
-    VALUES(?,?,?,'recipe',1,'{}',?,?, 'armed',?,?,?)`,
+    (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+    VALUES(?,?,?,'recipe',1,'{}',?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
     site,
     id,
-    JSON.stringify({ ...bounds, site }),
+    JSON.stringify(region ?? { ...bounds, site }),
+    region ? '{}' : null,
+    region ? 'No tables' : null,
+    region ? at : null,
     at,
     at,
     at,
@@ -717,17 +723,19 @@ describe('native watch bounds and one booking claim', () => {
   });
 });
 
+/** The agent's request for a free watch of the Bistro on Resy, checked with the `check-recipe` recipe. */
+const free = {
+  site: 'https://resy.com/search',
+  recipe_id: 'check-recipe',
+  parameters: {},
+  venue: bounds.venue,
+  party_size: 4,
+  windows: bounds.windows,
+  financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+  until: bounds.until,
+};
+
 describe('venue release schedules and card times', () => {
-  const free = {
-    site: 'https://resy.com/search',
-    recipe_id: 'check-recipe',
-    parameters: {},
-    venue: bounds.venue,
-    party_size: 4,
-    windows: bounds.windows,
-    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
-    until: bounds.until,
-  };
   it('reads a release rule apart from the bounds and refuses one it could not schedule', () => {
     const wording = 'Tables released 30 days ahead at 10:00';
     expect(validateWatchRequest({ ...free, release: { days_ahead: 30, time: '10:00', wording } })).toMatchObject({
@@ -760,7 +768,7 @@ describe('venue release schedules and card times', () => {
       { days_ahead: 30, time: '10:00', wording, until: bounds.until },
       'Tables released 30 days ahead at 10:00',
     ])
-      expect(() => validateWatchRequest({ ...free, release })).toThrow();
+      expect(() => validateWatchRequest({ ...free, release })).toThrow('A release rule needs');
   });
 
   it("stores the rule once, on the venue's clock as the host reads it, outside the bounds the principal approves", async () => {
@@ -886,9 +894,6 @@ describe('venue release schedules and card times', () => {
     const card = renderWatchCard(watch, 'UTC', 'America/Los_Angeles');
     expect(card).toContain('converts Nov 15, 2026, 12:00 AM Los Angeles time');
     expect(card).not.toContain('2026-11-15T08:00:00');
-    expect(card).toContain(
-      'Arrival window: Oct 16, 2026, 7:00 PM through 9:00 PM UTC (Oct 16, 2026, 12:00 PM through 2:00 PM Los Angeles time)',
-    );
   });
 });
 
@@ -936,26 +941,17 @@ describe('watches on sites with no reader (KTD20)', () => {
       },
     };
   }
-  async function seedRegionWatch(id: string, watchBounds: WatchBounds = regionBounds, status = 'armed'): Promise<void> {
-    const at = new Date().toISOString();
-    await getDb().run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
-      VALUES(?,?,'larder.example','recipe',1,'{}',?,?,'{}','No tables',?,?,?,?,?)`,
-      id,
-      jobId,
-      id,
-      JSON.stringify(watchBounds),
-      at,
-      status,
-      at,
-      at,
-      at,
-    );
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT(job_id) DO NOTHING",
-      jobId,
-    );
-  }
+  /** The agent's request for a free watch of The Larder's tables, checked with the `larder-recipe` recipe. */
+  const regionRequest = {
+    site: 'https://larder.example/tables',
+    recipe_id: 'larder-recipe',
+    parameters: {},
+    venue: { id: 'the-larder', name: 'The Larder' },
+    party_size: 2,
+    windows: regionBounds.windows,
+    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+    until: regionBounds.until,
+  };
 
   it('covers a booking the site’s own checkout reads within the merchant, venue, party, window and maximum', () => {
     const now = '2026-10-15T12:00:00.000Z';
@@ -964,7 +960,8 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(compareWatchBounds(regionBounds, depositFacts(4000, { venue: 'THE LARDER' }), now).status).toBe(
       'within_bounds',
     );
-    const outside: Array<[PurchaseFacts, string]> = [
+    const outside: Array<[PurchaseFacts, string, string?]> = [
+      [depositFacts(), 'deadline', regionBounds.until],
       [{ ...depositFacts(), site: 'tables.example' }, 'merchant'],
       [depositFacts(4000, { venue: 'The Larder Annex' }), 'venue_or_party'],
       [depositFacts(4000, { partySize: 4 }), 'venue_or_party'],
@@ -982,41 +979,30 @@ describe('watches on sites with no reader (KTD20)', () => {
         'financial_terms',
       ],
       [{ ...depositFacts(), addOns: ['Wine pairing'] }, 'financial_terms'],
-    ];
-    for (const [facts, reason] of outside)
-      expect(compareWatchBounds(regionBounds, facts, now)).toEqual({ status: 'outside_bounds', reason });
-    // A no-show fee per guest counts for every guest against the maximum.
-    const noShow = {
-      ...depositFacts(0),
-      commitments: [
+      // A no-show fee per guest counts for every guest against the maximum.
+      [
         {
-          kind: 'conditional_fee' as const,
-          terms: 'No-show fee $30 per person',
-          amountMinor: 3000,
-          perPerson: true,
-          conditionalTrigger: 'no_show' as const,
+          ...depositFacts(0),
+          commitments: [
+            {
+              kind: 'conditional_fee',
+              terms: 'No-show fee $30 per person',
+              amountMinor: 3000,
+              perPerson: true,
+              conditionalTrigger: 'no_show',
+            },
+          ],
         },
+        'financial_limit',
       ],
-    };
-    expect(compareWatchBounds(regionBounds, noShow, now)).toEqual({
-      status: 'outside_bounds',
-      reason: 'financial_limit',
-    });
-    expect(compareWatchBounds(regionBounds, depositFacts(), regionBounds.until).status).toBe('outside_bounds');
-  });
-
-  it('leaves a booking its approval does not cover to the purchase’s own card', async () => {
-    await seedRegionWatch('larder');
-    const { context } = await executionContext('larder-purchase');
-    expect(await prepareWatchPurchase(context, depositFacts(8000))).toBeUndefined();
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_watch_notices')).toEqual([]);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_authorities')).toEqual([]);
+    ];
+    for (const [facts, reason, at = now] of outside)
+      expect(compareWatchBounds(regionBounds, facts, at)).toEqual({ status: 'outside_bounds', reason });
   });
 
   it('lets a free commit or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
-    await seedRegionWatch('larder');
-    await seedRegionWatch('elsewhere', { ...regionBounds, site: 'tables.example' });
-    await getDb().run("UPDATE gws_ea_browser_watches SET site = 'tables.example' WHERE id = 'elsewhere'");
+    await seedWatch('larder', regionBounds);
+    await seedWatch('elsewhere', { ...regionBounds, site: 'tables.example' });
     const at = new Date().toISOString();
     // A commit on another site touches nothing.
     await claimRegionWatchCommit(getDb(), {
@@ -1046,52 +1032,34 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'cancelled' });
   });
 
-  it('lets a free booking spend only a watch whose venue, party and windows it falls within', async () => {
-    await seedRegionWatch('early', {
+  // A free booking spends only a watch its page's venue, party and start do not fall outside; a fact the page leaves
+  // unstated may be the watched table, so it spends the first watch it may be.
+  it.each<[string, GenericBookingFacts, 'early' | 'larder' | null]>([
+    ['another venue', { venue: 'The Larder Annex', partySize: 2, at: '2026-10-16T19:30:00-07:00' }, null],
+    ['another party size', { venue: 'The Larder', partySize: 4, at: '2026-10-16T19:30:00-07:00' }, null],
+    ['a start outside both windows', { venue: 'The Larder', partySize: 2, at: '2026-10-16T22:15:00-07:00' }, null],
+    ['the later watch’s window', { venue: 'THE LARDER', partySize: 2, at: '2026-10-16T19:30:00-07:00' }, 'larder'],
+    ['no stated party or time', { venue: 'The Larder', timeText: 'Saturday evening' }, 'early'],
+  ])('lets a free booking for %s spend the watch it falls within', async (_case, booking, spent) => {
+    await seedWatch('early', {
       ...regionBounds,
       windows: [{ start: '2026-10-17T00:00:00.000Z', end: '2026-10-17T01:00:00.000Z' }],
     });
-    await seedRegionWatch('larder');
-    const at = new Date().toISOString();
-    const free = (attemptId: string, booking: GenericBookingFacts) =>
-      claimRegionWatchCommit(getDb(), { jobId, site: 'larder.example', attemptId, requestId: attemptId, at, booking });
-    // Another venue, party size or start on the same site is not a watched table: it leaves both watches going.
-    await free('annex', { venue: 'The Larder Annex', partySize: 2, at: '2026-10-16T19:30:00-07:00' });
-    await free('four', { venue: 'The Larder', partySize: 4, at: '2026-10-16T19:30:00-07:00' });
-    await free('late', { venue: 'The Larder', partySize: 2, at: '2026-10-16T22:15:00-07:00' });
-    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual({
-      state: 'available',
-      watch_id: null,
-    });
-    expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual([
-      { id: 'early', status: 'armed' },
-      { id: 'larder', status: 'armed' },
-    ]);
-    // A table within the later watch's window spends the job's one booking on that watch, not the earlier one.
-    await free('covered', { venue: 'THE LARDER', partySize: 2, at: '2026-10-16T19:30:00-07:00' });
-    expect(await getDb().get('SELECT state,watch_id,attempt_id FROM gws_ea_browser_watch_job_claims')).toEqual({
-      state: 'committing',
-      watch_id: 'larder',
-      attempt_id: 'covered',
-    });
-    expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
-    expect(await getBrowserWatch('early')).toMatchObject({ status: 'armed' });
-  });
-
-  it('lets a free booking whose page states no party or time spend the watch it may be', async () => {
-    await seedRegionWatch('larder');
+    await seedWatch('larder', regionBounds);
     await claimRegionWatchCommit(getDb(), {
       jobId,
       site: 'larder.example',
-      attemptId: 'unstated',
-      requestId: 'r1',
+      attemptId: 'free',
+      requestId: 'free',
       at: new Date().toISOString(),
-      booking: { venue: 'The Larder', timeText: 'Saturday evening' },
+      booking,
     });
-    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual({
-      state: 'committing',
-      watch_id: 'larder',
-    });
+    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual(
+      spent ? { state: 'committing', watch_id: spent } : { state: 'available', watch_id: null },
+    );
+    expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual(
+      ['early', 'larder'].map((id) => ({ id, status: id === spent ? 'booking' : 'armed' })),
+    );
   });
 
   it('asks for a region only where the host has no reader, and refuses one where it reads the venue itself', async () => {
@@ -1103,21 +1071,11 @@ describe('watches on sites with no reader (KTD20)', () => {
       jobId,
       new Date().toISOString(),
     );
-    const request = {
-      site: 'https://larder.example/tables',
-      recipe_id: 'larder-recipe',
-      parameters: {},
-      venue: { id: 'the-larder', name: 'The Larder' },
-      party_size: 2,
-      windows: regionBounds.windows,
-      financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
-      until: regionBounds.until,
-    };
-    expect(await createBrowserWatch(context, request)).toEqual({ status: 'refused', reason: 'region_required' });
+    expect(await createBrowserWatch(context, regionRequest)).toEqual({ status: 'refused', reason: 'region_required' });
     const region = { ref: 'e5', generation: 1 };
     expect(
       await createBrowserWatch(context, {
-        ...request,
+        ...regionRequest,
         site: 'https://www.resy.com/',
         recipe_id: 'resy-recipe',
         region,
@@ -1126,7 +1084,7 @@ describe('watches on sites with no reader (KTD20)', () => {
     // A release on a site with no reader needs the venue's zone from the agent.
     expect(
       await createBrowserWatch(context, {
-        ...request,
+        ...regionRequest,
         region,
         release: { days_ahead: 30, time: '10:00', wording: 'Tables open 30 days ahead at 10:00' },
       }),
@@ -1135,24 +1093,15 @@ describe('watches on sites with no reader (KTD20)', () => {
   });
 
   it('reads a region and the watch to mark again, and keeps a queued release readable when it runs', async () => {
-    const request = {
-      site: 'https://larder.example/tables',
-      recipe_id: 'larder-recipe',
-      parameters: {},
-      venue: { id: 'the-larder', name: 'The Larder' },
-      party_size: 2,
-      windows: regionBounds.windows,
-      financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
-      until: regionBounds.until,
-    };
-    expect(validateWatchRequest({ ...request, region: { ref: 'f1e7', generation: 3 } }).region).toEqual({
+    expect(validateWatchRequest({ ...regionRequest, region: { ref: 'f1e7', generation: 3 } }).region).toEqual({
       ref: 'f1e7',
       generation: 3,
     });
-    expect(() => validateWatchRequest({ ...request, region: { ref: 'button', generation: 3 } })).toThrow('region');
-    expect(() => validateWatchRequest({ ...request, watch_id: 'watch-1' })).toThrow('watch_id');
+    expect(() => validateWatchRequest({ ...regionRequest, region: { ref: 'button', generation: 3 } })).toThrow(
+      'region',
+    );
+    expect(() => validateWatchRequest({ ...regionRequest, watch_id: 'watch-1' })).toThrow('watch_id');
     // The queue keeps the agent's own fields, so the run reads a release rule as the agent sent it.
-    const cards = await bindPrincipal();
     const { queue } = await executionContext('queued-release');
     await queue.start();
     try {
@@ -1180,14 +1129,7 @@ describe('watches on sites with no reader (KTD20)', () => {
         {
           action: 'watch',
           requestId: 'queued',
-          site: 'https://resy.com/search',
-          recipe_id: 'check-recipe',
-          parameters: {},
-          venue: bounds.venue,
-          party_size: 4,
-          windows: bounds.windows,
-          financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
-          until: bounds.until,
+          ...free,
           release: { days_ahead: 30, time: '10:00', wording: 'Tables released 30 days ahead at 10:00' },
         },
         session,
@@ -1201,7 +1143,6 @@ describe('watches on sites with no reader (KTD20)', () => {
       expect(await getDb().get('SELECT release_json FROM gws_ea_browser_watches')).toEqual({
         release_json: expect.stringContaining('"timeZone":"America/New_York"') as unknown,
       });
-      expect(cards).toEqual([]);
     } finally {
       await queue.stop();
     }

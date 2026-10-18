@@ -157,22 +157,11 @@ const PAGES: Record<string, string> = {
   '/order-total': `${nativeForm('/signup')}<p>Order total $10.00 due today, charged to your Visa card ending 4242.</p>`,
   '/ambiguous': nativeForm('/signup', 'Go'),
   '/get-signup': nativeForm('/signup').replace('method="post"', 'method="get"'),
-  '/terms-signup': nativeForm(
-    '/signup',
-    'Create account',
-    `${checkbox('terms', 'I agree to the Terms of Service', ' required')}${checkbox('news', 'Send me news and special offers', '')}`,
-  ),
   '/marketing-terms': nativeForm(
     '/signup',
     'Create account',
     checkbox('consent', 'I agree to the Terms and to receive marketing emails', ' required'),
   ),
-  '/paid-terms': nativeForm(
-    '/signup',
-    'Create account',
-    checkbox('member', 'I accept the membership terms and recurring billing', ' required'),
-  ),
-  '/optional-terms': nativeForm('/signup', 'Create account', checkbox('terms', 'I agree to the Terms of Service', '')),
   '/offers-signup': nativeForm(
     '/signup',
     'Create account',
@@ -906,8 +895,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     const anyChecked = async (): Promise<unknown> =>
       page.evaluate("Array.from(document.querySelectorAll('input[type=checkbox]')).some((box) => box.checked)");
 
-    it('ticks the terms box of the bound form before the activation, and leaves the offers box unticked', async () => {
-      const { result, password } = await signUp('/terms-signup', SIGNUP);
+    it('ticks the terms box of the bound form and unticks its pre-ticked offers box before the activation', async () => {
+      const { result, password } = await signUp('/offers-signup', SIGNUP);
       expect(result).toEqual({ status: 'account_created', vault: 'saved' });
       expect(posts).toEqual([
         {
@@ -926,7 +915,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
     it('ticks it in a controlled JS form whose submit control waits for it, through the form’s own handlers', async () => {
       const { result, password } = await signUp('/js-terms', SIGNUP);
       expect(result).toEqual({ status: 'account_created', vault: 'saved' });
-      // The tick reached the controlled form's own state, which is what it posts; the stop tests below prove the
+      // The tick reached the controlled form's own state, which is what it posts; the stop test below proves the
       // engine decides before anything is disclosed.
       expect(posts.map(({ host, path, body }) => ({ host, path, body: JSON.parse(body) as unknown }))).toEqual([
         {
@@ -937,45 +926,26 @@ describe.skipIf(!chromePath)('native authorized signup and password change', () 
       ]);
     }, 30_000);
 
-    for (const [path, what] of [
-      ['/optional-terms', 'a terms box without the required attribute'],
-      ['/offers-signup', 'the terms box, and unticks a pre-ticked offers box,'],
-    ] as const)
-      it(`ticks ${what} before the activation`, async () => {
-        const { result, password } = await signUp(path, SIGNUP);
-        expect(result).toEqual({ status: 'account_created', vault: 'saved' });
-        expect(posts.map((post) => post.body)).toEqual([
-          new URLSearchParams({
-            email: USERNAME,
-            password: password!,
-            password_confirmation: password!,
-            terms: 'on',
-          }).toString(),
-        ]);
-      }, 30_000);
-
-    for (const [path, label] of [
-      ['/marketing-terms', 'I agree to the Terms and to receive marketing emails'],
-      ['/paid-terms', 'I accept the membership terms and recurring billing'],
-    ] as const)
-      it(`stops for "${label}" on ${path} with a stop for the principal, before anything is saved or disclosed`, async () => {
-        await page.goto(`${SITE}${path}`);
-        const authority = await signupAuthority();
-        const result = await fill(authority, await refs(SIGNUP));
-        const stops = await getDb().all<{ id: string; job_id: string; site: string; wording: string }>(
-          'SELECT id,job_id,site,wording FROM gws_ea_browser_consent_stops',
-        );
-        expect(stops).toEqual([{ id: expect.any(String), job_id: JOB, site: 'shop.example', wording: label }]);
-        expect(result).toEqual({
-          status: 'refused',
-          reason: 'consent_required',
-          consent: [{ stop_id: stops[0].id, site: 'shop.example', wording: label }],
-        });
-        expect(posts).toEqual([]);
-        expect(fake.calls).not.toContain('create');
-        expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
-        expect(await anyChecked()).toBe(false);
-      }, 30_000);
+    // Which wordings stop is the consent engine's own decision (consent.test.ts); this is the signup's path to it.
+    it('stops for a terms box bundled with marketing with a stop for the principal, before anything is saved or disclosed', async () => {
+      const label = 'I agree to the Terms and to receive marketing emails';
+      await page.goto(`${SITE}/marketing-terms`);
+      const authority = await signupAuthority();
+      const result = await fill(authority, await refs(SIGNUP));
+      const stops = await getDb().all<{ id: string; job_id: string; site: string; wording: string }>(
+        'SELECT id,job_id,site,wording FROM gws_ea_browser_consent_stops',
+      );
+      expect(stops).toEqual([{ id: expect.any(String), job_id: JOB, site: 'shop.example', wording: label }]);
+      expect(result).toEqual({
+        status: 'refused',
+        reason: 'consent_required',
+        consent: [{ stop_id: stops[0].id, site: 'shop.example', wording: label }],
+      });
+      expect(posts).toEqual([]);
+      expect(fake.calls).not.toContain('create');
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'preparing', exposed_at: null });
+      expect(await anyChecked()).toBe(false);
+    }, 30_000);
 
     it("takes a signup form's own agree-and-create control as its activation", async () => {
       const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });

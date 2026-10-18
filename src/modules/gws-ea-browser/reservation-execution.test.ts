@@ -20,60 +20,20 @@ vi.mock('../../container-runner.js', () => ({
 }));
 vi.mock('../gws-ea-meetings/calendar-facts.js', () => ({ findPrincipalCalendarConflicts: calendar }));
 import type { OutboundFile } from '../../channels/adapter.js';
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { resolveSystemSession } from '../../session-manager.js';
-import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
-import { upsertUser } from '../permissions/db/users.js';
-import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
 import { BrowserQueue } from './queue.js';
 import { observePage, pageMayShowSecret } from './observe.js';
-import { resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
+import { principalReachable, seedPrincipal } from './principal-fixture.js';
+import { freeResyTable, resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import type { WatchBounds } from './watches.js';
 import type { Session } from '../../types.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-function state(): ResyFixtureState {
-  return {
-    inventory: {
-      query: { day: '2026-10-17', party_size: 2 },
-      results: {
-        venues: [
-          {
-            venue: {
-              id: { resy: 25973 },
-              name: "L'Artusi",
-              currency: { code: 'USD' },
-              location: { time_zone: 'EST5EDT' },
-            },
-            slots: [
-              {
-                config: { id: 1442725, token: 'opaque-native-slot-token', type: 'Bar Counter' },
-                date: { start: '2026-10-17 11:00:00', end: '2026-10-17 12:00:00' },
-                size: { min: 2, max: 2 },
-                time: { turn: { actual: 3600 } },
-                payment: { is_paid: false, cancellation_fee: null, deposit_fee: null, is_add_on_required: false },
-                has_add_ons: false,
-              },
-            ],
-          },
-        ],
-      },
-    },
-    policy: [],
-    details: {
-      venue: { id: 25973 },
-      user: { id: 72, payment_methods: [{ id: 101, display: '4242' }] },
-      config: { double_confirmation: false, add_ons: [] },
-      payment: { amounts: { total: 0, items: [] } },
-      cancellation: { fee: null, display: { policy: [] } },
-      book_token: { value: 'secret-book-token' },
-    },
-  };
-}
 describe.skipIf(!chromePath)('native reservation through the common purchase executor', () => {
   let fixture: Awaited<ReturnType<typeof resyFixture>>;
   let fixtureState: ResyFixtureState;
@@ -126,7 +86,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       mode: 0o600,
     });
     process.env.GWS_EA_BROWSER_POLICY_FILE = policyFile;
-    fixtureState = state();
+    fixtureState = freeResyTable();
     fixture = await resyFixture(chromePath, fixtureState);
     await resyReservationSignature.preparePage?.(fixture.page);
     await load();
@@ -252,30 +212,14 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     });
   }, 15_000);
   describe('an errand with no watch', () => {
-    const PRINCIPAL = 'gchat:users/principal';
     /** Each card posted to the principal, with the files that went with it. */
     let cards: Array<{ card: Record<string, unknown>; files: readonly OutboundFile[] | undefined }>;
     beforeEach(async () => {
       await getDb().run('DELETE FROM gws_ea_browser_watches');
       await getDb().run('DELETE FROM gws_ea_browser_watch_job_claims');
       // The principal who answers purchase cards, in their direct message.
-      await createMessagingGroup({
-        id: 'mg-principal',
-        channel_type: 'gchat',
-        platform_id: 'spaces/principal',
-        name: 'principal',
-        is_group: 0,
-        unknown_sender_policy: 'strict',
-        created_at: new Date().toISOString(),
-      });
-      await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
-      await upsertUserDm({
-        user_id: PRINCIPAL,
-        channel_type: 'gchat',
-        messaging_group_id: 'mg-principal',
-        resolved_at: new Date().toISOString(),
-      });
-      await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
+      await seedPrincipal();
+      await principalReachable();
       cards = [];
       setDeliveryAdapter({
         async deliver(_type, _platformId, _thread, _kind, content, files) {

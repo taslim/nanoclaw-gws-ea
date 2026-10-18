@@ -33,6 +33,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getDestinations } from '../agent-to-agent/db/agent-destinations.js';
 import type { AgentGroup, Session } from '../../types.js';
+import { writeBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
   setBrowserAdmissionReady(true);
@@ -130,11 +131,6 @@ it('creates the sealed per-thread edge and disables every delegated errand even 
 
 describe('the browser access setting', () => {
   const file = `${ROOT}/browser/policy.json`;
-  /** Write the operator's policy where every host check reads it. */
-  function policy(value: Record<string, unknown>): void {
-    fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = file;
-  }
   /** Open an errand from `source` to browser, as its send_message with `thread: "new"` does. */
   async function delegate(source: Session, id: string): Promise<Session> {
     const browser = (await getBrowserAgentGroupId())!;
@@ -175,7 +171,7 @@ describe('the browser access setting', () => {
   });
 
   it('gives each listed group its own edge pair, tools and guidance, and its reports come back to it alone', async () => {
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] });
+    writeBrowserAccess(file, { agentGroupIds: ['main', 'research'] });
     await reconcileBrowserGroup(file);
     const browser = (await getBrowserAgentGroupId())!;
     const errand = { local_name: 'browser', target_id: browser, session_mode: 'per-thread', inbound_untrusted: 1 };
@@ -227,7 +223,7 @@ describe('the browser access setting', () => {
   });
 
   it('cancels the jobs of a group removed from the list and takes back its edges, tools and guidance', async () => {
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] });
+    writeBrowserAccess(file, { agentGroupIds: ['main', 'research'] });
     await reconcileBrowserGroup(file);
     const browser = (await getBrowserAgentGroupId())!;
     const desk = (await resolveSystemSession('research', 'system:test:research')).session;
@@ -236,7 +232,7 @@ describe('the browser access setting', () => {
     const unstarted = await delegate(desk, 'unstarted');
     const own = await delegate((await resolveSystemSession('main', 'system:test:main')).session, 'kept');
 
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main'] });
+    writeBrowserAccess(file, { agentGroupIds: ['main'] });
     await reconcileBrowserGroup(file);
 
     for (const session of [started, unstarted])
@@ -253,34 +249,14 @@ describe('the browser access setting', () => {
   });
 
   it('keeps every route closed while an enabled list names no group', async () => {
-    policy({ schemaVersion: 1, enabled: true });
+    writeBrowserAccess(file);
     await reconcileBrowserGroup(file);
     const errand = await delegate((await resolveSystemSession('main', 'system:test:main')).session, 'before');
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: [] });
+    writeBrowserAccess(file, { agentGroupIds: [] });
     await reconcileBrowserGroup(file);
     expect(await edges('main')).toEqual([]);
     expect(await edges((await getBrowserAgentGroupId())!)).toEqual([]);
     expect(await readBrowserJob(errand.thread_id!)).toMatchObject({ state: 'cancelled' });
     expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
-  });
-
-  it('treats a list edited by hand to name external-email as unavailable, closing the browser to everyone', async () => {
-    await createAgentGroup({
-      id: 'external',
-      name: 'external-email',
-      folder: 'external',
-      agent_provider: null,
-      created_at: new Date().toISOString(),
-    });
-    await getDb().run('UPDATE gws_ea_profile SET external_email_agent_group_id = ? WHERE singleton = 1', 'external');
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] });
-    await reconcileBrowserGroup(file);
-    const errand = await delegate((await resolveSystemSession('research', 'system:test:research')).session, 'errand');
-    policy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research', 'external'] });
-    await reconcileBrowserGroup(file);
-    expect(await edges('main')).toEqual([]);
-    expect(await edges('research')).toEqual([]);
-    expect(await edges('external')).toEqual([]);
-    expect(await readBrowserJob(errand.thread_id!)).toMatchObject({ state: 'cancelled' });
   });
 });

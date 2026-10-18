@@ -435,7 +435,8 @@ describe('the browser credential request', () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
   });
 
-  it('never takes a terms checkbox from the agent, for a signup or a password change', async () => {
+  // The request's fields are the same for every credential operation, a signup's included.
+  it('never takes a terms checkbox from the agent', async () => {
     await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
     const { page, result } = run(String(recorded.authority), {
@@ -445,10 +446,6 @@ describe('the browser credential request', () => {
     });
     await expect(result).rejects.toMatchObject({ code: 'invalid-args' });
     expect(page).not.toHaveBeenCalled();
-    const signup = await ask({ operation: 'signup', site: ORIGIN, username: 'remy.vance@example.com' });
-    const joining = run(String(signup.authority), { username: ref(1), new_password: ref(2), accept_terms: ref(3) });
-    await expect(joining.result).rejects.toMatchObject({ code: 'invalid-args' });
-    expect(joining.page).not.toHaveBeenCalled();
   });
 
   describe('reconciliation', () => {
@@ -983,15 +980,12 @@ describe("a signup's account email (KTD14; R20, R23, R25)", () => {
     );
   });
 
-  it("answers alias_unavailable for one under the assistant's own address while no alias is recorded, and records nothing", async () => {
+  it("answers alias_unavailable for one under the assistant's own address until an alias is recorded, then refuses it naming the alias, and records one only under the alias", async () => {
     for (const username of ['juno@corp.example', 'Juno+Shop@corp.example'])
       expect(await ask({ operation: 'signup', site: ORIGIN, username }), username).toEqual({
         status: 'alias_unavailable',
       });
     expect(await recordedAttempts()).toEqual([]);
-  });
-
-  it("refuses one under the assistant's own address once an alias is recorded, naming the alias, and records one under the alias", async () => {
     await recordWebAlias('onuj@corp.example');
     await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno@corp.example' })).rejects.toMatchObject({
       code: 'invalid-args',

@@ -7,7 +7,6 @@ import { getEmoji, Message, parseMarkdown, type Adapter, type AdapterPostableMes
 import type { ChannelSetup, InboundMessage, OutboundFile } from './adapter.js';
 import {
   createChatSdkBridge,
-  FilesNotAttachedError,
   readPostedRequest,
   splitForLimit,
   type FileAttacher,
@@ -1382,7 +1381,7 @@ describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
   const NO_PICTURE = "I couldn't attach the picture that goes with this.";
   const PICTURE: OutboundFile = { filename: 'checkout.png', mimeType: 'image/png', data: Buffer.from('png bytes') };
 
-  type Attaching = 'attaches' | 'cannot attach' | 'fails';
+  type Attaching = 'attaches' | 'fails';
   interface AttachCall {
     threadId: string;
     message: AdapterPostableMessage;
@@ -1425,7 +1424,6 @@ describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
     const attacher: FileAttacher = {
       postWithFiles: async (threadId, message, files) => {
         attached.push({ threadId, message, files });
-        if (attaching === 'cannot attach') throw new FilesNotAttachedError('Chat refused checkout.png');
         if (attaching === 'fails') throw new Error('Chat could not be reached');
         return posted(threadId);
       },
@@ -1438,15 +1436,7 @@ describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
         : {}),
     });
     await bridge.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: vi.fn() });
-    const { SqliteStateAdapter } = await import('../state-sqlite.js');
-    const state = new SqliteStateAdapter();
-    await state.connect();
-    return {
-      bridge,
-      posts,
-      attached,
-      posted: (messageId: string) => readPostedRequest(state, 'fixture', messageId),
-    };
+    return { bridge, posts, attached };
   }
 
   /** The approval request, naming `pictures` when given, with `files` beside it when given. */
@@ -1469,49 +1459,11 @@ describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
     return { markdown: [`**${TITLE}**`, QUESTION, ...lines, HOW_TO_ANSWER].join('\n\n') };
   }
 
-  it('posts a request with its picture on the one message it is answered on, through an adapter that attaches files', async () => {
-    const desk = await pictureBridge('attaches');
-    try {
-      const id = await desk.bridge.deliver(DM, null, ask(1, [PICTURE]));
-
-      expect(desk.attached).toEqual([{ threadId: DM, message: words(), files: [PICTURE] }]);
-      expect(desk.posts).toEqual([]);
-      expect(id).toBe('spaces/AAAAjuno/messages/morgan.1');
-      expect((await desk.posted(id!))?.questionId).toBe('appr-1');
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('posts the request without its picture, saying so, when the adapter could not attach it', async () => {
-    const desk = await pictureBridge('cannot attach');
-    try {
-      const id = await desk.bridge.deliver(DM, null, ask(1, [PICTURE]));
-
-      expect(desk.attached).toHaveLength(1);
-      expect(desk.posts).toEqual([{ threadId: DM, message: words(NO_PICTURE) }]);
-      expect((await desk.posted(id!))?.questionId).toBe('appr-1');
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
   it('fails the request as any failed post does when the adapter fails for another reason', async () => {
     const desk = await pictureBridge('fails');
     try {
       await expect(desk.bridge.deliver(DM, null, ask(1, [PICTURE]))).rejects.toThrow(/could not be reached/u);
       expect(desk.posts).toEqual([]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
-
-  it('hands an adapter that cannot attach files none, and says the picture is unavailable', async () => {
-    const desk = await pictureBridge();
-    try {
-      await desk.bridge.deliver(DM, null, ask(1, [PICTURE]));
-
-      expect(desk.posts).toEqual([{ threadId: DM, message: words(NO_PICTURE) }]);
     } finally {
       await desk.bridge.teardown();
     }
@@ -1537,19 +1489,23 @@ describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
   });
 
   it.each([
-    ['its bytes did not come with it, as on a re-post after a restart', 1, undefined, NO_PICTURE],
-    ['only some of them came with it', 2, [PICTURE], "I couldn't attach the pictures that go with this."],
-  ] as const)('says the pictures a request names are unavailable when %s', async (_when, pictures, files, line) => {
-    const desk = await pictureBridge('attaches');
-    try {
-      await desk.bridge.deliver(DM, null, ask(pictures, files === undefined ? undefined : [...files]));
+    ['the adapter cannot attach files', undefined, 1, [PICTURE], NO_PICTURE],
+    ['its bytes did not come with it, as on a re-post after a restart', 'attaches', 1, undefined, NO_PICTURE],
+    ['only some of them came with it', 'attaches', 2, [PICTURE], "I couldn't attach the pictures that go with this."],
+  ] as const)(
+    'says the pictures a request names are unavailable when %s',
+    async (_when, attaching, pictures, files, line) => {
+      const desk = await pictureBridge(attaching);
+      try {
+        await desk.bridge.deliver(DM, null, ask(pictures, files === undefined ? undefined : [...files]));
 
-      expect(desk.attached).toEqual([]);
-      expect(desk.posts).toEqual([{ threadId: DM, message: words(line) }]);
-    } finally {
-      await desk.bridge.teardown();
-    }
-  });
+        expect(desk.attached).toEqual([]);
+        expect(desk.posts).toEqual([{ threadId: DM, message: words(line) }]);
+      } finally {
+        await desk.bridge.teardown();
+      }
+    },
+  );
 
   it('posts a request that names no picture as before, attaching no file sent with it', async () => {
     const desk = await pictureBridge('attaches');

@@ -35,7 +35,7 @@ const SINCE = String.raw`(?:today|this\s+week|(?:in\s+)?the\s+(?:last|past)\s+\d
  * the region is compared. A slot's own time ("7:30 PM", "19:30") is availability and stays; a clock's is not. The
  * vocabulary is data, widened or narrowed here.
  */
-export const VOLATILE_REGION_TEXT: Readonly<Record<string, RegExp>> = {
+const VOLATILE_REGION_TEXT: Readonly<Record<string, RegExp>> = {
   /** A clock with seconds, which no slot shows: "19:42:13", "7:42:13 PM". */
   clockSeconds: /\b\d{1,2}:\d{2}:\d{2}(?:\s*[ap]\.?m\.?)?/giu,
   /** A clock reading the page's own time: "Updated 7:42 PM", "As of 19:42", "Local time 7 PM". */

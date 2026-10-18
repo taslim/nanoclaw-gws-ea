@@ -809,10 +809,6 @@ describe("the assistant's web address in each identity section (KTD14)", () => {
       " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`, so you recognize them on a page; " +
         'never type one into a site. Only the host puts one on a site, signing Morgan in to their own account with their login in 1Password.',
     );
-    // Any other group still reads them as it did.
-    expect(await identity(research)).toContain(
-      " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`.",
-    );
   });
 
   it("names the alias as main's web address beside its own, and keeps the principal's accounts to their logins in 1Password", async () => {

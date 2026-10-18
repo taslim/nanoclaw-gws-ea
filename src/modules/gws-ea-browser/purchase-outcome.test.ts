@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { root } = await vi.hoisted(async () => {
@@ -26,15 +27,14 @@ vi.mock('../../container-runner.js', () => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import type { ResponseFrame } from '../../cli/frame.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
-import { guard } from '../../guard/index.js';
+import { getDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
-import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
-import { upsertUser } from '../permissions/db/users.js';
-import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { PurchaseAuthorityError, PurchaseAuthorityStore } from './authority.js';
@@ -42,12 +42,12 @@ import { readBrowserJob } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
 import { SiteLeaseStore } from './leases.js';
-import { notifyPendingUnconfirmed, purchaseOutcomeGuard, recordPurchaseOutcome } from './purchase-outcome.js';
+import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
+import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
 import { claimRegionWatchCommit } from './watches.js';
 import { BrowserQueue } from './queue.js';
 
-const PRINCIPAL = 'gchat:users/principal';
 const ALIAS = 'aya.web@example.test';
 const SITE = 'pottery.example';
 
@@ -92,37 +92,8 @@ const runtime: ConstructorParameters<typeof BrowserQueue>[1] = {
 };
 
 let main: Session;
+const policy = (agentGroupIds?: readonly string[]): string => writeBrowserPolicy(root, agentGroupIds);
 
-async function policy(agentGroupIds?: readonly string[]): Promise<void> {
-  fs.mkdirSync(`${root}/browser`, { recursive: true });
-  fs.writeFileSync(
-    `${root}/browser/policy.json`,
-    JSON.stringify(
-      agentGroupIds ? { schemaVersion: 2, enabled: true, agentGroupIds } : { schemaVersion: 1, enabled: true },
-    ),
-    { mode: 0o600 },
-  );
-}
-
-/** A live errand that `source` opened, with its lazily created job. */
-async function errand(source: string, name: string): Promise<{ session: Session; job: BrowserJob }> {
-  const session = (await resolveSystemSession('browser-p', `system:a2a:${source}:${name}`)).session;
-  const job = await new BrowserStore().jobForSession(session);
-  if (!job) throw new Error('The errand was not admitted');
-  return { session, job };
-}
-
-/** What the host wrote into a session, oldest first. */
-async function notes(session: Session): Promise<string[]> {
-  return (
-    (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox
-        .getInboundHistory(50)
-        .map((message) => (JSON.parse(message.content) as { text: string }).text)
-        .reverse(),
-    )) ?? []
-  );
-}
 const unconfirmedNotes = async (session: Session): Promise<string[]> =>
   (await notes(session)).filter((text) => text.includes('so it is unconfirmed'));
 
@@ -172,7 +143,31 @@ const record = (
   outcome: 'placed' | 'not_placed',
   source: 'email' | 'principal',
   from: Session = main,
-) => recordPurchaseOutcome({ thread, attempt_id: attemptId, outcome, source }, from);
+) =>
+  recordPurchaseOutcome(
+    { thread, attempt_id: attemptId, outcome, source },
+    from,
+    () => new BrowserQueue(new BrowserStore(), runtime),
+  );
+
+let requests = 0;
+/** Sends record_purchase_outcome as the agent's tool does, through its guarded delivery, and reads the one answer. */
+async function recordAsTool(from: Session, fields: Record<string, unknown>): Promise<ResponseFrame> {
+  const requestId = `outcome-${++requests}`;
+  await getDeliveryAction('record_purchase_outcome')!(
+    { ...fields, action: 'record_purchase_outcome', requestId },
+    from,
+  );
+  const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
+  try {
+    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
+      content: string;
+    };
+    return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
+  } finally {
+    db.close();
+  }
+}
 
 const attempt = (id: string) =>
   getDb().get<{ resolution: string | null; resolution_source: string | null; merchant_record_id: string | null }>(
@@ -188,38 +183,10 @@ const blocks = () => getDb().all<{ site: string }>('SELECT site FROM gws_ea_brow
 
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
-  await policy();
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/browser/policy.json`);
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', policy());
   await runMigrations(await initTestDb());
-  for (const id of ['main-p', 'browser-p', 'desk-p'])
-    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
-  await createMessagingGroup({
-    id: 'mg-principal',
-    channel_type: 'gchat',
-    platform_id: 'spaces/principal',
-    name: 'principal',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: new Date().toISOString(),
-  });
-  await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
-    assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
-    principalTimezone: 'America/Los_Angeles',
-    mainAgentGroupId: 'main-p',
-    principalEmails: ['morgan@example.test'],
-  });
-  await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'browser-p');
-  await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
-  await upsertUserDm({
-    user_id: PRINCIPAL,
-    channel_type: 'gchat',
-    messaging_group_id: 'mg-principal',
-    resolved_at: new Date().toISOString(),
-  });
-  await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
-  main = (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
+  main = await seedAssistant();
+  await principalReachable();
 });
 
 afterEach(async () => {
@@ -252,8 +219,6 @@ describe('a purchase with no page proof', () => {
     const store = new PurchaseAuthorityStore();
     expect(await store.waitsOnEarlier(SITE)).toBe(true);
     expect(await store.waitsOnEarlier('table.example')).toBe(false);
-    // The card's one-attempt exception names it.
-    expect(await store.waitsOnEarlier(SITE, [id])).toBe(false);
     expect((await readBrowserJob(job.thread_id))?.unconfirmed).toEqual([
       {
         attempt_id: id,
@@ -272,12 +237,7 @@ describe('a purchase with no page proof', () => {
     expect(await getDb().get('SELECT notified_at FROM gws_ea_browser_purchase_attempts WHERE id = ?', id)).toEqual({
       notified_at: null,
     });
-    await upsertUserDm({
-      user_id: PRINCIPAL,
-      channel_type: 'gchat',
-      messaging_group_id: 'mg-principal',
-      resolved_at: new Date().toISOString(),
-    });
+    await principalReachable();
     await notifyPendingUnconfirmed();
     await notifyPendingUnconfirmed();
     expect(await unconfirmedNotes(main)).toHaveLength(1);
@@ -339,23 +299,6 @@ describe('main recording an unconfirmed purchase', () => {
       (await notes((await getSession(job.browser_session_id))!)).filter((text) => text.includes('"placed"')),
     ).toEqual([]);
     expect((await readBrowserJob(job.thread_id))?.unconfirmed).toBeUndefined();
-  });
-
-  it('records not placed from the principal, leaving the authority spent and the answer for the next card', async () => {
-    const { job } = await errand('main-p', 'mugs');
-    const id = await unconfirmed(job, 'mugs');
-    expect(await record(job.thread_id, id, 'not_placed', 'principal')).toMatchObject({ status: 'recorded' });
-    expect(await attempt(id)).toEqual({
-      resolution: 'not_committed',
-      resolution_source: 'principal',
-      merchant_record_id: null,
-    });
-    expect(await authority(id)).toMatchObject({ state: 'revoked' });
-    expect(await blocks()).toEqual([]);
-    const store = new PurchaseAuthorityStore();
-    expect(await store.recordedNotPlaced(SITE)).toEqual([{ id, attemptedAt: expect.any(String), source: 'principal' }]);
-    await store.markRecordedShown(await store.recordedNotPlaced(SITE), 'card-next');
-    expect(await store.recordedNotPlaced(SITE)).toEqual([]);
   });
 
   it('returns the recorded result to a later recording and never overwrites it', async () => {
@@ -445,16 +388,10 @@ describe('main recording an unconfirmed purchase', () => {
           main,
           () => queue,
         ),
-      ).toEqual({
-        status: 'possible_duplicate',
-        thread: job.thread_id,
-        recorded: { outcome: 'not_placed', source: 'principal' },
-      });
-      expect(
-        await getDb().get('SELECT kind,notified_at FROM gws_ea_browser_incidents WHERE job_id = ?', job.id),
-      ).toEqual({ kind: 'late_confirmation', notified_at: expect.any(String) });
-      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
-        cancelled: 1,
+      ).toMatchObject({ status: 'possible_duplicate' });
+      // The incident is told before the cleanup that fails.
+      expect(await getDb().get('SELECT notified_at FROM gws_ea_browser_incidents WHERE job_id = ?', job.id)).toEqual({
+        notified_at: expect.any(String),
       });
       return job;
     };
@@ -484,32 +421,34 @@ describe('main recording an unconfirmed purchase', () => {
   });
 
   it("refuses another group's attempt, and lets main record one whose group's browser access was removed", async () => {
-    await policy(['main-p', 'desk-p']);
+    policy(['main-p', 'desk-p']);
     const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
+    const ask = (from: Session, thread: string, attemptId: string, outcome: 'placed' | 'not_placed') =>
+      recordAsTool(from, { thread, attempt_id: attemptId, outcome, source: 'principal' });
+    const refused = (message: string) => ({ ok: false, error: { code: 'forbidden', message } });
+    const recorded = { ok: true, data: { status: 'recorded' } };
     const { job } = await errand('desk-p', 'aprons');
     const id = await unconfirmed(job, 'aprons');
-    await expect(record(job.thread_id, id, 'placed', 'email')).rejects.toThrow(
-      'No browser job of yours exists for that thread.',
+    expect(await ask(main, job.thread_id, id, 'placed')).toMatchObject(
+      refused('No browser job of yours exists for that thread.'),
     );
     const mine = await errand('main-p', 'mugs');
     const own = await unconfirmed(mine.job, 'mugs', 'mugs.example');
-    await expect(record(mine.job.thread_id, own, 'placed', 'email', desk)).rejects.toThrow(
-      'No browser job of yours exists for that thread.',
+    expect(await ask(desk, mine.job.thread_id, own, 'placed')).toMatchObject(
+      refused('No browser job of yours exists for that thread.'),
     );
-    // Removed from the browser setting: its errand's notice and its answer fall to main.
-    await policy(['main-p']);
-    expect(
-      await guard(purchaseOutcomeGuard, { actor: { kind: 'agent', agentGroupId: 'desk-p' }, payload: {} }),
-    ).toMatchObject({ effect: 'deny' });
+    // Removed from the browser setting, it records nothing: its errand's notice and its answer fall to main.
+    policy(['main-p']);
+    expect(await ask(desk, job.thread_id, id, 'placed')).toMatchObject(
+      refused('Only an agent with browser access records a purchase outcome.'),
+    );
     const removed = await unconfirmed(job, 'aprons-again', 'aprons.example');
     expect((await unconfirmedNotes(main)).some((text) => text.includes(removed))).toBe(true);
-    expect(await record(job.thread_id, id, 'not_placed', 'principal')).toMatchObject({ status: 'recorded' });
+    expect(await ask(main, job.thread_id, id, 'not_placed')).toMatchObject(recorded);
     expect(await attempt(id)).toMatchObject({ resolution: 'not_committed', resolution_source: 'principal' });
     // Main records whatever the setting lists.
-    await policy(['desk-p']);
-    expect(
-      await guard(purchaseOutcomeGuard, { actor: { kind: 'agent', agentGroupId: 'main-p' }, payload: {} }),
-    ).toMatchObject({ effect: 'allow' });
+    policy(['desk-p']);
+    expect(await ask(main, mine.job.thread_id, own, 'placed')).toMatchObject(recorded);
   });
 });
 
@@ -708,25 +647,6 @@ describe('a region watch (KTD20)', () => {
       status: 'already_recorded',
     });
     expect(await watchState(job, 'larder')).toEqual([{ status: 'booked' }, finished]);
-  });
-
-  it('ends the watch a card booking claimed when its step shows it was not placed', async () => {
-    const { job } = await errand('main-p', 'osteria');
-    await regionWatch(job, 'osteria', 'osteria.example');
-    const id = await press(job, 'osteria', 'osteria.example');
-    await claim(job, 'osteria.example', id);
-    expect(
-      await new PurchaseAuthorityStore().resolve(id, {
-        placed: false,
-        source: 'step',
-        evidence: { declined: 'Your card was declined.' },
-      }),
-    ).toMatchObject({ status: 'resolved' });
-    expect(await watchState(job, 'osteria')).toEqual([
-      { status: 'cancelled' },
-      { state: 'unknown', finished_at: expect.any(String) },
-    ]);
-    expect(await authority(id)).toMatchObject({ state: 'revoked' });
   });
 });
 

@@ -1,6 +1,5 @@
 /** Personal-data disclosures (KTD19; R25, R34) against the real privacy store, central DB and delivery path. */
 import fs from 'node:fs';
-import Database from 'better-sqlite3';
 import type { Frame } from 'playwright-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -11,11 +10,7 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
 }));
-import type { ResponseFrame } from '../../cli/frame.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import type { DbDriver } from '../../db/driver.js';
-import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
@@ -25,6 +20,7 @@ import './index.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { personalDataStop, type FieldFrames } from './disclosures.js';
 import type { BrowserAction } from './executor.js';
+import { deliverAction, refusal } from './testing/delivery-answer.js';
 
 const MOBILE = '+1 415 555 0134';
 const HOME = '123 Main Street, Springfield';
@@ -36,23 +32,9 @@ let browser: Session;
 let job: BrowserJob;
 let mobile: string;
 let home: string;
-let requests = 0;
 
-/** Send one request as main's tool would, and read the host's one answer. */
-async function send(from: Session, fields: Record<string, unknown>): Promise<ResponseFrame> {
-  const requestId = `disclose-${++requests}`;
-  await getDeliveryAction('record_disclosure')!({ ...fields, action: 'record_disclosure', requestId }, from);
-  const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
-  try {
-    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
-      content: string;
-    };
-    return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
-  } finally {
-    db.close();
-  }
-}
-const refused = (frame: ResponseFrame): string => (frame.ok ? 'recorded' : frame.error.message);
+/** Send one request as main's record_disclosure tool would, and read the host's one answer. */
+const send = (from: Session, fields: Record<string, unknown>) => deliverAction(from, 'record_disclosure', fields);
 
 const type = (text: string, ref = 'e1'): BrowserAction => ({ kind: 'type', ref, generation: 1, text });
 const fill = (...values: string[]): BrowserAction => ({
@@ -116,39 +98,40 @@ describe('record_disclosure (KTD19)', () => {
     expect(await getDb().all('SELECT job_id, site, value_id FROM gws_ea_browser_disclosures')).toEqual([
       { job_id: job.id, site: 'osteria.example', value_id: mobile },
     ]);
-    // The value itself stays in the privacy store alone.
+    // The value itself stays in the privacy store alone: no table holds the number however it is written. A
+    // timestamp's milliseconds may read 555, so the check is the whole number.
     const tables = await getDb().all<{ name: string }>(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'gws_ea_private_values'",
     );
     for (const { name } of tables)
-      expect(JSON.stringify(await getDb().all(`SELECT * FROM "${name}"`)), name).not.toMatch(/555|0134/u);
+      expect(JSON.stringify(await getDb().all(`SELECT * FROM "${name}"`)), name).not.toMatch(/415\D{0,2}555\D?0134/u);
   });
 
   it("refuses a value the store does not hold, one of the principal's addresses, a site that is not public, and an unknown field", async () => {
     const theirs = (await addPrivateValue({ label: 'Personal', kind: 'email', value: 'Morgan+home@example.test' })).id;
     const thread = browser.thread_id;
-    expect(refused(await send(main, { thread, site: OSTERIA, value_id: 'pv-000000000000' }))).toMatch(
+    expect(refusal(await send(main, { thread, site: OSTERIA, value_id: 'pv-000000000000' }))).toMatch(
       /No stored private value/u,
     );
-    expect(refused(await send(main, { thread, site: OSTERIA, value_id: theirs }))).toMatch(/sign/u);
+    expect(refusal(await send(main, { thread, site: OSTERIA, value_id: theirs }))).toMatch(/sign/u);
     for (const site of ['localhost', 'http://127.0.0.1/reserve', 'not a site', 'mailto:host@osteria.example'])
-      expect(refused(await send(main, { thread, site, value_id: mobile })), site).toMatch(/public website/u);
-    expect(refused(await send(main, { thread, site: OSTERIA, value_id: mobile, value: MOBILE }))).toMatch(
+      expect(refusal(await send(main, { thread, site, value_id: mobile })), site).toMatch(/public website/u);
+    expect(refusal(await send(main, { thread, site: OSTERIA, value_id: mobile, value: MOBILE }))).toMatch(
       /Unknown record_disclosure field/u,
     );
     expect(await getDb().all('SELECT * FROM gws_ea_browser_disclosures')).toEqual([]);
   });
 
   it("refuses an errand that is not the caller's own or no longer live, and any group without browser access", async () => {
-    expect(refused(await send(main, { thread: 'system:a2a:main:unknown', site: OSTERIA, value_id: mobile }))).toBe(
+    expect(refusal(await send(main, { thread: 'system:a2a:main:unknown', site: OSTERIA, value_id: mobile }))).toBe(
       'No live browser job of yours exists for that thread.',
     );
     const other = (await resolveSystemSession('other', 'system:test:other')).session;
-    expect(refused(await send(other, { thread: browser.thread_id, site: OSTERIA, value_id: mobile }))).toBe(
+    expect(refusal(await send(other, { thread: browser.thread_id, site: OSTERIA, value_id: mobile }))).toBe(
       'Only an agent with browser access may manage browser jobs.',
     );
     await getDb().run('UPDATE gws_ea_browser_jobs SET cancelled = 1 WHERE id = ?', job.id);
-    expect(refused(await send(main, { thread: browser.thread_id, site: OSTERIA, value_id: mobile }))).toBe(
+    expect(refusal(await send(main, { thread: browser.thread_id, site: OSTERIA, value_id: mobile }))).toBe(
       'No live browser job of yours exists for that thread.',
     );
     expect(await getDb().all('SELECT * FROM gws_ea_browser_disclosures')).toEqual([]);
@@ -162,7 +145,7 @@ describe('what a batch gives each site (KTD19, R34)', () => {
     });
   });
 
-  it('lets the disclosed value go to its site, however it is written or split, and reads nothing for a batch that types nothing', async () => {
+  it('lets the disclosed value go to its site, however it is written or split', async () => {
     const batches: BrowserAction[][] = [
       [fill('Morgan Ellery', '(415) 555-0134')],
       [type('+14155550134'), { kind: 'select', ref: 'e2', generation: 1, value: '2' }],
@@ -171,20 +154,26 @@ describe('what a batch gives each site (KTD19, R34)', () => {
       [fill('Table for two')],
     ];
     for (const actions of batches) expect(await stop(OSTERIA, actions), JSON.stringify(actions)).toBeUndefined();
-    const unread = new Proxy({} as DbDriver, {
-      get: () => () => Promise.reject(new Error('The check read the database')),
-    });
-    expect(
-      await personalDataStop(unread, job.id, [{ kind: 'observe' }, { kind: 'scroll', direction: 'down' }], new Map()),
-    ).toBeUndefined();
   });
 
-  it('refuses the disclosed value on any other site: typed there, carried there in an address, or typed after opening it', async () => {
-    expect(await stop(WINNER, [type('415 555 0134')])).toBe('personal_data');
-    expect(await stop(OSTERIA, [navigate('https://winner.example/claim?mobile=%2B1%20415%20555%200134')])).toBe(
-      'personal_data',
-    );
-    expect(await stop(OSTERIA, [navigate(WINNER), type('(415) 555-0134')])).toBe('personal_data');
+  it('refuses the disclosed value on any other site, and a value main never disclosed on every site: typed, split, carried in an address, or typed after opening one', async () => {
+    const refusals: Array<readonly [string, BrowserAction[]]> = [
+      // The disclosed mobile number anywhere but its site.
+      [WINNER, [type('415 555 0134')]],
+      [OSTERIA, [navigate('https://winner.example/claim?mobile=%2B1%20415%20555%200134')]],
+      [OSTERIA, [navigate(WINNER), type('(415) 555-0134')]],
+      // Split across area-code and number fields, or across the batch's actions.
+      [WINNER, [fill('415', '5550134')]],
+      [WINNER, [fill('415', '555', '0134')]],
+      [WINNER, [type('415', 'e1'), type('555', 'e2'), type('0134', 'e3')]],
+      // The home address main never disclosed, on the site it disclosed the mobile number to as well.
+      [OSTERIA, [type('Please deliver to 123 Main St.')]],
+      [WINNER, [type('Please deliver to 123 Main St.')]],
+      [OSTERIA, [navigate('https://maps.example/directions?from=123%20Main%20Street&to=Osteria')]],
+      [OSTERIA, [navigate('https://maps.example/directions/123-main-st/osteria')]],
+    ];
+    for (const [url, actions] of refusals)
+      expect(await stop(url, actions), `${url} ${JSON.stringify(actions)}`).toBe('personal_data');
     // A subdomain is its site: the disclosure names the registrable domain.
     expect(await stop('https://book.osteria.example/', [type('415.555.0134')])).toBeUndefined();
   });
@@ -200,23 +189,6 @@ describe('what a batch gives each site (KTD19, R34)', () => {
     expect(await typed([type('(415) 555-0134', 'e2')], inFrame('https://book.osteria.example/widget'))).toBeUndefined();
     for (const frame of ['about:blank', 'about:srcdoc', 'data:text/html,<input>'])
       expect(await typed([type('(415) 555-0134', 'e2')], inFrame(frame)), frame).toBe('personal_data');
-  });
-
-  it('refuses a phone split across area-code and number fields where no disclosure covers it', async () => {
-    expect(await stop(WINNER, [fill('415', '5550134')])).toBe('personal_data');
-    expect(await stop(WINNER, [fill('415', '555', '0134')])).toBe('personal_data');
-    expect(await stop(WINNER, [type('415', 'e1'), type('555', 'e2'), type('0134', 'e3')])).toBe('personal_data');
-  });
-
-  it('refuses a stored value main never disclosed, on every site, in a field or an address', async () => {
-    for (const url of [OSTERIA, WINNER])
-      expect(await stop(url, [type('Please deliver to 123 Main St.')]), url).toBe('personal_data');
-    expect(await stop(OSTERIA, [navigate('https://maps.example/directions?from=123%20Main%20Street&to=Osteria')])).toBe(
-      'personal_data',
-    );
-    expect(await stop(OSTERIA, [navigate('https://maps.example/directions/123-main-st/osteria')])).toBe(
-      'personal_data',
-    );
   });
 
   it("refuses the principal's address on every site, in any spelling that reaches their mailbox, split or encoded", async () => {
@@ -245,7 +217,7 @@ describe('a disclosure stays with the group whose errand it was recorded for (KT
     });
     expect(await stop(OSTERIA, [type(MOBILE)], job)).toBeUndefined();
     expect(await stop(OSTERIA, [type(MOBILE)], theirs)).toBe('personal_data');
-    expect(refused(await send(research, { thread: browser.thread_id, site: OSTERIA, value_id: home }))).toBe(
+    expect(refusal(await send(research, { thread: browser.thread_id, site: OSTERIA, value_id: home }))).toBe(
       'No live browser job of yours exists for that thread.',
     );
     expect(await send(research, { thread: errand.thread_id, site: OSTERIA, value_id: mobile })).toMatchObject({

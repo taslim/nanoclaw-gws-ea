@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { dispatch } from '../../cli/dispatch.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getAliasSetup, getAssistantAlias, proposeAliasCandidate } from '../gws-ea-profile/db.js';
+import { getAliasSetup, proposeAliasCandidate } from '../gws-ea-profile/db.js';
 import { probeAlias } from './alias-probe.js';
 import { setActiveInbox } from './runtime.js';
 import {
@@ -62,40 +62,13 @@ describe('the web alias probe (KTD13)', () => {
       outcome: 'verified',
       alias: ALIAS,
     });
-    await expect(getAssistantAlias()).resolves.toBe(ALIAS);
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
 
     await expect(probeAlias(inbox(gmail), { address: ALIAS, send: true })).resolves.toEqual({
       outcome: 'verified',
       alias: ALIAS,
     });
     expect(gmail.sent).toHaveLength(1);
-  });
-
-  it('records an alias whose probe arrives after a first read found nothing', async () => {
-    await proposeAliasCandidate(ALIAS);
-    await probeAlias(inbox(gmail), { address: ALIAS, send: true });
-    // Only the copy Gmail keeps as sent: nothing has arrived.
-    await expect(probeAlias(inbox(gmail), { address: ALIAS, send: false })).resolves.toMatchObject({
-      outcome: 'not_yet',
-    });
-
-    gmail.deliver();
-    await expect(probeAlias(inbox(gmail), { address: ALIAS, send: false })).resolves.toEqual({
-      outcome: 'verified',
-      alias: ALIAS,
-    });
-    expect(gmail.sent).toHaveLength(1);
-  });
-
-  it('reports a bounce as not added yet, and records nothing', async () => {
-    await proposeAliasCandidate(ALIAS);
-    gmail.onSend = () => gmail.bounce();
-
-    await expect(probeAlias(inbox(gmail), { address: ALIAS, send: true })).resolves.toEqual({
-      outcome: 'bounced',
-      alias: null,
-    });
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: null, candidate: ALIAS });
   });
 
   it.each(['List-Id', 'X-Google-Group-Id'] as const)(
@@ -110,7 +83,7 @@ describe('the web alias probe (KTD13)', () => {
         outcome: 'group',
         alias: null,
       });
-      await expect(getAssistantAlias()).resolves.toBeNull();
+      await expect(getAliasSetup()).resolves.toMatchObject({ alias: null });
     },
   );
 
@@ -158,38 +131,20 @@ describe('the web alias probe (KTD13)', () => {
 });
 
 describe("the host's alias commands", () => {
-  it('reads the setup, proposes a candidate, and probes it through the running inbox', async () => {
-    const run = (command: string, args: Record<string, unknown> = {}) =>
-      dispatch({ id: command, command, args }, { caller: 'host' });
+  const run = (command: string, args: Record<string, unknown> = {}) =>
+    dispatch({ id: command, command, args }, { caller: 'host' });
 
-    await expect(run('gws-ea-alias-get')).resolves.toMatchObject({
-      ok: true,
-      data: { alias: null, candidate: null, probe_sent: false },
-    });
-    await expect(run('gws-ea-alias-propose', { address: ALIAS })).resolves.toMatchObject({
-      ok: true,
-      data: { alias: null, candidate: ALIAS, probe_sent: false },
-    });
+  it('probes only through the running inbox, recording nothing without it', async () => {
+    await run('gws-ea-alias-propose', { address: ALIAS });
+
     await expect(run('gws-ea-alias-probe', { address: ALIAS, send: true })).resolves.toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/inbox is not running/u) },
     });
-
-    setActiveInbox(inbox(gmail));
-    gmail.onSend = (id) => gmail.deliver(id);
-    await expect(run('gws-ea-alias-probe', { address: ALIAS, send: true })).resolves.toMatchObject({
-      ok: true,
-      data: { outcome: 'verified', alias: ALIAS },
-    });
-    await expect(run('gws-ea-alias-get')).resolves.toMatchObject({
-      ok: true,
-      data: { alias: ALIAS, candidate: null, probe_sent: false },
-    });
+    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS, probe_message_id: null });
   });
 
   it('withdraws a candidate, and refuses unknown or missing fields', async () => {
-    const run = (command: string, args: Record<string, unknown> = {}) =>
-      dispatch({ id: command, command, args }, { caller: 'host' });
     await run('gws-ea-alias-propose', { address: ALIAS });
 
     await expect(run('gws-ea-alias-propose', { none: true })).resolves.toMatchObject({

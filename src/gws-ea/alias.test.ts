@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { dispatch } from '../cli/dispatch.js';
 import { parseArgv } from '../cli/parse-argv.js';
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
-import { getAliasSetup, getAssistantAlias } from '../modules/gws-ea-profile/db.js';
+import { getAliasSetup } from '../modules/gws-ea-profile/db.js';
 import { setActiveInbox } from '../modules/gws-ea-inbox/runtime.js';
 import {
   ALIAS,
@@ -33,11 +33,10 @@ import { runCli } from './cli.js';
 import type { RunEvent } from './events.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
-import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionResult } from './phases.js';
 import { claimInstanceAlias, getInstanceReservation } from './registry.js';
-import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
+import { persistTestRuntime } from './testing/runtime-fixture.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 describe("the assistant's web alias name (R21)", () => {
@@ -64,7 +63,6 @@ describe("the assistant's web alias name (R21)", () => {
     if (stem.status !== 'derived') return;
     expect(stem.stem.length).toBe(60);
     expect(aliasCandidateAfter(stem.stem, `${stem.stem}9998`)).toBe(`${stem.stem}9999`);
-    expect(`${stem.stem}9999`.length).toBeLessThanOrEqual(64);
   });
 
   it('offers the reversed name first, and skips a role address to the next candidate', () => {
@@ -246,7 +244,7 @@ describe('the web alias setup step (KTD13)', () => {
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
 
     expect(world.gmail.sent).toHaveLength(1);
-    await expect(getAssistantAlias()).resolves.toBe(ALIAS);
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
     expect(await world.claimed()).toBe(ALIAS);
     await expect(world.run()).resolves.toEqual({ status: 'ready' });
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
@@ -258,7 +256,7 @@ describe('the web alias setup step (KTD13)', () => {
     world.gmail.onSend = (id) => world.gmail.deliver(id);
 
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
-    await expect(getAssistantAlias()).resolves.toBe(ALIAS);
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
   });
 
   it('stays pending as not added yet when the probe bounces', async () => {
@@ -295,7 +293,7 @@ describe('the web alias setup step (KTD13)', () => {
     world.gmail.deliver();
     await expect(world.run()).resolves.toEqual({ status: 'ready' });
     expect(world.gmail.sent).toHaveLength(1);
-    await expect(getAssistantAlias()).resolves.toBe(ALIAS);
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
   });
 
   it('refuses a copy that came through a Google Group', async () => {
@@ -307,7 +305,7 @@ describe('the web alias setup step (KTD13)', () => {
       code: 'alias_is_group',
       resumeFlag: '--alias-taken',
     });
-    await expect(getAssistantAlias()).resolves.toBeNull();
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: null });
   });
 
   it('moves a taken candidate to the next, and a resume after it offers only the new one', async () => {
@@ -347,7 +345,7 @@ describe('the web alias setup step (KTD13)', () => {
     await expect(world.run({ kind: 'added', name: 'juno.hale@example.test' })).resolves.toEqual({
       status: 'ready',
     });
-    await expect(getAssistantAlias()).resolves.toBe('juno.hale@example.test');
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'juno.hale@example.test' });
     expect(await world.claimed()).toBe('juno.hale@example.test');
 
     // Once verified, the alias does not change here.
@@ -380,24 +378,7 @@ describe('the web alias setup step (KTD13)', () => {
 
   it("takes the operator's word on it from capabilities enable browser", async () => {
     const world = await stepWorld();
-    const reserved = await getInstanceReservation(world.paths, world.instanceId);
-    const onecli = createOnecliRuntimeLayout({
-      instanceId: world.instanceId,
-      instanceRoot: world.paths.instanceRoot(world.instanceId),
-      project: reserved.exclusive_resource_claims.onecli_project,
-      appPort: reserved.allocated_ports.onecli_app,
-      gatewayPort: reserved.allocated_ports.onecli_gateway,
-      dockerEndpoint: 'unix:///var/run/docker.sock',
-    });
-    await persistInstanceRuntime(
-      createInstanceRuntimeConfig(world.paths, reserved, onecli, {
-        nodePath: process.execPath,
-        homeDirectory: path.dirname(world.paths.configRoot),
-        selectedProvider: 'claude',
-        dockerEndpoint: 'unix:///var/run/docker.sock',
-      }),
-      () => undefined,
-    );
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
     const enable = async (...flags: string[]) => {
       const stdout: string[] = [];
       const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId, ...flags, '--json'], {
@@ -408,17 +389,30 @@ describe('the web alias setup step (KTD13)', () => {
       });
       return { exit, result: JSON.parse(stdout.join('\n')) as unknown };
     };
+    // Each candidate the step claims is a change, reported even when the browser policy already stood.
     const asked = (address: string) => ({
       exit: 10,
-      result: { data: { pause: { message: expect.stringContaining(`Add ${address} as an alias`) } } },
+      result: { changed: true, data: { pause: { message: expect.stringContaining(`Add ${address} as an alias`) } } },
     });
 
-    expect(await enable()).toMatchObject(asked(ALIAS));
+    expect(await enable()).toMatchObject({
+      ...asked(ALIAS),
+      result: {
+        ...asked(ALIAS).result,
+        next_actions: [
+          { kind: 'external', url: 'https://admin.google.com/ac/users' },
+          {
+            kind: 'command',
+            argv: ['gws-ea', 'capabilities', 'enable', 'browser', '--id', world.instanceId, '--alias-added'],
+          },
+        ],
+      },
+    });
     expect(await enable('--alias-taken')).toMatchObject(asked('onuj2@example.test'));
     expect(await enable('--alias', 'Juno.Web')).toMatchObject(asked('juno.web@example.test'));
     world.gmail.onSend = (id) => world.gmail.deliver(id);
     expect(await enable('--alias-added')).toMatchObject({ exit: 0, result: { outcome: 'succeeded' } });
-    await expect(getAssistantAlias()).resolves.toBe('juno.web@example.test');
+    await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'juno.web@example.test' });
   });
 });
 

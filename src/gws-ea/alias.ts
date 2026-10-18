@@ -309,8 +309,6 @@ export interface AliasStepOptions {
   readonly decision?: AliasDecision;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl?: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  /** Waits between read-backs of a probe just sent. */
-  readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
 const READY: ProvisionResult = Object.freeze({ status: 'ready' });
@@ -628,6 +626,5 @@ export function runAliasStep(
       ...(options.decision ? { decision: options.decision } : {}),
     },
     reporter,
-    options.sleep,
   );
 }

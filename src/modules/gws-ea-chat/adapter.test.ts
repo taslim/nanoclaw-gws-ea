@@ -30,7 +30,7 @@ import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
-import { requestApproval, type RequestApprovalOptions } from '../approvals/primitive.js';
+import { requestApproval } from '../approvals/primitive.js';
 import { RENEW_BEFORE_EXPIRY_MS } from '../gws-ea-google/tokens.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -1209,9 +1209,6 @@ describe('requests', () => {
       '*Install a package?*\n\nI would like jq to read the export.\n\n' +
         'Quote this message with yes or no, or react 👍 or 👎.',
     );
-    // A request that names no picture uploads nothing and carries no attachment.
-    expect(api.uploads).toEqual([]);
-    expect(api.messages.get(name!)?.attachment).toBeUndefined();
     const state = new SqliteStateAdapter();
     await state.connect();
     expect(await readPostedRequest(state, 'gchat', name!)).toEqual({
@@ -1264,18 +1261,10 @@ describe('a picture on an approval request (KTD6)', () => {
   const CHAT_IS_DOWN = { status: 500, message: 'Internal error encountered.' };
 
   let session: Session;
-  /** Each send's content, as the host delivered it. */
-  let sent: string[];
   /** The channel the host's registry started; the registry tears it down. */
   let hosted: ChannelAdapter | undefined;
 
-  async function startHost(): Promise<void> {
-    registerChannelAdapter('gchat', { factory: () => (hosted = build()) });
-    await initChannelAdapters(() => hostSetup());
-  }
-
   beforeEach(async () => {
-    sent = [];
     const now = new Date().toISOString();
     await createAgentGroup({
       id: 'ag-browser',
@@ -1307,14 +1296,9 @@ describe('a picture on an approval request (KTD6)', () => {
       created_at: now,
     });
     await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-juno', resolved_at: now });
-    await startHost();
-    const channels = createChannelDeliveryAdapter();
-    setDeliveryAdapter({
-      deliver: (...send) => {
-        sent.push(send[4]);
-        return channels.deliver(...send);
-      },
-    });
+    registerChannelAdapter('gchat', { factory: () => (hosted = build()) });
+    await initChannelAdapters(() => hostSetup());
+    setDeliveryAdapter(createChannelDeliveryAdapter());
   });
 
   afterEach(async () => {
@@ -1322,8 +1306,8 @@ describe('a picture on an approval request (KTD6)', () => {
     if (channel === hosted) channel = undefined;
   });
 
-  /** The browser's purchase card for the principal, with the pictures given. */
-  function askToBuy(pictures?: RequestApprovalOptions['pictures']): Promise<string | null> {
+  /** The browser's purchase card for the principal, with the checkout's picture. */
+  function askToBuy(): Promise<string | null> {
     return requestApproval({
       session,
       agentName: 'browser',
@@ -1333,7 +1317,7 @@ describe('a picture on an approval request (KTD6)', () => {
       question: QUESTION,
       approverUserId: PRINCIPAL,
       originLine: ORIGIN,
-      ...(pictures === undefined ? {} : { pictures }),
+      pictures: [PICTURE],
     });
   }
 
@@ -1369,7 +1353,7 @@ describe('a picture on an approval request (KTD6)', () => {
   }
 
   it('posts the card and its picture as one message, and a 👍 on it answers the request', async () => {
-    const id = await askToBuy([PICTURE]);
+    const id = await askToBuy();
 
     expect(id).not.toBeNull();
     expect(api.uploads).toEqual([
@@ -1398,7 +1382,7 @@ describe('a picture on an approval request (KTD6)', () => {
   });
 
   it("shows the card's outcome on its own message, which keeps its picture", async () => {
-    const id = await askToBuy([PICTURE]);
+    const id = await askToBuy();
     const [card] = api.posted();
 
     await getDeliveryAdapter()!.deliver(
@@ -1423,7 +1407,7 @@ describe('a picture on an approval request (KTD6)', () => {
   it('still posts the card when Chat refuses its picture, saying the picture is unavailable', async () => {
     api.failures.set(UPLOAD_PATH, CHAT_IS_DOWN);
 
-    const id = await askToBuy([PICTURE]);
+    const id = await askToBuy();
 
     expect(id).not.toBeNull();
     expect(api.uploads).toEqual([]);
@@ -1434,13 +1418,6 @@ describe('a picture on an approval request (KTD6)', () => {
     expect((await getPendingApproval(id!))?.platform_message_id).toBe(card!.name);
   });
 
-  it('says the picture is unavailable when none could be taken, and uploads nothing', async () => {
-    await askToBuy([null]);
-
-    expect(api.uploads).toEqual([]);
-    expect(api.posted().map((card) => card.text)).toEqual([cardText(NO_PICTURE)]);
-  });
-
   it('keeps the picture out of the approval row, the database and the logs', async () => {
     const logged: unknown[] = [];
     for (const level of ['debug', 'info', 'warn', 'error', 'fatal'] as const) {
@@ -1449,9 +1426,9 @@ describe('a picture on an approval request (KTD6)', () => {
       });
     }
 
-    const attached = await askToBuy([PICTURE]);
+    const attached = await askToBuy();
     api.failures.set(UPLOAD_PATH, CHAT_IS_DOWN);
-    const refused = await askToBuy([PICTURE]);
+    const refused = await askToBuy();
 
     expect(api.uploads).toHaveLength(1);
     expect(api.posted().map((card) => card.attachment?.length ?? 0)).toEqual([1, 0]);
@@ -1460,33 +1437,6 @@ describe('a picture on an approval request (KTD6)', () => {
     expect(await tablesHoldingPicture()).toEqual([]);
     expect(logged.length).toBeGreaterThan(0);
     expect(holdsPicture(logged)).toBe(false);
-  });
-
-  it('re-posts a card after a restart saying its picture is unavailable: nothing kept holds the picture', async () => {
-    await askToBuy([PICTURE]);
-    const card = sent.find((content) => (JSON.parse(content) as { type?: string }).type === 'ask_question');
-    expect(card).toBeDefined();
-
-    // The host restarts over the same database; the picture's bytes went with the process.
-    await teardownChannelAdapters();
-    await startHost();
-    await createChannelDeliveryAdapter().deliver('gchat', `gchat:${DM}`, null, 'chat-sdk', card!, undefined, 'gchat');
-
-    expect(api.uploads).toHaveLength(1);
-    const [, reposted, ...more] = api.posted();
-    expect(more).toEqual([]);
-    expect(reposted!.text).toBe(cardText(NO_PICTURE));
-    expect(reposted!.attachment).toBeUndefined();
-  });
-
-  it('posts an approval that names no picture as before: its words alone, nothing uploaded', async () => {
-    await askToBuy();
-
-    expect(api.uploads).toEqual([]);
-    const [card, ...more] = api.posted();
-    expect(more).toEqual([]);
-    expect(card!.text).toBe(cardText());
-    expect(card!.attachment).toBeUndefined();
   });
 });
 

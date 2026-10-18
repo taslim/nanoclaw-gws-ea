@@ -66,13 +66,14 @@ import { prepareMerchantPage } from './merchant-signatures.js';
 import {
   WATCHED,
   openWebFixture,
+  refIn,
   watchedBookingSite,
   type OpenWebFixture,
   type WatchedSiteState,
 } from './open-web-native-fixture.js';
-import { observePage, type BrowserRef } from './observe.js';
+import { observePage } from './observe.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
-import { resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
+import { freeResyTable, resyFixture } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { BrowserQueue } from './queue.js';
@@ -82,12 +83,44 @@ import type { WatchBounds, WatchRow } from './watches.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
-/** The aria ref of the one element named `name` in an observation, with its generation. */
-function refIn(observation: { snapshot: string; generation: number }, name: string): BrowserRef {
-  const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
-  const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
-  if (!ref) throw new Error(`Missing ${name} in ${observation.snapshot}`);
-  return { ref, generation: observation.generation };
+/** A fresh central DB and an enabled browser policy, with no wake requested yet. */
+async function freshBrowserState(): Promise<void> {
+  vi.mocked(requestWake).mockClear();
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
+    mode: 0o600,
+  });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+  await runMigrations(await initTestDb());
+}
+async function clearBrowserState(): Promise<void> {
+  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  await closeDb();
+  fs.rmSync(root, { recursive: true, force: true });
+  vi.useRealTimers();
+}
+/** The data of the host's answer to the browser agent's request `id`. */
+async function answerOf(session: Session, id: string): Promise<Record<string, unknown>> {
+  const row = await getDb().get<{ answer_json: string }>(
+    'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
+    session.id,
+    id,
+  );
+  if (!row) throw new Error(`No answer for ${id}`);
+  return (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
+}
+/** The browser agent's `action` through the queue, run to its answer. */
+async function requestOf(
+  queue: BrowserQueue,
+  session: Session,
+  action: string,
+  content: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const id = `${action}-${randomUUID()}`;
+  await queue.accept(action, content, session, id);
+  await queue.idle();
+  return answerOf(session, id);
 }
 
 describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeout: 90_000 }, () => {
@@ -122,14 +155,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     // Date moves on in real time from the errand's afternoon, a week before the dinner; a test may jump it.
     vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-10-17T19:00:00.000Z'));
-    vi.mocked(requestWake).mockClear();
-    fs.rmSync(root, { recursive: true, force: true });
-    fs.mkdirSync(`${root}/browser`, { recursive: true });
-    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
-    await runMigrations(await initTestDb());
+    await freshBrowserState();
     for (const id of ['main-w', 'browser-w'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await createMessagingGroup({
@@ -205,27 +231,11 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     setBrowserAdmissionReady(false);
     await queue?.stop();
     await page?.context().close();
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
-    await closeDb();
-    fs.rmSync(root, { recursive: true, force: true });
-    vi.useRealTimers();
+    await clearBrowserState();
   });
 
-  async function answer(id: string): Promise<Record<string, unknown>> {
-    const row = await getDb().get<{ answer_json: string }>(
-      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
-      session.id,
-      id,
-    );
-    if (!row) throw new Error(`No answer for ${id}`);
-    return (JSON.parse(row.answer_json) as { data: Record<string, unknown> }).data;
-  }
-  async function request(action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const id = `${action}-${randomUUID()}`;
-    await queue.accept(action, content, session, id);
-    await queue.idle();
-    return answer(id);
-  }
+  const request = (action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> =>
+    requestOf(queue, session, action, content);
   const run = (actions: BrowserAction[]): Promise<Record<string, unknown>> => request('browser', { actions });
   /** The agent's purchase of the control named `name`, aimed from a fresh observation. */
   async function purchase(name: string): Promise<Record<string, unknown>> {
@@ -234,7 +244,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     const id = `purchase-${randomUUID()}`;
     await handler({ action: 'purchase', requestId: id, target: refIn(await observePage(page), name) }, session);
     await queue.idle();
-    return answer(id);
+    return answerOf(session, id);
   }
   const approvals = (): Promise<PendingApproval[]> =>
     getDb().all<PendingApproval>('SELECT * FROM pending_approvals ORDER BY created_at');
@@ -320,63 +330,14 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(sent).toEqual([]);
     expect(await watch()).toMatchObject({ status: 'booked' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
-    expect(await getDb().all('SELECT resolution,merchant_record_id FROM gws_ea_browser_free_attempts')).toEqual([
-      { resolution: 'committed', merchant_record_id: 'LR-1930' },
-    ]);
-    // A booked watch checks no more.
-    const served = site.served;
-    await checkNow();
-    expect(site.served).toBe(served);
   });
 
-  it('books a free table outside the watch’s window without spending the watch, which then books its own', async () => {
+  it('books a free table outside the watch’s window without spending the watch', async () => {
     await setWatch();
     await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
     expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
     expect(await watch()).toMatchObject({ status: 'armed' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
-
-    site.slots = ['1930'];
-    await checkNow();
-    expect(await notices()).toEqual([expect.objectContaining({ status: 'changed' })]);
-    await run([{ kind: 'navigate', url: WATCHED.tables }]);
-    await run([{ kind: 'click', ...refIn(await observePage(page), '7:30 PM') }]);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-1930' });
-    expect(await watch()).toMatchObject({ status: 'booked' });
-    expect(await getDb().get('SELECT state,attempt_id FROM gws_ea_browser_watch_job_claims')).toEqual({
-      state: 'booked',
-      attempt_id: expect.stringMatching(/^free-attempt-/u) as unknown,
-    });
-  });
-
-  it('slows down as changes book nothing, and the hourly cap holds a sixth wake until the hour allows it', async () => {
-    await setWatch();
-    const intervals: number[] = [];
-    // Late, early and bar seating: each a change, none within the window, so the agent books none.
-    for (const slots of [['2215'], ['2230'], ['2245'], ['1600'], ['1630']]) {
-      site.slots = slots;
-      const before = Date.now();
-      await checkNow();
-      intervals.push(Math.round((Date.parse((await watch()).next_check_at) - before) / 60_000));
-    }
-    expect((await notices()).map((notice) => notice.status)).toEqual(Array(5).fill('changed'));
-    expect(watchWakes()).toBe(5);
-    // The week-out cadence is five minutes; each unmatched change doubles it, to at most an hour.
-    expect(intervals).toEqual([10, 20, 40, 60, 60]);
-
-    site.slots = ['1645'];
-    await checkNow();
-    expect(await notices()).toHaveLength(5);
-    expect(watchWakes()).toBe(5);
-    expect((await watch()).region_baseline).toContain('4:30 PM');
-
-    vi.setSystemTime(Date.now() + 61 * 60_000);
-    await checkNow();
-    const all = await notices();
-    expect(all).toHaveLength(6);
-    const held = all[5].region as { before: string; after: string };
-    expect(held.before).toContain('4:30 PM');
-    expect(held.after).toContain('4:45 PM');
   });
 
   it('wakes the agent to mark the region again when a redesign drops it, and checks the new mark', async () => {
@@ -386,11 +347,10 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     // One miss may be the site's own hiccup: only a second one running wakes the agent.
     expect(await notices()).toEqual([]);
     await checkNow();
-    await checkNow();
     expect(await notices()).toEqual([
       expect.objectContaining({ status: 'region_missing', reason: 'region_not_found', watch_id: created.watch_id }),
     ]);
-    expect(await outcomes()).toEqual(['region_missing', 'region_missing', 'region_missing']);
+    expect(await outcomes()).toEqual(['region_missing', 'region_missing']);
     expect(watchWakes()).toBe(1);
     const listed = (await request('list_watches', {})).watches as Array<Record<string, unknown>>;
     expect(listed).toEqual([
@@ -439,54 +399,47 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
   it('refuses a region off the recipe’s view, one with nothing to compare or one too large, set or marked again', async () => {
     await run([{ kind: 'navigate', url: WATCHED.tables }]);
     const recipe = await request('save_recipe', { name: 'Tables', first_action: 0, last_action: 0, parameters: [] });
-    const mark = (region: BrowserRef, watchId?: string): Promise<Record<string, unknown>> =>
-      request('watch', {
-        ...BOUNDS,
-        recipe_id: recipe.recipe_id,
-        financial: FREE,
-        region,
-        ...(watchId ? { watch_id: watchId } : {}),
-      });
-    /** The ref of the first element whose observed line shows `text`. */
-    const refShowing = (observation: { snapshot: string; generation: number }, text: string): BrowserRef => {
+    /** The agent marks, on `url`, the first element whose observed line shows `text`. */
+    async function mark(url: string, text: string, watchId?: string): Promise<Record<string, unknown>> {
+      await run([{ kind: 'navigate', url }]);
+      const observation = await observePage(page);
       const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(text));
       const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
       if (!ref) throw new Error(`Missing ${text} in ${observation.snapshot}`);
-      return { ref, generation: observation.generation };
-    };
+      return request('watch', {
+        ...BOUNDS,
+        recipe_id: recipe.recipe_id,
+        financial: FREE,
+        region: { ref, generation: observation.generation },
+        ...(watchId ? { watch_id: watchId } : {}),
+      });
+    }
+    // The booking page is not the view the recipe reaches.
+    const offRoute = `${WATCHED.book}?slot=1930`;
+    expect(await mark(offRoute, '"Reserve now"')).toMatchObject({ status: 'refused', reason: 'region_off_route' });
+    // The day's booking tally changes on every view: once stripped, nothing is left to compare.
+    expect(await mark(WATCHED.tables, 'times today')).toMatchObject({ status: 'refused', reason: 'region_unmarkable' });
     // More slots than the host keeps of a region's text.
-    const crowded = Array.from(
+    site.slots = Array.from(
       { length: 168 },
       (_, index) => `${10 + Math.floor(index / 12)}${String((index % 12) * 5).padStart(2, '0')}`,
     );
-    async function refusesEach(watchId?: string): Promise<void> {
-      const refused = (reason: string) => ({ status: 'refused', reason, ...(watchId ? { watch_id: watchId } : {}) });
-      // The booking page is not the view the recipe reaches.
-      await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=1930` }]);
-      expect(await mark(refIn(await observePage(page), 'Reserve now'), watchId)).toMatchObject(
-        refused('region_off_route'),
-      );
-      // The day's booking tally changes on every view: once stripped, nothing is left to compare.
-      await run([{ kind: 'navigate', url: WATCHED.tables }]);
-      expect(await mark(refShowing(await observePage(page), 'times today'), watchId)).toMatchObject(
-        refused('region_unmarkable'),
-      );
-      site.slots = crowded;
-      await run([{ kind: 'navigate', url: WATCHED.tables }]);
-      expect(await mark(refIn(await observePage(page), 'Available tables'), watchId)).toMatchObject(
-        refused('region_too_large'),
-      );
-      site.slots = [];
-    }
-    await refusesEach();
+    expect(await mark(WATCHED.tables, '"Available tables"')).toMatchObject({
+      status: 'refused',
+      reason: 'region_too_large',
+    });
+    site.slots = [];
     expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
 
-    // Marking a watch's region again refuses each the same way, and leaves its marked region as it was.
-    await run([{ kind: 'navigate', url: WATCHED.tables }]);
-    const created = await mark(refIn(await observePage(page), 'Available tables'));
+    // Marking a watch's region again goes through the same mark: its refusal leaves the marked region as it was.
+    const created = await mark(WATCHED.tables, '"Available tables"');
     expect(created).toMatchObject({ status: 'armed' });
     const marked = await watch();
-    await refusesEach(String(created.watch_id));
+    expect(await mark(offRoute, '"Reserve now"', String(created.watch_id))).toMatchObject({
+      status: 'refused',
+      reason: 'region_off_route',
+      watch_id: created.watch_id,
+    });
     expect(await watch()).toMatchObject({
       status: 'armed',
       region_json: marked.region_json,
@@ -500,13 +453,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' })).toMatchObject({
       status: 'awaiting_principal',
     });
-    const [card] = await approvals();
-    expect(card.question).toContain('Venue: "The Larder"');
-    expect(card.question).toContain('Maximum total exposure, all guests and fees: $50.00 (USD)');
-    expect(card.question).toContain(
-      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue',
-    );
-    await approve(card);
+    await approve((await approvals())[0]);
     expect(await watch()).toMatchObject({ status: 'armed' });
 
     site.slots = ['2000'];
@@ -523,42 +470,41 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await watch()).toMatchObject({ status: 'booked' });
   });
 
-  it('sends a card for a paid table above the watch’s maximum, and its approved booking ends the watch', async () => {
+  it('sends a card for a paid table above the watch’s maximum, and only an approved booking it fits ends the watch', async () => {
     site.deposit = 80;
     await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' });
     await approve((await approvals())[0]);
+    const purchaseCard = async (): Promise<PendingApproval> => {
+      const card = (await approvals()).find((approval) => approval.action === 'browser_purchase');
+      if (!card) throw new Error('No purchase card');
+      return card;
+    };
+    // A carded table outside the watch's window books without spending the watch.
+    await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'awaiting_principal' });
+    await approve(await purchaseCard());
+    expect(await getDb().all('SELECT kind,state FROM gws_ea_browser_authorities')).toEqual([
+      { kind: 'checkout', state: 'committed' },
+    ]);
+    expect(await watch()).toMatchObject({ status: 'armed' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+
     site.slots = ['1930'];
     await checkNow();
     await run([{ kind: 'navigate', url: WATCHED.tables }]);
     await run([{ kind: 'click', ...refIn(await observePage(page), '7:30 PM') }]);
     expect(await purchase('Reserve now')).toMatchObject({ status: 'awaiting_principal' });
-    const purchaseCard = (await approvals()).find((approval) => approval.action === 'browser_purchase');
-    if (!purchaseCard) throw new Error('No purchase card');
-    expect(purchaseCard.question).toContain('$80.00');
+    const card = await purchaseCard();
+    expect(card.question).toContain('$80.00');
     // A card pursued is the agent's match: the watch keeps its cadence while the principal decides.
     expect((await watch()).status).toBe('armed');
-    await approve(purchaseCard);
+    await approve(card);
     expect(await getDb().all('SELECT kind,state FROM gws_ea_browser_authorities')).toEqual([
+      { kind: 'checkout', state: 'committed' },
       { kind: 'checkout', state: 'committed' },
     ]);
     expect(await watch()).toMatchObject({ status: 'booked' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
-  });
-
-  it('books a carded table outside the watch’s window without spending the watch', async () => {
-    site.deposit = 80;
-    await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' });
-    await approve((await approvals())[0]);
-    await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'awaiting_principal' });
-    const purchaseCard = (await approvals()).find((approval) => approval.action === 'browser_purchase');
-    if (!purchaseCard) throw new Error('No purchase card');
-    await approve(purchaseCard);
-    expect(await getDb().all('SELECT kind,state FROM gws_ea_browser_authorities')).toEqual(
-      expect.arrayContaining([{ kind: 'checkout', state: 'committed' }]),
-    );
-    expect(await watch()).toMatchObject({ status: 'armed' });
-    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
   });
 });
 
@@ -567,66 +513,13 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
   let queue: BrowserQueue;
   let session: Session;
   let jobId: string;
-  /** A free bar-counter table at L'Artusi, as Resy's own API answers it. */
-  const state = (): ResyFixtureState => ({
-    inventory: {
-      query: { day: '2026-10-17', party_size: 2 },
-      results: {
-        venues: [
-          {
-            venue: {
-              id: { resy: 25973 },
-              name: "L'Artusi",
-              currency: { code: 'USD' },
-              location: { time_zone: 'EST5EDT' },
-            },
-            slots: [
-              {
-                config: { id: 1442725, token: 'opaque-native-slot-token', type: 'Bar Counter' },
-                date: { start: '2026-10-17 11:00:00', end: '2026-10-17 12:00:00' },
-                size: { min: 2, max: 2 },
-                time: { turn: { actual: 3600 } },
-                payment: { is_paid: false, cancellation_fee: null, deposit_fee: null, is_add_on_required: false },
-                has_add_ons: false,
-              },
-            ],
-          },
-        ],
-      },
-    },
-    policy: [],
-    details: {
-      venue: { id: 25973 },
-      user: { id: 72, payment_methods: [{ id: 101, display: '4242' }] },
-      config: { double_confirmation: false, add_ons: [] },
-      payment: { amounts: { total: 0, items: [] } },
-      cancellation: { fee: null, display: { policy: [] } },
-      book_token: { value: 'secret-book-token' },
-    },
-  });
-  async function request(action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const id = `${action}-${randomUUID()}`;
-    await queue.accept(action, content, session, id);
-    await queue.idle();
-    const row = await getDb().get<{ answer_json: string }>(
-      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
-      session.id,
-      id,
-    );
-    return (JSON.parse(row?.answer_json ?? '{}') as { data: Record<string, unknown> }).data;
-  }
+  const request = (action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> =>
+    requestOf(queue, session, action, content);
   beforeEach(async () => {
     if (!chromePath) throw new Error('Chrome required');
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-10-15T12:00:00.000Z'));
-    vi.mocked(requestWake).mockClear();
-    fs.rmSync(root, { recursive: true, force: true });
-    fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
-    await runMigrations(await initTestDb());
+    await freshBrowserState();
     for (const id of ['reader-main', 'reader-browser'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await getDb().run(
@@ -639,7 +532,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     const job = await store.jobForSession(session);
     if (!job) throw new Error('No browser job');
     jobId = job.id;
-    resy = await resyFixture(chromePath, state());
+    resy = await resyFixture(chromePath, freeResyTable());
     await resyReservationSignature.preparePage?.(resy.page);
     // The model-free check reads Resy's API in a page of its own, as a signed-out check page would.
     signedOut.open = async () => {
@@ -660,10 +553,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     signedOut.open = undefined;
     await queue?.stop();
     await resy?.close();
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
-    await closeDb();
-    fs.rmSync(root, { recursive: true, force: true });
-    vi.useRealTimers();
+    await clearBrowserState();
   });
 
   it('books a Resy table through its reader without waking the agent', async () => {

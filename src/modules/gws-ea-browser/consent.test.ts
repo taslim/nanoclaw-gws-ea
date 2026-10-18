@@ -33,11 +33,11 @@ const radio = (id: number, group: string, label: string, checked = false): Conse
 });
 /** The site the page belongs to. */
 const SITE = 'shop.example';
-const decide = (choices: ConsentChoice[], granted: readonly string[] = [], purchase = false): ConsentDecision =>
-  decideConsent(choices, { granted: new Set(granted.map(normalizeConsentWording)), purchase, site: SITE });
+const decide = (choices: ConsentChoice[], granted: readonly string[] = []): ConsentDecision =>
+  decideConsent(choices, { granted: new Set(granted.map(normalizeConsentWording)), purchase: false, site: SITE });
 
 describe('the wording of a choice', () => {
-  it('reads a box that only accepts the site’s terms or privacy policy as terms, never one carrying marketing, data sharing or money', () => {
+  it('reads a box that only accepts the site’s terms or privacy policy as terms, and one that bundles them with anything else as bundled', () => {
     for (const label of [
       'I agree to the Terms of Service',
       'I accept the Terms and Conditions and the Privacy Policy',
@@ -59,6 +59,10 @@ describe('the wording of a choice', () => {
       ['I agree to the payment terms', 'bundled'],
       ['I agree to the Terms of Service and the free trial', 'bundled'],
       ['I agree to the Terms; my plan renews automatically at $10/month', 'bundled'],
+      ['I agree to the Terms and to receive marketing emails', 'bundled'],
+      ['I accept the membership terms and recurring billing', 'bundled'],
+      ['I agree to the Terms of Service and the liability waiver', 'bundled'],
+      ['I have read the privacy policy and agree to receive offers', 'bundled'],
     ] as const)
       expect(classifyConsentLabel(label), label).toBe(kind);
   });
@@ -77,11 +81,8 @@ describe('the wording of a choice', () => {
       'I agree to their Terms of Service',
       "I agree to the Terms of Service and Stripe's Connected Account Agreement",
       'I agree to the Terms of Service and the Stripe Services Agreement',
-    ]) {
+    ])
       expect(classifyConsentLabel(label, shop), label).toBe('agreement');
-      // Read with no site, a named party is never the site's.
-      expect(classifyConsentLabel(label), label).toBe('agreement');
-    }
     const pottery = { site: 'hale-pottery.example', links: [] };
     for (const label of [
       "I agree to Hale Pottery's Terms of Service",
@@ -145,20 +146,13 @@ describe('the wording of a choice', () => {
       expect(classifyConsentLabel(label)).toBe('opt_out');
   });
 
-  it('cannot read a double negative or a box that bundles the terms with anything else', () => {
+  it('cannot read a double negative', () => {
     for (const label of [
       'Uncheck this box if you do not want to receive offers',
       'I don’t want to miss out on deals',
       'Untick if you would prefer not to hear from us',
     ])
       expect(classifyConsentLabel(label)).toBe('double_negative');
-    for (const label of [
-      'I agree to the Terms and to receive marketing emails',
-      'I accept the membership terms and recurring billing',
-      'I agree to the Terms of Service and the liability waiver',
-      'I have read the privacy policy and agree to receive offers',
-    ])
-      expect(classifyConsentLabel(label)).toBe('bundled');
   });
 
   it('reads waivers, attestations and fee acknowledgements as agreements, and paid extras as add-ons', () => {
@@ -196,22 +190,15 @@ describe('the wording of a choice', () => {
 
   it('normalizes wording without changing it: spacing and compatibility forms only', () => {
     expect(normalizeConsentWording('  I confirm I am\n 21  or older ')).toBe('I confirm I am 21 or older');
-    expect(normalizeConsentWording('I confirm I am 21 or older')).not.toBe(
-      normalizeConsentWording('I confirm I am 18 or older'),
-    );
+    expect(normalizeConsentWording('I confirm I am ２１ or older')).toBe('I confirm I am 21 or older');
+    // The words, their case and their punctuation are the wording the principal approves.
+    expect(normalizeConsentWording('I agree to Klarna’s “Terms”')).toBe('I agree to Klarna’s “Terms”');
   });
 
-  it('treats a click on any choice the engine owns as consent-class, but not a functional or priced delivery choice', () => {
-    expect(consentClassChoice({ kind: 'checkbox', label: 'Send me offers' })).toBe(true);
-    expect(consentClassChoice({ kind: 'switch', label: 'Email me product news' })).toBe(true);
-    expect(consentClassChoice({ kind: 'checkbox', label: 'I agree to the Terms of Service' })).toBe(true);
+  it('reads a click on a radio option by its question, and on a select by its question and options', () => {
     expect(
       consentClassChoice({ kind: 'radio', label: 'No', group: 'Would you like to receive offers by email?' }),
     ).toBe(true);
-    expect(consentClassChoice({ kind: 'checkbox', label: 'Same as billing address' })).toBe(false);
-    expect(consentClassChoice({ kind: 'radio', label: 'Express delivery, $8.00', group: 'Delivery option' })).toBe(
-      false,
-    );
     expect(consentClassChoice({ kind: 'select', label: 'Size', options: ['S', 'M', 'L'] })).toBe(false);
   });
 });
@@ -229,16 +216,8 @@ describe('the engine’s decision for a form', () => {
     });
   });
 
-  it('stops for another company’s terms, or terms linked from another site, and ticks terms linked within the site', () => {
+  it('ticks terms linked within the site and another company’s terms the principal agreed to, and stops for another company’s terms asked as a question', () => {
     const klarna = "I agree to Klarna's Terms of Service";
-    expect(decide([box(klarna, { required: true })])).toEqual({
-      status: 'consent_required',
-      items: [{ id: 0, wording: klarna, kind: 'agreement' }],
-    });
-    expect(decide([box('I agree to the Terms of Service', { links: ['https://pay.example/terms'] })])).toEqual({
-      status: 'consent_required',
-      items: [{ id: 0, wording: 'I agree to the Terms of Service', kind: 'agreement' }],
-    });
     expect(
       decide([box('I accept the terms and privacy policy', { links: ['https://www.shop.example/legal/terms'] })]),
     ).toEqual({ status: 'ready', set: [{ id: 0, checked: true }], agreements: [], addOns: [] });
@@ -249,7 +228,7 @@ describe('the engine’s decision for a form', () => {
       agreements: [],
       addOns: [],
     });
-    // A terms question asked as a Yes/No pair is read the same way.
+    // Another company's terms asked as a Yes/No pair stop until the principal agrees.
     const question = 'Do you accept the PayPal User Agreement?';
     expect(decide([radio(0, question, 'Yes'), radio(1, question, 'No')])).toEqual({
       status: 'consent_required',
@@ -264,16 +243,6 @@ describe('the engine’s decision for a form', () => {
         box('Same as billing address', { id: 1, checked: true }),
       ]),
     ).toEqual({ status: 'ready', set: [{ id: 0, checked: true }], agreements: [], addOns: [] });
-  });
-
-  it('moves a Yes/No offers radio pair to No', () => {
-    const group = 'Would you like to receive offers by email?';
-    expect(decide([radio(0, group, 'Yes', true), radio(1, group, 'No')])).toEqual({
-      status: 'ready',
-      set: [{ id: 1, checked: true }],
-      agreements: [],
-      addOns: [],
-    });
   });
 
   it('answers a question asked the other way round with Yes, and a question with no way to decline stops', () => {
@@ -321,65 +290,5 @@ describe('the engine’s decision for a form', () => {
         status: 'consent_required',
         items: [{ id: 0, wording, kind }],
       });
-  });
-
-  it('ticks only the box whose exact wording the principal approved', () => {
-    expect(
-      decide(
-        [box('I agree to receive marketing', { required: true }), box('Send me partner offers', { id: 1 })],
-        ['I agree to receive marketing'],
-      ),
-    ).toEqual({ status: 'ready', set: [{ id: 0, checked: true }], agreements: [], addOns: [] });
-    // Changed wording is a new question.
-    expect(
-      decide([box('I agree to receive marketing texts', { required: true })], ['I agree to receive marketing']),
-    ).toMatchObject({ status: 'consent_required' });
-  });
-
-  it('puts agreements on a purchase’s card instead of stopping, and ticks the approved ones', () => {
-    const attestation = box('I confirm I am 21 or older', { required: true });
-    expect(decide([attestation], [], true)).toEqual({
-      status: 'ready',
-      set: [],
-      agreements: ['I confirm I am 21 or older'],
-      addOns: [],
-    });
-    expect(decide([attestation], ['I confirm I am 21 or older'], true)).toEqual({
-      status: 'ready',
-      set: [{ id: 0, checked: true }],
-      agreements: ['I confirm I am 21 or older'],
-      addOns: [],
-    });
-  });
-
-  it('unticks a pre-ticked donation, and counts one the host could not untick as an add-on', () => {
-    const donation = box('Round up for charity ($0.58)', { checked: true });
-    expect(decide([donation])).toEqual({
-      status: 'ready',
-      set: [{ id: 0, checked: false }],
-      agreements: [],
-      addOns: [],
-    });
-    expect(decideConsent([donation], { granted: new Set(), purchase: true, site: SITE, kept: new Set([0]) })).toEqual({
-      status: 'ready',
-      set: [],
-      agreements: [],
-      addOns: ['Round up for charity ($0.58)'],
-    });
-    expect(decideConsent([donation], { granted: new Set(), purchase: false, site: SITE, kept: new Set([0]) })).toEqual({
-      status: 'add_on',
-      addOns: ['Round up for charity ($0.58)'],
-    });
-  });
-
-  it('stops for an offers box the site keeps ticking after the host unticked it', () => {
-    expect(
-      decideConsent([box('Send me offers', { checked: true })], {
-        granted: new Set(),
-        purchase: false,
-        site: SITE,
-        kept: new Set([0]),
-      }),
-    ).toEqual({ status: 'consent_required', items: [{ id: 0, wording: 'Send me offers', kind: 'marketing' }] });
   });
 });

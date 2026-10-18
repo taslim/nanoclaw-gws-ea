@@ -976,33 +976,6 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(decided).toHaveLength(5);
   });
 
-  it('names the web alias flag a pause waits on in the resume command', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation());
-    const io = lines();
-    const pause: ProvisionHumanPause = {
-      kind: 'human-action',
-      phase: 'provision_alias',
-      code: 'alias_required',
-      message: 'Add onuj@example.test as an alias of juno@example.test in the Google Admin console, then confirm it.',
-      details: ['Add the alternate email onuj on example.test, then Save'],
-      actionUrl: 'https://admin.google.com/ac/users',
-      resumeFlag: '--alias-added',
-    };
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        ...io.runtime,
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision: async () => ({ status: 'paused', pause }),
-      }),
-    ).toBe(10);
-    expect(io.out).toContain(`Paused at provision_alias: ${pause.message}`);
-    expect(io.out).toContain('Open: https://admin.google.com/ac/users');
-    expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id} --alias-added`);
-  });
-
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
@@ -1032,10 +1005,11 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(io.out.join('\n')).not.toContain('Paused at');
   });
 
-  it('reports a pause the person stops at, logged against the step that paused', async () => {
+  it('reports a pause the person stops at, where to act, and the step that paused in its log', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
     const io = lines();
+    const pause = { ...CHAT_PAUSE, actionUrl: 'https://console.cloud.google.com/apis/api/chat.googleapis.com' };
 
     expect(
       await runCli(['resume', '--id', input.instance_id], {
@@ -1046,11 +1020,12 @@ describe('gws-ea stop summaries and exit codes', () => {
         advanceProvision: async (_operation, { runtime }) => {
           // A later runtime check runs after the step that paused, as before a real human pause.
           await runStep(runtime, { id: 'start_nanoclaw' }, async () => undefined);
-          return { status: 'paused', pause: CHAT_PAUSE };
+          return { status: 'paused', pause };
         },
       }),
     ).toBe(10);
     expect(io.out).toContain(`Paused at configure_channel: ${CHAT_PAUSE.message}`);
+    expect(io.out).toContain(`Open: ${pause.actionUrl}`);
     expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id} --chat-configured`);
     const log = io.out.at(-1)?.replace(/^Log: /u, '') ?? '';
     expect(await readFile(log, 'utf8')).toMatch(/· paused at configure_channel \(chat_configuration_required\)\n$/u);

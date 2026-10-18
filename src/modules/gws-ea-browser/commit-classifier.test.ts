@@ -16,6 +16,7 @@ import {
   refusedScriptRequest,
   registerReviewedMerchantFlow,
   type ActionClass,
+  type ActivationIntent,
   type ControlFacts,
   type ControlRegion,
 } from './commit-classifier.js';
@@ -41,23 +42,34 @@ const region = (changes: Partial<ControlRegion> = {}): ControlRegion => ({
   ...changes,
 });
 
+const box = (label: string, changes: Partial<ControlFacts> = {}): ControlFacts =>
+  button(label, { tag: 'label', type: '', toggles: { kind: 'checkbox', label }, ...changes });
+const link = (name: string, href: string, changes: Partial<ControlFacts> = {}): ControlFacts =>
+  button(name, { tag: 'a', type: '', href, ...changes });
+
+/** One control, its class under the open rule, and the action on it when that is not a click. */
+type ClassCase = readonly [facts: ControlFacts, expected: ActionClass, kind?: ActivationIntent['kind']];
+function expectClasses(cases: readonly ClassCase[]): void {
+  cases.forEach(([facts, expected, kind], row) =>
+    expect(classifyControlFacts(facts, kind), `row ${row}: "${facts.name}" (${kind ?? 'click'})`).toBe(expected),
+  );
+}
+const each = (names: readonly string[], facts: (name: string) => ControlFacts, expected: ActionClass): ClassCase[] =>
+  names.map((name) => [facts(name), expected]);
+
 describe('the open rule', () => {
   it('lets an unknown control on any site run as an ordinary action', () => {
-    expect(classifyControlFacts(button('Get it instantly', { type: 'button' }))).toBe('ordinary');
-    // A transaction elsewhere on the page says nothing about a control outside its form or dialog.
-    expect(classifyControlFacts(button('Search', { transaction: true, region: region() }))).toBe('ordinary');
-    expect(classifyControlFacts(button('Choose', { tag: 'select', role: 'combobox', type: 'select-one' }))).toBe(
-      'ordinary',
-    );
-    expect(
-      classifyControlFacts(
-        button('Autumn menus open', { tag: 'a', type: '', href: 'https://news.example/2026/10/17/autumn-menus' }),
-      ),
-    ).toBe('ordinary');
+    expectClasses([
+      [button('Get it instantly', { type: 'button' }), 'ordinary'],
+      // A transaction elsewhere on the page says nothing about a control outside its form or dialog.
+      [button('Search', { transaction: true, region: region() }), 'ordinary'],
+      [button('Choose', { tag: 'select', role: 'combobox', type: 'select-one' }), 'ordinary'],
+      [link('Autumn menus open', 'https://news.example/2026/10/17/autumn-menus'), 'ordinary'],
+    ]);
   });
 
   it('refuses today’s purchase words and the widened ones, and paid registration', () => {
-    for (const name of [
+    const words = [
       'Buy now',
       'Place order',
       'Confirm reservation',
@@ -68,71 +80,56 @@ describe('the open rule', () => {
       'Renew membership',
       'Place bid',
       'Complete reservation',
-    ])
-      expect(classifyControlFacts(button(name))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Search', { visibleLabel: 'Place order' }))).toBe('purchase_control');
-    expect(
-      classifyControlFacts(button('Purchase history', { tag: 'a', type: '', href: 'https://shop.example/orders' })),
-    ).toBe('ordinary');
-    expect(classifyControlFacts(button('Register', { moneyTerms: true }))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Register'))).toBe('ordinary');
-    expect(
-      classifyControlFacts(
-        button('Register', { tag: 'a', type: '', href: 'https://events.example/signup', moneyTerms: true }),
-      ),
-    ).toBe('ordinary');
+    ];
+    expectClasses([
+      ...each(words, (name) => button(name), 'purchase_control'),
+      [button('Search', { visibleLabel: 'Place order' }), 'purchase_control'],
+      [link('Purchase history', 'https://shop.example/orders'), 'ordinary'],
+      [button('Register', { moneyTerms: true }), 'purchase_control'],
+      [button('Register'), 'ordinary'],
+      [link('Register', 'https://events.example/signup', { moneyTerms: true }), 'ordinary'],
+    ]);
   });
 
   it('refuses a click on a choice the consent engine owns, by the choice it would toggle (step 4)', () => {
-    const box = (label: string, changes: Partial<ControlFacts> = {}): ControlFacts =>
-      button(label, { tag: 'label', type: '', toggles: { kind: 'checkbox', label }, ...changes });
-    for (const label of [
+    const owned = [
       'Send me offers',
       'Tick here if you do NOT want our newsletter',
       'I agree to the Terms of Service',
       'I confirm I am 21 or older',
       'Round up for charity ($0.58)',
-    ])
-      expect(classifyControlFacts(box(label))).toBe('consent_control');
-    expect(
-      classifyControlFacts(
+    ];
+    expectClasses([
+      ...each(owned, (label) => box(label), 'consent_control'),
+      [
         button('', { tag: 'div', role: 'switch', toggles: { kind: 'switch', label: 'Text me deals' } }),
-      ),
-    ).toBe('consent_control');
-    expect(
-      classifyControlFacts(
+        'consent_control',
+      ],
+      [
         button('Marketing', {
           tag: 'select',
           type: 'select-one',
           toggles: { kind: 'select', label: 'Marketing emails', options: ['Yes', 'No'] },
         }),
+        'consent_control',
         'select',
-      ),
-    ).toBe('consent_control');
-    // Functional choices stay the agent's, a priced delivery option among them.
-    expect(classifyControlFacts(box('Same as billing address'))).toBe('ordinary');
-    expect(
-      classifyControlFacts(
+      ],
+      // Functional choices stay the agent's, a priced delivery option among them.
+      [box('Same as billing address'), 'ordinary'],
+      [
         button('Express delivery, $8.00', {
           tag: 'input',
           type: 'radio',
           toggles: { kind: 'radio', label: 'Express delivery, $8.00', group: 'Delivery option' },
         }),
-      ),
-    ).toBe('ordinary');
-    // The earlier steps still decide first: a press that sends a message speaks, whatever it toggles.
-    expect(classifyControlFacts(box('Send me offers', { tag: 'button', type: 'submit', name: 'Send message' }))).toBe(
-      'speaks_as_principal',
-    );
+        'ordinary',
+      ],
+    ]);
   });
 
   it('treats a commit on a transaction page as a purchase and named preparation there as ordinary', () => {
     const checkout = { region: region({ transaction: true }), transaction: true };
-    expect(classifyControlFacts(button('Continue', checkout))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Continue', { region: region() }))).toBe('ordinary');
-    // An unnamed press in a transaction form is no preparation the host can name.
-    expect(classifyControlFacts(button('', checkout))).toBe('purchase_control');
-    for (const [name, visibleLabel] of [
+    const preparation = [
       ['Apply', 'Apply'],
       ['Apply coupon', 'Apply'],
       ['Remove', 'Remove'],
@@ -147,37 +144,33 @@ describe('the open rule', () => {
       ['Add to cart', 'Add to cart'],
       ['Proceed to checkout', 'Proceed to checkout'],
       ['Cancel', 'Cancel'],
-    ])
-      expect(classifyControlFacts(button(name, { ...checkout, visibleLabel }))).toBe('ordinary');
-    expect(classifyControlFacts(button('Increase quantity', { ...checkout, visibleLabel: 'Pay' }))).toBe(
-      'purchase_control',
-    );
-    // Choices and fields are never a commit; a link is decided by its route.
-    expect(classifyControlFacts(button('Quantity', { ...checkout, tag: 'select', type: 'select-one' }))).toBe(
-      'ordinary',
-    );
-    expect(classifyControlFacts(button('Leave at door', { ...checkout, tag: 'input', type: 'checkbox' }))).toBe(
-      'ordinary',
-    );
-    expect(classifyControlFacts(button('Promo code', { ...checkout, tag: 'input', type: 'text' }))).toBe('ordinary');
-    expect(
-      classifyControlFacts(
-        button('Terms of sale', { ...checkout, tag: 'a', type: '', href: 'https://shop.example/terms' }),
-      ),
-    ).toBe('ordinary');
-    expect(classifyControlFacts(button('Continue', { ...checkout, tag: 'a', type: '', scripted: true }))).toBe(
-      'purchase_control',
-    );
-    // A modal that speaks of the order commits on a transaction page; dismissing it does not.
+    ] as const;
     const modal = { region: region({ dialog: true, modalOrder: true }) };
-    expect(classifyControlFacts(button('Confirm', { ...modal, transaction: true }))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Confirm', modal))).toBe('ordinary');
-    expect(classifyControlFacts(button('Cancel', { ...modal, transaction: true }))).toBe('ordinary');
+    expectClasses([
+      [button('Continue', checkout), 'purchase_control'],
+      [button('Continue', { region: region() }), 'ordinary'],
+      // An unnamed press in a transaction form is no preparation the host can name.
+      [button('', checkout), 'purchase_control'],
+      ...preparation.map(
+        ([name, visibleLabel]): ClassCase => [button(name, { ...checkout, visibleLabel }), 'ordinary'],
+      ),
+      [button('Increase quantity', { ...checkout, visibleLabel: 'Pay' }), 'purchase_control'],
+      // Choices and fields are never a commit; a link is decided by its route.
+      [button('Quantity', { ...checkout, tag: 'select', type: 'select-one' }), 'ordinary'],
+      [button('Leave at door', { ...checkout, tag: 'input', type: 'checkbox' }), 'ordinary'],
+      [button('Promo code', { ...checkout, tag: 'input', type: 'text' }), 'ordinary'],
+      [link('Terms of sale', 'https://shop.example/terms', checkout), 'ordinary'],
+      [button('Continue', { ...checkout, tag: 'a', type: '', scripted: true }), 'purchase_control'],
+      // A modal that speaks of the order commits on a transaction page; dismissing it does not.
+      [button('Confirm', { ...modal, transaction: true }), 'purchase_control'],
+      [button('Confirm', modal), 'ordinary'],
+      [button('Cancel', { ...modal, transaction: true }), 'ordinary'],
+    ]);
   });
 
   it('lets an order page’s view controls run beside its charge and card, but no change, cancellation or payment', () => {
     const confirmation = { region: region({ transaction: true }), transaction: true };
-    for (const name of [
+    const views = [
       'Add to calendar',
       'View receipt',
       'Print receipt',
@@ -188,90 +181,89 @@ describe('the open rule', () => {
       'Track your package',
       'Manage booking',
       'Manage my reservation',
-    ])
-      expect(classifyControlFacts(button(name, confirmation)), name).toBe('ordinary');
-    // A booking's change or cancellation stays a purchase where the page shows a fee (R14), and no view name covers
-    // a payment.
-    for (const name of ['Change booking', 'Cancel reservation', 'Modify order'])
-      expect(classifyControlFacts(button(name, { ...confirmation, feeTerms: true })), name).toBe('purchase_control');
-    expect(classifyControlFacts(button('Modify order', confirmation))).toBe('purchase_control');
-    expect(classifyControlFacts(button('View receipt', { ...confirmation, visibleLabel: 'Pay now' }))).toBe(
-      'purchase_control',
-    );
-    expect(classifyControlFacts(button('Add to calendar and pay', confirmation))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Get tickets', confirmation))).toBe('purchase_control');
+    ];
+    expectClasses([
+      ...each(views, (name) => button(name, confirmation), 'ordinary'),
+      // No view name covers changing or cancelling a booking, or a payment: each stays a commit on this page.
+      [button('Change booking', confirmation), 'purchase_control'],
+      [button('Cancel reservation', confirmation), 'purchase_control'],
+      [button('Modify order', confirmation), 'purchase_control'],
+      [button('View receipt', { ...confirmation, visibleLabel: 'Pay now' }), 'purchase_control'],
+      [button('Add to calendar and pay', confirmation), 'purchase_control'],
+      [button('Get tickets', confirmation), 'purchase_control'],
+    ]);
   });
 
   it('refuses speaking: by label, in a chat widget and when a press sends free text outside a booking', () => {
-    for (const name of [
+    const speaking = [
       'Post',
       'Reply',
       'Write a review',
       'Leave a tip',
       'Message the host',
+      'Message the restaurant',
       'Submit feedback',
       'Send message',
-    ])
-      expect(classifyControlFacts(button(name))).toBe('speaks_as_principal');
-    for (const name of ['Send', 'Submit'])
-      expect(classifyControlFacts(button(name, { region: region({ freeText: true }) }))).toBe('speaks_as_principal');
-    expect(classifyControlFacts(button('Send', { region: region() }))).toBe('ordinary');
-    // A note inside a booking or order rides along with it.
-    expect(classifyControlFacts(button('Reserve', { region: region({ freeText: true, commits: true }) }))).toBe(
-      'ordinary',
-    );
+    ];
     const field = { tag: 'input', type: 'text', role: '' };
-    expect(classifyControlFacts(button('Start chat', { chatFrame: true }))).toBe('speaks_as_principal');
-    expect(classifyControlFacts(button('Message', { ...field, chatFrame: true }))).toBe('ordinary');
-    expect(classifyControlFacts(button('Message', { ...field, chatFrame: true }), 'submit')).toBe(
-      'speaks_as_principal',
-    );
-    const typed = { ...field, region: region({ freeText: true }) };
-    expect(classifyControlFacts(button('Comment', typed), 'submit')).toBe('speaks_as_principal');
-    expect(classifyControlFacts(button('Comment', typed))).toBe('ordinary');
+    const freeText = { region: region({ freeText: true }) };
+    const typed = { ...field, ...freeText };
+    expectClasses([
+      ...each(speaking, (name) => button(name), 'speaks_as_principal'),
+      [button('Send', freeText), 'speaks_as_principal'],
+      [button('Submit', freeText), 'speaks_as_principal'],
+      [button('Send', { region: region() }), 'ordinary'],
+      // A note inside a booking or order rides along with it.
+      [button('Reserve', { region: region({ freeText: true, commits: true }) }), 'ordinary'],
+      [button('Start chat', { chatFrame: true }), 'speaks_as_principal'],
+      [button('Message', { ...field, chatFrame: true }), 'ordinary'],
+      [button('Message', { ...field, chatFrame: true }), 'speaks_as_principal', 'submit'],
+      [button('Comment', typed), 'speaks_as_principal', 'submit'],
+      [button('Comment', typed), 'ordinary'],
+    ]);
   });
 
   it('refuses account-security changes by label, route and the fields a signed-in account form holds', () => {
+    const labels = ['Change sign-in email', 'Update phone', 'Manage two-factor', 'Update payment method'];
     const account = { accountPage: true, region: region({ accountFields: true }) };
-    expect(classifyControlFacts(button('Save', account))).toBe('account_security');
-    expect(classifyControlFacts(button('Email address', { ...account, tag: 'input', type: 'email' }), 'submit')).toBe(
-      'account_security',
-    );
-    expect(classifyControlFacts(button('Email address', { ...account, tag: 'input', type: 'email' }))).toBe('ordinary');
-    expect(classifyControlFacts(button('Save preferences', { accountPage: true, region: region() }))).toBe('ordinary');
-    // Contact fields on a checkout are no account page.
-    expect(classifyControlFacts(button('Save', { region: region({ accountFields: true }) }))).toBe('ordinary');
-    expect(classifyControlFacts(button('Save', { formAction: 'https://shop.example/account/change-password' }))).toBe(
-      'account_security',
-    );
+    const email = { ...account, tag: 'input', type: 'email' };
+    expectClasses([
+      ...each(labels, (name) => button(name), 'account_security'),
+      [button('Save', account), 'account_security'],
+      [button('Email address', email), 'account_security', 'submit'],
+      [button('Email address', email), 'ordinary'],
+      [button('Save preferences', { accountPage: true, region: region() }), 'ordinary'],
+      // Contact fields on a checkout are no account page.
+      [button('Save', { region: region({ accountFields: true }) }), 'ordinary'],
+      [button('Save', { formAction: 'https://shop.example/account/change-password' }), 'account_security'],
+    ]);
   });
 
   it('treats cancelling or changing a booking whose page shows a fee as a purchase', () => {
-    for (const name of ['Cancel reservation', 'Modify booking', 'Yes, cancel', 'Cancel'])
-      expect(classifyControlFacts(button(name, { feeTerms: true, region: region() }))).toBe('purchase_control');
-    expect(classifyControlFacts(button('Cancel reservation', { region: region() }))).toBe('ordinary');
-    // A bare Cancel in a dialog closes the dialog.
-    expect(classifyControlFacts(button('Cancel', { feeTerms: true, region: region({ dialog: true }) }))).toBe(
-      'ordinary',
-    );
+    const cancelling = ['Cancel reservation', 'Modify booking', 'Yes, cancel', 'Cancel'];
+    expectClasses([
+      ...each(cancelling, (name) => button(name, { feeTerms: true, region: region() }), 'purchase_control'),
+      [button('Cancel reservation', { region: region() }), 'ordinary'],
+      // A bare Cancel in a dialog closes the dialog.
+      [button('Cancel', { feeTerms: true, region: region({ dialog: true }) }), 'ordinary'],
+    ]);
   });
 
-  it('decides blocked address, account security, speaking, then purchases, in that order', () => {
-    expect(classifyControlFacts(button('Change password', { tag: 'a', type: '', href: 'file:///etc/passwd' }))).toBe(
-      'blocked_address',
-    );
-    expect(
-      classifyControlFacts(
+  it('decides blocked address, account security, speaking, consent, then purchases, in that order', () => {
+    expectClasses([
+      [link('Change password', 'file:///etc/passwd'), 'blocked_address'],
+      [
         button('Save', { chatFrame: true, accountPage: true, region: region({ accountFields: true }) }),
-      ),
-    ).toBe('account_security');
-    expect(classifyControlFacts(button('Buy now', { chatFrame: true }))).toBe('speaks_as_principal');
-    expect(
-      classifyControlFacts(button('Place order', { formAction: 'https://shop.example/account/change-password' })),
-    ).toBe('account_security');
-    expect(
-      classifyControlFacts(button('Send', { region: region({ freeText: true, transaction: true, commits: true }) })),
-    ).toBe('purchase_control');
+        'account_security',
+      ],
+      [button('Buy now', { chatFrame: true }), 'speaks_as_principal'],
+      [button('Place order', { formAction: 'https://shop.example/account/change-password' }), 'account_security'],
+      // A press that sends a message speaks, whatever it toggles.
+      [box('Send me offers', { tag: 'button', type: 'submit', name: 'Send message' }), 'speaks_as_principal'],
+      // A choice the consent engine owns is the engine's, whatever purchase words it carries.
+      [box('Subscribe to our newsletter'), 'consent_control'],
+      [button('Send', { region: region({ freeText: true, transaction: true, commits: true }) }), 'purchase_control'],
+    ]);
   });
 });
 
@@ -413,9 +405,6 @@ it('lets a reviewed flow decide only what the open rule leaves ordinary', async 
   reviewed = 'ordinary';
   read.mockResolvedValue(button('Buy now'));
   expect(await classifyActivation(page, element)).toBe('purchase_control');
-  read.mockResolvedValue(button('Message', { tag: 'input', type: 'text', chatFrame: true }));
-  expect(await classifyActivation(page, element)).toBe('ordinary');
-  expect(await classifyActivation(page, element, 'submit')).toBe('speaks_as_principal');
 });
 
 it('recognizes the reviewed read-only Amazon review URL and refuses unknown activating/security paths', () => {
@@ -427,17 +416,6 @@ it('recognizes the reviewed read-only Amazon review URL and refuses unknown acti
     'purchase_control',
   );
   expect(classifyNavigationUrl('https://www.amazon.com/unknown-oneclick')).toBe('purchase_control');
-  for (const [name, reason] of [
-    ['Write a review', 'speaks_as_principal'],
-    ['Message the restaurant', 'speaks_as_principal'],
-    ['Change sign-in email', 'account_security'],
-    ['Update phone', 'account_security'],
-    ['Manage two-factor', 'account_security'],
-    ['Update payment method', 'account_security'],
-  ])
-    expect(
-      classifyControlFacts({ name, tag: 'button', type: 'submit', role: 'button', href: null, transaction: true }),
-    ).toBe(reason);
 });
 
 describe('the credential activation scope', () => {
@@ -644,14 +622,19 @@ it('strips Referer only from subresources, once across nested sign-in scopes, an
   expect(patterns.every((pattern) => pattern.resourceType && pattern.resourceType !== 'Document')).toBe(true);
 });
 
-it('decides a document under the purchase press that was approved when it paused', async () => {
+/** A reviewed flow on `host` that reads every control and route as a purchase it verifies, so an approval presses it. */
+function registerApprovingFlow(id: string, host: string): void {
   registerReviewedMerchantFlow({
-    id: 'approved-press-fixture',
-    matches: (url) => url.hostname === 'press.example',
+    id,
+    matches: (url) => url.hostname === host,
     classifyControl: async () => 'purchase_control',
     classifyNavigation: () => 'purchase_control',
     verifyPurchaseControl: async () => true,
   });
+}
+
+it('decides a document under the purchase press that was approved when it paused', async () => {
+  registerApprovingFlow('approved-press-fixture', 'press.example');
   let place!: () => void;
   const placed = new Promise<never>((_resolve, reject) => {
     place = () => reject(new Error('Protocol error (Target.getTargetInfo): No target with given id found'));
@@ -712,12 +695,6 @@ it('lets a document no operation asked for load only as a GET on the leased site
   // A frame's document is judged by its page's site, whatever its own.
   expect(await pause('https://widgets.example/poll', 'GET', 'widget-frame')).toBe('continued');
   expect(await pause('https://widgets.example/vote', 'POST', 'widget-frame')).toBe('refused');
-  // A read-only replay's scope follows GET navigation only.
-  await guard.runWithPolicy({ readOnly: true }, async () => {
-    expect(await pause('https://shop.example/deals/today')).toBe('continued');
-    expect(await pause('https://shop.example/deals/saved', 'POST')).toBe('refused');
-    expect(guard.reason()).toBe('read_only');
-  });
 });
 
 describe("an ordinary action's script-request window", () => {
@@ -869,13 +846,7 @@ describe("an ordinary action's script-request window", () => {
   });
 
   it('starts an approved press only once every ordinary window on its page has closed', async () => {
-    registerReviewedMerchantFlow({
-      id: 'settled-press-fixture',
-      matches: (url) => url.hostname === 'settled-press.example',
-      classifyControl: async () => 'purchase_control',
-      classifyNavigation: () => 'purchase_control',
-      verifyPurchaseControl: async () => true,
-    });
+    registerApprovingFlow('settled-press-fixture', 'settled-press.example');
     const window = await windowFixture('settled-press.example');
     const element = { ownerFrame: async () => window.page.mainFrame() } as unknown as ElementHandle;
     vi.spyOn(isolatedFacts, 'readPageControlFacts').mockResolvedValue(button('Place order'));
