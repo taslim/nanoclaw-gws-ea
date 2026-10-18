@@ -18,7 +18,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
+import type { ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 
 import { getDb } from '../../db/connection.js';
@@ -29,9 +29,17 @@ import {
   ControlFactsUnavailableError,
   frameGone,
   moneyTerms,
+  record,
   type ToggledChoice,
 } from './control-facts.js';
-import { PROTOCOL_READ_TIMEOUT_MS, withinTime } from './page-targets.js';
+import {
+  attachFrameTarget,
+  bounded,
+  frameTreeFrames,
+  installReader,
+  PROTOCOL_READ_TIMEOUT_MS,
+  type IsolatedReader,
+} from './page-targets.js';
 
 // ---------------------------------------------------------------- what a choice's wording means
 
@@ -544,6 +552,8 @@ const librarySource = String.raw`(() => {
   return { arm, disarm, received, read, identify, shown, point };
 })()`;
 
+const READER: IsolatedReader = { world: WORLD, global: LIBRARY, source: librarySource };
+
 /** What narrows the host's search for a choice's handle: its element, and its id, name and role. */
 interface ChoiceHint {
   readonly element: 'input' | 'select' | 'role';
@@ -558,8 +568,6 @@ interface ConsentRead {
   readonly choices: ReadonlyArray<ConsentChoice & { readonly hint: ChoiceHint }>;
 }
 
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
 const integer = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isInteger(value) ? value : undefined;
@@ -651,26 +659,6 @@ interface ConsentRound {
   close(): Promise<void>;
 }
 
-const bounded = <T>(work: Promise<T>, ms = PROTOCOL_READ_TIMEOUT_MS): Promise<T> => withinTime(work, ms);
-
-/** The CDP session of the frame's own target, or of the nearest ancestor an in-process frame shares. */
-async function attachSession(frame: Frame): Promise<CDPSession> {
-  for (let owner: Frame | null = frame; owner; owner = owner.parentFrame()) {
-    try {
-      return await bounded(frame.page().context().newCDPSession(owner));
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('does not have a separate CDP session')) throw error;
-    }
-  }
-  throw new ControlFactsUnavailableError();
-}
-
-interface FrameTreeNode {
-  frame: { id: string };
-  childFrames?: FrameTreeNode[];
-}
-const frameIds = (node: FrameTreeNode): string[] => [node.frame.id, ...(node.childFrames ?? []).flatMap(frameIds)];
-
 /**
  * Hands the control into a fresh isolated world of each frame its session hosts, keeps the one world that
  * received it, and reads the control's form there. Any part that cannot complete fails the read; nothing is
@@ -681,27 +669,21 @@ async function readRound(page: Page, control: ElementHandle): Promise<ConsentRou
   const frame = await control.ownerFrame();
   if (!selector || !frame || frame.page() !== page) throw new ControlFactsUnavailableError();
   const name = await selector;
-  const session = await attachSession(frame);
+  // The CDP session of the frame's own target, or of the nearest ancestor an in-process frame shares.
+  const attached = await attachFrameTarget(frame, PROTOCOL_READ_TIMEOUT_MS);
+  if (!attached) throw new ControlFactsUnavailableError();
+  const { session } = attached;
   const close = async (): Promise<void> => {
     await session.detach().catch(() => undefined);
   };
   try {
     const { frameTree } = await bounded(session.send('Page.getFrameTree'));
     const contexts: number[] = [];
-    for (const frameId of frameIds(frameTree as FrameTreeNode)) {
+    for (const { id } of frameTreeFrames(frameTree)) {
       try {
-        const { executionContextId } = await bounded(
-          session.send('Page.createIsolatedWorld', { frameId, worldName: WORLD }),
-        );
-        const installed = await bounded(
-          session.send('Runtime.evaluate', {
-            contextId: executionContextId,
-            expression: `globalThis.${LIBRARY} = ${librarySource}; true`,
-            returnByValue: true,
-          }),
-        );
-        if (installed.exceptionDetails || installed.result.value !== true) throw new ControlFactsUnavailableError();
-        contexts.push(executionContextId);
+        const contextId = await installReader(session, id, READER);
+        if (contextId === undefined) throw new ControlFactsUnavailableError();
+        contexts.push(contextId);
       } catch (error) {
         if (!frameGone(error)) throw error;
       }

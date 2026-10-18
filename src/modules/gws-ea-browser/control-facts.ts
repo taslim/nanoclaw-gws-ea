@@ -8,7 +8,14 @@ import { getDomain } from 'tldts';
 
 import { SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
 import { isolationSelector } from './authentication-submit.js';
-import { PROTOCOL_READ_TIMEOUT_MS, withinTime } from './page-targets.js';
+import {
+  bounded,
+  installReaders,
+  openTargetSessions,
+  PROTOCOL_READ_TIMEOUT_MS,
+  type HostedFrame,
+  type IsolatedReader,
+} from './page-targets.js';
 
 /** What the control's own form or dialog holds, read with the control. */
 export interface ControlRegion {
@@ -703,6 +710,12 @@ const librarySource = String.raw`(sources) => {
     const slot = slots.get(eventName);
     return slot && slot.count === 1 && slot.node ? control(slot.node) : null;
   };
+  // What a field holds as the page shows it: a select's chosen options, a typed field's value, an editable's words.
+  const shownValue = (element) => {
+    if (element instanceof HTMLSelectElement) return squash(Array.from(element.selectedOptions, (option) => option.text).join(' '));
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
+    return squash(element.innerText);
+  };
   // A field as a checkout read reports it. A secret's or a card field's value is never read.
   const checkoutField = (element) => {
     const withheld = secretField(element) || cardEntryField(element);
@@ -714,10 +727,7 @@ const librarySource = String.raw`(sources) => {
       name: element.getAttribute('name') || '',
       autocomplete: element.getAttribute('autocomplete') || '',
       label: squash(labelsOf(element)) || squash(element.getAttribute('aria-label')) || squash(element.getAttribute('placeholder')),
-      value: withheld ? null
-        : element instanceof HTMLSelectElement ? squash(Array.from(element.selectedOptions, (option) => option.text).join(' '))
-        : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value
-        : squash(element.innerText),
+      value: withheld ? null : shownValue(element),
       card: cardEntryField(element),
       secret: secretField(element),
       checked: choice ? element.checked : null,
@@ -751,6 +761,12 @@ const librarySource = String.raw`(sources) => {
 const vocabularySources: Readonly<Record<string, string>> = Object.fromEntries(
   Object.entries(PAGE_VOCABULARY).map(([key, pattern]) => [key, pattern.source]),
 );
+
+const READER: IsolatedReader = {
+  world: WORLD,
+  global: LIBRARY,
+  source: `(${librarySource})(${JSON.stringify(vocabularySources)})`,
+};
 
 /** A box on its document's viewport, in CSS pixels. */
 export interface CheckoutBox {
@@ -827,19 +843,10 @@ interface FrameScan {
   /** The whole document's facts a checkout read needs; read only for one. */
   readonly page?: Omit<CheckoutFrame, 'url' | 'top' | 'signedIn'>;
 }
-/** A frame one of the read's sessions hosts, with the isolated world the reader is installed in. */
-interface HostedFrame {
-  readonly id: string;
-  readonly parentId?: string;
-  readonly url: string;
-  readonly session: CDPSession;
-  readonly context: number;
+/** A hosted frame, with what its scan found and whether its owner element names a chat widget. */
+interface ScannedFrame extends HostedFrame {
   scan?: FrameScan;
   chatOwner?: boolean;
-}
-interface FrameTreeNode {
-  frame: { id: string; parentId?: string; url: string };
-  childFrames?: FrameTreeNode[];
 }
 /** A node of a target's pierced DOM tree: its own children, its shadow roots of every mode, a frame's document. */
 interface PiercedNode {
@@ -859,8 +866,8 @@ export class ControlFactsUnavailableError extends Error {
   }
 }
 
-const bounded = <T>(work: Promise<T>, ms = PROTOCOL_READ_TIMEOUT_MS): Promise<T> => withinTime(work, ms);
-const record = (value: unknown): Record<string, unknown> | undefined =>
+/** A read value as a plain object; undefined for null, an array or anything else. */
+export const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const flag = (value: unknown): boolean => value === true;
 const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
@@ -1070,32 +1077,13 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
   };
 }
 
-/** One CDP session per target: the page's, and each out-of-process frame's. */
+/**
+ * One CDP session per target: the page's, and each out-of-process frame's. A frame gone meanwhile has nothing to
+ * read; any other frame that cannot be opened fails the read.
+ */
 async function openSessions(page: Page): Promise<Map<Frame, CDPSession>> {
-  const sessions = new Map<Frame, CDPSession>();
-  const frames = page.frames().filter((frame) => frame !== page.mainFrame());
-  const opened = await Promise.allSettled([
-    bounded(page.context().newCDPSession(page)),
-    ...frames.map((frame) => bounded(page.context().newCDPSession(frame))),
-  ]);
-  let failed = false;
-  opened.forEach((attempt, index) => {
-    const frame = index === 0 ? page.mainFrame() : frames[index - 1];
-    if (attempt.status === 'fulfilled') sessions.set(frame, attempt.value);
-    // An in-process frame shares its local root's session; a frame gone meanwhile has nothing to read.
-    else if (
-      index === 0 ||
-      !(
-        (attempt.reason instanceof Error && attempt.reason.message.includes('does not have a separate CDP session')) ||
-        frame.isDetached()
-      )
-    )
-      failed = true;
-  });
-  if (failed) {
-    await Promise.all([...sessions.values()].map((session) => session.detach().catch(() => undefined)));
-    throw new ControlFactsUnavailableError();
-  }
+  const sessions = await openTargetSessions(page, (frame) => frame.isDetached());
+  if (!sessions) throw new ControlFactsUnavailableError();
   return sessions;
 }
 
@@ -1103,44 +1091,8 @@ async function openSessions(page: Page): Promise<Map<Frame, CDPSession>> {
  * Every frame each session hosts, with a fresh isolated world holding the reader. A frame that went away
  * meanwhile is left out; any other failure fails the read.
  */
-async function hostedFrames(sessions: Iterable<CDPSession>): Promise<Map<string, HostedFrame>> {
-  const tree = new Map<string, Omit<HostedFrame, 'context'>>();
-  for (const session of sessions) {
-    const { frameTree } = await bounded(session.send('Page.getFrameTree'));
-    const visit = (node: FrameTreeNode): void => {
-      if (!tree.has(node.frame.id))
-        tree.set(node.frame.id, {
-          id: node.frame.id,
-          ...(node.frame.parentId ? { parentId: node.frame.parentId } : {}),
-          url: node.frame.url,
-          session,
-        });
-      node.childFrames?.forEach(visit);
-    };
-    visit(frameTree);
-  }
-  const frames = new Map<string, HostedFrame>();
-  await Promise.all(
-    [...tree.values()].map(async (hosted) => {
-      try {
-        const { executionContextId } = await bounded(
-          hosted.session.send('Page.createIsolatedWorld', { frameId: hosted.id, worldName: WORLD }),
-        );
-        const installed = await bounded(
-          hosted.session.send('Runtime.evaluate', {
-            contextId: executionContextId,
-            expression: `globalThis.${LIBRARY} = (${librarySource})(${JSON.stringify(vocabularySources)}); true`,
-            returnByValue: true,
-          }),
-        );
-        if (installed.exceptionDetails || installed.result.value !== true) throw new ControlFactsUnavailableError();
-        frames.set(hosted.id, { ...hosted, context: executionContextId });
-      } catch (error) {
-        if (!frameGone(error)) throw error;
-      }
-    }),
-  );
-  return frames;
+async function hostedFrames(sessions: Iterable<CDPSession>): Promise<ReadonlyMap<string, ScannedFrame>> {
+  return (await installReaders(sessions, READER, { unreadTree: false, unreadFrame: frameGone })).frames;
 }
 
 /**
@@ -1148,18 +1100,18 @@ async function hostedFrames(sessions: Iterable<CDPSession>): Promise<Map<string,
  * reads each whole document for a checkout too.
  */
 async function scanFrames(
-  frames: ReadonlyMap<string, HostedFrame>,
+  frames: ReadonlyMap<string, ScannedFrame>,
   objectGroup: string,
   detailed: boolean,
 ): Promise<void> {
-  const depth = (hosted: HostedFrame): number => {
+  const depth = (hosted: ScannedFrame): number => {
     let levels = 0;
     for (let parent = hosted.parentId; parent; parent = frames.get(parent)?.parentId) levels++;
     return levels;
   };
   const ordered = [...frames.values()].sort((left, right) => depth(right) - depth(left));
   for (const hosted of ordered) {
-    const owners: Array<{ child: HostedFrame; objectId: string }> = [];
+    const owners: Array<{ child: ScannedFrame; objectId: string }> = [];
     for (const child of frames.values()) {
       if (child.parentId !== hosted.id) continue;
       try {
@@ -1203,17 +1155,17 @@ async function readHandedControl(
   element: ElementHandle,
   frame: Frame,
   sessions: ReadonlyMap<Frame, CDPSession>,
-  frames: ReadonlyMap<string, HostedFrame>,
+  frames: ReadonlyMap<string, ScannedFrame>,
   selector: string,
   checkout: boolean,
-): Promise<{ hosted: HostedFrame; facts: Omit<ControlFacts, 'transaction'>; region?: CheckoutRegion }> {
+): Promise<{ hosted: ScannedFrame; facts: Omit<ControlFacts, 'transaction'>; region?: CheckoutRegion }> {
   let owner: Frame | null = frame;
   while (owner && !sessions.has(owner)) owner = owner.parentFrame();
   const session = owner ? sessions.get(owner) : undefined;
   const candidates = [...frames.values()].filter((hosted) => hosted.session === session);
   if (!session || !candidates.length) throw new ControlFactsUnavailableError();
   const eventName = `gws-ea-auth-${randomUUID()}`;
-  const call = (hosted: HostedFrame, method: 'arm' | 'disarm' | 'received' | 'read' | 'checkout') =>
+  const call = (hosted: ScannedFrame, method: 'arm' | 'disarm' | 'received' | 'read' | 'checkout') =>
     bounded(
       session.send('Runtime.evaluate', {
         contextId: hosted.context,
@@ -1354,8 +1306,8 @@ async function readIsolated(
     );
     const scans = [...frames.values()].flatMap((candidate) => (candidate.scan ? [candidate.scan] : []));
     // The control's frame and every frame around it below the page: a chat widget anywhere there speaks.
-    const chain: HostedFrame[] = [];
-    let current: HostedFrame | undefined = hosted;
+    const chain: ScannedFrame[] = [];
+    let current: ScannedFrame | undefined = hosted;
     while (current?.parentId) {
       chain.push(current);
       current = frames.get(current.parentId);

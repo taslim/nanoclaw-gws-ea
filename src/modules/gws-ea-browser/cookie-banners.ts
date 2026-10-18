@@ -14,12 +14,19 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import type { CDPSession, ElementHandle, Page } from 'playwright-core';
+import type { ElementHandle, Page } from 'playwright-core';
 
 import { isolationSelector } from './authentication-submit.js';
 import { activateControl, BrowserActivationError } from './commit-classifier.js';
-import { frameGone } from './control-facts.js';
-import { PROTOCOL_READ_TIMEOUT_MS, withinTime } from './page-targets.js';
+import { frameGone, record } from './control-facts.js';
+import {
+  bounded,
+  installReaders,
+  openTargetSessions,
+  PROTOCOL_READ_TIMEOUT_MS,
+  type HostedFrame,
+  type IsolatedReader,
+} from './page-targets.js';
 
 // ---------------------------------------------------------------- the rules
 
@@ -483,6 +490,12 @@ const librarySources = {
   bannerName: BANNER_VOCABULARY.bannerName.source,
 };
 
+const READER: IsolatedReader = {
+  world: WORLD,
+  global: LIBRARY,
+  source: `(${librarySource})(${JSON.stringify(librarySources)})`,
+};
+
 /** Finds the node at a path the isolated world read; the world then confirms it is the very node it chose. */
 const WALK = `(steps) => {
   let node = document.documentElement;
@@ -490,9 +503,6 @@ const WALK = `(steps) => {
   return node || null;
 }`;
 
-const bounded = <T>(work: Promise<T>, ms = PROTOCOL_READ_TIMEOUT_MS): Promise<T> => withinTime(work, ms);
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const PLATFORMS: ReadonlySet<unknown> = new Set(COOKIE_BANNER_RULES.map((rule) => rule.platform));
 const SELECTED: ReadonlySet<unknown> = new Set(['reject', 'settings', null]);
 
@@ -546,18 +556,6 @@ function parseRegions(value: unknown): CookieBannerRegionRead[] | undefined {
   return regions;
 }
 
-interface FrameTreeNode {
-  frame: { id: string; parentId?: string; loaderId: string; url: string };
-  childFrames?: FrameTreeNode[];
-}
-/** A frame one of the read's sessions hosts, with the isolated world the reader is installed in. */
-interface HostedFrame {
-  readonly id: string;
-  readonly parentId?: string;
-  readonly url: string;
-  readonly session: CDPSession;
-  readonly context: number;
-}
 /** A child frame's owner element, resolved in its parent's world. */
 interface FrameOwner {
   readonly parent: HostedFrame;
@@ -594,74 +592,6 @@ async function call(hosted: HostedFrame, expression: string, ms = PROTOCOL_READ_
   return value;
 }
 
-/** One CDP session per target, the page's first; a frame that cannot be attached is not read. */
-async function openSessions(page: Page): Promise<CDPSession[]> {
-  const frames = page.frames().filter((frame) => frame !== page.mainFrame());
-  const opened = await Promise.allSettled([
-    bounded(page.context().newCDPSession(page)),
-    ...frames.map((frame) => bounded(page.context().newCDPSession(frame))),
-  ]);
-  const sessions = opened.flatMap((attempt) => (attempt.status === 'fulfilled' ? [attempt.value] : []));
-  if (opened[0]?.status !== 'fulfilled') {
-    await Promise.all(sessions.map((session) => session.detach().catch(() => undefined)));
-    throw new Error('The page has no session to read banners in');
-  }
-  return sessions;
-}
-
-/** Every frame the sessions host, each with a fresh isolated world holding the reader; one that fails is not read. */
-async function hostFrames(
-  sessions: readonly CDPSession[],
-): Promise<{ loader: string; frames: Map<string, HostedFrame> }> {
-  const tree = new Map<string, Omit<HostedFrame, 'context'>>();
-  let main: FrameTreeNode['frame'] | undefined;
-  for (const session of sessions) {
-    let frameTree: FrameTreeNode;
-    try {
-      ({ frameTree } = await bounded(session.send('Page.getFrameTree')));
-    } catch (error) {
-      if (session === sessions[0]) throw error;
-      continue;
-    }
-    main ??= frameTree.frame;
-    const visit = (node: FrameTreeNode): void => {
-      if (!tree.has(node.frame.id))
-        tree.set(node.frame.id, {
-          id: node.frame.id,
-          ...(node.frame.parentId ? { parentId: node.frame.parentId } : {}),
-          url: node.frame.url,
-          session,
-        });
-      node.childFrames?.forEach(visit);
-    };
-    visit(frameTree);
-  }
-  const frames = new Map<string, HostedFrame>();
-  await Promise.all(
-    [...tree.values()].map(async (hosted) => {
-      try {
-        const { executionContextId } = await bounded(
-          hosted.session.send('Page.createIsolatedWorld', { frameId: hosted.id, worldName: WORLD }),
-        );
-        const installed = await bounded(
-          hosted.session.send('Runtime.evaluate', {
-            contextId: executionContextId,
-            expression: `globalThis.${LIBRARY} = (${librarySource})(${JSON.stringify(librarySources)}); true`,
-            returnByValue: true,
-          }),
-        );
-        if (!installed.exceptionDetails && installed.result.value === true)
-          frames.set(hosted.id, { ...hosted, context: executionContextId });
-        // eslint-disable-next-line no-catch-all/no-catch-all -- a frame the host cannot read holds no banner it can press
-      } catch (_error) {
-        /* Left unread. */
-      }
-    }),
-  );
-  if (!main || !frames.has(main.id)) throw new Error('The main frame could not be read for banners');
-  return { loader: main.loaderId, frames };
-}
-
 /** A child frame's owner, resolved in its parent's world; undefined for the main frame or an unread parent. */
 async function resolveOwner(
   frames: ReadonlyMap<string, HostedFrame>,
@@ -694,18 +624,26 @@ const withoutFragment = (raw: string): string => raw.replace(/#.*$/u, '');
 
 /** Reads every frame's banners once, keeping the sessions and worlds open until the round closes. */
 async function readBanners(page: Page): Promise<BannerRound> {
-  const sessions = await openSessions(page);
+  // One CDP session per target, the page's first; a frame that cannot be attached is not read.
+  const sessions = await openTargetSessions(page, () => true);
+  if (!sessions) throw new Error('The page has no session to read banners in');
   const objectGroup = `gws-ea-cookie-banners-${randomUUID()}`;
   const close = async (): Promise<void> => {
     await Promise.all(
-      sessions.map(async (session) => {
+      [...sessions.values()].map(async (session) => {
         await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
         await session.detach().catch(() => undefined);
       }),
     );
   };
   try {
-    const { loader, frames } = await hostFrames(sessions);
+    // Every frame the sessions host, each with a fresh isolated world holding the reader. A frame session or a
+    // frame the host cannot read holds no banner it can press, so it is left unread.
+    const { main, frames } = await installReaders(sessions.values(), READER, {
+      unreadTree: true,
+      unreadFrame: () => true,
+    });
+    if (!main || !frames.has(main.id)) throw new Error('The main frame could not be read for banners');
     const owners = new Map<string, FrameOwner>();
     const facts = new Map<string, { shown: boolean; placed: boolean }>();
     await Promise.all(
@@ -750,7 +688,7 @@ async function readBanners(page: Page): Promise<BannerRound> {
       return true;
     };
     return {
-      loader,
+      loader: main.loaderId,
       banners,
       async state(banner) {
         try {

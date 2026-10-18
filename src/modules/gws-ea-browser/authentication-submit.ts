@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { selectors, type BrowserContext, type CDPSession, type ElementHandle, type Frame } from 'playwright-core';
 
+import { attachFrameTarget, frameTreeFrames } from './page-targets.js';
+
 const worldName = 'gws-ea-native-authentication';
 // Unlike ElementHandle.evaluate/dispatchEvent, a contentScript selector runs in
 // Playwright's isolated utility world. The selector receives the exact handle as
@@ -138,21 +140,6 @@ const readControlSource = `
     };
   };`;
 
-async function attachFrameSession(frame: Frame): Promise<{ session: CDPSession; owner: Frame }> {
-  let owner = frame;
-  for (;;) {
-    try {
-      return { session: await frame.page().context().newCDPSession(owner), owner };
-    } catch (error) {
-      const parent = owner.parentFrame();
-      if (!parent || !(error instanceof Error) || !error.message.includes('does not have a separate CDP session'))
-        throw error;
-      // In-process frames belong to their nearest independently targeted ancestor.
-      owner = parent;
-    }
-  }
-}
-
 /**
  * Every native write and activation runs here: a CDP session on the frame's
  * own target, the bound document still loaded, and the bound nodes resolved
@@ -167,21 +154,22 @@ async function withBoundNodes<T>(
   refused: T,
   operation: (session: CDPSession, objectIds: readonly string[]) => Promise<T>,
 ): Promise<T> {
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  let attached: Awaited<ReturnType<typeof attachFrameTarget>>;
   try {
-    attached = await attachFrameSession(frame);
+    attached = await attachFrameTarget(frame);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Renderer errors refuse the operation without exposing protocol prose.
   } catch (_error) {
     return refused;
   }
+  if (!attached) return refused;
   const { session } = attached;
   const objectGroup = `gws-ea-auth-${randomUUID()}`;
   try {
     const objectIds: string[] = [];
     try {
       const { frameTree } = await session.send('Page.getFrameTree');
-      const selected = findFrame(frameTree, document.frameId);
-      if (!selected || selected.frame.loaderId !== document.loaderId) return refused;
+      const selected = frameTreeFrames(frameTree).find((listed) => listed.id === document.frameId);
+      if (!selected || selected.loaderId !== document.loaderId) return refused;
       const { executionContextId } = await session.send('Page.createIsolatedWorld', {
         frameId: document.frameId,
         worldName,
@@ -502,15 +490,6 @@ function chosenFrame(tree: NativeFrameTree, frame: Frame, owner: Frame): NativeF
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
-function findFrame(tree: NativeFrameTree, id: string): NativeFrameTree | undefined {
-  if (tree.frame.id === id) return tree;
-  for (const child of tree.childFrames ?? []) {
-    const found = findFrame(child, id);
-    if (found) return found;
-  }
-  return undefined;
-}
-
 interface InspectedNode<Facts> {
   frameId: string;
   loaderId: string;
@@ -528,13 +507,14 @@ async function inspectNativeNode<Facts>(
   const registered = contextSelectors.get(frame.page().context());
   if (!registered) return undefined;
   const selectorName = await registered;
-  let attached: Awaited<ReturnType<typeof attachFrameSession>>;
+  let attached: Awaited<ReturnType<typeof attachFrameTarget>>;
   try {
-    attached = await attachFrameSession(frame);
+    attached = await attachFrameTarget(frame);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Protocol errors refuse authentication without exposing page prose.
   } catch (_error) {
     return undefined;
   }
+  if (!attached) return undefined;
   const { session, owner } = attached;
   const eventName = `gws-ea-auth-${randomUUID()}`;
   let contextId: number | undefined;
