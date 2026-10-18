@@ -214,7 +214,13 @@ export class FakeGoogleEvents {
     const subscription: StoredSubscription = {
       name: `subscriptions/chat-${this.nextId++}`,
       targetResource: '//chat.googleapis.com/spaces/-',
-      eventTypes: ['google.workspace.chat.message.v1.created', 'google.workspace.chat.reaction.v1.created'],
+      eventTypes: [
+        'google.workspace.chat.message.v1.created',
+        'google.workspace.chat.reaction.v1.created',
+        'google.workspace.chat.membership.v1.created',
+        'google.workspace.chat.membership.v1.updated',
+        'google.workspace.chat.membership.v1.deleted',
+      ],
       notificationEndpoint: { pubsubTopic: TOPIC },
       payloadOptions: { includeResource: false },
       state: 'ACTIVE',

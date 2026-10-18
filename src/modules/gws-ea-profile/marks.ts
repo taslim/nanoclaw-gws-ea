@@ -52,6 +52,8 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
     new Date(now - PRINCIPAL_MESSAGE_LIFETIME_MS).toISOString(),
   );
   const sender = request.authenticatedSender;
+  const rawUserId = sender?.userId ?? '';
+  const userId = rawUserId.includes(':') ? rawUserId : `${request.channelType}:${rawUserId}`;
   const quote = isRecord(parsed.replyTo) ? parsed.replyTo : undefined;
   if (
     sender?.kind !== 'human' ||
@@ -59,7 +61,7 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
     quote?.forwarded === true ||
     parsed.quoted === true ||
     parsed.reaction !== undefined ||
-    !(await isVerifiedPrincipalUser(sender.userId))
+    !(await isVerifiedPrincipalUser(userId))
   )
     return clean();
   const text = principalWords(parsed);
@@ -75,7 +77,7 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
      ON CONFLICT (messaging_group_id, message_id) DO NOTHING`,
     request.messageId,
     request.messagingGroup.id,
-    sender.userId,
+    userId,
     new Date(received).toISOString(),
     text,
   );

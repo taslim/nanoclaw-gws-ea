@@ -32,8 +32,17 @@ const WORKSPACE_EVENTS = 'https://workspaceevents.googleapis.com/v1';
 export const CHAT_SUBSCRIPTION_TARGET = '//chat.googleapis.com/spaces/-';
 export const CHAT_MESSAGE_CREATED = 'google.workspace.chat.message.v1.created';
 export const CHAT_REACTION_CREATED = 'google.workspace.chat.reaction.v1.created';
+export const CHAT_MEMBERSHIP_CREATED = 'google.workspace.chat.membership.v1.created';
+export const CHAT_MEMBERSHIP_UPDATED = 'google.workspace.chat.membership.v1.updated';
+export const CHAT_MEMBERSHIP_DELETED = 'google.workspace.chat.membership.v1.deleted';
 /** The events subscribed to. Their batch variants arrive without asking; reaction deletions are not wanted. */
-export const CHAT_EVENT_TYPES: readonly string[] = [CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED];
+export const CHAT_EVENT_TYPES: readonly string[] = [
+  CHAT_MESSAGE_CREATED,
+  CHAT_REACTION_CREATED,
+  CHAT_MEMBERSHIP_CREATED,
+  CHAT_MEMBERSHIP_UPDATED,
+  CHAT_MEMBERSHIP_DELETED,
+];
 
 const LIFECYCLE_PREFIX = 'google.workspace.events.subscription.v1.';
 export const SUBSCRIPTION_EXPIRATION_REMINDER = `${LIFECYCLE_PREFIX}expirationReminder`;

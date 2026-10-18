@@ -44,7 +44,7 @@ import {
 } from 'chat';
 import { OAuth2Client } from 'google-auth-library';
 
-import type { ChannelAdapter, ChannelDefaults, OutboundFile } from '../../channels/adapter.js';
+import type { ChannelDefaults, OutboundFile } from '../../channels/adapter.js';
 import type { AudioSource } from '../../channels/inbound-content.js';
 import {
   createChatSdkBridge,
@@ -71,6 +71,8 @@ import {
 } from './hydrate.js';
 import type { WorkspaceEvent } from './pubsub-pull.js';
 import { CHAT_MESSAGE_CREATED } from './subscription.js';
+import { createChatMembershipReader, type AssistantChatChannel } from './membership.js';
+import { chatAcceptsInbound } from '../gws-ea-chats/db.js';
 
 /**
  * A reaction someone placed on a message in one of the assistant's
@@ -173,6 +175,7 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
   private readonly hydrator: ChatHydrator;
   private readonly startDelivery: AssistantChatAdapterOptions['startDelivery'];
   private readonly chatClient: GoogleClientOptions;
+  private readonly membership: ReturnType<typeof createChatMembershipReader>;
   private delivery: ChatDelivery | undefined;
   private reactionHandler: ChatReactionHandler | undefined;
   /** The 👀 of each message a turn works on, until it is off. */
@@ -193,6 +196,11 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     this.hydrator = options.hydrator;
     this.startDelivery = options.startDelivery;
     this.chatClient = { token: options.chatToken, ...(options.fetch === undefined ? {} : { fetch: options.fetch }) };
+    this.membership = createChatMembershipReader({
+      client: this.chatClient,
+      hydrator: this.hydrator,
+      assistantUserId: options.botUserId,
+    });
   }
 
   override async initialize(chat: ChatInstance): Promise<void> {
@@ -365,6 +373,7 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
    * the rest.
    */
   async handleChatEvent(event: WorkspaceEvent): Promise<void> {
+    if (await this.membership.handle(event)) return;
     const parts = chatEventParts(event);
     if (parts.length === 0) {
       log.warn('Acknowledged a Chat event with nothing to handle', { type: event.type, messageId: event.messageId });
@@ -378,6 +387,13 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     );
     const ready = read.filter((part): part is ReadPart => part !== undefined).sort((a, b) => a.at - b.at);
     for (const part of ready) await part.dispatch();
+  }
+
+  fetchChatMembers(platformId: string) {
+    return this.membership.fetchChatMembers(platformId);
+  }
+  isOwnMessage(platformId: string, messageId: string) {
+    return this.membership.isOwnMessage(platformId, messageId);
   }
 
   /**
@@ -574,6 +590,8 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
   }
 
   private async readMessage(name: string): Promise<ReadPart | undefined> {
+    const space = spaceOfMessage(name);
+    if (space !== undefined && !(await chatAcceptsInbound('gchat', `gchat:${space}`))) return undefined;
     const read = await this.readMessageIn(name);
     if (read === undefined) {
       log.info('Acknowledged a Chat message the assistant can no longer read', { name });
@@ -666,7 +684,7 @@ function gchatAudioSource(raw: Record<string, unknown>): AudioSource {
  */
 export const GCHAT_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'request_approval' },
-  group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
+  group: { engageMode: 'module', threads: false, unknownSenderPolicy: 'public' },
   mentions: 'platform',
 };
 
@@ -700,8 +718,8 @@ export function escapeChatRequestText(text: string): string {
  * each remembered with the time Google recorded it. A request the host wrote
  * passes `escapeChatRequestText`, whatever its builder quoted.
  */
-export function createAssistantChatChannel(adapter: AssistantChatAdapter): ChannelAdapter {
-  return createChatSdkBridge({
+export function createAssistantChatChannel(adapter: AssistantChatAdapter): AssistantChatChannel {
+  const channel = createChatSdkBridge({
     adapter,
     concurrency: 'concurrent',
     supportsThreads: true,
@@ -711,5 +729,9 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Chann
     redelivers: true,
     textRequests: { postedAt: chatCreateTime },
     escapeCardText: escapeChatRequestText,
+  });
+  return Object.assign(channel, {
+    fetchChatMembers: (platformId: string) => adapter.fetchChatMembers(platformId),
+    isOwnMessage: (platformId: string, messageId: string) => adapter.isOwnMessage(platformId, messageId),
   });
 }

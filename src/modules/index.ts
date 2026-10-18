@@ -41,6 +41,7 @@ import './gws-ea-dates/index.js';
 import './gws-ea-workspace/index.js';
 import './gws-ea-external-email/index.js';
 import './gws-ea-chat-agents/index.js';
+import './gws-ea-chats/index.js';
 import './gws-ea-inbox/index.js';
 import './gws-ea-meetings/index.js';
 import './gws-ea-matters/index.js';
