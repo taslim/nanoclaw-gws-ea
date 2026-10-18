@@ -890,12 +890,13 @@ async function commitFree(
               JSON.stringify(free.facts),
               at,
             );
-            // A free table on a region watch's site spends the watch's one booking (KTD20).
-            if (freeCommitBooks(read.facts)) {
+            // A free table on a region watch's site spends the watch's one booking (KTD20); region watches
+            // live only on sites without a reviewed reader.
+            if (free.kind === 'generic' && freeCommitBooks(free.facts)) {
               const { claimRegionWatchCommit } = await import('./watches.js');
               await claimRegionWatchCommit(db, {
                 jobId: context.job.id,
-                site: read.facts.site,
+                site: free.facts.site,
                 attemptId,
                 requestId: context.request.id,
                 at,
