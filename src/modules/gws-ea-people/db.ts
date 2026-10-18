@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import { hasControlCharacters, identityMatchKey, normalizePrincipalEmail, parseLine } from '../../gws-ea/validation.js';
-import { getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
+import { assistantOwnAddresses, getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import { createFingerprintKey, fingerprintKeyFile, identityFingerprint, readFingerprintKey } from './fingerprint.js';
 import type { ForgottenFingerprint } from './forget-handoff.js';
 
@@ -334,14 +334,15 @@ function identityToAdmit(author: ChangeSource, value: string, source: string | u
   return { handle: parseIdentity(value), source: identitySourceFor(author, source) };
 }
 
-/** Why `handle` cannot be a person's: it is the principal's or the assistant's own, in any spelling. */
+/**
+ * Why `handle` cannot be a person's: it is the principal's or the
+ * assistant's own (its web alias included), in any spelling.
+ */
 async function reservedIdentity(handle: string): Promise<string | undefined> {
   const key = identityMatchKey(handle);
   const profile = await getGwsEaProfile();
-  if (profile.assistant_workspace_email !== null) {
-    if (identityMatchKey(`email:${profile.assistant_workspace_email}`) === key) {
-      return `${handle} is the assistant's own address, not a person's`;
-    }
+  if (assistantOwnAddresses(profile).some((email) => identityMatchKey(`email:${email}`) === key)) {
+    return `${handle} is the assistant's own address, not a person's`;
   }
   if (profile.principal_emails.some((email) => identityMatchKey(`email:${email}`) === key)) {
     return `${handle} is the principal's own address, not a person's`;

@@ -115,6 +115,7 @@ const OPERATIONAL_CODES = new Set([
   'unsupported_merchant',
   'window_closed',
   'browser_unavailable',
+  'alias_unavailable',
   'interrupted',
   'outcome_unknown',
   'awaiting_principal',

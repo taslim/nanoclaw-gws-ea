@@ -20,6 +20,8 @@ import { upsertUser } from '../permissions/db/users.js';
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
   readonly assistant_workspace_email: string | null;
+  /** The assistant's verified web alias, one of its own addresses (KTD14), or null until one is recorded. */
+  readonly assistant_alias: string | null;
   readonly principal_display_name: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
@@ -33,10 +35,11 @@ export interface GwsEaProfile {
 
 /**
  * Who a project document is written for (KTD14): `main` reads live pointers,
- * `external-email` gets nothing but names and its guidance, and any other
- * group what its capabilities allow.
+ * `external-email` gets nothing but names and its guidance, `browser` gives
+ * the assistant's web alias to websites, and any other group what its
+ * capabilities allow.
  */
-export type ProjectDocAudience = 'main' | 'external-email' | 'other';
+export type ProjectDocAudience = 'main' | 'external-email' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -164,15 +167,15 @@ function principalEmail(value: string): string {
  * The assistant and the principal are separate people, so no address is
  * both, and an address is listed in one spelling (R3).
  */
-function assertMayList(email: string, listed: readonly string[], assistantWorkspaceEmail: string | null): void {
-  const conflict = principalAddressConflict(email, listed, assistantWorkspaceEmail);
+function assertMayList(email: string, listed: readonly string[], assistant: readonly string[]): void {
+  const conflict = principalAddressConflict(email, listed, assistant);
   if (conflict !== undefined) throw new Error(conflict);
 }
 
 function principalEmails(values: readonly string[], assistantWorkspaceEmail: string): readonly string[] {
   const emails = [...new Set(values.map(principalEmail))];
   if (emails.length === 0) throw new Error('The principal needs at least one email address');
-  const conflict = principalAddressesConflict(emails, assistantWorkspaceEmail);
+  const conflict = principalAddressesConflict(emails, [assistantWorkspaceEmail]);
   if (conflict !== undefined) throw new Error(conflict);
   return emails;
 }
@@ -326,23 +329,38 @@ export async function recordExternalEmailAgentGroupId(agentGroupId: string): Pro
 /** Whom `agentGroupId`'s project document is written for. Without a profile every group is `other`. */
 export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
-  const row = await getDb().get<{ main_agent_group_id: string | null; external_email_agent_group_id: string | null }>(
-    'SELECT main_agent_group_id, external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  const row = await getDb().get<
+    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+  >(
+    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   if (row?.main_agent_group_id === agentGroupId) return 'main';
   if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  if (row?.browser_agent_group_id === agentGroupId) return 'browser';
   return 'other';
 }
 
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
-    `SELECT assistant_display_name, assistant_workspace_email, principal_display_name,
+    `SELECT assistant_display_name, assistant_workspace_email, assistant_alias, principal_display_name,
             principal_timezone, main_agent_group_id, external_email_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
   return { ...profile, principal_emails: await heldAddresses() };
+}
+
+/**
+ * The addresses the profile names as the assistant's own (KTD14): its
+ * Workspace email and, once verified, its web alias.
+ */
+export function assistantOwnAddresses(
+  profile: Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'> | undefined,
+): string[] {
+  return [profile?.assistant_workspace_email, profile?.assistant_alias].filter(
+    (address): address is string => typeof address === 'string' && address !== '',
+  );
 }
 
 /** Mail from an address speaks as the identity `email:<address>`, as the inbox names every sender. */
@@ -515,6 +533,15 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
   return profile?.assistant_workspace_email ?? null;
 }
 
+/** The assistant's own addresses as the profile holds them now (`assistantOwnAddresses`). */
+async function heldAssistantAddresses(): Promise<string[]> {
+  return assistantOwnAddresses(
+    await getDb().get<Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'>>(
+      'SELECT assistant_workspace_email, assistant_alias FROM gws_ea_profile WHERE singleton = 1',
+    ),
+  );
+}
+
 /**
  * `value` as the profile would hold it, refused when it is malformed, the
  * assistant's own address, or another spelling of one the profile holds;
@@ -525,7 +552,7 @@ export async function proposedPrincipalAddress(
 ): Promise<{ readonly email: string; readonly held: boolean }> {
   const email = principalEmail(value);
   const held = await heldAddresses();
-  assertMayList(email, held, await assistantWorkspaceEmail());
+  assertMayList(email, held, await heldAssistantAddresses());
   return { email, held: held.includes(email) };
 }
 
@@ -673,7 +700,7 @@ export async function addPrincipalAddress(value: string): Promise<{ readonly ema
   const email = principalEmail(value);
   const db = getDb();
   return db.transaction(async () => {
-    assertMayList(email, await heldAddresses(), await assistantWorkspaceEmail());
+    assertMayList(email, await heldAddresses(), await heldAssistantAddresses());
     const added = await holdPrincipalAddress(email, new Date().toISOString());
     await syncPrincipalMembers();
     return { email, added };

@@ -152,7 +152,7 @@ async function principalEmailsInput(source: InputSource, assistantWorkspaceEmail
   const assistant = assistantWorkspaceEmail.trim().toLowerCase();
   const provided = source.context.providedPrincipalEmails;
   if (provided.length > 0) {
-    const conflict = principalAddressesConflict(provided, assistant);
+    const conflict = principalAddressesConflict(provided, [assistant]);
     if (conflict !== undefined) {
       throw new GwsEaError('invalid_arguments', `--${PRINCIPAL_EMAIL_FLAG}: ${conflict}`, {
         details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` },
@@ -184,7 +184,7 @@ function principalEmailsFrom(value: string, assistant: string): { emails: string
   for (const entry of entries) {
     const email = normalizePrincipalEmail(entry);
     if (email === undefined) return { emails: [], problem: `${entry} is not an email address` };
-    const conflict = principalAddressConflict(email, emails, assistant);
+    const conflict = principalAddressConflict(email, emails, [assistant]);
     if (conflict !== undefined) return { emails: [], problem: conflict };
     if (!emails.includes(email)) emails.push(email);
   }

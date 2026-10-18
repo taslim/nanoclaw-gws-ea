@@ -32,6 +32,7 @@ import {
 import { readBrowserPolicy } from './policy.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
 import { beginBrowserActionTrace, isReadOnlyBrowserAction } from './recipes.js';
+import { typedAddressStop } from './web-address.js';
 
 export type BrowserStopReason =
   | 'stale_ref'
@@ -49,6 +50,7 @@ export type BrowserStopReason =
   | 'unsupported_merchant'
   | 'window_closed'
   | 'browser_unavailable'
+  | 'alias_unavailable'
   | 'interrupted';
 export type BrowserAction =
   | { kind: 'navigate'; url: string }
@@ -197,6 +199,12 @@ export function browserActionRefs(action: BrowserAction): BrowserRef[] {
   return action.kind === 'form_input' ? [...action.fields, ...(action.submit ? [action.submit] : [])] : [];
 }
 
+/** The ordinary text an action types into a site. */
+function typedText(action: BrowserAction): string[] {
+  if (action.kind === 'type') return [action.text];
+  return action.kind === 'form_input' ? action.fields.map((field) => field.value) : [];
+}
+
 export async function isSecretBrowserField(target: Pick<PinnedBrowserRef, 'element'>): Promise<boolean> {
   const facts = await target.element.evaluate((node) => {
     const e = node as unknown as { getAttribute(name: string): string | null };
@@ -262,6 +270,9 @@ export async function executeBrowserBatch(
 ): Promise<Record<string, unknown>> {
   if (options.siteAccess && (!options.page || !options.readOnly))
     throw new Error('Signed-out site access requires an explicit read-only page');
+  // Before any action runs: an address the assistant converses from never goes onto a site (KTD14).
+  const addressStop = await typedAddressStop(validateBrowserBatch(payload).actions.flatMap(typedText));
+  if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
   try {
     return await withBrowserJobNavigation(

@@ -43,6 +43,7 @@ import type { PendingApproval, Session } from '../../types.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { bindVerifiedPrincipalUser, listPrincipalAddresses, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
@@ -629,6 +630,17 @@ describe('who may ask, and for whom', () => {
       error: { code: 'forbidden' },
     });
     expect(await pendingApprovals()).toEqual([]);
+  });
+
+  it("refuses the assistant's web alias as the principal's 1Password email, in any spelling that reaches it (KTD14)", async () => {
+    await recordWebAlias('onuj@assistant.example.test');
+    for (const email of ['onuj@assistant.example.test', 'Onuj+vault@assistant.example.test'])
+      expect(await ask({ operation: 'share', email }), email).toMatchObject({
+        ok: false,
+        error: { code: 'forbidden', message: expect.stringMatching(/assistant's own address/u) },
+      });
+    expect(await pendingApprovals()).toEqual([]);
+    expect(onePassword.calls).toEqual([]);
   });
 
   it('holds a page-supplied recipient for the principal, who can refuse it, and shares nothing meanwhile', async () => {

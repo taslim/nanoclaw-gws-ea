@@ -73,11 +73,35 @@ function principalAddressesSentence(principal: string, emails: readonly string[]
     : ` ${principal}'s email addresses are ${quoted}.`;
 }
 
+/** An address quoted exactly in a code span when it can be. */
+function quotedAddress(email: string): string {
+  return email.includes('`') ? escapeMarkdownInline(email) : `\`${email}\``;
+}
+
 /** The assistant's own address, where the principal shares calendars; quoted exactly when it can be. */
 function assistantAddressSentence(assistant: string, email: string | null): string {
   if (email === null) return '';
-  const shown = email.includes('`') ? escapeMarkdownInline(email) : `\`${email}\``;
-  return ` ${assistant}'s own Google Workspace address is ${shown}.`;
+  return ` ${assistant}'s own Google Workspace address is ${quotedAddress(email)}.`;
+}
+
+/**
+ * The assistant on the web, for main (KTD14): its alias, or that none is set
+ * up yet, and that accounts in the principal's name come only from their
+ * logins in 1Password (R25).
+ */
+function mainWebSentences(assistant: string, principal: string, alias: string | null): string {
+  const address =
+    alias === null
+      ? ` ${assistant} has no web address yet: until the operator sets it up, a browser errand that needs ${assistant}'s email stops with \`alias_unavailable\`.`
+      : ` ${assistant}'s web address is ${quotedAddress(alias)}: ${assistant}'s email on every website, for ${assistant}'s own accounts and for bookings and checkouts made for ${principal}.`;
+  return `${address} ${assistant} never creates an account in ${principal}'s name: ${principal}'s own accounts come only from their logins in 1Password, so when an errand needs one that the vault has no login for, ask ${principal} to add it to 1Password.`;
+}
+
+/** The browser's email on every website (KTD14): the alias, never the address the assistant converses from. */
+function browserWebSentence(assistant: string, principal: string, alias: string | null): string {
+  return alias === null
+    ? ` ${assistant} has no email address for websites yet: a site form that needs one cannot be completed until the operator sets it up, so report that to main.`
+    : ` ${assistant}'s email on every website is ${quotedAddress(alias)}: give it wherever a site asks for ${assistant}'s email, including on a booking or checkout made for ${principal} in ${principal}'s name, and open ${assistant}'s accounts with it, in ${assistant}'s own name.`;
 }
 
 /**
@@ -93,8 +117,10 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
  * Who the assistant and the principal are, for each audience (KTD14). Main
  * reads the principal's addresses live. `external-email` writes to people
  * other than the principal, so it gets the two names and no address of
- * either. Any other group gets the addresses as of its container's start:
- * the default `group` CLI scope leaves the live list out of its reach.
+ * either. The browser gives the assistant's web alias to websites, never
+ * the address it converses from. Any other group gets the addresses as of
+ * its container's start: the default `group` CLI scope leaves the live list
+ * out of its reach.
  */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
@@ -105,14 +131,15 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
   if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
-  const addresses =
+  const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
+  const theirs = principalAddressesSentence(principal, profile.principal_emails);
+  const body =
     audience === 'main'
-      ? MAIN_PRINCIPAL_ADDRESSES_POINTER
-      : principalAddressesSentence(principal, profile.principal_emails);
-  return {
-    name: 'Assistant Identity',
-    body: `${names}${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${addresses}`,
-  };
+      ? `${own}${mainWebSentences(assistant, principal, profile.assistant_alias)}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`
+      : audience === 'browser'
+        ? `${browserWebSentence(assistant, principal, profile.assistant_alias)}${theirs}`
+        : `${own}${theirs}`;
+  return { name: 'Assistant Identity', body: `${names}${body}` };
 }
 
 registerRequiredProjectDocSection('gws-ea-profile:identity', identitySection);

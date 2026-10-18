@@ -27,8 +27,10 @@ import {
   projectDocAudience,
   reconcileGwsEaProfile,
   recordExternalEmailAgentGroupId,
+  setBrowserAgentGroupId,
 } from './db.js';
 import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
+import { recordWebAlias } from './testing/web-alias.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
 
@@ -70,6 +72,7 @@ describe('GWS-EA profile module', () => {
     expect(await getGwsEaProfile()).toEqual({
       assistant_display_name: null,
       assistant_workspace_email: null,
+      assistant_alias: null,
       principal_display_name: null,
       principal_timezone: null,
       main_agent_group_id: null,
@@ -556,6 +559,17 @@ describe("the principal's email addresses", () => {
     expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
+  it("refuses the assistant's web alias, in any spelling that reaches it (KTD14)", async () => {
+    await recordWebAlias('yaa@example.test');
+    for (const email of ['yaa@example.test', 'YAA+shop@example.test']) {
+      expect(await run('principal-addresses-add', { email }), email).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/assistant's own/i) },
+      });
+    }
+    expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
+  });
+
   it("refuses a dotted spelling of an assistant's Gmail address", async () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
@@ -740,6 +754,68 @@ describe("external-email's pointer and audience", () => {
     const [other] = await getRequiredProjectDocSections(research);
     expect(other?.body).toContain('`morgan@example.test`');
     expect(other?.body).toContain('`aya@example.test`');
+  });
+});
+
+describe("the assistant's web address in each identity section (KTD14)", () => {
+  const main = group('ag-main');
+  const browser = group('ag-browser', 'browser');
+  const research = group('ag-research', 'research');
+  const NAMES =
+    'Juno is the assistant. Morgan is the principal. They are separate people: act and communicate as Juno, support Morgan, and never present the assistant as the principal.';
+  const ACCOUNTS =
+    " Juno never creates an account in Morgan's name: Morgan's own accounts come only from their logins in 1Password, so when an errand needs one that the vault has no login for, ask Morgan to add it to 1Password.";
+
+  beforeEach(async () => {
+    for (const candidate of [main, browser, research]) await createGroup(candidate);
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Juno',
+      assistantWorkspaceEmail: 'juno@example.test',
+      principalDisplayName: 'Morgan',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+      principalEmails: ['morgan@example.test'],
+    });
+    await setBrowserAgentGroupId(browser.id);
+  });
+
+  async function identity(of: AgentGroup): Promise<string | undefined> {
+    return (await getRequiredProjectDocSections(of)).find((section) => section.name === 'Assistant Identity')?.body;
+  }
+
+  it("gives the browser the alias as its email on every site and the assistant's own name for its accounts, never the address it converses from", async () => {
+    await recordWebAlias('onuj@example.test');
+
+    expect(await projectDocAudience(browser.id)).toBe('browser');
+    expect(await identity(browser)).toBe(
+      `${NAMES} Juno's email on every website is \`onuj@example.test\`: give it wherever a site asks for Juno's email, ` +
+        "including on a booking or checkout made for Morgan in Morgan's name, and open Juno's accounts with it, in Juno's own name. " +
+        "Morgan's email address is `morgan@example.test`.",
+    );
+  });
+
+  it("names the alias as main's web address beside its own, and keeps the principal's accounts to their logins in 1Password", async () => {
+    await recordWebAlias('onuj@example.test');
+
+    expect(await identity(main)).toBe(
+      `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.` +
+        " Juno's web address is `onuj@example.test`: Juno's email on every website, for Juno's own accounts and for bookings and checkouts made for Morgan." +
+        `${ACCOUNTS}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`,
+    );
+    // Another group's section is as it was: the browser alone gives an email to websites.
+    expect(await identity(research)).not.toContain('onuj@example.test');
+  });
+
+  it('tells main and the browser that no web address is set up while none is recorded (R23)', async () => {
+    expect(await identity(main)).toContain(
+      " Juno has no web address yet: until the operator sets it up, a browser errand that needs Juno's email stops with `alias_unavailable`." +
+        ACCOUNTS,
+    );
+    const body = await identity(browser);
+    expect(body).toContain(
+      ' Juno has no email address for websites yet: a site form that needs one cannot be completed until the operator sets it up, so report that to main.',
+    );
+    expect(body).not.toContain('juno@example.test');
   });
 });
 
@@ -993,6 +1069,7 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
     expect(read).toMatchObject({ ok: true, data: { principal_display_name: 'Morgan Ellery' } });
     expect(read.ok && Object.keys(read.data as object).sort()).toEqual(
       [
+        'assistant_alias',
         'assistant_display_name',
         'assistant_workspace_email',
         'browser_agent_group_id',

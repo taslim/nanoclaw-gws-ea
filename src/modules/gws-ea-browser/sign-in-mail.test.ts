@@ -62,11 +62,15 @@ import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 
 registerMigration(gwsEaInboxMigration);
 registerSignInMailDelivery(() => {
   throw new Error('Principal queue is provided by its own test.');
 });
+
+/** The assistant's web alias: its email on every site (KTD14). */
+const ALIAS = 'tnatsissa@example.com';
 
 let messages: GmailMessage[];
 let nextReply: SignInReply;
@@ -82,6 +86,7 @@ beforeEach(async () => {
     'UPDATE gws_ea_profile SET assistant_workspace_email = ? WHERE singleton = 1',
     'assistant@example.com',
   );
+  await recordWebAlias(ALIAS);
   messages = [];
   nextReply = { kind: 'code', value: '642981' };
   await createAgentGroup({
@@ -163,12 +168,13 @@ async function interpret(reply: SignInReply = nextReply): Promise<void> {
   expect(JSON.parse(answer.content)).toMatchObject({ frame: { ok: true, data: { status: 'accepted' } } });
 }
 
-function fixture(username = false) {
+/** A sign-in page: its email field when `username`, holding `current`, else its code field. */
+function fixture(username = false, current = '') {
   let url = 'https://www.shop.example/login';
   let loader = 'initial';
   const field = {
     ownerFrame: async () => frame,
-    inputValue: async () => '',
+    inputValue: async () => current,
     dispose: vi.fn(async () => undefined),
     evaluate: async () => ({
       tag: 'INPUT',
@@ -334,7 +340,7 @@ it('registers the wait before sending, routes raw HTML to external-email, and re
   });
   const result = await executeSignInCode(f.context, payload);
   expect(result).toEqual({ status: 'code_filled' });
-  expect(f.values).toEqual(['assistant@example.com', '642981']);
+  expect(f.values).toEqual([ALIAS, '642981']);
   expect(list).not.toHaveBeenCalled();
   expect(read).not.toHaveBeenCalled();
   const [session] = await getSessionsByAgentGroup('external-email');
@@ -352,8 +358,33 @@ it('returns ambiguity when the interpreter cannot identify one credential', asyn
   await observePage(f.page);
   nextReply = { kind: 'unavailable' };
   expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'ambiguous' });
-  expect(f.values).toEqual(['assistant@example.com']);
+  expect(f.values).toEqual([ALIAS]);
   expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+describe("the assistant's email on a sign-in form (KTD14)", () => {
+  it('signs in with the alias, never an address the assistant converses from, even one the site filled in (R26)', async () => {
+    const f = fixture(true, 'Assistant@example.com');
+    await observePage(f.page);
+    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
+    expect(f.values).toEqual([ALIAS, '642981']);
+  });
+
+  it('keeps the +tag spelling of the alias an account was registered with', async () => {
+    const f = fixture(true, ' Tnatsissa+Shop@example.com ');
+    await observePage(f.page);
+    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
+    expect(f.values).toEqual(['tnatsissa+shop@example.com', '642981']);
+  });
+
+  it('stops with alias_unavailable while no alias is recorded, before any wait or send (R23)', async () => {
+    await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
+    const f = fixture(true, 'assistant@example.com');
+    await observePage(f.page);
+    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'alias_unavailable' });
+    expect(f.values).toEqual([]);
+    expect(await getSignInClaim('signin-request')).toBeUndefined();
+  });
 });
 
 it.each(['session', 'job', 'expiry', 'cancellation', 'restart'] as const)(
@@ -383,7 +414,7 @@ it.each(['session', 'job', 'expiry', 'cancellation', 'restart'] as const)(
       return { status: 'submitted' };
     });
     expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'nothing_arrived' });
-    expect(f.values).toEqual(['assistant@example.com']);
+    expect(f.values).toEqual([ALIAS]);
   },
 );
 
@@ -435,7 +466,7 @@ it.each(['https://www.shop.example:8443/login', 'http://www.shop.example/login',
       return result;
     });
     expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'origin_mismatch' });
-    expect(f.values).toEqual(['assistant@example.com']);
+    expect(f.values).toEqual([ALIAS]);
   },
 );
 it('taints bearer documents before traffic and returns only after fresh sanitized navigation and history reset', async () => {
@@ -557,7 +588,7 @@ it.each(['timer', 'abort', 'inactive'] as const)(
       if (mode === 'timer') expect(result).toEqual({ value: { status: 'nothing_arrived' } });
       else expect(result).toMatchObject({ error: { code: 'forbidden' } });
       expect(await answerSignInReply({ kind: 'code', value: '642981' }, session)).toEqual({ status: 'no_wait' });
-      expect(f.values).toEqual(['assistant@example.com']);
+      expect(f.values).toEqual([ALIAS]);
       expect(f.page.goto).not.toHaveBeenCalled();
     } finally {
       controller.abort();
@@ -754,6 +785,30 @@ describe('a signup waiting for its email verification', () => {
     expect(await getSignInClaim('signup-request')).toMatchObject({ state: 'waiting', gmail_message_id: null });
     // Still watched: nothing has arrived yet, which a later verify step may still find.
     expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
+  });
+
+  it('watches a signup under the alias, and under a +tag of it, as mail to the assistant (KTD14)', async () => {
+    expect(await openSignupVerification({ ...signup, username: ALIAS })).toBe(true);
+    expect(
+      await openSignupVerification({
+        ...signup,
+        claimId: 'signup-tagged',
+        attemptId: 'attempt-2',
+        username: 'tnatsissa+store@example.com',
+      }),
+    ).toBe(true);
+    receive('Your verification code is 642981', { to: ALIAS });
+    receive('Your verification code is 135790', { to: 'tnatsissa+store@example.com' });
+    expect(await interpretFor('signup-request', { kind: 'code', value: '642981' })).toEqual({ status: 'accepted' });
+    expect(await interpretFor('signup-tagged', { kind: 'code', value: '135790' })).toEqual({ status: 'accepted' });
+    expect(await takeSignupVerification(context(), 'attempt-1')).toMatchObject({
+      status: 'arrived',
+      reply: { value: '642981' },
+    });
+    expect(await takeSignupVerification(context(), 'attempt-2')).toMatchObject({
+      status: 'arrived',
+      reply: { value: '135790' },
+    });
   });
 
   it("opens no wait for an account outside the assistant's mailbox, or without an inbox", async () => {

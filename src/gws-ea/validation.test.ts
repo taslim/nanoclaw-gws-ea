@@ -209,28 +209,31 @@ describe('GWS-EA shared validation', () => {
       );
     });
 
-    it("refuses the assistant's own address in any spelling that reaches its mailbox (R3)", () => {
-      expect(principalAddressConflict('ea+x@corp.example', [], 'ea@corp.example')).toBe(
+    it("refuses each of the assistant's own addresses in any spelling that reaches its mailbox (R3, KTD14)", () => {
+      const own = ['ea@corp.example', 'ae@corp.example'];
+      expect(principalAddressConflict('ea+x@corp.example', [], own)).toBe(
         "ea+x@corp.example is the assistant's own address, not one of the principal's",
       );
-      expect(principalAddressConflict('e.a@gmail.com', [], 'ea@gmail.com')).toMatch(/assistant's own/u);
-      expect(principalAddressConflict('pat@corp.example', [], null)).toBeUndefined();
+      expect(principalAddressConflict('AE+shop@corp.example', [], own)).toMatch(/assistant's own/u);
+      expect(principalAddressConflict('e.a@gmail.com', [], ['ea@gmail.com'])).toMatch(/assistant's own/u);
+      expect(principalAddressConflict('pat@corp.example', [], own)).toBeUndefined();
+      expect(principalAddressConflict('pat@corp.example', [], [])).toBeUndefined();
     });
 
     it('refuses another spelling of a listed address, naming it, but not the same spelling again (R3)', () => {
-      expect(principalAddressConflict('first.last@gmail.com', LISTED, 'ea@corp.example')).toBe(
+      expect(principalAddressConflict('first.last@gmail.com', LISTED, ['ea@corp.example'])).toBe(
         "first.last@gmail.com is another spelling of firstlast@gmail.com, already one of the principal's addresses",
       );
-      expect(principalAddressConflict('firstlast@gmail.com', LISTED, 'ea@corp.example')).toBeUndefined();
-      expect(principalAddressConflict('pat+x@corp.example', LISTED, 'ea@corp.example')).toBeUndefined();
+      expect(principalAddressConflict('firstlast@gmail.com', LISTED, ['ea@corp.example'])).toBeUndefined();
+      expect(principalAddressConflict('pat+x@corp.example', LISTED, ['ea@corp.example'])).toBeUndefined();
     });
 
     it('judges each address of a list against those before it', () => {
-      expect(principalAddressesConflict(['pat@corp.example', 'pat@corp.example'], 'ea@corp.example')).toBeUndefined();
-      expect(principalAddressesConflict(['firstlast@gmail.com', 'first.last@gmail.com'], null)).toBe(
+      expect(principalAddressesConflict(['pat@corp.example', 'pat@corp.example'], ['ea@corp.example'])).toBeUndefined();
+      expect(principalAddressesConflict(['firstlast@gmail.com', 'first.last@gmail.com'], [])).toBe(
         "first.last@gmail.com is another spelling of firstlast@gmail.com, already one of the principal's addresses",
       );
-      expect(principalAddressesConflict(['pat@corp.example', 'EA@corp.example'], 'ea@corp.example')).toMatch(
+      expect(principalAddressesConflict(['pat@corp.example', 'EA@corp.example'], ['ea@corp.example'])).toMatch(
         /assistant's own/u,
       );
     });

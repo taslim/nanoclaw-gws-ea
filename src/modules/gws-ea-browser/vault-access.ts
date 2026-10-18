@@ -28,6 +28,7 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import {
+  assistantOwnAddresses,
   getGwsEaProfile,
   isVerifiedPrincipalUser,
   listPrincipalAddresses,
@@ -353,8 +354,8 @@ async function recipient(value: unknown): Promise<Recipient> {
   const email = typeof value === 'string' ? normalizePrincipalEmail(value) : undefined;
   // Never read as a flag by the provider's CLI.
   if (email === undefined || email.startsWith('-')) throw invalidArgs('email must be one email address.');
-  const assistant = (await getGwsEaProfile()).assistant_workspace_email;
-  if (assistant !== null && identityMatchKey(`email:${email}`) === identityMatchKey(`email:${assistant}`))
+  const key = identityMatchKey(`email:${email}`);
+  if (assistantOwnAddresses(await getGwsEaProfile()).some((own) => identityMatchKey(`email:${own}`) === key))
     throw forbidden("That is the assistant's own address: the vault is shared only with the principal.");
   return { kind: resolvePrincipalAddress(email, listed) === undefined ? 'other' : 'principal', email };
 }

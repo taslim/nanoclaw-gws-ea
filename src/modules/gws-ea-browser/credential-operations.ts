@@ -109,6 +109,7 @@ import {
   openVerificationLink,
   takeSignupVerification,
 } from './sign-in-mail.js';
+import { signupAccountStop } from './web-address.js';
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
@@ -204,6 +205,9 @@ export async function credentialAuthorityRequest(
   );
   if (open) return recorded(open, job.thread_id);
   if (kind === 'signup') {
+    // The account is the assistant's own, under its web address (KTD14).
+    const stop = await signupAccountStop(username);
+    if (stop) return { status: stop };
     // A signup that may have reached the site is settled through its own job, never retried (KTD8).
     if (
       unresolved.some(

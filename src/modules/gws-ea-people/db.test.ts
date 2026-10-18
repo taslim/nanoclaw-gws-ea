@@ -11,6 +11,7 @@ import { getRegisteredMigrations } from '../../db/migrations/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { getMembers } from '../permissions/db/agent-group-members.js';
 import {
   addPerson,
@@ -385,6 +386,13 @@ describe('GWS-EA people store', () => {
     await expect(addPerson(pat({ identity }))).rejects.toThrow(message);
     const { id } = await addPerson(pat({ identity: undefined }));
     await expect(updatePerson({ id, source: 'principal', addIdentity: identity })).rejects.toThrow(message);
+    expect(await rowCount('gws_ea_people_identities')).toBe(0);
+  });
+
+  it("refuses the assistant's web alias, in any spelling that reaches it, as a person identity (KTD14)", async () => {
+    await recordWebAlias('onuj@example.test');
+    for (const identity of ['email:Onuj@example.test', 'onuj+shop@example.test'])
+      await expect(addPerson(pat({ identity })), identity).rejects.toThrow(/assistant's own/i);
     expect(await rowCount('gws_ea_people_identities')).toBe(0);
   });
 

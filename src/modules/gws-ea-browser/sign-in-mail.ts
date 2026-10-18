@@ -60,6 +60,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { signInAddress } from './web-address.js';
 
 interface SignInPayload extends Record<string, unknown> {
   from: 'assistant' | 'principal';
@@ -531,6 +532,9 @@ export async function executeSignInCode(
         throw invalidArgs('Choose the email or one-time-code field in a supported sign-in form.');
       if (payload.from === 'principal' && kind !== 'otp')
         throw invalidArgs('Choose the principal code field after requesting their code.');
+      // The assistant signs in with its web address, never one it converses from (KTD14).
+      const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
+      if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
       const binding = await bindBrowserSecretField(
         page,
         target,
@@ -557,15 +561,8 @@ export async function executeSignInCode(
       });
       if (payload.from === 'assistant') assistantWait = awaitAssistantReply(context, claim);
       await context.assertActive();
-      if (kind === 'username') {
-        const inbox = activeInbox();
-        if (!inbox) throw forbidden('The assistant inbox is unavailable.');
-        await inbox.gmailAddress();
-        await context.assertActive();
-        const addresses = await assistantAddresses();
-        const current = (await target.element.inputValue()).trim().toLowerCase();
-        const email = addresses.has(current) ? current : [...addresses][0];
-        if (!email) throw forbidden('The assistant inbox address is unavailable.');
+      if (kind === 'username' && email !== undefined) {
+        if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
         const sent = await fillBoundBrowserSecret(context, binding, async () => email);
         if (sent.status === 'origin_mismatch') return sent;
         if (sent.status !== 'submitted' && sent.status !== 'cleared_after_submit')

@@ -46,7 +46,7 @@ export const browser = requestTool({
   name: 'browser',
   description:
     'Run an ordered batch in this errand’s host browser. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
-    'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main. An unknown commit must be reconciled, never retried. ' +
+    'Outcomes: completed, or stopped with stale_ref, not_actionable, timeout, navigated, purchase_control, speaks_as_principal, account_security, secret_field, blocked_address, challenge, sign_in_wall, site_busy, unsupported_merchant, window_closed, browser_unavailable, alias_unavailable or interrupted. A commit-class result is committed or outcome_unknown. Use the returned page after navigated; re-observe stale_ref; use purchase for purchase_control, and report unsupported or blocked work to main, and alias_unavailable: no web email is set up yet. An unknown commit must be reconciled, never retried. ' +
     NO_REPEAT,
   properties: {
     actions: {
@@ -249,7 +249,7 @@ export const credentialForm = requestTool({
 export const signInCode = requestTool({
   name: 'sign_in_code',
   description:
-    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or awaiting_code. Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity or origin mismatch. ' +
+    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch, awaiting_code or alias_unavailable (no web email is set up yet). Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity, origin mismatch or alias_unavailable. ' +
     NO_REPEAT,
   properties: {
     from: {

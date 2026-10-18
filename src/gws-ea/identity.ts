@@ -140,7 +140,7 @@ function validatePrincipalEmails(values: readonly string[], assistantWorkspaceEm
     ),
   ];
   if (emails.length === 0) throw new GwsEaError('invalid_identity', 'The principal needs at least one email address');
-  const conflict = principalAddressesConflict(emails, assistantWorkspaceEmail);
+  const conflict = principalAddressesConflict(emails, [assistantWorkspaceEmail]);
   if (conflict !== undefined) throw new GwsEaError('invalid_identity', conflict);
   return emails;
 }

@@ -29,8 +29,9 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
-import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
@@ -971,5 +972,47 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
     );
     expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
+  });
+});
+
+describe("a signup's account email (KTD14; R20, R23, R25)", () => {
+  const recordedAttempts = () => getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
+
+  beforeEach(async () => {
+    await getDb().run(
+      'UPDATE gws_ea_profile SET assistant_display_name = ?, assistant_workspace_email = ? WHERE singleton = 1',
+      'Juno',
+      'juno@corp.example',
+    );
+  });
+
+  it("answers alias_unavailable for one under the assistant's own address while no alias is recorded, and records nothing", async () => {
+    for (const username of ['juno@corp.example', 'Juno+Shop@corp.example'])
+      expect(await ask({ operation: 'signup', site: ORIGIN, username }), username).toEqual({
+        status: 'alias_unavailable',
+      });
+    expect(await recordedAttempts()).toEqual([]);
+  });
+
+  it("refuses one under the assistant's own address once an alias is recorded, naming the alias, and records one under the alias", async () => {
+    await recordWebAlias('onuj@corp.example');
+    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno@corp.example' })).rejects.toMatchObject({
+      code: 'invalid-args',
+      message: expect.stringContaining('onuj@corp.example'),
+    });
+    expect(await recordedAttempts()).toEqual([]);
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'onuj+shop@corp.example' })).toMatchObject({
+      status: 'recorded',
+      username: 'onuj+shop@corp.example',
+    });
+  });
+
+  it("refuses one under the principal's address in any spelling: the assistant never opens an account in their name", async () => {
+    await addPrincipalAddress('morgan@principal.example');
+    await recordWebAlias('onuj@corp.example');
+    await expect(
+      ask({ operation: 'signup', site: ORIGIN, username: 'Morgan+shop@principal.example' }),
+    ).rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/1Password/u) });
+    expect(await recordedAttempts()).toEqual([]);
   });
 });
