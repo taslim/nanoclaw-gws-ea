@@ -1978,24 +1978,28 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
         }),
       };
     });
-    await open(GENERIC.steps);
-    expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
-    for (let change = 1; change <= 3; change++) {
+    try {
+      await open(GENERIC.steps);
+      expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
+      for (let change = 1; change <= 3; change++) {
+        await approve((await approvals())[0]);
+        const [card] = await approvals();
+        expect(card.question).toContain(`The total rose to $${42 + change}.00`);
+      }
       await approve((await approvals())[0]);
-      const [card] = await approvals();
-      expect(card.question).toContain(`The total rose to $${42 + change}.00`);
+      expect(await approvals()).toEqual([]);
+      expect(sent).toHaveLength(4);
+      const notices = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.getInboundHistory(100).map((message) => message.content),
+      );
+      expect(notices?.some((content) => content.includes('checkout_changing'))).toBe(true);
+      expect(await attempts()).toMatchObject(Array(4).fill({ resolution: 'not_committed' }));
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+        cancelled: 1,
+      });
+    } finally {
+      fixture.serve(GENERIC.stepsNext, genericCheckoutPages()[GENERIC.stepsNext]);
     }
-    await approve((await approvals())[0]);
-    expect(await approvals()).toEqual([]);
-    expect(sent).toHaveLength(4);
-    const notices = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.getInboundHistory(100).map((message) => message.content),
-    );
-    expect(notices?.some((content) => content.includes('checkout_changing'))).toBe(true);
-    expect(await attempts()).toMatchObject(Array(4).fill({ resolution: 'not_committed' }));
-    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
-      cancelled: 1,
-    });
   });
 
   it('presses Place order once when the same step comes back, and leaves the attempt unconfirmed', async () => {
