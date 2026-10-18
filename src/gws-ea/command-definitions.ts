@@ -529,7 +529,22 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             : command === 'enable'
               ? 'Enable one assistant’s host browser; it signs in with emailed codes and links, and its 1Password vault once provisioned.'
               : 'Disable one assistant’s browser.',
-      options: command === 'enable' ? [id, ...aliasOptions] : [id],
+      options:
+        command === 'enable'
+          ? [
+              id,
+              ...aliasOptions,
+              {
+                ...value(
+                  'agent-group',
+                  'agent_group_id',
+                  'An agent group that may use the browser, in place of main alone; repeat for each. Each shares the signed-in browser profile and the vault’s logins.',
+                ),
+                repeatable: true,
+              },
+              flag('main-only', 'Let main alone use the browser again, forgetting any listed agent groups.'),
+            ]
+          : [id],
       effects:
         command === 'show' || command === 'check'
           ? [
@@ -544,9 +559,10 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             ? [
                 'Writes the enabled owner-only instance policy; host reconciliation activates the browser.',
                 "Then sets up the assistant's web alias: pauses until it is added in the Google Admin console, and verifies it with a test message.",
+                'With --agent-group, first asks the running assistant to confirm it reads an access list and has each group; neither browser nor external-email can be listed. A group no longer listed has its jobs cancelled.',
               ]
             : [
-                'Writes disabled policy; the host stops jobs and withdraws cards on reconciliation, including after restart.',
+                'Writes disabled policy, keeping any listed agent groups; the host stops jobs and withdraws cards on reconciliation, including after restart.',
               ],
       prerequisites: [
         'An explicitly named managed assistant with a readable runtime record.',
@@ -557,7 +573,12 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       ],
       examples: [
         `gws-ea capabilities ${command} browser --id <instance_id>`,
-        ...(command === 'enable' ? ['gws-ea capabilities enable browser --id <instance_id> --alias-added'] : []),
+        ...(command === 'enable'
+          ? [
+              'gws-ea capabilities enable browser --id <instance_id> --alias-added',
+              'gws-ea capabilities enable browser --id <instance_id> --agent-group <main_id> --agent-group <agent_group_id>',
+            ]
+          : []),
       ],
       outputModes: managedModes,
       resultSchema: managedResultSchema(

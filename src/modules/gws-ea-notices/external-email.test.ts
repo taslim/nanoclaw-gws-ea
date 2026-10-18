@@ -276,6 +276,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -318,12 +319,67 @@ describe('a sealed browser errand failure', () => {
     expect(mainWakes()).toBe(1);
   });
 
+  it("tells another agent with browser access of its own job's failure, in the session it delegated from, never main", async () => {
+    const session = await browserJob();
+    await createAgentGroup({
+      id: 'ag-research',
+      name: 'Research Desk',
+      folder: 'research',
+      agent_provider: null,
+      created_at: now(),
+    });
+    fs.mkdirSync(`${TEST_DIR}/browser`, { mode: 0o700 });
+    fs.writeFileSync(
+      `${TEST_DIR}/browser/policy.json`,
+      JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['ag-main', 'ag-research'] }),
+      { mode: 0o600 },
+    );
+    vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${TEST_DIR}/browser/policy.json`);
+    const desk = (await resolveSession('ag-research', null, null, 'agent-shared')).session;
+    const errand = (await resolveSystemSession('ag-browser', 'system:a2a:ag-research:desk-job')).session;
+    await writeSessionMessage('ag-browser', errand.id, {
+      id: 'desk-delegation',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'ag-research',
+      channelType: 'agent',
+      threadId: errand.thread_id,
+      content: JSON.stringify({ text: 'Find a table.' }),
+      sourceSessionId: desk.id,
+    });
+    const route = { channelType: 'agent', platformId: 'ag-research', threadId: errand.thread_id };
+    queueTurnFailed(errand, 'desk-turn-failed', route, ['desk-delegation']);
+    await drain(errand, 1);
+    const db = new Database(inboundDbPath('ag-research', desk.id), { readonly: true });
+    const told = db.prepare('SELECT content FROM messages_in').all() as Array<{ content: string }>;
+    db.close();
+    expect(told.map((row) => JSON.parse(row.content) as { text: string; sender: string })).toEqual([
+      {
+        text: `Browser job ${errand.thread_id}: its turn failed before it finished, so the errand may be left undone.`,
+        sender: 'system',
+        senderId: 'system',
+      },
+    ]);
+    expect(facts()).toEqual([]);
+    expect(vi.mocked(requestWake).mock.calls.some(([woken]) => woken.id === desk.id)).toBe(true);
+    // main's own errand still reaches main alone.
+    queueTurnFailed(
+      session,
+      'main-turn-failed',
+      { channelType: 'agent', platformId: 'ag-main', threadId: session.thread_id },
+      [],
+    );
+    await drain(session, 1);
+    expect(facts()).toHaveLength(1);
+  });
+
   it('tells main of a report that cannot be delivered', async () => {
     const session = await browserJob();
+    // Addressed to main, which opened the errand, over a route the host never granted: delivery fails.
     queue(session, {
       id: 'browser-report-failed',
       content: { text: 'Private report words.' },
-      route: { channelType: 'agent', platformId: 'missing-main', threadId: session.thread_id },
+      route: { channelType: 'agent', platformId: 'ag-main', threadId: session.thread_id },
     });
     await drain(session, 3);
     expect(facts()).toHaveLength(1);

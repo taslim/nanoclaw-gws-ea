@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -9,7 +10,10 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
 }));
+import type { ResponseFrame } from '../../cli/frame.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getDeliveryAction } from '../../delivery.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -26,6 +30,7 @@ import { BrowserQueue } from './queue.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
+import { vaultAccessGuard } from './vault-access.js';
 
 let session: Session;
 beforeEach(async () => {
@@ -265,5 +270,112 @@ describe('cancelling a job with credential attempts', () => {
     await getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'rejected'");
     await sweepBrowserJobSessions(new Date().toISOString());
     expect((await getSession(session.id))?.status).toBe('closed');
+  });
+});
+
+describe('a second agent group the browser access setting lists', () => {
+  let requests = 0;
+  /** Send one request as the runner's tool would, and read the host's one answer. */
+  async function send(from: Session, action: string, fields: Record<string, unknown>): Promise<ResponseFrame> {
+    const requestId = `access-${++requests}`;
+    await getDeliveryAction(action)!({ ...fields, action, requestId }, from);
+    const db = new Database(inboundDbPath(from.agent_group_id, from.id), { readonly: true });
+    try {
+      const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as {
+        content: string;
+      };
+      return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
+    } finally {
+      db.close();
+    }
+  }
+  const refused = (frame: ResponseFrame): string => (frame.ok ? 'accepted' : frame.error.message);
+  const bounds = {
+    venue_id: 'bistro-ellery',
+    party_size: 2,
+    window_start: '2026-11-06T19:00:00-05:00',
+    window_end: '2026-11-06T21:00:00-05:00',
+  };
+
+  let main: Session;
+  let research: Session;
+  let other: Session;
+  let mainThread: string;
+  let researchThread: string;
+  beforeEach(async () => {
+    for (const id of ['research', 'other'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    const file = `${root}/browser/policy.json`;
+    fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }), {
+      mode: 0o600,
+    });
+    process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+    main = (await resolveSystemSession('main', 'system:test:main')).session;
+    research = (await resolveSystemSession('research', 'system:test:research')).session;
+    other = (await resolveSystemSession('other', 'system:test:other')).session;
+    mainThread = session.thread_id!;
+    researchThread = (await resolveSystemSession('browser', 'system:a2a:research:errand')).session.thread_id!;
+  });
+
+  it('records its jobs as its own and lets it manage them like main', async () => {
+    expect((await readBrowserJob(researchThread))?.job.source_agent_group_id).toBe('research');
+    expect(await send(research, 'reservation_bounds', { thread: researchThread, ...bounds })).toMatchObject({
+      ok: true,
+      data: { status: 'recorded', thread: researchThread },
+    });
+    expect(await send(research, 'cancel_job', { thread: researchThread })).toMatchObject({
+      ok: true,
+      data: { status: 'cancelled' },
+    });
+    expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+  });
+
+  it("never lets main reach its jobs, nor it main's", async () => {
+    for (const [from, thread] of [
+      [main, researchThread],
+      [research, mainThread],
+    ] as const) {
+      expect(refused(await send(from, 'cancel_job', { thread }))).toBe(
+        'No delegated browser job exists for that thread.',
+      );
+      expect(refused(await send(from, 'reservation_bounds', { thread, ...bounds }))).toBe(
+        'No live browser job of yours exists for that thread.',
+      );
+      expect(await send(from, 'relay_code', { thread, code: '482913' })).toMatchObject({
+        ok: true,
+        data: { status: 'no_wait' },
+      });
+    }
+    expect(await readBrowserJob(researchThread)).toMatchObject({ state: 'idle' });
+    expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+    expect(await getDb().all('SELECT job_id FROM gws_ea_browser_reservation_bounds')).toEqual([]);
+  });
+
+  it("shares the vault's logins with it: it may share the vault with the principal, as main may", async () => {
+    for (const [agentGroupId, effect] of [
+      ['research', 'allow'],
+      ['main', 'allow'],
+      ['other', 'deny'],
+    ] as const)
+      expect(await guard(vaultAccessGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
+        effect,
+      });
+  });
+
+  it('refuses a group the setting does not list, and main once it lists only others', async () => {
+    expect(refused(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    fs.writeFileSync(
+      `${root}/browser/policy.json`,
+      JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }),
+    );
+    expect(refused(await send(main, 'cancel_job', { thread: mainThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    expect(
+      await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'research' }, payload: {} }),
+    ).toMatchObject({ effect: 'allow' });
   });
 });

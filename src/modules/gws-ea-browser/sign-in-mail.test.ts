@@ -614,7 +614,9 @@ it.each(['fill', 'restart'] as const)(
       unlock = resolve;
     });
     const lock = queue.withJobLock(job.id, () => blocked);
-    await expect(answerRelayCode(request, browser, 'main-relay', queue)).rejects.toThrow('Only main');
+    await expect(answerRelayCode(request, browser, 'main-relay', queue)).rejects.toThrow(
+      'Only an agent with browser access',
+    );
     expect(await answerRelayCode(request, source, 'main-relay', queue)).toBe(ANSWER_LATER);
     const pending = await context.store.pending(job.id);
     expect(pending).toHaveLength(1);

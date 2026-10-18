@@ -41,7 +41,8 @@ import type { Session } from '../../types.js';
 import { DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import type { ApprovalHandlerContext } from '../approvals/primitive.js';
-import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 import {
   credentialFieldFits,
   httpsOrigin,
@@ -149,20 +150,21 @@ function vaultOutcome(reason: BrowserVaultReason): Outcome {
 }
 
 /**
- * Canonical main records the principal's delegation of one signup or one
- * password change for an exact job, site and account. A change binds the
- * Login this host saved for that site and username, checked fresh against
- * its ownership record (R18); any other Login, an edited one, or an account
- * with no saved Login is refused here, before the browser can act. Sign-in
- * email, phone, two-factor and payment-method changes have no operation.
+ * An agent with browser access records the principal's delegation of one
+ * signup or one password change for an exact job of its own, site and
+ * account. A change binds the Login this host saved for that site and
+ * username, checked fresh against its ownership record (R18); any other
+ * Login, an edited one, or an account with no saved Login is refused here,
+ * before the browser can act. Sign-in email, phone, two-factor and
+ * payment-method changes have no operation.
  */
 export async function credentialAuthorityRequest(
   content: Record<string, unknown>,
   session: Session,
   dependencies: CredentialOperationDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<Outcome> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may delegate an account signup or password change.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may delegate an account signup or password change.');
   if (Object.keys(content).some((key) => !AUTHORITY_FIELDS.has(key)))
     throw invalidArgs('Unknown credential_authority field.');
   if (content.operation === 'release') return credentialReleaseRequest(content, session, dependencies);
@@ -180,7 +182,7 @@ export async function credentialAuthorityRequest(
   const origin = httpsOrigin(site)?.origin;
   const domain = origin && registrableDomain(origin);
   if (!origin || !domain) throw invalidArgs('The site must be a public HTTPS address.');
-  const job = await resolveBrowserJob(thread);
+  const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
   const cancelling =
     job &&
     (await getDb().get<{ cancel_requested: number }>(
@@ -188,7 +190,7 @@ export async function credentialAuthorityRequest(
       job.id,
     ));
   if (!job || job.cancelled || cancelling?.cancel_requested)
-    throw forbidden('No live main-owned browser job exists for that thread.');
+    throw forbidden('No live browser job of yours exists for that thread.');
   const kind: CredentialKind = operation === 'signup' ? 'signup' : 'rotation';
   const { attempts } = dependencies;
   const unresolved = await attempts.unresolved();
@@ -249,8 +251,8 @@ export const credentialReleaseGuard = defineGuardedAction({
   grantActionName: CREDENTIAL_RELEASE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor, payload }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may ask the principal to release a credential attempt.');
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+      return DENY('Only an agent with browser access may ask the principal to release a credential attempt.');
     const attempt = typeof payload.attemptId === 'string' ? await credentialAttempts.get(payload.attemptId) : undefined;
     if (!attempt || attempt.job_id !== payload.jobId || !RELEASABLE_PHASES.includes(attempt.phase))
       return DENY('That credential attempt is settled, or its own step settles it.');
@@ -392,8 +394,8 @@ async function credentialReleaseRequest(
     content.username !== undefined
   )
     throw invalidArgs('release needs only the job thread and the credential authority it recorded.');
-  const job = await resolveBrowserJob(thread);
-  if (!job) throw forbidden('No main-owned browser job exists for that thread.');
+  const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
+  if (!job) throw forbidden('No browser job of yours exists for that thread.');
   const found = await attempts.get(authority);
   if (!found || found.job_id !== job.id || !RELEASABLE_PHASES.includes(found.phase))
     return { status: 'not_releasable' };

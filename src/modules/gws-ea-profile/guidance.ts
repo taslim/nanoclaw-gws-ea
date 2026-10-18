@@ -15,20 +15,29 @@ import path from 'node:path';
 import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 
-export interface Guidance {
+export type Guidance = {
   /** The agent it is for, as the host's log names it. */
   readonly agent: string;
   /** The section's heading. */
   readonly heading: string;
   /** The file, relative to the checkout. */
   readonly file: string;
-  /** The agent's group, or null before the host has created it. */
-  readonly agentGroupId: () => Promise<string | null>;
-}
+} & (
+  | {
+      /** The agent's group, or null before the host has created it. */
+      readonly agentGroupId: () => Promise<string | null>;
+    }
+  | {
+      /** Whether `agentGroupId` receives it: guidance for every group a setting names. */
+      readonly receives: (agentGroupId: string) => Promise<boolean>;
+    }
+);
 
 export function registerGuidance(id: string, guidance: Guidance): void {
   registerRequiredProjectDocSection(id, async (group) => {
-    if (group.id !== (await guidance.agentGroupId())) return undefined;
+    const receives =
+      'receives' in guidance ? await guidance.receives(group.id) : group.id === (await guidance.agentGroupId());
+    if (!receives) return undefined;
     const file = path.resolve(process.cwd(), guidance.file);
     if (!fs.existsSync(file)) {
       log.error(`${guidance.agent}'s guidance is missing; it starts without it`, { file });

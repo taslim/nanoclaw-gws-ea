@@ -111,3 +111,30 @@ it('names the host-recorded site when the principal needs to relay a sign-in cod
     'principal sign-in code for merchant.example (https://login.merchant.example)',
   );
 });
+
+it("never links another agent's browser job into main's matters", async () => {
+  await createAgentGroup({
+    id: 'research',
+    name: 'research',
+    folder: 'research',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    `${root}/browser/policy.json`,
+    JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/browser/policy.json`);
+  try {
+    const foreign = 'system:a2a:research:desk-job';
+    await resolveSystemSession('browser', foreign);
+    await expect(
+      openMatter({ title: 'Find a table', openLoop: 'Pending.', links: [{ kind: 'job', reference: foreign }] }),
+    ).rejects.toThrow(`No browser job ${foreign} exists`);
+    expect(await readBrowserJob(foreign)).toMatchObject({ state: 'idle', job: { source_agent_group_id: 'research' } });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});

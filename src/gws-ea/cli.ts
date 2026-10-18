@@ -8,6 +8,7 @@ import {
 } from './capabilities.js';
 import { aliasDecision, type AliasDecision, type AliasStepOptions } from './alias.js';
 import {
+  browserAccessLine,
   browserCapabilityLines,
   browserCapabilityNextActions,
   browserAliasNextActions,
@@ -2473,12 +2474,25 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
           }
           if (command === 'enable') {
+            const agentGroupIds = invocation.repeated['agent-group'] ?? [];
+            if (agentGroupIds.length > 0 && options['main-only'] === 'true')
+              throw new GwsEaError('invalid_arguments', 'Use --agent-group or --main-only, not both.');
             const decision = aliasDecisionOf(options);
-            const enabled = await enableBrowserWithAlias(paths, instanceId, {
-              ...dependencies,
-              alias: { ...runtime.browserAlias, ...(decision ? { decision } : {}) },
-              emit: (event) => presenter.event(event),
-            });
+            const enabled = await enableBrowserWithAlias(
+              paths,
+              instanceId,
+              {
+                ...dependencies,
+                ncl: runtime.browserInspection?.ncl,
+                alias: { ...runtime.browserAlias, ...(decision ? { decision } : {}) },
+                emit: (event) => presenter.event(event),
+              },
+              agentGroupIds.length > 0
+                ? { kind: 'agent_groups', agentGroupIds }
+                : options['main-only'] === 'true'
+                  ? { kind: 'main' }
+                  : undefined,
+            );
             data = enabled;
             if (enabled.pause) {
               const pause = enabled.pause;
@@ -2510,7 +2524,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           presenter.report({
             outcome: 'ready',
             headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
-            details: nextActionLines(actions),
+            details: [`Access: ${browserAccessLine(data.access)}.`, ...nextActionLines(actions)],
           });
           emitResult(
             managedResult(invocation.definition.path.join(' '), {

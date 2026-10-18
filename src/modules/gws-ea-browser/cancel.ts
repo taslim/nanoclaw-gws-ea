@@ -6,8 +6,9 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
@@ -25,19 +26,29 @@ export interface BrowserJobView {
   readonly last_report?: { readonly at: string; readonly text: string };
 }
 
-/** An existing native main-owned thread only; job rows are lazy, session ownership is not. */
-export async function resolveBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJob | undefined> {
-  const main = await getMainAgentGroupId();
+/**
+ * An existing native errand thread only; job rows are lazy, session ownership
+ * is not. With `owner`, only an errand that group opened, created only while
+ * it has browser access; without, the host's own reach to any errand, as
+ * cancellation needs once a group's access ended.
+ */
+export async function resolveBrowserJob(
+  thread: string,
+  store = new BrowserStore(),
+  owner?: string,
+): Promise<BrowserJob | undefined> {
+  const source = errandSource(thread);
   const browser = await getBrowserAgentGroupId();
-  if (main === null || browser === null || !thread.startsWith(`system:a2a:${main}:`)) return undefined;
+  if (source === undefined || browser === null || (owner !== undefined && source !== owner)) return undefined;
   const existing = await store.getJob(thread);
-  if (existing) return existing.source_agent_group_id === main ? existing : undefined;
+  if (existing) return existing.source_agent_group_id === source ? existing : undefined;
   const session = await store.db.get<Session>(
     'SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ?',
     browser,
     thread,
   );
-  return session ? store.jobForSession(session) : undefined;
+  if (!session) return undefined;
+  return owner === undefined ? store.errandJob(session) : store.jobForSession(session);
 }
 
 export async function readBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJobView | undefined> {
@@ -144,13 +155,17 @@ async function unresolvedWork(db: DbDriver, jobId: string): Promise<boolean> {
   return (await committing(db, jobId)) || (await heldCredentialSites(db, jobId)).size > 0;
 }
 
-/** DB-only half: callers may join authority/watch/card changes in this same transaction. */
+/**
+ * DB-only half: callers may join authority/watch/card changes in this same
+ * transaction. With `owner`, only an errand that group opened.
+ */
 export async function cancelBrowserJobInTransaction(
   thread: string,
   store = new BrowserStore(),
+  owner?: string,
 ): Promise<BrowserJobCancellation> {
-  const job = await resolveBrowserJob(thread, store);
-  if (!job) throw invalidArgs('No main-owned browser job exists for that thread.');
+  const job = await resolveBrowserJob(thread, store, owner);
+  if (!job) throw invalidArgs('No delegated browser job exists for that thread.');
   if (job.cancelled) return { status: 'already_cancelled', thread, job, waitingJobs: [] };
   const purchases = await store.db.hasTable('gws_ea_browser_authorities');
   const inProgress = await committing(store.db, job.id);
@@ -206,8 +221,12 @@ export async function finishBrowserJobCancellation(
   await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
 }
 
-export async function cancelBrowserJob(thread: string, store = new BrowserStore()): Promise<BrowserJobCancellation> {
-  const result = await store.db.transaction(() => cancelBrowserJobInTransaction(thread, store));
+export async function cancelBrowserJob(
+  thread: string,
+  store = new BrowserStore(),
+  owner?: string,
+): Promise<BrowserJobCancellation> {
+  const result = await store.db.transaction(() => cancelBrowserJobInTransaction(thread, store, owner));
   await finishBrowserJobCancellation(result);
   return result;
 }
@@ -325,11 +344,11 @@ export async function sweepBrowserJobSessions(
 export const browserDelegateGuard = defineGuardedAction({
   action: 'gws_ea_browser.delegate',
   async decide({ actor }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may manage browser jobs.');
-    if (!(await readBrowserPolicy()).enabled)
-      return DENY('The operator needs to enable the browser for this assistant.');
-    return ALLOW('Canonical main manages its own browser errands.');
+    const policy = await readBrowserPolicy();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+      return DENY('Only an agent with browser access may manage browser jobs.');
+    if (!policy.enabled) return DENY('The operator needs to enable the browser for this assistant.');
+    return ALLOW('An agent with browser access manages its own browser errands.');
   },
 });
 
@@ -337,12 +356,13 @@ export const browserDelegateGuard = defineGuardedAction({
 export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'cancel_job',
-    answeringAction('cancel_job', async (content) => {
+    answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
       if (!(await readBrowserPolicy()).enabled)
         throw forbidden('The operator needs to enable the browser for this assistant.');
       configureBrowserCancellation(queue());
-      const result = await cancelBrowserJob(content.thread);
+      // Each agent cancels only the errands it opened.
+      const result = await cancelBrowserJob(content.thread, undefined, session.agent_group_id);
       return { status: result.status, thread: result.thread };
     }),
     answeredGuard(browserDelegateGuard),

@@ -189,6 +189,23 @@ export function registerA2aInboundFraming(framing: InboundFraming): void {
   inboundFraming = framing;
 }
 
+/**
+ * A product's rule on where one of its sessions may send, beyond its group's
+ * destination rows: a tool agent's errand, say, answers only the agent that
+ * opened it. A reason refuses the send, as an unknown thread is refused.
+ */
+type A2aRoutePolicy = (input: {
+  readonly session: Session;
+  readonly targetAgentGroupId: string;
+}) => Promise<string | undefined>;
+const routePolicies = new Map<string, A2aRoutePolicy>();
+
+/** Register a route policy. IDs take the `module:name` form, as a refusal names its policy. */
+export function registerA2aRoutePolicy(id: string, policy: A2aRoutePolicy): void {
+  if (routePolicies.has(id)) throw new Error(`A2A route policy already registered: ${id}`);
+  routePolicies.set(id, policy);
+}
+
 export interface RoutableAgentMessage {
   id: string;
   platform_id: string | null;
@@ -282,6 +299,10 @@ export async function routeAgentMessage(
   const targetAgentGroupId = msg.platform_id;
   if (!targetAgentGroupId) {
     throw new Error(`agent-to-agent message ${msg.id} is missing a target agent group id`);
+  }
+  for (const [id, policy] of routePolicies) {
+    const refusal = await policy({ session, targetAgentGroupId });
+    if (refusal !== undefined) throw new OutboundRefusedError(id, refusal);
   }
 
   // The a2a.send decision (guard.ts) carries the checks verbatim in their

@@ -4,6 +4,7 @@ import { getDb } from '../../db/connection.js';
 import { hasControlCharacters, parseLine } from '../../gws-ea/validation.js';
 import { getThread, holdThread, placeThread, THREAD_HANDLER, threadPlacement } from '../gws-ea-inbox/thread-map.js';
 import { getPerson } from '../gws-ea-people/db.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
   cancelBrowserJob,
   cancelBrowserJobInTransaction,
@@ -421,10 +422,16 @@ export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
 // Writes: each in one transaction, with the links' open flag kept in step.
 // ---------------------------------------------------------------------------
 
-/** The host keeps only references it can resolve: a thread the inbox knows, a person with a record. */
+/**
+ * The host keeps only references it can resolve: a thread the inbox knows,
+ * a browser job main delegated (matters are main's), a person with a record.
+ */
 async function assertResolvable(link: LinkRef): Promise<void> {
-  if (link.kind === 'job' && !(await resolveBrowserJob(link.reference)))
-    throw new Error(`No browser job ${link.reference} exists`);
+  if (link.kind === 'job') {
+    const main = await getMainAgentGroupId();
+    if (main === null || !(await resolveBrowserJob(link.reference, undefined, main)))
+      throw new Error(`No browser job ${link.reference} exists`);
+  }
   if (link.kind === 'thread' && (await getThread(link.reference)) === undefined) {
     throw new Error(`No email thread ${link.reference} exists`);
   }

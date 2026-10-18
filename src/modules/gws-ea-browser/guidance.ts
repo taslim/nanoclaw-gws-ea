@@ -3,31 +3,38 @@ import { registerCapability } from '../../capabilities.js';
 import { getDb } from '../../db/connection.js';
 import { registerA2aInboundFraming } from '../agent-to-agent/agent-route.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
-import { getBrowserAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
+import { hasBrowserAccess } from './access.js';
 
+/** Whether a group may delegate to the browser, whether or not the operator has it enabled now (KTD15). */
+async function delegates(agentGroupId: string): Promise<boolean> {
+  return (await getDb().hasTable('gws_ea_profile')) && hasBrowserAccess(agentGroupId);
+}
+
+/**
+ * The delegate tools reach exactly the groups the browser access setting
+ * names, so enablement changes need no container restart; every request is
+ * still checked by the host.
+ */
 export const BROWSER_DELEGATE_CAPABILITY = 'browser-delegate';
 registerCapability(BROWSER_DELEGATE_CAPABILITY, {
   description: 'Delegate browser errands, cancel jobs and relay principal sign-in codes through the host',
-  default: 'on',
+  default: 'off',
+  grantedTo: delegates,
 });
 
-async function pointer(which: 'main' | 'browser'): Promise<string | null> {
-  if (!(await getDb().hasTable('gws_ea_profile'))) return null;
-  return which === 'main' ? getMainAgentGroupId() : getBrowserAgentGroupId();
-}
-
 registerGuidance('gws-ea-browser:main-guidance', {
-  agent: 'main',
+  agent: 'a delegating agent',
   heading: 'Browser delegation',
   file: path.join('src', 'modules', 'gws-ea-browser', 'main-guidance.md'),
-  agentGroupId: () => pointer('main'),
+  receives: delegates,
 });
 registerGuidance('gws-ea-browser:job-guidance', {
   agent: 'browser',
   heading: 'Browser errand',
   file: path.join('templates', 'gws-ea', 'browser', 'instructions.md'),
-  agentGroupId: () => pointer('browser'),
+  agentGroupId: async () => ((await getDb().hasTable('gws_ea_profile')) ? getBrowserAgentGroupId() : null),
 });
 registerA2aInboundFraming((content) => {
   const value: unknown = JSON.parse(content);

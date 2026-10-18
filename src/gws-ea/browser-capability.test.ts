@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,24 +7,26 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { browserPaths } from '../modules/gws-ea-browser/paths.js';
-import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
+import { BROWSER_POLICY_VERSIONS, readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 import {
+  assertBrowserPolicyReadable,
   browserAliasNextActions,
   disableBrowserCapability,
   enableBrowserCapability,
   enableBrowserWithAlias,
   inspectBrowserCapability,
+  releaseBrowserPolicyVersions,
 } from './browser-capability.js';
 import { runCli } from './cli.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
 import { getInstanceReservation } from './registry.js';
-import { GwsEaError } from './types.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths } from './paths.js';
 import { runSanitizedCommandOutcome, type SanitizedCommand } from './process.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import { expectResultContract } from './testing/result-contract.js';
+import { GwsEaError } from './types.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -109,6 +111,13 @@ function aliasHost(verifies: () => boolean) {
     }
   };
   return { ncl, calls };
+}
+
+/** A host whose web alias is already verified: the alias step has nothing to wait for. */
+async function verifiedAliasHost(runtime: unknown, args: readonly string[]): Promise<unknown> {
+  if (args.slice(0, 2).join(' ') === 'gws-ea-alias get')
+    return { alias: 'onuj@example.test', candidate: null, probe_sent: false };
+  return aliasHost(() => true).ncl(runtime, args);
 }
 
 const chrome = async (command: SanitizedCommand) => {
@@ -342,5 +351,166 @@ describe('assistant browser capability', () => {
       }),
     ).toBe(0);
     expectResultContract('capabilities list', JSON.parse(stdout.join('\n')));
+  });
+});
+
+describe('the browser access setting', () => {
+  /** The running host as `ncl` reaches it: what it reads, its profile and its agent groups. */
+  function host(options: { readonly versions?: readonly number[]; readonly down?: boolean } = {}) {
+    const asked: string[][] = [];
+    const ncl = async (_runtime: unknown, args: readonly string[]): Promise<unknown> => {
+      asked.push([...args]);
+      if (options.down) throw new Error('host down');
+      if (args[0] === 'gws-ea-browser-health')
+        return {
+          schemaVersion: 1,
+          ...(options.versions ? { policyVersions: options.versions } : {}),
+          enabled: true,
+          proxy: { state: 'stopped' },
+        };
+      if (args[0] === 'gws-ea-profile-get')
+        return { browser_agent_group_id: 'ag-browser', external_email_agent_group_id: 'ag-external' };
+      if (args[0] === 'groups' && ['ag-main', 'ag-research', 'ag-browser', 'ag-external'].includes(args[3]))
+        return { id: args[3] };
+      throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: group not found: ${args[3]}`);
+    };
+    return { ncl, asked };
+  }
+  const listing = (...agentGroupIds: string[]) => ({ kind: 'agent_groups' as const, agentGroupIds });
+
+  it('writes a version-2 list once the running host reads one and has each group', async () => {
+    const f = await fixture();
+    const { ncl, asked } = host({ versions: [1, 2] });
+    const result = await enableBrowserCapability(f.paths, f.instanceId, { ncl }, listing('ag-main', 'ag-research'));
+    expect(result).toMatchObject({
+      enabled: true,
+      changed: true,
+      access: { version: 2, agent_group_ids: ['ag-main', 'ag-research'] },
+    });
+    expect(asked).toEqual([
+      ['gws-ea-browser-health'],
+      ['gws-ea-profile-get'],
+      ['groups', 'get', '--id', 'ag-main'],
+      ['groups', 'get', '--id', 'ag-research'],
+    ]);
+    expect(await readBrowserPolicy(f.browser.policyFile)).toMatchObject({
+      status: 'enabled',
+      access: { version: 2, agentGroupIds: ['ag-main', 'ag-research'] },
+    });
+    expect((await stat(f.browser.policyFile)).mode & 0o777).toBe(0o600);
+    expect(
+      await enableBrowserCapability(f.paths, f.instanceId, { ncl }, listing('ag-main', 'ag-research', 'ag-main')),
+    ).toMatchObject({ changed: false });
+  });
+
+  it.each([
+    ['does not read a list', { versions: [1] }, 'browser_access_unsupported'],
+    ['reports no versions at all', {}, 'browser_access_unsupported'],
+    ['is not running', { down: true }, 'browser_access_unverified'],
+  ])('refuses version 2, writing nothing, when the host %s', async (_case, options, code) => {
+    const f = await fixture();
+    await enableBrowserCapability(f.paths, f.instanceId);
+    const before = await readFile(f.browser.policyFile, 'utf8');
+    await expect(
+      enableBrowserCapability(f.paths, f.instanceId, { ncl: host(options).ncl }, listing('ag-research')),
+    ).rejects.toMatchObject({ code });
+    expect(await readFile(f.browser.policyFile, 'utf8')).toBe(before);
+  });
+
+  it.each([
+    ['the external-email group', 'ag-external', 'is external-email, which can never use the browser'],
+    ['the browser itself', 'ag-browser', 'is browser, which can never use the browser'],
+    ['a group the assistant does not have', 'ag-unknown', 'has no agent group ag-unknown'],
+  ])('refuses a list naming %s', async (_case, id, message) => {
+    const f = await fixture();
+    await expect(
+      enableBrowserCapability(f.paths, f.instanceId, { ncl: host({ versions: [1, 2] }).ncl }, listing('ag-main', id)),
+    ).rejects.toMatchObject({ code: 'invalid_arguments', message: expect.stringContaining(message) });
+    expect(await readBrowserPolicy(f.browser.policyFile)).toMatchObject({ status: 'disabled', access: { version: 1 } });
+  });
+
+  it('keeps the list through disable and a plain enable, and returns to main alone only when asked', async () => {
+    const f = await fixture();
+    const { ncl } = host({ versions: [1, 2] });
+    await enableBrowserCapability(f.paths, f.instanceId, { ncl }, listing('ag-research'));
+    const list = { version: 2, agent_group_ids: ['ag-research'] };
+    expect(await disableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ enabled: false, access: list });
+    expect(await readBrowserPolicy(f.browser.policyFile)).toMatchObject({
+      status: 'disabled',
+      access: { version: 2, agentGroupIds: ['ag-research'] },
+    });
+    expect(await enableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ changed: true, access: list });
+    expect(await inspectBrowserCapability(f.paths, f.instanceId)).toMatchObject({ access: list });
+    expect(await enableBrowserCapability(f.paths, f.instanceId, {}, { kind: 'main' })).toMatchObject({
+      changed: true,
+      access: { version: 1 },
+    });
+    expect(JSON.parse(await readFile(f.browser.policyFile, 'utf8'))).toEqual({ schemaVersion: 1, enabled: true });
+  });
+
+  it('refuses a rollback below version 2 while a list is in place, until main alone has the browser again', async () => {
+    const f = await fixture();
+    const older = path.join(f.root, 'older-release');
+    const newer = path.join(f.root, 'newer-release');
+    await mkdir(path.join(newer, 'src', 'gws-ea'), { recursive: true });
+    await writeFile(
+      path.join(newer, 'src', 'gws-ea', 'browser-compatibility.json'),
+      JSON.stringify({ schemaVersion: 1, policyVersions: [1, 2] }),
+    );
+    expect(await releaseBrowserPolicyVersions(older)).toEqual([1]);
+    expect(await releaseBrowserPolicyVersions(newer)).toEqual([1, 2]);
+    await assertBrowserPolicyReadable(f.runtime, older, 'dogfood older');
+    await enableBrowserCapability(f.paths, f.instanceId, { ncl: host({ versions: [1, 2] }).ncl }, listing('ag-main'));
+    await disableBrowserCapability(f.paths, f.instanceId);
+    await expect(assertBrowserPolicyReadable(f.runtime, older, 'dogfood older')).rejects.toMatchObject({
+      code: 'rollback_unavailable',
+      message: expect.stringContaining('which dogfood older cannot read'),
+    });
+    await assertBrowserPolicyReadable(f.runtime, newer, 'dogfood newer');
+    await enableBrowserCapability(f.paths, f.instanceId, {}, { kind: 'main' });
+    await assertBrowserPolicyReadable(f.runtime, older, 'dogfood older');
+  });
+
+  it('ships a release marker naming exactly the versions its host reads', async () => {
+    expect(await releaseBrowserPolicyVersions(process.cwd())).toEqual([...BROWSER_POLICY_VERSIONS]);
+  });
+
+  it('grants through the command line with the published result, telling the operator what a grant shares', async () => {
+    const f = await fixture();
+    const stdout: string[] = [];
+    const exit = await runCli(
+      ['capabilities', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--json'],
+      {
+        paths: f.paths,
+        stdout: (line) => stdout.push(line),
+        stderr: () => undefined,
+        browserInspection: { ncl: host({ versions: [1, 2] }).ncl },
+        // The assistant's web alias is already verified, so the grant completes without a pause.
+        browserAlias: { ncl: verifiedAliasHost },
+      },
+    );
+    expect(exit).toBe(0);
+    const result: unknown = JSON.parse(stdout.join('\n'));
+    expectResultContract('capabilities enable browser', result);
+    expect(result).toMatchObject({ data: { access: { version: 2, agent_group_ids: ['ag-research'] } } });
+    const lines: string[] = [];
+    expect(
+      await runCli(['capabilities', 'show', 'browser', '--id', f.instanceId], {
+        paths: f.paths,
+        stdout: (line) => lines.push(line),
+        stderr: () => undefined,
+      }),
+    ).toBe(0);
+    expect(lines).toContain(
+      "  Access: agent groups ag-research; each shares the signed-in browser profile and the vault's logins",
+    );
+    const errors: string[] = [];
+    expect(
+      await runCli(
+        ['capabilities', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--main-only'],
+        { paths: f.paths, stdout: () => undefined, stderr: (line) => errors.push(line) },
+      ),
+    ).not.toBe(0);
+    expect(errors.join('\n')).toContain('Use --agent-group or --main-only, not both.');
   });
 });

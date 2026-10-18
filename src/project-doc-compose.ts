@@ -20,6 +20,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  grantCapabilities,
   grantsInstructions,
   MCP_SERVERS_CAPABILITY,
   parseStoredCapabilities,
@@ -187,7 +188,12 @@ export async function composeGroupProjectDoc(
   if (!fs.existsSync(groupDir)) fs.mkdirSync(groupDir, { recursive: true });
 
   const configRow = await getContainerConfig(group.id);
-  const grants = new Set(resolveCapabilities(parseStoredCapabilities(configRow?.capabilities, group.name), group.name));
+  const grants = new Set(
+    await grantCapabilities(
+      resolveCapabilities(parseStoredCapabilities(configRow?.capabilities, group.name), group.name),
+      group.id,
+    ),
+  );
   // Re-validated rather than cast: these `instructions` strings are the only
   // stored, agent-influenced text copied verbatim into the system prompt.
   const mcpServers = grants.has(MCP_SERVERS_CAPABILITY)

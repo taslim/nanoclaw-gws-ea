@@ -61,14 +61,17 @@ import { createHash } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter, registerDeliveryAction, registerDeliveryFailedHook } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { InboundOrigin, OutboundMessage } from '../../mailbox/index.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
+import { requestWake } from '../../request-wake.js';
+import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { errandSource, hasBrowserAccess } from '../gws-ea-browser/access.js';
 import { conversationPeople, EMAIL_CHANNEL_TYPE, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import { markLookFailed } from '../gws-ea-matters/db.js';
 import { lookSeries } from '../gws-ea-matters/looks.js';
@@ -79,7 +82,13 @@ import {
   isVerifiedPrincipalUser,
   principalContact,
 } from '../gws-ea-profile/db.js';
-import { noteNames, writeNoteForMain, type NoteNames, type NotePiece } from '../gws-ea-profile/main-note.js';
+import {
+  isDuplicateNote,
+  noteNames,
+  writeNoteForMain,
+  type NoteNames,
+  type NotePiece,
+} from '../gws-ea-profile/main-note.js';
 import { gwsEaNoticesMigration } from './migration.js';
 
 registerMigration(gwsEaNoticesMigration);
@@ -149,24 +158,29 @@ async function deliverToPrincipal(text: string, route: Route | undefined, notice
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+/** A browser errand: its job thread, the browser session working it, and the agent group that delegated it. */
+interface BrowserErrand {
+  readonly job: string;
+  readonly session: Session;
+  readonly source: string;
+}
+
 /**
  * Whose conversation a session's is: one of `main`'s, an outside email thread
- * of `external-email`'s, or no one's (any other session, a task session
- * included).
+ * of `external-email`'s, a browser errand of an agent with browser access,
+ * or no one's (any other session, a task session included).
  */
 async function conversationOf(
   session: Session,
-): Promise<'main' | { readonly thread: string } | { readonly job: string } | undefined> {
-  const main = await getMainAgentGroupId();
-  if (
-    session.messaging_group_id === null &&
-    main !== null &&
-    session.agent_group_id === (await getBrowserAgentGroupId()) &&
-    session.thread_id?.startsWith(`system:a2a:${main}:`)
-  )
-    return { job: session.thread_id };
+): Promise<'main' | { readonly thread: string } | BrowserErrand | undefined> {
+  const source =
+    session.messaging_group_id === null && session.agent_group_id === (await getBrowserAgentGroupId())
+      ? errandSource(session.thread_id)
+      : undefined;
+  if (source !== undefined && session.thread_id !== null && (await hasBrowserAccess(source)))
+    return { job: session.thread_id, session, source };
   if (session.messaging_group_id === null) return undefined;
-  if (session.agent_group_id === main) return 'main';
+  if (session.agent_group_id === (await getMainAgentGroupId())) return 'main';
   if (session.thread_id === null || session.agent_group_id !== (await getExternalEmailAgentGroupId())) return undefined;
   return { thread: session.thread_id };
 }
@@ -310,21 +324,57 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
   }
 }
 
-async function tellMainOfBrowserJob(cause: Cause, thread: string, failed: readonly string[]): Promise<void> {
+/**
+ * Tell the agent that delegated a browser errand of `failed` in it, once:
+ * main with the job's open matter, any other agent with browser access in
+ * the session it delegated from (R28). No other agent hears of it.
+ */
+async function tellOfBrowserJob(cause: Cause, errand: BrowserErrand, failed: readonly string[]): Promise<void> {
   const words: Record<Cause, string> = {
     'delivery-failed': 'its report could not be delivered, even after retrying.',
     'inbound-failed': 'a delegated message could not be processed, even after retrying.',
     'turn-failed': 'its turn failed before it finished, so the errand may be left undone.',
   };
-  const result = await writeNoteForMain({
-    id: factId(`browser-${cause}`, [thread, ...[...failed].sort()]),
-    timestamp: new Date().toISOString(),
-    text: `Browser job ${thread}: ${words[cause]}`,
-    wake: true,
-    pieces: [{ kind: 'job', reference: thread }],
-  });
-  if (result === 'no-main' || result === 'no-principal')
-    log.warn('Nobody to tell of a browser job failure', { thread, cause, result });
+  const thread = errand.job;
+  const id = factId(`browser-${cause}`, [thread, ...[...failed].sort()]);
+  const timestamp = new Date().toISOString();
+  const text = `Browser job ${thread}: ${words[cause]}`;
+  if (errand.source === (await getMainAgentGroupId())) {
+    const result = await writeNoteForMain({
+      id,
+      timestamp,
+      text,
+      wake: true,
+      pieces: [{ kind: 'job', reference: thread }],
+    });
+    if (result === 'no-main' || result === 'no-principal')
+      log.warn('Nobody to tell of a browser job failure', { thread, cause, result });
+    return;
+  }
+  const delegatedFrom = await withExistingMailboxSession(errand.session.agent_group_id, errand.session.id, (mailbox) =>
+    mailbox.getMostRecentPeerSourceSessionId(errand.source),
+  );
+  const session = delegatedFrom ? await getSession(delegatedFrom) : undefined;
+  if (session?.agent_group_id !== errand.source || session.status !== 'active') {
+    log.warn('Nobody to tell of a browser job failure', { thread, cause, result: 'no-delegating-session' });
+    return;
+  }
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id,
+      kind: 'chat',
+      timestamp,
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+    });
+  } catch (error) {
+    if (!isDuplicateNote(error)) throw error;
+    return;
+  }
+  const fresh = await getSession(session.id);
+  if (fresh) await requestWake(fresh, 'inbound-message');
 }
 
 /** What main reads of a failure in its own conversation that the principal has nothing to resend for. */
@@ -427,9 +477,9 @@ registerDeliveryFailedHook(async (failed, session) => {
         contentOf(post.content)?.operation !== 'reaction',
     );
     if (reports.length > 0)
-      await tellMainOfBrowserJob(
+      await tellOfBrowserJob(
         'delivery-failed',
-        route.job,
+        route,
         reports.map((post) => post.id),
       );
     return;
@@ -466,7 +516,7 @@ registerInboundFailedHook(async (failed, session) => {
   const ids = failed.map((message) => message.id);
   if (conversation !== 'main') {
     if ('job' in conversation) {
-      await tellMainOfBrowserJob('inbound-failed', conversation.job, ids);
+      await tellOfBrowserJob('inbound-failed', conversation, ids);
       return;
     }
     await tellMain('inbound-failed', conversation.thread, ids);
@@ -517,7 +567,7 @@ registerDeliveryAction(
     const batch = idsOf(content.batch);
     if (conversation !== 'main') {
       if ('job' in conversation) {
-        await tellMainOfBrowserJob('turn-failed', conversation.job, batch);
+        await tellOfBrowserJob('turn-failed', conversation, batch);
         return;
       }
       // A turn answering another agent is no one's to hear of: a failure never answers a failure.

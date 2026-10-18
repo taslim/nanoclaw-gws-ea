@@ -13,9 +13,10 @@ vi.mock('../../config.js', async (original) => ({
   TEMPLATES_DIR: `${process.cwd()}/templates`,
 }));
 
-import { resolveCapabilities } from '../../capabilities.js';
+import { getGroupCapabilities, resolveCapabilities } from '../../capabilities.js';
+import { materializeContainerJson } from '../../container-config.js';
 import { assertSessionAdmitted } from '../../container-runner.js';
-import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
@@ -68,7 +69,8 @@ it('stamps the exact sealed composition once and refuses capability drift at adm
   await expect(
     assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: 'job' } }),
   ).rejects.toThrow('browser may not start');
-  expect(resolveCapabilities('all', 'main')).toContain('browser-delegate');
+  // A stored selection never grants the delegate tools: the browser access setting does.
+  expect(resolveCapabilities('all', 'main')).not.toContain('browser-delegate');
   expect(resolveCapabilities('all', 'main')).not.toContain('browser');
 });
 
@@ -145,6 +147,45 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
         disposition: 'create',
         key: { installSlug: 'test', agentGroupId: id, sessionId: foreign.id },
       }),
-    ).rejects.toThrow('main-owned errand');
+    ).rejects.toThrow('errand delegated by an agent with browser access');
   }
+});
+
+it('hands the delegate tools to main under version 1, enabled or not, and to no other group', async () => {
+  for (const id of ['main', 'research']) {
+    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    await ensureContainerConfig(id);
+  }
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(true);
+  expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(false);
+  // Stored explicitly, the key is still the setting's to grant.
+  await updateContainerConfigJson('research', 'capabilities', ['reply', 'browser-delegate']);
+  expect((await materializeContainerJson('research')).capabilities).toEqual(['reply']);
+  expect((await materializeContainerJson('main')).capabilities).toContain('browser-delegate');
+  expect(
+    JSON.parse(fs.readFileSync(`${ROOT}/groups/main/container.json`, 'utf8')) as { capabilities: string[] },
+  ).toMatchObject({ capabilities: expect.arrayContaining(['browser-delegate']) });
+});
+
+it('admits the errands of every listed group, and no longer main once the list leaves it out', async () => {
+  for (const id of ['main', 'research'])
+    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
+  const policy = `${ROOT}/browser/policy.json`;
+  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }), {
+    mode: 0o600,
+  });
+  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const id = await ensureBrowserGroup();
+  const admit = async (thread: string) =>
+    assertSessionAdmitted({
+      disposition: 'create',
+      key: { installSlug: 'test', agentGroupId: id, sessionId: (await resolveSystemSession(id, thread)).session.id },
+    });
+  await expect(admit('system:a2a:research:errand')).resolves.toBeUndefined();
+  await expect(admit('system:a2a:main:errand')).rejects.toThrow('errand delegated by an agent with browser access');
+  expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(true);
+  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
 });

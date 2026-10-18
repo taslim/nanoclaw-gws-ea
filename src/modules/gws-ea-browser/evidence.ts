@@ -1,6 +1,7 @@
 import { getDb } from '../../db/connection.js';
 import type { MailboxSession } from '../../mailbox/types.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 
 /** Metadata only. This boundary deliberately does not expose browser or mailbox content. */
 export interface BrowserEvidence {
@@ -246,12 +247,15 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
             s.agent_group_id AS browser_agent_group_id
        FROM gws_ea_browser_jobs j
        JOIN sessions s ON s.id=j.browser_session_id AND s.thread_id=j.thread_id
-       JOIN gws_ea_profile p ON p.singleton=1 AND p.main_agent_group_id=j.source_agent_group_id
-                               AND p.browser_agent_group_id=s.agent_group_id
+       JOIN gws_ea_profile p ON p.singleton=1 AND p.browser_agent_group_id=s.agent_group_id
       WHERE j.id=? AND j.id=j.thread_id AND s.status='active' AND s.messaging_group_id IS NULL`,
     thread,
   );
-  if (!job || !job.thread_id.startsWith(`system:a2a:${job.source_agent_group_id}:`))
+  if (
+    !job ||
+    errandSource(job.thread_id) !== job.source_agent_group_id ||
+    !(await hasBrowserAccess(job.source_agent_group_id))
+  )
     throw new Error('Browser job not found');
   const [requests, downloads, watchChecks, openCards, attempts, nextWatch] = await Promise.all([
     db.all<EvidenceRequest>(

@@ -244,6 +244,9 @@ const browserMetadata = {
   actions: array(choices(...BROWSER_CAPABILITY.actions)),
   summary: text,
 };
+const browserAccess = {
+  oneOf: [object({ version: { const: 1 } }), object({ version: { const: 2 }, agent_group_ids: array(text) })],
+};
 export const BROWSER_CAPABILITY_SCHEMA = object({
   ...browserMetadata,
   instance_id: text,
@@ -258,10 +261,11 @@ export const BROWSER_CAPABILITY_SCHEMA = object({
   }),
   isolation: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
   ready: bool,
+  access: nullable(browserAccess),
 });
 export const BROWSER_OPERATION_SCHEMA = object(
-  { ...browserMetadata, instance_id: text, enabled: bool, changed: bool, pause },
-  [...Object.keys(browserMetadata), 'instance_id', 'enabled', 'changed'],
+  { ...browserMetadata, instance_id: text, enabled: bool, changed: bool, access: browserAccess, pause },
+  [...Object.keys(browserMetadata), 'instance_id', 'enabled', 'changed', 'access'],
 );
 const onePasswordMetadata = {
   name: { const: 'onepassword' },

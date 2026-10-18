@@ -38,7 +38,7 @@ import {
 import { reconcileBrowserGroup } from './reconcile.js';
 import { browserSignInMigration } from './sign-in-migration.js';
 import { cleanupBrowserSignInMail, recoverBrowserSignInMail, registerSignInMailDelivery } from './sign-in-mail.js';
-import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
+import { DEFAULT_BROWSER_POLICY, readBrowserPolicy, type BrowserPolicy } from './policy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 import {
@@ -71,7 +71,7 @@ export class BrowserUnavailableError extends Error {
 type EnabledPolicy = Extract<BrowserPolicy, { enabled: true }>;
 
 export class BrowserRuntime {
-  private policy: BrowserPolicy = { status: 'disabled', enabled: false, reason: 'operator-enablement-required' };
+  private policy: BrowserPolicy = DEFAULT_BROWSER_POLICY;
   private proxy: PublicBrowserProxy | undefined;
   private attached: ChromeConnection | undefined;
   private windows: JobWindows | undefined;

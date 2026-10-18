@@ -12,7 +12,8 @@ import {
   requestApproval,
 } from '../approvals/index.js';
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
-import { getMainAgentGroupId, isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
@@ -147,13 +148,13 @@ export async function readDelegatedReservationBounds(
   return row ? (JSON.parse(row.bounds_json) as NonNullable<PurchaseBounds['reservation']>) : undefined;
 }
 
-/** Main records the principal's errand scope; this grants no financial authority by itself. */
+/** A delegating agent records the principal's errand scope; this grants no financial authority by itself. */
 async function reservationBoundsRequest(
   content: Record<string, unknown>,
   session: Session,
 ): Promise<Record<string, unknown>> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may record reservation bounds.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may record reservation bounds.');
   if (
     Object.keys(content).some(
       (key) => !['action', 'requestId', 'thread', 'venue_id', 'party_size', 'window_start', 'window_end'].includes(key),
@@ -182,8 +183,8 @@ async function reservationBoundsRequest(
   };
   if (bounds.windowEnd <= bounds.windowStart) throw invalidArgs('The reservation window must end after it starts.');
   return getDb().transaction(async () => {
-    const job = await resolveBrowserJob(content.thread as string);
-    if (!job || job.cancelled) throw forbidden('No live main-owned browser job exists for that thread.');
+    const job = await resolveBrowserJob(content.thread as string, undefined, session.agent_group_id);
+    if (!job || job.cancelled) throw forbidden('No live browser job of yours exists for that thread.');
     const encoded = JSON.stringify(bounds);
     const existing = await readDelegatedReservationBounds(job.id);
     if (existing && JSON.stringify(existing) === encoded)
@@ -208,8 +209,8 @@ const guaranteeGuard = defineGuardedAction({
   grantActionName: GUARANTEE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor }) {
-    if (actor.kind !== 'agent' || actor.agentGroupId !== (await getMainAgentGroupId()))
-      return DENY('Only main may propose a reservation guarantee.');
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+      return DENY('Only an agent with browser access may propose a reservation guarantee.');
     if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
@@ -285,8 +286,8 @@ export async function reservationGuaranteeRequest(
   session: Session,
   requestId: string,
 ): Promise<Record<string, unknown>> {
-  if (session.agent_group_id !== (await getMainAgentGroupId()))
-    throw forbidden('Only main may manage reservation guarantees.');
+  if (!(await hasBrowserAccess(session.agent_group_id)))
+    throw forbidden('Only an agent with browser access may manage reservation guarantees.');
   if (!(await readBrowserPolicy()).enabled) throw forbidden('Browser is disabled.');
   if (Object.keys(content).some((key) => !['action', 'requestId', 'operation', 'currency', 'max_total'].includes(key)))
     throw invalidArgs('Unknown reservation_guarantee field.');

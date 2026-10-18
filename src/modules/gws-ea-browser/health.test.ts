@@ -8,6 +8,6 @@ vi.mock('./index.js', () => ({ getBrowserRuntime: () => runtime }));
 import { browserHealth } from './health.js';
 
 it('observes host state without starting or reconciling the optional browser', async () => {
-  expect(await browserHealth()).toEqual({ schemaVersion: 1, ...runtime.state() });
+  expect(await browserHealth()).toEqual({ schemaVersion: 1, policyVersions: [1, 2], ...runtime.state() });
   expect(runtime.reconcile).not.toHaveBeenCalled();
 });
