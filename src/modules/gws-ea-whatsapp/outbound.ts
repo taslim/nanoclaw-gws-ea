@@ -93,7 +93,6 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         'WhatsApp was unavailable for more than four hours. Please check whether the message is still wanted.',
       );
     }
-    // Own the durable row before checking connectivity, including a negative receipt for ordinary rows.
     const canonicalLid = /^(\d+)@lid$/u.exec(platformId)?.[1];
     if (canonicalLid && !pending.accepted)
       admittedRequest ??= options.contacts.claimDM(canonicalLid, key, pending.createdAt);

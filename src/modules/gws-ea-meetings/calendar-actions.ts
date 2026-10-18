@@ -243,6 +243,11 @@ export function conferenceWords(conference: EventConference | undefined): string
   }
 }
 
+/** A time ready to write: in the principal's zone and, when known, the other side's. */
+export function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
+  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
+}
+
 /**
  * A slot as US readers write it, in `timezone`: "Tuesday, Oct 6, 10:00–10:30
  * AM BST", its zone by the short name people know rather than its IANA name.

@@ -19,6 +19,7 @@ import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type EventWrite } from './calendar-api.js';
 import {
   assertInvitationShareable,
+  bothZones,
   conferenceWords,
   ensureEvent,
   eventIdFor,
@@ -58,9 +59,6 @@ function bookingIdOf(value: unknown): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value))
     throw invalidArgs('booking must be the id book gave you in this chat.');
   return value;
-}
-function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
-  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
 }
 async function bookingFor(chat: string, eventId: string): Promise<ChatBooking | undefined> {
   return getDb().get<ChatBooking>(

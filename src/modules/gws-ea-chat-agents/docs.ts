@@ -91,7 +91,6 @@ async function owned(file: string, group: string): Promise<boolean> {
 async function requireOwned(file: string, group: string): Promise<void> {
   if (!(await owned(file, group))) throw forbidden('Only documents made for this job may be edited or shared.');
 }
-/** A chat clearance reaches only that chat, not wider readers someone gave a document in Drive. */
 async function onlyChatReaders(file: string, chat: string): Promise<boolean> {
   const principal = await loadPrincipalRecognizer();
   const addresses = new Set(

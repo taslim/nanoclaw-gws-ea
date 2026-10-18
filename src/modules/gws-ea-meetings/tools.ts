@@ -76,6 +76,7 @@ import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
   assertInvitationShareable,
+  bothZones,
   conferenceWords,
   ensureEvent,
   eventIdFor,
@@ -187,11 +188,6 @@ function spanAt(start: number, minutes: number): Span {
   return { start, end: start + minutes * MINUTE };
 }
 
-/** A time ready to write: in the principal's zone and, when known, the other side's. */
-function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
-  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
-}
-
 // ---------------------------------------------------------------------------
 // The principal, and the thread's calendar
 // ---------------------------------------------------------------------------
@@ -252,7 +248,6 @@ export interface SchedulingToolsDeps {
   readonly calendar: () => MeetingsCalendarApi;
 }
 
-/** Calendar writes serialize across email and chat so two sources cannot take one slot. */
 let schedulingTurn: Promise<unknown> = Promise.resolve();
 export function inSchedulingTurn<T>(work: () => Promise<T>): Promise<T> {
   const done = schedulingTurn.then(work);

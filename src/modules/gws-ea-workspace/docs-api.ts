@@ -1,4 +1,3 @@
-/** Native Google Docs reads and text edits, with the host's Drive-authorized token. */
 import { randomUUID } from 'node:crypto';
 import { isRecord } from '../../gws-ea/validation.js';
 import { GoogleApiError, googleJson, type GoogleClientOptions } from '../gws-ea-inbox/gmail-api.js';
@@ -25,7 +24,6 @@ export interface DocsApi {
   replace(file: string, find: string, replace: string, revision: string): Promise<void>;
 }
 
-/** Text runs preserve their order across tables, headers, footnotes and nested document tabs. */
 function readContent(value: unknown, text: string[], references: string[]): void {
   if (Array.isArray(value)) {
     for (const entry of value) readContent(entry, text, references);

@@ -192,7 +192,6 @@ export class WhatsAppContacts {
           | { id: number; request_id: string | null; principal_message_id: string | null }
           | undefined;
         if (!receipt) {
-          // A refused ordinary row must remain ordinary after a later principal request is admitted.
           this.db
             .prepare('INSERT INTO dm_admissions(account,person,admitted_at,outbound_row_id) VALUES(?,?,?,?)')
             .run(this.account(), person, this.timestamp(), rowId);
