@@ -45,6 +45,10 @@ export interface OnecliAdmin {
   /** Create an agent. One whose identifier exists already (409) is no failure: the list then names it. */
   createAgent(agent: { readonly name: string; readonly identifier: string }): Promise<void>;
   setSecretMode(agentId: string, mode: OnecliSecretMode): Promise<void>;
+  /** Explicit secret assignments in the pinned OneCLI 1.42 API; values are never read. */
+  listAgentSecretIds(agentId: string): Promise<readonly string[]>;
+  /** Replace the assignments, including an empty list when retiring a host-owned agent. */
+  setAgentSecretIds(agentId: string, secretIds: readonly string[]): Promise<void>;
 }
 
 export interface OnecliAdminDependencies {
@@ -58,7 +62,7 @@ interface OnecliEndpoint {
 }
 
 interface OnecliCall {
-  readonly method: 'GET' | 'POST' | 'PATCH';
+  readonly method: 'GET' | 'POST' | 'PATCH' | 'PUT';
   readonly route: string;
   /** What the call asks for, as an error names it. */
   readonly label: string;
@@ -209,6 +213,28 @@ export function createOnecliAdmin(
         route: `/v1/agents/${encodeURIComponent(agentId)}/secret-mode`,
         label: `agent ${agentId}'s secret mode`,
         body: { mode },
+      });
+    },
+    async listAgentSecretIds(agentId) {
+      const ids = await read(endpoint, {
+        method: 'GET',
+        route: `/v1/agents/${encodeURIComponent(agentId)}/secrets`,
+        label: `agent ${agentId}'s secret assignments`,
+      });
+      if (
+        !Array.isArray(ids) ||
+        !ids.every((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256) ||
+        new Set(ids).size !== ids.length
+      )
+        throw new GwsEaError(INVALID_OUTPUT, 'OneCLI returned invalid agent secret assignments');
+      return ids;
+    },
+    async setAgentSecretIds(agentId, secretIds) {
+      await send(endpoint, {
+        method: 'PUT',
+        route: `/v1/agents/${encodeURIComponent(agentId)}/secrets`,
+        label: `agent ${agentId}'s secret assignments`,
+        body: { secretIds },
       });
     },
   };

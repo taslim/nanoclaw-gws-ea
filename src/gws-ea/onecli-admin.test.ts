@@ -80,6 +80,31 @@ describe('the OneCLI API key', () => {
 });
 
 describe('OneCLI administration', () => {
+  it('reads and replaces only the named agent secret assignments using the pinned OneCLI API', async () => {
+    const { fetch, requests } = oneCli((request) =>
+      request.method === 'GET' ? json(['model-secret']) : json({ success: true }),
+    );
+    const admin = createOnecliAdmin(APP_URL, API_KEY, { fetch });
+
+    expect(await admin.listAgentSecretIds('agent/chat')).toEqual(['model-secret']);
+    await admin.setAgentSecretIds('agent/chat', ['model-secret']);
+
+    expect(requests.map(({ method, route, body }) => ({ method, route, body }))).toEqual([
+      { method: 'GET', route: `${APP_URL}/v1/agents/agent%2Fchat/secrets`, body: undefined },
+      { method: 'PUT', route: `${APP_URL}/v1/agents/agent%2Fchat/secrets`, body: { secretIds: ['model-secret'] } },
+    ]);
+  });
+
+  it.each([{}, ['model-secret', 'model-secret'], [12], ['']].map((answer) => ({ answer })))(
+    'refuses malformed agent secret assignments $answer',
+    async ({ answer }) => {
+      const { fetch } = oneCli(() => json(answer));
+      await expect(createOnecliAdmin(APP_URL, API_KEY, { fetch }).listAgentSecretIds('agent')).rejects.toMatchObject({
+        code: 'invalid_onecli_output',
+      });
+    },
+  );
+
   it('sends every call to the given app URL with the given key, and registers the key for redaction', async () => {
     const { fetch, requests } = oneCli(() => json([]));
     const admin = createOnecliAdmin(APP_URL, API_KEY, { fetch });

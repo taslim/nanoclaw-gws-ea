@@ -184,11 +184,32 @@ async function assertHostMayList(
   const sealed = new Map<unknown, string>([
     [profile.browser_agent_group_id, 'browser'],
     [profile.external_email_agent_group_id, 'external-email'],
+    [profile.external_chat_agent_group_id, 'external-chat'],
   ]);
+  const inactiveJobs = new Set<string>();
+  if ('external_chat_agent_group_id' in profile) {
+    const chatAgents = await ncl(runtime, ['gws-ea-chat-agents-health']);
+    if (!isRecord(chatAgents) || !Array.isArray(chatAgents.jobs))
+      throw new GwsEaError('invalid_child_output', 'The host-owned chat agent registry could not be read.');
+    for (const job of chatAgents.jobs) {
+      if (
+        !isRecord(job) ||
+        typeof job.agent_group_id !== 'string' ||
+        !['creating', 'active', 'retiring', 'retired'].includes(String(job.state))
+      )
+        throw new GwsEaError('invalid_child_output', 'The host-owned chat agent registry is invalid.');
+      if (job.state !== 'active') inactiveJobs.add(job.agent_group_id);
+    }
+  }
   for (const id of agentGroupIds) {
     const agent = sealed.get(id);
     if (agent !== undefined)
       throw new GwsEaError('invalid_arguments', `Agent group ${id} is ${agent}, which can never use the browser.`);
+    if (inactiveJobs.has(id))
+      throw new GwsEaError(
+        'invalid_arguments',
+        `Agent group ${id} is not an active chat job and cannot use the browser.`,
+      );
     try {
       await ncl(runtime, ['groups', 'get', '--id', id]);
     } catch (cause) {

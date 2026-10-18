@@ -40,6 +40,7 @@ import {
 import { escapeMarkdownInline } from './markdown.js';
 import {
   gwsEaExternalEmailPointerMigration,
+  gwsEaExternalChatPointerMigration,
   gwsEaBrowserPointerMigration,
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
@@ -53,6 +54,7 @@ registerMigration(gwsEaPrincipalAddressesMigration);
 registerMigration(gwsEaExternalEmailPointerMigration);
 registerMigration(gwsEaBrowserPointerMigration);
 registerMigration(gwsEaWebAliasMigration);
+registerMigration(gwsEaExternalChatPointerMigration);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.
@@ -149,7 +151,8 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const principal = escapeMarkdownInline(profile.principal_display_name);
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
-  if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
+  if (audience === 'external-email' || audience === 'external-chat' || audience === 'job')
+    return { name: 'Assistant Identity', body: names };
   if (audience === 'browser') {
     const body = `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
     return { name: 'Assistant Identity', body: `${names}${body}` };

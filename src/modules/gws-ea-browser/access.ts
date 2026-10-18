@@ -13,7 +13,12 @@
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { normalizeName } from '../agent-to-agent/db/agent-destinations.js';
-import { getBrowserAgentGroupId, getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  getBrowserAgentGroupId,
+  getExternalChatAgentGroupId,
+  getExternalEmailAgentGroupId,
+  getMainAgentGroupId,
+} from '../gws-ea-profile/db.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 
 /**
@@ -23,10 +28,24 @@ import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
  */
 export async function browserAccessGroups(policy?: BrowserPolicy): Promise<readonly string[]> {
   const current = policy ?? (await readHostBrowserPolicy());
-  if (current.status !== 'unavailable' && current.access.version === 2) return current.access.agentGroupIds;
+  if (current.status !== 'unavailable' && current.access.version === 2) {
+    const allowed: string[] = [];
+    for (const group of current.access.agentGroupIds) if (await eligibleChatGroup(group)) allowed.push(group);
+    return allowed;
+  }
   if (!(await getDb().hasTable('gws_ea_profile'))) return [];
   const main = await getMainAgentGroupId();
   return main === null ? [] : [main];
+}
+
+/** A saved list cannot grant a shared chat container or revive a job outside its active lifetime. */
+async function eligibleChatGroup(group: string): Promise<boolean> {
+  const db = getDb();
+  if ((await db.hasTable('gws_ea_profile')) && group === (await getExternalChatAgentGroupId())) return false;
+  const job = (await db.hasTable('gws_ea_job_agents'))
+    ? await db.get<{ state: string }>('SELECT state FROM gws_ea_job_agents WHERE agent_group_id = ?', group)
+    : undefined;
+  return job === undefined || job.state === 'active';
 }
 
 /** Whether `agentGroupId` may use the browser under `policy` (the operator's current one by default). */
@@ -81,7 +100,11 @@ export async function readHostBrowserPolicy(file?: string): Promise<BrowserPolic
   if (policy.status === 'unavailable' || policy.access.version === 1) return policy;
   try {
     if (await getDb().hasTable('gws_ea_profile')) {
-      const sealed = [await getBrowserAgentGroupId(), await getExternalEmailAgentGroupId()];
+      const sealed = [
+        await getBrowserAgentGroupId(),
+        await getExternalEmailAgentGroupId(),
+        await getExternalChatAgentGroupId(),
+      ];
       if (policy.access.agentGroupIds.some((id) => sealed.includes(id)))
         return { status: 'unavailable', enabled: false, reason: 'invalid-browser-policy' };
     }

@@ -1,5 +1,15 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
+export const gwsEaExternalChatPointerMigration: ModuleMigration = {
+  version: 6,
+  name: 'module:gws-ea-profile:external-chat-pointer',
+  async up(db) {
+    await db.exec(
+      'ALTER TABLE gws_ea_profile ADD COLUMN external_chat_agent_group_id TEXT REFERENCES agent_groups(id);',
+    );
+  },
+};
+
 export const gwsEaBrowserPointerMigration: ModuleMigration = {
   version: 4,
   name: 'module:gws-ea-profile:browser-pointer',

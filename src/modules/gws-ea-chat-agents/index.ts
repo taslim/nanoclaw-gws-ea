@@ -1,0 +1,130 @@
+import '../capabilities/index.js';
+import '../gws-ea-profile/index.js';
+import path from 'node:path';
+import { registerProtectedGroupPolicy } from '../../cli/guard.js';
+import { register } from '../../cli/registry.js';
+import { TIMEZONE } from '../../config.js';
+import { registerSessionAdmissionPolicy } from '../../container-runner.js';
+import { getDb } from '../../db/connection.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { getSession } from '../../db/sessions.js';
+import { GwsEaError } from '../../gws-ea/types.js';
+import { onHostStart } from '../../host-lifecycle.js';
+import { log } from '../../log.js';
+import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
+import { resolveTimezone } from '../../timezone.js';
+import { getExternalChatAgentGroupId, getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { registerGuidance } from '../gws-ea-profile/guidance.js';
+import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
+import { chatAgentDrift } from './drift.js';
+import { ensureExternalChatGroup, reconcileChatShape } from './external-chat.js';
+import { reconcileChatGateway } from './gateway.js';
+import { getJobAgent, listJobAgents } from './jobs.js';
+import { chatAgentsMigration } from './migration.js';
+import { retireJobAgent } from './retire.js';
+
+export { ensureExternalChatGroup } from './external-chat.js';
+export {
+  createJobAgent,
+  activateJobAgent,
+  getJobAgent,
+  getJobAgentForChat,
+  listJobAgents,
+  type JobAgent,
+} from './jobs.js';
+export { retireJobAgent } from './retire.js';
+export {
+  EXTERNAL_CHAT_CAPABILITIES,
+  JOB_CHAT_CAPABILITIES,
+  CHAT_TOOLS_CAPABILITY,
+  JOB_DOCUMENTS_CAPABILITY,
+} from './shape.js';
+
+registerMigration(chatAgentsMigration);
+
+async function kind(group: string): Promise<'external-chat' | 'job' | undefined> {
+  if (group === (await getExternalChatAgentGroupId())) return 'external-chat';
+  return (await getJobAgent(group)) ? 'job' : undefined;
+}
+
+export async function reconcileChatAgents(): Promise<void> {
+  const external = await ensureExternalChatGroup();
+  await reconcileChatShape(external, 'external-chat');
+  for (const job of await listJobAgents()) {
+    if (job.state === 'retired' || job.state === 'retiring') continue;
+    await reconcileChatShape(job.agent_group_id, 'job');
+    await reconcileChatGateway(job.agent_group_id);
+  }
+  await resumeRetiringJobAgents();
+}
+
+/** Startup and the chat lifecycle loop resume cleanup once the control-plane operation releases its lock. */
+export async function resumeRetiringJobAgents(): Promise<void> {
+  for (const job of await listJobAgents()) {
+    if (job.state !== 'retiring') continue;
+    try {
+      await retireJobAgent(job.agent_group_id);
+    } catch (error) {
+      if (!(error instanceof GwsEaError) || error.code !== 'instance_busy') throw error;
+      log.info('Job retirement waits for the current instance operation', { agentGroupId: job.agent_group_id });
+    }
+  }
+}
+
+onHostStart(async () => {
+  if (!(await getDb().hasTable('gws_ea_profile')) || (await getMainAgentGroupId()) === null) return;
+  await reconcileChatAgents();
+});
+
+registerProtectedGroupPolicy('gws-ea-chat-agents:host-owned', async (group) =>
+  (await kind(group)) ? 'chat agents are configured only by the host' : undefined,
+);
+
+export async function chatAgentHealth(group: string, sessionProvider?: string | null): Promise<string[]> {
+  const type = await kind(group);
+  if (!type) return [];
+  const job = type === 'job' ? await getJobAgent(group) : undefined;
+  const state = job && job.state !== 'active' ? [`its job-agent state is ${job.state}`] : [];
+  return [...state, ...(await chatAgentDrift(group, type, sessionProvider))];
+}
+
+registerSessionAdmissionPolicy('gws-ea-chat-agents:authorized-shape', async ({ key }) => {
+  const session = await getSession(key.sessionId);
+  const problems = await chatAgentHealth(key.agentGroupId, session?.agent_provider);
+  if (problems.length > 0) throw new Error(`Chat agent may not start: ${problems.join('; ')}`);
+});
+
+registerRequiredProjectDocSection('gws-ea-chat-agents:principal', async (group) => {
+  if (!(await kind(group.id))) return undefined;
+  const profile = await getGwsEaProfile();
+  const principal =
+    profile.principal_display_name === null ? 'the principal' : escapeMarkdownInline(profile.principal_display_name);
+  return {
+    name: 'Principal',
+    body: `You work for ${principal}, whose time zone is ${resolveTimezone(profile.principal_timezone ?? TIMEZONE)}.`,
+  };
+});
+for (const [type, file] of [
+  ['external-chat', 'external-chat.guidance.md'],
+  ['job', 'job.guidance.md'],
+] as const)
+  registerGuidance(`gws-ea-chat-agents:${type}-guidance`, {
+    agent: type,
+    heading: type === 'job' ? 'Job Chat' : 'External Chat',
+    file: path.join('src', 'modules', 'gws-ea-chat-agents', file),
+    receives: async (group) => (await kind(group)) === type,
+  });
+
+register({
+  name: 'gws-ea-chat-agents-health',
+  description: 'Read the host-owned chat agent identities and lifecycle states.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    if (Object.keys(raw).length > 0) throw new Error('Chat agent health takes no arguments');
+    return undefined;
+  },
+  async handler() {
+    return { external_chat_agent_group_id: await getExternalChatAgentGroupId(), jobs: await listJobAgents() };
+  },
+});

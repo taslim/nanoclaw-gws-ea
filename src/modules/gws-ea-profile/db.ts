@@ -28,6 +28,7 @@ export interface GwsEaProfile {
   readonly main_agent_group_id: string | null;
   /** The agent group the host created for `external-email`, or null until it has. */
   readonly external_email_agent_group_id: string | null;
+  readonly external_chat_agent_group_id: string | null;
   readonly browser_agent_group_id: string | null;
   readonly updated_at: string | null;
   /** The principal's email addresses, sorted. */
@@ -40,7 +41,7 @@ export interface GwsEaProfile {
  * the assistant's web alias to websites, and any other group what its
  * capabilities allow.
  */
-export type ProjectDocAudience = 'main' | 'external-email' | 'browser' | 'other';
+export type ProjectDocAudience = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -293,6 +294,25 @@ export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   return row?.external_email_agent_group_id ?? null;
 }
 
+/** The shared chat group the host stamped, never one an inbound sender selected. */
+export async function getExternalChatAgentGroupId(): Promise<string | null> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return null;
+  const row = await getDb().get<{ external_chat_agent_group_id: string | null }>(
+    'SELECT external_chat_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.external_chat_agent_group_id ?? null;
+}
+
+export async function recordExternalChatAgentGroupId(group: string): Promise<void> {
+  identifier(group, 'external-chat agent group ID');
+  await getDb().transaction(async () => {
+    const held = await getExternalChatAgentGroupId();
+    if (held === group) return;
+    if (held !== null) throw new Error('external-chat is already bound to an agent group');
+    await getDb().run('UPDATE gws_ea_profile SET external_chat_agent_group_id = ? WHERE singleton = 1', group);
+  });
+}
+
 /** The host-stamped, sealed browser group. A caller cannot choose this identity. */
 export async function getBrowserAgentGroupId(): Promise<string | null> {
   const row = await getDb().get<{ browser_agent_group_id: string | null }>(
@@ -331,12 +351,24 @@ export async function recordExternalEmailAgentGroupId(agentGroupId: string): Pro
 export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
   const row = await getDb().get<
-    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+    Pick<
+      GwsEaProfile,
+      | 'main_agent_group_id'
+      | 'external_email_agent_group_id'
+      | 'external_chat_agent_group_id'
+      | 'browser_agent_group_id'
+    >
   >(
-    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+    'SELECT main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   if (row?.main_agent_group_id === agentGroupId) return 'main';
   if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  if (row?.external_chat_agent_group_id === agentGroupId) return 'external-chat';
+  if (
+    (await getDb().hasTable('gws_ea_job_agents')) &&
+    (await getDb().get('SELECT 1 FROM gws_ea_job_agents WHERE agent_group_id = ?', agentGroupId))
+  )
+    return 'job';
   if (row?.browser_agent_group_id === agentGroupId) return 'browser';
   return 'other';
 }
@@ -344,7 +376,7 @@ export async function projectDocAudience(agentGroupId: string): Promise<ProjectD
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
     `SELECT assistant_display_name, assistant_workspace_email, assistant_alias, principal_display_name,
-            principal_timezone, main_agent_group_id, external_email_agent_group_id, browser_agent_group_id, updated_at
+            principal_timezone, main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );

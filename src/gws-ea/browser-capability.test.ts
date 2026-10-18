@@ -383,6 +383,39 @@ describe('the browser access setting', () => {
   }
   const listing = (...agentGroupIds: string[]) => ({ kind: 'agent_groups' as const, agentGroupIds });
 
+  it.each(['shared', 'retired', 'retiring', 'creating'])(
+    'refuses broad access for the %s chat agent, but admits an active job',
+    async (state) => {
+      const f = await fixture();
+      const base = host({ versions: [1, 2] }).ncl;
+      const ncl = async (runtime: Parameters<typeof base>[0], args: readonly string[]) => {
+        if (args[0] === 'gws-ea-profile-get')
+          return {
+            browser_agent_group_id: 'ag-browser',
+            external_email_agent_group_id: 'ag-external',
+            external_chat_agent_group_id: 'ag-shared',
+          };
+        if (args[0] === 'gws-ea-chat-agents-health')
+          return {
+            external_chat_agent_group_id: 'ag-shared',
+            jobs: [
+              { agent_group_id: 'ag-job', state: state === 'shared' ? 'retired' : state },
+              { agent_group_id: 'ag-active-job', state: 'active' },
+            ],
+          };
+        if (args[0] === 'groups') return { id: args[3] };
+        return base(runtime, args);
+      };
+      const id = state === 'shared' ? 'ag-shared' : 'ag-job';
+      await expect(enableBrowserCapability(f.paths, f.instanceId, { ncl }, listing(id))).rejects.toMatchObject({
+        code: 'invalid_arguments',
+      });
+      await expect(
+        enableBrowserCapability(f.paths, f.instanceId, { ncl }, listing('ag-active-job')),
+      ).resolves.toMatchObject({ enabled: true });
+    },
+  );
+
   it('writes a version-2 list once the running host reads one and has each group', async () => {
     const f = await fixture();
     const { ncl } = host({ versions: [1, 2] });

@@ -130,6 +130,9 @@ describe('GWS-EA instance runtime', () => {
     const environment = await readFile(path.join(config.state_root, '.env'), 'utf8');
     expect(environment).toContain(`GWS_EA_VOICE_POLICY_FILE=${path.join(configRoot, 'voice.json')}\n`);
     expect(environment).toContain(
+      `GWS_EA_INSTANCE_LOCK_FILE=${path.join(configRoot, 'locks', `${config.instance_id}.lock`)}\n`,
+    );
+    expect(environment).toContain(
       `GWS_EA_ONEPASSWORD_POLICY_FILE=${path.join(configRoot, 'onepassword', 'policy.json')}\n`,
     );
     // A locator names the shared policy; the management token beside it is never bound to an assistant.
