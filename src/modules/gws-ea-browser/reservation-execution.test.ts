@@ -19,14 +19,18 @@ vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../gws-ea-meetings/calendar-facts.js', () => ({ findPrincipalCalendarConflicts: calendar }));
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getDeliveryAction } from '../../delivery.js';
+import type { OutboundFile } from '../../channels/adapter.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { resolveSystemSession } from '../../session-manager.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { upsertUser } from '../permissions/db/users.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
 import { BrowserQueue } from './queue.js';
-import { observePage } from './observe.js';
+import { observePage, pageMayShowSecret } from './observe.js';
 import { resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import type { WatchBounds } from './watches.js';
@@ -247,4 +251,82 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       state: 'unknown',
     });
   }, 15_000);
+  describe('an errand with no watch', () => {
+    const PRINCIPAL = 'gchat:users/principal';
+    /** Each card posted to the principal, with the files that went with it. */
+    let cards: Array<{ card: Record<string, unknown>; files: readonly OutboundFile[] | undefined }>;
+    beforeEach(async () => {
+      await getDb().run('DELETE FROM gws_ea_browser_watches');
+      await getDb().run('DELETE FROM gws_ea_browser_watch_job_claims');
+      // The principal who answers purchase cards, in their direct message.
+      await createMessagingGroup({
+        id: 'mg-principal',
+        channel_type: 'gchat',
+        platform_id: 'spaces/principal',
+        name: 'principal',
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: new Date().toISOString(),
+      });
+      await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: new Date().toISOString() });
+      await upsertUserDm({
+        user_id: PRINCIPAL,
+        channel_type: 'gchat',
+        messaging_group_id: 'mg-principal',
+        resolved_at: new Date().toISOString(),
+      });
+      await bindVerifiedPrincipalUser(PRINCIPAL, new Date().toISOString());
+      cards = [];
+      setDeliveryAdapter({
+        async deliver(_type, _platformId, _thread, _kind, content, files) {
+          const card = JSON.parse(content) as Record<string, unknown>;
+          if (card.type === 'ask_question') cards.push({ card, files });
+          return `message-${cards.length}`;
+        },
+      });
+    });
+    it('books a free reservation with no card on file itself, with no card, as a money-less attempt (R3)', async () => {
+      fixtureState.selectedPayment = null;
+      fixtureState.details.user = { id: 72, payment_methods: [] };
+      // The booking sends this box's state, and Resy's reviewed record proves only a booking with it unticked.
+      fixtureState.extraTerms =
+        '<label><input type="checkbox" name="venue_marketing_opt_in" checked> Send me news and offers from L&#39;Artusi</label>';
+      await load();
+      expect(await purchase('free')).toMatchObject({ status: 'booked', order_number: '90123', repeat_safe: false });
+      expect(fixture.submitted()).toBe(1);
+      expect(cards).toEqual([]);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM pending_approvals')).toEqual({ count: 0 });
+      expect(
+        await getDb().all(
+          'SELECT site,platform,account_key,resolution,merchant_record_id FROM gws_ea_browser_free_attempts',
+        ),
+      ).toEqual([
+        { site: 'resy.com', platform: null, account_key: null, resolution: 'committed', merchant_record_id: '90123' },
+      ]);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_authorities')).toEqual({ count: 0 });
+    });
+    it('sends a card and presses nothing for a reservation with a card on file, or with a fee', async () => {
+      expect(await purchase('card-on-file')).toMatchObject({ status: 'awaiting_principal' });
+      fixtureState.policy = [
+        'We have a 24-hour cancellation/no-show policy of $25 per person for guests booking with us.',
+      ];
+      const inventory = fixtureState.inventory as {
+        results: { venues: Array<{ slots: Array<{ payment: Record<string, unknown> }> }> };
+      };
+      inventory.results.venues[0].slots[0].payment.cancellation_fee = 25;
+      fixtureState.details.cancellation = { fee: { amount: 25 }, display: { policy: fixtureState.policy } };
+      await load();
+      expect(await purchase('fee')).toMatchObject({ status: 'awaiting_principal' });
+      expect(fixture.submitted()).toBe(0);
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_free_attempts')).toEqual({ count: 0 });
+      // Resy's checkout document holds a booking bearer the host tracks as a secret, so its reader places no
+      // picture: each card names one with none beside it, which the card says is unavailable (KTD6).
+      expect(await pageMayShowSecret(fixture.page)).toBe(true);
+      expect(cards.map(({ card, files }) => ({ pictures: card.pictures, files }))).toEqual([
+        { pictures: 1, files: undefined },
+        { pictures: 1, files: undefined },
+      ]);
+    });
+  });
 });

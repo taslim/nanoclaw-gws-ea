@@ -501,6 +501,22 @@ function readPayment(
 }
 
 /**
+ * Whether the page offers or holds a way to pay (KTD3): a card field in the checkout, or a saved payment method,
+ * an express-pay button or payment entry in any frame. A booking beside one is never free, reviewed or not.
+ */
+export function offersPayment(read: CheckoutRead): boolean {
+  return (
+    read.region.fields.some((field) => field.card) ||
+    read.frames.some(
+      (frame) =>
+        frame.expressPay.length > 0 ||
+        frame.paymentEntry ||
+        frame.lines.some((line) => PAYMENT_VOCABULARY.savedCard.test(line)),
+    )
+  );
+}
+
+/**
  * What one read of an unreviewed checkout is (KTD3, KTD5), decided in order: free, needing a card, incomplete,
  * or a card's facts. Pure: the host's isolated-world read and the job's merchant are its only inputs.
  */
@@ -529,13 +545,7 @@ export function decideGenericCheckout(
   const free =
     !lines.some((line) => line.money.length || chargeWording(line.text)) &&
     !positive(label).length &&
-    !read.region.fields.some((field) => field.card) &&
-    !read.frames.some(
-      (frame) =>
-        frame.expressPay.length ||
-        frame.paymentEntry ||
-        frame.lines.some((line) => PAYMENT_VOCABULARY.savedCard.test(line)),
-    );
+    !offersPayment(read);
   if (free)
     return {
       status: 'free',

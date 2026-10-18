@@ -26,6 +26,7 @@ import {
   type PurchaseCard,
 } from './cards.js';
 import { cancelBrowserJobInTransaction, finishBrowserJobCancellation } from './cancel.js';
+import { checkoutPicture } from './checkout-picture.js';
 import {
   activateControl,
   BrowserActivationError,
@@ -34,22 +35,29 @@ import {
   framesUnreadyStop,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
+import { ControlFactsUnavailableError, readCheckoutRegion } from './control-facts.js';
 import { readConfirmation, readPageLines, showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { recordConsentGrant, runConsentPass, type ConsentAgreement } from './consent.js';
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } from './db.js';
 import {
   GENERIC_FLOW_ID,
+  isFreeReservation,
   materialPurchaseChange,
   type FreeCommitFacts,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
-import { freeCommitBooks, genericCheckoutSignature, pressRefusal } from './generic-signature.js';
+import { freeCommitBooks, genericCheckoutSignature, offersPayment, pressRefusal } from './generic-signature.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
-import { merchantSignatureFor, readMerchantPurchase, readMerchantPurchaseEvidence } from './merchant-signatures.js';
+import {
+  merchantSignatureFor,
+  readMerchantPurchase,
+  readMerchantPurchaseEvidence,
+  type MerchantPurchaseRead,
+} from './merchant-signatures.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
 import { writeBrowserNotice } from './notices.js';
@@ -295,6 +303,8 @@ async function requestPurchaseCard(
   });
   if (decision.effect === 'deny') throw forbidden(decision.reason);
   if (decision.effect !== 'hold') throw forbidden('Purchase confirmation was not held for the principal.');
+  // The card's picture (KTD6), taken before anything durable changes; null leaves the card saying it is unavailable.
+  const picture = await checkoutPicture(context, facts);
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
   const detached = await db.transaction(async () => {
     const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -343,6 +353,7 @@ async function requestPurchaseCard(
     expiresAt: expires,
     originLine: `From your browser errand ${context.job.thread_id}.`,
     details: { facts: { site: facts.site, total_minor: String(facts.totalMinor), currency: facts.currency } },
+    pictures: [picture],
   });
   // A synchronous card click may already have created the authority; never reopen its logical card.
   if (approvalId) {
@@ -767,20 +778,65 @@ export async function executeAuthorizedPurchase(
 }
 
 /**
+ * A commit the host presses itself (KTD3, R3): an unreviewed checkout read as free, or a reviewed reservation
+ * free by the same test, with the reviewed signature that reads it and proves its outcome.
+ */
+type FreeCommit =
+  | { readonly kind: 'generic'; readonly facts: FreeCommitFacts; readonly element: ElementHandle }
+  | {
+      readonly kind: 'reviewed';
+      readonly facts: PurchaseFacts;
+      readonly element: ElementHandle;
+      readonly signature: MerchantSignature;
+    };
+
+/**
+ * Whether a reviewed reservation is free by the test any site's booking takes (KTD3, R3): its reviewed facts
+ * state no money and no terms, and nothing on the page offers or holds a way to pay. An unreadable page is not.
+ */
+async function freeReservation(page: Page, facts: PurchaseFacts, element: ElementHandle): Promise<boolean> {
+  if (!isFreeReservation(facts)) return false;
+  try {
+    return !offersPayment(await readCheckoutRegion(page, element));
+  } catch (error) {
+    if (error instanceof ControlFactsUnavailableError) return false;
+    throw error;
+  }
+}
+
+/** Whether a re-read shows the same free commit: still free, and nothing about it changed. */
+async function stillFree(page: Page, free: FreeCommit, latest: MerchantPurchaseRead): Promise<boolean> {
+  switch (free.kind) {
+    case 'generic':
+      return latest.status === 'free' && JSON.stringify(latest.facts) === JSON.stringify(free.facts);
+    case 'reviewed':
+      return (
+        latest.status === 'ready' &&
+        JSON.stringify(latest.facts) === JSON.stringify(free.facts) &&
+        (await freeReservation(page, latest.facts, free.element))
+      );
+    default: {
+      const unknown: never = free;
+      throw new Error(`Unknown free commit ${JSON.stringify(unknown)}`);
+    }
+  }
+}
+
+/**
  * A free commit (KTD3): the host presses it itself, with no card. It runs the consent check, writes a money-less
- * attempt, presses, and reads the booking's outcome from the page. A confirmation that shows a charge after it is
- * spending nobody approved (KTD10).
+ * attempt, presses, and reads the booking's outcome: a reviewed signature's merchant record, or the page's
+ * confirmation, where one that shows a charge after it is spending nobody approved (KTD10).
  */
 async function commitFree(
   context: BrowserExecutionContext,
   page: Page,
-  read: { facts: FreeCommitFacts; element: ElementHandle },
+  free: FreeCommit,
 ): Promise<{ answer: Record<string, unknown>; unapproved?: UnapprovedCommit }> {
   const db = context.store.db;
   const attemptId = stableId('free-attempt', context.request.id);
   const scope = { jobId: context.job.id, db };
   // The consent engine's check, as before any submission (KTD11): every choice it owns made, or a stop.
-  const consent = await runConsentPass(page, read.element, { scope, assertActive: context.assertActive });
+  const consent = await runConsentPass(page, free.element, { scope, assertActive: context.assertActive });
   if (consent.status === 'consent_required')
     return { answer: { status: 'stopped', reason: 'consent_required', consent: consent.stops, repeat_safe: true } };
   if (consent.status === 'add_on')
@@ -795,24 +851,24 @@ async function commitFree(
   try {
     await activateControl(
       page,
-      read.element,
+      free.element,
       async () => {
-        const arrived = genericCheckoutSignature.waitForResult(page, Math.min(10_000, context.remaining()));
-        await read.element.click({ timeout: Math.min(10_000, context.remaining()) });
+        // Listening starts before the press.
+        const arrived = (free.kind === 'reviewed' ? free.signature : genericCheckoutSignature)
+          .waitForResult(page, Math.min(10_000, context.remaining()))
+          .catch(() => undefined);
+        await free.element.click({ timeout: Math.min(10_000, context.remaining()) });
         await arrived;
       },
       {
-        checkout: { origin: read.facts.origin },
+        // A reviewed flow admits its own exact control; a generic press its checkout origin (KTD4).
+        ...(free.kind === 'generic' ? { checkout: { origin: free.facts.origin } } : {}),
         async commitStarted() {
           await context.assertActive();
           // The check immediately before the press: still free, still this booking, every choice still made.
-          const again = await runConsentPass(page, read.element, { scope, assertActive: context.assertActive });
-          const latest = await readMerchantPurchase(page, read.element);
-          if (
-            again.status !== 'ready' ||
-            latest.status !== 'free' ||
-            JSON.stringify(latest.facts) !== JSON.stringify(read.facts)
-          )
+          const again = await runConsentPass(page, free.element, { scope, assertActive: context.assertActive });
+          const latest = await readMerchantPurchase(page, free.element);
+          if (again.status !== 'ready' || !(await stillFree(page, free, latest)))
             throw new PurchaseAuthorityError('changed', 'The booking changed before the host pressed it.');
           await db.transaction(async () => {
             const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -828,10 +884,10 @@ async function commitFree(
               attemptId,
               context.job.id,
               context.request.id,
-              read.facts.site,
-              read.facts.platform ?? null,
-              read.facts.contactEmail ?? null,
-              JSON.stringify(read.facts),
+              free.facts.site,
+              free.kind === 'generic' ? (free.facts.platform ?? null) : null,
+              free.kind === 'generic' ? (free.facts.contactEmail ?? null) : null,
+              JSON.stringify(free.facts),
               at,
             );
           });
@@ -848,17 +904,32 @@ async function commitFree(
     // The press may or may not have reached the site: no page proof either way.
     return { answer: { status: 'outcome_unknown', attempt_id: attemptId, repeat_safe: false } };
   }
+  const noProof = { answer: { status: 'outcome_unknown', attempt_id: attemptId, repeat_safe: false } };
+  if (free.kind === 'reviewed') {
+    // The reviewed signature's merchant record, bound to the checkout it read just before the press, proves it.
+    const record = page.isClosed() ? undefined : await free.signature.readEvidence(page);
+    if (record?.resolution !== 'committed') return noProof;
+    await resolveFreeAttempt(db, attemptId, record.recordId, record);
+    return {
+      answer: {
+        status: record.reservation ? 'booked' : 'placed',
+        order_number: record.recordId,
+        attempt_id: attemptId,
+        repeat_safe: false,
+      },
+    };
+  }
   const evidence = page.isClosed() ? undefined : await readConfirmation(page);
-  if (!evidence) return { answer: { status: 'outcome_unknown', attempt_id: attemptId, repeat_safe: false } };
-  await resolveFreeAttempt(db, attemptId, evidence);
+  if (!evidence) return noProof;
+  await resolveFreeAttempt(db, attemptId, evidence.reference, evidence);
   if (showsCharge(evidence))
     return {
       answer: { status: 'stopped', reason: 'unapproved_commit', attempt_id: attemptId, repeat_safe: false },
-      unapproved: { site: read.facts.site, evidence },
+      unapproved: { site: free.facts.site, evidence },
     };
   return {
     answer: {
-      status: freeCommitBooks(read.facts) ? 'booked' : 'placed',
+      status: freeCommitBooks(free.facts) ? 'booked' : 'placed',
       order_number: evidence.reference,
       attempt_id: attemptId,
       repeat_safe: false,
@@ -866,12 +937,17 @@ async function commitFree(
   };
 }
 
-/** A free attempt the page's confirmation proves placed. */
-async function resolveFreeAttempt(db: DbDriver, id: string, evidence: ConfirmationEvidence): Promise<void> {
+/** A free attempt its proof shows placed: the page's confirmation, or a reviewed signature's merchant record. */
+async function resolveFreeAttempt(
+  db: DbDriver,
+  id: string,
+  recordId: string,
+  evidence: ConfirmationEvidence | MerchantPurchaseEvidence,
+): Promise<void> {
   await db.run(
     "UPDATE gws_ea_browser_free_attempts SET resolution = 'committed',evidence_json = ?,merchant_record_id = ?,reconciled_at = ? WHERE id = ? AND resolution IS NULL",
     JSON.stringify(evidence),
-    evidence.reference,
+    recordId,
     new Date().toISOString(),
     id,
   );
@@ -912,7 +988,7 @@ export async function executeBrowserPurchase(
           case 'ready':
             break;
           case 'free': {
-            const free = await commitFree(context, page, read);
+            const free = await commitFree(context, page, { kind: 'generic', facts: read.facts, element: read.element });
             found.unapproved = free.unapproved;
             return free.answer;
           }
@@ -948,6 +1024,17 @@ export async function executeBrowserPurchase(
             : { ...watch, repeat_safe: false };
         const live = await store.liveForJob(context.job.id);
         if (live) return executeAuthorizedPurchase(context, live.id);
+        // A reviewed reservation free by the test any site's booking takes is the host's to press, with no card (R3).
+        if (await freeReservation(page, facts, read.element)) {
+          const free = await commitFree(context, page, {
+            kind: 'reviewed',
+            facts: read.facts,
+            element: read.element,
+            signature: read.signature,
+          });
+          found.unapproved = free.unapproved;
+          return free.answer;
+        }
         const bounds = purchaseBounds(payload, await principalClock());
         const child = await deriveReservationGuaranteeAuthority(
           context.job.id,

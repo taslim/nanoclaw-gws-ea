@@ -307,8 +307,8 @@ async function readAmazonPurchase(page: Page, target?: ElementHandle): Promise<M
     )
   )
     return refuse('terms_unavailable');
-  const totals = await page.locator(AMAZON_RETAIL.total).allTextContents();
-  const totalRows = totals.map(normal).filter((text) => /^Order total:/u.test(text));
+  const totals = (await page.locator(AMAZON_RETAIL.total).allTextContents()).map(normal);
+  const totalRows = totals.filter((text) => /^Order total:/u.test(text));
   const totalMinor = totalRows.length === 1 ? moneyMinor(totalRows[0].replace(/^Order total:\s*/u, '')) : undefined;
   const payment = await oneText(page.locator(AMAZON_RETAIL.payment));
   const cards = payment ? [...payment.matchAll(/(?:ending in|ending|\*{4})\s*(\d{4})\b/giu)] : [];
@@ -350,7 +350,18 @@ async function readAmazonPurchase(page: Page, target?: ElementHandle): Promise<M
     commitments: [{ kind: 'retail', terms }],
     ...(reference ? { checkoutReference: reference } : {}),
   };
-  return completePurchaseFacts(facts) ? { status: 'ready', facts, element } : refuse('terms_unavailable');
+  if (!completePurchaseFacts(facts)) return refuse('terms_unavailable');
+  // The card's picture shows the order total's row and the commit control, on the main frame's viewport. A row
+  // gone meanwhile leaves the picture without it, never the read without its facts.
+  const [total, control] = await Promise.all([
+    page
+      .locator(AMAZON_RETAIL.total)
+      .nth(totals.findIndex((text) => /^Order total:/u.test(text)))
+      .boundingBox({ timeout: 2_000 })
+      .catch(() => null),
+    element.boundingBox(),
+  ]);
+  return { status: 'ready', facts, element, ...(control ? { regions: { control, ...(total ? { total } : {}) } } : {}) };
 }
 
 /** Empty/stale history is never proof of absence. Only a complete merchant order-detail record is evidence. */

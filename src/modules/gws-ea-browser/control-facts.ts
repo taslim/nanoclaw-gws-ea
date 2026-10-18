@@ -484,6 +484,10 @@ const librarySource = String.raw`(sources) => {
   // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete or names.
   const secretField = (element) => textEntry(element) && (element.type === 'password' ||
     re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') || re.secretField.test(describe(element)));
+  // A field holding a secret (KTD6): a password, a code or payment details, by its type, autocomplete, names or
+  // labels, so a show-password toggle that made it a text field still counts.
+  const secretValue = (element) => (secretField(element) || cardEntryField(element) ||
+    (textEntry(element) && re.secretField.test(labelsOf(element)))) && typeof element.value === 'string' && element.value !== '';
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';
@@ -741,7 +745,7 @@ const librarySource = String.raw`(sources) => {
         .map((element) => ({ datetime: element.getAttribute('datetime') || '', text: squash(element.textContent) })),
     };
   };
-  return { scan, arm, disarm, received, read, checkout };
+  return { scan, arm, disarm, received, read, checkout, secretValue };
 }`;
 
 const vocabularySources: Readonly<Record<string, string>> = Object.fromEntries(
@@ -836,6 +840,16 @@ interface HostedFrame {
 interface FrameTreeNode {
   frame: { id: string; parentId?: string; url: string };
   childFrames?: FrameTreeNode[];
+}
+/** A node of a target's pierced DOM tree: its own children, its shadow roots of every mode, a frame's document. */
+interface PiercedNode {
+  backendNodeId: number;
+  localName: string;
+  /** The frame a frame owner holds. */
+  frameId?: string;
+  children?: PiercedNode[];
+  shadowRoots?: PiercedNode[];
+  contentDocument?: PiercedNode;
 }
 
 /** The page could not be read in an isolated world, so nothing about the control is known. */
@@ -1251,6 +1265,70 @@ export async function readCheckoutRegion(page: Page, element: ElementHandle): Pr
   const read = await readIsolated(page, element, true);
   if (!read.checkout) throw new ControlFactsUnavailableError();
   return { facts: read.facts, ...read.checkout };
+}
+
+/**
+ * Whether any field on the page holds a secret (KTD6): a password, a code or payment details, in every frame and
+ * every shadow root, closed ones included. Each target's pierced DOM tree finds the fields, and each field's
+ * value is read in its frame's isolated world, so page script cannot answer for it. Throws
+ * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
+ */
+export async function pageHoldsSecretValue(page: Page): Promise<boolean> {
+  const objectGroup = `gws-ea-secret-scan-${randomUUID()}`;
+  const sessions = await openSessions(page);
+  try {
+    const frames = await hostedFrames(sessions.values());
+    for (const session of sessions.values()) {
+      const [{ frameTree }, { root }] = await Promise.all([
+        bounded(session.send('Page.getFrameTree')),
+        bounded(session.send('DOM.getDocument', { depth: -1, pierce: true }), READ_TIMEOUT_MS),
+      ]);
+      // Each text field by the frame whose document holds it; another target's frame is that target's to read.
+      const fields = new Map<string, number[]>();
+      const visit = (node: PiercedNode, frameId: string): void => {
+        if (node.localName === 'input' || node.localName === 'textarea')
+          fields.set(frameId, [...(fields.get(frameId) ?? []), node.backendNodeId]);
+        for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])]) visit(child, frameId);
+        if (node.contentDocument && node.frameId) visit(node.contentDocument, node.frameId);
+      };
+      visit(root, frameTree.frame.id);
+      for (const [frameId, nodes] of fields) {
+        const hosted = frames.get(frameId);
+        if (!hosted || hosted.session !== session) throw new ControlFactsUnavailableError();
+        const handed: Array<{ objectId: string }> = [];
+        for (const backendNodeId of nodes) {
+          const { object } = await bounded(
+            session.send('DOM.resolveNode', { backendNodeId, executionContextId: hosted.context, objectGroup }),
+          );
+          if (!object.objectId) throw new ControlFactsUnavailableError();
+          handed.push({ objectId: object.objectId });
+        }
+        const result = await bounded(
+          session.send('Runtime.callFunctionOn', {
+            executionContextId: hosted.context,
+            functionDeclaration: `function (...fields) { return fields.some((field) => globalThis.${LIBRARY}.secretValue(field)); }`,
+            arguments: handed,
+            returnByValue: true,
+          }),
+          READ_TIMEOUT_MS,
+        );
+        if (result.exceptionDetails || typeof result.result.value !== 'boolean')
+          throw new ControlFactsUnavailableError();
+        if (result.result.value) return true;
+      }
+    }
+    return false;
+  } catch (_error) {
+    // A scan that cannot complete proves nothing about the page.
+    throw new ControlFactsUnavailableError();
+  } finally {
+    await Promise.all(
+      [...sessions.values()].map(async (session) => {
+        await session.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined);
+        await session.detach().catch(() => undefined);
+      }),
+    );
+  }
 }
 
 async function readIsolated(

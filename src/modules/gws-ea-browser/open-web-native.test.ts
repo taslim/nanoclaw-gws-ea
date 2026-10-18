@@ -25,9 +25,11 @@ vi.mock('../../container-runner.js', () => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
+import type { OutboundFile } from '../../channels/adapter.js';
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
+import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -51,6 +53,7 @@ import { BrowserStore } from './db.js';
 import { recordDisclosureRequest } from './disclosures.js';
 import { executeBrowserBatch, type BrowserAction } from './executor.js';
 import { setBrowserAdmissionReady } from './group.js';
+import type { CheckoutRegions } from './merchant-contract.js';
 import { prepareMerchantPage, readMerchantPurchase } from './merchant-signatures.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import {
@@ -68,7 +71,14 @@ import {
   type OpenWebRequest,
 } from './open-web-native-fixture.js';
 import { browserVault } from './onepassword.js';
-import { observePage, type BrowserObservation, type BrowserRef } from './observe.js';
+import {
+  bindPageSecretDocuments,
+  observePage,
+  registerPageSecret,
+  releasePageSecret,
+  type BrowserObservation,
+  type BrowserRef,
+} from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
@@ -605,6 +615,23 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
 });
 
 /** The aria ref of the one control named `name` in an observation, with its generation. */
+/** A PNG's width and height, as its header states them. */
+function pngSize(data: Buffer): { width: number; height: number } {
+  expect(data.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+}
+
+/** The whole-pixel size of the clip around a checkout's total and its commit control. */
+function clipSize(regions: CheckoutRegions): { width: number; height: number } {
+  const boxes = [regions.control, ...(regions.total ? [regions.total] : [])];
+  const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
+  const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
+  return {
+    width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
+    height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
+  };
+}
+
 function refIn(observation: { snapshot: string; generation: number }, name: string): BrowserRef {
   const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
   const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
@@ -1371,8 +1398,16 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
   let session: Session;
   let main: Session;
   let sent: string[];
+  /** The files each delivery carried, beside its content in `sent`. */
+  let attached: Array<readonly OutboundFile[] | undefined>;
   const posts = (): string[] =>
     fixture.requests.filter((request) => request.method !== 'GET').map((request) => request.url);
+  /** Each card posted: how many pictures it names, and the files that went with it. */
+  const cards = (): Array<{ pictures: unknown; files: readonly OutboundFile[] | undefined }> =>
+    sent.flatMap((content, index) => {
+      const card = JSON.parse(content) as { type?: string; pictures?: unknown };
+      return card.type === 'ask_question' ? [{ pictures: card.pictures, files: attached[index] }] : [];
+    });
 
   beforeAll(async () => {
     if (!chromePath) throw new Error('Set GWS_EA_BROWSER_TEST_CHROME for the open-web fixture.');
@@ -1424,9 +1459,11 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     main = (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
     session = (await resolveSystemSession('browser-p', 'system:a2a:main-p:checkout')).session;
     sent = [];
+    attached = [];
     setDeliveryAdapter({
-      async deliver(_type, _platformId, _thread, _kind, content) {
+      async deliver(_type, _platformId, _thread, _kind, content, files) {
         sent.push(content);
+        attached.push(files);
         return `message-${sent.length}`;
       },
     });
@@ -1549,10 +1586,18 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     await run('note', [
       { kind: 'type', ...refIn(await observePage(page), 'Delivery instructions'), text: 'Leave it with the porter' },
     ]);
+    const checkout = await read('#commit');
+    if (checkout.status !== 'ready' || !checkout.regions) throw new Error(`Checkout unread: ${checkout.status}`);
     expect(await purchase('Place order', 'ae3')).toMatchObject({ status: 'awaiting_principal' });
     expect(posts()).toEqual([]);
     const [approval] = await approvals();
     expect(sent).toHaveLength(1);
+    // One picture goes with it: the clip of the total and the commit control, and nothing else of the page (KTD6).
+    const [card] = cards();
+    expect(card.pictures).toBe(1);
+    expect(card.files).toHaveLength(1);
+    expect(card.files![0]).toMatchObject({ filename: 'checkout.png', mimeType: 'image/png' });
+    expect(pngSize(card.files![0].data)).toEqual(clipSize(checkout.regions));
     for (const line of [
       'Site: pottery.example',
       'Account: guest checkout',
@@ -1581,6 +1626,108 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
         merchant_record_id: 'HP-1042',
       },
     ]);
+  });
+
+  it("keeps the picture's bytes out of the card's rows, the approval row, the databases and the logs", async () => {
+    const logged: unknown[][] = [];
+    const levels = (['debug', 'info', 'warn', 'error', 'fatal'] as const).map((level) =>
+      vi.spyOn(log, level).mockImplementation((...args) => {
+        logged.push(args);
+      }),
+    );
+    try {
+      await open(GENERIC.review);
+      expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+    } finally {
+      for (const spy of levels) spy.mockRestore();
+    }
+    const picture = cards()[0]?.files?.[0]?.data;
+    if (!picture) throw new Error('The card carried no picture');
+    const written = [
+      picture.toString('base64'),
+      picture.toString('base64url'),
+      picture.toString('hex'),
+      picture.toString('latin1'),
+    ];
+    const seen = new WeakSet<object>();
+    /** Whether a value holds the picture: in any written form, or as bytes. */
+    const holds = (value: unknown): boolean => {
+      if (typeof value === 'string') return written.some((form) => value.includes(form));
+      if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+      seen.add(value);
+      if (value instanceof Uint8Array) return Buffer.from(value).includes(picture.subarray(8, 64));
+      return Object.values(value).some(holds);
+    };
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_cards')).toHaveLength(1);
+    expect(await approvals()).toHaveLength(1);
+    for (const { name } of await getDb().all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'"))
+      expect(holds(await getDb().all(`SELECT * FROM "${name}"`)), name).toBe(false);
+    for (const held of [session, main])
+      expect(
+        holds(
+          await withExistingMailboxSession(held.agent_group_id, held.id, (mailbox) => mailbox.getInboundHistory(100)),
+        ),
+      ).toBe(false);
+    expect(logged.length).toBeGreaterThan(0);
+    expect(holds(logged)).toBe(false);
+  });
+
+  it('refuses the picture on a document where the host inserted a secret, and takes it on the next one', async () => {
+    const code = 'fixture-sign-in-code-4417';
+    await open(GENERIC.review);
+    // What the host's own fills do on inserting a value: the document holds it until it is replaced.
+    registerPageSecret(page, code);
+    await bindPageSecretDocuments(page, code);
+    releasePageSecret(page, code);
+    expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+    // A card that names a picture with none beside it says the picture is unavailable (the bridge's line).
+    expect(cards()).toEqual([{ pictures: 1, files: undefined }]);
+    await open(GENERIC.review);
+    expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+    expect(cards()[1]).toMatchObject({ pictures: 1, files: [{ mimeType: 'image/png' }] });
+  });
+
+  it('refuses the picture when a field in an open or a closed shadow root holds a secret, and only then', async () => {
+    const shadowed = (mode: 'open' | 'closed', field: string, value: string): string =>
+      checkoutPage({
+        action: '/checkout/placed',
+        commit: 'Place order',
+        items: ['Celadon mug × 2'],
+        total: '$42.00',
+        payment: 'Visa ending in 4242',
+        email: ALIAS,
+        outside: `<account-panel></account-panel><script>const root = document.querySelector('account-panel').attachShadow({ mode: '${mode}' }); root.innerHTML = '${field}'; root.querySelector('input').value = '${value}';</script>`,
+      });
+    const password = '<label>Password <input type="password" name="pw"></label>';
+    const code = '<label>Code <input type="text" autocomplete="one-time-code"></label>';
+    for (const [index, [mode, field, value, pictured]] of (
+      [
+        ['open', password, 'fixture-pass-7731', false],
+        ['closed', code, '552913', false],
+        ['open', password, '', true],
+      ] as const
+    ).entries()) {
+      const address = `https://pottery.example/checkout/account-${index}`;
+      fixture.serve(address, shadowed(mode, field, value));
+      await open(address);
+      expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+      expect(cards().at(-1), `${mode} root, ${value ? 'filled' : 'empty'}`).toMatchObject(
+        pictured ? { pictures: 1, files: [{ mimeType: 'image/png' }] } : { pictures: 1, files: undefined },
+      );
+    }
+  });
+
+  it('posts the card when the capture fails, naming the picture it lacks', async () => {
+    await open(GENERIC.review);
+    const capture = vi.spyOn(page, 'screenshot').mockRejectedValueOnce(new Error('The capture failed'));
+    try {
+      expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+      expect(capture).toHaveBeenCalledTimes(1);
+    } finally {
+      capture.mockRestore();
+    }
+    expect(cards()).toEqual([{ pictures: 1, files: undefined }]);
+    expect(await approvals()).toHaveLength(1);
   });
 
   it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt (AE2)', async () => {

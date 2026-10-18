@@ -29,6 +29,7 @@ import { createPendingApproval } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import type { OutboundFile } from '../../channels/adapter.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { sweepExpiredApprovals } from '../approvals/index.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
@@ -72,7 +73,7 @@ let cartAdded: number;
 let total = '85.00';
 let confirmation = true;
 let cardDuringDelivery: (() => Promise<void>) | undefined;
-let sent: Array<{ platformId: string; content: string }>;
+let sent: Array<{ platformId: string; content: string; files?: readonly OutboundFile[] }>;
 let orderedAt: string;
 let holdPost: Promise<void> | undefined;
 let sawPost: (() => void) | undefined;
@@ -495,8 +496,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     sent = [];
     orderedAt = new Date().toISOString();
     setDeliveryAdapter({
-      async deliver(_type, platformId, _thread, _kind, content) {
-        sent.push({ platformId, content });
+      async deliver(_type, platformId, _thread, _kind, content, files) {
+        sent.push({ platformId, content, files });
         if (cardDuringDelivery) await cardDuringDelivery();
         return `message-${sent.length}`;
       },
@@ -606,6 +607,26 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(approval.question).toMatch(/Place your order/);
     expect(approval.question).toMatch(/Due now: \$85.00/);
     expect(approval.question).toMatch(/Due later: none/);
+    // The reviewed reader places its order total and commit control: the card's one picture is clipped to both.
+    expect(JSON.parse(sent[0].content)).toMatchObject({ pictures: 1 });
+    expect(sent[0].files).toHaveLength(1);
+    const boxes = await Promise.all(
+      [page.locator(AMAZON_RETAIL.total).filter({ hasText: 'Order total:' }), page.locator(AMAZON_RETAIL.control)].map(
+        async (locator) => {
+          const box = await locator.boundingBox();
+          if (!box) throw new Error('Fixture checkout box missing');
+          return box;
+        },
+      ),
+    );
+    const picture = sent[0].files![0].data;
+    expect(picture.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const left = Math.floor(Math.min(...boxes.map((box) => box.x)));
+    const top = Math.floor(Math.min(...boxes.map((box) => box.y)));
+    expect({ width: picture.readUInt32BE(16), height: picture.readUInt32BE(20) }).toEqual({
+      width: Math.ceil(Math.max(...boxes.map((box) => box.x + box.width))) - left,
+      height: Math.ceil(Math.max(...boxes.map((box) => box.y + box.height))) - top,
+    });
     expect(await readBrowserJob(session.thread_id!)).toMatchObject({
       state: 'awaiting_principal',
       held_sites: ['amazon.com'],

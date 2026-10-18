@@ -3,6 +3,7 @@ import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { httpsOrigin, SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
+import { ControlFactsUnavailableError, pageHoldsSecretValue } from './control-facts.js';
 import type { CookieBannerReport } from './cookie-banners.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
@@ -175,15 +176,35 @@ async function collectSecretFields(page: Page): Promise<boolean> {
   return present;
 }
 
-export async function pageHasSecret(page: Page): Promise<boolean> {
+/** Whether the host inserted a secret on one of the page's current documents, or holds one not yet bound to them. */
+async function hostSecretOnPage(page: Page): Promise<boolean> {
   const state = stateFor(page);
-  if ((await collectSecretFields(page)) || state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
+  if (state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
   if (!state.secretDocumentLoaders.size) return false;
   try {
     const loaders = await documentLoaders(page);
     return !loaders.size || [...loaders].some((loader) => state.secretDocumentLoaders.has(loader));
   } catch (_error) {
     return true;
+  }
+}
+
+export async function pageHasSecret(page: Page): Promise<boolean> {
+  return (await collectSecretFields(page)) || (await hostSecretOnPage(page));
+}
+
+/**
+ * Whether a picture of the page could show a secret (KTD6): the host inserted one on the page, or an
+ * isolated-world scan of every frame, shadow roots included, finds a field holding one. A scan that cannot
+ * complete counts as finding one.
+ */
+export async function pageMayShowSecret(page: Page): Promise<boolean> {
+  if (await hostSecretOnPage(page)) return true;
+  try {
+    return await pageHoldsSecretValue(page);
+  } catch (error) {
+    if (error instanceof ControlFactsUnavailableError) return true;
+    throw error;
   }
 }
 
