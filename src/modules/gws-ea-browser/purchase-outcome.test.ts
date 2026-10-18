@@ -29,6 +29,7 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
+import { log } from '../../log.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
@@ -40,6 +41,7 @@ import { PurchaseAuthorityError, PurchaseAuthorityStore } from './authority.js';
 import { readBrowserJob } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
+import { SiteLeaseStore } from './leases.js';
 import { notifyPendingUnconfirmed, purchaseOutcomeGuard, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
 import { claimRegionWatchCommit } from './watches.js';
@@ -221,6 +223,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
@@ -428,6 +431,56 @@ describe('main recording an unconfirmed purchase', () => {
     expect(await attempt(id)).toMatchObject({ resolution: 'not_committed', resolution_source: 'principal' });
     expect(await getDb().all('SELECT id FROM gws_ea_browser_incidents')).toHaveLength(1);
     expect((await notes(main)).filter((text) => text.includes('bought it twice'))).toHaveLength(1);
+  });
+
+  it('answers possible_duplicate with the incident told when the stopped job’s cleanup fails', async () => {
+    const warned = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const duplicate = async (name: string, queue: BrowserQueue): Promise<BrowserJob> => {
+      const { job } = await errand('main-p', name);
+      const id = await unconfirmed(job, name);
+      await record(job.thread_id, id, 'not_placed', 'principal');
+      expect(
+        await recordPurchaseOutcome(
+          { thread: job.thread_id, attempt_id: id, outcome: 'placed', source: 'email' },
+          main,
+          () => queue,
+        ),
+      ).toEqual({
+        status: 'possible_duplicate',
+        thread: job.thread_id,
+        recorded: { outcome: 'not_placed', source: 'principal' },
+      });
+      expect(
+        await getDb().get('SELECT kind,notified_at FROM gws_ea_browser_incidents WHERE job_id = ?', job.id),
+      ).toEqual({ kind: 'late_confirmation', notified_at: expect.any(String) });
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
+        cancelled: 1,
+      });
+      return job;
+    };
+    // Closing the stopped job's window, which releases its staged uploads, fails: a job waiting on its site still wakes.
+    const leases = new SiteLeaseStore(getDb());
+    const waiting = await errand('main-p', 'plates');
+    const { job: mugs } = await errand('main-p', 'mugs');
+    expect(await leases.acquire(mugs.id, `https://${SITE}/`)).toMatchObject({ acquired: true });
+    expect(await leases.acquire(waiting.job.id, `https://${SITE}/`)).toMatchObject({ acquired: false });
+    await duplicate(
+      'mugs',
+      new BrowserQueue(new BrowserStore(), {
+        ...runtime,
+        closeJob: () => Promise.reject(new Error('Staged upload removal failed')),
+      }),
+    );
+    const woken = (await notes(waiting.session)).filter((text) => text.includes('browser_site_available'));
+    expect(woken).toHaveLength(1);
+    // Any other cleanup that fails after the incident is recorded and told leaves the answer standing.
+    const failing = new BrowserQueue(new BrowserStore(), runtime);
+    vi.spyOn(failing, 'wakeWaiters').mockRejectedValue(new Error('Mailbox unavailable'));
+    const bowls = await duplicate('bowls', failing);
+    expect(warned).toHaveBeenCalledWith(
+      'A stopped browser job could not be cleaned up',
+      expect.objectContaining({ job: bowls.id, error: 'Mailbox unavailable' }),
+    );
   });
 
   it("refuses another group's attempt, and lets main record one whose group's browser access was removed", async () => {

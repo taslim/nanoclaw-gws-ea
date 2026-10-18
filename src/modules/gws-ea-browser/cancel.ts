@@ -285,7 +285,8 @@ export async function finishBrowserJobCancellation(
       );
   if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
   await queue.interruptJob(result.job.id, running);
-  await queue.runtime.closeJob(result.job.id);
+  // The job is already cancelled; a window that fails to close leaves its site's waiters to be woken all the same.
+  await queue.runtime.closeJob(result.job.id).catch(() => undefined);
   await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
 }
 

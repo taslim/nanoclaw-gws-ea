@@ -31,6 +31,7 @@ import {
   materialPurchaseChange,
   venueKey,
   type FinancialCommitment,
+  type GenericBookingFacts,
   type PurchaseBounds,
   type PurchaseFacts,
   type ReservationFacts,
@@ -194,6 +195,26 @@ export function watchReleases(watch: WatchRow): number[] {
 }
 
 /**
+ * Where a booking, as a page states it, falls outside a region watch's venue, party or windows (KTD20). A fact the
+ * page does not state never places it outside.
+ */
+function regionBookingOutside(
+  bounds: WatchBounds,
+  booking: Pick<GenericBookingFacts, 'venue' | 'partySize' | 'at'>,
+): 'venue_or_party' | 'time' | undefined {
+  if (
+    (booking.venue !== undefined && venueKey(booking.venue) !== venueKey(bounds.venue.name)) ||
+    (booking.partySize !== undefined && booking.partySize !== bounds.partySize)
+  )
+    return 'venue_or_party';
+  if (booking.at === undefined) return undefined;
+  const start = Date.parse(booking.at);
+  return bounds.windows.some((window) => start >= Date.parse(window.start) && start <= Date.parse(window.end))
+    ? undefined
+    : 'time';
+}
+
+/**
  * A region watch's approval covers a booking (KTD20) when the site's own checkout, as the host reads it, is the
  * watched merchant's, for the venue and party, arriving within a window, with its total, amount due now and every fee
  * within the approved maximum. A recurring charge has no total a one-time maximum bounds.
@@ -203,11 +224,9 @@ function compareRegionWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now
   if (!(Date.parse(now) < Date.parse(bounds.until))) return refuse('deadline');
   if (facts.site !== bounds.site) return refuse('merchant');
   const slot = bookedSlot(facts);
-  if (!slot || venueKey(slot.venueName) !== venueKey(bounds.venue.name) || slot.partySize !== bounds.partySize)
-    return refuse('venue_or_party');
-  const start = Date.parse(slot.at);
-  if (!bounds.windows.some((window) => start >= Date.parse(window.start) && start <= Date.parse(window.end)))
-    return refuse('time');
+  if (!slot) return refuse('venue_or_party');
+  const outside = regionBookingOutside(bounds, { venue: slot.venueName, partySize: slot.partySize, at: slot.at });
+  if (outside) return refuse(outside);
   const financial = bounds.financial;
   if (
     financial.currency !== facts.currency ||
@@ -544,19 +563,30 @@ export async function recordRegionCheck(
 /**
  * A booking that a region watch's errand commits on the watched site by a free commit or a card's approval spends
  * the job's one booking claim (KTD20), as the watch's own authority does: the watch stops checking, and the commit's
- * outcome ends it. Joins the commit's transaction and waits on nothing outside the database. A job with no live region
- * watch on the site, or whose claim is already spent, is left as it is.
+ * outcome ends it. A free commit's `booking`, as its page states it, spends only a watch it does not fall outside:
+ * a table for another venue, party or time books and leaves every watch going, while one whose page leaves a fact
+ * unstated may be the watched table and spends it. Joins the commit's transaction and waits on nothing outside the
+ * database. A job with no such live region watch on the site, or whose claim is already spent, is left as it is.
  */
 export async function claimRegionWatchCommit(
   db: DbDriver,
-  input: { jobId: string; site: string; attemptId: string; requestId: string; at: string },
+  input: {
+    jobId: string;
+    site: string;
+    attemptId: string;
+    requestId: string;
+    at: string;
+    booking?: GenericBookingFacts;
+  },
 ): Promise<void> {
   if (!(await db.hasTable('gws_ea_browser_watches'))) return;
-  const watch = await db.get<WatchRow>(
-    "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND region_json IS NOT NULL AND status IN ('armed','checking','preparing') ORDER BY created_at,id LIMIT 1",
+  const live = await db.all<WatchRow>(
+    "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND region_json IS NOT NULL AND status IN ('armed','checking','preparing') ORDER BY created_at,id",
     input.jobId,
     input.site,
   );
+  const { booking } = input;
+  const watch = booking ? live.find((candidate) => !regionBookingOutside(boundsOf(candidate), booking)) : live[0];
   if (!watch) return;
   const claimed = await db.run(
     "UPDATE gws_ea_browser_watch_job_claims SET state = 'committing',watch_id = ?,attempt_id = ?,request_id = ?,commit_started_at = ? WHERE job_id = ? AND state = 'available'",

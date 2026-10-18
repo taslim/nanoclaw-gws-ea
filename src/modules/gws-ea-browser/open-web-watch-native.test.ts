@@ -329,6 +329,26 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(site.served).toBe(served);
   });
 
+  it('books a free table outside the watch’s window without spending the watch, which then books its own', async () => {
+    await setWatch();
+    await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
+    expect(await watch()).toMatchObject({ status: 'armed' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+
+    site.slots = ['1930'];
+    await checkNow();
+    expect(await notices()).toEqual([expect.objectContaining({ status: 'changed' })]);
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    await run([{ kind: 'click', ...refIn(await observePage(page), '7:30 PM') }]);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-1930' });
+    expect(await watch()).toMatchObject({ status: 'booked' });
+    expect(await getDb().get('SELECT state,attempt_id FROM gws_ea_browser_watch_job_claims')).toEqual({
+      state: 'booked',
+      attempt_id: expect.stringMatching(/^free-attempt-/u) as unknown,
+    });
+  });
+
   it('slows down as changes book nothing, and the hourly cap holds a sixth wake until the hour allows it', async () => {
     await setWatch();
     const intervals: number[] = [];
@@ -414,6 +434,65 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     const [, change] = await notices();
     expect(change).toMatchObject({ status: 'changed' });
     expect((change.region as { after: string }).after).toContain('8:00 PM');
+  });
+
+  it('refuses a region off the recipe’s view, one with nothing to compare or one too large, set or marked again', async () => {
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    const recipe = await request('save_recipe', { name: 'Tables', first_action: 0, last_action: 0, parameters: [] });
+    const mark = (region: BrowserRef, watchId?: string): Promise<Record<string, unknown>> =>
+      request('watch', {
+        ...BOUNDS,
+        recipe_id: recipe.recipe_id,
+        financial: FREE,
+        region,
+        ...(watchId ? { watch_id: watchId } : {}),
+      });
+    /** The ref of the first element whose observed line shows `text`. */
+    const refShowing = (observation: { snapshot: string; generation: number }, text: string): BrowserRef => {
+      const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(text));
+      const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
+      if (!ref) throw new Error(`Missing ${text} in ${observation.snapshot}`);
+      return { ref, generation: observation.generation };
+    };
+    // More slots than the host keeps of a region's text.
+    const crowded = Array.from(
+      { length: 168 },
+      (_, index) => `${10 + Math.floor(index / 12)}${String((index % 12) * 5).padStart(2, '0')}`,
+    );
+    async function refusesEach(watchId?: string): Promise<void> {
+      const refused = (reason: string) => ({ status: 'refused', reason, ...(watchId ? { watch_id: watchId } : {}) });
+      // The booking page is not the view the recipe reaches.
+      await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=1930` }]);
+      expect(await mark(refIn(await observePage(page), 'Reserve now'), watchId)).toMatchObject(
+        refused('region_off_route'),
+      );
+      // The day's booking tally changes on every view: once stripped, nothing is left to compare.
+      await run([{ kind: 'navigate', url: WATCHED.tables }]);
+      expect(await mark(refShowing(await observePage(page), 'times today'), watchId)).toMatchObject(
+        refused('region_unmarkable'),
+      );
+      site.slots = crowded;
+      await run([{ kind: 'navigate', url: WATCHED.tables }]);
+      expect(await mark(refIn(await observePage(page), 'Available tables'), watchId)).toMatchObject(
+        refused('region_too_large'),
+      );
+      site.slots = [];
+    }
+    await refusesEach();
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
+
+    // Marking a watch's region again refuses each the same way, and leaves its marked region as it was.
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    const created = await mark(refIn(await observePage(page), 'Available tables'));
+    expect(created).toMatchObject({ status: 'armed' });
+    const marked = await watch();
+    await refusesEach(String(created.watch_id));
+    expect(await watch()).toMatchObject({
+      status: 'armed',
+      region_json: marked.region_json,
+      region_baseline: marked.region_baseline,
+      region_marked_at: marked.region_marked_at,
+    });
   });
 
   it('books a paid table a change found under the watch’s approval when the host-read total is within it', async () => {

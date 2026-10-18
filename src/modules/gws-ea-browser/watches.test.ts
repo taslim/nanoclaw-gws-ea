@@ -19,7 +19,7 @@ import { BrowserQueue } from './queue.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
-import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
+import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
 import {
   claimRegionWatchCommit,
   claimWatchBooking,
@@ -1044,6 +1044,54 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booked' });
     // The job's other watches end with it.
     expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('lets a free booking spend only a watch whose venue, party and windows it falls within', async () => {
+    await seedRegionWatch('early', {
+      ...regionBounds,
+      windows: [{ start: '2026-10-17T00:00:00.000Z', end: '2026-10-17T01:00:00.000Z' }],
+    });
+    await seedRegionWatch('larder');
+    const at = new Date().toISOString();
+    const free = (attemptId: string, booking: GenericBookingFacts) =>
+      claimRegionWatchCommit(getDb(), { jobId, site: 'larder.example', attemptId, requestId: attemptId, at, booking });
+    // Another venue, party size or start on the same site is not a watched table: it leaves both watches going.
+    await free('annex', { venue: 'The Larder Annex', partySize: 2, at: '2026-10-16T19:30:00-07:00' });
+    await free('four', { venue: 'The Larder', partySize: 4, at: '2026-10-16T19:30:00-07:00' });
+    await free('late', { venue: 'The Larder', partySize: 2, at: '2026-10-16T22:15:00-07:00' });
+    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual({
+      state: 'available',
+      watch_id: null,
+    });
+    expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual([
+      { id: 'early', status: 'armed' },
+      { id: 'larder', status: 'armed' },
+    ]);
+    // A table within the later watch's window spends the job's one booking on that watch, not the earlier one.
+    await free('covered', { venue: 'THE LARDER', partySize: 2, at: '2026-10-16T19:30:00-07:00' });
+    expect(await getDb().get('SELECT state,watch_id,attempt_id FROM gws_ea_browser_watch_job_claims')).toEqual({
+      state: 'committing',
+      watch_id: 'larder',
+      attempt_id: 'covered',
+    });
+    expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
+    expect(await getBrowserWatch('early')).toMatchObject({ status: 'armed' });
+  });
+
+  it('lets a free booking whose page states no party or time spend the watch it may be', async () => {
+    await seedRegionWatch('larder');
+    await claimRegionWatchCommit(getDb(), {
+      jobId,
+      site: 'larder.example',
+      attemptId: 'unstated',
+      requestId: 'r1',
+      at: new Date().toISOString(),
+      booking: { venue: 'The Larder', timeText: 'Saturday evening' },
+    });
+    expect(await getDb().get('SELECT state,watch_id FROM gws_ea_browser_watch_job_claims')).toEqual({
+      state: 'committing',
+      watch_id: 'larder',
+    });
   });
 
   it('asks for a region only where the host has no reader, and refuses one where it reads the venue itself', async () => {

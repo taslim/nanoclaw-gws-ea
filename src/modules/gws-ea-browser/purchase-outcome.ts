@@ -198,7 +198,8 @@ async function lateConfirmation(
     evidenceKey: attempt.id,
     evidence: { reported: 'placed', source, recorded: recordedAs(attempt) },
   });
-  /* eslint-disable no-catch-all/no-catch-all -- the incident is recorded: the sweep retries a notice that fails here */
+  /* eslint-disable no-catch-all/no-catch-all -- the incident and the job's stop are recorded: the sweep retries a
+     notice that fails here, and cleanup that fails never turns the possible duplicate into an error */
   try {
     await notifyIncident(incident.id);
   } catch (error) {
@@ -207,8 +208,16 @@ async function lateConfirmation(
       error: error instanceof Error ? error.message : String(error),
     });
   }
+  try {
+    await finishBrowserJobCancellation(stop, queue);
+  } catch (error) {
+    log.warn('A stopped browser job could not be cleaned up', {
+      job: stop.job.id,
+      incident: incident.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   /* eslint-enable no-catch-all/no-catch-all */
-  await finishBrowserJobCancellation(stop, queue);
 }
 
 export function registerPurchaseOutcomeDelivery(queue: () => BrowserQueue): void {
