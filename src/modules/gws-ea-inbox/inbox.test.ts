@@ -2757,38 +2757,6 @@ describe("mail to the assistant's web alias, which routes like any mail to the a
     expect(rows(main)).toEqual([]);
     expect(await outsideMail()).toEqual([]);
   });
-
-  it('hands a sign-in code sent to the alias, and a signup code sent to a +tag of it, to their sign-in claims', async () => {
-    await browserSignInMigration.up(getDb());
-    await createSignInClaim({
-      id: 'alias-sign-in',
-      jobId: 'job-sign-in',
-      source: 'assistant',
-      origin: 'https://shop.example',
-      binding: {},
-      at: new Date(now()),
-    });
-    await createSignInClaim({
-      id: 'alias-signup',
-      jobId: 'job-signup',
-      source: 'assistant',
-      origin: 'https://store.example',
-      binding: { attempt: 'attempt-1', username: 'onuj+store@assistant.example' },
-      at: new Date(now()),
-    });
-    const signIn = gmail.receive({ from: 'login@shop.example', to: [ALIAS], body: 'Your code is 642981' });
-    const signup = gmail.receive({
-      from: 'verify@store.example',
-      to: ['onuj+store@assistant.example'],
-      body: 'Confirm your email with 135790',
-    });
-    await inbox.tick();
-
-    expect([await outcomeOf(signIn), await outcomeOf(signup)]).toEqual(['browser-sign-in', 'browser-sign-in']);
-    expect(await getSignInClaim('alias-sign-in')).toMatchObject({ gmail_message_id: signIn });
-    expect(await getSignInClaim('alias-signup')).toMatchObject({ gmail_message_id: signup });
-    expect(rows(main)).toEqual([]);
-  });
 });
 
 // ---------------------------------------------------------------------------

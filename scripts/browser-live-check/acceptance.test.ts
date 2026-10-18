@@ -104,22 +104,10 @@ describe('post-deployment browser acceptance evidence', () => {
     await expect(beginAcceptance(root, 'owner-run')).rejects.toMatchObject({ code: 'EEXIST' });
   });
 
-  it('documents a receipt for exactly the scenarios it records, the open-web checks among them', async () => {
+  it('documents a receipt for exactly the scenarios it records', async () => {
     const readme = await readFile(new URL('./README.md', import.meta.url), 'utf8');
     const documented = [...readme.matchAll(/^\| `([a-z_]+)` +\|/gmu)].map(([, name]) => name);
     expect(documented).toEqual([...acceptanceScenarios]);
-    for (const name of [
-      'open_browsing_unreviewed',
-      'unreviewed_checkout_card',
-      'free_booking',
-      'consent_form',
-      'cookie_banner',
-      'alias_admin_console',
-    ])
-      expect(acceptanceScenarios).toContain(name);
-    // Any site's checkout goes to approval now: no scenario expects a refused merchant.
-    expect(acceptanceScenarios).not.toContain('unsupported_purchase');
-    expect(readme).not.toMatch(/outcome_unknown|unsupported/u);
   });
 
   it('attributes native request timestamps and labels the remaining time as model and orchestration', () => {

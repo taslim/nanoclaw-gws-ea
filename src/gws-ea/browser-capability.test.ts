@@ -77,47 +77,22 @@ const hostDown = async (): Promise<never> => {
   throw new GwsEaError('command_failed', 'Command failed (exit code 2)');
 };
 
-/** The assistant's host as the alias step reaches it: the profile, and the alias commands in memory. */
-function aliasHost(verifies: () => boolean) {
-  const calls: string[] = [];
-  let alias: string | null = null;
-  let candidate: string | null = null;
-  let probeSent = false;
-  const setup = () => ({ alias, candidate, probe_sent: probeSent });
-  const ncl = async (_runtime: unknown, args: readonly string[]): Promise<unknown> => {
-    calls.push(args.join(' '));
-    const value = (flag: string) => args[args.indexOf(flag) + 1];
-    switch (args.slice(0, 2).join(' ')) {
-      case 'gws-ea-profile get':
-        return {
-          assistant_display_name: 'Juno Hale',
-          assistant_workspace_email: 'assistant@example.test',
-          principal_emails: ['morgan@example.test'],
-        };
-      case 'gws-ea-alias get':
-        return setup();
-      case 'gws-ea-alias propose':
-        candidate = args.includes('--none') ? null : value('--address');
-        probeSent = false;
-        return setup();
-      case 'gws-ea-alias probe':
-        if (args.includes('--send')) probeSent = true;
-        if (!verifies()) return { outcome: 'not_yet', alias: null };
-        alias = candidate;
-        candidate = null;
-        return { outcome: 'verified', alias };
-      default:
-        throw new Error(`unexpected ncl ${args.join(' ')}`);
-    }
-  };
-  return { ncl, calls };
-}
-
-/** A host whose web alias is already verified: the alias step has nothing to wait for. */
-async function verifiedAliasHost(runtime: unknown, args: readonly string[]): Promise<unknown> {
-  if (args.slice(0, 2).join(' ') === 'gws-ea-alias get')
-    return { alias: 'onuj@example.test', candidate: null, probe_sent: false };
-  return aliasHost(() => true).ncl(runtime, args);
+/** The assistant's host as the alias step first reaches it: its profile, and no web alias asked for yet. */
+async function aliasHost(_runtime: unknown, args: readonly string[]): Promise<unknown> {
+  switch (args.slice(0, 2).join(' ')) {
+    case 'gws-ea-profile get':
+      return {
+        assistant_display_name: 'Juno Hale',
+        assistant_workspace_email: 'assistant@example.test',
+        principal_emails: ['morgan@example.test'],
+      };
+    case 'gws-ea-alias get':
+      return { alias: null, candidate: null, probe_sent: false };
+    case 'gws-ea-alias propose':
+      return { alias: null, candidate: args[args.indexOf('--address') + 1], probe_sent: false };
+    default:
+      throw new Error(`unexpected ncl ${args.join(' ')}`);
+  }
 }
 
 const chrome = async (command: SanitizedCommand) => {
@@ -136,14 +111,12 @@ describe('assistant browser capability', () => {
     expect(await enableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ changed: false });
   });
 
-  it("asks for the assistant's web alias once enabled, and finishes when its probe arrives", async () => {
+  it("asks for the assistant's web alias once enabled", async () => {
     const f = await fixture();
-    let delivered = false;
-    const host = aliasHost(() => delivered);
     const effects: unknown[] = [];
 
     const enabled = await enableBrowserWithAlias(f.paths, f.instanceId, {
-      alias: { ncl: host.ncl },
+      ncl: aliasHost,
       recordEffect: (changed) => void effects.push(changed),
     });
 
@@ -169,20 +142,12 @@ describe('assistant browser capability', () => {
         argv: ['gws-ea', 'capabilities', 'enable', 'browser', '--id', f.instanceId, '--alias-added'],
       },
     ]);
-
-    delivered = true;
-    const verified = await enableBrowserWithAlias(f.paths, f.instanceId, {
-      alias: { ncl: host.ncl, decision: { kind: 'added' }, sleep: async () => undefined },
-    });
-    expect(verified).toMatchObject({ enabled: true, changed: false });
-    expect(verified.pause).toBeUndefined();
-    expect(host.calls.filter((call) => call.includes('--send'))).toHaveLength(1);
   });
 
   it('pauses for a running host when the assistant is stopped, with the browser enabled', async () => {
     const f = await fixture();
 
-    const enabled = await enableBrowserWithAlias(f.paths, f.instanceId, { alias: { ncl: hostDown } });
+    const enabled = await enableBrowserWithAlias(f.paths, f.instanceId, { ncl: hostDown });
 
     expect(enabled).toMatchObject({ enabled: true, pause: { code: 'alias_host_unavailable' } });
     expect(enabled.pause?.details?.[0]).toBe(
@@ -322,13 +287,7 @@ describe('assistant browser capability', () => {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
-        browserInspection: {
-          runCommand: chrome,
-          ncl: async () => {
-            throw new Error('host down');
-          },
-        },
-        browserAlias: { ncl: hostDown },
+        browserInspection: { runCommand: chrome, ncl: hostDown },
       });
       // With the host down, an enable waits for it to set the web alias up.
       expect(exit).toBe(command === 'check' ? 1 : command === 'enable' ? 10 : 0);
@@ -355,12 +314,14 @@ describe('assistant browser capability', () => {
 });
 
 describe('the browser access setting', () => {
-  /** The running host as `ncl` reaches it: what it reads, its profile and its agent groups. */
+  /** The running host as `ncl` reaches it: what it reads, its profile, its agent groups and its verified web alias. */
   function host(options: { readonly versions?: readonly number[]; readonly down?: boolean } = {}) {
     const asked: string[][] = [];
     const ncl = async (_runtime: unknown, args: readonly string[]): Promise<unknown> => {
       asked.push([...args]);
       if (options.down) throw new Error('host down');
+      if (args.join(' ') === 'gws-ea-alias get')
+        return { alias: 'onuj@example.test', candidate: null, probe_sent: false };
       if (args[0] === 'gws-ea-browser-health')
         return {
           schemaVersion: 1,
@@ -484,9 +445,8 @@ describe('the browser access setting', () => {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
-        browserInspection: { ncl: host({ versions: [1, 2] }).ncl },
         // The assistant's web alias is already verified, so the grant completes without a pause.
-        browserAlias: { ncl: verifiedAliasHost },
+        browserInspection: { ncl: host({ versions: [1, 2] }).ncl },
       },
     );
     expect(exit).toBe(0);

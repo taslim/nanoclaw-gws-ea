@@ -342,10 +342,6 @@ describe('a second agent group the browser access setting lists', () => {
       expect(refused(await send(from, 'reservation_bounds', { thread, ...bounds }))).toBe(
         'No live browser job of yours exists for that thread.',
       );
-      expect(await send(from, 'relay_code', { thread, code: '482913' })).toMatchObject({
-        ok: true,
-        data: { status: 'no_wait' },
-      });
     }
     expect(await readBrowserJob(researchThread)).toMatchObject({ state: 'idle' });
     expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });

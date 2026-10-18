@@ -962,9 +962,14 @@ describe('gws-ea stop summaries and exit codes', () => {
       { kind: 'added', name: 'juno.web' },
     ]);
 
-    const contradicted = await resume('--alias-taken', '--alias-added');
-    expect(contradicted.exit).not.toBe(0);
-    expect(contradicted.err).toContain('--alias-taken cannot be combined');
+    for (const flags of [
+      ['--alias-taken', '--alias-added'],
+      ['--alias-taken', '--alias', 'juno.web'],
+    ]) {
+      const contradicted = await resume(...flags);
+      expect(contradicted.exit, flags.join(' ')).not.toBe(0);
+      expect(contradicted.err, flags.join(' ')).toContain('--alias-taken cannot be combined');
+    }
     const role = await resume('--alias', 'postmaster');
     expect(role.exit).not.toBe(0);
     expect(role.err).toContain('role address');

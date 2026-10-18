@@ -611,14 +611,22 @@ it.each(['fill', 'restart'] as const)(
   async (mode) => {
     const f = fixture();
     await observePage(f.page);
-    for (const id of ['main', 'browser'])
+    for (const id of ['main', 'browser', 'research'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await getDb().run(
       'UPDATE gws_ea_profile SET main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1',
       'main',
       'browser',
     );
+    // The setting lists a second group: it may use the browser, but its relays reach only its own errands (R28, KTD15).
+    const policy = `${root}/browser/policy.json`;
+    fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }), {
+      mode: 0o600,
+    });
+    vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', policy);
     const source = (await resolveSystemSession('main', 'system:principal')).session;
+    const research = (await resolveSystemSession('research', 'system:principal')).session;
     const browser = (await resolveSystemSession('browser', 'system:a2a:main:job')).session;
     const job = (await f.context.store.jobForSession(browser))!;
     const context = { ...f.context, job, session: browser };
@@ -626,11 +634,17 @@ it.each(['fill', 'restart'] as const)(
     expect(waiting).toEqual({ status: 'awaiting_code', site: 'shop.example', origin: 'https://www.shop.example' });
     const code = '817264';
     const request = { action: 'relay_code', requestId: 'main-relay', thread: job.id, code };
-    const outbound = new Database(outboundDbPath(source.agent_group_id, source.id));
-    outbound
-      .prepare('INSERT INTO messages_out(id,kind,timestamp,content) VALUES(?,?,?,?)')
-      .run('main-relay', 'system', new Date().toISOString(), JSON.stringify(request));
-    outbound.close();
+    const foreign = { action: 'relay_code', requestId: 'research-relay', thread: job.id, code: '552918' };
+    for (const [from, sent] of [
+      [source, request],
+      [research, foreign],
+    ] as const) {
+      const outbound = new Database(outboundDbPath(from.agent_group_id, from.id));
+      outbound
+        .prepare('INSERT INTO messages_out(id,kind,timestamp,content) VALUES(?,?,?,?)')
+        .run(sent.requestId, 'system', new Date().toISOString(), JSON.stringify(sent));
+      outbound.close();
+    }
     const queue = new BrowserQueue(context.store, {
       pageForJob: async () => f.page,
       connection: async () => {
@@ -648,6 +662,8 @@ it.each(['fill', 'restart'] as const)(
     await expect(answerRelayCode(request, browser, 'main-relay', queue)).rejects.toThrow(
       'Only an agent with browser access',
     );
+    expect(await answerRelayCode(foreign, research, 'research-relay', queue)).toEqual({ status: 'no_wait' });
+    expect(await context.store.pending(job.id)).toEqual([]);
     expect(await answerRelayCode(request, source, 'main-relay', queue)).toBe(ANSWER_LATER);
     const pending = await context.store.pending(job.id);
     expect(pending).toHaveLength(1);

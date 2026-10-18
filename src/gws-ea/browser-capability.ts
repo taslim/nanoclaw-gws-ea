@@ -82,8 +82,8 @@ export interface BrowserCapabilityDependencies {
   readonly ncl?: NclRunner;
 }
 export interface BrowserEnableDependencies extends BrowserCapabilityDependencies {
-  /** The web alias step that follows the policy write. */
-  readonly alias?: AliasStepOptions;
+  /** The operator's word on the web alias step that follows the policy write; the step asks the host through `ncl`. */
+  readonly alias?: Pick<AliasStepOptions, 'decision'>;
   /** Hears the alias step's progress. */
   readonly emit?: (event: RunEvent) => void;
 }
@@ -265,7 +265,7 @@ export async function enableBrowserWithAlias(
   const alias = await withAssistantLock(paths, instanceId, async () => {
     const { runtime, files } = await target(paths, instanceId);
     if (!(await readBrowserPolicy(files.policyFile)).enabled) return undefined;
-    return runAliasStep(paths, instanceId, runtime, reporter, dependencies.alias);
+    return runAliasStep(paths, instanceId, runtime, reporter, { ...dependencies.alias, ncl: dependencies.ncl });
   });
   if (alias?.status !== 'paused') return enabled;
   const { settled: _settled, kind: _kind, ...pause } = alias.pause;

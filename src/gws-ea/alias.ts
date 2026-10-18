@@ -218,10 +218,10 @@ export function aliasDecision(flags: {
 export const ALIAS_STEP = { id: 'provision_alias', label: "Setting up the assistant's web alias…" } as const;
 
 /** Where the operator adds an alias: the Admin console's user list, which opens the assistant's account. */
-export const ADMIN_CONSOLE_USERS_URL = 'https://admin.google.com/ac/users';
+const ADMIN_CONSOLE_USERS_URL = 'https://admin.google.com/ac/users';
 
 /** Seconds between read-backs of a probe just sent, before the step pauses until a later resume. */
-export const PROBE_READ_BACK_WAITS_SECONDS = [2, 3, 5, 5, 5, 10] as const;
+const PROBE_READ_BACK_WAITS_SECONDS = [2, 3, 5, 5, 5, 10] as const;
 
 /** The assistant as the alias step names it, from the profile its host serves. */
 export interface AliasIdentity {

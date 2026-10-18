@@ -6,7 +6,7 @@ import {
   voiceCapabilityNextActions,
   browserCapabilityCatalog,
 } from './capabilities.js';
-import { aliasDecision, type AliasDecision, type AliasStepOptions } from './alias.js';
+import { aliasDecision, type AliasDecision } from './alias.js';
 import {
   browserAccessLine,
   browserCapabilityLines,
@@ -258,9 +258,8 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
+  /** How the browser commands reach Chrome and the assistant's host, its web alias step included; tests substitute it. */
   browserInspection?: BrowserCapabilityInspection;
-  /** How a browser enable's web alias step reaches the assistant's host; tests substitute it. */
-  browserAlias?: Pick<AliasStepOptions, 'ncl' | 'sleep'>;
   /** How the 1Password CLI is found and run; tests substitute the runner. */
   onePassword?: OnePasswordCliSeams;
   /** A terminal's choice among the operator's 1Password accounts; absent, enable requires --account. */
@@ -2484,7 +2483,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               {
                 ...dependencies,
                 ncl: runtime.browserInspection?.ncl,
-                alias: { ...runtime.browserAlias, ...(decision ? { decision } : {}) },
+                alias: { decision },
                 emit: (event) => presenter.event(event),
               },
               agentGroupIds.length > 0

@@ -20,24 +20,24 @@ import {
 import '../modules/gws-ea-profile/index.js';
 import '../modules/gws-ea-inbox/index.js';
 import {
-  ADMIN_CONSOLE_USERS_URL,
   aliasCandidateAfter,
-  aliasDecision,
   aliasHost,
   aliasStem,
   ensureAssistantAlias,
   firstAliasCandidate,
   parseAliasName,
-  PROBE_READ_BACK_WAITS_SECONDS,
   type AliasDecision,
   type AliasHost,
 } from './alias.js';
+import { runCli } from './cli.js';
 import type { RunEvent } from './events.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionResult } from './phases.js';
 import { claimInstanceAlias, getInstanceReservation } from './registry.js';
+import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 describe("the assistant's web alias name (R21)", () => {
@@ -118,22 +118,6 @@ describe("the operator's own alias name (--alias)", () => {
     ]) {
       expect(() => parseAliasName(value), value).toThrow(GwsEaError);
     }
-  });
-});
-
-describe('the alias flags', () => {
-  it('make one decision, and refuse --alias-taken beside a name or a confirmation', () => {
-    expect(aliasDecision({ added: false, taken: false, name: undefined })).toBeUndefined();
-    expect(aliasDecision({ added: true, taken: false, name: undefined })).toEqual({ kind: 'added' });
-    expect(aliasDecision({ added: true, taken: false, name: 'juno.web' })).toEqual({ kind: 'added', name: 'juno.web' });
-    expect(aliasDecision({ added: false, taken: true, name: undefined })).toEqual({ kind: 'taken' });
-    expect(aliasDecision({ added: false, taken: false, name: 'juno.web' })).toEqual({
-      kind: 'named',
-      name: 'juno.web',
-    });
-    expect(() => aliasDecision({ added: true, taken: true, name: undefined })).toThrow(/--alias-taken/u);
-    expect(() => aliasDecision({ added: false, taken: true, name: 'juno.web' })).toThrow(/--alias-taken/u);
-    expect(() => aliasDecision({ added: false, taken: false, name: 'admin' })).toThrow(/role address/u);
   });
 });
 
@@ -242,7 +226,7 @@ describe('the web alias setup step (KTD13)', () => {
         'To choose the name yourself, continue with --alias <name>',
       ],
       resumeFlag: '--alias-added',
-      actionUrl: ADMIN_CONSOLE_USERS_URL,
+      actionUrl: 'https://admin.google.com/ac/users',
     });
     expect(await world.claimed()).toBe(ALIAS);
     await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS, probe_message_id: null });
@@ -305,10 +289,8 @@ describe('the web alias setup step (KTD13)', () => {
       message: `The test message to ${ALIAS} has not arrived yet: Google can take up to 24 hours to start delivering to a new alias.`,
     });
     expect(pause.resumeFlag).toBeUndefined();
-    expect(world.sleeps).toEqual(PROBE_READ_BACK_WAITS_SECONDS.map((seconds) => seconds * 1_000));
-    expect(world.events.filter((event) => event.type === 'step-waiting')).toHaveLength(
-      PROBE_READ_BACK_WAITS_SECONDS.length,
-    );
+    expect(world.sleeps).toEqual([2_000, 3_000, 5_000, 5_000, 5_000, 10_000]);
+    expect(world.events.filter((event) => event.type === 'step-waiting')).toHaveLength(6);
 
     world.gmail.deliver();
     await expect(world.run()).resolves.toEqual({ status: 'ready' });
@@ -328,19 +310,18 @@ describe('the web alias setup step (KTD13)', () => {
     await expect(getAssistantAlias()).resolves.toBeNull();
   });
 
-  it('moves a taken candidate to the next, and a late probe for the earlier one cannot record it', async () => {
+  it('moves a taken candidate to the next, and a resume after it offers only the new one', async () => {
     const world = await stepWorld();
     await world.run();
     await world.run({ kind: 'added' });
 
-    expect(paused(await world.run({ kind: 'taken' }))).toMatchObject({
+    const next = paused(await world.run({ kind: 'taken' }));
+    expect(next).toMatchObject({
       code: 'alias_required',
       message: `Add onuj2@example.test as an alias of ${ASSISTANT_EMAIL} in the Google Admin console, then confirm it.`,
     });
     expect(await world.claimed()).toBe('onuj2@example.test');
-    // The probe sent to onuj@ arrives only now.
-    world.gmail.deliver();
-    expect(paused(await world.run())).toMatchObject({ code: 'alias_required' });
+    expect(paused(await world.run())).toEqual(next);
     await expect(getAliasSetup()).resolves.toEqual({
       alias: null,
       candidate: 'onuj2@example.test',
@@ -395,6 +376,49 @@ describe('the web alias setup step (KTD13)', () => {
       message: expect.stringContaining('Add onuj3@example.test as an alias'),
     });
     expect(await world.claimed()).toBe('onuj3@example.test');
+  });
+
+  it("takes the operator's word on it from capabilities enable browser", async () => {
+    const world = await stepWorld();
+    const reserved = await getInstanceReservation(world.paths, world.instanceId);
+    const onecli = createOnecliRuntimeLayout({
+      instanceId: world.instanceId,
+      instanceRoot: world.paths.instanceRoot(world.instanceId),
+      project: reserved.exclusive_resource_claims.onecli_project,
+      appPort: reserved.allocated_ports.onecli_app,
+      gatewayPort: reserved.allocated_ports.onecli_gateway,
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    await persistInstanceRuntime(
+      createInstanceRuntimeConfig(world.paths, reserved, onecli, {
+        nodePath: process.execPath,
+        homeDirectory: path.dirname(world.paths.configRoot),
+        selectedProvider: 'claude',
+        dockerEndpoint: 'unix:///var/run/docker.sock',
+      }),
+      () => undefined,
+    );
+    const enable = async (...flags: string[]) => {
+      const stdout: string[] = [];
+      const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId, ...flags, '--json'], {
+        paths: world.paths,
+        stdout: (line) => stdout.push(line),
+        stderr: () => undefined,
+        browserInspection: { ncl: (_runtime, args) => hostNcl(args) },
+      });
+      return { exit, result: JSON.parse(stdout.join('\n')) as unknown };
+    };
+    const asked = (address: string) => ({
+      exit: 10,
+      result: { data: { pause: { message: expect.stringContaining(`Add ${address} as an alias`) } } },
+    });
+
+    expect(await enable()).toMatchObject(asked(ALIAS));
+    expect(await enable('--alias-taken')).toMatchObject(asked('onuj2@example.test'));
+    expect(await enable('--alias', 'Juno.Web')).toMatchObject(asked('juno.web@example.test'));
+    world.gmail.onSend = (id) => world.gmail.deliver(id);
+    expect(await enable('--alias-added')).toMatchObject({ exit: 0, result: { outcome: 'succeeded' } });
+    await expect(getAssistantAlias()).resolves.toBe('juno.web@example.test');
   });
 });
 

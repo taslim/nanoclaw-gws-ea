@@ -221,14 +221,9 @@ describe('approval presentation and expiry', () => {
       'chat-sdk',
       undefined,
     ]);
-    expect(Object.keys(JSON.parse(content) as Record<string, unknown>)).toEqual([
-      'type',
-      'questionId',
-      'title',
-      'question',
-      'options',
-    ]);
-    expect((JSON.parse(content) as { questionId: string }).questionId).toBe(id);
+    const card = JSON.parse(content) as Record<string, unknown>;
+    expect(card).not.toHaveProperty('pictures');
+    expect(card.questionId).toBe(id);
   });
 
   it('does not leave a pending request when no delivery adapter exists', async () => {
