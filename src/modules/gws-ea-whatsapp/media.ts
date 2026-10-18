@@ -83,6 +83,15 @@ export async function inboundMedia(
     ...(Number.isFinite(size) ? { size } : {}),
     ...(audioSource ? { audioSource } : {}),
   };
+  function failed(reason: NonNullable<WhatsAppAttachment['downloadError']>): WhatsAppAttachment[] {
+    return [
+      {
+        ...base,
+        downloadError: reason,
+        ...(type === 'audio' ? { speech: { status: 'failed', reason } as const } : {}),
+      },
+    ];
+  }
   const refused = !eligible
     ? 'chat-declined'
     : size === undefined || !Number.isSafeInteger(size) || size < 0
@@ -90,35 +99,15 @@ export async function inboundMedia(
       : size > MAX_WHATSAPP_MEDIA_BYTES
         ? 'too-large'
         : undefined;
-  if (refused)
-    return [
-      {
-        ...base,
-        downloadError: refused,
-        ...(type === 'audio' ? { speech: { status: 'failed', reason: refused } as const } : {}),
-      },
-    ];
+  if (refused) return failed(refused);
   /* eslint-disable no-catch-all/no-catch-all -- media failure is an attachment outcome, never a lost message */
   try {
     const bytes = await download(raw);
-    if (bytes.length > MAX_WHATSAPP_MEDIA_BYTES)
-      return [
-        {
-          ...base,
-          downloadError: 'too-large',
-          ...(type === 'audio' ? { speech: { status: 'failed', reason: 'too-large' } as const } : {}),
-        },
-      ];
+    if (bytes.length > MAX_WHATSAPP_MEDIA_BYTES) return failed('too-large');
     return [{ ...base, data: bytes.toString('base64') }];
   } catch (error) {
     log.warn('Could not download WhatsApp attachment', { messageId: raw.key.id, err: error });
-    return [
-      {
-        ...base,
-        downloadError: 'media-download-failed',
-        ...(type === 'audio' ? { speech: { status: 'failed', reason: 'media-download-failed' } as const } : {}),
-      },
-    ];
+    return failed('media-download-failed');
   }
 }
 

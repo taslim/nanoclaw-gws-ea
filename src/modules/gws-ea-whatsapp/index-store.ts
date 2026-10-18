@@ -1,4 +1,3 @@
-/** Durable inbox, trusted quote copies and row-keyed sends; all outside release snapshots. */
 import { BufferJSON, proto, type WAMessage } from '@whiskeysockets/baileys';
 import Database from 'better-sqlite3';
 
@@ -23,7 +22,6 @@ interface MessageRow {
   text: string;
   at: number;
   routed: number;
-  raw: string | null;
 }
 export interface PendingSend {
   readonly rowId: string;
@@ -53,6 +51,7 @@ export class WhatsAppIndex {
         forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,
         PRIMARY KEY(chat,id)
       );
+      CREATE INDEX IF NOT EXISTS messages_prune ON messages(at) WHERE from_me=0 AND routed=1;
       CREATE TABLE IF NOT EXISTS pending_sends (
         row_id TEXT PRIMARY KEY,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL
       );
@@ -63,7 +62,9 @@ export class WhatsAppIndex {
   }
 
   message(chat: string, id: string): IndexedMessage | undefined {
-    const row = this.db.prepare('SELECT * FROM messages WHERE chat=? AND id=?').get(chat, id) as MessageRow | undefined;
+    const row = this.db
+      .prepare('SELECT chat,id,sender,from_me,forwarded,text,at,routed FROM messages WHERE chat=? AND id=?')
+      .get(chat, id) as MessageRow | undefined;
     return row === undefined
       ? undefined
       : {

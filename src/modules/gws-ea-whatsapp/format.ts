@@ -1,10 +1,8 @@
-/** WhatsApp-native markdown and mention conversion, ported from the upstream adapter. */
 interface TextSegment {
   content: string;
   isProtected: boolean;
 }
 
-/** Split text into code-block-protected and unprotected regions. */
 function splitProtectedRegions(text: string): TextSegment[] {
   const segments: TextSegment[] = [];
   const codeBlockRegex = /```[\s\S]*?```|`[^`\n]+`/g;
@@ -26,18 +24,12 @@ function splitProtectedRegions(text: string): TextSegment[] {
   return segments;
 }
 
-/** Apply WhatsApp-native formatting to an unprotected text segment. */
 function transformForWhatsApp(text: string): string {
   // Order matters: italic before bold to avoid **bold** → *bold* → _bold_
-  // 1. Italic: *text* (not **) → _text_
   text = text.replace(/(?<!\*)\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?!\*)/g, '_$1_');
-  // 2. Bold: **text** → *text*
   text = text.replace(/\*\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*\*/g, '*$1*');
-  // 3. Headings: ## Title → *Title*
   text = text.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
-  // 4. Links: [text](url) → text (url)
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-  // 5. Horizontal rules: --- / *** / ___ → stripped
   text = text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '');
   return text;
 }

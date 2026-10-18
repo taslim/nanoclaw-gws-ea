@@ -1,4 +1,3 @@
-/** The assistant's Baileys transport. Connection establishment never holds channel startup open. */
 import {
   Browsers,
   DisconnectReason,

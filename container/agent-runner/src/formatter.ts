@@ -337,7 +337,6 @@ function formatSingleChat(msg: MessageInRow): string {
   return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
 }
 
-/** Host attribution sits outside the source body, whose markup remains escaped. */
 function formatPrincipalMark(value: unknown): string {
   const mark = attachmentRecord(value);
   if (typeof mark?.id !== 'string' || !mark.id || typeof mark.messagingGroupId !== 'string' || !mark.messagingGroupId) {

@@ -1,4 +1,3 @@
-/** Number-scoped first-contact authority, beside auth and never in a release snapshot. */
 import { createHash } from 'node:crypto';
 
 import type { BaileysEventMap } from '@whiskeysockets/baileys';

@@ -1,4 +1,3 @@
-/** Account state is instance-owned and deliberately outside release snapshot roots. */
 import fs from 'node:fs';
 import path from 'node:path';
 

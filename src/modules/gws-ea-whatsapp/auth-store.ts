@@ -1,4 +1,3 @@
-/** Transactional host-only credentials and Signal keys. No credential reaches an agent. */
 import {
   BufferJSON,
   initAuthCreds,

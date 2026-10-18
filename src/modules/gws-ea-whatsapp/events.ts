@@ -1,4 +1,3 @@
-/** Resolves native group facts once, for the chats owner's admission and roster decisions. */
 import type { BaileysEventMap, GroupMetadata, GroupParticipant } from '@whiskeysockets/baileys';
 
 import type { WhatsAppSocket } from './adapter.js';
