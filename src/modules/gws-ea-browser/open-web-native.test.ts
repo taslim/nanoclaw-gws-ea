@@ -819,6 +819,32 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(posts()).toEqual([]);
   });
 
+  it('refuses the payment post and the checkout submit that page script sends as a field is typed into', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.typedPosts);
+    const guard = await ensureBrowserNavigationGuard(page);
+    /** Types as `actions` says, aimed from a fresh observation, once every earlier window has closed. */
+    const typed = async (actions: (observation: BrowserObservation) => BrowserAction[]): Promise<void> => {
+      await guard.actionsSettled();
+      await page.evaluate(`document.getElementById('status').textContent = 'Ready'`);
+      expect(await batch(page, actions(await observePage(page)))).toMatchObject({ status: 'completed' });
+      await expect.poll(() => page.locator('#status').textContent()).toBe('refused');
+    };
+    await typed((seen) => [{ kind: 'type', ...refIn(seen, 'Gift message'), text: 'Happy birthday' }]);
+    await typed((seen) => [
+      { kind: 'form_input', fields: [{ ...refIn(seen, 'Delivery notes'), value: 'Leave it with the porter' }] },
+    ]);
+    // A key that edits the field is typing too.
+    await typed((seen) => [
+      { kind: 'key', ...refIn(seen, 'Gift message'), key: 'End' },
+      { kind: 'key', ...refIn(seen, 'Gift message'), key: 'Backspace' },
+    ]);
+    // The typing itself went through.
+    expect(await page.locator('input[name="gift"]').inputValue()).toBe('Happy birthda');
+    expect(await page.locator('input[name="notes"]').inputValue()).toBe('Leave it with the porter');
+    expect(posts()).toEqual([]);
+  });
+
   it('never slows a widget polling with GETs, during an action or after it', async () => {
     const page = await open();
     await go(page, OPEN_WEB.live);
@@ -1090,6 +1116,37 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     } finally {
       await slow.detach().catch(() => undefined);
     }
+  });
+
+  it('runs Add to calendar on an order page showing its confirmation, charge and card, and raises nothing', async () => {
+    expect(await press(OPEN_WEB.thanks, 'Add to calendar')).toMatchObject({
+      status: 'completed',
+      actions: [{ status: 'completed' }],
+    });
+    expect(await page.locator('#added').isVisible()).toBe(true);
+    expect(await incidents()).toEqual([]);
+    expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
+      cancelled: 0,
+    });
+    expect(await mainNotes()).toEqual([]);
+  });
+
+  it('raises nothing when Track order opens another page showing the same order and charge', async () => {
+    expect(await press(OPEN_WEB.thanks, 'Track order')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(page.url()).toBe(OPEN_WEB.tracking);
+    expect(await incidents()).toEqual([]);
+    expect(await mainNotes()).toEqual([]);
+  });
+
+  it('stops the job when a press on that order page confirms a new charge in a frame beside the old confirmation', async () => {
+    await run('open-thanks', [{ kind: 'navigate', url: OPEN_WEB.thanks }]);
+    await page.frameLocator('#perks').locator('#accept').waitFor();
+    expect(await run('accept', [{ kind: 'click', ...refIn(await observePage(page), 'Yes, add it') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'unapproved_commit',
+      incident: { site: 'shop.example', reference: 'PK-7731', charged: '$19.00' },
+    });
+    expect(await incidents()).toMatchObject([{ kind: 'unapproved_commit', site: 'shop.example' }]);
   });
 
   it('raises nothing for a waitlist number or a $0.00 registration', async () => {
@@ -1396,6 +1453,26 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
     ).toEqual(refusedBeforeTyping);
     for (const name of ['area', 'exchange', 'line'])
       expect(await page.locator(`input[name="${name}"]`).inputValue()).toBe('');
+    expect(posts()).toEqual([]);
+  });
+
+  it('refuses the disclosed mobile number in another site’s frame on the restaurant’s page, and fills the restaurant’s own field', async () => {
+    await disclose('osteria.example');
+    await open(PERSONAL_DATA.events);
+    const offers = page.frameLocator('#offers').locator('input[name="mobile"]');
+    await offers.waitFor();
+    expect(
+      await run('offers', [
+        { kind: 'type', ...refIn(await observePage(page), 'Mobile for offers'), text: '(415) 555-0134' },
+      ]),
+    ).toEqual(refusedBeforeTyping);
+    expect(await offers.inputValue()).toBe('');
+    expect(
+      await run('enquiry', [
+        { kind: 'type', ...refIn(await observePage(page), 'Contact number'), text: '(415) 555-0134' },
+      ]),
+    ).toMatchObject({ status: 'completed' });
+    expect(await page.locator('input[name="phone"]').inputValue()).toBe('(415) 555-0134');
     expect(posts()).toEqual([]);
   });
 
@@ -1749,6 +1826,45 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
       { resolution: null, merchant_record_id: null },
     ]);
     expect(await blocks()).toEqual([{ site: 'pottery.example' }]);
+  });
+
+  it('raises nothing when a press shows the approved order again for its total, and stops the job when it shows more', async () => {
+    const html = (title: string, body: string, script = ''): string =>
+      `<!doctype html><html><head><title>${title}</title></head><body>${body}${script ? `<script>${script}</script>` : ''}</body></html>`;
+    fixture.serve(
+      'https://pottery.example/orders',
+      html(
+        'Your orders',
+        '<h1>Your orders</h1><button type="button" id="view">View order</button> <button type="button" id="updated">View updated order</button>',
+        `document.getElementById('view').addEventListener('click', () => location.assign('/orders/HP-1042'));
+document.getElementById('updated').addEventListener('click', () => location.assign('/orders/HP-1042/updated'));`,
+      ),
+    );
+    fixture.serve(
+      'https://pottery.example/orders/HP-1042',
+      html('Order', '<h1>Thank you for your order</h1><p>Order number: HP-1042</p><p>Order total $42.00</p>'),
+    );
+    // A gift box added to the same order: its number again, for more than the principal approved.
+    fixture.serve(
+      'https://pottery.example/orders/HP-1042/updated',
+      html('Order', '<h1>Thank you, your order is updated</h1><p>Order number: HP-1042</p><p>Order total $61.00</p>'),
+    );
+    await open(GENERIC.review);
+    await purchase('Place order');
+    await approve((await approvals())[0]);
+    expect(page.url()).toBe(GENERIC.placed);
+    const view = async (name: string): Promise<Record<string, unknown>> => {
+      await open('https://pottery.example/orders');
+      return run(`view-${name}`, [{ kind: 'click', ...refIn(await observePage(page), name) }]);
+    };
+    expect(await view('View order')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await getDb().all('SELECT kind FROM gws_ea_browser_incidents')).toEqual([]);
+    expect(await view('View updated order')).toMatchObject({
+      status: 'stopped',
+      reason: 'unapproved_commit',
+      incident: { site: 'pottery.example', reference: 'HP-1042', charged: '$61.00' },
+    });
+    expect(await getDb().all('SELECT kind FROM gws_ea_browser_incidents')).toEqual([{ kind: 'unapproved_commit' }]);
   });
 
   it("keeps the picture's bytes out of the card's rows, the approval row, the databases and the logs", async () => {

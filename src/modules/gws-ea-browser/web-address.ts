@@ -6,7 +6,8 @@
  * reports) never go onto a site. Whatever would put the assistant's email
  * on a site meets this:
  *
- * - text the browser types that holds an address it converses from;
+ * - text the browser types or selects, or an address it opens, that holds
+ *   an address it converses from;
  * - a signup whose account is one;
  * - a sign-in by emailed code, where the host fills the email itself.
  *
@@ -53,12 +54,13 @@ async function webIdentity(): Promise<WebIdentity> {
 }
 
 /**
- * What a browser batch meets when the text it types holds an address the
- * assistant converses from: `alias_unavailable` while no alias is recorded,
- * and a refusal naming the alias once one is. Reads nothing unless something
- * typed is written like an email address.
+ * What a browser batch meets when the text it gives a site (what it types or
+ * selects, and the addresses it opens with their query decoded) holds an
+ * address the assistant converses from: `alias_unavailable` while no alias is
+ * recorded, and a refusal naming the alias once one is. Reads nothing unless
+ * some of that text is written like an email address.
  */
-export async function typedAddressStop(texts: readonly string[]): Promise<'alias_unavailable' | undefined> {
+export async function givenAddressStop(texts: readonly string[]): Promise<'alias_unavailable' | undefined> {
   const written = texts.flatMap((text) => text.match(WRITTEN_ADDRESS) ?? []);
   if (written.length === 0) return undefined;
   const identity = await webIdentity();

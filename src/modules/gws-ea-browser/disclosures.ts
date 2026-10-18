@@ -9,14 +9,17 @@
  * no other group's errand, nor a later errand of the same group, can use it. It names the value and never
  * copies it.
  *
- * Before a batch runs, the host reads everything it would give a website: the text it types, the options it
- * selects, the names of the files it uploads and the addresses it opens, query and all. Typing goes to the
- * site the page is on when it runs, which an address the batch opened before it changes; an address goes to
- * its own site. Each site's share is read in order as one form's fields, so a value split across fields or an
- * address's parameters, or written another way, is found. A stored value on a site the errand has no
- * disclosure for, or one of the principal's addresses on any site, stops the batch with `personal_data` before
- * anything is typed or opened. The principal's addresses reach a site only through the host's own sign-in to
- * their own account from their login in 1Password (`fill_secret`), which no batch carries.
+ * Once a batch's refs are pinned, before any of its actions runs, the host reads everything it would give a
+ * website: the text it types, the options it selects, the names of the files it uploads and the addresses it
+ * opens, query and all. What goes into a field goes to the site of the field's own frame, so a cross-site frame
+ * on a page (an ad, a chat widget, a newsletter popup) is a site of its own; a frame whose document has no web
+ * address of its own (about:blank, srcdoc, data:) has no site, so nothing stored goes into it. What the batch
+ * fills after opening an address counts against that address's site as well. An address goes to its own site.
+ * Each site's share is read in order as one form's fields, so a value split across fields or an address's
+ * parameters, or written another way, is found. A stored value on a site the errand has no disclosure for, or
+ * one of the principal's addresses on any site, stops the batch with `personal_data` before anything is typed
+ * or opened. The principal's addresses reach a site only through the host's own sign-in to their own account
+ * from their login in 1Password (`fill_secret`), which no batch carries.
  */
 import path from 'node:path';
 
@@ -30,6 +33,7 @@ import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
 import { registrableSite } from './commit-classifier.js';
 import type { BrowserAction } from './executor.js';
+import type { BrowserRef, PinnedBrowserRef } from './observe.js';
 
 // ---------------------------------------------------------------- main's disclosure
 
@@ -98,37 +102,45 @@ export function registerDisclosureDelivery(): void {
 // ---------------------------------------------------------------- the check before a batch runs
 
 /** What opening `url` gives its site: the address, and each parameter's value as the site reads it. */
-function addressFields(url: string): string[] {
+export function addressFields(url: string): string[] {
   return URL.canParse(url) ? [url, ...new URL(url).searchParams.values()] : [url];
 }
 
+/** The pinned refs of a batch, by ref: the frame each field is in. */
+export type FieldFrames = ReadonlyMap<string, Pick<PinnedBrowserRef, 'frame'>>;
+
 /** What a batch gives each website, in order, keyed by the site's registrable domain. */
-function siteShares(pageUrl: string, actions: readonly BrowserAction[]): Map<string | undefined, string[]> {
+function siteShares(actions: readonly BrowserAction[], frames: FieldFrames): Map<string | undefined, string[]> {
   const shares = new Map<string | undefined, string[]>();
-  let site = registrableSite(pageUrl);
+  // The site of the last address the batch opened, once it opened one.
+  let opened: { readonly site: string | undefined } | undefined;
   const give = (to: string | undefined, fields: readonly string[]): void => {
     shares.set(to, [...(shares.get(to) ?? []), ...fields]);
+  };
+  const fill = (ref: BrowserRef, fields: readonly string[]): void => {
+    const frame = frames.get(ref.ref)?.frame;
+    const site = frame ? registrableSite(frame.url()) : undefined;
+    give(site, fields);
+    if (opened && opened.site !== site) give(opened.site, fields);
   };
   for (const action of actions) {
     switch (action.kind) {
       case 'navigate':
-        site = registrableSite(action.url);
-        give(site, addressFields(action.url));
+        opened = { site: registrableSite(action.url) };
+        give(opened.site, addressFields(action.url));
         break;
       case 'type':
-        give(site, [action.text]);
+        fill(action, [action.text]);
         break;
       case 'select':
-        give(site, [action.value]);
+        fill(action, [action.value]);
         break;
       case 'form_input':
-        give(
-          site,
-          action.fields.map((field) => field.value),
-        );
+        // Each field by its own frame, in order: a form's fields in one frame read as one form.
+        for (const field of action.fields) fill(field, [field.value]);
         break;
       case 'upload':
-        give(site, [path.basename(action.path)]);
+        fill(action, [path.basename(action.path)]);
         break;
       case 'observe':
       case 'screenshot':
@@ -148,17 +160,17 @@ function siteShares(pageUrl: string, actions: readonly BrowserAction[]): Map<str
 }
 
 /**
- * `personal_data` when a batch on a page at `pageUrl` would give a website one of the principal's addresses, or
- * a stored value job `jobId` has no disclosure for on that site. Read through `db`, the job's store; a batch
- * that types, selects, uploads and opens nothing reads nothing.
+ * `personal_data` when a batch whose refs `frames` pinned would give a website one of the principal's
+ * addresses, or a stored value job `jobId` has no disclosure for on that site. Read through `db`, the job's
+ * store; a batch that types, selects, uploads and opens nothing reads nothing.
  */
 export async function personalDataStop(
   db: DbDriver,
   jobId: string,
-  pageUrl: string,
   actions: readonly BrowserAction[],
+  frames: FieldFrames,
 ): Promise<'personal_data' | undefined> {
-  const shares = siteShares(pageUrl, actions);
+  const shares = siteShares(actions, frames);
   if (shares.size === 0) return undefined;
   const data = await loadPersonalData(db);
   if (data.empty) return undefined;

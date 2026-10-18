@@ -1,6 +1,7 @@
 /** Personal-data disclosures (KTD19; R25, R34) against the real privacy store, central DB and delivery path. */
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import type { Frame } from 'playwright-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
   const { tmpdir } = await import('node:os');
@@ -22,7 +23,7 @@ import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, type BrowserJob } from './db.js';
-import { personalDataStop } from './disclosures.js';
+import { personalDataStop, type FieldFrames } from './disclosures.js';
 import type { BrowserAction } from './executor.js';
 
 const MOBILE = '+1 415 555 0134';
@@ -59,8 +60,11 @@ const fill = (...values: string[]): BrowserAction => ({
   fields: values.map((value, index) => ({ ref: `e${index + 1}`, generation: 1, value })),
 });
 const navigate = (url: string): BrowserAction => ({ kind: 'navigate', url });
+/** Fields e1 to e3 as pinned on a page at `url`: each in the page's own frame, unless `frames` names another. */
+const fieldsOn = (url: string, frames: Readonly<Record<string, string>> = {}): FieldFrames =>
+  new Map(['e1', 'e2', 'e3'].map((ref) => [ref, { frame: { url: () => frames[ref] ?? url } as unknown as Frame }]));
 const stop = (url: string, actions: BrowserAction[], of: BrowserJob = job) =>
-  personalDataStop(getDb(), of.id, url, actions);
+  personalDataStop(getDb(), of.id, actions, fieldsOn(url));
 
 function writePolicy(policy: Record<string, unknown>): void {
   fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify(policy), { mode: 0o600 });
@@ -171,7 +175,7 @@ describe('what a batch gives each site (KTD19, R34)', () => {
       get: () => () => Promise.reject(new Error('The check read the database')),
     });
     expect(
-      await personalDataStop(unread, job.id, WINNER, [{ kind: 'observe' }, { kind: 'scroll', direction: 'down' }]),
+      await personalDataStop(unread, job.id, [{ kind: 'observe' }, { kind: 'scroll', direction: 'down' }], new Map()),
     ).toBeUndefined();
   });
 
@@ -183,6 +187,19 @@ describe('what a batch gives each site (KTD19, R34)', () => {
     expect(await stop(OSTERIA, [navigate(WINNER), type('(415) 555-0134')])).toBe('personal_data');
     // A subdomain is its site: the disclosure names the registrable domain.
     expect(await stop('https://book.osteria.example/', [type('415.555.0134')])).toBeUndefined();
+  });
+
+  it("gives a field in another site's frame to that site, and one in a frame with no address of its own to none", async () => {
+    const offers = 'https://offers.example/sms';
+    const inFrame = (frame: string): FieldFrames => fieldsOn(OSTERIA, { e2: frame });
+    const typed = (actions: BrowserAction[], frames: FieldFrames) => personalDataStop(getDb(), job.id, actions, frames);
+    expect(await typed([type('(415) 555-0134', 'e2')], inFrame(offers))).toBe('personal_data');
+    expect(await typed([fill('Morgan Ellery', '(415) 555-0134')], inFrame(offers))).toBe('personal_data');
+    // The page's own field takes it, as does a frame on the disclosed site itself.
+    expect(await typed([type('(415) 555-0134', 'e1')], inFrame(offers))).toBeUndefined();
+    expect(await typed([type('(415) 555-0134', 'e2')], inFrame('https://book.osteria.example/widget'))).toBeUndefined();
+    for (const frame of ['about:blank', 'about:srcdoc', 'data:text/html,<input>'])
+      expect(await typed([type('(415) 555-0134', 'e2')], inFrame(frame)), frame).toBe('personal_data');
   });
 
   it('refuses a phone split across area-code and number fields where no disclosure covers it', async () => {

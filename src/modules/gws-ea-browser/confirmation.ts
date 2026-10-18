@@ -232,13 +232,18 @@ export function showsCharge(evidence: ConfirmationEvidence): boolean {
   return (evidence.charged?.amountMinor ?? 0) > 0;
 }
 
+/** What each of the page's documents confirms, the main document first; one that confirms nothing is left out. */
+export async function readConfirmations(page: Page): Promise<ConfirmationEvidence[]> {
+  return (await Promise.all(page.frames().map(readFrame))).filter(
+    (evidence): evidence is ConfirmationEvidence => evidence !== undefined,
+  );
+}
+
 /**
  * What the page's documents confirm, the main document first: the first that shows a charge, else the first
  * confirmation at all; undefined when no document confirms anything.
  */
 export async function readConfirmation(page: Page): Promise<ConfirmationEvidence | undefined> {
-  const found = (await Promise.all(page.frames().map(readFrame))).filter(
-    (evidence): evidence is ConfirmationEvidence => evidence !== undefined,
-  );
+  const found = await readConfirmations(page);
   return found.find(showsCharge) ?? found[0];
 }

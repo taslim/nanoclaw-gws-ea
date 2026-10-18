@@ -18,11 +18,12 @@ import {
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
 import { isSensitiveField } from './authentication-signatures.js';
-import { readConfirmation, showsCharge } from './confirmation.js';
+import { readConfirmations, showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserConsentStop, type ConsentStopView } from './consent.js';
 import { settleCookieBanners } from './cookie-banners.js';
-import { personalDataStop } from './disclosures.js';
+import { addressFields, personalDataStop } from './disclosures.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
+import type { PurchaseFacts } from './fingerprint.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { SiteLeaseStore } from './leases.js';
 import {
@@ -40,7 +41,7 @@ import {
 import { readBrowserPolicy } from './policy.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
 import { beginBrowserActionTrace, isReadOnlyBrowserAction } from './recipes.js';
-import { typedAddressStop } from './web-address.js';
+import { givenAddressStop } from './web-address.js';
 
 export type BrowserStopReason =
   | 'stale_ref'
@@ -212,9 +213,11 @@ export function browserActionRefs(action: BrowserAction): BrowserRef[] {
   return action.kind === 'form_input' ? [...action.fields, ...(action.submit ? [action.submit] : [])] : [];
 }
 
-/** The ordinary text an action types into a site. */
-function typedText(action: BrowserAction): string[] {
+/** The ordinary text an action gives a site: what it types or selects, and an address it opens, query decoded. */
+function givenText(action: BrowserAction): string[] {
   if (action.kind === 'type') return [action.text];
+  if (action.kind === 'select') return [action.value];
+  if (action.kind === 'navigate') return addressFields(action.url);
   return action.kind === 'form_input' ? action.fields.map((field) => field.value) : [];
 }
 
@@ -240,10 +243,23 @@ async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<v
   if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
 }
 
-async function fieldInput(context: BrowserExecutionContext, target: PinnedBrowserRef, value: string): Promise<void> {
-  if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
+/**
+ * Types each value into its field, in order. Page script may submit or post as a field changes, so the fills run
+ * inside one script-request window, as a press does (KTD2). Typing presses nothing: no confirmation check follows.
+ */
+async function fieldInput(
+  context: BrowserExecutionContext,
+  guard: BrowserNavigationGuard,
+  fields: ReadonlyArray<{ readonly target: PinnedBrowserRef; readonly value: string }>,
+): Promise<void> {
+  for (const { target } of fields) if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
   await context.assertActive();
-  await target.element.fill(value, { timeout: context.remaining() });
+  await guard.duringAction(context.remaining(), async () => {
+    for (const { target, value } of fields) {
+      await context.assertActive();
+      await target.element.fill(value, { timeout: context.remaining() });
+    }
+  });
 }
 
 class BrowserBatchStop extends Error {
@@ -283,22 +299,74 @@ async function nativeAction(
   }
 }
 
+/** A field's Enter submits its form; Space presses the control it is on. */
+const ENTER_KEY = /^(?:Shift\+)?Enter$/u;
+const SPACE_KEY = /^(?:Shift\+)?Space$/u;
+
+/** Whether an action may run an ordinary press, whose result the confirmation check reads (KTD10). */
+function mayPress(action: BrowserAction): boolean {
+  if (action.kind === 'click') return true;
+  if (action.kind === 'key') return ENTER_KEY.test(action.key) || SPACE_KEY.test(action.key);
+  return action.kind === 'form_input' && action.submit !== undefined;
+}
+
 /**
- * After an ordinary press: a confirmation showing a charge means it bought something nobody approved (KTD10).
- * `site` is the merchant, the page's site when it was pressed.
+ * The same order confirmed for the same charge, whichever document or path shows it: an order's page and its
+ * receipt or tracking page show one order.
+ */
+function sameConfirmation(left: ConfirmationEvidence, right: ConfirmationEvidence): boolean {
+  return (
+    left.reference === right.reference &&
+    left.charged?.amountMinor === right.charged?.amountMinor &&
+    left.charged?.currency === right.charged?.currency
+  );
+}
+
+/**
+ * Whether `evidence` is the merchant's record of a purchase this job placed under an approval, confirmed for no
+ * more than the approved total (KTD8): the same order number for more is something added to that order. A free
+ * commit was approved for nothing, so a charge on its record is never its own.
+ */
+async function placedByJob(context: BrowserExecutionContext, evidence: ConfirmationEvidence): Promise<boolean> {
+  const { charged } = evidence;
+  if (!charged) return false;
+  const approved = await context.store.db.all<{ facts_json: string }>(
+    `SELECT authority.facts_json FROM gws_ea_browser_purchase_attempts attempt
+     JOIN gws_ea_browser_authorities authority ON authority.id = attempt.authority_id
+     WHERE attempt.job_id = ? AND attempt.resolution = 'committed' AND attempt.merchant_record_id = ?`,
+    context.job.id,
+    evidence.reference,
+  );
+  return approved.some(({ facts_json }) => {
+    const facts = JSON.parse(facts_json) as Pick<PurchaseFacts, 'currency' | 'totalMinor'>;
+    return facts.currency === charged.currency && charged.amountMinor <= facts.totalMinor;
+  });
+}
+
+/**
+ * After an ordinary press: a new confirmation showing a charge means it bought something nobody approved (KTD10).
+ * `site` is the merchant, the page's site when it was pressed. An order the page showed for the same charge before
+ * the press (`before`) bought nothing, wherever the press shows it again: a press on a thank-you page, or its
+ * receipt or tracking. Nor did the order this job's own approved purchase placed, for up to its approved total.
  */
 async function unapprovedCommit(
   context: BrowserExecutionContext,
   page: Page,
   site: string | undefined,
+  before: readonly ConfirmationEvidence[],
 ): Promise<UnapprovedCommit | undefined> {
   if (page.isClosed()) return undefined;
   await page
     .waitForLoadState('domcontentloaded', { timeout: Math.min(CONFIRMATION_LOAD_MS, context.remaining()) })
     .catch(() => undefined);
-  const evidence = await readConfirmation(page);
-  if (!evidence || !showsCharge(evidence)) return undefined;
-  return { site: site ?? registrableSite(evidence.source) ?? new URL(evidence.source).hostname, evidence };
+  // Every document counts, not only the first that shows a charge: a frame beside an old confirmation can show a
+  // new one.
+  for (const evidence of await readConfirmations(page)) {
+    if (!showsCharge(evidence) || before.some((shown) => sameConfirmation(shown, evidence))) continue;
+    if (await placedByJob(context, evidence)) continue;
+    return { site: site ?? registrableSite(evidence.source) ?? new URL(evidence.source).hostname, evidence };
+  }
+  return undefined;
 }
 
 /** The keyboard and recipe paths must identify the very same native submit control. */
@@ -340,12 +408,9 @@ export async function executeBrowserBatch(
     throw new Error('Signed-out site access requires an explicit read-only page');
   const { actions } = validateBrowserBatch(payload);
   // Before any action runs: an address the assistant converses from never goes onto a site (KTD14).
-  const addressStop = await typedAddressStop(actions.flatMap(typedText));
+  const addressStop = await givenAddressStop(actions.flatMap(givenText));
   if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
-  // Nor does the principal's personal data, except where main disclosed it for this errand (KTD19).
-  const dataStop = await personalDataStop(context.store.db, context.job.id, page.url(), actions);
-  if (dataStop) return { status: 'stopped', reason: dataStop, repeat_safe: true };
   let ran: { answer: Record<string, unknown>; unapproved?: UnapprovedCommit };
   try {
     ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, actions, page, options), {
@@ -393,6 +458,10 @@ async function executeBatch(
   page.on('framenavigated', navigated);
   try {
     refs = await pinBrowserRefs(page, actions.flatMap(browserActionRefs));
+    // Before any action runs, the principal's personal data goes onto no site but where main disclosed it for this
+    // errand: each field's value goes to the site of the frame the field is in (KTD19).
+    const dataStop = await personalDataStop(context.store.db, context.job.id, actions, refs);
+    if (dataStop) return { answer: { status: 'stopped', reason: dataStop, repeat_safe: true } };
     for (let index = 0; index < actions.length; index++) {
       const action = actions[index];
       const before = navigation;
@@ -418,6 +487,8 @@ async function executeBatch(
         if (options.readOnly && !(await isReadOnlyBrowserAction(page, action, refs)))
           throw new BrowserBatchStop('read_only');
         await context.assertActive();
+        // What the page already confirmed: a press that leaves it in place bought nothing (KTD10).
+        const confirmedBefore = mayPress(action) ? await readConfirmations(page) : [];
         const target = 'ref' in action ? refs.get(action.ref) : undefined;
         if (['click', 'type', 'select', 'key', 'form_input', 'upload', 'download'].includes(action.kind))
           repeatSafe = false;
@@ -448,7 +519,7 @@ async function executeBatch(
           case 'type':
             if (target) {
               await refuseFieldEntry(page, target);
-              await fieldInput(context, target, action.text);
+              await fieldInput(context, guard, [{ target, value: action.text }]);
             }
             break;
           case 'select':
@@ -471,7 +542,7 @@ async function executeBatch(
               if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
               const press = (): Promise<void> =>
                 nativeAction(context, (options) => target.element.press(action.key, options));
-              if (/^(?:Shift\+)?Enter$/u.test(action.key)) {
+              if (ENTER_KEY.test(action.key)) {
                 const formSubmit = await browserKeyboardSubmitTarget(target.element);
                 try {
                   // A field's Enter submits its form through the form's own submit control; a formless field's
@@ -486,7 +557,7 @@ async function executeBatch(
                 } finally {
                   await formSubmit.dispose();
                 }
-              } else if (/^(?:Shift\+)?Space$/u.test(action.key))
+              } else if (SPACE_KEY.test(action.key))
                 ({ ordinaryPress: pressed } = await activateControl(
                   page,
                   target.element,
@@ -494,7 +565,8 @@ async function executeBatch(
                   undefined,
                   intent('click'),
                 ));
-              else await press();
+              // Any other key edits or moves within the field: typing, inside the same window as a fill.
+              else await guard.duringAction(context.remaining(), press);
             }
             break;
           case 'scroll': {
@@ -518,7 +590,11 @@ async function executeBatch(
               if (!pinned) throw new BrowserBatchStop('stale_ref');
               await refuseFieldEntry(page, pinned);
             }
-            for (const field of action.fields) await fieldInput(context, refs.get(field.ref)!, field.value);
+            await fieldInput(
+              context,
+              guard,
+              action.fields.map((field) => ({ target: refs.get(field.ref)!, value: field.value })),
+            );
             if (action.submit) {
               const submit = refs.get(action.submit.ref)!;
               ({ ordinaryPress: pressed } = await activateControl(
@@ -558,7 +634,10 @@ async function executeBatch(
               let retained = false;
               try {
                 await context.assertActive();
-                await target.element.setInputFiles(staged.path, { timeout: context.remaining() });
+                // Choosing a file fills a field: page script reacting to it runs inside the same window as typing.
+                await guard.duringAction(context.remaining(), () =>
+                  target.element.setInputFiles(staged.path, { timeout: context.remaining() }),
+                );
                 retainBrowserUpload(page, staged);
                 retained = true;
               } finally {
@@ -591,7 +670,7 @@ async function executeBatch(
         const blocked = guard.reason();
         if (blocked) throw new BrowserBatchStop(blocked);
         if (pressed) {
-          const commit = await unapprovedCommit(context, page, site);
+          const commit = await unapprovedCommit(context, page, site, confirmedBefore);
           if (commit) throw new UnapprovedCommitStop(commit);
         }
         await trace?.finish();

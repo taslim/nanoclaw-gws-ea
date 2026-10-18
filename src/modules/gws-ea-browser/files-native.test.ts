@@ -274,6 +274,29 @@ describe.skipIf(!chromePath)('native Chrome file transfers', () => {
     expect(fs.readdirSync(uploadRoot)).toEqual([]);
   }, 20_000);
 
+  it('refuses the checkout submit that page script sends as a file is chosen, as it does for typing', async () => {
+    const source = path.join(sessionDir(session.agent_group_id, session.id), 'documents', 'receipt.txt');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, 'A receipt to attach.');
+    await page.evaluate(`document.querySelector('input[type="file"]').addEventListener('change', () => {
+  void fetch('/api/checkout/submit', { method: 'POST', mode: 'no-cors', body: 'attached=1' }).then(
+    () => { document.body.dataset.posted = 'sent'; },
+    () => { document.body.dataset.posted = 'refused'; },
+  );
+})`);
+    const result = await executeBrowserBatch(
+      context,
+      {
+        actions: [
+          { kind: 'upload', ...(await target('Supporting document')), path: '/workspace/documents/receipt.txt' },
+        ],
+      },
+      { record: false },
+    );
+    expect(result).toMatchObject({ status: 'completed', actions: [{ status: 'completed' }] });
+    await expect.poll(() => page.locator('body').getAttribute('data-posted')).toBe('refused');
+  }, 20_000);
+
   it('refuses File System Access pickers before any native panel opens', async () => {
     // These pickers need a secure context; a routed origin provides one without the network.
     const picker = (name: string, call: string) =>

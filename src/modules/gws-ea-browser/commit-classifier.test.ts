@@ -175,6 +175,33 @@ describe('the open rule', () => {
     expect(classifyControlFacts(button('Cancel', { ...modal, transaction: true }))).toBe('ordinary');
   });
 
+  it('lets an order page’s view controls run beside its charge and card, but no change, cancellation or payment', () => {
+    const confirmation = { region: region({ transaction: true }), transaction: true };
+    for (const name of [
+      'Add to calendar',
+      'View receipt',
+      'Print receipt',
+      'Download receipt',
+      'Download invoice',
+      'View your booking',
+      'Track order',
+      'Track your package',
+      'Manage booking',
+      'Manage my reservation',
+    ])
+      expect(classifyControlFacts(button(name, confirmation)), name).toBe('ordinary');
+    // A booking's change or cancellation stays a purchase where the page shows a fee (R14), and no view name covers
+    // a payment.
+    for (const name of ['Change booking', 'Cancel reservation', 'Modify order'])
+      expect(classifyControlFacts(button(name, { ...confirmation, feeTerms: true })), name).toBe('purchase_control');
+    expect(classifyControlFacts(button('Modify order', confirmation))).toBe('purchase_control');
+    expect(classifyControlFacts(button('View receipt', { ...confirmation, visibleLabel: 'Pay now' }))).toBe(
+      'purchase_control',
+    );
+    expect(classifyControlFacts(button('Add to calendar and pay', confirmation))).toBe('purchase_control');
+    expect(classifyControlFacts(button('Get tickets', confirmation))).toBe('purchase_control');
+  });
+
   it('refuses speaking: by label, in a chat widget and when a press sends free text outside a booking', () => {
     for (const name of [
       'Post',

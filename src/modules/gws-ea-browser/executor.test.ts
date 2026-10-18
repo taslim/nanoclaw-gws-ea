@@ -170,4 +170,28 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
     for (const text of ['onuj@corp.example', 'Onuj+Orders@corp.example', 'morgan@principal.example'])
       await expect(executeBrowserBatch(context, typing(text)), text).rejects.toBe(opened);
   });
+
+  it('reads the addresses a batch opens, their query decoded, and the options it selects, the same way', async () => {
+    const opening = (url: string) => ({ actions: [{ kind: 'navigate', url }] });
+    const choosing = (value: string) => ({ actions: [{ kind: 'select', ref: 'e1', generation: 1, value }] });
+    const giving = [
+      opening('https://offers.example/join?email=Juno%2Borders%40corp.example&list=weekly'),
+      opening('https://offers.example/join/juno@corp.example'),
+      choosing('juno@corp.example'),
+    ];
+    for (const payload of giving)
+      expect(await executeBrowserBatch(context, payload), JSON.stringify(payload)).toEqual({
+        status: 'stopped',
+        reason: 'alias_unavailable',
+        repeat_safe: true,
+      });
+    await recordWebAlias('onuj@corp.example');
+    for (const payload of giving)
+      await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toMatchObject({
+        code: 'invalid-args',
+        message: expect.stringContaining('onuj@corp.example'),
+      });
+    for (const payload of [opening('https://offers.example/join?email=onuj%40corp.example'), choosing('Weekly')])
+      await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toBe(opened);
+  });
 });
