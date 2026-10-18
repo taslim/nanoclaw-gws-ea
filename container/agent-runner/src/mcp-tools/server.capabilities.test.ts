@@ -60,7 +60,7 @@ const EXTERNAL_EMAIL_TOOLS = [
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
-const MAIN_CHAT_TOOLS = ['chat_admit', 'chat_decline', 'chat_handoff', 'chat_leave', 'whatsapp_link'];
+const MAIN_CHAT_TOOLS = ['chat_admit', 'chat_decline', 'chat_handoff', 'chat_leave', 'chat_reach_out', 'whatsapp_link'];
 const EXTERNAL_CHAT_TOOLS = [
   'book',
   'cancel_booking',

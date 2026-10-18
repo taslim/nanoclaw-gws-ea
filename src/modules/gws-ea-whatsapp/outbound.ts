@@ -81,6 +81,7 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     if (!isRecord(message.content)) throw new Error('WhatsApp outbound content must be an object');
     const content = message.content;
     const key = rowId ?? `host-${randomUUID()}`;
+    let admittedRequest = request;
     const messageId = whatsappMessageId(key);
     const originalTime = message.timestamp === undefined ? options.now() : Date.parse(message.timestamp);
     if (!Number.isFinite(originalTime)) throw new Error('WhatsApp outbound row has an invalid original timestamp');
@@ -92,6 +93,10 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         'WhatsApp was unavailable for more than four hours. Please check whether the message is still wanted.',
       );
     }
+    // Own the durable row before checking connectivity, including a negative receipt for ordinary rows.
+    const canonicalLid = /^(\d+)@lid$/u.exec(platformId)?.[1];
+    if (canonicalLid && !pending.accepted)
+      admittedRequest ??= options.contacts.claimDM(canonicalLid, key, pending.createdAt);
     const socket = options.socket();
     if (!socket || !options.connected()) throw new ChannelNotConnectedError();
     const text = words(content);
@@ -164,8 +169,9 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
               'gws-ea-whatsapp:principal-unbound',
               'The principal must send the binding code from their own WhatsApp before the assistant can write to them.',
             );
-          await options.contacts.reserve([person.lid], key, request);
-          options.contacts.handoff(id, person.lid, key, request);
+          admittedRequest ??= options.contacts.claimDM(person.lid, key, pending.createdAt);
+          await options.contacts.reserve([person.lid], key, admittedRequest);
+          options.contacts.handoff(id, person.lid, key, admittedRequest);
         }
         try {
           const sent = await socket.sendMessage(platformId, part, { messageId: id });
@@ -187,7 +193,7 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         } catch (error) {
           const status = whatsappStatusCode(error);
           if (status === 463 && person) {
-            await options.contacts.refused(person.lid, key, request?.principalMessageId ?? null);
+            await options.contacts.refused(person.lid, key, admittedRequest?.principalMessageId ?? null);
             options.index.complete(key);
             throw new OutboundRefusedError(
               'gws-ea-whatsapp:contact-refused',

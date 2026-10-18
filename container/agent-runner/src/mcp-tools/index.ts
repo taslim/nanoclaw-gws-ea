@@ -24,6 +24,7 @@ await loadToolModule('time', () => import('./time.js'));
 await import('./gws-ea-email.js');
 await import('./gws-ea-chat.js');
 await import('./gws-ea-chat-docs.js');
+await import('./gws-ea-chat-outreach.js');
 await import('./calendar-write.js');
 await import('./request-status.js');
 await import('./gws-ea-browser.js');

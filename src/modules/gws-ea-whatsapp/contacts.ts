@@ -13,6 +13,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const CAP = 5;
 /** Only the admitted chat_reach_out host action may supply this receipt of the principal's own stored message. */
 export interface WhatsAppOutreachRequest {
+  readonly requestId: string;
   readonly principalMessageId: string;
 }
 interface Refusal {
@@ -50,6 +51,7 @@ export class WhatsAppContacts {
       CREATE TABLE IF NOT EXISTS handoffs(account TEXT NOT NULL,message_id TEXT NOT NULL,person TEXT NOT NULL,operation TEXT NOT NULL,request_id TEXT,PRIMARY KEY(account,message_id));
       CREATE TABLE IF NOT EXISTS notices(id TEXT PRIMARY KEY,account TEXT NOT NULL,at TEXT NOT NULL,text TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations(account TEXT NOT NULL,id TEXT NOT NULL,result TEXT,PRIMARY KEY(account,id));
+      CREATE TABLE IF NOT EXISTS dm_admissions(id INTEGER PRIMARY KEY,account TEXT NOT NULL,person TEXT NOT NULL,request_id TEXT,principal_message_id TEXT,admitted_at TEXT NOT NULL,outbound_row_id TEXT,UNIQUE(account,person,request_id),UNIQUE(account,outbound_row_id),CHECK((request_id IS NULL)=(principal_message_id IS NULL)),CHECK(request_id IS NOT NULL OR outbound_row_id IS NOT NULL));
     `);
   }
   private timestamp(): string {
@@ -169,6 +171,39 @@ export class WhatsAppContacts {
       .prepare('INSERT OR IGNORE INTO handoffs(account,message_id,person,operation,request_id) VALUES(?,?,?,?,?)')
       .run(this.account(), messageId, person, operation, request?.principalMessageId ?? null);
   }
+  /** Admission sends nothing. The serving chat's first durable outbound row claims this receipt once. */
+  admitDM(person: string, request: WhatsAppOutreachRequest): void {
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO dm_admissions(account,person,request_id,principal_message_id,admitted_at) VALUES(?,?,?,?,?)',
+      )
+      .run(this.account(), person, request.requestId, request.principalMessageId, this.timestamp());
+  }
+  claimDM(person: string, rowId: string, rowCreatedAt: number): WhatsAppOutreachRequest | undefined {
+    return this.db
+      .transaction(() => {
+        const receipt = this.db
+          .prepare(
+            `SELECT id,request_id,principal_message_id FROM dm_admissions
+        WHERE account=? AND person=? AND (outbound_row_id=? OR (outbound_row_id IS NULL AND admitted_at<=?))
+        ORDER BY outbound_row_id IS NULL,rowid LIMIT 1`,
+          )
+          .get(this.account(), person, rowId, new Date(rowCreatedAt).toISOString()) as
+          | { id: number; request_id: string | null; principal_message_id: string | null }
+          | undefined;
+        if (!receipt) {
+          // A refused ordinary row must remain ordinary after a later principal request is admitted.
+          this.db
+            .prepare('INSERT INTO dm_admissions(account,person,admitted_at,outbound_row_id) VALUES(?,?,?,?)')
+            .run(this.account(), person, this.timestamp(), rowId);
+          return undefined;
+        }
+        this.db.prepare('UPDATE dm_admissions SET outbound_row_id=? WHERE id=?').run(rowId, receipt.id);
+        if (receipt.request_id === null || receipt.principal_message_id === null) return undefined;
+        return { requestId: receipt.request_id, principalMessageId: receipt.principal_message_id };
+      })
+      .immediate();
+  }
   async stopped(
     operation: string,
     reason: 'add refused' | 'group creation unconfirmed' | 'participant add unconfirmed',
@@ -208,7 +243,7 @@ export class WhatsAppContacts {
       await this.reserve(
         [handed.person],
         handed.operation,
-        handed.request_id ? { principalMessageId: handed.request_id } : undefined,
+        handed.request_id ? { requestId: handed.operation, principalMessageId: handed.request_id } : undefined,
       );
       return true;
     } catch (error) {

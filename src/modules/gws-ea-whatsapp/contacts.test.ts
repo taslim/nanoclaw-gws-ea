@@ -128,17 +128,17 @@ it('allows only a fresh admitted principal request after a 463 expiry; ordinary 
   const adapter = await h.start();
   h.socket().sendError = Object.assign(new Error('refused'), { output: { statusCode: 463 } });
   await expect(
-    adapter.reachOutDM({ lid: '12000' }, message, { principalMessageId: 'own-first' }),
+    adapter.reachOutDM({ lid: '12000' }, message, { requestId: 'first-request', principalMessageId: 'own-first' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   h.socket().sendError = undefined;
   await expect(
-    adapter.reachOutDM({ lid: '12000' }, message, { principalMessageId: 'own-too-soon' }),
+    adapter.reachOutDM({ lid: '12000' }, message, { requestId: 'soon-request', principalMessageId: 'own-too-soon' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   h.now.value += 24 * 60 * 60 * 1000 + 1;
   await expect(adapter.deliver('12000@lid', null, message, 'late-reminder')).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-refused',
   });
-  await adapter.reachOutDM({ lid: '12000' }, message, { principalMessageId: 'own-fresh' });
+  await adapter.reachOutDM({ lid: '12000' }, message, { requestId: 'fresh-request', principalMessageId: 'own-fresh' });
   expect(h.socket().sends).toHaveLength(2);
 });
 

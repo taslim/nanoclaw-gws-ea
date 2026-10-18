@@ -31,9 +31,9 @@ export function createWhatsAppOutreach(options: {
   readonly now: () => number;
 }) {
   function operation(request: WhatsAppOutreachRequest, action: string): string {
-    if (!request.principalMessageId.trim())
+    if (!request.requestId.trim() || !request.principalMessageId.trim())
       throw new Error('WhatsApp outreach requires the admitted principal message');
-    return `reach-out:${request.principalMessageId}:${action}`;
+    return `reach-out:${request.requestId}:${action}`;
   }
   function jid(person: WhatsAppPerson): string {
     if (!/^\d+$/u.test(person.lid)) throw new Error('WhatsApp outreach requires a resolved LID');
@@ -117,6 +117,15 @@ export function createWhatsAppOutreach(options: {
     }
   }
   return {
+    async prepareReachOutDM(
+      person: WhatsAppPerson,
+      request: WhatsAppOutreachRequest,
+    ): Promise<{ readonly platformId: string }> {
+      const platformId = jid(person);
+      await options.contacts.reserve([person.lid], operation(request, `dm:${person.lid}`), request);
+      options.contacts.admitDM(person.lid, request);
+      return { platformId };
+    },
     async resolveNumber(number: string): Promise<WhatsAppPerson | undefined> {
       const phone = number.replace(/^\+/u, '');
       if (!/^\d{7,15}$/u.test(phone)) throw new Error('WhatsApp number must include the country code');

@@ -24,7 +24,7 @@ export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
   default: 'on',
-  instructions: [MAIN_CHAT_CAPABILITY],
+  instructions: [MAIN_CHAT_CAPABILITY, 'gws-ea-chat-outreach'],
 });
 
 /**

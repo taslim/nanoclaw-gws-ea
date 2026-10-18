@@ -70,6 +70,7 @@ export interface WhatsAppAdapterOptions {
   readonly now?: () => number;
 }
 export interface WhatsAppAdapter extends ChannelAdapter {
+  openDM(handle: string): Promise<string>;
   /** Wait for this connection attempt's socket construction, never for open. Also used after a new link record is saved. */
   reconnect(): Promise<void>;
   /** U3 owns authorization and lifecycle; this requests the code only for a linking record. */
@@ -84,6 +85,7 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   fetchGroupMembers(platformId: string): Promise<WhatsAppGroup>;
   leaveGroup(platformId: string): Promise<void>;
   resolveNumber(number: string): Promise<WhatsAppPerson | undefined>;
+  prepareReachOutDM(person: WhatsAppPerson, request: WhatsAppOutreachRequest): Promise<{ readonly platformId: string }>;
   reachOutDM(
     person: WhatsAppPerson,
     message: OutboundMessage,

@@ -30,6 +30,7 @@ import { registerChatLifecycleTask } from './lifecycle.js';
 import { chatToolsMigration } from './tools-migration.js';
 import { EXPECT_REPLY_ACTION, consumeExpectedChatReply, expireExpectedChatReplies } from './expect.js';
 import { REMIND_ACTION } from './remind.js';
+import { CHAT_OUTREACH_ACTIONS } from './outreach.js';
 
 export * from './db.js';
 export * from './hold.js';
@@ -47,6 +48,7 @@ registerDeliveryAction(...REMIND_ACTION);
 registerExpectedChatReplyReader('gws-ea-chats:expected', consumeExpectedChatReply);
 registerChatLifecycleTask('gws-ea-chats:expected', expireExpectedChatReplies);
 for (const [action, handler, guard] of CHAT_BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);
+for (const [action, handler, guard] of CHAT_OUTREACH_ACTIONS) registerDeliveryAction(action, handler, guard);
 registerSessionAdmissionPolicy('gws-ea-chats:context', async ({ key }) => {
   const session = await getSession(key.sessionId);
   if (session) await writeChatContext(session);

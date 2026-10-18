@@ -16,7 +16,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await h.close();
 });
-const request = { principalMessageId: 'principal-own-request' };
+const request = { requestId: 'native-request', principalMessageId: 'principal-own-request' };
 const person = { lid: '12000', phoneJid: '15551112222@s.whatsapp.net' };
 
 describe('native WhatsApp outreach', () => {
@@ -79,6 +79,68 @@ it('creates a group with the bound principal, adds requested people and returns 
   ]);
 });
 
+it('creates distinct groups for distinct tool requests citing the same principal message', async () => {
+  await h.writeLink({ schema_version: 1, state: 'connected', principal: { lid: '11000' } });
+  const adapter = await h.start();
+  const first = await adapter.createGroup('Dinner', [person], { ...request, requestId: 'dinner-request' });
+  const second = await adapter.createGroup('Venue', [person], { ...request, requestId: 'venue-request' });
+  expect([first.platformId, second.platformId]).toEqual(['created-1@g.us', 'created-2@g.us']);
+  expect(h.socket().createdGroups.map(({ subject }) => subject)).toEqual(['Dinner', 'Venue']);
+});
+
+it('defers an admitted DM to the real outbound row and never lends a fresh post-refusal citation to an old row', async () => {
+  const adapter = await h.start();
+  expect(
+    await adapter.prepareReachOutDM(person, { requestId: 'first-request', principalMessageId: 'own-first' }),
+  ).toEqual({ platformId: '12000@lid' });
+  expect(h.socket().sends).toEqual([]);
+  h.socket().sendError = Object.assign(new Error('refused'), { output: { statusCode: 463 } });
+  await expect(
+    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' } }, 'first-row'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  h.socket().sendError = undefined;
+  h.now.value += 24 * 60 * 60 * 1000 + 1;
+  await expect(
+    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' } }, 'old-reminder'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  await adapter.teardown();
+  const offline = await h.start({}, false);
+  await expect(
+    offline.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Offline reminder' } }, 'offline-reminder'),
+  ).rejects.toMatchObject({ name: 'ChannelNotConnectedError' });
+  h.now.value += 1;
+  await h.socket().emit('connection.update', { connection: 'open' });
+  await offline.prepareReachOutDM(person, { requestId: 'fresh-request', principalMessageId: 'own-fresh' });
+  await offline.teardown();
+  const fresh = await h.start();
+  await expect(
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' } }, 'first-row'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  await expect(
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Offline reminder' } }, 'offline-reminder'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  await expect(
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' } }, 'old-reminder'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  await expect(
+    fresh.deliver(
+      '12000@lid',
+      null,
+      {
+        kind: 'chat',
+        timestamp: new Date(h.now.value - 1).toISOString(),
+        content: { text: 'Queued before the new request' },
+      },
+      'older-queued-row',
+    ),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  await fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'A newly requested hello' } }, 'fresh-row');
+  await expect(
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Unrelated reminder' } }, 'unrelated-row'),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
+  expect(h.socket().sends).toHaveLength(1);
+});
+
 it('checks cap and time-lock before group creation, participant adds and per-person invitation handoff', async () => {
   await h.writeLink({ schema_version: 1, state: 'connected', principal: { lid: '11000' } });
   const adapter = await h.start();
@@ -124,9 +186,9 @@ it('checks cap and time-lock before group creation, participant adds and per-per
     await h.socket().emit('connection.update', lock);
     return result;
   };
-  await expect(adapter.addParticipant('team@g.us', person, { principalMessageId: 'after-lock' })).rejects.toMatchObject(
-    { guardId: 'gws-ea-whatsapp:contact-time-lock' },
-  );
+  await expect(
+    adapter.addParticipant('team@g.us', person, { requestId: 'after-lock-request', principalMessageId: 'after-lock' }),
+  ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-time-lock' });
   expect(h.socket().sends).toHaveLength(5);
 });
 
@@ -251,9 +313,12 @@ it('admits the full direct outreach message and text attachments through the nor
     },
   ];
   for (const [index, message] of messages.entries())
-    await expect(adapter.reachOutDM(person, message, { principalMessageId: `private-${index}` })).rejects.toMatchObject(
-      { guardId: 'gws-ea-privacy:audience' },
-    );
+    await expect(
+      adapter.reachOutDM(person, message, {
+        requestId: `private-request-${index}`,
+        principalMessageId: `private-${index}`,
+      }),
+    ).rejects.toMatchObject({ guardId: 'gws-ea-privacy:audience' });
   expect(h.socket().sends).toEqual([]);
 });
 

@@ -513,7 +513,10 @@ it('publishes a new principal binding to the active adapter’s native group ope
   const { socket, code } = await connect();
   await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('bind', code)] });
   const adapter = getChannelAdapterExact('whatsapp') as WhatsAppAdapter;
-  await adapter.createGroup('A shared errand', [], { principalMessageId: 'real-admitted-group-request' });
+  await adapter.createGroup('A shared errand', [], {
+    requestId: 'admitted-group-operation',
+    principalMessageId: 'real-admitted-group-request',
+  });
   expect(socket.createdGroups[0].participants).toContain('12000@lid');
 });
 
