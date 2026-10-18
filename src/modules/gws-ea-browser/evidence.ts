@@ -173,6 +173,17 @@ const OPERATIONAL_CODES = new Set([
   'in_progress',
   'calendar_conflict',
   'calendar_unavailable',
+  'marked',
+  'region_read',
+  'region_missing',
+  'region_not_found',
+  'route_changed',
+  'region_required',
+  'region_off_route',
+  'region_unmarkable',
+  'region_too_large',
+  'site_has_reader',
+  'bounds_changed',
   'available',
   'ready',
   'failed',
@@ -202,7 +213,15 @@ const OPERATIONAL_CODES = new Set([
   'handler-error',
   'transport-error',
 ]);
-const CHECK_OUTCOMES = new Set(['ready', 'blocked', 'failed', 'site_busy', 'interrupted']);
+const CHECK_OUTCOMES = new Set([
+  'ready',
+  'region_read',
+  'region_missing',
+  'blocked',
+  'failed',
+  'site_busy',
+  'interrupted',
+]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

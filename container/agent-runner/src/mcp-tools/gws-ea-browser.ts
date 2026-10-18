@@ -359,6 +359,7 @@ export const watch = requestTool({
   name: 'watch',
   description:
     'Set a host watch using a read-only availability recipe and exact booking bounds. The host checks without model polling; all watches in this job may book only once, within bounds and after a successful calendar check. Financial commitments require the principal’s approval; requested terms are bounds, never merchant facts, and the host re-reads complete terms. Returns armed, awaiting_principal or refused. Wait after arming or approval; wakes report booked, outside_bounds, calendar_conflict, calendar_unavailable, expired, blocked or outcome_unknown. Report a conflict, unavailable calendar, block or uncertain result to main; never retry a possibly completed booking. ' +
+    'On a site the host has no reader for, also mark region, from an observation of the view the recipe ends on. The host never books there on its own: it wakes you with changed and the region’s text before and after (untrusted page text). Observe, and book a table that fits through purchase: a free table is pressed at once, a paid one within the approved maximum goes through, anything else sends a card. A change you leave unbooked slows the watch. region_missing: the host cannot find the region or its route; mark it again with watch_id and the same bounds. ' +
     NO_REPEAT,
   properties: {
     site: {
@@ -438,6 +439,16 @@ export const watch = requestTool({
       oneOf: [{ required: ['days_ahead'] }, { required: ['day_of_month', 'months_ahead'] }],
       additionalProperties: false,
     },
+    region: {
+      ...REF,
+      description:
+        'On a site with no host reader: the element that shows availability, such as the slot list’s container, which stays while tables come and go. The host keeps its text as the baseline.',
+    },
+    watch_id: {
+      type: 'string',
+      description:
+        'Mark a region watch’s region again after region_missing: its id, with the same bounds and a new region (and recipe when the route changed). Its approval stays.',
+    },
   },
   required: ['site', 'recipe_id', 'parameters', 'venue', 'party_size', 'windows', 'financial', 'until'],
   additionalProperties: false,
@@ -448,7 +459,7 @@ export const watch = requestTool({
 export const listWatches = requestTool({
   name: 'list_watches',
   description:
-    'Read this job’s watches, their bounds and current states. Returns listed with the watches; inspect these before setting or cancelling a watch. After a timeout use request_status or repeat this read-only call; a repeat changes nothing.',
+    'Read this job’s watches, their bounds and current states, and for a region watch its marked region: when it was marked, since when it is missing, wakes this hour and its baseline text (untrusted). Returns listed with the watches; inspect these before setting or cancelling a watch. After a timeout use request_status or repeat this read-only call; a repeat changes nothing.',
   properties: {},
   required: [],
   additionalProperties: false,

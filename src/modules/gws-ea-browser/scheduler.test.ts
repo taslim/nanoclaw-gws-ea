@@ -13,13 +13,14 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { requestWake } from '../../request-wake.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
 import { BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
-import { createBrowserWatchScheduler } from './scheduler.js';
+import { createBrowserWatchScheduler, type BrowserWatchCheckResult } from './scheduler.js';
 import type { WatchBounds } from './watches.js';
 import type { ReservationAvailability } from './merchant-contract.js';
 import { nextWatchCheck, watchSitePolicy, type WatchReleaseRule, type WatchSitePolicy } from './watch-policy.js';
@@ -702,4 +703,143 @@ it('runs a release burst in the principal’s night within the site’s hourly c
   expect(started).toHaveLength(4);
   // The cap, not the burst, sets the next check: an hour after the first of the four.
   expect(Date.parse((await nextCheck('release'))!)).toBe(Date.parse(started[0]) + 3_600_000 + 1);
+});
+
+/** A region watch (KTD20) on an unreviewed site, its slot list marked with `baseline` as its text. */
+async function armRegion(id: string, baseline: string): Promise<void> {
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,'larder.example','recipe:larder',1,'{}',?,?,?,?,?,'armed',?,?,?)`,
+    id,
+    jobId,
+    id,
+    JSON.stringify({ ...bounds, kind: 'region', site: 'larder.example', venue: { id: 'larder', name: 'The Larder' } }),
+    JSON.stringify({ role: 'region', name: 'Available tables', ordinal: 0, count: 1, framePath: [], frameUrls: [] }),
+    baseline,
+    at,
+    at,
+    at,
+    at,
+  );
+  await getDb().run(
+    "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT DO NOTHING",
+    jobId,
+  );
+}
+const regionWakes = (): number =>
+  vi.mocked(requestWake).mock.calls.filter(([, reason]) => reason === 'browser-watch').length;
+/** Runs the scheduler to its watch's next check, `checks` times. */
+async function checkRegion(scheduler: ReturnType<typeof createBrowserWatchScheduler>, checks = 1): Promise<void> {
+  for (let check = 0; check < checks; check++) {
+    const row = await getDb().get<{ next_check_at: string }>('SELECT next_check_at FROM gws_ea_browser_watches');
+    vi.setSystemTime(new Date(Math.max(Date.parse(row!.next_check_at), Date.now())));
+    await scheduler.tick();
+  }
+}
+const regionInterval = async (): Promise<number> =>
+  (Date.parse(
+    (await getDb().get<{ next_check_at: string }>('SELECT next_check_at FROM gws_ea_browser_watches'))!.next_check_at,
+  ) -
+    Date.now()) /
+  60_000;
+
+it('makes no model wakes over a simulated day for a watch on a static page', async () => {
+  vi.mocked(requestWake).mockClear();
+  const text = '- region "Available tables":\n  - paragraph: No tables';
+  await armRegion('static', text);
+  let reads = 0;
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => {
+      reads++;
+      return { status: 'region_read', text };
+    },
+    random: () => 0.5,
+  });
+  const end = Date.now() + 86_400_000;
+  while (Date.now() < end) {
+    await scheduler.tick();
+    const row = await getDb().get<{ next_check_at: string }>('SELECT next_check_at FROM gws_ea_browser_watches');
+    vi.setSystemTime(new Date(Math.max(Date.parse(row!.next_check_at), Date.now() + 60_000)));
+  }
+  // Checks ran all day within the site's daily cap; none woke the agent.
+  expect(reads).toBeGreaterThan(100);
+  expect(reads).toBeLessThanOrEqual(watchSitePolicy('larder.example').dailyCap);
+  expect(await getDb().all('SELECT * FROM gws_ea_browser_watch_notices')).toEqual([]);
+  expect(regionWakes()).toBe(0);
+  expect(await getDb().get('SELECT status,region_baseline FROM gws_ea_browser_watches')).toEqual({
+    status: 'armed',
+    region_baseline: text,
+  });
+});
+
+it('wakes the agent with each change and books nothing itself; a step toward a booking ends the slowdown', async () => {
+  vi.mocked(requestWake).mockClear();
+  await armRegion('changing', 'No tables');
+  let text = 'No tables';
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => ({ status: 'region_read', text }),
+    random: () => 0.5,
+  });
+  // A day and a half out, the cadence is four minutes; two changes that book nothing make it sixteen.
+  for (const change of ['10:15 PM', '10:30 PM']) {
+    text = change;
+    await checkRegion(scheduler);
+  }
+  expect(regionWakes()).toBe(2);
+  expect(await regionInterval()).toBe(16);
+  expect(
+    (
+      await getDb().all<{ outcome_json: string }>(
+        'SELECT outcome_json FROM gws_ea_browser_watch_notices ORDER BY created_at',
+      )
+    ).map((notice) => (JSON.parse(notice.outcome_json) as { region: unknown }).region),
+  ).toEqual([
+    { untrusted: true, before: 'No tables', after: '10:15 PM' },
+    { untrusted: true, before: '10:15 PM', after: '10:30 PM' },
+  ]);
+  // The host never books a region watch's change: no booking was queued, and the job's one claim is untouched.
+  expect(await getDb().all("SELECT id FROM gws_ea_browser_requests WHERE action = 'browser_watch_book'")).toEqual([]);
+  expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+  // The agent pursued the next change: a free commit's attempt is its match, and the cadence is back to four minutes.
+  text = '7:30 PM';
+  await checkRegion(scheduler);
+  await getDb().run(
+    "INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,facts_json,attempted_at) VALUES('free',?,'free-request','larder.example','{}',?)",
+    jobId,
+    new Date(Date.now() + 1).toISOString(),
+  );
+  await checkRegion(scheduler);
+  expect(regionWakes()).toBe(3);
+  expect(await regionInterval()).toBe(4);
+});
+
+it('wakes the agent once to mark the region again when two checks running miss it, and starts over when it is found', async () => {
+  vi.mocked(requestWake).mockClear();
+  await armRegion('missing', 'No tables');
+  const reads: BrowserWatchCheckResult[] = [];
+  const scheduler = createBrowserWatchScheduler(queue, {
+    check: async () => reads.shift() ?? { status: 'failed' },
+    random: () => 0.5,
+  });
+  const missing: BrowserWatchCheckResult = { status: 'region_missing', reason: 'region_not_found' };
+  reads.push(missing, missing, missing, { status: 'region_read', text: 'No tables' }, missing, missing);
+  await checkRegion(scheduler, 1);
+  expect(regionWakes()).toBe(0);
+  await checkRegion(scheduler, 2);
+  expect(regionWakes()).toBe(1);
+  await checkRegion(scheduler, 3);
+  const notices = await getDb().all<{ outcome_json: string }>(
+    'SELECT outcome_json FROM gws_ea_browser_watch_notices ORDER BY created_at',
+  );
+  expect(notices.map((notice) => JSON.parse(notice.outcome_json) as Record<string, unknown>)).toEqual([
+    expect.objectContaining({ status: 'region_missing', reason: 'region_not_found', watch_id: 'missing' }),
+    expect.objectContaining({ status: 'region_missing', reason: 'region_not_found', watch_id: 'missing' }),
+  ]);
+  expect(regionWakes()).toBe(2);
+  // A failed check is neither a read nor a miss: the absence stands, and nothing more wakes the agent.
+  await checkRegion(scheduler);
+  expect(await getDb().get('SELECT region_missing_since IS NOT NULL AS missing FROM gws_ea_browser_watches')).toEqual({
+    missing: 1,
+  });
+  expect(regionWakes()).toBe(2);
 });

@@ -251,6 +251,17 @@ export class PurchaseAuthorityStore {
       )
         throw new PurchaseAuthorityError('authority_unavailable');
       if (claim) await claim(this.db, authority, current);
+      else if (current.reservation || current.generic?.booking) {
+        // A booking a card or the standing guarantee covers on a region watch's site spends its one booking (KTD20).
+        const { claimRegionWatchCommit } = await import('./watches.js');
+        await claimRegionWatchCommit(this.db, {
+          jobId: authority.job_id,
+          site: current.site,
+          attemptId: authority.attempt_id,
+          requestId: context.request.id,
+          at,
+        });
+      }
       const changed = await this.db.run(
         "UPDATE gws_ea_browser_authorities SET state = 'committing',commit_started_at = ?,commit_request_id = ? WHERE id = ? AND state = 'live'",
         at,
@@ -366,6 +377,9 @@ export class PurchaseAuthorityStore {
       if (authority.watch_id) {
         const { finishWatchPurchase } = await import('./watches.js');
         await finishWatchPurchase(this.db, authority.watch_id, authority.attempt_id, outcome);
+      } else {
+        const { finishWatchCommit } = await import('./watches.js');
+        await finishWatchCommit(this.db, authority.job_id, authority.attempt_id, outcome);
       }
       await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', id);
       await this.settleRequestedCancellation(authority.job_id, at);
@@ -408,6 +422,9 @@ export class PurchaseAuthorityStore {
       if (authority.watch_id) {
         const { finishWatchPurchase } = await import('./watches.js');
         await finishWatchPurchase(this.db, authority.watch_id, authority.attempt_id, outcome);
+      } else {
+        const { finishWatchCommit } = await import('./watches.js');
+        await finishWatchCommit(this.db, authority.job_id, authority.attempt_id, outcome);
       }
       await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', id);
       await this.settleRequestedCancellation(authority.job_id, at);

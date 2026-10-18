@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { ElementHandle, Frame, Page } from 'playwright-core';
+import type { ElementHandle, Frame, Locator, Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -326,11 +326,12 @@ export async function captureElementLocator(element: ElementHandle): Promise<Str
   }
   throw new Error('No structured accessible locator for this element');
 }
-export async function resolveLocator(
+/** The element a structured locator names, as a Playwright locator: its frames and its matches' count unchanged. */
+export async function locateStructured(
   page: Page,
   target: StructuredBrowserLocator,
   checkMainUrl = true,
-): Promise<ElementHandle> {
+): Promise<Locator> {
   let frame = page.mainFrame();
   if (checkMainUrl && checkpointUrl(frame.url()) !== target.frameUrls[0]) throw new Error('Frame changed');
   for (let index = 0; index < target.framePath.length; index++) {
@@ -340,9 +341,42 @@ export async function resolveLocator(
   }
   const matches = frame.getByRole(target.role, { name: target.name, exact: true });
   if ((await matches.count()) !== target.count) throw new Error('Accessible element count changed');
-  const element = await matches.nth(target.ordinal).elementHandle({ timeout: 1_000 });
+  return matches.nth(target.ordinal);
+}
+export async function resolveLocator(
+  page: Page,
+  target: StructuredBrowserLocator,
+  checkMainUrl = true,
+): Promise<ElementHandle> {
+  const element = await (await locateStructured(page, target, checkMainUrl)).elementHandle({ timeout: 1_000 });
   if (!element) throw new Error('Element is absent');
   return element;
+}
+/**
+ * A watch's marked region (KTD20): the element's structured locator, recorded as a recipe step's target is, when its
+ * page is where `recipe` ends (the same address path and heading; inputs may change its query). `off_route` when it is
+ * elsewhere, undefined when no accessible role and name find the element again. A watch replays the recipe, then finds
+ * the region by `locateStructured`.
+ */
+export async function captureRecipeRegion(
+  page: Page,
+  target: PinnedBrowserRef,
+  recipe: BrowserRecipe,
+): Promise<StructuredBrowserLocator | 'off_route' | undefined> {
+  const snapshot = await snapshotBrowserStructure(page);
+  const end = recipe.steps.at(-1)?.after;
+  const here = checkpoint(snapshot);
+  const route = (point: RecipeCheckpoint): string => {
+    const url = new URL(point.url);
+    return JSON.stringify([url.origin, url.pathname, point.heading ?? null]);
+  };
+  if (!end || route(end) !== route(here)) return 'off_route';
+  try {
+    return await captureLocator(target, flatten(ariaNodes(snapshot.tree)));
+  } catch (error) {
+    if (error instanceof Error) return undefined;
+    throw error;
+  }
 }
 /**
  * Whether a target only reads: an ordinary control or field, on no transaction page, outside any form that

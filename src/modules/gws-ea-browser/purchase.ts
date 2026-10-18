@@ -890,6 +890,17 @@ async function commitFree(
               JSON.stringify(free.facts),
               at,
             );
+            // A free table on a region watch's site spends the watch's one booking (KTD20).
+            if (freeCommitBooks(read.facts)) {
+              const { claimRegionWatchCommit } = await import('./watches.js');
+              await claimRegionWatchCommit(db, {
+                jobId: context.job.id,
+                site: read.facts.site,
+                attemptId,
+                requestId: context.request.id,
+                at,
+              });
+            }
           });
           attempted = true;
         },
@@ -990,6 +1001,13 @@ export async function executeBrowserPurchase(
           case 'free': {
             const free = await commitFree(context, page, { kind: 'generic', facts: read.facts, element: read.element });
             found.unapproved = free.unapproved;
+            // Its outcome ends a region watch the press claimed.
+            if (typeof free.answer.attempt_id === 'string') {
+              const { finishWatchCommit } = await import('./watches.js');
+              await context.store.db.transaction(() =>
+                finishWatchCommit(context.store.db, context.job.id, String(free.answer.attempt_id), free.answer),
+              );
+            }
             return free.answer;
           }
           case 'card_needed':

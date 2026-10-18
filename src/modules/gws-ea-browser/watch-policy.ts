@@ -146,10 +146,24 @@ export function watchStartAt(
   return Math.min(watchQuietUntil(policy, due, principalTimeZone), releaseBurstFrom(releases, due) ?? Infinity);
 }
 /**
+ * How often a watch with no reader may wake the browser agent in any hour (KTD20): every change it reports and
+ * every request to mark its region again count, and a sixth change in the hour waits for the hour to allow it.
+ */
+export const WATCH_HOURLY_WAKES = 5;
+/** The most normalized text a marked region may hold (KTD20): the part that shows availability, not a whole page. */
+export const WATCH_REGION_TEXT_LIMIT = 4_000;
+/** The longest a slowed watch waits between checks, before jitter, however many of its changes matched nothing. */
+export const WATCH_SLOWED_INTERVAL_MS = 60 * 60_000;
+/** How much slower a watch checks after `unmatched` wakes this hour that led to no booking: doubling, from none. */
+export function watchSlowdown(unmatched: number): number {
+  return 2 ** Math.min(Math.max(0, unmatched), WATCH_HOURLY_WAKES);
+}
+/**
  * The one source of a watch's next check, after one at `now`: the floor inside a release
- * burst, otherwise a cadence that quickens as arrival nears, and never past a coming
- * release check, nor so close before one that the floor would hold it back. A bounded
- * jitter avoids identical intervals even when a deterministic random source repeats.
+ * burst, otherwise a cadence that quickens as arrival nears, slowed by `slowdown` to at most an hour
+ * when the watch's changes keep matching nothing, and never past a coming release check, nor so
+ * close before one that the floor would hold it back. A bounded jitter avoids identical
+ * intervals even when a deterministic random source repeats.
  */
 export function nextWatchCheck(
   policy: WatchSitePolicy,
@@ -158,15 +172,18 @@ export function nextWatchCheck(
   releases: readonly number[],
   previous: number | null,
   random: () => number = Math.random,
+  slowdown = 1,
 ): { at: number; interval: number } {
   const remaining = arrival - now;
+  const cadence = Math.min(
+    policy.intervalMs,
+    remaining < 86_400_000 ? 2 * 60_000 : remaining < 7 * 86_400_000 ? 4 * 60_000 : policy.intervalMs,
+  );
+  // A release burst is the moment the watch exists for: no slowdown holds it back.
   const base =
     releaseBurstFrom(releases, now) === now
       ? policy.floorMs
-      : Math.min(
-          policy.intervalMs,
-          remaining < 86_400_000 ? 2 * 60_000 : remaining < 7 * 86_400_000 ? 4 * 60_000 : policy.intervalMs,
-        );
+      : Math.min(cadence * Math.max(1, slowdown), Math.max(cadence, WATCH_SLOWED_INTERVAL_MS));
   let interval = Math.max(
     policy.floorMs,
     Math.round(base * (1 + (Math.min(1, Math.max(0, random())) * 2 - 1) * policy.jitterFraction)),

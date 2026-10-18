@@ -450,3 +450,21 @@ export const browserGenericCheckoutMigration: PortableMigration & { name: Module
     `);
   },
 };
+
+/**
+ * Wake-on-change watches (KTD20): on a site with no reader, the region the agent marked, its normalized text as
+ * the agent last saw it, when it was marked, and since when the host has not found it. Reader watches leave them
+ * null. Wakes are the watch's own notices, so they need no table of their own.
+ */
+export const browserWatchRegionMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watch-region',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_json TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_baseline TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_marked_at TEXT;
+      ALTER TABLE gws_ea_browser_watches ADD COLUMN region_missing_since TEXT;
+    `);
+  },
+};

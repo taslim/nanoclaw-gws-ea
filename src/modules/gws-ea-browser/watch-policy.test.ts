@@ -3,10 +3,12 @@ import { expect, it } from 'vitest';
 import {
   RELEASE_BURST_MS,
   RELEASE_CHECK_DELAY_MS,
+  WATCH_SLOWED_INTERVAL_MS,
   nextWatchCheck,
   releaseInstants,
   watchQuietUntil,
   watchSitePolicy,
+  watchSlowdown,
   watchStartAt,
   type WatchReleaseRule,
 } from './watch-policy.js';
@@ -138,4 +140,21 @@ it("lets a release burst start inside the principal's night and holds ordinary c
   expect(startAt('2026-10-25T01:04:00Z', [release])).toBe('2026-10-25T01:04:00.000Z');
   expect(startAt('2026-10-25T01:30:00Z', [release])).toBe('2026-10-25T02:00:00.000Z');
   expect(startAt('2026-10-25T00:30:00Z', [])).toBe('2026-10-25T02:00:00.000Z');
+});
+
+it('slows a watch whose changes keep matching nothing, to at most an hour, but never its release', () => {
+  const release = Date.parse('2026-10-25T01:00:00Z');
+  const arrival = Date.parse(dinner[0].start);
+  const plan = (at: string, unmatched: number, releases: readonly number[] = []) =>
+    nextWatchCheck(policy, Date.parse(at), arrival, releases, null, () => 0.5, watchSlowdown(unmatched));
+  // A month out the cadence is five minutes; each change that booked nothing doubles it, up to an hour.
+  expect([0, 1, 2, 3, 4, 5, 9].map((unmatched) => plan('2026-10-17T12:00:00Z', unmatched).interval / 60_000)).toEqual([
+    5, 10, 20, 40, 60, 60, 60,
+  ]);
+  expect(WATCH_SLOWED_INTERVAL_MS).toBe(60 * 60_000);
+  // The day before arrival the cadence is two minutes, and slows from there.
+  expect(plan('2026-11-24T00:00:00Z', 2).interval).toBe(8 * 60_000);
+  // A release is the moment the watch exists for: its burst keeps the floor, and a slowed check gives way to it.
+  expect(plan('2026-10-25T01:00:05Z', 5, [release]).interval).toBe(policy.floorMs);
+  expect(plan('2026-10-25T00:30:00Z', 5, [release]).at).toBe(release + RELEASE_CHECK_DELAY_MS);
 });

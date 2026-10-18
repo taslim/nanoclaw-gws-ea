@@ -20,6 +20,7 @@ import {
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
+  browserWatchRegionMigration,
   browserWatchReleaseMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
@@ -71,6 +72,7 @@ registerMigration(browserConsentMigration);
 registerMigration(browserIncidentsMigration);
 registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
+registerMigration(browserWatchRegionMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';

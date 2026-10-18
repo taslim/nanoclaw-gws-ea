@@ -22,24 +22,37 @@ import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-prof
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
 import { cardEventSpan, cardTime, quotePurchaseText } from './cards.js';
+import { agreementsGranted } from './consent.js';
 import { browserSite } from './leases.js';
 import {
   amountMinor,
   completePurchaseFacts,
   formatMoney,
   materialPurchaseChange,
+  venueKey,
   type PurchaseBounds,
   type PurchaseFacts,
   type ReservationFacts,
 } from './fingerprint.js';
 import type { ReservationPolicy } from './merchant-contract.js';
+import { merchantSignatures } from './merchant-signatures.js';
+import { readBrowserRef, type BrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
-import { loadRecipe, recipeCheckKey, executeRecipe, type BrowserRecipe } from './recipes.js';
+import {
+  loadRecipe,
+  recipeCheckKey,
+  executeRecipe,
+  type BrowserRecipe,
+  type StructuredBrowserLocator,
+} from './recipes.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
 import {
+  WATCH_HOURLY_WAKES,
+  WATCH_REGION_TEXT_LIMIT,
   principalClock,
   releaseInstants,
   watchSitePolicy,
+  watchSlowdown,
   watchStartAt,
   type WatchReleaseRule,
 } from './watch-policy.js';
@@ -52,6 +65,11 @@ export interface WatchFinancialBounds {
   policy?: ReservationPolicy;
 }
 export interface WatchBounds {
+  /**
+   * `region` for a watch on a site with no reader (KTD20): the agent watches the region it marked, and the host books
+   * only through the site's own checkout, read when the agent finds a table. Absent for a reader watch.
+   */
+  kind?: 'region';
   site: string;
   venue: { id: string; name: string };
   partySize: number;
@@ -89,6 +107,14 @@ export interface WatchRow {
   booking_recipe_version: number | null;
   /** The venue's release schedule, written once at creation; null when the venue states none. */
   release_json: string | null;
+  /** On a site with no reader (KTD20), the structured locator of the region the agent marked; null on a reader watch. */
+  region_json: string | null;
+  /** The region's normalized text as the agent last saw it: at its marking, then at each change that woke it. */
+  region_baseline: string | null;
+  /** When the agent marked the region, which a missing-region wake is keyed to. */
+  region_marked_at: string | null;
+  /** Since when the host has not found the region; null while it finds it. */
+  region_missing_since: string | null;
   created_at: string;
   updated_at: string;
   next_check_at: string;
@@ -107,6 +133,26 @@ const APPROVAL_ACTION = 'browser_watch_setup';
 const liveStates = ['armed', 'checking', 'preparing'] as const;
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const boundsOf = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json) as WatchBounds;
+/**
+ * An unreviewed page states when a booking starts, not when it ends: its calendar check and slot claim cover the two
+ * hours a table is usually held.
+ */
+const GENERIC_BOOKING_SPAN_MS = 2 * 60 * 60_000;
+/** The reservation a purchase books: a reviewed reader's, or a generic booking whose venue, party and start it read. */
+function bookedSlot(facts: PurchaseFacts): ReservationFacts | undefined {
+  if (facts.reservation) return facts.reservation;
+  const booking = facts.generic?.booking;
+  if (!booking?.venue || booking.partySize === undefined || !booking.at || !Number.isFinite(Date.parse(booking.at)))
+    return undefined;
+  return {
+    venueId: venueKey(booking.venue),
+    venueName: booking.venue,
+    partySize: booking.partySize,
+    at: new Date(booking.at).toISOString(),
+    endAt: new Date(Date.parse(booking.at) + GENERIC_BOOKING_SPAN_MS).toISOString(),
+    timeZone: booking.timeZone ?? 'UTC',
+  };
+}
 export function watchSlotKey(slot: ReservationFacts): string {
   return digest(
     JSON.stringify([
@@ -132,8 +178,45 @@ export function watchReleases(watch: WatchRow): number[] {
   );
 }
 
+/**
+ * A region watch's approval covers a booking (KTD20) when the site's own checkout, as the host reads it, is the
+ * watched merchant's, for the venue and party, arriving within a window, with its total, amount due now and every fee
+ * within the approved maximum. A recurring charge has no total a one-time maximum bounds.
+ */
+function compareRegionWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now: string): WatchBoundResult {
+  const refuse = (reason: string): WatchBoundResult => ({ status: 'outside_bounds', reason });
+  if (!(Date.parse(now) < Date.parse(bounds.until))) return refuse('deadline');
+  if (facts.site !== bounds.site) return refuse('merchant');
+  const slot = bookedSlot(facts);
+  if (!slot || venueKey(slot.venueName) !== venueKey(bounds.venue.name) || slot.partySize !== bounds.partySize)
+    return refuse('venue_or_party');
+  const start = Date.parse(slot.at);
+  if (!bounds.windows.some((window) => start >= Date.parse(window.start) && start <= Date.parse(window.end)))
+    return refuse('time');
+  const financial = bounds.financial;
+  if (
+    financial.currency !== facts.currency ||
+    ![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)
+  )
+    return refuse('currency_or_total');
+  if (
+    !completePurchaseFacts(facts) ||
+    facts.addOns?.length ||
+    facts.commitments.some((term) => term.kind === 'subscription' || term.kind === 'trial')
+  )
+    return refuse('financial_terms');
+  const exposure = facts.commitments.reduce(
+    (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? slot.partySize : 1),
+    0,
+  );
+  return Math.max(facts.totalMinor, exposure) > financial.maxTotalMinor || facts.dueNowMinor > financial.maxDueNowMinor
+    ? refuse('financial_limit')
+    : { status: 'within_bounds' };
+}
+
 /** Start windows constrain arrival; the full host-read duration is checked against the calendar. */
 export function compareWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now: string): WatchBoundResult {
+  if (bounds.kind === 'region') return compareRegionWatchBounds(bounds, facts, now);
   const refuse = (reason: string): WatchBoundResult => ({ status: 'outside_bounds', reason });
   const slot = facts.reservation;
   if (
@@ -236,16 +319,18 @@ export async function claimWatchBooking(db: DbDriver, input: ClaimWatchInput): P
     !['armed', 'preparing'].includes(watch.status)
   )
     throw new Error('Watch is no longer armed');
+  const slot = bookedSlot(input.facts);
   if (
     compareWatchBounds(boundsOf(watch), input.facts, input.at).status !== 'within_bounds' ||
-    watchSlotKey(input.facts.reservation!) !== watchSlotKey(input.calendarCheckedReservation) ||
-    input.facts.reservation!.venueName !== input.calendarCheckedReservation.venueName
+    !slot ||
+    watchSlotKey(slot) !== watchSlotKey(input.calendarCheckedReservation) ||
+    slot.venueName !== input.calendarCheckedReservation.venueName
   )
     throw new Error('Watch bounds or calendar-checked slot changed');
   await db.run(
     'INSERT INTO gws_ea_browser_watch_slot_claims(site,slot_key,job_id,watch_id,attempt_id) VALUES(?,?,?,?,?)',
     watch.site,
-    watchSlotKey(input.facts.reservation!),
+    watchSlotKey(slot),
     input.jobId,
     watch.id,
     input.attemptId,
@@ -308,13 +393,14 @@ export async function finishWatchPurchase(
   if (certain) await promoteWatchRecipe(db, watch, attemptId);
 }
 
-export async function emitWatchNotice(
+/** Records one notice for a watch's job, once per event key; `deliverWatchNotices` writes it and wakes the job. */
+async function insertWatchNotice(
+  db: DbDriver,
   watch: WatchRow,
   status: string,
   eventKey: string,
   details: Record<string, unknown> = {},
 ): Promise<void> {
-  const db = getDb();
   await db.run(
     `INSERT INTO gws_ea_browser_watch_notices(watch_id,event_key,outcome_json,created_at) VALUES(?,?,?,?) ON CONFLICT(watch_id,event_key) DO NOTHING`,
     watch.id,
@@ -322,7 +408,174 @@ export async function emitWatchNotice(
     JSON.stringify({ type: 'browser_watch_outcome', job: watch.job_id, watch_id: watch.id, status, ...details }),
     new Date().toISOString(),
   );
+}
+export async function emitWatchNotice(
+  watch: WatchRow,
+  status: string,
+  eventKey: string,
+  details: Record<string, unknown> = {},
+): Promise<void> {
+  const db = getDb();
+  await insertWatchNotice(db, watch, status, eventKey, details);
   await deliverWatchNotices(db);
+}
+
+/** A region watch's wakes (KTD20), each a notice: every change it reported and every request to mark it again. */
+const REGION_WAKE = /^(?:change|region_missing):/u;
+/** When a region watch woke the agent in the hour before `now`. */
+async function regionWakesThisHour(db: DbDriver, watchId: string, now: number): Promise<number[]> {
+  const notices = await db.all<{ event_key: string; created_at: string }>(
+    'SELECT event_key,created_at FROM gws_ea_browser_watch_notices WHERE watch_id = ? AND created_at > ?',
+    watchId,
+    new Date(now - 3_600_000).toISOString(),
+  );
+  return notices.filter((notice) => REGION_WAKE.test(notice.event_key)).map((notice) => Date.parse(notice.created_at));
+}
+/** The job's latest step toward a booking: a free commit's attempt, a purchase card, or a spending authority. */
+async function latestBookingStep(db: DbDriver, jobId: string): Promise<number> {
+  const step = await db.get<{ at: string | null }>(
+    `SELECT MAX(at) AS at FROM (
+      SELECT MAX(attempted_at) AS at FROM gws_ea_browser_free_attempts WHERE job_id = ?
+      UNION ALL SELECT MAX(created_at) AS at FROM gws_ea_browser_purchase_cards WHERE job_id = ?
+      UNION ALL SELECT MAX(created_at) AS at FROM gws_ea_browser_authorities WHERE job_id = ?)`,
+    jobId,
+    jobId,
+    jobId,
+  );
+  return Date.parse(step?.at ?? '') || 0;
+}
+/**
+ * How much slower a region check runs (KTD20). The agent decides on each wake: a wake that no step toward a booking
+ * followed (a free commit, a purchase card or an authority) matched nothing, and each such wake this hour doubles the
+ * cadence; a booking step resets it. A shared check keeps its least-slowed member's pace; a reader watch never slows.
+ */
+export async function regionWatchSlowdown(
+  db: DbDriver,
+  watches: readonly WatchRow[],
+  now = Date.now(),
+): Promise<number> {
+  let slowdown = Infinity;
+  for (const watch of watches) {
+    if (!watch.region_json) return 1;
+    const booking = await latestBookingStep(db, watch.job_id);
+    const unmatched = (await regionWakesThisHour(db, watch.id, now)).filter((at) => at > booking).length;
+    slowdown = Math.min(slowdown, watchSlowdown(unmatched));
+  }
+  return Number.isFinite(slowdown) ? slowdown : 1;
+}
+const excerpt = (text: string): string =>
+  text.length > WATCH_REGION_TEXT_LIMIT ? `${text.slice(0, WATCH_REGION_TEXT_LIMIT)}…` : text;
+/** What one model-free check read of a region watch's region. */
+export type RegionCheckRead =
+  | { status: 'region_read'; text: string }
+  | { status: 'region_missing'; reason: 'region_not_found' | 'route_changed' };
+/**
+ * Records what a check `checkId` read for a region watch it served (KTD20), while the watch is still that check's
+ * and its region the one read. A changed text wakes the agent with the text before and after, untrusted, and the
+ * baseline moves on; a change over the hourly cap keeps the old baseline, so it wakes once the hour allows. A
+ * region found again ends its absence; one missing on two checks running wakes the agent once to mark it again.
+ */
+export async function recordRegionCheck(
+  db: DbDriver,
+  watch: WatchRow,
+  checkId: string,
+  read: RegionCheckRead,
+  now = Date.now(),
+): Promise<void> {
+  const at = new Date(now).toISOString();
+  await db.transaction(async () => {
+    const current = await getBrowserWatch(watch.id, db);
+    if (
+      !current?.region_json ||
+      current.status !== 'checking' ||
+      current.pending_request_id !== checkId ||
+      current.region_marked_at !== watch.region_marked_at
+    )
+      return;
+    const capped = (await regionWakesThisHour(db, current.id, now)).length >= WATCH_HOURLY_WAKES;
+    switch (read.status) {
+      case 'region_read':
+        if (current.region_missing_since)
+          await db.run('UPDATE gws_ea_browser_watches SET region_missing_since = NULL WHERE id = ?', current.id);
+        if (read.text === current.region_baseline || capped) return;
+        await db.run(
+          'UPDATE gws_ea_browser_watches SET region_baseline = ?,updated_at = ? WHERE id = ?',
+          read.text,
+          at,
+          current.id,
+        );
+        await insertWatchNotice(db, current, 'changed', `change:${checkId}`, {
+          region: { untrusted: true, before: excerpt(current.region_baseline ?? ''), after: excerpt(read.text) },
+        });
+        return;
+      case 'region_missing':
+        if (!current.region_missing_since) {
+          await db.run('UPDATE gws_ea_browser_watches SET region_missing_since = ? WHERE id = ?', at, current.id);
+          return;
+        }
+        if (!capped)
+          await insertWatchNotice(
+            db,
+            current,
+            'region_missing',
+            `region_missing:${digest(`${current.region_marked_at ?? ''}\0${current.region_missing_since}`)}`,
+            { reason: read.reason },
+          );
+        return;
+      default: {
+        const unknown: never = read;
+        throw new Error(`Unknown region read ${JSON.stringify(unknown)}`);
+      }
+    }
+  });
+}
+
+/**
+ * A booking that a region watch's errand commits on the watched site by a free commit or a card's approval spends
+ * the job's one booking claim (KTD20), as the watch's own authority does: the watch stops checking, and the commit's
+ * outcome ends it. Joins the commit's transaction and waits on nothing outside the database. A job with no live region
+ * watch on the site, or whose claim is already spent, is left as it is.
+ */
+export async function claimRegionWatchCommit(
+  db: DbDriver,
+  input: { jobId: string; site: string; attemptId: string; requestId: string; at: string },
+): Promise<void> {
+  if (!(await db.hasTable('gws_ea_browser_watches'))) return;
+  const watch = await db.get<WatchRow>(
+    "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND region_json IS NOT NULL AND status IN ('armed','checking','preparing') ORDER BY created_at,id LIMIT 1",
+    input.jobId,
+    input.site,
+  );
+  if (!watch) return;
+  const claimed = await db.run(
+    "UPDATE gws_ea_browser_watch_job_claims SET state = 'committing',watch_id = ?,attempt_id = ?,request_id = ?,commit_started_at = ? WHERE job_id = ? AND state = 'available'",
+    watch.id,
+    input.attemptId,
+    input.requestId,
+    input.at,
+    input.jobId,
+  );
+  if (claimed.changes)
+    await db.run(
+      "UPDATE gws_ea_browser_watches SET status = 'booking',pending_request_id = NULL,updated_at = ? WHERE id = ?",
+      input.at,
+      watch.id,
+    );
+}
+/** Ends the watch whose claim a commit took, once the commit's outcome is known. Joins the outcome's transaction. */
+export async function finishWatchCommit(
+  db: DbDriver,
+  jobId: string,
+  attemptId: string,
+  outcome: Record<string, unknown>,
+): Promise<void> {
+  if (!(await db.hasTable('gws_ea_browser_watch_job_claims'))) return;
+  const claim = await db.get<{ watch_id: string | null }>(
+    "SELECT watch_id FROM gws_ea_browser_watch_job_claims WHERE job_id = ? AND attempt_id = ? AND state = 'committing'",
+    jobId,
+    attemptId,
+  );
+  if (claim?.watch_id) await finishWatchPurchase(db, claim.watch_id, attemptId, outcome);
 }
 export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void> {
   const withdrawn = await db.all<WatchRow>(
@@ -374,17 +627,18 @@ export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void>
 }
 
 async function checkWatchCalendar(watch: WatchRow, facts: PurchaseFacts): Promise<WatchPurchaseRefusal | undefined> {
-  if (!facts.reservation) return { status: 'outside_bounds', watchId: watch.id };
+  const slot = bookedSlot(facts);
+  if (!slot) return { status: 'outside_bounds', watchId: watch.id };
   let status: 'calendar_conflict' | 'calendar_unavailable' | undefined;
   try {
-    const result = await findPrincipalCalendarConflicts(facts.reservation.at, facts.reservation.endAt);
+    const result = await findPrincipalCalendarConflicts(slot.at, slot.endAt);
     if (result.conflicts.length || result.conflicts_not_listed) status = 'calendar_conflict';
     // eslint-disable-next-line no-catch-all/no-catch-all -- Missing access, fetch failures and unreadable calendar data all fail closed.
   } catch (_error) {
     status = 'calendar_unavailable';
   }
   if (status) {
-    await emitWatchNotice(watch, status, `${status}:${digest(JSON.stringify(facts.reservation))}`);
+    await emitWatchNotice(watch, status, `${status}:${digest(JSON.stringify(slot))}`);
     return { status, watchId: watch.id };
   }
   return undefined;
@@ -413,10 +667,19 @@ export async function prepareWatchPurchase(
     const pending = watches.find((candidate) => candidate.status === 'awaiting_principal');
     if (!active.length && pending) return { status: 'awaiting_principal', watchId: pending.id };
     if (!active.length) return undefined;
+    // A region watch approved only what its bounds cover: any other booking is the principal's on its own card.
+    if (active.every((candidate) => boundsOf(candidate).kind === 'region')) return undefined;
     for (const candidate of active)
       await emitWatchNotice(candidate, 'outside_bounds', `outside:${digest(JSON.stringify(facts.reservation))}`);
     return { status: 'outside_bounds', watchId: watches[0].id };
   }
+  // An agreement the principal has not approved goes on the purchase's card, which approves it with the booking.
+  if (
+    boundsOf(watch).kind === 'region' &&
+    facts.agreements?.length &&
+    !(await agreementsGranted(db, facts.site, facts.agreements))
+  )
+    return undefined;
   const failure = await checkWatchCalendar(watch, facts);
   if (failure) return failure;
   await context.assertActive();
@@ -441,11 +704,8 @@ export async function prepareWatchPurchase(
   }
   const id = `watch-authority-${digest(`${watch.id}\0${context.request.id}`)}`;
   const bounds = boundsOf(watch);
-  const window = bounds.windows.find(
-    (entry) =>
-      Date.parse(facts.reservation!.at) >= Date.parse(entry.start) &&
-      Date.parse(facts.reservation!.at) <= Date.parse(entry.end),
-  );
+  const arrival = Date.parse(bookedSlot(facts)?.at ?? '');
+  const window = bounds.windows.find((entry) => arrival >= Date.parse(entry.start) && arrival <= Date.parse(entry.end));
   if (!window) return { status: 'outside_bounds', watchId: watch.id };
   const authority = await store.create({
     id,
@@ -456,7 +716,8 @@ export async function prepareWatchPurchase(
     facts,
     bounds: {
       reservation: {
-        venueId: bounds.venue.id,
+        // A generic booking names its venue only as the page shows it.
+        venueId: bounds.kind === 'region' ? bounds.venue.name : bounds.venue.id,
         partySize: bounds.partySize,
         windowStart: window.start,
         windowEnd: window.end,
@@ -479,7 +740,8 @@ export async function prepareWatchCommit(
     return { status: 'outside_bounds', watchId: watchId ?? '' };
   const failure = await checkWatchCalendar(watch, facts);
   if (failure) return failure;
-  const checked = facts.reservation!;
+  const checked = bookedSlot(facts);
+  if (!checked) return { status: 'outside_bounds', watchId: watch.id };
   return (db, currentAuthority, immediatelyRereadFacts) =>
     claimWatchBooking(db, {
       watchId: watch.id,
@@ -609,6 +871,10 @@ interface WatchInput extends Record<string, unknown> {
   financial: { currency: string; max_total: string; terms: string };
   until: string;
   release?: WatchReleaseInput;
+  /** On a site with no reader, the observation ref of the region that shows availability (KTD20). */
+  region?: BrowserRef;
+  /** A region watch to mark again, with the same bounds. */
+  watch_id?: string;
 }
 function offsetInstant(value: unknown): string {
   const parsed = readIsoTime(value, 'required');
@@ -667,6 +933,8 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
           'financial',
           'until',
           'release',
+          'region',
+          'watch_id',
           'budget_ms',
         ].includes(key),
     )
@@ -716,6 +984,12 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
   const until = offsetInstant(raw.until);
   if (until <= new Date().toISOString()) throw invalidArgs('Watch deadline has already passed.');
   const release = raw.release === undefined ? undefined : validateRelease(raw.release);
+  const region =
+    raw.region === undefined
+      ? undefined
+      : readBrowserRef(raw.region, 'region needs a ref and generation from the latest observation.');
+  if (raw.watch_id !== undefined && (typeof raw.watch_id !== 'string' || !raw.watch_id || !region))
+    throw invalidArgs('Marking a watch again needs its watch_id and a region.');
   return {
     site: raw.site,
     recipe_id: raw.recipe_id,
@@ -726,6 +1000,41 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     financial: { currency: financial.currency, max_total: financial.max_total, terms: financial.terms },
     until,
     ...(release ? { release } : {}),
+    ...(region ? { region } : {}),
+    ...(typeof raw.watch_id === 'string' ? { watch_id: raw.watch_id } : {}),
+  };
+}
+/** A queued watch keeps the agent's own fields: its execution reads them again, as the agent sent them. */
+function validateQueuedWatch(raw: Record<string, unknown>): Record<string, unknown> {
+  validateWatchRequest(raw);
+  return Object.fromEntries(Object.entries(raw).filter(([key]) => !['action', 'requestId', 'budget_ms'].includes(key)));
+}
+/**
+ * Whether the host reads a site's availability itself (Resy): its watches book through the reader, never a region.
+ * The site's own home counts as well as the address given, so no other host name on it avoids the reader.
+ */
+function hasWatchReader(address: string, site: string): boolean {
+  const urls = [new URL(address), new URL(`https://${site}/`)];
+  return merchantSignatures.some(
+    (signature) => signature.readAvailability !== undefined && urls.some((url) => signature.matches(url)),
+  );
+}
+/** A region watch's bounds (KTD20): the venue by the name its site shows, and one maximum for every charge. */
+function regionWatchBounds(input: WatchInput, site: string): WatchBounds {
+  const maxTotalMinor = amountMinor(input.financial.max_total, input.financial.currency)!;
+  return {
+    kind: 'region',
+    site,
+    venue: input.venue,
+    partySize: input.party_size,
+    windows: input.windows,
+    financial: {
+      freeOnly: maxTotalMinor === 0,
+      currency: input.financial.currency,
+      maxTotalMinor,
+      maxDueNowMinor: maxTotalMinor,
+    },
+    until: input.until,
   };
 }
 const watchSetupGuard = defineGuardedAction({
@@ -767,6 +1076,19 @@ const watchSetupGuard = defineGuardedAction({
 export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principalTimeZone: string): string {
   const bounds = boundsOf(watch),
     financial = bounds.financial;
+  if (bounds.kind === 'region')
+    return [
+      'Approve one reservation across this errand’s watches, within these bounds:',
+      `Site: ${quotePurchaseText(watch.site)}`,
+      `Venue: ${quotePurchaseText(bounds.venue.name)}`,
+      `Party size: ${bounds.partySize}`,
+      ...bounds.windows.map(
+        (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
+      ),
+      `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
+      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
+      `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
+    ].join('\n');
   return [
     'Approve one reservation across this errand’s watches, within these bounds:',
     `Site: ${quotePurchaseText(watch.site)}`,
@@ -784,28 +1106,23 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
     `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
   ].join('\n');
 }
-export async function createBrowserWatch(
+type PreparedWatch =
+  | {
+      status: 'ready';
+      bounds: WatchBounds;
+      release: WatchReleaseRule | undefined;
+      /** The venue's clock for the card's arrival windows, when the host or the release rule names it. */
+      venueTimeZone: string | undefined;
+      region?: { locator: StructuredBrowserLocator; text: string };
+    }
+  | { status: 'refused'; reason: string };
+/** A reader watch's bounds and release (Resy): the venue, its zone and its terms as the host reads them. */
+async function prepareReaderWatch(
   context: BrowserExecutionContext,
-  payload: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const input = validateWatchRequest(payload),
-    db = context.store.db;
-  const id = `watch-${digest(context.request.id)}`;
-  const existing = await getBrowserWatch(id, db);
-  if (existing)
-    return {
-      status: existing.status === 'awaiting_principal' ? 'awaiting_principal' : existing.status,
-      watch_id: existing.id,
-    };
-  const recipe = await loadRecipe(input.recipe_id, db),
-    site = browserSite(input.site);
-  if (
-    !recipe?.readOnly ||
-    recipe.site !== site ||
-    JSON.stringify(recipe.parameters.map((entry) => entry.name).sort()) !==
-      JSON.stringify(Object.keys(input.parameters).sort())
-  )
-    return { status: 'refused', reason: 'read_only_recipe_required' };
+  input: WatchInput,
+  site: string,
+): Promise<PreparedWatch> {
+  if (input.region) return { status: 'refused', reason: 'site_has_reader' };
   const { readBrowserWatchSetup } = await import('./watch-runtime.js');
   const setup = await readBrowserWatchSetup(context, { site, venue: input.venue, partySize: input.party_size });
   if (
@@ -850,20 +1167,83 @@ export async function createBrowserWatch(
     )
       return { status: 'refused', reason: 'terms_unavailable' };
   }
-  const bounds: WatchBounds = {
-    site,
-    venue: setup.availability.venue,
-    partySize: input.party_size,
-    windows: input.windows,
-    financial: {
-      freeOnly,
-      currency: input.financial.currency,
-      maxTotalMinor,
-      maxDueNowMinor: freeOnly ? 0 : policy!.dueNowMinor,
-      ...(freeOnly ? {} : { policy }),
+  return {
+    status: 'ready',
+    bounds: {
+      site,
+      venue: setup.availability.venue,
+      partySize: input.party_size,
+      windows: input.windows,
+      financial: {
+        freeOnly,
+        currency: input.financial.currency,
+        maxTotalMinor,
+        maxDueNowMinor: freeOnly ? 0 : policy!.dueNowMinor,
+        ...(freeOnly ? {} : { policy }),
+      },
+      until: input.until,
     },
-    until: input.until,
+    release,
+    venueTimeZone: setup.availability.timeZone,
   };
+}
+/**
+ * A region watch on a site with no reader (KTD20): the recipe to the availability view, the region the agent marked
+ * on it, and that region's normalized text as the baseline. Its release rule reads on the zone the agent gives.
+ */
+async function prepareRegionWatch(
+  context: BrowserExecutionContext,
+  input: WatchInput,
+  site: string,
+  recipe: BrowserRecipe,
+): Promise<PreparedWatch> {
+  if (!input.region) return { status: 'refused', reason: 'region_required' };
+  const release = input.release && watchReleaseRule(input.release, undefined);
+  if (input.release && !release) return { status: 'refused', reason: 'release_zone_unknown' };
+  const { markWatchRegion } = await import('./watch-runtime.js');
+  const mark = await markWatchRegion(context, input.region, recipe);
+  if (mark.status === 'refused') return mark;
+  return {
+    status: 'ready',
+    bounds: regionWatchBounds(input, site),
+    release,
+    venueTimeZone: release?.timeZone,
+    region: { locator: mark.region, text: mark.text },
+  };
+}
+/** The recipe a watch checks with: read-only, on the watch's site, taking exactly the watch's inputs. */
+async function watchRecipe(input: WatchInput, site: string, db: DbDriver): Promise<BrowserRecipe | undefined> {
+  const recipe = await loadRecipe(input.recipe_id, db);
+  return recipe?.readOnly &&
+    recipe.site === site &&
+    JSON.stringify(recipe.parameters.map((entry) => entry.name).sort()) ===
+      JSON.stringify(Object.keys(input.parameters).sort())
+    ? recipe
+    : undefined;
+}
+export async function createBrowserWatch(
+  context: BrowserExecutionContext,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const input = validateWatchRequest(payload),
+    db = context.store.db;
+  if (input.watch_id) return markBrowserWatchAgain(context, input);
+  const id = `watch-${digest(context.request.id)}`;
+  const existing = await getBrowserWatch(id, db);
+  if (existing)
+    return {
+      status: existing.status === 'awaiting_principal' ? 'awaiting_principal' : existing.status,
+      watch_id: existing.id,
+    };
+  const site = browserSite(input.site);
+  const recipe = await watchRecipe(input, site, db);
+  if (!recipe) return { status: 'refused', reason: 'read_only_recipe_required' };
+  const prepared = hasWatchReader(input.site, site)
+    ? await prepareReaderWatch(context, input, site)
+    : await prepareRegionWatch(context, input, site, recipe);
+  if (prepared.status === 'refused') return prepared;
+  const { bounds, release, region } = prepared;
+  const freeOnly = bounds.financial.freeOnly;
   const at = new Date().toISOString();
   await db.transaction(async () => {
     const job = await context.store.getJob(context.job.id);
@@ -878,7 +1258,7 @@ export async function createBrowserWatch(
       context.job.id,
     );
     await db.run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id,
       context.job.id,
       site,
@@ -888,11 +1268,15 @@ export async function createBrowserWatch(
       recipeCheckKey(recipe, input.parameters),
       JSON.stringify(bounds),
       release ? JSON.stringify(release) : null,
+      region ? JSON.stringify(region.locator) : null,
+      region?.text ?? null,
+      region ? at : null,
       freeOnly ? 'armed' : 'awaiting_principal',
       at,
       at,
       at,
     );
+    if (region) return;
     const links = await db.all<{ booking_recipe_id: string; booking_recipe_version: number }>(
       'SELECT * FROM gws_ea_browser_watch_recipe_links WHERE check_recipe_id = ? AND check_recipe_version = ? ORDER BY verified_at DESC',
       recipe.id,
@@ -915,7 +1299,9 @@ export async function createBrowserWatch(
       }
     }
   });
-  if (freeOnly) return { status: 'armed', watch_id: id, free_only: true };
+  // The region's text is the page's, as the agent's own observation was.
+  const marked = region ? { region: { untrusted: true, text: region.text } } : {};
+  if (freeOnly) return { status: 'armed', watch_id: id, free_only: true, ...marked };
   const watch = (await getBrowserWatch(id, db))!;
   const approvalPayload = { watchId: id, jobId: watch.job_id, bounds: boundsOf(watch) };
   const decision = await guard(watchSetupGuard, {
@@ -926,7 +1312,8 @@ export async function createBrowserWatch(
     await db.run("UPDATE gws_ea_browser_watches SET status = 'cancelled' WHERE id = ?", id);
     return { status: 'refused', reason: 'principal_unavailable' };
   }
-  const question = renderWatchCard(watch, setup.availability.timeZone, await principalClock());
+  const principalTimeZone = await principalClock();
+  const question = renderWatchCard(watch, prepared.venueTimeZone ?? principalTimeZone, principalTimeZone);
   const approvalId = await requestApproval({
     session: context.session,
     agentName: 'browser',
@@ -951,7 +1338,51 @@ export async function createBrowserWatch(
       "UPDATE gws_ea_browser_watches SET status = 'cancelled' WHERE id = ? AND status = 'awaiting_principal'",
       id,
     );
-  return { status: approvalId ? 'awaiting_principal' : 'refused', watch_id: id };
+  return { status: approvalId ? 'awaiting_principal' : 'refused', watch_id: id, ...(approvalId ? marked : {}) };
+}
+/**
+ * Marks a region watch's region again (KTD20) after the host could not find it, from a fresh observation of the view
+ * its recipe reaches, with a new recipe when the route changed. Its bounds, approval and release stay; the new text is
+ * its baseline, and it is checked again at once.
+ */
+async function markBrowserWatchAgain(
+  context: BrowserExecutionContext,
+  input: WatchInput,
+): Promise<Record<string, unknown>> {
+  const db = context.store.db;
+  const watch = await getBrowserWatch(input.watch_id!, db);
+  if (!watch || watch.job_id !== context.job.id) throw invalidArgs('This watch does not belong to the job.');
+  if (!watch.region_json) return { status: 'refused', reason: 'site_has_reader', watch_id: watch.id };
+  const markable = ['awaiting_principal', 'armed', 'checking'];
+  if (!markable.includes(watch.status)) return { status: watch.status, watch_id: watch.id };
+  const site = browserSite(input.site);
+  if (JSON.stringify(regionWatchBounds(input, site)) !== watch.bounds_json)
+    return { status: 'refused', reason: 'bounds_changed', watch_id: watch.id };
+  const recipe = await watchRecipe(input, site, db);
+  if (!recipe) return { status: 'refused', reason: 'read_only_recipe_required', watch_id: watch.id };
+  const { markWatchRegion } = await import('./watch-runtime.js');
+  const mark = await markWatchRegion(context, input.region!, recipe);
+  if (mark.status === 'refused') return { ...mark, watch_id: watch.id };
+  const at = new Date().toISOString();
+  const marked = await db.run(
+    `UPDATE gws_ea_browser_watches SET check_recipe_id = ?,check_recipe_version = ?,parameters_json = ?,check_key = ?,region_json = ?,region_baseline = ?,region_marked_at = ?,region_missing_since = NULL,next_check_at = ?,updated_at = ? WHERE id = ? AND status IN (${markable.map(() => '?').join(',')})`,
+    recipe.id,
+    recipe.version,
+    JSON.stringify(input.parameters),
+    recipeCheckKey(recipe, input.parameters),
+    JSON.stringify(mark.region),
+    mark.text,
+    at,
+    at,
+    at,
+    watch.id,
+    ...markable,
+  );
+  if (!marked.changes) {
+    const current = await getBrowserWatch(watch.id, db);
+    return { status: current?.status ?? 'cancelled', watch_id: watch.id };
+  }
+  return { status: 'marked', watch_id: watch.id, region: { untrusted: true, text: mark.text } };
 }
 
 registerApprovalHandler(
@@ -1110,7 +1541,7 @@ export async function recoverBrowserWatches(queue: BrowserQueue): Promise<void> 
   await deliverWatchNotices(db);
 }
 
-registerBrowserQueuedAction('watch', { validate: validateWatchRequest, execute: createBrowserWatch });
+registerBrowserQueuedAction('watch', { validate: validateQueuedWatch, execute: createBrowserWatch });
 registerBrowserQueuedAction('list_watches', {
   validate: () => ({}),
   async execute(context) {
@@ -1120,8 +1551,9 @@ registerBrowserQueuedAction('list_watches', {
     );
     const principalTimeZone = await principalClock();
     const now = Date.now();
-    return {
-      watches: watches.map((watch) => ({
+    const listed: Array<Record<string, unknown>> = [];
+    for (const watch of watches)
+      listed.push({
         id: watch.id,
         status: watch.status,
         bounds: boundsOf(watch),
@@ -1138,8 +1570,17 @@ registerBrowserQueuedAction('list_watches', {
                 ),
               ).toISOString()
             : watch.next_check_at,
-      })),
-    };
+        // A region watch's mark: when it was made, whether the host still finds it, and the text it compares against.
+        region: watch.region_json
+          ? {
+              marked_at: watch.region_marked_at,
+              missing_since: watch.region_missing_since,
+              wakes_this_hour: (await regionWakesThisHour(context.store.db, watch.id, now)).length,
+              baseline: { untrusted: true, text: excerpt(watch.region_baseline ?? '') },
+            }
+          : null,
+      });
+    return { watches: listed };
   },
 });
 registerBrowserQueuedAction('cancel_watch', {

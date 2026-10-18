@@ -1446,3 +1446,77 @@ export async function openWebFixture(chromePath: string): Promise<OpenWebFixture
     },
   };
 }
+
+/** Where the watched booking site lives (KTD20): an unreviewed venue whose slot list changes between checks. */
+export const WATCHED = {
+  tables: 'https://larder.example/tables?date=2026-10-24&party=2',
+  book: 'https://larder.example/book',
+  confirm: 'https://larder.example/book/confirm',
+} as const;
+
+/** What the watched site shows on its next request; a test changes it between checks. */
+export interface WatchedSiteState {
+  /** The slots the list shows, by their 24-hour time ("1930"); none shows "No tables". */
+  slots: string[];
+  /** The deposit a booking asks, in dollars; none books a free table. */
+  deposit?: number;
+  /** The page's redesign drops the region the agent marked. */
+  redesigned: boolean;
+  /** How many requests the availability view has answered: its countdown, viewers and clock move with each. */
+  served: number;
+}
+
+const slotLabel = (slot: string): string => {
+  const hour = Number(slot.slice(0, 2));
+  return `${hour > 12 ? hour - 12 : hour}:${slot.slice(2)} ${hour >= 12 ? 'PM' : 'AM'}`;
+};
+
+/**
+ * The Larder's availability view and booking pages. Each view of the slot list carries a countdown, a viewer count, a
+ * clock and a booking tally that change on every request, inside the marked region and beside it.
+ */
+export function watchedBookingSite(): { state: WatchedSiteState; pages: Record<string, OpenWebRoute> } {
+  const state: WatchedSiteState = { slots: [], redesigned: false, served: 0 };
+  const tables = (): OpenWebResponse => {
+    const served = ++state.served;
+    const list = state.slots.length
+      ? `<ul>${state.slots.map((slot) => `<li><a href="/book?slot=${slot}">${slotLabel(slot)}</a></li>`).join('')}</ul>`
+      : '<p>No tables</p>';
+    const volatile = `<p>Offer ends in 0${served % 5}:${String(59 - served).padStart(2, '0')}</p><p>${10 + served} people viewing</p>`;
+    const slots = state.redesigned
+      ? `<section aria-label="Times">${list}</section>`
+      : `<section aria-label="Available tables"><p>Saturday, October 24 · party of 2</p>${volatile}${list}</section>`;
+    return {
+      body: document(
+        'The Larder',
+        `<h1>The Larder</h1><p>Updated 7:${String(10 + served).padStart(2, '0')} PM · ${30 + served} people viewing</p>${slots}<p>Booked ${served} times today</p>`,
+      ),
+    };
+  };
+  const book = (request: OpenWebRequest): OpenWebResponse => {
+    const slot = new URL(request.url).searchParams.get('slot') ?? '1930';
+    const at = `2026-10-24T${slot.slice(0, 2)}:${slot.slice(2)}:00-07:00`;
+    const terms =
+      state.deposit === undefined
+        ? '<p>No payment is needed to reserve.</p>'
+        : `<p>Table for 2</p><p>Deposit: $${state.deposit}.00 charged when you book</p><p>Card on file: Visa ending in 4242</p><label>Email <input type="email" name="email" value="aya.web@example.test"></label>`;
+    return {
+      body: document(
+        'Book at The Larder',
+        `<h1>The Larder</h1><form id="book" method="post" action="/book/confirm"><label>Party size <select name="party"><option selected>2</option><option>4</option></select></label>
+<p>Dinner on <time datetime="${at}">Saturday, October 24, ${slotLabel(slot)}</time></p><input type="hidden" name="slot" value="${slot}">
+${terms}<button type="submit" id="reserve">Reserve now</button></form>`,
+      ),
+    };
+  };
+  const confirm = (request: OpenWebRequest): OpenWebResponse => {
+    const slot = new URLSearchParams(request.body).get('slot') ?? '';
+    return {
+      body: document(
+        'Booked',
+        `<h1>You're booked at The Larder</h1><p>Confirmation #LR-${slot}</p>${state.deposit === undefined ? '' : `<p>Deposit paid $${state.deposit}.00</p>`}`,
+      ),
+    };
+  };
+  return { state, pages: { [WATCHED.tables]: tables, [WATCHED.book]: book, [WATCHED.confirm]: confirm } };
+}
