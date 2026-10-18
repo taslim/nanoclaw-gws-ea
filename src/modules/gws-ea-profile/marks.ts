@@ -44,8 +44,6 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
   const hadMetadata = 'principalMessage' in parsed || 'authenticatedSender' in parsed;
   delete parsed.principalMessage;
   delete parsed.authenticatedSender;
-  // The transport assertion survives in the mailbox for failure notices.
-  // Every body-supplied assertion is replaced, including on unmarked input.
   if (request.authenticatedSender !== undefined) parsed.authenticatedSender = { ...request.authenticatedSender };
   const clean = (): string =>
     hadMetadata || request.authenticatedSender !== undefined ? JSON.stringify(parsed) : request.content;

@@ -279,8 +279,6 @@ export async function pickApprovalDelivery(
     if (contact && !contact.directMessage.detached_at)
       return { userId: contact.userId, messagingGroup: contact.directMessage };
   }
-  // A principal identity that cannot receive a card must not be reopened by
-  // the generic cold-DM fallback; other eligible administrators still can.
   const reachable = approvers.filter((userId) => !principals.has(userId));
   if (originChannelType) {
     for (const userId of reachable) {

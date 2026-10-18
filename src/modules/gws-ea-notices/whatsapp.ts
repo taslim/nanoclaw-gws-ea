@@ -1,4 +1,3 @@
-/** WhatsApp trouble is durably owed to the principal on Google Chat, regardless of the current DM. */
 import { createHash } from 'node:crypto';
 
 import { getDeliveryAdapter } from '../../delivery.js';
@@ -75,21 +74,21 @@ async function retryPending(): Promise<void> {
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+function noticeDeliveryKey(notice: WhatsAppLinkNotice): string {
+  if (notice.kind !== 'principal-number-changed') return notice.id;
+  const bindingFingerprint = createHash('sha256')
+    .update(notice.link.principalVerifiedAt ?? notice.link.principal?.phoneJid ?? '')
+    .digest('hex')
+    .slice(0, 16);
+  return `${notice.id}:${bindingFingerprint}`;
+}
+
 registerWhatsAppObserver({
   async onLinkNotice(notice) {
     const directory = whatsappDirectory();
     if (!directory) return false;
-    // The link owner supplies outage ids. A number-change belongs to the
-    // particular binding, so a later binding of the same LID can report anew.
-    const key =
-      notice.kind === 'principal-number-changed'
-        ? `${notice.id}:${createHash('sha256')
-            .update(notice.link.principalVerifiedAt ?? notice.link.principal?.phoneJid ?? '')
-            .digest('hex')
-            .slice(0, 16)}`
-        : notice.id;
     inStore(directory, (store) => {
-      store.accept(key, notice);
+      store.accept(noticeDeliveryKey(notice), notice);
     });
     await retryPending();
     return true;

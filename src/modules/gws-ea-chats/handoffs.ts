@@ -5,7 +5,6 @@ import path from 'node:path';
 import type { OutboundFile } from '../../channels/adapter.js';
 import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { listOpenMatterLinks } from '../gws-ea-matters/db.js';
 
 export interface ChatHandoff {
   readonly id: string;
@@ -23,9 +22,12 @@ export interface ChatFile {
 }
 export async function chatMatterIds(chat: string): Promise<string[]> {
   if (!(await getDb().hasTable('gws_ea_matter_links'))) return [];
-  return (await listOpenMatterLinks())
-    .filter((link) => link.kind === 'chat' && link.reference === chat)
-    .map((link) => link.matter_id);
+  return (
+    await getDb().all<{ matter_id: string }>(
+      "SELECT matter_id FROM gws_ea_matter_links WHERE matter_open=1 AND kind='chat' AND reference=? ORDER BY matter_id,linked_at,rowid",
+      chat,
+    )
+  ).map((link) => link.matter_id);
 }
 export async function getChatCalendar(chat: string): Promise<string | null> {
   return (

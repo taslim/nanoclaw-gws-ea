@@ -1,4 +1,3 @@
-/** Live WhatsApp notices and binding refusals stay outside release snapshots with their acknowledged link. */
 import fs from 'node:fs';
 import path from 'node:path';
 

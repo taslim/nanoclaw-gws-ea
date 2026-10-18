@@ -14,7 +14,7 @@ import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
-import { hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import { hasControlCharacters, isRecord, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { requestWake } from '../../request-wake.js';
 import { runInConversationTail } from '../../router.js';
@@ -155,9 +155,8 @@ function peopleOf(value: unknown): PersonEmail[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw invalidArgs('people must list members with their email addresses.');
   const people = value.map((item: unknown) => {
-    if (typeof item !== 'object' || item === null || Array.isArray(item))
-      throw invalidArgs('people must list {member,email} entries.');
-    const entry = item as Record<string, unknown>;
+    if (!isRecord(item)) throw invalidArgs('people must list {member,email} entries.');
+    const entry = item;
     if (Object.keys(entry).some((key) => key !== 'member' && key !== 'email'))
       throw invalidArgs('people must list {member,email} entries.');
     const member = textOf(entry.member, 'people.member', 256);
