@@ -8,6 +8,7 @@ import {
   activateControl,
   BrowserActivationError,
   BrowserSiteBusyError,
+  classifyActivation,
   classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
@@ -376,7 +377,11 @@ async function executeBatch(
                 const formSubmit = await browserKeyboardSubmitTarget(target.element);
                 try {
                   const submit = formSubmit.asElement();
-                  if (!submit) throw new BrowserBatchStop('unsupported_merchant');
+                  if (!submit) {
+                    // A formless field's Enter is the field's own press: classified, though not yet carried out.
+                    const classification = await classifyActivation(page, target.element, 'submit');
+                    throw new BrowserBatchStop(classification === 'ordinary' ? 'unsupported_merchant' : classification);
+                  }
                   await activateControl(page, submit, press, undefined, {
                     kind: 'submit',
                     assertActive: context.assertActive,

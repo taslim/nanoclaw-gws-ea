@@ -72,7 +72,7 @@ import {
   readControlFacts,
   termsConsentLabel,
   withBrowserJobNavigation,
-  type ActivationClass,
+  type CredentialActivationClass,
 } from './commit-classifier.js';
 import type { BrowserRequest } from './db.js';
 import {
@@ -756,15 +756,14 @@ type StepRefusal =
   | 'unsupported_form'
   | 'unsupported_terms'
   | 'form_changed'
-  | 'unsupported_control'
-  | Exclude<ActivationClass, 'ordinary' | 'unsupported_merchant'>;
+  | Exclude<CredentialActivationClass, 'ordinary'>;
 class StepStop extends Error {
   constructor(readonly reason: StepRefusal) {
     super(reason);
   }
 }
-const stopFor = (classification: Exclude<ActivationClass, 'ordinary'>): StepStop =>
-  new StepStop(classification === 'unsupported_merchant' ? 'unsupported_control' : classification);
+const stopFor = (classification: Exclude<CredentialActivationClass, 'ordinary'>): StepStop =>
+  new StepStop(classification);
 
 /** A field the host fills: one of the account's, or the code a signup's verification email carried. */
 type FieldRole = CredentialFormField | 'code';

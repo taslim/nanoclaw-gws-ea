@@ -39,6 +39,11 @@ export async function prepareAuthenticationIsolation(
   await registered;
 }
 
+/** The exact-node handoff selector registered for a prepared context; undefined until it is prepared. */
+export function isolationSelector(context: BrowserContext): Promise<string> | undefined {
+  return contextSelectors.get(context);
+}
+
 export interface NativeAuthenticationFacts {
   origin: string;
   action: string;

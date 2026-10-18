@@ -50,6 +50,7 @@ import {
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
+import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { coverPageTargets } from './page-targets.js';
 import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 import { setBrowserAdmissionReady } from './group.js';
@@ -490,6 +491,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       },
     });
     page = await browser.newPage();
+    // Classification reads each control in an isolated world, through the handoff a job context registers.
+    await prepareAuthenticationIsolation(page.context(), true);
     await page.goto(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`);
     queue = new BrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
@@ -704,6 +707,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       if (closePage) {
         await page.close();
         page = await browser.newPage();
+        await prepareAuthenticationIsolation(page.context(), true);
       }
       await click(row);
       await queue.idle();

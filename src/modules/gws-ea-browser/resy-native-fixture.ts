@@ -7,6 +7,7 @@ import { createServer as httpServer } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { connect, type Socket } from 'node:net';
 import { chromium, type Browser, type Page } from 'playwright-core';
+import { prepareAuthenticationIsolation } from './authentication-submit.js';
 export interface ResyFixtureState {
   inventory: Record<string, unknown>;
   details: Record<string, unknown>;
@@ -122,6 +123,8 @@ export async function resyFixture(
     args: ['--ignore-certificate-errors'],
   });
   const page = await browser.newPage();
+  // Classification reads each control in an isolated world, through the handoff a job context registers.
+  await prepareAuthenticationIsolation(page.context(), true);
   return {
     browser,
     page,

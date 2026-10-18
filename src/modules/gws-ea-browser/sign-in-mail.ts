@@ -455,8 +455,7 @@ async function openBearerLink<T>(
         classify(url) {
           if (!httpsOrigin(url.href) || getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain)
             return 'blocked_address';
-          const classification = classifyNavigationUrl(url.href);
-          return classification === 'unsupported_merchant' ? 'ordinary' : classification;
+          return classifyNavigationUrl(url.href);
         },
         async beforeNavigate(url) {
           await context.assertActive();

@@ -6,6 +6,7 @@ import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { closeDb, initDb } from '../../db/connection.js';
 import { BrowserStore } from './db.js';
 import { browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
+import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { executeBrowserBatch } from './executor.js';
 import { observePage, registerPageSecret, type BrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './queue.js';
@@ -175,6 +176,8 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
       args: ['--disable-quic', '--proxy-bypass-list=<-loopback>'],
     });
     page = await browser.newPage();
+    // Classification reads each control in an isolated world, through the handoff a job context registers.
+    await prepareAuthenticationIsolation(page.context(), true);
     await page.goto('http://fixture.example/search');
     context = {
       job: { id: 'job-1' },

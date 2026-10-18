@@ -14,6 +14,7 @@ import type { BrowserExecutionContext } from './queue.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
 import * as nativeAuthentication from './authentication-submit.js';
+import * as isolatedFacts from './control-facts.js';
 import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
@@ -135,6 +136,17 @@ function fixture(origin = 'https://www.shop.example') {
   } as unknown as BrowserExecutionContext;
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
+  vi.spyOn(isolatedFacts, 'readPageControlFacts').mockImplementation(async () => ({
+    name: 'Sign in',
+    visibleLabel: 'Sign in',
+    role: '',
+    tag: 'button',
+    type: 'submit',
+    href: null,
+    formMethod: form.method,
+    formAction: form.action,
+    transaction: false,
+  }));
   vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockImplementation(async (element) => ({
     frameId: 'fixture-frame',
     loaderId: 'fixture-document',

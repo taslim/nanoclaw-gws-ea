@@ -6,40 +6,37 @@ import { documentGate } from './document-gate.js';
 import { ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import type { BrowserExecutionContext } from './queue.js';
 import {
-  authenticationEndpoint,
   inspectAuthenticationControl,
   submitAuthenticationForm,
   type AuthenticationFormSignature,
   type CredentialKind,
   httpsOrigin,
 } from './authentication-signatures.js';
+import { moneyTerms, readPageControlFacts, type ControlFacts } from './control-facts.js';
 
-export type ActivationClass =
+export type { ControlFacts, ControlRegion } from './control-facts.js';
+
+/** What the open rule decides for every control and navigation (KTD1). */
+export type ActionClass =
   | 'ordinary'
   | 'purchase_control'
-  | 'unsupported_merchant'
   | 'speaks_as_principal'
   | 'account_security'
   | 'blocked_address';
-export interface ControlFacts {
-  name: string;
-  visibleLabel?: string;
-  formMethod?: string;
-  formAction?: string;
-  authenticationForm?: boolean;
-  role: string;
-  tag: string;
-  type: string;
-  href: string | null;
-  transaction: boolean;
-  /** Prices, recurring charges, trials or billing anywhere on the page, read by the host. */
-  moneyTerms?: boolean;
-}
+/**
+ * An activation's outcome. `unsupported_merchant` is never a classification: it is a reviewed flow's exact
+ * check failing, or an ordinary control the host cannot carry out natively yet.
+ */
+export type ActivationClass = ActionClass | 'unsupported_merchant';
+/** A credential operation's own strict outcome: anything outside its vocabulary is an unsupported control. */
+export type CredentialActivationClass = ActionClass | 'unsupported_control';
 export interface ReviewedMerchantFlow {
   readonly id: string;
   matches(url: URL): boolean;
-  classifyControl(page: Page, element: ElementHandle, facts: ControlFacts): Promise<ActivationClass>;
-  classifyNavigation(url: URL): ActivationClass;
+  /** The flow's exact reading of a control on its pages; undefined leaves the control to the open rule. */
+  classifyControl(page: Page, element: ElementHandle, facts: ControlFacts): Promise<ActionClass | undefined>;
+  /** The flow's exact reading of a route on its origins; undefined leaves the route to the open rule. */
+  classifyNavigation(url: URL): ActionClass | undefined;
   verifyPurchaseControl?(page: Page, element: ElementHandle): Promise<boolean>;
 }
 const merchantFlows: ReviewedMerchantFlow[] = [...merchantSignatures];
@@ -50,65 +47,121 @@ export function registerReviewedMerchantFlow(flow: ReviewedMerchantFlow): void {
   merchantFlows.push(flow);
 }
 
+// Vocabulary is data: widen or narrow it here, never by bypassing the classification order.
 const purchase =
-  /\b(?:buy(?:\s+now)?|pay(?:\s+now)?|place\s+(?:your\s+)?order|confirm\s+(?:purchase|order|reservation|booking)|complete\s+(?:purchase|order|booking)|reserve\s+now|book\s+now|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge))\b/iu;
+  /\b(?:buy(?:\s+now)?|pay(?:\s+now)?|place\s+(?:your\s+)?order|order\s+now|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|confirm\s+(?:purchase|order|reservation|booking)|complete\s+(?:purchase|order|booking|reservation)|reserve\s+now|book\s+now|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge)|upgrade|renew|place\s+(?:a\s+|your\s+)?bid|bid\s+now)\b/iu;
+/** Registration is a purchase only when it is paid. */
+const registration = /\bregister\b/iu;
+/** Cancelling or changing a booking or an order, a purchase on a page that shows a fee (R14). */
+const cancellation =
+  /\b(?:cancel|change|modify|reschedule|amend)\s+(?:(?:my|this|your|the)\s+)?(?:reservation|booking|order|appointment|table|stay|trip|tickets?|subscription|membership|plan|visit|class)s?\b|^yes,?\s+cancel\b/iu;
+/** A bare Cancel cancels the booking on its page; in a dialog it closes the dialog. */
+const bareCancel = /^cancel$/iu;
 const security =
   /\b(?:change|reset|delete|remove|update|manage)\s+(?:password|security|account|payment\s+method|credit\s+card)|\b(?:sign\s*out|log\s*out|delete\s+account)\b/iu;
 const speaking =
   /\b(?:send\s+(?:message|email)|publish|post\s+(?:review|comment)|submit\s+(?:review|comment)|agree\s+on\s+behalf)\b/iu;
+/** Speaking a control's label names: reviews, comments, ratings, tips and messages to people (R4). */
+const speakingName =
+  /\b(?:write|leave|add|post|submit)\s+(?:a\s+|your\s+)?(?:review|comment|rating|reply|answer|question|tip)\b|\b(?:send|post|submit)\s+(?:a\s+|your\s+)?(?:message|reply|note|inquiry|enquiry|feedback)\b|\b(?:give|send)\s+(?:a\s+)?tip\b|\brate\s+(?:this|us|it|your)\b|\bmessage\s+(?:the\s+|a\s+)?(?:restaurant|seller|host|owner|store|shop|business|venue|organi[sz]er|support)\b/iu;
+/** A press named only for speaking. On a field the same word names its content, not an action. */
+const speakingPress = /^(?:post|reply|comment|publish|tweet)$/iu;
 const unrelatedSecurity =
   /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu;
 const securityRoute =
   /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu;
 const purchaseRoute =
   /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu;
-const ordinaryName =
-  /^(?:search|find(?:\s+(?:a\s+)?(?:table|restaurant|time|availability))?|check\s+availability|view(?:\s+(?:details|menu|availability|more|results|cart|basket))?|show\s+more|load\s+more|learn\s+more|details|next|previous|back|close|cancel|dismiss|continue\s+(?:shopping|browsing)|add\s+to\s+(?:cart|basket)|sign\s*in|log\s*in|continue\s+with\s+email|send\s+(?:(?:sign.?in|verification|login|one.?time)\s+)?(?:code|link)|verify\s+(?:code|email)|submit\s+code|accept\s+(?:all\s+)?cookies|reject\s+(?:all\s+)?cookies|(?:cookie\s+)?preferences)$/iu;
+/**
+ * Named preparation on a checkout: never a commit, even where the page is a transaction page (R2). Each of a
+ * control's names must be preparation.
+ */
+const preparation =
+  /^(?:[+−–-]|plus|minus|(?:(?:increase|decrease|reduce|raise|lower|update|change|edit|set|select|choose)\s+(?:the\s+)?)?(?:quantity|qty)\b.*|remove\b.*|delete(?:\s+(?:item|this\s+item|from\s+.+))?|apply(?:\s+(?:code|coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher|credit))?|(?:add|enter|use|have\s+an?)\s+(?:a\s+)?(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|edit\b.*|change(?:\s+(?:address|delivery|shipping|date|time|quantity|size|colou?r|items?))?|(?:use|add|edit|change|select|choose|save|enter)\s+(?:(?:a|this|new|another|the)\s+)?(?:(?:shipping|delivery|billing)\s+)?address(?:es)?\b.*|(?:select|choose|change)\s+(?:a\s+|the\s+)?(?:delivery|shipping)\s+(?:option|method|speed|date|time)|(?:standard|express|next.day|same.day|economy|priority|free)\s+(?:delivery|shipping)\b.*|back|go\s+back|previous|return\s+to\s+(?:cart|bag|basket|shop|store|shipping|information|details)|continue\s+(?:shopping|browsing)|keep\s+shopping|(?:show|hide|view|see|open|close)\s+(?:the\s+)?(?:order\s+)?(?:summary|details)|order\s+summary|add\s+to\s+(?:cart|bag|basket)|(?:view|go\s+to|open)\s+(?:cart|bag|basket)|(?:proceed|continue|go)\s+to\s+(?:checkout|shipping|delivery|payment|billing|information|details)|check\s*out|close|dismiss|cancel|not\s+now|no,?\s+thanks)$/iu;
+/** Roles and tags that choose or hold a value: activating one never presses anything. */
+const choiceRole =
+  /^(?:checkbox|radio|switch|option|menuitemcheckbox|menuitemradio|tab|slider|spinbutton|combobox|listbox|textbox|searchbox)$/iu;
 
-export function classifyControlFacts(facts: ControlFacts): ActivationClass {
-  const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
-  if (security.test(evidence) || unrelatedSecurity.test(evidence)) return 'account_security';
+/**
+ * Whether the action presses the control: a button, a scripted link or click handler, or an Enter or host
+ * submit. Choosing, typing into or focusing a field presses nothing; a link with an address is a navigation,
+ * decided by its route.
+ */
+function presses(facts: ControlFacts, kind: ActivationIntent['kind']): boolean {
+  if (kind === 'submit') return true;
+  if (choiceRole.test(facts.role) || ['select', 'textarea', 'option', 'label'].includes(facts.tag)) return false;
+  if (facts.tag === 'input') return ['submit', 'image', 'button', 'reset'].includes(facts.type);
+  if (facts.href && !facts.scripted) return false;
+  return (
+    facts.tag === 'button' ||
+    facts.tag === 'a' ||
+    facts.scripted === true ||
+    /^(?:button|link|menuitem)$/iu.test(facts.role)
+  );
+}
+
+/**
+ * The open rule (KTD1). Every control is decided fresh, in this order: blocked address, account security,
+ * speaking, consent-class controls, purchase vocabulary, a commit on a transaction page, then ordinary.
+ * `kind` is the action: an Enter or a host submit presses the control it is aimed at.
+ */
+export function classifyControlFacts(facts: ControlFacts, kind: ActivationIntent['kind'] = 'click'): ActionClass {
+  const names = [facts.name, facts.visibleLabel ?? ''].map((name) => name.trim()).filter(Boolean);
+  const evidence = names.join(' ');
+  const pressed = presses(facts, kind);
+  const region = facts.region;
+  const routes = [facts.href, facts.formAction].flatMap((raw) => (raw ? [classifyNavigationUrl(raw)] : []));
+  // 1. A blocked address.
+  if (routes.includes('blocked_address')) return 'blocked_address';
+  // 2. Account security: by label, by route, or a press of an account form on a signed-in account page.
+  if (
+    security.test(evidence) ||
+    unrelatedSecurity.test(evidence) ||
+    routes.includes('account_security') ||
+    (pressed && facts.accountPage === true && region?.accountFields === true)
+  )
+    return 'account_security';
+  // 3. Speaking: by label, by route, in a chat widget, or a press that sends free text outside a booking or order,
+  // where the text would be that transaction's note.
   if (
     speaking.test(evidence) ||
-    /\b(?:write a review|message (?:the |a )?(?:restaurant|seller|host))\b/iu.test(evidence)
+    speakingName.test(evidence) ||
+    (pressed && names.some((name) => speakingPress.test(name))) ||
+    routes.includes('speaks_as_principal') ||
+    (pressed && (facts.chatFrame === true || (region?.freeText === true && !region.commits)))
   )
     return 'speaks_as_principal';
-  if (purchase.test(evidence)) return 'purchase_control';
-  // Money/payment clues can stop work; their absence never proves an unknown control safe.
-  if (facts.transaction) return 'unsupported_merchant';
+  // 4. Consent-class controls (KTD11) are decided here, before any purchase.
+  // 5. Purchase vocabulary: a label or route naming one, paid registration, or cancelling or changing a booking
+  // whose page shows a fee.
   if (
-    ['input', 'textarea'].includes(facts.tag) &&
-    ['text', 'search', 'email', 'tel', 'url', 'number', 'date', 'time', 'datetime-local', ''].includes(facts.type)
+    purchase.test(evidence) ||
+    routes.includes('purchase_control') ||
+    (pressed && facts.moneyTerms === true && registration.test(evidence)) ||
+    (facts.feeTerms === true &&
+      names.some((name) => cancellation.test(name) || (bareCancel.test(name) && region?.dialog !== true)))
   )
-    return 'ordinary';
-  const readOnlyForm =
-    facts.formMethod?.toLowerCase() === 'get' &&
-    facts.formAction !== undefined &&
-    /^https?:\/\/[^/]+\/(?:search|s|find|browse|availability)(?:[/?#]|$)/iu.test(facts.formAction) &&
-    classifyNavigationUrl(facts.formAction) === 'ordinary';
+    return 'purchase_control';
+  // 6. A commit on a transaction page: a press in a form or dialog that shows a total or a charge with a payment
+  // method, or in a modal speaking of the order on such a page, unless the host names it as preparation.
   if (
-    facts.tag === 'select' &&
-    readOnlyForm &&
-    /^(?:search|filter|sort|party(?: size)?|date|time|guests?|people|location|language|country|quantity)$/iu.test(
-      facts.name.trim(),
-    )
+    pressed &&
+    (region?.transaction === true || (region?.modalOrder === true && facts.transaction)) &&
+    !(names.length > 0 && names.every((name) => preparation.test(name)))
   )
-    return 'ordinary';
-  if (
-    readOnlyForm &&
-    ordinaryName.test(facts.name.trim()) &&
-    (!facts.visibleLabel?.trim() || ordinaryName.test(facts.visibleLabel.trim()))
-  )
-    return 'ordinary';
-  if (facts.tag === 'a' && facts.href) return classifyNavigationUrl(facts.href);
-  return 'unsupported_merchant';
+    return 'purchase_control';
+  return 'ordinary';
 }
+
+const ACTION_PARAMETER = /^(?:action|operation|intent|command|do)$/iu;
+/** A path segment of this many words or more is prose, such as an article's slug, never a route that acts. */
+const PROSE_WORDS = 4;
 
 /** A navigation's path and action parameters as words, for the host's own route signatures. */
 function navigationEvidence(url: URL): string | undefined {
   try {
     const actionParameters = [...url.searchParams]
-      .map(([name, value]) => (/^(?:action|operation|intent|command|do)$/iu.test(name) ? `${name} ${value}` : name))
+      .map(([name, value]) => (ACTION_PARAMETER.test(name) ? `${name} ${value}` : name))
       .join(' ');
     return decodeURIComponent(`${url.pathname} ${actionParameters}`).replace(/[_/-]+/gu, ' ');
   } catch (_error) {
@@ -116,7 +169,27 @@ function navigationEvidence(url: URL): string | undefined {
   }
 }
 
-export function classifyNavigationUrl(raw: string): ActivationClass {
+/** The words of a navigation's route that can act: its path segments and action parameters, without prose. */
+function routeWords(url: URL): string | undefined {
+  try {
+    return [
+      ...url.pathname.split('/').map((segment) => decodeURIComponent(segment)),
+      ...[...url.searchParams].map(([name, value]) => (ACTION_PARAMETER.test(name) ? `${name} ${value}` : name)),
+    ]
+      .map((piece) => piece.replace(/[_/-]+/gu, ' ').trim())
+      .filter((piece) => piece && piece.split(/\s+/u).length < PROSE_WORDS)
+      .join(' ');
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+    return undefined;
+  }
+}
+
+/**
+ * The open rule for a navigation: any public page loads, except a blocked address, an account-security,
+ * speaking or purchase route. A reviewed flow keeps its exact routes; its other routes take the open rule.
+ */
+export function classifyNavigationUrl(raw: string): ActionClass {
   let url: URL;
   try {
     url = new URL(raw);
@@ -124,29 +197,15 @@ export function classifyNavigationUrl(raw: string): ActivationClass {
     return 'blocked_address';
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return 'blocked_address';
-  const decoded = navigationEvidence(url);
-  if (decoded === undefined) return 'blocked_address';
-  if (security.test(decoded) || securityRoute.test(decoded)) return 'account_security';
-  if (speaking.test(decoded)) return 'speaks_as_principal';
-  const reviewed = merchantFlows.find((candidate) => candidate.matches(url));
-  if (
-    reviewed &&
-    reviewed.classifyNavigation(url) === 'ordinary' &&
-    ![...url.searchParams.keys()].some((name) => /^(?:action|operation|intent|command|do)$/iu.test(name))
-  )
+  const words = routeWords(url);
+  if (words === undefined) return 'blocked_address';
+  if (security.test(words) || securityRoute.test(words)) return 'account_security';
+  if (speaking.test(words)) return 'speaks_as_principal';
+  const reviewed = merchantFlows.find((candidate) => candidate.matches(url))?.classifyNavigation(url);
+  if (reviewed === 'ordinary' && ![...url.searchParams.keys()].some((name) => ACTION_PARAMETER.test(name)))
     return 'ordinary';
-  if (purchase.test(decoded) || purchaseRoute.test(decoded)) return 'purchase_control';
-  if (authenticationEndpoint(url)) return 'ordinary';
-  const flow = merchantFlows.find((candidate) => candidate.matches(url));
-  if (flow) return flow.classifyNavigation(url);
-  if (
-    url.pathname === '/' ||
-    /^\/(?:search|s|find|browse|products?|items?|dp|gp\/product|restaurants?|r|venues?|availability|menu|articles?|news|blog|docs?|help|support|login|signin|sign-in|auth\/login|account\/login)(?:\/|$)/iu.test(
-      url.pathname,
-    )
-  )
-    return 'ordinary';
-  return 'unsupported_merchant';
+  if (purchase.test(words) || purchaseRoute.test(words)) return 'purchase_control';
+  return reviewed && reviewed !== 'ordinary' ? reviewed : 'ordinary';
 }
 
 /**
@@ -176,9 +235,6 @@ const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(
 /** The control that submits a signup's emailed verification code. */
 const verificationActivation =
   /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
-const moneyTerms =
-  /(?:[$€£¥]\s?\d|\b\d+(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|dollars?|euros?|pounds?)\b|\bper\s+(?:month|year|week|day)\b|\/\s?(?:mo|month|yr|year)\b|\b(?:subscriptions?|free\s+trial|trial\s+period|billing|billed|recurring|auto-?renew\w*|membership\s+fees?)\b)/iu;
-
 /** The site terms a delegated signup accepts with the account, and what never rides along with them. */
 const siteTerms =
   /\b(?:terms(?:\s+(?:of\s+(?:service|use)|(?:and|&)\s+conditions))?|user\s+agreement|privacy\s+(?:policy|notice|statement))\b/iu;
@@ -203,7 +259,7 @@ export interface CredentialControlScope {
   readonly step?: 'credentials' | 'verification';
 }
 
-function credentialSecurityClass(evidence: string, kind: CredentialKind): ActivationClass | undefined {
+function credentialSecurityClass(evidence: string, kind: CredentialKind): ActionClass | undefined {
   const remaining = kind === 'rotation' ? evidence.replace(passwordChange, ' ') : evidence;
   if (
     security.test(remaining) ||
@@ -222,11 +278,7 @@ function credentialSecurityClass(evidence: string, kind: CredentialKind): Activa
  * than a change's own password route refused. Another site is left to the
  * generic rules (undefined).
  */
-export function classifyCredentialNavigation(
-  raw: string,
-  kind: CredentialKind,
-  site: string,
-): ActivationClass | undefined {
+export function classifyCredentialNavigation(raw: string, kind: CredentialKind, site: string): ActionClass | undefined {
   const url = httpsOrigin(raw);
   if (!url) return 'blocked_address';
   if (getDomain(url.hostname, { allowPrivateDomains: true }) !== site) return undefined;
@@ -250,15 +302,15 @@ export function classifyCredentialControlFacts(
   kind: CredentialKind,
   site: string,
   scope: CredentialControlScope = {},
-): ActivationClass {
+): CredentialActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
   const refused = credentialSecurityClass(evidence, kind);
   if (refused) return refused;
   if (purchase.test(evidence)) return 'purchase_control';
-  if (facts.transaction || facts.tag === 'a' || facts.href) return 'unsupported_merchant';
+  if (facts.transaction || facts.tag === 'a' || facts.href) return 'unsupported_control';
   if (facts.formAction) {
     const destination = classifyCredentialNavigation(facts.formAction, kind, site);
-    if (destination !== 'ordinary') return destination ?? 'unsupported_merchant';
+    if (destination !== 'ordinary') return destination ?? 'unsupported_control';
   }
   const fits = (name: string): boolean => {
     if (scope.step === 'verification') return kind === 'signup' && verificationActivation.test(name);
@@ -266,7 +318,7 @@ export function classifyCredentialControlFacts(
     return kind === 'signup' && scope.formControl === true && !facts.moneyTerms && agreeingSignup.test(name);
   };
   const names = [facts.name.trim(), facts.visibleLabel?.trim() ?? ''].filter(Boolean);
-  return names.length > 0 && names.every(fits) ? 'ordinary' : 'unsupported_merchant';
+  return names.length > 0 && names.every(fits) ? 'ordinary' : 'unsupported_control';
 }
 
 export async function classifyCredentialActivation(
@@ -275,99 +327,46 @@ export async function classifyCredentialActivation(
   kind: CredentialKind,
   site: string,
   scope: CredentialControlScope = {},
-): Promise<ActivationClass> {
+): Promise<CredentialActivationClass> {
   return classifyCredentialControlFacts(await readControlFacts(page, element), kind, site, scope);
 }
 
-export async function readControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
-  const facts = await element.evaluate((node): Omit<ControlFacts, 'transaction'> => {
-    const e = node as unknown as {
-      tagName: string;
-      textContent: string | null;
-      getAttribute(name: string): string | null;
-      value?: string;
-      labels?: ArrayLike<{ textContent: string | null }>;
-      form?: { method: string; action: string; querySelector(selector: string): unknown };
-    };
-    return {
-      name:
-        e.getAttribute('aria-label') ||
-        e.getAttribute('title') ||
-        Array.from(e.labels ?? [])
-          .map((label) => label.textContent ?? '')
-          .join(' ') ||
-        e.textContent?.trim() ||
-        e.value ||
-        '',
-      visibleLabel: e.textContent?.trim() || '',
-      formMethod: e.form?.method,
-      formAction: e.form?.action,
-      authenticationForm: Boolean(
-        e.form &&
-        e.form.method.toLowerCase() === 'post' &&
-        /^(?:https:\/\/[^/]+)\/(?:login|signin|sign-in|auth|session|sessions|account\/login)(?:[/?#]|$)/iu.test(
-          e.form.action,
-        ) &&
-        e.form.querySelector(
-          'input[type="password"],input[autocomplete="one-time-code"],input[autocomplete="username"],input[type="email"]',
-        ) &&
-        !e.form.querySelector('input[autocomplete^="cc-"]'),
-      ),
-      role: e.getAttribute('role') || '',
-      tag: e.tagName.toLowerCase(),
-      type: e.getAttribute('type') || '',
-      href: e.getAttribute('href'),
-    };
-  });
-  const text = await page.locator('body').innerText({ timeout: 2_000 });
-  const transaction =
-    /(?:order\s+total|total\s+due|due\s+(?:now|today)|cancellation\s+fee|no.show\s+fee|per\s+month|subscription|free\s+trial)/iu.test(
-      text,
-    ) &&
-    /(?:visa|mastercard|amex|payment\s+method|card\s+ending|credit\s+card|debit\s+card|charge|fee|deposit)/iu.test(
-      text,
-    );
-  const frame = await element.ownerFrame();
-  return {
-    ...facts,
-    href: facts.href ? new URL(facts.href, frame?.url() ?? page.url()).href : null,
-    transaction,
-    moneyTerms: moneyTerms.test(text),
-  };
+/** The control's facts and the page's transaction signal, read in isolated worlds across every frame. */
+export function readControlFacts(page: Page, element: ElementHandle): Promise<ControlFacts> {
+  return readPageControlFacts(page, element);
 }
 
-export async function classifyActivation(page: Page, element: ElementHandle): Promise<ActivationClass> {
-  return (await activationDispatch(page, element)).classification;
+/** The open rule for an action on this control, with any reviewed flow's exact reading of it. */
+export async function classifyActivation(
+  page: Page,
+  element: ElementHandle,
+  kind: ActivationIntent['kind'] = 'click',
+): Promise<ActionClass> {
+  return (await activationDispatch(page, element, kind)).classification;
 }
 
 async function activationDispatch(
   page: Page,
   element: ElementHandle,
+  kind: ActivationIntent['kind'],
 ): Promise<{
-  classification: ActivationClass;
+  classification: ActionClass;
+  facts: ControlFacts;
   flow?: ReviewedMerchantFlow;
   authentication?: AuthenticationFormSignature;
 }> {
   const facts = await readControlFacts(page, element);
-  const generic = classifyControlFacts(facts);
+  const generic = classifyControlFacts(facts, kind);
   const flow = merchantFlows.find((candidate) => candidate.matches(new URL(page.url())));
-  // Explicit financial, speaking and security denials always outrank a site's sign-in claim.
-  if (['purchase_control', 'account_security', 'speaks_as_principal', 'blocked_address'].includes(generic))
-    return { classification: generic, flow };
-  if (facts.formAction) {
-    const destination = classifyNavigationUrl(facts.formAction);
-    if (['purchase_control', 'account_security', 'speaks_as_principal', 'blocked_address'].includes(destination))
-      return { classification: destination, flow };
-  }
-  if (flow) {
-    const classification = await flow.classifyControl(page, element, facts);
-    if (classification !== 'unsupported_merchant') return { classification, flow };
-  }
+  // Every refusal of the open rule outranks a reviewed flow and a site's sign-in claim.
+  if (generic !== 'ordinary') return { classification: generic, facts, flow };
+  const reviewed = flow && (await flow.classifyControl(page, element, facts));
+  if (reviewed) return { classification: reviewed, facts, flow };
   if (!facts.transaction && facts.formMethod?.toLowerCase() === 'post' && facts.formAction) {
     const authentication = await inspectAuthenticationControl(element);
-    if (authentication) return { classification: 'ordinary', authentication };
+    if (authentication) return { classification: 'ordinary', facts, authentication };
   }
-  return { classification: generic };
+  return { classification: 'ordinary', facts };
 }
 
 export class BrowserActivationError extends Error {
@@ -407,8 +406,8 @@ export async function activateControl(
   authority?: { commitStarted(): Promise<void> },
   intent: ActivationIntent = { kind: 'click' },
 ): Promise<void> {
-  const dispatch = await activationDispatch(page, element);
-  const { classification } = dispatch;
+  const dispatch = await activationDispatch(page, element, intent.kind);
+  const { classification, facts } = dispatch;
   if (classification === 'purchase_control' && authority) {
     const source = new URL(page.url());
     const flow = dispatch.flow;
@@ -427,30 +426,19 @@ export async function activateControl(
   if (dispatch.authentication) {
     const authentication = dispatch.authentication;
     const guard = await ensureBrowserNavigationGuard(page);
-    await guard.runWithPolicy(
-      {
-        classify(url) {
-          const classification = classifyNavigationUrl(url.href);
-          return classification === 'unsupported_merchant' &&
-            url.origin === authentication.origin &&
-            authenticationEndpoint(url)
-            ? 'ordinary'
-            : classification;
-        },
-      },
-      async () => {
-        const arrived = page
-          .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
-          .catch(() => undefined);
-        if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
-          throw new BrowserActivationError('unsupported_merchant');
-        await arrived;
-      },
-    );
+    // The open rule decides where the submission lands.
+    await guard.runWithPolicy({}, async () => {
+      const arrived = page
+        .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
+        .catch(() => undefined);
+      if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
+        throw new BrowserActivationError('unsupported_merchant');
+      await arrived;
+    });
     return;
   }
-  const facts = await readControlFacts(page, element);
-  if (facts.tag === 'input' || facts.tag === 'textarea') {
+  // A field is only focused; a submit input is pressed like any button, below.
+  if ((facts.tag === 'input' && !presses(facts, 'click')) || facts.tag === 'textarea') {
     await element.focus();
     return;
   }
@@ -553,8 +541,9 @@ async function decideNavigation(
   ) {
     const target = new URL(url);
     if (target.origin === approved.origin && approved.flow.matches(target)) {
+      // During its approved press a reviewed flow's own route is ordinary; a route it does not know is refused.
       const known = approved.flow.classifyNavigation(target);
-      classification = known === 'purchase_control' ? 'ordinary' : known;
+      classification = known === 'purchase_control' ? 'ordinary' : (known ?? 'unsupported_merchant');
     }
   }
   for (const policy of scopes) {

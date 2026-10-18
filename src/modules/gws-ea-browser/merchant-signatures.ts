@@ -3,7 +3,7 @@
  * digital delivery, marketplace financing and every unreadable/drifted layout.
  */
 import type { ElementHandle, Locator, Page } from 'playwright-core';
-import type { ActivationClass, ControlFacts, ReviewedMerchantFlow } from './commit-classifier.js';
+import type { ActionClass, ControlFacts, ReviewedMerchantFlow } from './commit-classifier.js';
 import { completePurchaseFacts, moneyMinor, type PurchaseFacts } from './fingerprint.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
 import { resyReservationSignature } from './resy-signature.js';
@@ -226,10 +226,10 @@ async function amazonPreparationControl(page: Page, element: ElementHandle): Pro
 export const amazonRetailFlow: ReviewedMerchantFlow = {
   id: AMAZON_RETAIL.id,
   matches: sameOrigin,
-  async classifyControl(page, element, facts: ControlFacts): Promise<ActivationClass> {
+  async classifyControl(page, element, facts: ControlFacts): Promise<ActionClass | undefined> {
     if (await isAmazonRetailCommit(page, element)) return 'purchase_control';
     if (await amazonPreparationControl(page, element)) return 'ordinary';
-    // Reviewed preparation is native form/endpoint bound; remaining ordinary actions are read-only.
+    // Reviewed preparation is native form/endpoint bound; every other control is left to the open rule.
     if (facts.tag === 'a' && facts.href) {
       const url = new URL(facts.href);
       return this.classifyNavigation(url);
@@ -242,17 +242,17 @@ export const amazonRetailFlow: ReviewedMerchantFlow = {
       /^(?:search|search amazon)$/iu.test(facts.name.trim())
     )
       return 'ordinary';
-    return 'unsupported_merchant';
+    return undefined;
   },
   verifyPurchaseControl: isAmazonRetailCommit,
   classifyNavigation(url) {
-    if (!sameOrigin(url)) return 'unsupported_merchant';
+    if (!sameOrigin(url)) return undefined;
     if (url.pathname === AMAZON_RETAIL.submitPath) return 'purchase_control';
     if (
       review(url) &&
       [...url.searchParams.keys()].some((name) => !['purchaseId', 'ie', 'pipelineType', 'from', 'ref_'].includes(name))
     )
-      return 'unsupported_merchant';
+      return undefined;
     if (
       review(url) ||
       url.pathname === AMAZON_RETAIL.confirmationPath ||
@@ -265,7 +265,7 @@ export const amazonRetailFlow: ReviewedMerchantFlow = {
       url.pathname === '/'
     )
       return 'ordinary';
-    return 'unsupported_merchant';
+    return undefined;
   },
 };
 

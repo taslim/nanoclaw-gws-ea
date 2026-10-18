@@ -63,7 +63,8 @@ jobs:
             src/modules/gws-ea-browser/resy-signature.test.ts \
             src/modules/gws-ea-browser/signed-out.test.ts \
             src/modules/gws-ea-browser/reservation-execution.test.ts \
-            src/modules/gws-ea-browser/files-native.test.ts
+            src/modules/gws-ea-browser/files-native.test.ts \
+            src/modules/gws-ea-browser/open-web-native.test.ts
 
       - name: Container tests
         working-directory: container/agent-runner
