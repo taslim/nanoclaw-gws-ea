@@ -668,7 +668,9 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
 
   it('books a Resy table through its reader without waking the agent', async () => {
     // The agent recorded the route to the reservation and its booking path: a click that reached the commit.
-    await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] });
+    expect(
+      await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] }),
+    ).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
     await resy.page.locator('body[data-ready="yes"]').waitFor();
     const observation = await observePage(resy.page);
     expect(
