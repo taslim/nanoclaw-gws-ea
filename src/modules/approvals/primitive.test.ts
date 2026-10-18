@@ -198,6 +198,39 @@ describe('approval presentation and expiry', () => {
     expect(row.question).toBe('Approve?\n\nThis is for your Friday reservation.');
   });
 
+  it('delivers an approval without pictures exactly as before: the card alone, no files', async () => {
+    const deliver = vi.fn<ChannelDeliveryAdapter['deliver']>().mockResolvedValue('pm-plain');
+    setDeliveryAdapter({ deliver });
+
+    const id = await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'plain_card',
+      payload: {},
+      title: 'Approval',
+      question: 'Approve?',
+      originLine: 'From the test.',
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [channelType, platformId, threadId, kind, content, files] = deliver.mock.calls[0]!;
+    expect([channelType, platformId, threadId, kind, files]).toEqual([
+      DM_CHANNEL,
+      DM_PLATFORM,
+      null,
+      'chat-sdk',
+      undefined,
+    ]);
+    expect(Object.keys(JSON.parse(content) as Record<string, unknown>)).toEqual([
+      'type',
+      'questionId',
+      'title',
+      'question',
+      'options',
+    ]);
+    expect((JSON.parse(content) as { questionId: string }).questionId).toBe(id);
+  });
+
   it('does not leave a pending request when no delivery adapter exists', async () => {
     const adapter = vi.spyOn(delivery, 'getDeliveryAdapter').mockReturnValue(null);
     const id = await requestApproval({
@@ -211,5 +244,64 @@ describe('approval presentation and expiry', () => {
     expect(id).toBeNull();
     expect(await getPendingApprovalsByAction('no_adapter')).toEqual([]);
     adapter.mockRestore();
+  });
+});
+
+describe('pictures on approval requests (KTD6)', () => {
+  const PICTURE = {
+    filename: 'checkout.png',
+    mimeType: 'image/png' as const,
+    data: Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('total 41.20 USD'),
+    ]),
+  };
+
+  /** Every way the picture's bytes could be written as text. */
+  function writtenForms(data: Buffer): string[] {
+    return [data.toString('base64'), data.toString('base64url'), data.toString('hex'), data.toString('latin1')];
+  }
+
+  it('hands the picture to its one delivery beside the card, which names it, and keeps none of its bytes', async () => {
+    const deliver = vi.fn<ChannelDeliveryAdapter['deliver']>().mockResolvedValue('pm-picture');
+    setDeliveryAdapter({ deliver });
+
+    const id = await requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'purchase_card',
+      payload: { cardId: 'card-1' },
+      title: 'Approve this purchase?',
+      question: 'Checkout at shop.example: 41.20 USD.',
+      pictures: [PICTURE],
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [, , , , content, files] = deliver.mock.calls[0]!;
+    expect(JSON.parse(content)).toMatchObject({ type: 'ask_question', questionId: id, pictures: 1 });
+    expect(files).toEqual([PICTURE]);
+    const [row] = await getPendingApprovalsByAction('purchase_card');
+    const kept = JSON.stringify(row) + content;
+    for (const form of writtenForms(PICTURE.data)) expect(kept).not.toContain(form);
+    expect(row?.payload).toBe(JSON.stringify({ cardId: 'card-1' }));
+  });
+
+  it('names a picture that could not be taken, with no file beside the card', async () => {
+    const deliver = vi.fn<ChannelDeliveryAdapter['deliver']>().mockResolvedValue('pm-refused');
+    setDeliveryAdapter({ deliver });
+
+    await requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'purchase_card',
+      payload: {},
+      title: 'Approve this purchase?',
+      question: 'Checkout at shop.example: 41.20 USD.',
+      pictures: [null],
+    });
+
+    const [, , , , content, files] = deliver.mock.calls[0]!;
+    expect(JSON.parse(content)).toMatchObject({ pictures: 1 });
+    expect(files).toBeUndefined();
   });
 });

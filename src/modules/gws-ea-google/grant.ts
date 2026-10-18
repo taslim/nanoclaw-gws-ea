@@ -116,8 +116,9 @@ export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleC
  * Chat is the host's alone: it is how the assistant talks, as its own account,
  * so no agent holds a Chat scope. Its token carries the narrowest scopes
  * covering what the host does there: `chat.messages` sends, reads, and edits
- * messages, adds, lists, and removes reactions, downloads attachments, and is
- * the scope the Workspace Events subscription to message and reaction events
+ * messages, adds, lists, and removes reactions, uploads and downloads
+ * attachments, and is the scope the Workspace Events subscription to message
+ * and reaction events
  * rests on; `chat.spaces.readonly` reads a space and finds a DM;
  * `chat.spaces.create` opens one; and `chat.memberships.readonly` reads who
  * is in a space.
