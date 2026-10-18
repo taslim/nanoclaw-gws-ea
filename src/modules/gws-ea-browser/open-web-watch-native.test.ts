@@ -72,6 +72,9 @@ import {
   type WatchedSiteState,
 } from './open-web-native-fixture.js';
 import { observePage } from './observe.js';
+// TEMPORARY CI DIAGNOSTIC imports.
+import { ensureBrowserNavigationGuard } from './commit-classifier.js';
+import { settleCookieBanners } from './cookie-banners.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { freeResyTable, resyFixture } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
@@ -649,4 +652,56 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     expect(await getDb().all('SELECT event_key FROM gws_ea_browser_watch_notices')).toEqual([]);
     expect(vi.mocked(requestWake).mock.calls.map(([, reason]) => reason)).not.toContain('browser-watch');
   });
+
+  // TEMPORARY CI DIAGNOSTIC: which step after a navigation aborts the Resy page's own API calls on CI.
+  it('TEMPORARY: reports which navigation step aborts the Resy page API calls', async () => {
+    if (!chromePath) throw new Error('Chrome required');
+    const address = 'https://resy.com/reservation-details';
+    const load = (page: Page) => page.goto(address, { waitUntil: 'domcontentloaded' });
+    const variants: Array<[string, (page: Page) => Promise<unknown>]> = [
+      ['plain', load],
+      ['gate', async (page) => (await ensureBrowserNavigationGuard(page)).runWithPolicy({}, () => load(page))],
+      [
+        'gate+banners',
+        async (page) =>
+          (await ensureBrowserNavigationGuard(page)).runWithPolicy({}, async () => {
+            await load(page);
+            await settleCookieBanners(page);
+          }),
+      ],
+      [
+        'gate+observe',
+        async (page) =>
+          (await ensureBrowserNavigationGuard(page)).runWithPolicy({}, async () => {
+            await load(page);
+            await observePage(page);
+          }),
+      ],
+      ['executor', () => request('browser', { actions: [{ kind: 'navigate', url: address }] })],
+    ];
+    const results: string[] = [];
+    for (const [name, run] of variants)
+      for (let trial = 0; trial < 6; trial++) {
+        await resy.close();
+        resy = await resyFixture(chromePath, freeResyTable());
+        await resyReservationSignature.preparePage?.(resy.page);
+        const failed: string[] = [];
+        resy.page.on('requestfailed', (r) =>
+          failed.push(`${r.method()} ${new URL(r.url()).pathname} ${r.failure()?.errorText ?? ''}`),
+        );
+        const outcome = await run(resy.page).then(
+          () => 'ran',
+          (error: unknown) => `threw ${String(error).slice(0, 80)}`,
+        );
+        const ready = await resy.page
+          .locator('body[data-ready="yes"]')
+          .waitFor({ timeout: 8_000 })
+          .then(
+            () => 'ready',
+            () => 'NOT READY',
+          );
+        results.push(`${name}#${trial} ${outcome} ${ready} ${failed.join(', ')}`);
+      }
+    throw new Error(`RESY ABORT DIAGNOSTIC\n${results.join('\n')}`);
+  }, 600_000);
 });
