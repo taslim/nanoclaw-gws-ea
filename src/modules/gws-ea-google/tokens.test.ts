@@ -46,6 +46,7 @@ const CHAT = [
   'https://www.googleapis.com/auth/chat.spaces.readonly',
   'https://www.googleapis.com/auth/chat.spaces.create',
   'https://www.googleapis.com/auth/chat.memberships.readonly',
+  'https://www.googleapis.com/auth/chat.memberships',
 ];
 
 /** A grant from before Drive, Docs, Sheets, Slides and Forms joined the sign-in. */

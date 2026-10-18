@@ -46,6 +46,7 @@ export type WhatsAppSocket = Pick<
   | 'groupFetchAllParticipating'
   | 'updateMediaMessage'
   | 'groupMetadata'
+  | 'groupLeave'
   | 'onWhatsApp'
   | 'groupCreate'
   | 'groupParticipantsUpdate'
@@ -81,6 +82,7 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   logout(): Promise<void>;
   clearAuth(): void;
   fetchGroupMembers(platformId: string): Promise<WhatsAppGroup>;
+  leaveGroup(platformId: string): Promise<void>;
   resolveNumber(number: string): Promise<WhatsAppPerson | undefined>;
   reachOutDM(
     person: WhatsAppPerson,
@@ -506,6 +508,11 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     clearAuth() {
       discardInbound = true;
       auth.clear();
+    },
+    async leaveGroup(platformId) {
+      if (!/^[A-Za-z0-9-]+@g\.us$/u.test(platformId)) throw new Error('Leaving requires a WhatsApp group address.');
+      if (!socket || !connected) throw new ChannelNotConnectedError();
+      await socket.groupLeave(platformId);
     },
     fetchGroupMembers: groupEvents.fetchGroupMembers,
     ...outreach,

@@ -317,11 +317,12 @@ describe('signing in as the assistant', () => {
     ],
     [
       'Chat',
-      /\/auth\/chat\.(messages|spaces\.readonly|spaces\.create|memberships\.readonly)$/u,
+      /\/auth\/chat\.(messages|spaces\.readonly|spaces\.create|memberships|memberships\.readonly)$/u,
       // The host's Chat token's scopes, in the order the consent asks for them.
       [
         'https://www.googleapis.com/auth/chat.spaces.readonly',
         'https://www.googleapis.com/auth/chat.spaces.create',
+        'https://www.googleapis.com/auth/chat.memberships',
         'https://www.googleapis.com/auth/chat.memberships.readonly',
         'https://www.googleapis.com/auth/chat.messages',
       ],

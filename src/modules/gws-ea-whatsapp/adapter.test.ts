@@ -180,3 +180,16 @@ describe('WhatsApp transport lifecycle', () => {
     await adapter.teardown();
   });
 });
+
+it('leaves exactly the requested group through the live native socket, and propagates failures', async () => {
+  const adapter = create();
+  await adapter.setup(setup());
+  await adapter.reconnect();
+  await sockets[0].emit('connection.update', { connection: 'open' });
+  await adapter.leaveGroup('trip@g.us');
+  expect(sockets[0].leftGroups).toEqual(['trip@g.us']);
+  sockets[0].leaveError = new Error('leave refused');
+  await expect(adapter.leaveGroup('other@g.us')).rejects.toThrow('leave refused');
+  await expect(adapter.leaveGroup('12000@lid')).rejects.toThrow(/group/);
+  await adapter.teardown();
+});

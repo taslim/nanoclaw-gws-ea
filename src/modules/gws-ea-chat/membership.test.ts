@@ -12,9 +12,10 @@ const assistant = 'users/100';
 registerChatMembershipObserver(async (event) => {
   seen.push(event);
 });
-const fetch: typeof globalThis.fetch = async (input) => {
+const fetch: typeof globalThis.fetch = async (input, init) => {
   const url = new URL(String(input));
-  reads.push(`${url.pathname}${url.search}`);
+  reads.push(`${init?.method === 'DELETE' ? 'DELETE ' : ''}${url.pathname}${url.search}`);
+  if (init?.method === 'DELETE' && url.pathname === '/v1/spaces/room/members/100') return Response.json({});
   if (removed) return Response.json({ error: { code: 403, message: 'Not a member' } }, { status: 403 });
   if (url.pathname === '/v1/spaces/room')
     return Response.json({ name: 'spaces/room', spaceType: 'SPACE', displayName: 'Trip' });
@@ -106,4 +107,10 @@ it('reads every space in a native batch membership event', async () => {
   });
   expect(seen).toHaveLength(1);
   expect(seen[0]?.kind).toBe('join');
+});
+
+it('leaves only the assistant membership in the requested space through native Google Chat', async () => {
+  const adapter = build();
+  await adapter.leaveChat('gchat:spaces/room');
+  expect(reads).toContain('DELETE /v1/spaces/room/members/100');
 });

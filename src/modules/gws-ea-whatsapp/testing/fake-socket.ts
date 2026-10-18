@@ -20,6 +20,8 @@ export class FakeSocket implements WhatsAppSocket {
   readonly lookups: string[] = [];
   readonly numberQueries: string[] = [];
   readonly groups = new Map<string, GroupMetadata>();
+  readonly leftGroups: string[] = [];
+  leaveError?: Error;
   readonly createdGroups: { subject: string; participants: string[] }[] = [];
   readonly participantUpdates: { jid: string; participants: string[]; action: ParticipantAction }[] = [];
   readonly addResults = new Map<string, Awaited<ReturnType<WhatsAppSocket['groupParticipantsUpdate']>>[number]>();
@@ -95,6 +97,11 @@ export class FakeSocket implements WhatsAppSocket {
   }
   async groupFetchAllParticipating(): Promise<Record<string, GroupMetadata>> {
     return Object.fromEntries(this.groups);
+  }
+  async groupLeave(jid: string): ReturnType<WhatsAppSocket['groupLeave']> {
+    this.leftGroups.push(jid);
+    if (this.leaveError) throw this.leaveError;
+    return undefined;
   }
   async groupMetadata(jid: string): Promise<GroupMetadata> {
     const group = this.groups.get(jid);

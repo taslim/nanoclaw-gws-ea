@@ -20,6 +20,7 @@ export type ChatMembershipEvent =
   | { readonly kind: 'detach'; readonly platformId: string };
 export interface AssistantChatChannel extends ChannelAdapter {
   fetchChatMembers(platformId: string): Promise<ChatMembership>;
+  leaveChat(platformId: string): Promise<void>;
   isOwnMessage(platformId: string, messageId: string): Promise<boolean>;
 }
 const observers = new Set<(event: ChatMembershipEvent) => Promise<void>>();
@@ -78,6 +79,14 @@ export function createChatMembershipReader(options: {
   }
   return {
     fetchChatMembers,
+    async leaveChat(platformId: string): Promise<void> {
+      const space = chatSpaceName(platformId);
+      await googleJson(
+        options.client,
+        `https://chat.googleapis.com/v1/${space}/members/${options.assistantUserId.replace(/^users\//u, '')}`,
+        { method: 'DELETE' },
+      );
+    },
     async isOwnMessage(platformId: string, messageId: string): Promise<boolean> {
       const space = chatSpaceName(platformId);
       if (!messageId.startsWith(`${space}/messages/`)) return false;

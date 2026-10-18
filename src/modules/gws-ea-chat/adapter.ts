@@ -30,7 +30,7 @@
  * uploaded to the conversation, then one message with the text and every
  * upload.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { GoogleChatAdapter, type GoogleChatMessage, type WorkspaceEventNotification } from '@chat-adapter/gchat';
 import {
@@ -50,6 +50,7 @@ import {
   createChatSdkBridge,
   FilesNotAttachedError,
   type FileAttacher,
+  type IdempotentTextPoster,
   type ReactionSource,
   type ReplyContext,
   type WorkingIndicator,
@@ -169,7 +170,10 @@ export function hostChatAuth(token: () => Promise<string>, fetch?: typeof global
   return client;
 }
 
-export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource, WorkingIndicator, FileAttacher {
+export class AssistantChatAdapter
+  extends GoogleChatAdapter
+  implements ReactionSource, WorkingIndicator, FileAttacher, IdempotentTextPoster
+{
   /** Chat's events are pulled: the bridge registers no webhook route for this adapter. */
   readonly runtimeMode = 'polling';
   private readonly hydrator: ChatHydrator;
@@ -290,6 +294,23 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     }
   }
 
+  /** Google messages.create requestId makes a repeated text create return the original message. */
+  async postTextOnce(threadId: string, text: string, deliveryId: string): Promise<RawMessage<unknown>> {
+    const { spaceName, threadName } = this.decodeThreadId(threadId);
+    const query = new URLSearchParams({ requestId: createHash('sha256').update(deliveryId).digest('hex') });
+    if (threadName !== undefined) query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD');
+    const posted = await googleJson(this.chatClient, `${CHAT}/${spaceName}/messages?${query.toString()}`, {
+      method: 'POST',
+      body: {
+        text: convertEmojiPlaceholders(this.formatConverter.renderPostable({ markdown: text }), 'gchat'),
+        ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+      },
+    });
+    if (!isRecord(posted) || typeof posted.name !== 'string')
+      throw new GoogleApiError(502, 'Chat posted a message without naming it');
+    return { id: posted.name, threadId, raw: posted };
+  }
+
   /**
    * Post a message with files on it as one message, the one a reaction or
    * quote then answers (KTD6). Each file is uploaded to the conversation
@@ -389,6 +410,9 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     for (const part of ready) await part.dispatch();
   }
 
+  leaveChat(platformId: string) {
+    return this.membership.leaveChat(platformId);
+  }
   fetchChatMembers(platformId: string) {
     return this.membership.fetchChatMembers(platformId);
   }
@@ -731,6 +755,7 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Assis
     escapeCardText: escapeChatRequestText,
   });
   return Object.assign(channel, {
+    leaveChat: (platformId: string) => adapter.leaveChat(platformId),
     fetchChatMembers: (platformId: string) => adapter.fetchChatMembers(platformId),
     isOwnMessage: (platformId: string, messageId: string) => adapter.isOwnMessage(platformId, messageId),
   });

@@ -188,6 +188,19 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
   await build(startDelivery).setup(hostSetup());
 }
 
+it('uses one stable Google create request ID for a repeated durable text row', async () => {
+  await start();
+  const message = { kind: 'chat', content: { text: 'A durable notice' } };
+  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
+  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
+  await channel!.deliver(`gchat:${DM}`, null, message, 'another-row');
+  const ids = api.calls(`${DM}/messages`).map(({ url }) => url.searchParams.get('requestId'));
+  expect(ids).toHaveLength(3);
+  expect(ids[0]).toMatch(/^[0-9a-f]{64}$/u);
+  expect(ids[1]).toBe(ids[0]);
+  expect(ids[2]).not.toBe(ids[0]);
+});
+
 function messageEvent(name: string): WorkspaceEvent {
   return {
     messageId: `pubsub-${name}`,
