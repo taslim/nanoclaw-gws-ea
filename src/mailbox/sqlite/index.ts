@@ -207,7 +207,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
     countUnreadContext: (exceptChannelType) => countUnreadContext(db, exceptChannelType),
-    releaseHeldMessages: (processAfter) => releaseHeldMessages(db, processAfter),
+    releaseHeldMessages: (processAfter, options) => releaseHeldMessages(db, processAfter, options),
     settleHeldMessages: () => settleHeldMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),

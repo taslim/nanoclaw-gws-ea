@@ -37,3 +37,23 @@ wirings by default.
 
 Evidence: module-engagement, native wiring-command, DB and existing routing
 tests, plus the recorded-divergence tests.
+
+## Stop and replace one linked channel
+
+`stopChannelAdapter(key)` removes only the exact active instance from delivery
+before awaiting its teardown. It returns `not-active` when the key is absent;
+teardown errors propagate. The caller can then use the existing hot-start API
+to construct a fresh transport after unlinking or expired pairing. Other
+channels keep running.
+
+Evidence: the native hot-start tests cover withdrawal during teardown, exact
+instance matching, replacement and failure propagation. The recorded-divergence
+suite exercises replacing WhatsApp while Google Chat remains connected.
+
+## Preserve engagement when releasing a held chat
+
+`releaseHeldMessages(processAfter, { preserveTriggers: true })` makes held rows
+pending while retaining which ones originally called for a turn. Ambient chat
+context stays silent. The default still makes every released row a trigger, as
+existing email holds require. Native mailbox and routing tests cover both
+release modes, including a chat with only ambient held context.

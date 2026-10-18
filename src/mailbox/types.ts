@@ -35,6 +35,10 @@ export interface MailboxSessionKey {
   sessionId: string;
 }
 
+export interface HeldReleaseOptions {
+  readonly preserveTriggers?: boolean;
+}
+
 export type ProcessingAck = ProcessingAckRecord;
 export type Destination = DestinationRecord;
 export type SessionRouting = SessionRoutingRecord;
@@ -129,9 +133,10 @@ export interface InboundMailbox {
   countUnreadContext(exceptChannelType: string): number;
   /**
    * Release every held message: each becomes a pending trigger, due at
-   * `processAfter` (null: due now). Returns how many it released.
+   * `processAfter` (null: due now). With preserveTriggers, retain each row's
+   * original engagement instead. Returns how many it released.
    */
-  releaseHeldMessages(processAfter: string | null): number;
+  releaseHeldMessages(processAfter: string | null, options?: HeldReleaseOptions): number;
   /**
    * Settle every held message: each is completed unread, so no turn ever
    * reads it and no later release brings it back. Returns how many it settled.

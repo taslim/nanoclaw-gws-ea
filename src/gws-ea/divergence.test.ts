@@ -695,6 +695,83 @@ describe('recorded divergence: prepared module engagement and destination-free c
 });
 
 describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
+  it('can release held chat context without making ambient messages wake the assistant', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const createdAt = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'chat-agent',
+      name: 'Chat',
+      folder: 'chat-agent',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await db.createMessagingGroup({
+      id: 'trip',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      is_group: 1,
+      name: 'Trip',
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await db.createMessagingGroupAgent(
+      {
+        id: 'chat-wiring',
+        messaging_group_id: 'trip',
+        agent_group_id: 'chat-agent',
+        engage_mode: 'module',
+        engage_pattern: null,
+        sender_scope: 'all',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 0,
+        created_at: createdAt,
+      },
+      { companionDestination: false },
+    );
+    await import('../mailbox/compose.js');
+    const router = await import('../router.js');
+    const { findSessionForAgent } = await import('../db/sessions.js');
+    const { withExistingMailboxSession } = await import('../session-manager.js');
+    router.registerEngagementDecider('whatsapp', ({ event }) => event.message.isMention === true);
+    router.registerInboundDelay(() => router.HOLD_UNTIL_RELEASED);
+    external.requestWake.mockClear();
+    const receive = (id: string, isMention: boolean) =>
+      router.routeInbound({
+        channelType: 'whatsapp',
+        platformId: 'trip@g.us',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat',
+          content: JSON.stringify({ text: id }),
+          timestamp: createdAt,
+          isGroup: true,
+          isMention,
+        },
+      });
+
+    await receive('ambient', false);
+    const sessionId = (await findSessionForAgent('chat-agent', 'trip', null))?.id ?? '';
+    expect(
+      await withExistingMailboxSession('chat-agent', sessionId, (mailbox) => {
+        expect(mailbox.releaseHeldMessages(null, { preserveTriggers: true })).toBe(1);
+        return mailbox.countDueMessages();
+      }),
+    ).toBe(0);
+    await receive('addressed', true);
+    expect(external.requestWake).not.toHaveBeenCalled();
+    expect(
+      await withExistingMailboxSession('chat-agent', sessionId, (mailbox) => {
+        expect(mailbox.releaseHeldMessages(null, { preserveTriggers: true })).toBe(1);
+        return mailbox.countDueMessages();
+      }),
+    ).toBe(1);
+  });
+
   it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named, or settles it unread', async () => {
     await freshInstall();
     const db = await import('../db/index.js');
@@ -1526,6 +1603,44 @@ describe("recorded divergence: the host's own sends pass the outbound guards, an
 });
 
 describe('recorded divergence: WhatsApp is an instance-owned module channel', () => {
+  it('can replace its linked transport without stopping another channel', async () => {
+    await freshInstall();
+    const registry = await import('../channels/channel-registry.js');
+    const setups: string[] = [];
+    const stops: string[] = [];
+    let generation = 0;
+    const adapter = (channelType: string, identity: string) => ({
+      name: channelType,
+      channelType,
+      supportsThreads: false,
+      setup: async () => {
+        setups.push(identity);
+      },
+      teardown: async () => {
+        stops.push(identity);
+      },
+      isConnected: () => !stops.includes(identity),
+      deliver: async () => identity,
+    });
+    registry.registerChannelAdapter('whatsapp', { factory: () => adapter('whatsapp', `wa-${++generation}`) });
+    registry.registerChannelAdapter('gchat', { factory: () => adapter('gchat', 'gchat') });
+    await registry.initChannelAdapters(() => ({
+      onInbound() {},
+      onInboundEvent() {},
+      onMetadata() {},
+      onAction() {},
+    }));
+    cleanups.push(() => registry.teardownChannelAdapters());
+
+    await expect(registry.stopChannelAdapter('whatsapp')).resolves.toBe('stopped');
+    expect(stops).toEqual(['wa-1']);
+    expect(registry.getChannelAdapterExact('whatsapp')).toBeUndefined();
+    expect(registry.getChannelAdapterExact('gchat')?.isConnected()).toBe(true);
+    await expect(registry.startChannelAdapter('whatsapp')).resolves.toBe('started');
+    expect(setups).toEqual(['wa-1', 'gchat', 'wa-2']);
+    expect(registry.getChannelAdapterExact('whatsapp')?.isConnected()).toBe(true);
+  });
+
   it('registers once from the module barrel and stays inert without a link record', async () => {
     await freshInstall();
     const registry = await import('../channels/channel-registry.js');

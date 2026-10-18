@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 
 import { createInboundRecord, parseIsoTimestamp } from '../model.js';
 import type { InboundWrite } from '../model.js';
-import type { MessageRetry } from '../types.js';
+import type { HeldReleaseOptions, MessageRetry } from '../types.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -146,13 +146,20 @@ export function countUnreadContext(db: Database.Database, exceptChannelType: str
 /**
  * Release every held message: each becomes a pending trigger, due at
  * `processAfter` (null: due now), so the sweep wakes the session for it once
- * it is due. Returns how many it released.
+ * it is due. With preserveTriggers, retain each row's original engagement.
+ * Returns how many it released.
  */
-export function releaseHeldMessages(db: Database.Database, processAfter: string | null): number {
+export function releaseHeldMessages(
+  db: Database.Database,
+  processAfter: string | null,
+  options?: HeldReleaseOptions,
+): number {
   const due = processAfter === null ? null : parseIsoTimestamp(processAfter);
   return db
-    .prepare("UPDATE messages_in SET status = 'pending', trigger = 1, process_after = ? WHERE status = 'held'")
-    .run(due).changes;
+    .prepare(
+      "UPDATE messages_in SET status = 'pending', trigger = CASE WHEN ? THEN trigger ELSE 1 END, process_after = ? WHERE status = 'held'",
+    )
+    .run(options?.preserveTriggers === true ? 1 : 0, due).changes;
 }
 
 /**

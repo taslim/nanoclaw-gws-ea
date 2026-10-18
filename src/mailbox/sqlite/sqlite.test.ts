@@ -312,6 +312,37 @@ describe('SQLite mailbox canonical serialization', () => {
     expect(inbound.getWaitingMessages()).toEqual([{ id: 'held', tries: 0, processAfter: later }]);
   });
 
+  it.each([
+    { triggers: [false], due: 0 },
+    { triggers: [false, true], due: 1 },
+  ])('can release held context preserving its original engagement: $triggers', async ({ triggers, due }) => {
+    const db = new Database(':memory:');
+    databases.push(db);
+    db.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(db);
+    for (const [i, trigger] of triggers.entries()) {
+      await inbound.insertMessage({
+        id: `held-${i}`,
+        kind: 'chat',
+        timestamp: '2026-10-18T12:00:00.000Z',
+        platformId: 'trip@g.us',
+        channelType: 'whatsapp',
+        threadId: null,
+        content: JSON.stringify({ text: trigger ? 'Aya, can you help?' : 'See you Thursday' }),
+        processAfter: null,
+        recurrence: null,
+        status: 'held',
+        trigger,
+      });
+    }
+    expect(inbound.countDueMessages()).toBe(0);
+    expect(inbound.releaseHeldMessages(null, { preserveTriggers: true })).toBe(triggers.length);
+    expect(inbound.countDueMessages()).toBe(due);
+    expect(db.prepare('SELECT status, trigger, process_after FROM messages_in ORDER BY seq').all()).toEqual(
+      triggers.map((trigger) => ({ status: 'pending', trigger: Number(trigger), process_after: null })),
+    );
+  });
+
   it('reads the inbound messages a failure names, whatever their status, in the order they arrived', async () => {
     const inboundDb = new Database(':memory:');
     databases.push(inboundDb);

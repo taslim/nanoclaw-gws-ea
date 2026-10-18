@@ -347,6 +347,16 @@ export async function teardownChannelAdapters(): Promise<void> {
   activeAdapters.clear();
 }
 
+/** Withdraw one exact instance before closing it; a teardown failure propagates to the caller. */
+export async function stopChannelAdapter(key: string): Promise<'stopped' | 'not-active'> {
+  const adapter = activeAdapters.get(key);
+  if (!adapter) return 'not-active';
+  activeAdapters.delete(key);
+  await adapter.teardown();
+  log.info('Channel adapter stopped', { channel: key });
+  return 'stopped';
+}
+
 /**
  * slack-agent-flow seam — hot-start ONE registered adapter after boot.
  * Captures the host's setupFn from initChannelAdapters and replays the same

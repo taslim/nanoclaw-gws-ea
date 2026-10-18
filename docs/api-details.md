@@ -129,6 +129,17 @@ registry bridge, so a platform can derive its idempotency key from that ID.
 projection and guards, so an adapter can expire an old queued send even when
 it first sees the row after a host outage. Direct host sends may omit it.
 
+`stopChannelAdapter(key)` withdraws one exact active instance before awaiting
+teardown, returning `stopped` or `not-active`. Teardown errors propagate. After
+it settles, `startChannelAdapter(key)` can construct a fresh instance with the
+captured host setup; other active channels are unaffected.
+
+Held chat context can use
+`mailbox.releaseHeldMessages(processAfter, { preserveTriggers: true })` to keep
+each row's original engagement. Callers wake only when `countDueMessages()` finds
+a trigger. Without the option, release retains its existing behavior of making
+every held row a pending trigger.
+
 ### Chat SDK Bridge
 
 Wraps a Chat SDK adapter + Chat instance to conform to the NanoClaw ChannelAdapter interface. Trunk ships the bridge and the channel registry only — platform-specific Chat SDK adapters (Discord, Slack, Telegram, etc.) and native adapters (WhatsApp/Baileys) are installed by the `/add-<channel>` skills from the `channels` branch.

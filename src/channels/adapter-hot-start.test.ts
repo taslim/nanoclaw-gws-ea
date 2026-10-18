@@ -116,6 +116,53 @@ describe('startChannelAdapter (hot-start seam)', () => {
     expect(reg.getChannelAdapterExact('slack-nocreds')).toBeUndefined();
   });
 
+  it('stops only the exact instance before awaiting teardown and can start a fresh one', async () => {
+    const reg = await import('./channel-registry.js');
+    const { setupFn, byAdapter } = createSetupFn();
+    const first = createFakeAdapter('whatsapp', 'wa-main');
+    const second = createFakeAdapter('whatsapp', 'wa-main');
+    const sibling = createFakeAdapter('whatsapp', 'wa-other');
+    let finishTeardown: (() => void) | undefined;
+    first.teardown = () =>
+      new Promise<void>((resolve) => {
+        finishTeardown = resolve;
+      });
+    let created = 0;
+    reg.registerChannelAdapter('wa-main', { factory: () => (created++ === 0 ? first : second) });
+    reg.registerChannelAdapter('wa-other', { factory: () => sibling });
+    await reg.initChannelAdapters(setupFn);
+
+    try {
+      await expect(reg.stopChannelAdapter('whatsapp')).resolves.toBe('not-active');
+      const stopped = reg.stopChannelAdapter('wa-main');
+      expect(reg.getChannelAdapterExact('wa-main')).toBeUndefined();
+      expect(reg.getChannelAdapterExact('wa-other')).toBe(sibling);
+      expect(finishTeardown).toBeTypeOf('function');
+      finishTeardown!();
+      await expect(stopped).resolves.toBe('stopped');
+      await expect(reg.startChannelAdapter('wa-main')).resolves.toBe('started');
+      expect(reg.getChannelAdapterExact('wa-main')).toBe(second);
+      expect(second.setupConfigs).toEqual([byAdapter.get(second)]);
+    } finally {
+      finishTeardown?.();
+      first.teardown = async () => {};
+    }
+  });
+
+  it('propagates teardown failure after withdrawing the exact instance', async () => {
+    const reg = await import('./channel-registry.js');
+    const adapter = createFakeAdapter('whatsapp');
+    const failure = new Error('socket did not close');
+    adapter.teardown = async () => {
+      throw failure;
+    };
+    reg.registerChannelAdapter('whatsapp', { factory: () => adapter });
+    await reg.initChannelAdapters(createSetupFn().setupFn);
+
+    await expect(reg.stopChannelAdapter('whatsapp')).rejects.toBe(failure);
+    expect(reg.getChannelAdapterExact('whatsapp')).toBeUndefined();
+  });
+
   it('retries setup on NetworkError and still starts', async () => {
     vi.useFakeTimers();
     const reg = await import('./channel-registry.js');
