@@ -91,3 +91,33 @@ export const gwsEaMatterJobsMigration: ModuleMigration = {
     `);
   },
 };
+
+export const gwsEaMatterChatsMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:chat-links',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_matter_links_with_chats (
+        matter_id TEXT NOT NULL REFERENCES gws_ea_matters(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('thread', 'event', 'file', 'person', 'memory', 'job', 'chat')),
+        reference TEXT NOT NULL CHECK (reference <> ''),
+        handler TEXT CHECK (handler <> ''),
+        matter_open INTEGER NOT NULL CHECK (matter_open IN (0, 1)),
+        linked_at TEXT NOT NULL,
+        account TEXT CHECK (account <> ''),
+        account_at TEXT,
+        PRIMARY KEY (matter_id, kind, reference),
+        CHECK ((account IS NULL) = (account_at IS NULL)),
+        CHECK (kind = 'chat' OR account IS NULL)
+      );
+      INSERT INTO gws_ea_matter_links_with_chats (matter_id, kind, reference, handler, matter_open, linked_at)
+        SELECT matter_id, kind, reference, handler, matter_open, linked_at FROM gws_ea_matter_links;
+      DROP TABLE gws_ea_matter_links;
+      ALTER TABLE gws_ea_matter_links_with_chats RENAME TO gws_ea_matter_links;
+      CREATE INDEX idx_gws_ea_matter_links_reference ON gws_ea_matter_links (kind, reference);
+      CREATE UNIQUE INDEX idx_gws_ea_matter_links_one_open_matter
+        ON gws_ea_matter_links (kind, reference)
+        WHERE matter_open = 1 AND kind IN ('thread', 'event', 'file', 'job');
+    `);
+  },
+};

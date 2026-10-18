@@ -62,7 +62,8 @@ import {
   type DriveFile,
   type DrivePermission,
 } from '../gws-ea-workspace/drive-api.js';
-import type { LinkRef, MatterLink } from './db.js';
+import { CHAT_ACCOUNT_MAX, type LinkRef, type MatterLink } from './db.js';
+import { readChatLink } from './chat-links.js';
 
 /** How long one read may take before its link renders as unread. */
 export const READ_DEADLINE_MS = 5_000;
@@ -367,6 +368,15 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
     return state.ok ? state.value : { line: unread(state.error) };
   };
   switch (link.kind) {
+    case 'chat':
+      return settled(async () => {
+        const chat = await readChatLink(link.reference);
+        if (chat === undefined) return { line: 'no such chat' };
+        return {
+          line: `${chat.state}; ${chat.member_count} member${chat.member_count === 1 ? '' : 's'}; served by ${chat.serving_agent_group_id}`,
+          ...(chat.name === null ? {} : { framed: untrusted(`Name: ${chat.name}`, FRAME_LIMIT, 'chat') }),
+        };
+      });
     case 'job':
       return settled(async () => {
         const view = await readBrowserJob(link.reference);
@@ -414,6 +424,14 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
 async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens): Promise<string[]> {
   if (link.handler === null) return [];
   const handled = `  handled by ${link.handler}`;
+  if (link.kind === 'chat') {
+    return link.account === undefined
+      ? [handled]
+      : [
+          `${handled}; its account, ${formatLocalTime(link.account.at, lens.timezone)}:`,
+          untrusted(link.account.text, CHAT_ACCOUNT_MAX, link.handler),
+        ];
+  }
   const accountOf = sources.threadAccount;
   if (link.kind !== 'thread' || accountOf === undefined) return [handled];
   const account = await within(`account on ${link.reference}`, () => accountOf(link.reference));

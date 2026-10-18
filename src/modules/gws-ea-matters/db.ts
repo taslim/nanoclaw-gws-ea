@@ -12,9 +12,10 @@ import {
   resolveBrowserJob,
   type BrowserJobCancellation,
 } from '../gws-ea-browser/cancel.js';
+import { readChatLink } from './chat-links.js';
 
 /** What a matter links to (R3), in the order a matter lists them. */
-export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory', 'job'] as const;
+export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory', 'job', 'chat'] as const;
 export type LinkKind = (typeof LINK_KINDS)[number];
 
 /**
@@ -34,7 +35,11 @@ export interface MatterLink extends LinkRef {
   /** The agent that works this link and keeps its account of it (R7), or null while only `main` does. */
   readonly handler: string | null;
   readonly linked_at: string;
+  /** A chat handler's account of this matter, never shared with the chat's other matters. */
+  readonly account?: { readonly text: string; readonly at: string };
 }
+
+export const CHAT_ACCOUNT_MAX = 2_000;
 
 export interface StrandSummary {
   readonly id: string;
@@ -213,6 +218,10 @@ function memoryPath(text: string, value: string): string {
 export function canonicalReference(kind: LinkKind, value: string): string {
   const text = value.trim();
   switch (kind) {
+    case 'chat':
+      if (text.length === 0 || text.length > 256 || /[\s,]/u.test(text) || hasControlCharacters(text))
+        throw new Error(`Chat ${JSON.stringify(value)} is invalid: use its messaging-group id`);
+      return text;
     case 'job':
       if (!/^system:a2a:[^:\s]+:[^\s]+$/u.test(text) || hasControlCharacters(text))
         throw new Error('Job must name the native browser thread returned by delegation');
@@ -258,7 +267,7 @@ function parseLinks(links: readonly LinkRef[]): LinkRef[] {
 
 function requireSome(links: readonly LinkRef[]): void {
   if (links.length === 0) {
-    throw new Error('Give at least one link to place: a thread, event, file, person or memory file');
+    throw new Error('Give at least one link to place: a thread, event, file, person, memory file, browser job or chat');
   }
 }
 
@@ -307,10 +316,16 @@ export async function getMatter(id: string): Promise<Matter | undefined> {
   const db = getDb();
   const row = await matterRow(id.trim());
   if (!row) return undefined;
-  const links = await db.all<MatterLink>(
-    'SELECT kind, reference, handler, linked_at FROM gws_ea_matter_links WHERE matter_id = ? ORDER BY linked_at, rowid',
+  const rows = await db.all<
+    Omit<MatterLink, 'account'> & { readonly account: string | null; readonly account_at: string | null }
+  >(
+    'SELECT kind, reference, handler, linked_at, account, account_at FROM gws_ea_matter_links WHERE matter_id = ? ORDER BY linked_at, rowid',
     row.id,
   );
+  const links: MatterLink[] = rows.map(({ account, account_at, ...link }) => ({
+    ...link,
+    ...(account === null || account_at === null ? {} : { account: { text: account, at: account_at } }),
+  }));
   const strands = await db.all<{ readonly id: string; readonly title: string; readonly closed_at: string | null }>(
     'SELECT id, title, closed_at FROM gws_ea_matters WHERE parent_id = ? ORDER BY created_at, id',
     row.id,
@@ -427,6 +442,9 @@ export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
  * a browser job main delegated (matters are main's), a person with a record.
  */
 async function assertResolvable(link: LinkRef): Promise<void> {
+  if (link.kind === 'chat' && (await readChatLink(link.reference)) === undefined) {
+    throw new Error(`No chat ${link.reference} exists`);
+  }
   if (link.kind === 'job') {
     const main = await getMainAgentGroupId();
     if (main === null || !(await resolveBrowserJob(link.reference, undefined, main)))
@@ -795,6 +813,30 @@ export async function setLinkHandler(link: LinkRef, handler: string): Promise<vo
     link.kind,
     canonicalReference(link.kind, link.reference),
   );
+}
+
+/** Leave the serving agent's report on one open matter's chat link, never on that chat's other matters. */
+export async function setChatLinkAccount(
+  matterId: string,
+  messagingGroupId: string,
+  handler: string,
+  text: string,
+): Promise<void> {
+  const chat = canonicalReference('chat', messagingGroupId);
+  const account = text.trim();
+  if (account.length === 0 || account.length > CHAT_ACCOUNT_MAX)
+    throw new Error(`Chat account must be 1 to ${CHAT_ACCOUNT_MAX} characters`);
+  const serving = parseLine(handler, 'Chat handler', 256);
+  const { changes } = await getDb().run(
+    `UPDATE gws_ea_matter_links SET handler = ?, account = ?, account_at = ?
+      WHERE matter_id = ? AND kind = 'chat' AND reference = ? AND matter_open = 1`,
+    serving,
+    account,
+    new Date().toISOString(),
+    matterId.trim(),
+    chat,
+  );
+  if (changes === 0) throw new Error(`No open matter ${matterId} links chat ${chat}`);
 }
 
 /**
