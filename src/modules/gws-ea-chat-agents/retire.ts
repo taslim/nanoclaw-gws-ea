@@ -20,7 +20,6 @@ async function revokeBrowser(group: string): Promise<void> {
   const stored = readEnvFile(['GWS_EA_INSTANCE_LOCK_FILE', 'NANOCLAW_INSTALL_ID']);
   const lock = stored.GWS_EA_INSTANCE_LOCK_FILE;
   if (!lock) {
-    // No browser policy means no grant to mutate. A real instance with browser state must carry its binding.
     try {
       await readPrivateFile(file, 16 * 1024);
     } catch (error) {
@@ -44,7 +43,6 @@ async function revokeBrowser(group: string): Promise<void> {
   await reconcileBrowserGroup(file);
 }
 
-/** Re-read after claiming the same instance lock used by operator capability changes. */
 async function removeBrowserGrant(file: string, group: string): Promise<void> {
   let raw: string;
   try {

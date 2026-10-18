@@ -38,7 +38,6 @@ export async function browserAccessGroups(policy?: BrowserPolicy): Promise<reado
   return main === null ? [] : [main];
 }
 
-/** A saved list cannot grant a shared chat container or revive a job outside its active lifetime. */
 async function eligibleChatGroup(group: string): Promise<boolean> {
   const db = getDb();
   if ((await db.hasTable('gws_ea_profile')) && group === (await getExternalChatAgentGroupId())) return false;

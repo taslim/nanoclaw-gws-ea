@@ -19,7 +19,6 @@ async function identity(client: OnecliAdmin, group: string): Promise<OnecliAgent
   return found[0];
 }
 
-/** The single credential scoped to this provider's declared inference endpoint, never a website credential. */
 async function modelSecret(client: OnecliAdmin, group: string): Promise<string> {
   const config = await getContainerConfig(group);
   const provider = resolveProviderName(null, config?.provider);
