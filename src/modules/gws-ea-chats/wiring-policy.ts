@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
-import { createMessagingGroupAgent, getMessagingGroupAgents } from '../../db/messaging-groups.js';
+import { createMessagingGroupAgent, getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
 import { registerWiringAdmissionPolicy } from '../../db/wiring-admission.js';
 import type { MessagingGroupAgent } from '../../types.js';
 import { getJobAgent } from '../gws-ea-chat-agents/jobs.js';
@@ -17,8 +17,7 @@ export const CHAT_WIRING = {
 } as const satisfies Partial<MessagingGroupAgent>;
 
 export async function ensureChatWiring(chat: Chat): Promise<void> {
-  const existing = await getMessagingGroupAgents(chat.messaging_group_id);
-  if (existing.some((row) => row.agent_group_id === chat.serving_agent_group_id)) return;
+  if (await getMessagingGroupAgentByPair(chat.messaging_group_id, chat.serving_agent_group_id)) return;
   await createMessagingGroupAgent(
     {
       id: `mga-chat-${randomUUID()}`,

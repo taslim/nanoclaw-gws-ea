@@ -8,7 +8,6 @@ import { getChat } from './db.js';
 /** A group-wide channel grant would let every shared session send outside its origin. */
 export async function chatDestinationViolation(row: AgentDestination): Promise<string | undefined> {
   if (!(await getDb().hasTable('gws_ea_chats'))) return undefined;
-  // Native A2A ACLs and the receiving module's policies retain authority.
   if (row.target_type === 'agent') return undefined;
   if (row.agent_group_id === (await getExternalChatAgentGroupId()))
     return 'Shared chat sessions may reply only to their originating chat.';

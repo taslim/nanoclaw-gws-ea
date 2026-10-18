@@ -7,7 +7,7 @@ import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
 import { getChat } from './db.js';
 import { admitChatFromPrincipalMessage } from './hold.js';
-import { channelUserId, listChatMembers, memberFact, recordChatSpeaker, setChatMemberEmail } from './roster.js';
+import { channelUserId, getChatMember, memberFact, recordChatSpeaker, setChatMemberEmail } from './roster.js';
 
 export type ExpectedChatReplyReader = (chatId: string, userId: string) => Promise<boolean>;
 const expectedReaders = new Map<string, ExpectedChatReplyReader>();
@@ -31,7 +31,6 @@ export async function decideChatEngagement({ event, messagingGroup }: Engagement
   const parsed = contentRecord(event.message.content);
   const mark = isRecord(parsed?.principalMessage) ? parsed.principalMessage : undefined;
   if (chat.state === 'asking' && mark?.id === event.message.id && mark.messagingGroupId === messagingGroup.id) {
-    // The mark alone never grants admission: read the persisted, exact-chat principal words.
     chat = await admitChatFromPrincipalMessage(messagingGroup.id, event.message.id);
   }
   if (chat.state === 'declined' || chat.state === 'detached') return false;
@@ -53,7 +52,7 @@ export async function decideChatEngagement({ event, messagingGroup }: Engagement
         /(?:\bmy (?:email(?: address)?|address)\s*(?:is|:)|\b(?:email|reach|contact) me (?:at|on))\s*$/iu.test(
           parsed.text.slice(0, parsed.text.indexOf(emails[0])),
         )) &&
-      (await listChatMembers(messagingGroup.id)).some((member) => member.member_key === userId)
+      (await getChatMember(messagingGroup.id, userId))
     )
       await setChatMemberEmail(messagingGroup.id, userId, emails[0], 'member');
   }

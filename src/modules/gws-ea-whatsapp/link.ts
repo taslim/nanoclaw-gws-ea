@@ -336,7 +336,6 @@ export class WhatsAppLinking {
       this.pairingDeadline = undefined;
       if (record) this.discardPending(record);
       if (record?.principal) await removeWhatsAppPrincipalBinding(record.principal.lid);
-      // contacts.sqlite is account-number scoped and survives unlink, including refusals and time locks.
       for (const file of ['auth.sqlite', 'link.json'])
         await fs.rm(path.join(this.options.directory, file), { force: true });
       await claimInstanceWhatsApp(this.options.paths, this.options.instanceId, undefined);

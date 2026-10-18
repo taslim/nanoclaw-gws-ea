@@ -38,6 +38,13 @@ export async function listChatMembers(chat: string): Promise<ChatMember[]> {
     chat,
   );
 }
+export async function getChatMember(chat: string, key: string): Promise<ChatMember | undefined> {
+  return getDb().get<ChatMember>(
+    'SELECT * FROM gws_ea_chat_members WHERE messaging_group_id = ? AND member_key = ?',
+    chat,
+    key,
+  );
+}
 async function writeMemberFact(chat: string, member: ChatMemberFact): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_chat_members
@@ -105,7 +112,7 @@ export async function setChatMemberEmail(
     key,
     source,
   );
-  if (result.changes === 0 && !(await listChatMembers(chat)).some((member) => member.member_key === key))
+  if (result.changes === 0 && !(await getChatMember(chat, key)))
     throw new Error('The person is not a member of this chat.');
 }
 export async function forgetFromChatRosters(person: ForgottenPerson): Promise<void> {
