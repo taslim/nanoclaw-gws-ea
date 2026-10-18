@@ -1559,6 +1559,9 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     // With no worker registered, the purchase navigation reaches the gate, which refuses it outside any errand.
     await page.evaluate("location.assign('/checkout/placeorder')");
     await expect.poll(() => guard.reason(), { timeout: 5_000 }).toBe('purchase_control');
+    // The refused navigation ends on Chrome's error page; read the page once that has committed.
+    await expect.poll(() => page.url(), { timeout: 5_000 }).toMatch(/^chrome-error:/u);
+    await page.waitForLoadState('domcontentloaded');
     expect(await page.content()).not.toContain('served by worker');
   }, 30_000);
 });
