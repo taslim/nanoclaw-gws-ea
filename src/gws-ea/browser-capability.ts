@@ -6,11 +6,13 @@ import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
 import { browserPaths, readPrivateFile, writePrivateFile } from '../modules/gws-ea-browser/paths.js';
 import { readBrowserPolicy, SYSTEM_CHROME, type BrowserPolicyFile } from '../modules/gws-ea-browser/policy.js';
+import { runAliasStep, type AliasStepOptions } from './alias.js';
+import type { RunEvent, StepReporter } from './events.js';
 import { runInstanceNclJson } from './ncl.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome, type SanitizedCommandOutcomeRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
-import type { NextAction } from './result.js';
+import type { NextAction, OperationData } from './result.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
@@ -48,9 +50,17 @@ export interface BrowserOperationData {
   readonly instance_id: string;
   readonly enabled: boolean;
   readonly changed: boolean;
+  /** What an enable's web alias step waits on the operator for (KTD13). */
+  readonly pause?: OperationData['pause'];
 }
 export interface BrowserCapabilityDependencies {
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
+}
+export interface BrowserEnableDependencies extends BrowserCapabilityDependencies {
+  /** The web alias step that follows the policy write. */
+  readonly alias?: AliasStepOptions;
+  /** Hears the alias step's progress. */
+  readonly emit?: (event: RunEvent) => void;
 }
 export interface BrowserCapabilityInspection {
   readonly check?: boolean;
@@ -133,6 +143,47 @@ export async function enableBrowserCapability(
     }
     return { ...BROWSER_CAPABILITY, instance_id: instanceId, enabled: true, changed };
   });
+}
+
+/**
+ * Enable the assistant's browser, then bring it to a verified web alias
+ * (KTD13): under the assistant's lock again, and only while the policy still
+ * enables the browser. An alias that waits on the operator returns as the
+ * operation's pause, with the browser already enabled.
+ */
+export async function enableBrowserWithAlias(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  dependencies: BrowserEnableDependencies = {},
+): Promise<BrowserOperationData> {
+  const enabled = await enableBrowserCapability(paths, instanceId, dependencies);
+  const reporter: StepReporter = {
+    emit: (event) => {
+      if (event.type === 'domain-effect') void dependencies.recordEffect?.(event.changed);
+      dependencies.emit?.(event);
+    },
+  };
+  const alias = await withAssistantLock(paths, instanceId, async () => {
+    const { runtime, files } = await target(paths, instanceId);
+    if (!(await readBrowserPolicy(files.policyFile)).enabled) return undefined;
+    return runAliasStep(paths, instanceId, runtime, reporter, dependencies.alias);
+  });
+  if (alias?.status !== 'paused') return enabled;
+  const { settled: _settled, kind: _kind, ...pause } = alias.pause;
+  return { ...enabled, pause };
+}
+
+/** What continues an enable whose web alias waits: the pause's flag, or the input it names. */
+export function browserAliasNextActions(instanceId: string, pause: NonNullable<OperationData['pause']>): NextAction[] {
+  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  const flag = pause.resumeFlag;
+  return [
+    ...(pause.actionUrl ? [{ kind: 'external' as const, instruction: pause.message, url: pause.actionUrl }] : []),
+    ...(flag?.includes('<')
+      ? [{ kind: 'external' as const, instruction: `Supply the input requested by ${flag}.` }]
+      : []),
+    { kind: 'command', argv: flag && !flag.includes('<') ? [...command, ...flag.split(' ')] : command },
+  ];
 }
 
 export async function disableBrowserCapability(

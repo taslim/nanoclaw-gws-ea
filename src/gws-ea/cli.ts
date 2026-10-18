@@ -6,11 +6,13 @@ import {
   voiceCapabilityNextActions,
   browserCapabilityCatalog,
 } from './capabilities.js';
+import { aliasDecision, type AliasDecision, type AliasStepOptions } from './alias.js';
 import {
   browserCapabilityLines,
   browserCapabilityNextActions,
+  browserAliasNextActions,
   disableBrowserCapability,
-  enableBrowserCapability,
+  enableBrowserWithAlias,
   inspectBrowserCapability,
   type BrowserCapabilityInspection,
   type BrowserCapabilityObservation,
@@ -256,6 +258,8 @@ type RemoveAssistantRunner = (
 
 export interface CliRuntime {
   browserInspection?: BrowserCapabilityInspection;
+  /** How a browser enable's web alias step reaches the assistant's host; tests substitute it. */
+  browserAlias?: Pick<AliasStepOptions, 'ncl' | 'sleep'>;
   /** How the 1Password CLI is found and run; tests substitute the runner. */
   onePassword?: OnePasswordCliSeams;
   /** A terminal's choice among the operator's 1Password accounts; absent, enable requires --account. */
@@ -352,6 +356,15 @@ function nextActionLines(actions: readonly NextAction[]): string[] {
       ? action.instruction
       : `Next: ${action.argv.map((value) => (/^[a-zA-Z0-9_-]+$/u.test(value) ? value : shellQuote(value))).join(' ')}`,
   );
+}
+
+/** The web alias decision `--alias-added`, `--alias-taken` and `--alias <name>` make (KTD13). */
+function aliasDecisionOf(options: CommandOptions): AliasDecision | undefined {
+  return aliasDecision({
+    added: options['alias-added'] === 'true',
+    taken: options['alias-taken'] === 'true',
+    name: options.alias,
+  });
 }
 
 /** `--billing-account`: the billing account a pause offered, as Google names it. */
@@ -558,6 +571,7 @@ class Cli {
       case 'resume': {
         const instanceId = targetInstance(options);
         const billingAccount = parseBillingAccount(options['billing-account']);
+        const alias = aliasDecisionOf(options);
         return () =>
           this.#attempt({
             command,
@@ -567,6 +581,7 @@ class Cli {
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
               ...(billingAccount ? { billingAccount } : {}),
+              ...(alias ? { alias } : {}),
               ...(options['google-client-file']
                 ? { googleClientFile: path.resolve(options['google-client-file']) }
                 : {}),
@@ -2458,7 +2473,36 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
           }
           if (command === 'enable') {
-            data = await enableBrowserCapability(paths, instanceId, dependencies);
+            const decision = aliasDecisionOf(options);
+            const enabled = await enableBrowserWithAlias(paths, instanceId, {
+              ...dependencies,
+              alias: { ...runtime.browserAlias, ...(decision ? { decision } : {}) },
+              emit: (event) => presenter.event(event),
+            });
+            data = enabled;
+            if (enabled.pause) {
+              const pause = enabled.pause;
+              const next = browserAliasNextActions(instanceId, pause);
+              presenter.report({
+                outcome: 'paused',
+                headline: `Browser enabled for assistant ${instanceId}; its web alias waits: ${pause.message}`,
+                details: [
+                  ...(pause.details ?? []).map((detail) => `  ${detail}`),
+                  ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
+                  ...nextActionLines(next.filter((action) => action.kind === 'command')),
+                ],
+              });
+              emitResult(
+                managedResult(invocation.definition.path.join(' '), {
+                  outcome: 'paused',
+                  changed,
+                  data,
+                  error: new GwsEaError(pause.code, pause.message),
+                  next_actions: next,
+                }),
+              );
+              return EXIT_CODES.paused;
+            }
           } else if (command === 'disable') {
             data = await disableBrowserCapability(paths, instanceId, dependencies);
           } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);

@@ -41,6 +41,7 @@ import {
   gwsEaBrowserPointerMigration,
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
+  gwsEaWebAliasMigration,
 } from './migration.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
 import './wiring-policy.js';
@@ -49,6 +50,7 @@ registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
 registerMigration(gwsEaExternalEmailPointerMigration);
 registerMigration(gwsEaBrowserPointerMigration);
+registerMigration(gwsEaWebAliasMigration);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.

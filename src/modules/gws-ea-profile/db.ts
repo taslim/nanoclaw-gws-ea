@@ -5,6 +5,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   EMAIL_PATTERN,
   hasControlCharacters,
+  identityMatchKey,
   normalizePrincipalEmail,
   principalAddressConflict,
   principalAddressesConflict,
@@ -526,6 +527,104 @@ export async function proposedPrincipalAddress(
   const held = await heldAddresses();
   assertMayList(email, held, await assistantWorkspaceEmail());
   return { email, held: held.includes(email) };
+}
+
+// ---------------------------------------------------------------------------
+// The web alias (KTD13)
+// ---------------------------------------------------------------------------
+
+/**
+ * The assistant's web alias as its setup stands: the alias once a probe
+ * verified it, and until then the address the operator was asked to add and
+ * the Message-ID of the latest probe sent to it.
+ */
+export interface AliasSetup {
+  readonly alias: string | null;
+  readonly candidate: string | null;
+  readonly probe_message_id: string | null;
+}
+
+export async function getAliasSetup(): Promise<AliasSetup> {
+  const row = await getDb().get<AliasSetup>(
+    `SELECT assistant_alias AS alias, alias_candidate AS candidate, alias_probe_message_id AS probe_message_id
+       FROM gws_ea_profile
+      WHERE singleton = 1`,
+  );
+  if (!row) throw new Error('GWS-EA profile singleton is missing');
+  return row;
+}
+
+/** The assistant's verified web alias, one of its own addresses (KTD14), or null until one is recorded. */
+export async function getAssistantAlias(): Promise<string | null> {
+  return (await getAliasSetup()).alias;
+}
+
+/**
+ * Make `address` the alias the operator is asked to add, or ask for none.
+ * A new candidate forgets the previous one's probe, so that probe can never
+ * record it; the same candidate keeps its probe. Refused once an alias is
+ * verified, and for the assistant's own address or one of the principal's,
+ * which no probe may reach.
+ */
+export async function proposeAliasCandidate(address: string | null): Promise<AliasSetup> {
+  const candidate = address === null ? null : normalizePrincipalEmail(address);
+  if (candidate === undefined) throw new Error(`The web alias is not an email address: ${JSON.stringify(address)}`);
+  const db = getDb();
+  return db.transaction(async () => {
+    const setup = await getAliasSetup();
+    if (setup.alias !== null) throw new Error(`The assistant's web alias is already ${setup.alias}`);
+    if (candidate !== null) {
+      const own = await assistantWorkspaceEmail();
+      if (own !== null && identityMatchKey(`email:${candidate}`) === identityMatchKey(`email:${own}`)) {
+        throw new Error(`${candidate} is the assistant's own address, not an alias`);
+      }
+      if (principalRecognizer(await heldAddresses()).has(candidate)) {
+        throw new Error(`${candidate} is the principal's address, not the assistant's`);
+      }
+    }
+    if (setup.candidate === candidate) return setup;
+    await db.run(
+      `UPDATE gws_ea_profile
+          SET alias_candidate = ?, alias_probe_message_id = NULL, updated_at = ?
+        WHERE singleton = 1`,
+      candidate,
+      new Date().toISOString(),
+    );
+    return getAliasSetup();
+  });
+}
+
+/** Record the probe sent to `candidate`, only while it is still the candidate. True when recorded. */
+export async function recordAliasProbe(candidate: string, messageId: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_profile
+        SET alias_probe_message_id = ?
+      WHERE singleton = 1 AND assistant_alias IS NULL AND alias_candidate = ?`,
+    messageId,
+    candidate,
+  );
+  return result.changes > 0;
+}
+
+/**
+ * Record `candidate` as the assistant's alias once probe `messageId` reached
+ * it: in one compare-and-set, only while it is still the candidate and that
+ * is still its probe, so a late probe for an earlier candidate records
+ * nothing. True when recorded.
+ */
+export async function recordVerifiedAlias(candidate: string, messageId: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_profile
+        SET assistant_alias = alias_candidate,
+            alias_candidate = NULL,
+            alias_probe_message_id = NULL,
+            updated_at = ?
+      WHERE singleton = 1 AND assistant_alias IS NULL AND alias_candidate = ? AND alias_probe_message_id = ?`,
+    new Date().toISOString(),
+    candidate,
+    messageId,
+  );
+  return result.changes > 0;
 }
 
 /** A verified principal identity and its direct message with the assistant. */

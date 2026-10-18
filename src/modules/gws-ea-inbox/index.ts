@@ -46,11 +46,18 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { createMeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
-import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
+import {
+  getAliasSetup,
+  getMainAgentGroupId,
+  proposeAliasCandidate,
+  syncPrincipalMembers,
+  type AliasSetup,
+} from '../gws-ea-profile/db.js';
 import { createDriveApi } from '../gws-ea-workspace/drive-api.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { HOLD_UNTIL_RELEASED, registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
+import { probeAlias } from './alias-probe.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
 import {
@@ -66,7 +73,7 @@ import {
 import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
 import { inboundPace } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
-import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
+import { activeInbox, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 import { emailWords, sendKey } from './send.js';
 import {
   clearThreadAccounts,
@@ -227,6 +234,65 @@ register({
     return undefined;
   },
   handler: async () => getInboxHealth(),
+});
+
+// The web alias's setup, for gws-ea only (KTD13): gws-ea proposes the candidate the operator adds, then the
+// running inbox probes it.
+function aliasView(setup: AliasSetup) {
+  return { alias: setup.alias, candidate: setup.candidate, probe_sent: setup.probe_message_id !== null };
+}
+
+function aliasFields(raw: Record<string, unknown>, allowed: readonly string[]): void {
+  const unknown = Object.keys(raw).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) throw new Error(`Unknown alias field: --${unknown[0]}`);
+}
+
+function aliasAddress(raw: Record<string, unknown>): string {
+  if (typeof raw.address !== 'string' || raw.address.length === 0) throw new Error('--address is required');
+  return raw.address;
+}
+
+register({
+  name: 'gws-ea-alias-get',
+  description: "Report the web alias's setup.",
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    aliasFields(raw, []);
+    return undefined;
+  },
+  handler: async () => aliasView(await getAliasSetup()),
+});
+
+register({
+  name: 'gws-ea-alias-propose',
+  description: 'Ask for an address as the web alias (--address), or for none (--none).',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    aliasFields(raw, ['address', 'none']);
+    if (raw.none === true && raw.address === undefined) return null;
+    if (raw.none !== undefined) throw new Error('Give --address or --none, not both');
+    return aliasAddress(raw);
+  },
+  handler: async (address) => aliasView(await proposeAliasCandidate(address)),
+});
+
+register({
+  name: 'gws-ea-alias-probe',
+  description: 'Read back the web alias probe from the running inbox, sending a new one first with --send.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    aliasFields(raw, ['address', 'send']);
+    if (raw.send !== undefined && raw.send !== true) throw new Error('--send takes no value');
+    return { address: aliasAddress(raw), send: raw.send === true };
+  },
+  handler: async (input) => {
+    const inbox = activeInbox();
+    if (inbox === undefined) throw new Error("The assistant's inbox is not running, so its web alias cannot be probed");
+    return probeAlias(inbox, input);
+  },
 });
 
 // ---------------------------------------------------------------------------

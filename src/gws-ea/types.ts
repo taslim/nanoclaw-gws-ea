@@ -44,6 +44,12 @@ export interface ExclusiveResourceClaims {
   gchat_events_subscription: string;
   gchat_subscriber_account: string;
   workspace_email: string;
+  /**
+   * The assistant's web alias (KTD13): the address the operator was asked to
+   * add, claimed when its setup pauses, and kept once verified. It shares the
+   * workspace email's mailbox key space, so no address is two assistants'.
+   */
+  alias_email?: string;
   onecli_project: string;
 }
 

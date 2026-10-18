@@ -22,6 +22,9 @@ import {
 } from './phases.js';
 import { onePasswordHostPaths, onePasswordInstancePaths } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { enableOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
+import type { AliasStepOptions } from './alias.js';
+import { instanceBrowserPolicyFile } from './browser-capability.js';
+import { getInstanceReservation } from './registry.js';
 import {
   createProductionProvisionSteps,
   fixPrincipalChatAddress,
@@ -2767,5 +2770,129 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     expect(paused.pause.details).toContain(
       `Then: gws-ea capabilities enable onepassword --discard-unproven ${harness.instanceId}`,
     );
+  });
+});
+
+describe('the web alias an assistant with the browser enabled gets (KTD13)', () => {
+  /** The running host's alias commands, in memory: the candidate it asked for, and whether a probe arrived. */
+  function aliasHostNcl(arrives: () => boolean) {
+    const calls: string[] = [];
+    let alias: string | null = null;
+    let candidate: string | null = null;
+    let probeSent = false;
+    const setup = () => ({ alias, candidate, probe_sent: probeSent });
+    const ncl = async (_runtime: unknown, args: readonly string[]): Promise<unknown> => {
+      calls.push(args.join(' '));
+      const value = (flag: string) => args[args.indexOf(flag) + 1];
+      switch (args.slice(0, 2).join(' ')) {
+        case 'gws-ea-profile get':
+          return {
+            assistant_display_name: 'Aya',
+            assistant_workspace_email: 'assistant@example.com',
+            principal_emails: ['principal@example.test'],
+          };
+        case 'gws-ea-alias get':
+          return setup();
+        case 'gws-ea-alias propose':
+          candidate = args.includes('--none') ? null : value('--address');
+          probeSent = false;
+          return setup();
+        case 'gws-ea-alias probe': {
+          if (value('--address') !== candidate) return { outcome: 'superseded', alias: null };
+          if (args.includes('--send')) probeSent = true;
+          if (!probeSent) return { outcome: 'not_sent', alias: null };
+          if (!arrives()) return { outcome: 'not_yet', alias: null };
+          alias = candidate;
+          candidate = null;
+          probeSent = false;
+          return { outcome: 'verified', alias };
+        }
+        default:
+          throw new Error(`unexpected ncl ${args.join(' ')}`);
+      }
+    };
+    return { ncl, calls };
+  }
+
+  async function readyAssistant(browser: boolean) {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    const runtime = harness.lastContext!.input.runtime;
+    await persistInstanceRuntime(runtime, upsertEnvVars);
+    if (browser) {
+      await mkdir(path.dirname(instanceBrowserPolicyFile(runtime)), { recursive: true, mode: 0o700 });
+      await writeFile(instanceBrowserPolicyFile(runtime), `${JSON.stringify({ schemaVersion: 1, enabled: true })}\n`, {
+        mode: 0o600,
+      });
+    }
+    return harness;
+  }
+
+  function finish(harness: ProductionHarness, alias: AliasStepOptions, events: RunEvent[] = []) {
+    return withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
+      provisionAssistantResources(
+        operation,
+        { emit: (event) => events.push(event) },
+        {},
+        {
+          sleep: async () => undefined,
+          ...alias,
+        },
+      ),
+    );
+  }
+
+  it('never pauses for an alias, nor asks the host, while the browser is disabled', async () => {
+    const harness = await readyAssistant(false);
+    const host = aliasHostNcl(() => true);
+    const events: RunEvent[] = [];
+
+    await expect(finish(harness, { ncl: host.ncl, decision: { kind: 'added' } }, events)).resolves.toEqual({
+      status: 'ready',
+    });
+    expect(host.calls).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('pauses with the candidate claimed once every step is complete, and finishes when the probe arrives', async () => {
+    const harness = await readyAssistant(true);
+    let delivered = false;
+    const host = aliasHostNcl(() => delivered);
+    const events: RunEvent[] = [];
+
+    const paused = await finish(harness, { ncl: host.ncl }, events);
+
+    expect(paused).toMatchObject({
+      status: 'paused',
+      pause: {
+        phase: 'provision_alias',
+        code: 'alias_required',
+        // "Aya" reads the same reversed, so its first letter moves to the end.
+        message:
+          'Add yaa@example.com as an alias of assistant@example.com in the Google Admin console, then confirm it.',
+        resumeFlag: '--alias-added',
+      },
+    });
+    expect(events).toContainEqual({
+      type: 'step-started',
+      step: 'provision_alias',
+      label: "Setting up the assistant's web alias…",
+    });
+    expect(
+      (await getInstanceReservation(harness.paths, harness.instanceId)).exclusive_resource_claims.alias_email,
+    ).toBe('yaa@example.com');
+
+    // Not added yet: the probe goes unanswered, and the step pauses until a later resume.
+    await expect(finish(harness, { ncl: host.ncl, decision: { kind: 'added' } })).resolves.toMatchObject({
+      status: 'paused',
+      pause: { code: 'alias_not_delivered' },
+    });
+    delivered = true;
+    await expect(finish(harness, { ncl: host.ncl })).resolves.toEqual({ status: 'ready' });
+    expect(host.calls.filter((call) => call.includes('--send'))).toHaveLength(1);
+
+    // Verified: a resume asks nothing more of the operator.
+    await expect(finish(harness, { ncl: host.ncl })).resolves.toEqual({ status: 'ready' });
   });
 });

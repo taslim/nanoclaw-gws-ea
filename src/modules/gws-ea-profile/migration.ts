@@ -8,6 +8,24 @@ export const gwsEaBrowserPointerMigration: ModuleMigration = {
   },
 };
 
+/**
+ * The assistant's web alias (KTD13): the alias once a probe verifies it, and
+ * until then the candidate the operator was asked to add and the Message-ID
+ * of the probe sent to it. All three are written together by one
+ * compare-and-set; a profile from before holds none.
+ */
+export const gwsEaWebAliasMigration: ModuleMigration = {
+  version: 5,
+  name: 'module:gws-ea-profile:web-alias',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_profile ADD COLUMN assistant_alias TEXT;
+      ALTER TABLE gws_ea_profile ADD COLUMN alias_candidate TEXT;
+      ALTER TABLE gws_ea_profile ADD COLUMN alias_probe_message_id TEXT;
+    `);
+  },
+};
+
 export const gwsEaProfileMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-profile:create-profile',

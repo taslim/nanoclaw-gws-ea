@@ -930,6 +930,74 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(chosen).toHaveLength(1);
   });
 
+  it("resumes with the operator's word on the web alias, and refuses flags that contradict it", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const decided: unknown[] = [];
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { interaction }) => {
+      decided.push(interaction.decisions.alias);
+      return { status: 'ready' };
+    };
+    const resume = async (...flags: string[]) => {
+      const io = lines();
+      const exit = await runCli(['resume', '--id', input.instance_id, ...flags], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision,
+      });
+      return { exit, err: io.err.join('\n') };
+    };
+
+    expect((await resume()).exit).toBe(0);
+    expect((await resume('--alias-added')).exit).toBe(0);
+    expect((await resume('--alias-taken')).exit).toBe(0);
+    expect((await resume('--alias', 'Juno.Web')).exit).toBe(0);
+    expect((await resume('--alias', 'juno.web', '--alias-added')).exit).toBe(0);
+    expect(decided).toEqual([
+      undefined,
+      { kind: 'added' },
+      { kind: 'taken' },
+      { kind: 'named', name: 'Juno.Web' },
+      { kind: 'added', name: 'juno.web' },
+    ]);
+
+    const contradicted = await resume('--alias-taken', '--alias-added');
+    expect(contradicted.exit).not.toBe(0);
+    expect(contradicted.err).toContain('--alias-taken cannot be combined');
+    const role = await resume('--alias', 'postmaster');
+    expect(role.exit).not.toBe(0);
+    expect(role.err).toContain('role address');
+    expect(decided).toHaveLength(5);
+  });
+
+  it('names the web alias flag a pause waits on in the resume command', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const io = lines();
+    const pause: ProvisionHumanPause = {
+      kind: 'human-action',
+      phase: 'provision_alias',
+      code: 'alias_required',
+      message: 'Add onuj@example.test as an alias of juno@example.test in the Google Admin console, then confirm it.',
+      details: ['Add the alternate email onuj on example.test, then Save'],
+      actionUrl: 'https://admin.google.com/ac/users',
+      resumeFlag: '--alias-added',
+    };
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision: async () => ({ status: 'paused', pause }),
+      }),
+    ).toBe(10);
+    expect(io.out).toContain(`Paused at provision_alias: ${pause.message}`);
+    expect(io.out).toContain('Open: https://admin.google.com/ac/users');
+    expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id} --alias-added`);
+  });
+
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());

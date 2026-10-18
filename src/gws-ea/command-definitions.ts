@@ -113,6 +113,12 @@ const googleClient: OptionDefinition = {
   ...value('google-client-file', 'file', "Desktop OAuth client downloaded for the assistant's Google sign-in."),
   valueKind: 'file',
 };
+/** The operator's word on the assistant's web alias (KTD13), wherever its setup step runs. */
+const aliasOptions: readonly OptionDefinition[] = [
+  flag('alias-added', 'Confirm the offered web alias is added in the Google Admin console; sends it a test message.'),
+  flag('alias-taken', 'The Admin console refused the offered web alias as already in use; offer the next name.'),
+  value('alias', 'name', "Use this name, or whole address, for the assistant's web alias instead of the offered one."),
+];
 const managedModes = ['human', 'json'] as const;
 const nativeResult: ResultSchema = {
   type: 'string',
@@ -212,12 +218,16 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       flag('chat-configured', 'Confirm the offered Chat configuration step.'),
       value('billing-account', 'id', 'Billing account offered by a provisioning pause.'),
       googleClient,
+      ...aliasOptions,
       secrets,
     ],
-    effects: ['Continues journaled provisioning and its pending human step.'],
+    effects: [
+      'Continues journaled provisioning and its pending human step.',
+      "Then sets up an enabled browser's web alias, verifying it with a test message once it is added.",
+    ],
     prerequisites: assistantPrerequisites,
     recovery: ["Rerun resume with the pause's supplied inputs, or remove the partially created assistant."],
-    examples: ['gws-ea resume --id <instance_id> --chat-configured'],
+    examples: ['gws-ea resume --id <instance_id> --chat-configured', 'gws-ea resume --id <instance_id> --alias-added'],
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('resume')),
   },
@@ -519,7 +529,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             : command === 'enable'
               ? 'Enable one assistant’s host browser; it signs in with emailed codes and links, and its 1Password vault once provisioned.'
               : 'Disable one assistant’s browser.',
-      options: [id],
+      options: command === 'enable' ? [id, ...aliasOptions] : [id],
       effects:
         command === 'show' || command === 'check'
           ? [
@@ -531,7 +541,10 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
                 : []),
             ]
           : command === 'enable'
-            ? ['Writes the enabled owner-only instance policy; host reconciliation activates the browser.']
+            ? [
+                'Writes the enabled owner-only instance policy; host reconciliation activates the browser.',
+                "Then sets up the assistant's web alias: pauses until it is added in the Google Admin console, and verifies it with a test message.",
+              ]
             : [
                 'Writes disabled policy; the host stops jobs and withdraws cards on reconciliation, including after restart.',
               ],
@@ -542,7 +555,10 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       recovery: [
         'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
       ],
-      examples: [`gws-ea capabilities ${command} browser --id <instance_id>`],
+      examples: [
+        `gws-ea capabilities ${command} browser --id <instance_id>`,
+        ...(command === 'enable' ? ['gws-ea capabilities enable browser --id <instance_id> --alias-added'] : []),
+      ],
       outputModes: managedModes,
       resultSchema: managedResultSchema(
         command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,

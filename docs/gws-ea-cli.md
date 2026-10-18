@@ -9,8 +9,9 @@ for a command's flags, scope, effects, prerequisites, recovery, and examples.
 `gws-ea help capabilities install` and `gws-ea capabilities install --help`
 print identical help. Invalid paths remain errors even with `--help`.
 See [the voice guide](gws-ea-voice.md) for optional voice installation,
-activation, and health checks, and [1Password vaults](#1password-vaults) for
-assistants' saved logins.
+activation, and health checks, [1Password vaults](#1password-vaults) for
+assistants' saved logins, and [web alias](#web-alias) for the address an
+assistant's browser uses.
 
 ## Find and inspect an assistant
 
@@ -167,6 +168,46 @@ receipt keeps their IDs after the assistant is gone, and the names of any vault
 or runtime service account whose creation was never proven; once you have
 revoked or deleted them, close it with
 `gws-ea remove --id <full-id> --yes --abandon onepassword`.
+
+## Web alias
+
+```sh
+gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef
+# Once the offered alias is added in the Google Admin console:
+gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef --alias-added
+```
+
+An assistant whose browser is enabled has one web alias: its address for
+everything it does on the web in its own name, guest bookings and checkouts
+made for the principal included. The alias is the assistant's name,
+lowercased, in ASCII, without spaces, and reversed (`Juno` gives `onuj`). A
+name that reads the same reversed moves its first letter to the end instead
+(`Anna` gives `nnaa`). Role addresses such as `admin` or `postmaster` are
+never offered, and later candidates are numbered (`onuj2`, `onuj3`).
+
+`capabilities enable browser`, and `create` or `resume` once the browser is
+enabled, pause after every other step with the candidate and where to add
+it: the assistant's account in the Admin console (Directory > Users), then
+User information > Alternate email addresses (email aliases). The candidate
+is claimed on this machine first, so no two assistants are asked for the
+same address. Continue the same command with one of:
+
+- `--alias-added`: the alias is added. The assistant sends a short,
+  self-explaining test message to it and reads it back. An arrival records
+  the alias. A bounce means it is not added yet, and a copy through a Google
+  Group is refused. A new alias can take up to 24 hours to receive mail; run
+  the command again later without a flag to read the same message back.
+- `--alias-taken`: the Admin console says the address is in use; the next
+  candidate is offered.
+- `--alias <name>`: a name, or whole address, of your own; with
+  `--alias-added` once it is added. A name that gives no candidate, such as
+  one without ASCII letters, waits for this.
+
+Until the alias is verified, `status` reports setup as incomplete: its
+`web_alias` probe is degraded, naming the address it waits on and the command
+that continues. The alias is set up through the running assistant, so a
+stopped one pauses until `gws-ea start`. A recorded alias is not changed by
+these flags.
 
 ## Automation and streams
 

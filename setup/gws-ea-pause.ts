@@ -2,19 +2,21 @@
  * Attending a gws-ea pause at the terminal, so a run can go on in the same
  * process: a choice the pause offers, such as the billing account to link, is
  * made from its list; the Google Chat API configuration is confirmed in place;
- * the assistant's downloaded Google client is located; and what the person was
- * asked to do is waited for. Anything else stops, and the CLI reports how to
- * resume.
+ * the assistant's downloaded Google client is located; the web alias is
+ * confirmed added, taken, or named; and what the person was asked to do is
+ * waited for. Anything else stops, and the CLI reports how to resume.
  */
 import * as p from '@clack/prompts';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { parseAliasName } from '../src/gws-ea/alias.js';
 import { decisionForChoice, type PauseResponse } from '../src/gws-ea/events.js';
 import { GOOGLE_CLIENT_FILE_FLAG } from '../src/gws-ea/google-connection.js';
 import type { ProvisionHumanPause } from '../src/gws-ea/phases.js';
 import { pollUntil } from '../src/gws-ea/poll.js';
+import { GwsEaError } from '../src/gws-ea/types.js';
 
 const WATCH_INTERVAL_MS = 3_000;
 const WATCH_LIMIT_MS = 30 * 60_000;
@@ -76,6 +78,80 @@ async function askClientFile(prompts: PausePrompts, signal: AbortSignal): Promis
   return answer.trim() ? typedPath(answer.trim()) : '';
 }
 
+/** What the operator can say at a web alias pause, by its code; the one asking for a name takes it at once. */
+const ALIAS_ANSWERS: Readonly<Record<string, readonly AliasAnswer[]>> = {
+  alias_required: ['added', 'taken', 'named'],
+  alias_not_added: ['added', 'taken', 'named'],
+  alias_is_group: ['taken', 'named', 'added'],
+  alias_not_delivered: ['check', 'taken', 'named'],
+};
+type AliasAnswer = 'added' | 'taken' | 'named' | 'check';
+const ALIAS_LABELS: Readonly<Record<AliasAnswer, string>> = {
+  added: 'It is added',
+  taken: 'The Admin console says it is already in use',
+  named: 'Use a name of my own',
+  check: 'Check again',
+};
+
+/** The operator's own alias name, asked until the Admin console could take it; undefined when they cancel. */
+async function askAliasName(prompts: PausePrompts, signal: AbortSignal): Promise<string | undefined> {
+  for (;;) {
+    const answer = await prompts.text({ message: "The assistant's web alias", placeholder: 'onuj', signal });
+    if (prompts.isCancel(answer) || typeof answer !== 'string') return undefined;
+    const name = answer.trim();
+    try {
+      parseAliasName(name);
+      return name;
+    } catch (error) {
+      if (!(error instanceof GwsEaError)) throw error;
+      prompts.info(error.message);
+    }
+  }
+}
+
+/**
+ * A web alias pause (KTD13): where to add it, then what the operator says,
+ * as the decision `--alias-added`, `--alias-taken` or `--alias <name>`
+ * records. Checking again for a test message decides nothing, so a probe
+ * already sent is read back rather than sent again.
+ */
+async function attendAliasPause(
+  pause: ProvisionHumanPause,
+  shown: string,
+  prompts: PausePrompts,
+  signal: AbortSignal,
+): Promise<PauseResponse> {
+  const named = async (): Promise<PauseResponse> => {
+    const name = await askAliasName(prompts, signal);
+    return name === undefined ? STOP : { kind: 'continue', decisions: { alias: { kind: 'named', name } } };
+  };
+  const context = [...(pause.details ?? []), ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : [])];
+  if (pause.code === 'alias_name_required') {
+    prompts.note(shown, "The assistant's web alias");
+    return named();
+  }
+  const answers = ALIAS_ANSWERS[pause.code];
+  if (answers === undefined) return STOP;
+  if (context.length > 0) prompts.note(context.join('\n'), "The assistant's web alias");
+  const selected = await prompts.select({
+    message: pause.message,
+    options: answers.map((answer) => ({ value: answer, label: ALIAS_LABELS[answer] })),
+    signal,
+  });
+  switch (selected) {
+    case 'added':
+      return { kind: 'continue', decisions: { alias: { kind: 'added' } } };
+    case 'taken':
+      return { kind: 'continue', decisions: { alias: { kind: 'taken' } } };
+    case 'named':
+      return named();
+    case 'check':
+      return { kind: 'continue', decisions: { alias: undefined } };
+    default:
+      return STOP;
+  }
+}
+
 async function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
   await delay(milliseconds, undefined, { signal }).catch((error: unknown) => {
     if (!signal?.aborted) throw error;
@@ -129,6 +205,8 @@ export async function attendPause(
       decisions: { chatConfigured: true, ...(clientFile ? { googleClientFile: clientFile } : {}) },
     };
   }
+
+  if (pause.phase === 'provision_alias') return attendAliasPause(pause, shown, prompts, signal);
 
   if (pause.code === 'google_client_required') {
     prompts.note(shown, "The assistant's Google sign-in client");
