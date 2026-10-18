@@ -22,6 +22,7 @@ await loadToolModule('time', () => import('./time.js'));
 // request_status and main's calendar tools their own: their tests load them
 // ahead of this barrel.
 await import('./gws-ea-email.js');
+await import('./gws-ea-chat.js');
 await import('./calendar-write.js');
 await import('./request-status.js');
 await import('./gws-ea-browser.js');

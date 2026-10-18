@@ -237,6 +237,19 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).not.toContain('# NanoClaw Module: gws-ea-email-external');
   });
 
+  it('teaches main the tool that links WhatsApp from the principal conversation', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    const groupDir = path.join(TEST_ROOT, main.folder);
+
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+
+    expect(document).toContain('# NanoClaw Module: gws-ea-chat\n');
+    expect(document).toContain('whatsapp_link');
+  });
+
   it('teaches where each booking goes, what it holds about the principal, and what unconfirmed mail in their name is', async () => {
     const main = group('ag-main');
     await createGroup(main);

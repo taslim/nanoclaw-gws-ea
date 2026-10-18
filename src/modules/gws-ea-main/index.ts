@@ -8,6 +8,7 @@
  */
 import path from 'node:path';
 
+import { registerCapability } from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
@@ -18,6 +19,13 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
+
+export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
+registerCapability(MAIN_CHAT_CAPABILITY, {
+  description: 'whatsapp_link and chat-addressed host actions for canonical main',
+  default: 'on',
+  instructions: [MAIN_CHAT_CAPABILITY],
+});
 
 /**
  * The shared skills (`container/skills/`) `main` loads: web research and the

@@ -50,6 +50,8 @@ export interface ExclusiveResourceClaims {
    * workspace email's mailbox key space, so no address is two assistants'.
    */
   alias_email?: string;
+  /** This assistant alone may link this E.164 WhatsApp account. */
+  whatsapp_number?: string;
   onecli_project: string;
 }
 
@@ -127,4 +129,13 @@ export class GwsEaError extends Error {
     this.code = code;
     this.details = options.details;
   }
+}
+
+/** The running host’s account observation, also returned by the operator command socket. */
+export interface WhatsAppCommandData {
+  readonly state: 'unlinked' | 'linking' | 'connected' | 'needs-relink';
+  readonly number?: string;
+  readonly principal?: { readonly lid: string; readonly phoneJid?: string };
+  readonly bindingPending?: boolean;
+  readonly pairingCode?: string;
 }

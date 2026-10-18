@@ -17,6 +17,11 @@ export interface WhatsAppPerson {
 export interface WhatsAppLink {
   readonly schema_version: 1;
   readonly state: 'linking' | 'connected' | 'needs-relink';
+  readonly number?: string;
+  readonly principalNumber?: string;
+  readonly pairing?: { readonly expiresAt: number; readonly previousState: 'needs-relink' | null };
+  readonly binding?: { readonly code: string; readonly expiresAt: number };
+  readonly outage?: { readonly id: string; readonly notified?: boolean };
   readonly account?: WhatsAppPerson;
   readonly principal?: WhatsAppPerson;
   readonly error?: { readonly message: string; readonly at: string };
@@ -101,6 +106,24 @@ export async function readWhatsAppLink(directory: string): Promise<WhatsAppLink 
     !isRecord(value) ||
     value.schema_version !== 1 ||
     !['linking', 'connected', 'needs-relink'].includes(String(value.state)) ||
+    (value.number !== undefined && (typeof value.number !== 'string' || !/^\+[1-9]\d{6,14}$/u.test(value.number))) ||
+    (value.principalNumber !== undefined &&
+      (typeof value.principalNumber !== 'string' || !/^\+[1-9]\d{6,14}$/u.test(value.principalNumber))) ||
+    (value.pairing !== undefined &&
+      (!isRecord(value.pairing) ||
+        typeof value.pairing.expiresAt !== 'number' ||
+        !Number.isFinite(value.pairing.expiresAt) ||
+        ![null, 'needs-relink'].includes(value.pairing.previousState as null | 'needs-relink'))) ||
+    (value.binding !== undefined &&
+      (!isRecord(value.binding) ||
+        typeof value.binding.code !== 'string' ||
+        !/^[A-Z0-9-]{8,32}$/u.test(value.binding.code) ||
+        typeof value.binding.expiresAt !== 'number' ||
+        !Number.isFinite(value.binding.expiresAt))) ||
+    (value.outage !== undefined &&
+      (!isRecord(value.outage) ||
+        typeof value.outage.id !== 'string' ||
+        (value.outage.notified !== undefined && typeof value.outage.notified !== 'boolean'))) ||
     (value.account !== undefined && !person(value.account)) ||
     (value.principal !== undefined && !person(value.principal)) ||
     (value.error !== undefined &&

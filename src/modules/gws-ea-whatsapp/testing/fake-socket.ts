@@ -28,6 +28,9 @@ export class FakeSocket implements WhatsAppSocket {
   readonly user = { id: '15550000000:1@s.whatsapp.net', lid: '999000:1@lid', name: 'Assistant' };
   sendError?: Error;
   ended = false;
+  profileName?: string;
+  profileAbout?: string;
+  loggedOut = false;
   pairingCode = '12345678';
 
   readonly ev: BaileysEventEmitter = {
@@ -131,6 +134,22 @@ export class FakeSocket implements WhatsAppSocket {
           content: { tag: 'participant', attrs: { jid: person } },
         },
     );
+  }
+  async updateProfileName(name: string): Promise<void> {
+    this.profileName = name;
+  }
+  async updateProfileStatus(about: string): Promise<void> {
+    this.profileAbout = about;
+  }
+  async logout(): Promise<void> {
+    this.loggedOut = true;
+    await this.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: {
+        error: Object.assign(new Error('logged out'), { output: { statusCode: 401 } }),
+        date: new Date(),
+      },
+    });
   }
   async end(_error: Error | undefined): Promise<void> {
     this.ended = true;

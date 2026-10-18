@@ -1,6 +1,7 @@
-import { BufferJSON, proto, type WAMessage } from '@whiskeysockets/baileys';
 import Database from 'better-sqlite3';
+import { BufferJSON, proto, type WAMessage } from '@whiskeysockets/baileys';
 
+import { OutboundRefusedError } from '../../delivery.js';
 import { privateDatabaseFile } from './paths.js';
 
 export interface IndexedMessage {
@@ -25,6 +26,7 @@ interface MessageRow {
 }
 export interface PendingSend {
   readonly rowId: string;
+  readonly account: string;
   readonly chat: string;
   readonly createdAt: number;
   readonly accepted: boolean;
@@ -32,6 +34,7 @@ export interface PendingSend {
 }
 interface SendRow {
   row_id: string;
+  account: string;
   chat: string;
   created_at: number;
   accepted: number;
@@ -40,31 +43,36 @@ interface SendRow {
 
 export class WhatsAppIndex {
   private readonly db: Database.Database;
-  constructor(directory: string) {
+  constructor(
+    directory: string,
+    private readonly currentAccount: () => string,
+  ) {
     this.db = new Database(privateDatabaseFile(directory, 'messages.sqlite'));
     this.db.pragma('journal_mode = DELETE');
     this.db.pragma('synchronous = FULL');
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS intake (chat TEXT NOT NULL,id TEXT NOT NULL,raw TEXT NOT NULL,PRIMARY KEY(chat,id));
-      CREATE TABLE IF NOT EXISTS messages (
-        chat TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,from_me INTEGER NOT NULL,
-        forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,
-        PRIMARY KEY(chat,id)
-      );
+      CREATE TABLE IF NOT EXISTS intake(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,raw TEXT NOT NULL,PRIMARY KEY(account,chat,id));
+      CREATE TABLE IF NOT EXISTS held_intake(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,lid TEXT NOT NULL,PRIMARY KEY(account,chat,id));
+      CREATE TABLE IF NOT EXISTS messages(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,from_me INTEGER NOT NULL,forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,PRIMARY KEY(account,chat,id));
       CREATE INDEX IF NOT EXISTS messages_prune ON messages(at) WHERE from_me=0 AND routed=1;
-      CREATE TABLE IF NOT EXISTS pending_sends (
-        row_id TEXT PRIMARY KEY,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS requests (message_id TEXT PRIMARY KEY, chat TEXT NOT NULL, question_id TEXT NOT NULL, posted_at TEXT);
-      CREATE TABLE IF NOT EXISTS aliases (phone TEXT PRIMARY KEY,lid TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS names (jid TEXT PRIMARY KEY,name TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS pending_sends(row_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS requests(account TEXT NOT NULL,message_id TEXT NOT NULL,chat TEXT NOT NULL,question_id TEXT NOT NULL,posted_at TEXT,PRIMARY KEY(account,message_id));
+      CREATE TABLE IF NOT EXISTS aliases(account TEXT NOT NULL,phone TEXT NOT NULL,lid TEXT NOT NULL,PRIMARY KEY(account,phone),UNIQUE(account,lid));
+      CREATE TABLE IF NOT EXISTS names(account TEXT NOT NULL,jid TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(account,jid));
     `);
   }
-
+  private account(): string {
+    const account = this.currentAccount();
+    if (!/^\d+@s\.whatsapp\.net$/u.test(account))
+      throw new Error('WhatsApp message state requires the linked phone account');
+    return account;
+  }
   message(chat: string, id: string): IndexedMessage | undefined {
     const row = this.db
-      .prepare('SELECT chat,id,sender,from_me,forwarded,text,at,routed FROM messages WHERE chat=? AND id=?')
-      .get(chat, id) as MessageRow | undefined;
+      .prepare(
+        'SELECT chat,id,sender,from_me,forwarded,text,at,routed FROM messages WHERE account=? AND chat=? AND id=?',
+      )
+      .get(this.account(), chat, id) as MessageRow | undefined;
     return row === undefined
       ? undefined
       : {
@@ -78,13 +86,13 @@ export class WhatsAppIndex {
           routed: row.routed === 1,
         };
   }
-
   receive(message: IndexedMessage, raw: WAMessage): void {
     this.db
       .prepare(
-        'INSERT INTO messages(chat,id,sender,from_me,forwarded,text,at,routed,raw) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(chat,id) DO NOTHING',
+        'INSERT INTO messages(account,chat,id,sender,from_me,forwarded,text,at,routed,raw) VALUES(?,?,?,?,?,?,?,?,0,?) ON CONFLICT(account,chat,id) DO NOTHING',
       )
       .run(
+        this.account(),
         message.chat,
         message.id,
         message.sender,
@@ -92,7 +100,6 @@ export class WhatsAppIndex {
         Number(message.forwarded),
         message.text,
         message.at,
-        0,
         JSON.stringify(raw, BufferJSON.replacer),
       );
   }
@@ -100,48 +107,75 @@ export class WhatsAppIndex {
     if (!raw.key.remoteJid || !raw.key.id || raw.key.fromMe || !raw.message || raw.key.remoteJid.endsWith('@broadcast'))
       return;
     this.db
-      .prepare('INSERT INTO intake(chat,id,raw) VALUES(?,?,?) ON CONFLICT(chat,id) DO NOTHING')
-      .run(raw.key.remoteJid, raw.key.id, JSON.stringify(raw, BufferJSON.replacer));
+      .prepare('INSERT INTO intake(account,chat,id,raw) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO NOTHING')
+      .run(this.account(), raw.key.remoteJid, raw.key.id, JSON.stringify(raw, BufferJSON.replacer));
   }
   finishIntake(rawChat: string, id: string): void {
-    this.db.prepare('DELETE FROM intake WHERE chat=? AND id=?').run(rawChat, id);
+    const account = this.account();
+    this.db.prepare('DELETE FROM intake WHERE account=? AND chat=? AND id=?').run(account, rawChat, id);
+    this.db.prepare('DELETE FROM held_intake WHERE account=? AND chat=? AND id=?').run(account, rawChat, id);
   }
   routed(chat: string, id: string, rawChat = chat): void {
     this.db.transaction(() => {
-      this.db.prepare('UPDATE messages SET routed=1,raw=NULL WHERE chat=? AND id=?').run(chat, id);
+      this.db
+        .prepare('UPDATE messages SET routed=1,raw=NULL WHERE account=? AND chat=? AND id=?')
+        .run(this.account(), chat, id);
       this.finishIntake(rawChat, id);
     })();
   }
   unrouted(): WAMessage[] {
-    const rows = this.db.prepare('SELECT raw FROM intake ORDER BY rowid').all() as { raw: string }[];
+    const rows = this.db
+      .prepare(
+        'SELECT i.raw FROM intake i WHERE i.account=? AND NOT EXISTS(SELECT 1 FROM held_intake h WHERE h.account=i.account AND h.chat=i.chat AND h.id=i.id) ORDER BY i.rowid',
+      )
+      .all(this.account()) as { raw: string }[];
     return rows.map(({ raw }) => {
       const parsed = proto.WebMessageInfo.fromObject(JSON.parse(raw, BufferJSON.reviver) as Record<string, unknown>);
       if (!parsed.key) throw new Error('WhatsApp inbox record has no message key');
       return { ...parsed, key: parsed.key };
     });
   }
+  hold(rawChat: string, id: string, lid: string): void {
+    this.db
+      .prepare('INSERT INTO held_intake(account,chat,id,lid) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO NOTHING')
+      .run(this.account(), rawChat, id, lid);
+  }
+  releaseHeld(lid: string): void {
+    this.db.prepare('DELETE FROM held_intake WHERE account=? AND lid=?').run(this.account(), lid);
+  }
+  /** Abandon an unlinked account's queued input after transport quiescence, retaining handed-off message receipts. */
+  discardUnrouted(): void {
+    const account = this.account();
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM intake WHERE account=?').run(account);
+      this.db.prepare('DELETE FROM held_intake WHERE account=?').run(account);
+      this.db.prepare('DELETE FROM messages WHERE account=? AND from_me=0 AND routed=0').run(account);
+    })();
+  }
   wireMessage(chat: string, id: string): proto.IMessage | undefined {
-    const row = this.db.prepare('SELECT wire,text FROM messages WHERE chat=? AND id=?').get(chat, id) as
-      | { wire: string | null; text: string }
-      | undefined;
+    const row = this.db
+      .prepare('SELECT wire,text FROM messages WHERE account=? AND chat=? AND id=?')
+      .get(this.account(), chat, id) as { wire: string | null; text: string } | undefined;
     if (!row) return undefined;
     return row.wire
       ? proto.Message.fromObject(JSON.parse(row.wire, BufferJSON.reviver) as Record<string, unknown>)
       : { conversation: row.text };
   }
   edit(chat: string, id: string, text: string): void {
-    this.db.prepare('UPDATE messages SET text=? WHERE chat=? AND id=?').run(text, chat, id);
+    this.db
+      .prepare('UPDATE messages SET text=? WHERE account=? AND chat=? AND id=?')
+      .run(text, this.account(), chat, id);
   }
   sent(message: Omit<IndexedMessage, 'routed'>, wire?: proto.IMessage | null): void {
     this.db
       .prepare(
-        'INSERT INTO messages(chat,id,sender,from_me,forwarded,text,at,routed,wire) VALUES(?,?,?,?,?,?,?,1,?) ON CONFLICT(chat,id) DO UPDATE SET sender=excluded.sender,text=excluded.text,from_me=1,routed=1,raw=NULL,wire=excluded.wire',
+        'INSERT INTO messages(account,chat,id,sender,from_me,forwarded,text,at,routed,wire) VALUES(?,?,?,?,1,?,?,?,1,?) ON CONFLICT(account,chat,id) DO UPDATE SET sender=excluded.sender,text=excluded.text,from_me=1,routed=1,raw=NULL,wire=excluded.wire',
       )
       .run(
+        this.account(),
         message.chat,
         message.id,
         message.sender,
-        1,
         Number(message.forwarded),
         message.text,
         message.at,
@@ -152,11 +186,10 @@ export class WhatsAppIndex {
     this.db.prepare('DELETE FROM messages WHERE from_me=0 AND routed=1 AND at<?').run(now - 30 * 24 * 60 * 60 * 1000);
   }
   deleteChat(chat: string): void {
+    const account = this.account();
     this.db.transaction(() => {
-      this.db.prepare('DELETE FROM messages WHERE chat=?').run(chat);
-      this.db.prepare('DELETE FROM pending_sends WHERE chat=?').run(chat);
-      this.db.prepare('DELETE FROM requests WHERE chat=?').run(chat);
-      this.db.prepare('DELETE FROM intake WHERE chat=?').run(chat);
+      for (const table of ['messages', 'pending_sends', 'requests', 'intake', 'held_intake'])
+        this.db.prepare(`DELETE FROM ${table} WHERE account=? AND chat=?`).run(account, chat);
     })();
   }
   pending(rowId: string): PendingSend | undefined {
@@ -165,6 +198,7 @@ export class WhatsAppIndex {
       ? undefined
       : {
           rowId: row.row_id,
+          account: row.account,
           chat: row.chat,
           createdAt: row.created_at,
           accepted: row.accepted === 1,
@@ -172,14 +206,20 @@ export class WhatsAppIndex {
         };
   }
   prepare(rowId: string, chat: string, messageId: string, at: number): PendingSend {
+    const account = this.account();
     this.db
       .prepare(
-        'INSERT INTO pending_sends(row_id,chat,message_id,created_at) VALUES(?,?,?,?) ON CONFLICT(row_id) DO NOTHING',
+        'INSERT INTO pending_sends(row_id,account,chat,message_id,created_at) VALUES(?,?,?,?,?) ON CONFLICT(row_id) DO NOTHING',
       )
-      .run(rowId, chat, messageId, at);
+      .run(rowId, account, chat, messageId, at);
     const held = this.pending(rowId);
     if (!held || held.chat !== chat || held.messageId !== messageId)
       throw new Error('WhatsApp outbound row changed address');
+    if (held.account !== account && !held.accepted)
+      throw new OutboundRefusedError(
+        'gws-ea-whatsapp:account-changed',
+        'This message was queued for a different WhatsApp account. Check whether it is still wanted before sending a new message.',
+      );
     return held;
   }
   accepted(rowId: string): void {
@@ -189,28 +229,48 @@ export class WhatsAppIndex {
     this.db.prepare('DELETE FROM pending_sends WHERE row_id=?').run(rowId);
   }
   alias(lid: string, phone: string): void {
-    this.db
-      .prepare('INSERT INTO aliases(phone,lid) VALUES(?,?) ON CONFLICT(phone) DO UPDATE SET lid=excluded.lid')
-      .run(phone, lid);
+    const account = this.account();
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM aliases WHERE account=? AND lid=? AND phone<>?').run(account, lid, phone);
+      this.db
+        .prepare(
+          'INSERT INTO aliases(account,phone,lid) VALUES(?,?,?) ON CONFLICT(account,phone) DO UPDATE SET lid=excluded.lid',
+        )
+        .run(account, phone, lid);
+    })();
   }
   lid(phone: string): string | undefined {
-    return (this.db.prepare('SELECT lid FROM aliases WHERE phone=?').get(phone) as { lid: string } | undefined)?.lid;
+    return (
+      this.db.prepare('SELECT lid FROM aliases WHERE account=? AND phone=?').get(this.account(), phone) as
+        | { lid: string }
+        | undefined
+    )?.lid;
   }
   phone(lid: string): string | undefined {
-    return (this.db.prepare('SELECT phone FROM aliases WHERE lid=?').get(lid) as { phone: string } | undefined)?.phone;
+    return (
+      this.db.prepare('SELECT phone FROM aliases WHERE account=? AND lid=?').get(this.account(), lid) as
+        | { phone: string }
+        | undefined
+    )?.phone;
   }
   name(jid: string): string | undefined {
-    return (this.db.prepare('SELECT name FROM names WHERE jid=?').get(jid) as { name: string } | undefined)?.name;
+    return (
+      this.db.prepare('SELECT name FROM names WHERE account=? AND jid=?').get(this.account(), jid) as
+        | { name: string }
+        | undefined
+    )?.name;
   }
   rememberName(jid: string, name: string): void {
     this.db
-      .prepare('INSERT INTO names(jid,name) VALUES(?,?) ON CONFLICT(jid) DO UPDATE SET name=excluded.name')
-      .run(jid, name);
+      .prepare(
+        'INSERT INTO names(account,jid,name) VALUES(?,?,?) ON CONFLICT(account,jid) DO UPDATE SET name=excluded.name',
+      )
+      .run(this.account(), jid, name);
   }
   request(messageId: string): { questionId: string; platformId: string; postedAt?: string } | undefined {
-    const row = this.db.prepare('SELECT question_id,chat,posted_at FROM requests WHERE message_id=?').get(messageId) as
-      | { question_id: string; chat: string; posted_at: string | null }
-      | undefined;
+    const row = this.db
+      .prepare('SELECT question_id,chat,posted_at FROM requests WHERE account=? AND message_id=?')
+      .get(this.account(), messageId) as { question_id: string; chat: string; posted_at: string | null } | undefined;
     return row
       ? { questionId: row.question_id, platformId: row.chat, ...(row.posted_at ? { postedAt: row.posted_at } : {}) }
       : undefined;
@@ -218,16 +278,18 @@ export class WhatsAppIndex {
   requestMessage(questionId: string, chat: string): string | undefined {
     return (
       this.db
-        .prepare('SELECT message_id FROM requests WHERE question_id=? AND chat=? ORDER BY rowid DESC LIMIT 1')
-        .get(questionId, chat) as { message_id: string } | undefined
+        .prepare(
+          'SELECT message_id FROM requests WHERE account=? AND question_id=? AND chat=? ORDER BY rowid DESC LIMIT 1',
+        )
+        .get(this.account(), questionId, chat) as { message_id: string } | undefined
     )?.message_id;
   }
   rememberRequest(messageId: string, chat: string, questionId: string, postedAt?: string): void {
     this.db
       .prepare(
-        'INSERT INTO requests(message_id,chat,question_id,posted_at) VALUES(?,?,?,?) ON CONFLICT(message_id) DO NOTHING',
+        'INSERT INTO requests(account,message_id,chat,question_id,posted_at) VALUES(?,?,?,?,?) ON CONFLICT(account,message_id) DO NOTHING',
       )
-      .run(messageId, chat, questionId, postedAt ?? null);
+      .run(this.account(), messageId, chat, questionId, postedAt ?? null);
   }
   close(): void {
     this.db.close();

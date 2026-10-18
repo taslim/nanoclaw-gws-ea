@@ -134,7 +134,7 @@ describe('WhatsApp transport lifecycle', () => {
       type: 'notify',
       messages: [incoming('queued-second'), incoming('queued-third')],
     });
-    const disk = new WhatsAppIndex(directory);
+    const disk = new WhatsAppIndex(directory, () => '15550000000@s.whatsapp.net');
     try {
       expect(disk.unrouted().map((message) => message.key.id)).toEqual(['held-first', 'queued-second', 'queued-third']);
     } finally {

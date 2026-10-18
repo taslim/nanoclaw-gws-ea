@@ -219,7 +219,7 @@ it('records a consumed binding DM and a durably replayed DM as real 1:1 replies'
     unregister();
   }
   await adapter.deliver('12000@lid', null, message, 'consumed-known');
-  const index = new WhatsAppIndex(h.directory);
+  const index = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
   index.intake(incoming('replayed-direct', 'Hello', { key: { id: 'replayed-direct', remoteJid: '13000@lid' } }));
   index.close();
   await adapter.teardown();

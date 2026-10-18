@@ -3047,3 +3047,39 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     expect(io.err).toEqual([]);
   });
 });
+
+describe('gws-ea WhatsApp operator commands', () => {
+  it.each(['link', 'unlink', 'status'] as const)(
+    'runs whatsapp %s through only the selected assistant’s host command socket',
+    async (operation) => {
+      const paths = await testPaths();
+      const assistant = await createdAssistant(paths, 35001);
+      const io = lines();
+      const ncl = vi.fn(async () =>
+        operation === 'link'
+          ? { state: 'linking', number: '+15550000000', pairingCode: '12345678' }
+          : {
+              state: operation === 'unlink' ? 'unlinked' : 'needs-relink',
+              ...(operation === 'status' ? { number: '+15550000000' } : {}),
+            },
+      );
+      const flags = operation === 'link' ? ['--number', '+15550000000', '--principal-number', '+447700900123'] : [];
+      expect(
+        await runCli(['whatsapp', operation, '--id', assistant.instance_id, ...flags, '--json'], {
+          paths,
+          ...io.runtime,
+          whatsappNcl: ncl,
+        }),
+      ).toBe(0);
+      expect(ncl).toHaveBeenCalledWith(expect.objectContaining({ instance_id: assistant.instance_id }), [
+        'gws-ea-whatsapp',
+        operation,
+        ...flags,
+      ]);
+      expectResultContract(`whatsapp ${operation}`, JSON.parse(io.out.join('\n')));
+      expect(JSON.parse(io.out.join('\n')).data.state).toBe(
+        operation === 'link' ? 'linking' : operation === 'unlink' ? 'unlinked' : 'needs-relink',
+      );
+    },
+  );
+});

@@ -21,7 +21,7 @@ describe('durable WhatsApp outbound rows', () => {
     await expect(adapter.deliver('team@g.us', null, message, 'row-before-send')).rejects.toBeInstanceOf(
       ChannelNotConnectedError,
     );
-    const disk = new WhatsAppIndex(h.directory);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.pending('row-before-send')).toMatchObject({ accepted: false, chat: 'team@g.us' });
     disk.close();
     expect(h.socket().sends).toEqual([]);
@@ -49,11 +49,11 @@ describe('durable WhatsApp outbound rows', () => {
     const fresh = await h.start();
     expect(await fresh.deliver('team@g.us', null, message, 'accepted')).toBe(handedId);
     expect(h.socket().sends).toEqual([]);
-    const disk = new WhatsAppIndex(h.directory);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.pending('accepted')?.accepted).toBe(true);
     disk.close();
     fresh.completeDelivery('accepted');
-    const completed = new WhatsAppIndex(h.directory);
+    const completed = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(completed.pending('accepted')).toBeUndefined();
     expect(completed.message('team@g.us', handedId)?.fromMe).toBe(true);
     completed.close();
@@ -129,7 +129,7 @@ describe('durable WhatsApp outbound rows', () => {
     const adapter = await h.start();
     h.socket().sendError = Object.assign(new Error('forbidden'), { output: { statusCode: 403 } });
     await expect(adapter.deliver('team@g.us', null, message, 'refused')).rejects.toBeInstanceOf(OutboundRefusedError);
-    const disk = new WhatsAppIndex(h.directory);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.pending('refused')).toBeUndefined();
     disk.close();
   });

@@ -18,10 +18,17 @@ export type WhatsAppGroupEvent =
   | { readonly type: 'groups.upsert'; readonly value: BaileysEventMap['groups.upsert'] }
   | { readonly type: 'groups.update'; readonly value: BaileysEventMap['groups.update'] }
   | { readonly type: 'group-participants.update'; readonly value: BaileysEventMap['group-participants.update'] };
+export interface WhatsAppLinkNotice {
+  readonly id: string;
+  readonly kind: 'needs-relink' | 'principal-number-changed';
+  readonly text: string;
+  readonly link: WhatsAppLink;
+}
 export interface WhatsAppObserver {
+  readonly onLinkNotice?: (notice: WhatsAppLinkNotice) => Promise<boolean>;
   readonly onMembership?: (event: WhatsAppMembershipEvent) => Promise<void>;
   /** A binding message may be consumed; only a completed effect may return consume. */
-  readonly onMessage?: (received: WhatsAppReceived) => Promise<'consume' | 'route'>;
+  readonly onMessage?: (received: WhatsAppReceived) => Promise<'consume' | 'hold' | 'route'>;
   readonly onConnectionUpdate?: (event: {
     readonly update: BaileysEventMap['connection.update'];
     readonly link: WhatsAppLink | undefined;
@@ -35,9 +42,12 @@ export function registerWhatsAppObserver(observer: WhatsAppObserver): () => void
     observers.delete(observer);
   };
 }
-export async function observeWhatsAppMessage(received: WhatsAppReceived): Promise<boolean> {
-  for (const observer of observers) if ((await observer.onMessage?.(received)) === 'consume') return true;
-  return false;
+export async function observeWhatsAppMessage(received: WhatsAppReceived): Promise<'consume' | 'hold' | 'route'> {
+  for (const observer of observers) {
+    const result = await observer.onMessage?.(received);
+    if (result === 'consume' || result === 'hold') return result;
+  }
+  return 'route';
 }
 export async function observeWhatsAppGroup(event: WhatsAppGroupEvent): Promise<void> {
   for (const observer of observers) await observer.onGroupEvent?.(event);
@@ -52,4 +62,11 @@ export async function observeWhatsAppConnection(
 
 export async function observeWhatsAppMembership(event: WhatsAppMembershipEvent): Promise<void> {
   for (const observer of observers) await observer.onMembership?.(event);
+}
+
+/** True once at least one registered notice owner accepted the durable event; failures remain pending. */
+export async function observeWhatsAppLinkNotice(notice: WhatsAppLinkNotice): Promise<boolean> {
+  let accepted = false;
+  for (const observer of observers) if (observer.onLinkNotice && (await observer.onLinkNotice(notice))) accepted = true;
+  return accepted;
 }

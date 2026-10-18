@@ -22,6 +22,8 @@ import {
 import { createAnswers } from '../../channels/answers.js';
 import { resolveQuestionRender } from '../../channels/question-render-registry.js';
 import { log } from '../../log.js';
+import { OutboundRefusedError } from '../../delivery.js';
+import { checkOutbound } from '../gws-ea-privacy/outbound.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
 import { WhatsAppAuthStore } from './auth-store.js';
 import { WhatsAppContacts, type WhatsAppOutreachRequest } from './contacts.js';
@@ -47,6 +49,9 @@ export type WhatsAppSocket = Pick<
   | 'onWhatsApp'
   | 'groupCreate'
   | 'groupParticipantsUpdate'
+  | 'updateProfileName'
+  | 'updateProfileStatus'
+  | 'logout'
 > & {
   readonly ev: BaileysEventEmitter;
   readonly signalRepository: {
@@ -70,6 +75,11 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   requestPairingCode(phoneNumber: string): Promise<string>;
   resolvePerson(jid: string, alternate?: string | null): Promise<WhatsAppPerson | undefined>;
   completeDelivery(rowId: string): void;
+  isOwnMessage(platformId: string, messageId: string): boolean;
+  releaseHeldPrincipal(lid: string): Promise<void>;
+  setProfile(name: string, about: string): Promise<void>;
+  logout(): Promise<void>;
+  clearAuth(): void;
   fetchGroupMembers(platformId: string): Promise<WhatsAppGroup>;
   resolveNumber(number: string): Promise<WhatsAppPerson | undefined>;
   reachOutDM(
@@ -124,11 +134,13 @@ export async function resolveWaWebVersion(): Promise<[number, number, number]> {
 export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsAppAdapter {
   const now = options.now ?? Date.now;
   const auth = new WhatsAppAuthStore(options.directory);
-  const index = new WhatsAppIndex(options.directory);
+  const index = new WhatsAppIndex(options.directory, indexAccount);
   const state = new SqliteStateAdapter('gws-ea-whatsapp');
   let socket: WhatsAppSocket | undefined;
   let connected = false;
   let stopped = false;
+  let unlinking = false;
+  let discardInbound = false;
   let link: WhatsAppLink | undefined;
   let config: ChannelSetup | undefined;
   let connecting: Promise<void> | undefined;
@@ -160,6 +172,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     contacts,
     resolvePerson: async (jid) => (socket ? resolvePerson(socket, index, jid) : undefined),
     state,
+    directSendAllowed,
     socket: () => socket,
     connected: () => connected,
     now,
@@ -178,6 +191,23 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     now,
   });
 
+  function indexAccount(): string {
+    const phone = link?.number
+      ? `${link.number.slice(1)}@s.whatsapp.net`
+      : (socket?.user?.id ?? link?.account?.phoneJid);
+    if (!phone) throw new ChannelNotConnectedError();
+    return normalizedJid(phone);
+  }
+  async function directSendAllowed(person: WhatsAppPerson): Promise<boolean> {
+    const current = await readWhatsAppLink(options.directory);
+    if (!current) return false;
+    if (current.principal?.lid === person.lid) return current.principal.phoneJid === person.phoneJid;
+    return !(
+      current.principalNumber &&
+      !current.principal &&
+      person.phoneJid === `${current.principalNumber.slice(1)}@s.whatsapp.net`
+    );
+  }
   async function record(change: Partial<WhatsAppLink>): Promise<void> {
     const current = await readWhatsAppLink(options.directory);
     if (!current) return;
@@ -191,7 +221,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     });
   }
   function scheduleReconnect(): void {
-    if (stopped || reconnectTimer || link?.state !== 'connected') return;
+    if (stopped || reconnectTimer || link?.pairing || link?.state !== 'connected') return;
     const delay = Math.min(60_000, 1_000 * 2 ** Math.min(failures++, 6));
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
@@ -213,7 +243,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     handler: (value: BaileysEventMap[T]) => Promise<void>,
   ): void {
     const run = (value: BaileysEventMap[T]): Promise<void> => {
-      if (stopped || socket !== current) return Promise.resolve();
+      if (stopped || unlinking || socket !== current) return Promise.resolve();
       const work = handler(value).catch(report);
       events.add(work);
       void work
@@ -243,16 +273,18 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       logger,
       browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
+      ...(link.pairing ? { qrTimeout: Math.max(1, link.pairing.expiresAt - now()) } : {}),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       // rc14's native resend checks its memory cache before getMessage; every resend must consult the durable ledger.
       enableRecentMessageCache: false,
       getMessage: async (key) => {
+        if (!connected) return undefined;
         if (!key.remoteJid || !key.id) return undefined;
         let chat = key.remoteJid;
         if (!chat.endsWith('@g.us')) {
           const person = await resolvePerson(current, index, chat);
-          if (!person || !(await contacts.retry(key.id))) return undefined;
+          if (!person || !(await directSendAllowed(person)) || !(await contacts.retry(key.id))) return undefined;
           chat = `${person.lid}@lid`;
         }
         return index.message(chat, key.id)?.fromMe ? index.wireMessage(chat, key.id) : undefined;
@@ -313,6 +345,10 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     });
     listen(current, 'messages.upsert', async (batch) => {
       if (batch.type !== 'notify' && batch.type !== 'append') return;
+      if (!connected) {
+        for (const message of batch.messages) index.intake(message);
+        return;
+      }
       await inbound?.receive(batch.messages);
       scheduleReplay();
     });
@@ -333,7 +369,6 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     listen(current, 'connection.update', async (update) => {
       contacts.connection(update);
       if (update.connection === 'open') {
-        connected = true;
         failures = 0;
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
@@ -344,14 +379,25 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
           : current.user?.id
             ? await resolvePerson(current, index, current.user.id)
             : undefined;
+        if (link?.number && account?.phoneJid !== `${link.number.slice(1)}@s.whatsapp.net`) {
+          socket = undefined;
+          discardInbound = true;
+          auth.clear();
+          await current.end(new Error('Linked WhatsApp account does not match the admitted assistant number'));
+          await observeWhatsAppConnection({ connection: 'close' }, link);
+          return;
+        }
+        connected = true;
         await record({ state: 'connected', ...(account ? { account } : {}), error: undefined });
         await contacts.notify();
         await observeWhatsAppConnection(update, link);
+        link = await readWhatsAppLink(options.directory);
         await inbound?.replay();
         index.prune(now());
         scheduleReplay();
       } else if (update.connection === 'close') {
         connected = false;
+        if (unlinking) return;
         const error = update.lastDisconnect?.error;
         const code = error && 'output' in error ? (error.output as { statusCode?: number }).statusCode : undefined;
         if (code === DisconnectReason.loggedOut) {
@@ -405,6 +451,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       await connecting;
       await Promise.allSettled([...events]);
       await inbound?.settled();
+      if (discardInbound) index.discardUnrouted();
       await state.disconnect();
       auth.close();
       index.close();
@@ -435,6 +482,31 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       return `${person.lid}@lid`;
     },
     completeDelivery: outbound.complete,
+    isOwnMessage: (platformId, messageId) => index.message(platformId, messageId)?.fromMe === true,
+    async releaseHeldPrincipal(lid) {
+      link = await readWhatsAppLink(options.directory);
+      if (link?.principal?.lid !== lid) throw new Error('Only the bound principal’s pending messages may be released');
+      index.releaseHeld(lid);
+      scheduleReplay();
+    },
+    async setProfile(name, about) {
+      if (!socket || !connected) throw new ChannelNotConnectedError();
+      const check = await checkOutbound([name, about], 'others');
+      if (!check.allowed) throw new OutboundRefusedError('gws-ea-privacy:audience', check.reason);
+      await socket.updateProfileName(name);
+      await socket.updateProfileStatus(about);
+    },
+    async logout() {
+      discardInbound = true;
+      unlinking = true;
+      if (socket && connected) await socket.logout();
+      connected = false;
+      auth.clear();
+    },
+    clearAuth() {
+      discardInbound = true;
+      auth.clear();
+    },
     fetchGroupMembers: groupEvents.fetchGroupMembers,
     ...outreach,
     deliver: (platformId: string, _threadId: string | null, message: OutboundMessage, rowId?: string) =>

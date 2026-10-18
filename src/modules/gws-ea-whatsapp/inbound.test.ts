@@ -39,7 +39,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
       type: 'notify',
       messages: [incoming('in-usync', 'Hello', { key: { id: 'in-usync', remoteJid: '15553334444@s.whatsapp.net' } })],
     });
-    const disk = new WhatsAppIndex(h.directory);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.unrouted().map((message) => message.key.id)).toEqual(['in-usync']);
     disk.close();
     // A second process's connection reads the durable receipt while the old process has not routed it.

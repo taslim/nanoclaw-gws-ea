@@ -219,6 +219,7 @@ export async function bindPrincipal(
     '--display-name',
     displayName,
   ]);
+  // The host command uses gws-ea-profile/bind.ts’s authenticated identity primitive, shared with WhatsApp proof.
   const binding = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',

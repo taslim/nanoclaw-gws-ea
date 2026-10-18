@@ -17,11 +17,10 @@ import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 // registrations must follow this module's.
 import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
 import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
-import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
+import { bindPrincipalIdentity } from './bind.js';
 import {
   addPrincipalAddress,
   assertMainCaller,
-  bindVerifiedPrincipalUser,
   ensureMainAgentGroupIdLoaded,
   getGwsEaProfile,
   getMainAgentGroupId,
@@ -270,10 +269,7 @@ register({
   handler: async ({ userId, verifiedAt, messagingGroupId }) => {
     const dm = await getMessagingGroup(messagingGroupId);
     if (!dm) throw new Error(`Principal direct message not found: ${messagingGroupId}`);
-    await getDb().transaction(async () => {
-      await bindVerifiedPrincipalUser(userId, verifiedAt);
-      await rememberAuthenticatedUserDm(userId, dm, verifiedAt);
-    });
+    await bindPrincipalIdentity({ userId, verifiedAt, messagingGroupId });
     return { user_id: userId, verified_at: verifiedAt, messaging_group_id: dm.id };
   },
 });
@@ -581,7 +577,6 @@ registerResource({
 });
 
 export {
-  bindVerifiedPrincipalUser,
   getGwsEaProfile,
   isVerifiedPrincipalUser,
   listPrincipalAddresses,

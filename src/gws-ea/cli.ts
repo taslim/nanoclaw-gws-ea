@@ -86,6 +86,9 @@ import {
   type RunEvent,
   type StepReporter,
 } from './events.js';
+import { isRecord } from './validation.js';
+import type { WhatsAppCommandData } from './types.js';
+import { runInstanceNclJson } from './ncl.js';
 import { deriveGcpClaims, GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
@@ -258,6 +261,8 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
+  /** The operator’s WhatsApp commands use the same native host command socket as ncl. */
+  whatsappNcl?: typeof runInstanceNclJson;
   /** How the browser commands reach Chrome and the assistant's host, its web alias step included; tests substitute it. */
   browserInspection?: BrowserCapabilityInspection;
   /** How the 1Password CLI is found and run; tests substitute the runner. */
@@ -2005,6 +2010,43 @@ async function verifyServing(
  * just before the handover: `ncl` talks to the running host over its socket,
  * and a lock it held would outlive it.
  */
+function parseWhatsAppCommandData(value: unknown): WhatsAppCommandData {
+  const invalid = () => new GwsEaError('invalid_child_output', 'The host returned an invalid WhatsApp link state.');
+  if (!isRecord(value)) throw invalid();
+  const state = (['unlinked', 'linking', 'connected', 'needs-relink'] as const).find(
+    (candidate) => candidate === value.state,
+  );
+  if (
+    !state ||
+    Object.keys(value).some((key) => !['state', 'number', 'principal', 'bindingPending', 'pairingCode'].includes(key))
+  )
+    throw invalid();
+  const { number, bindingPending, pairingCode, principal } = value;
+  if (number !== undefined && (typeof number !== 'string' || !/^\+[1-9]\d{6,14}$/u.test(number))) throw invalid();
+  if (bindingPending !== undefined && typeof bindingPending !== 'boolean') throw invalid();
+  if (pairingCode !== undefined && (typeof pairingCode !== 'string' || !/^[A-Z0-9-]{4,32}$/u.test(pairingCode)))
+    throw invalid();
+  let bound: WhatsAppCommandData['principal'];
+  if (principal !== undefined) {
+    if (
+      !isRecord(principal) ||
+      typeof principal.lid !== 'string' ||
+      !/^\d+$/u.test(principal.lid) ||
+      (principal.phoneJid !== undefined &&
+        (typeof principal.phoneJid !== 'string' || !/^\d+@s\.whatsapp\.net$/u.test(principal.phoneJid)))
+    )
+      throw invalid();
+    bound = { lid: principal.lid, ...(principal.phoneJid === undefined ? {} : { phoneJid: principal.phoneJid }) };
+  }
+  return {
+    state,
+    ...(number === undefined ? {} : { number }),
+    ...(bindingPending === undefined ? {} : { bindingPending }),
+    ...(pairingCode === undefined ? {} : { pairingCode }),
+    ...(bound === undefined ? {} : { principal: bound }),
+  };
+}
+
 async function prepareNcl(
   paths: ControlPlanePaths,
   invocation: ParsedInvocation,
@@ -2431,6 +2473,45 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     }
   }
   switch (handler.kind) {
+    case 'whatsapp': {
+      let changed: Changed = false;
+      try {
+        const paths = runtime.paths ?? resolveControlPlanePaths();
+        const instanceId = targetInstance(options);
+        const operation = await acquireInstanceOperation(paths, instanceId, { command: 'ncl' });
+        if (!operation) throw busy();
+        let data: WhatsAppCommandData;
+        try {
+          const config = await loadCreatedRuntime(paths, instanceId);
+          const args = ['gws-ea-whatsapp', handler.command];
+          if (handler.command === 'link')
+            for (const key of ['number', 'principal-number'] as const)
+              if (options[key] !== undefined) args.push(`--${key}`, options[key]);
+          // An interrupted host call may already have started or removed the link.
+          if (handler.command !== 'status') changed = null;
+          data = parseWhatsAppCommandData(await (runtime.whatsappNcl ?? runInstanceNclJson)(config, args));
+        } finally {
+          operation.release();
+        }
+        if (handler.command !== 'status') changed = true;
+        emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'succeeded', changed, data }));
+        if (!json) {
+          output(`WhatsApp: ${data.state}${typeof data.number === 'string' ? ` (${data.number})` : ''}`);
+          if (typeof data.pairingCode === 'string') output(`Pairing code: ${data.pairingCode}`);
+        }
+        return EXIT_CODES.ready;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- the CLI boundary reports every host or transport failure as a redacted managed result
+      } catch (error) {
+        emitResult(
+          managedResult(invocation.definition.path.join(' '), {
+            outcome: isBusy(error) ? 'busy' : 'failed',
+            changed,
+            error,
+          }),
+        );
+        return reportStop(presenter, error);
+      }
+    }
     case 'capability': {
       const command = handler.command;
       if (handler.name === 'browser') {

@@ -129,6 +129,10 @@ describe('GWS-EA instance runtime', () => {
     await persistInstanceRuntime(config, upsertEnvVars, configRoot);
     const environment = await readFile(path.join(config.state_root, '.env'), 'utf8');
     expect(environment).toContain(`GWS_EA_VOICE_POLICY_FILE=${path.join(configRoot, 'voice.json')}\n`);
+    expect(environment).toContain(`GWS_EA_CONFIG_ROOT=${configRoot}\n`);
+    expect(environment).toContain(`GWS_EA_STATE_ROOT=${path.dirname(config.instance_root)}\n`);
+    expect(environment).toContain(`GWS_EA_INSTANCE_ID=${config.instance_id}\n`);
+    expect(environment).toContain(`GWS_EA_WHATSAPP_DIR=${path.join(config.instance_root, 'secrets', 'whatsapp')}\n`);
     expect(environment).toContain(
       `GWS_EA_INSTANCE_LOCK_FILE=${path.join(configRoot, 'locks', `${config.instance_id}.lock`)}\n`,
     );

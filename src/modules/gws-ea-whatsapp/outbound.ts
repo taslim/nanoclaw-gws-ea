@@ -62,6 +62,7 @@ export interface WhatsAppOutboundOptions {
   readonly index: WhatsAppIndex;
   readonly contacts: WhatsAppContacts;
   readonly resolvePerson: (jid: string) => Promise<WhatsAppPerson | undefined>;
+  readonly directSendAllowed: (person: WhatsAppPerson) => Promise<boolean>;
   readonly state: SqliteStateAdapter;
   readonly socket: () => WhatsAppSocket | undefined;
   readonly connected: () => boolean;
@@ -158,6 +159,11 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         if (!platformId.endsWith('@g.us') && !person)
           throw new Error('WhatsApp first contact requires a resolved recipient');
         if (person) {
+          if (!(await options.directSendAllowed(person)))
+            throw new OutboundRefusedError(
+              'gws-ea-whatsapp:principal-unbound',
+              'The principal must send the binding code from their own WhatsApp before the assistant can write to them.',
+            );
           await options.contacts.reserve([person.lid], key, request);
           options.contacts.handoff(id, person.lid, key, request);
         }

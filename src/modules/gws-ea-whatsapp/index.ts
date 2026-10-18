@@ -2,30 +2,31 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { registerChannelAdapter } from '../../channels/channel-registry.js';
+import { getChannelAdapterExact, registerChannelAdapter } from '../../channels/channel-registry.js';
 import { registerPostDeliveryHook } from '../../delivery.js';
 import { createWhatsAppAdapter, WHATSAPP_DEFAULTS, type WhatsAppAdapter } from './adapter.js';
 import { readWhatsAppLink, whatsappDirectory } from './paths.js';
+import { whatsAppLinking } from './link.js';
 
-let active: WhatsAppAdapter | undefined;
 /** The real active transport, for the link owner; absent before channel startup or without a link. */
 export function activeWhatsAppAdapter(): WhatsAppAdapter | undefined {
-  return active;
+  return getChannelAdapterExact('whatsapp') as WhatsAppAdapter | undefined;
 }
 registerChannelAdapter('whatsapp', {
   defaults: WHATSAPP_DEFAULTS,
   factory: () => {
     const directory = whatsappDirectory();
     if (!directory || !fs.existsSync(path.join(directory, 'link.json'))) return null;
-    return readWhatsAppLink(directory).then((record) => {
+    return readWhatsAppLink(directory).then(async (record) => {
       if (!record) throw new Error('WhatsApp link disappeared during channel startup');
-      active = createWhatsAppAdapter({ directory });
-      return active;
+      if (record.number) await whatsAppLinking().reconcile();
+      if (!(await readWhatsAppLink(directory))) throw new Error('WhatsApp pairing expired before channel startup');
+      return createWhatsAppAdapter({ directory });
     });
   },
 });
 registerPostDeliveryHook((message) => {
-  if (message.channelType === 'whatsapp') active?.completeDelivery(message.id);
+  if (message.channelType === 'whatsapp') activeWhatsAppAdapter()?.completeDelivery(message.id);
 });
 
 export {
@@ -47,6 +48,7 @@ export {
 export {
   registerWhatsAppObserver,
   type WhatsAppObserver,
+  type WhatsAppLinkNotice,
   type WhatsAppReceived,
   type WhatsAppGroupEvent,
 } from './observers.js';
@@ -55,3 +57,5 @@ export type { WhatsAppContent } from './inbound.js';
 export type { WhatsAppOutreachRequest } from './contacts.js';
 export type { WhatsAppGroup, WhatsAppGroupMember, WhatsAppMembershipEvent } from './events.js';
 export type { WhatsAppGroupOutreach } from './outreach.js';
+
+export { linkWhatsApp, whatsAppLinking, type WhatsAppLinkCaller, type WhatsAppLinkStatus } from './link.js';

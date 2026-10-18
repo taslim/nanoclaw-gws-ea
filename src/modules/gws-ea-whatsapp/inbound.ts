@@ -144,7 +144,12 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       ...(reaction ? { reaction: true, quiet: target?.fromMe !== true } : {}),
     };
     const received = { raw, platformId, isGroup, person, content, inbound };
-    if (await observeWhatsAppMessage(received)) {
+    const observation = await observeWhatsAppMessage(received);
+    if (observation === 'hold' && person) {
+      options.index.hold(rawChat, id, person.lid);
+      return;
+    }
+    if (observation === 'consume') {
       options.index.routed(platformId, id, rawChat);
       return;
     }
