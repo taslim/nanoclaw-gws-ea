@@ -598,7 +598,7 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     );
 
     const registry = await import('../channels/channel-registry.js');
-    const sent: Array<string | undefined> = [];
+    const sent: Array<{ id?: string; timestamp?: string }> = [];
     registry.registerChannelAdapter('whatsapp', {
       factory: () => ({
         name: 'whatsapp',
@@ -607,8 +607,8 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
         async setup() {},
         async teardown() {},
         isConnected: () => true,
-        async deliver(_platform, _thread, _message, messageId) {
-          sent.push(messageId);
+        async deliver(_platform, _thread, message, messageId) {
+          sent.push({ id: messageId, timestamp: message.timestamp });
           return 'platform-send';
         },
       }),
@@ -618,7 +618,7 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     delivery.setDeliveryAdapter(registry.createChannelDeliveryAdapter());
     await delivery.deliverSessionMessages(session);
     await delivery.deliverSessionMessages(session);
-    expect(sent).toEqual(['durable-send']);
+    expect(sent).toEqual([{ id: 'durable-send', timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u) }]);
   });
 });
 
@@ -1522,6 +1522,23 @@ describe("recorded divergence: the host's own sends pass the outbound guards, an
     expect(channelMessage).toContain('deduplicate: message.deduplicate,');
     expect(adminEvent).toContain('authenticatedSender: undefined,');
     expect(adminEvent).toContain("deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,");
+  });
+});
+
+describe('recorded divergence: WhatsApp is an instance-owned module channel', () => {
+  it('registers once from the module barrel and stays inert without a link record', async () => {
+    await freshInstall();
+    const registry = await import('../channels/channel-registry.js');
+    vi.mocked(registry.registerChannelAdapter).mockClear();
+
+    await import('../channels/index.js');
+    const whatsapp = () =>
+      vi.mocked(registry.registerChannelAdapter).mock.calls.filter(([name]) => name === 'whatsapp');
+    expect(whatsapp()).toHaveLength(0);
+
+    await import('../modules/index.js');
+    expect(whatsapp()).toHaveLength(1);
+    expect(await whatsapp()[0]![1].factory()).toBeNull();
   });
 });
 

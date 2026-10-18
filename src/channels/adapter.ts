@@ -183,6 +183,8 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox, or a host request's pictures
+  /** Original outbound row time, stamped by the host; absent for direct host sends. */
+  timestamp?: string;
 }
 
 /** Discovered conversation info (from syncConversations). */

@@ -140,6 +140,8 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
     /** Durable outbound row ID, when the send belongs to a mailbox row. */
     messageId?: string,
+    /** Original outbound row time, independent of when the adapter first sees it. */
+    timestamp?: string,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -238,7 +240,7 @@ async function assertOutboundAllowed(send: OutboundSend): Promise<void> {
 function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
   const disconnected = new Map<string, { readonly until: number; readonly error: ChannelNotConnectedError }>();
   return {
-    async deliver(channelType, platformId, threadId, kind, content, files, instance, messageId) {
+    async deliver(channelType, platformId, threadId, kind, content, files, instance, messageId, timestamp) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
       const key = instance ?? channelType;
       const unavailable = disconnected.get(key);
@@ -255,6 +257,7 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
           files,
           instance,
           messageId,
+          timestamp,
         );
       } catch (error) {
         if (error instanceof ChannelNotConnectedError)
@@ -606,6 +609,7 @@ async function deliverMessage(
     threadId: string | null;
     content: string;
     inReplyTo: string | null;
+    timestamp: string;
   },
   session: Session,
 ): Promise<string | undefined> {
@@ -812,6 +816,7 @@ async function deliverMessage(
     files,
     deliverInstance,
     msg.id,
+    msg.timestamp,
   );
   log.info('Message delivered', {
     id: msg.id,

@@ -414,6 +414,7 @@ export function wrapSqliteOutbound(
             const nullableText = (value: unknown): string | null => (value == null ? null : String(value));
             return {
               id: text(row.id),
+              timestamp: sqliteTimestamp(text(row.timestamp)),
               kind: text(row.kind),
               platformId: nullableText(row.platform_id),
               channelType: nullableText(row.channel_type),

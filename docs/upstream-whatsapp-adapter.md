@@ -1,0 +1,28 @@
+# WhatsApp adapter fixes to offer upstream
+
+This draft describes general fixes in the GWS-EA WhatsApp transport. It does not propose shipping GWS-EA's account linking, chat admission, private-information policy or group agents in NanoClaw core.
+
+## Proposed offer
+
+The native adapter can lose messages that WhatsApp has already acknowledged, drop offline deliveries, confuse phone and LID identities, and mark an offline send delivered without handing it to WhatsApp. The fixes belong in the channel skill's adapter, with the small native delivery seams documented separately.
+
+- Persist the complete `messages.upsert` batch synchronously before awaiting identity lookup, media download or an earlier route. Await `onInbound`, mark each receipt routed only after it resolves, replay unfinished receipts after failure and reconnect, and set native source-id deduplication to cover a crash after the mailbox write. Route both `notify` and `append`; ignore history-sync events.
+- Resolve people through Baileys' LID mapping, alternate JIDs and LID-protocol USync. Use the LID as the user identity and DM address, retaining the phone as an alias. A raw unresolved group sender has no authenticated sender; an unresolved DM is dropped. Push names and quoted text never establish identity.
+- Build reply context from the host's message index in that chat. An unknown quote names its id without copying a claimed sender or text. Retain own sends for the lifetime of the chat; prune other completed entries after 30 days.
+- Carry media as native base64 `data`, `mimeType` and audio source facts. A PTT note is `voice-note`; forwarding comes from platform context, including `forwardingScore`. Download media in a new chat as well as an admitted one, except declined/detached chats, and enforce the declared 25 MiB limit before download. Keep an unavailable recording as a named attachment with an explicit failure outcome.
+- Throw the native not-connected error while offline. Persist each outbound row before sending and derive the WhatsApp id from that row, with distinct deterministic ids for a file batch. Retain an uncertain send for replay using the same id, retain a confirmed handoff until native `markDelivered` has completed, and clear it from the post-delivery hook. Identical text in different rows remains different messages. Expire an unsent row after four hours using its original host-stamped timestamp; use the native refusal path to tell the sending agent.
+- Preserve the returned wire message for Baileys' retry `getMessage`, including media, across a host restart. Use Baileys' native media reupload method for a download whose media URL needs refreshing.
+- Use native `answers.ts` for quoted answers and approval thumbs, with durable request metadata and awaited authorization. A slash command is ordinary text. Forwarded text cannot authorize an approval. Send `composing` and `paused` presence around a turn.
+- Resolve a current WhatsApp Web version for every socket. Baileys' failed lookup returns its built-in version with `isLatest: false`; refuse that fallback and record the error instead. Start socket establishment without waiting for open so another channel can initialize. Reconnect linked sockets with bounded backoff; pairing sockets do not reconnect themselves. Logout clears both persisted and in-memory auth and leaves a registered `needs-relink` adapter holding queued rows.
+
+The existing markdown conversion and protected code regions are retained.
+
+## Documentation / Operational Notes
+
+The implementation pins `@whiskeysockets/baileys` to `7.0.0-rc14`. Source inspection of that exact published version confirmed caller ids are honored: `lib/Socket/messages-send.js` supplies a generated `messageId`, spreads the caller's options afterward, then passes `fullMsg.key.id` to `relayMessage`. `lib/Types/Message.d.ts` declares `messageId?: string`. This proves the client preserves the chosen id; it does not prove WhatsApp's server deduplication across every reconnect. That remains a live acceptance check.
+
+Account state lives only under the instance's owner-only `secrets/whatsapp/` directory: `link.json`, transactional `auth.sqlite`, and the durable message index `messages.sqlite`. The link can be `linking`, `connected` or `needs-relink`. None of this directory belongs in release snapshots or rollback restores. Logout deletes credentials and Signal keys, retains the link record and message receipts, and requires a new link. Remove must delete the directory. The first-contact ledger, refusals and time-lock, owned by the chat/link follow-on units, must use the same account-state boundary.
+
+`GWS_EA_WHATSAPP_DIR` explicitly selects the absolute `secrets/whatsapp` path, through the host environment or its `.env`. Without a path and link record the module opens no files or socket. The adapter stays registered after logout. A link owner can write the record and use the existing native `startChannelAdapter('whatsapp')` hot-start path, then request a pairing code from `activeWhatsAppAdapter()`.
+
+Local proof uses the production transport and real SQLite stores with a fake only at the Baileys socket/network boundary. The suite covers pre-await receipt persistence, restart replay, notify/append deduplication, LID aliases, unresolved senders, trusted quotes, PTT media reaching native voice preparation, declared-size rejection, row-keyed retries, original-age expiry, logout/relink, version lookup and module registration. ASR is controlled at its existing readiness/transcription boundary for the voice integration test. Real account linking, live server deduplication, and live speech accuracy are not claimed by these tests.

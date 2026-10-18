@@ -15,6 +15,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
+import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
   createState,
@@ -420,6 +422,12 @@ describe('snapshots', STAGING, () => {
 
   it('takes a copy that later writes never reach', async () => {
     const { layout, a } = await fencedForUpdate();
+    const whatsapp = path.join(layout.root, 'secrets', 'whatsapp');
+    await writeWhatsAppLink(whatsapp, { schema_version: 1, state: 'connected', account: { lid: '12025550123' } });
+    const auth = new WhatsAppAuthStore(whatsapp);
+    auth.saveCreds();
+    auth.close();
+    const authBefore = await readFile(path.join(whatsapp, 'auth.sqlite'));
     await mkdir(path.join(layout.root, 'browser', 'profile'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(layout.root, 'browser', 'staging'), { recursive: true, mode: 0o700 });
     await writeFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'private browser cookies', {
@@ -437,6 +445,8 @@ describe('snapshots', STAGING, () => {
       statSync(path.join(layout.state, '.env')).mode & 0o777,
     );
     expect(statSync(snapshot).mode & 0o777).toBe(0o700);
+    await expect(lstat(path.join(snapshot, 'secrets'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(path.join(whatsapp, 'auth.sqlite'))).toEqual(authBefore);
     await expect(lstat(path.join(snapshot, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'utf8')).toBe(
       'private browser cookies',

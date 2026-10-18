@@ -125,6 +125,9 @@ other channels and system actions continue. Ordinary send failures retain the
 existing attempt limit. The durable outbound row ID reaches the adapter as the
 optional fourth `deliver` argument, unchanged through outbound guards and the
 registry bridge, so a platform can derive its idempotency key from that ID.
+`OutboundMessage.timestamp` carries the original row time through the mailbox
+projection and guards, so an adapter can expire an old queued send even when
+it first sees the row after a host outage. Direct host sends may omit it.
 
 ### Chat SDK Bridge
 

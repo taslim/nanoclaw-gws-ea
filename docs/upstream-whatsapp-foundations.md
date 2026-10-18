@@ -14,6 +14,9 @@ limit, and missing adapters retain their existing behavior.
 The durable outbound row ID reaches `ChannelAdapter.deliver` as an optional
 fourth argument. An adapter can derive a platform message ID from it to reuse
 after a crash. Existing adapters ignore the extra argument.
+The native message also carries its original row timestamp from the mailbox
+projection. An adapter can decline a stale row even if the host was down before
+the adapter first saw it; a direct host send has no row timestamp.
 
 Evidence: `src/delivery-not-connected.test.ts`, the existing delivery suites and
 the recorded-divergence tests exercise outage recovery, unaffected channels,

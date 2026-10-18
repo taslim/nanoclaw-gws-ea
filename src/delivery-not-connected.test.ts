@@ -134,10 +134,11 @@ describe('delivery during a channel outage', () => {
     expect(sent).toEqual(['gchat-reply', 'wa-first', 'wa-second']);
   });
 
-  it('passes the durable outbound id through the real registry bridge to the channel adapter', async () => {
+  it('passes the durable outbound id and original time through the real registry bridge', async () => {
     const session = await conversation();
     enqueue(session, 'durable-row', 'whatsapp');
-    const ids: Array<string | undefined> = [];
+    vi.setSystemTime(Date.now() + 5 * 60 * 60 * 1_000);
+    const received: Array<{ id?: string; timestamp?: string }> = [];
     const adapter: ChannelAdapter = {
       name: 'whatsapp',
       channelType: 'whatsapp',
@@ -145,8 +146,8 @@ describe('delivery during a channel outage', () => {
       async setup() {},
       async teardown() {},
       isConnected: () => true,
-      async deliver(_platform, _thread, _message, messageId) {
-        ids.push(messageId);
+      async deliver(_platform, _thread, message, messageId) {
+        received.push({ id: messageId, timestamp: message.timestamp });
         return 'platform-id';
       },
     };
@@ -154,6 +155,6 @@ describe('delivery during a channel outage', () => {
     await initChannelAdapters(() => ({ onInbound() {}, onInboundEvent() {}, onMetadata() {}, onAction() {} }));
     setDeliveryAdapter(createChannelDeliveryAdapter());
     await deliverSessionMessages(session);
-    expect(ids).toEqual(['durable-row']);
+    expect(received).toEqual([{ id: 'durable-row', timestamp: '2026-10-18T12:00:00.000Z' }]);
   });
 });

@@ -176,9 +176,11 @@ describe('SQLite mailbox canonical serialization', () => {
       threadId: 'thread',
       content: '{"text":"reply"}',
     });
+    outboundDb.prepare('UPDATE messages_out SET timestamp = ? WHERE id = ?').run('2026-01-01 00:00:02', 'out-1');
     expect(outbound.getDueMessages()).toEqual([
       {
         id: 'out-1',
+        timestamp: '2026-01-01T00:00:02.000Z',
         kind: 'chat',
         platformId: 'room',
         channelType: 'test',
