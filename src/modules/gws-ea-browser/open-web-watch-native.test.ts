@@ -680,6 +680,23 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     );
     resy.page.on('pageerror', (e) => seen.push(`${stamp()} pageerror ${e.message}`));
     resy.page.on('console', (m) => seen.push(`${stamp()} console ${m.type()} ${m.text()}`));
+    resy.page.on('crash', () => seen.push(`${stamp()} crash`));
+    const network = await resy.page.context().newCDPSession(resy.page);
+    await network.send('Network.enable');
+    network.on('Network.requestWillBeSent', (e) =>
+      seen.push(`${stamp()} cdp sent ${e.requestId} ${e.type ?? '?'} ${e.request.method} ${e.request.url}`),
+    );
+    network.on('Network.loadingFailed', (e) => seen.push(`${stamp()} cdp failed ${JSON.stringify(e)}`));
+    network.on('Network.responseReceived', (e) =>
+      seen.push(`${stamp()} cdp response ${e.requestId} ${e.type} ${e.response.status} ${e.response.url}`),
+    );
+    const browserSession = await resy.browser.newBrowserCDPSession();
+    await browserSession.send('Target.setDiscoverTargets', { discover: true });
+    browserSession.on('Target.targetCreated', (e) =>
+      seen.push(`${stamp()} target+ ${e.targetInfo.type} ${e.targetInfo.url}`),
+    );
+    browserSession.on('Target.targetDestroyed', (e) => seen.push(`${stamp()} target- ${e.targetId}`));
+    browserSession.on('Target.targetCrashed', (e) => seen.push(`${stamp()} target crashed ${e.targetId}`));
     // The agent recorded the route to the reservation and its booking path: a click that reached the commit.
     expect(
       await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] }),
