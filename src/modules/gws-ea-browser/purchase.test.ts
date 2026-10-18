@@ -49,6 +49,7 @@ import {
   validatePurchaseRequest,
 } from './purchase.js';
 import { cancelBrowserJob, readBrowserJob } from './cancel.js';
+import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
@@ -246,6 +247,25 @@ async function grant(): Promise<SpendingAuthority> {
   const rows = await getDb().all<SpendingAuthority>('SELECT * FROM gws_ea_browser_authorities');
   if (!rows[0]) throw new Error('Authority missing');
   return rows[0];
+}
+/** What the host wrote into a session's conversation, oldest first. */
+async function texts(into: Session): Promise<string[]> {
+  return (
+    (await withExistingMailboxSession(into.agent_group_id, into.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+        .reverse(),
+    )) ?? []
+  );
+}
+/** Main records what it learned of `attemptId`, as its tool does. */
+function record(attemptId: string, outcome: 'placed' | 'not_placed', source: 'email' | 'principal') {
+  return recordPurchaseOutcome(
+    { thread: session.thread_id!, attempt_id: attemptId, outcome, source },
+    main,
+    () => queue,
+  );
 }
 
 it('accepts delivery bounds with UTC offsets, keeping window dates as written and the deadline in UTC', () => {
@@ -1065,11 +1085,19 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue.idle();
     expect((await store.get(authority.id))?.state).toBe('unknown');
     expect(JSON.parse((await queue.store.request(id))!.answer_json!)).toMatchObject({
-      data: { reason: 'outcome_unknown' },
+      data: { reason: 'unconfirmed' },
     });
     expect(submitted).toBe(0);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
     expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases')).toHaveLength(0);
+    // Main hears of it once, with the attempt id its job's state shows.
+    const told = (await texts(main)).filter((text) => text.includes('unconfirmed'));
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain(`(attempt ${authority.attempt_id})`);
+    expect(told[0]).toContain('record_purchase_outcome');
+    expect((await readBrowserJob(session.thread_id!))?.unconfirmed).toEqual([
+      expect.objectContaining({ attempt_id: authority.attempt_id, what: 'purchase on amazon.com', total: '$85.00' }),
+    ]);
   });
   it('keeps stale history inconclusive and clears a block only for complete matching host merchant evidence', async () => {
     confirmation = false;
@@ -1088,7 +1116,14 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       order_number: '123-1234567-1234567',
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(0);
-    expect((await grant()).state).toBe('unknown');
+    // The page's record resolves the attempt and its authority alike, from the page.
+    expect((await grant()).state).toBe('committed');
+    expect(
+      await getDb().get(
+        'SELECT resolution,resolution_source FROM gws_ea_browser_purchase_attempts WHERE id = ?',
+        authority.attempt_id,
+      ),
+    ).toEqual({ resolution: 'committed', resolution_source: 'page' });
     expect(submitted).toBe(1);
     await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'another-cart');
     await buy('another-purchase');
@@ -1106,26 +1141,73 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
   });
-  it('warns about a possible duplicate and grants only one new attempt without erasing the unresolved earlier purchase', async () => {
+  it('makes another purchase on the site wait on an unconfirmed one while browsing it goes on, until main records the order email (AE4)', async () => {
     confirmation = false;
     await buy();
     await click((await approvals())[0]);
     await queue.idle();
     const original = await grant();
+    expect(JSON.parse(original.outcome_json!)).toMatchObject({
+      status: 'unconfirmed',
+      attempt_id: original.attempt_id,
+    });
+    await navigate(`${AMAZON_RETAIL.origin}/dp/B012345678`, 'browse-product');
+    expect(await request('browse-product')).toMatchObject({ actions: [{ status: 'completed' }] });
+    expect(page.url()).toBe(`${AMAZON_RETAIL.origin}/dp/B012345678`);
     await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'new-cart');
-    await buy('possible-duplicate');
-    const [approval] = await approvals();
-    expect(approval.question).toContain('Possible duplicate');
-    expect(approval.question).toContain(original.attempt_id);
-    await click(approval);
-    await queue.idle();
-    expect(submitted).toBe(2);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_attempts WHERE resolution IS NULL')).toHaveLength(
-      2,
+    await buy('second-purchase');
+    expect(await request('second-purchase')).toMatchObject({ status: 'waiting_on_earlier', site: 'amazon.com' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_purchase_cards')).toHaveLength(1);
+    expect(submitted).toBe(1);
+    expect(await record(original.attempt_id, 'placed', 'email')).toEqual({
+      status: 'recorded',
+      thread: session.thread_id,
+      outcome: 'placed',
+      source: 'email',
+    });
+    expect((await grant()).state).toBe('committed');
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+    // The waiting errand is woken once, naming the site.
+    const woken = (await texts(session)).filter(
+      (text) => text.includes('browser_site_available') && text.includes('"site":"amazon.com"'),
     );
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
-    await click(approval);
-    expect(submitted).toBe(2);
+    expect(woken).toHaveLength(1);
+    await buy('after-the-answer');
+    expect(await request('after-the-answer')).toMatchObject({ status: 'awaiting_principal' });
+    const [card] = await approvals();
+    expect(card.question).not.toMatch(/Possible duplicate|Earlier purchase/u);
+    expect(submitted).toBe(1);
+    // Main reads the open card's facts from the job's state, on the principal's clock.
+    expect(await readBrowserJob(session.thread_id!)).toMatchObject({
+      state: 'awaiting_principal',
+      open_card: {
+        site: 'amazon.com',
+        total: '$85.00',
+        due_now: '$85.00',
+        expires: expect.stringMatching(/ Los Angeles time$/u),
+      },
+    });
+  });
+  it('puts main’s recorded "not placed" on the next card for the site, once, and never an attempt id', async () => {
+    confirmation = false;
+    await buy();
+    await click((await approvals())[0]);
+    await queue.idle();
+    const original = await grant();
+    expect(await record(original.attempt_id, 'not_placed', 'principal')).toMatchObject({ status: 'recorded' });
+    expect((await grant()).state).toBe('revoked');
+    await navigate(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`, 'retry-cart');
+    await buy('retry');
+    const [card] = await approvals();
+    expect(card.question).toMatch(
+      /Earlier purchase here, tried .+ Los Angeles time: I recorded it as not placed, from what you told me\./u,
+    );
+    expect(card.question).not.toMatch(/attempt-|authority-|Possible duplicate/u);
+    await click(card, 'reject');
+    await buy('retry-again');
+    const [next] = await approvals();
+    expect(next.question).not.toContain('recorded it as not placed');
+    expect(submitted).toBe(1);
   });
   it('refuses a purchase navigation inside an out-of-process widget frame before the widget receives it', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');

@@ -19,7 +19,7 @@ import {
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-facts.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
-import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
+import { PurchaseAuthorityStore, type ResolutionSource, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
 import { cardEventSpan, cardTime, quotePurchaseText } from './cards.js';
 import { agreementsGranted } from './consent.js';
@@ -359,20 +359,25 @@ export async function claimWatchBooking(db: DbDriver, input: ClaimWatchInput): P
   if (!moved.changes) throw new Error('Watch is no longer armed');
 }
 
-/** Called inside authority.conclude's transaction; common purchase notification owns its terminal message. */
+/**
+ * A watch booking's attempt, unconfirmed (`placed` undefined) or resolved by any source, inside the authority
+ * store's transaction; common purchase notification owns its terminal message. A resolved booking leaves the
+ * claim and the watch final: booked, or the job's one claim spent and the watch cancelled. Only a booking its
+ * page proved promotes its recipe.
+ */
 export async function finishWatchPurchase(
   db: DbDriver,
   watchId: string,
   attemptId: string,
-  outcome: Record<string, unknown>,
+  placed: boolean | undefined,
+  source?: ResolutionSource,
 ): Promise<void> {
   const watch = await getBrowserWatch(watchId, db);
   if (!watch) return;
   const at = new Date().toISOString();
-  const certain = outcome.status === 'booked' || outcome.status === 'placed';
   const updated = await db.run(
-    `UPDATE gws_ea_browser_watch_job_claims SET state = ?,finished_at = ? WHERE job_id = ? AND watch_id = ? AND attempt_id = ? AND state = 'committing'`,
-    certain ? 'booked' : 'unknown',
+    `UPDATE gws_ea_browser_watch_job_claims SET state = ?,finished_at = ? WHERE job_id = ? AND watch_id = ? AND attempt_id = ? AND state IN ('committing','unknown')`,
+    placed ? 'booked' : 'unknown',
     at,
     watch.job_id,
     watchId,
@@ -381,7 +386,7 @@ export async function finishWatchPurchase(
   if (!updated.changes) return;
   await db.run(
     'UPDATE gws_ea_browser_watches SET status = ?,updated_at = ?,pending_request_id = NULL WHERE id = ?',
-    certain ? 'booked' : 'outcome_unknown',
+    placed ? 'booked' : placed === false ? 'cancelled' : 'outcome_unknown',
     at,
     watchId,
   );
@@ -390,7 +395,7 @@ export async function finishWatchPurchase(
     "UPDATE gws_ea_browser_authorities SET state = 'revoked' WHERE job_id = ? AND kind = 'watch' AND state = 'live'",
     watch.job_id,
   );
-  if (certain) await promoteWatchRecipe(db, watch, attemptId);
+  if (placed && source === 'page') await promoteWatchRecipe(db, watch, attemptId);
 }
 
 /** Records one notice for a watch's job, once per event key; `deliverWatchNotices` writes it and wakes the job. */
@@ -562,20 +567,25 @@ export async function claimRegionWatchCommit(
       watch.id,
     );
 }
-/** Ends the watch whose claim a commit took, once the commit's outcome is known. Joins the outcome's transaction. */
+/**
+ * Ends the watch whose claim a commit took, whatever took it (the watch's own authority, a card or guarantee
+ * booking, or a free table on a region watch's site), once the commit's attempt is unconfirmed (`placed`
+ * undefined) or resolved by any source. Joins the authority store's transaction; a claim already final is left.
+ */
 export async function finishWatchCommit(
   db: DbDriver,
   jobId: string,
   attemptId: string,
-  outcome: Record<string, unknown>,
+  placed: boolean | undefined,
+  source?: ResolutionSource,
 ): Promise<void> {
   if (!(await db.hasTable('gws_ea_browser_watch_job_claims'))) return;
   const claim = await db.get<{ watch_id: string | null }>(
-    "SELECT watch_id FROM gws_ea_browser_watch_job_claims WHERE job_id = ? AND attempt_id = ? AND state = 'committing'",
+    "SELECT watch_id FROM gws_ea_browser_watch_job_claims WHERE job_id = ? AND attempt_id = ? AND state IN ('committing','unknown')",
     jobId,
     attemptId,
   );
-  if (claim?.watch_id) await finishWatchPurchase(db, claim.watch_id, attemptId, outcome);
+  if (claim?.watch_id) await finishWatchPurchase(db, claim.watch_id, attemptId, placed, source);
 }
 export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void> {
   const withdrawn = await db.all<WatchRow>(

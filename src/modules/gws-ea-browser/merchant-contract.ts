@@ -87,7 +87,11 @@ export interface MerchantSignature extends ReviewedMerchantFlow {
   readPurchase(page: Page, target?: ElementHandle, expected?: PurchaseFacts): Promise<MerchantCheckoutRead>;
   /** Starts listening before the sole authorized press. It must settle within timeoutMs. */
   waitForResult(page: Page, timeoutMs: number): Promise<void>;
-  readEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined>;
+  /**
+   * The merchant's own evidence of a purchase on the page. `attempted` names the attempt it must prove, which
+   * the generic signature reads a confirmation against (KTD8); a reviewed one reads its own record.
+   */
+  readEvidence(page: Page, attempted?: PurchaseFacts): Promise<MerchantPurchaseEvidence | undefined>;
   readAvailability?(page: Page, expected: { venueId: string; partySize: number }): Promise<ReservationAvailability>;
   readReservationPolicy?(page: Page, venueId: string): Promise<ReservationPolicy | undefined>;
 }

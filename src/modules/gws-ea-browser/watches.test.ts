@@ -222,7 +222,7 @@ describe('native watch bounds and one booking claim', () => {
         }),
       ),
     ).rejects.toThrow('already claimed');
-    await finishWatchPurchase(getDb(), 'friday', 'attempt', { status: 'booked' });
+    await finishWatchPurchase(getDb(), 'friday', 'attempt', true, 'page');
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'saturday')).toEqual({
       status: 'cancelled',
     });
@@ -313,11 +313,13 @@ describe('native watch bounds and one booking claim', () => {
       status: 'booking',
     });
     expect(await cancelBrowserJob(jobId)).toMatchObject({ status: 'in_progress' });
-    await authorityStore.conclude(
-      authority.id,
-      { status: 'booked', evidence: { recordId: 'reservation-1', account: 'principal' } },
-      true,
-    );
+    await authorityStore.resolve(authority.attempt_id, {
+      placed: true,
+      source: 'page',
+      evidence: { recordId: 'reservation-1' },
+      record: { id: 'reservation-1', account: 'principal' },
+      outcome: { status: 'booked' },
+    });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'friday')).toEqual({
       status: 'booked',
     });
@@ -640,11 +642,13 @@ describe('native watch bounds and one booking claim', () => {
         at: new Date().toISOString(),
       }),
     );
-    await store.conclude(
-      authority.id,
-      { status: 'booked', evidence: { recordId: 'reservation-recipe', account: 'principal' } },
-      true,
-    );
+    await store.resolve(authority.attempt_id, {
+      placed: true,
+      source: 'page',
+      evidence: { recordId: 'reservation-recipe' },
+      record: { id: 'reservation-recipe', account: 'principal' },
+      outcome: { status: 'booked' },
+    });
     expect(
       await getDb().all('SELECT booking_recipe_id,source_attempt_id FROM gws_ea_browser_watch_recipe_links'),
     ).toEqual([{ booking_recipe_id: saved.recipe_id, source_attempt_id: 'recipe-attempt' }]);
@@ -1029,9 +1033,9 @@ describe('watches on sites with no reader (KTD20)', () => {
     // The claim is spent: a second commit leaves the other watch armed.
     await claimRegionWatchCommit(getDb(), { jobId, site: 'tables.example', attemptId: 'again', requestId: 'r2', at });
     expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'armed' });
-    await finishWatchCommit(getDb(), jobId, 'other', { status: 'booked' });
+    await finishWatchCommit(getDb(), jobId, 'other', true, 'page');
     expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
-    await finishWatchCommit(getDb(), jobId, 'free', { status: 'booked', order_number: 'LR-1930' });
+    await finishWatchCommit(getDb(), jobId, 'free', true, 'page');
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
     expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booked' });
     // The job's other watches end with it.

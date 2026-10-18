@@ -10,7 +10,7 @@
 import type { ElementHandle, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 
-import { statedAmounts, type ConfirmationCharge } from './confirmation.js';
+import { readConfirmation, statedAmounts, type ConfirmationCharge, type ConfirmationEvidence } from './confirmation.js';
 import {
   ControlFactsUnavailableError,
   PAYMENT_VOCABULARY,
@@ -29,7 +29,13 @@ import {
   type GenericBookingFacts,
   type PurchaseFacts,
 } from './fingerprint.js';
-import type { CardNeeded, CheckoutRegions, MerchantCheckoutRead, MerchantSignature } from './merchant-contract.js';
+import type {
+  CardNeeded,
+  CheckoutRegions,
+  MerchantCheckoutRead,
+  MerchantPurchaseEvidence,
+  MerchantSignature,
+} from './merchant-contract.js';
 import type { StructuredBrowserLocator } from './recipes.js';
 
 const VOCABULARY = {
@@ -888,9 +894,50 @@ export function freeCommitBooks(facts: FreeCommitFacts): boolean {
   return Boolean(facts.booking) || VOCABULARY.bookingControl.test(facts.control.label);
 }
 
+/** Whether a confirmation is the merchant's own, or its payment platform's: a document on another site proves nothing of its attempt. */
+export function confirmsOnSite(confirmation: ConfirmationEvidence, site: string, platform?: string): boolean {
+  const at = siteOf(confirmation.source);
+  return at !== undefined && (at === site || at === platform);
+}
+
+/**
+ * What a confirmation page proves of a paid attempt on an unreviewed site (KTD8): an order number on a document
+ * of its merchant or payment platform, and any charge it states in the attempt's currency at its total or its
+ * amount due now. The attempt's contact email keys the order number (KTD5).
+ */
+async function readGenericEvidence(
+  page: Page,
+  attempted?: PurchaseFacts,
+): Promise<MerchantPurchaseEvidence | undefined> {
+  const generic = attempted?.generic;
+  if (!attempted || !generic) return undefined;
+  const confirmation = await readConfirmation(page);
+  if (!confirmation || !confirmsOnSite(confirmation, attempted.site, generic.platform)) return undefined;
+  const { charged } = confirmation;
+  if (
+    charged &&
+    (charged.currency !== attempted.currency ||
+      (charged.amountMinor !== attempted.totalMinor && charged.amountMinor !== attempted.dueNowMinor))
+  )
+    return undefined;
+  return {
+    flowId: GENERIC_FLOW_ID,
+    source: confirmation.source,
+    recordId: confirmation.reference,
+    orderedAt: new Date().toISOString(),
+    resolution: 'committed',
+    account: generic.contactEmail,
+    items: [],
+    totalMinor: charged?.amountMinor ?? attempted.totalMinor,
+    currency: attempted.currency,
+    cardEnding: attempted.cardEnding,
+    address: null,
+  };
+}
+
 /**
  * The generic signature: any web page no reviewed signature matches. It has no reviewed routes or controls, and
- * no merchant evidence of its own: a confirmation page proves what it placed.
+ * no merchant records of its own: a confirmation page proves what it placed.
  */
 export const genericCheckoutSignature: MerchantSignature = {
   id: GENERIC_FLOW_ID,
@@ -906,5 +953,5 @@ export const genericCheckoutSignature: MerchantSignature = {
   preparePage: prepareGenericPage,
   readPurchase: readGenericPurchase,
   waitForResult: waitForGenericResult,
-  readEvidence: () => Promise.resolve(undefined),
+  readEvidence: readGenericEvidence,
 };

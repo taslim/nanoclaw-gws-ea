@@ -7,6 +7,7 @@ import {
   consentGrants,
   credentialAuthority,
   recordDisclosure,
+  recordPurchaseOutcome,
   relayCode,
   reservationGuarantee,
   reservationBounds,
@@ -383,4 +384,45 @@ it("records a disclosure of one stored value to one site for a job, by the value
   expect(JSON.stringify(await waiting)).toContain('recorded');
   for (const word of ['recorded', 'personal_data', 'private-values', 'value_id'])
     expect(recordDisclosure.tool.description).toContain(word);
+});
+
+it("records an unconfirmed purchase's outcome by the job's attempt id, with its source and no merchant facts", async () => {
+  const validate = new Ajv().compile(recordPurchaseOutcome.tool.inputSchema);
+  const fields = {
+    thread: 'system:a2a:main:mugs',
+    attempt_id: 'attempt-1a2b3c',
+    outcome: 'not_placed',
+    source: 'principal',
+  };
+  expect(validate(fields)).toBe(true);
+  expect(validate({ ...fields, outcome: 'placed', source: 'email' })).toBe(true);
+  for (const changed of [
+    { ...fields, outcome: 'unknown' },
+    { ...fields, source: 'browser' },
+    { ...fields, order_number: 'HP-1042' },
+    { thread: fields.thread, outcome: fields.outcome, source: fields.source },
+    { attempt_id: fields.attempt_id, outcome: fields.outcome, source: fields.source },
+  ])
+    expect(validate(changed)).toBe(false);
+  expect((await recordPurchaseOutcome.handler({ thread: fields.thread, outcome: 'placed' })).isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  const waiting = recordPurchaseOutcome.handler(fields);
+  while (!getUndeliveredMessages().length) await Bun.sleep(1);
+  const [row] = getUndeliveredMessages();
+  expect(JSON.parse(row.content)).toEqual({ action: 'record_purchase_outcome', requestId: row.id, ...fields });
+  getInboundDb()
+    .prepare('INSERT INTO messages_in (id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)')
+    .run(
+      `action-resp-${row.id}`,
+      'system',
+      new Date().toISOString(),
+      JSON.stringify({
+        type: 'action_response',
+        requestId: row.id,
+        frame: { id: row.id, ok: true, data: { status: 'recorded', outcome: 'not_placed', source: 'principal' } },
+      }),
+    );
+  expect(JSON.stringify(await waiting)).toContain('recorded');
+  for (const word of ['recorded', 'already_recorded', 'possible_duplicate', 'in_progress', 'email', 'principal'])
+    expect(recordPurchaseOutcome.tool.description).toContain(word);
 });

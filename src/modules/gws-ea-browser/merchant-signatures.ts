@@ -472,6 +472,10 @@ export async function readMerchantPurchase(
   const read = await signature.readPurchase(page, target, expected);
   return read.status === 'ready' ? { ...read, signature } : read;
 }
-export async function readMerchantPurchaseEvidence(page: Page): Promise<MerchantPurchaseEvidence | undefined> {
-  return merchantSignatureFor(page)?.readEvidence(page);
+/** The page's signature's evidence of the purchase `attempted` made. */
+export async function readMerchantPurchaseEvidence(
+  page: Page,
+  attempted: PurchaseFacts,
+): Promise<MerchantPurchaseEvidence | undefined> {
+  return merchantSignatureFor(page)?.readEvidence(page, attempted);
 }

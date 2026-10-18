@@ -375,7 +375,8 @@ export const browserConsentMigration: PortableMigration & { name: ModuleMigratio
 
 /**
  * Incidents (KTD10): spending that may have slipped past the host, each recorded with its job's stop. A job
- * records one incident per kind and evidence; an incident from a page names no purchase attempt.
+ * records one incident per kind and evidence; an incident from a page names no purchase attempt, and a late
+ * confirmation names the attempt main had recorded not placed.
  */
 export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -384,7 +385,7 @@ export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrat
     await db.exec(`
       CREATE TABLE gws_ea_browser_incidents (
         id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('unapproved_commit')),
+        kind TEXT NOT NULL CHECK(kind IN ('unapproved_commit','late_confirmation')),
         site TEXT NOT NULL,
         job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id),
         attempt_id TEXT,
@@ -465,6 +466,36 @@ export const browserWatchRegionMigration: PortableMigration & { name: ModuleMigr
       ALTER TABLE gws_ea_browser_watches ADD COLUMN region_baseline TEXT;
       ALTER TABLE gws_ea_browser_watches ADD COLUMN region_marked_at TEXT;
       ALTER TABLE gws_ea_browser_watches ADD COLUMN region_missing_since TEXT;
+    `);
+  },
+};
+
+/**
+ * Purchase outcomes (KTD8, KTD9): where each attempt's outcome came from (its page, a step of its checkout, the
+ * merchant's email or the principal), when it became unconfirmed and when its delegating group heard so, and
+ * the card that showed main's recorded "not placed". A job a `purchase` answered waiting-on-earlier waits on its
+ * site until no attempt there is unresolved; `released_at` marks one whose wake is still to be told.
+ */
+export const browserPurchaseOutcomesMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:purchase-outcomes',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN resolution_source TEXT CHECK(resolution_source IN ('page','email','principal','step'));
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN unconfirmed_at TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN notified_at TEXT;
+      ALTER TABLE gws_ea_browser_purchase_attempts ADD COLUMN answer_card_id TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN resolution_source TEXT CHECK(resolution_source IN ('page','email','principal','step'));
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN unconfirmed_at TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN notified_at TEXT;
+      ALTER TABLE gws_ea_browser_free_attempts ADD COLUMN answer_card_id TEXT;
+      CREATE TABLE gws_ea_browser_purchase_waiters (
+        site TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        released_at TEXT,
+        PRIMARY KEY(site,job_id)
+      );
     `);
   },
 };

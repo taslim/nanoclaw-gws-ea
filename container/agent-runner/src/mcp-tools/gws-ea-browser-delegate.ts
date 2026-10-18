@@ -192,6 +192,25 @@ export const recordDisclosure = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
+export const recordPurchaseOutcome = requestTool({
+  name: 'record_purchase_outcome',
+  description:
+    "Record whether a browser job's unconfirmed purchase or booking went through, once you know: from the merchant's order email (source email) or the principal's answer when you asked them once (source principal). Name it by the attempt id the job's state shows, never one a browser report gives. Returns recorded; already_recorded with the outcome recorded first, which a later recording never changes; possible_duplicate when you record placed for one already recorded not_placed: tell the principal at once; or in_progress while its press is still settling. Until it is recorded, another purchase on that site waits. Repeating it changes nothing.",
+  properties: {
+    thread: THREAD,
+    attempt_id: { type: 'string', description: "The unconfirmed purchase's attempt id, as the job's state shows it." },
+    outcome: { type: 'string', enum: ['placed', 'not_placed'] },
+    source: {
+      type: 'string',
+      enum: ['email', 'principal'],
+      description: "email: the merchant's order email; principal: the principal's own answer.",
+    },
+  },
+  required: ['thread', 'attempt_id', 'outcome', 'source'],
+  additionalProperties: false,
+  repeatable: true,
+  timeoutMs: 120_000,
+});
 registerTools(
   [
     cancelJob,
@@ -202,6 +221,7 @@ registerTools(
     credentialAuthority,
     consentGrants,
     recordDisclosure,
+    recordPurchaseOutcome,
   ],
   'browser-delegate',
 );

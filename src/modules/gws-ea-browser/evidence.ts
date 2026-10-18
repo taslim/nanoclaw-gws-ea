@@ -126,6 +126,8 @@ const OPERATIONAL_CODES = new Set([
   'personal_data',
   'interrupted',
   'outcome_unknown',
+  'unconfirmed',
+  'waiting_on_earlier',
   'awaiting_principal',
   'withdrawn',
   'approved',

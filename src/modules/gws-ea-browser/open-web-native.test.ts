@@ -40,7 +40,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { configureBrowserCancellation } from './cancel.js';
+import { configureBrowserCancellation, readBrowserJob } from './cancel.js';
 import {
   classifyActivation,
   classifyNavigationUrl,
@@ -65,6 +65,7 @@ import {
   PROCESSOR,
   checkoutPage,
   feeTablePage,
+  genericCheckoutPages,
   openWebFixture,
   placedPage,
   type OpenWebFixture,
@@ -80,6 +81,7 @@ import {
   type BrowserRef,
 } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
+import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
@@ -1546,6 +1548,21 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     }>(
       'SELECT site,platform,account_key,resolution,merchant_record_id FROM gws_ea_browser_purchase_attempts ORDER BY attempted_at',
     );
+  const blocks = () => getDb().all<{ site: string }>('SELECT site FROM gws_ea_browser_purchase_blocks ORDER BY site');
+  /** What the host wrote into a session's conversation, oldest first. */
+  async function texts(into: Session): Promise<string[]> {
+    return (
+      (await withExistingMailboxSession(into.agent_group_id, into.id, (mailbox) =>
+        mailbox
+          .getInboundHistory(100)
+          .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+          .reverse(),
+      )) ?? []
+    );
+  }
+  /** Main's notes that an attempt is unconfirmed. */
+  const unconfirmedNotes = async (): Promise<string[]> =>
+    (await texts(main)).filter((text) => text.includes('so it is unconfirmed'));
   /** Main's recorded bounds for this errand's table, and the principal's standing guarantee up to $100. */
   async function standingGuarantee(): Promise<void> {
     const bounds = getDeliveryAction('reservation_bounds');
@@ -1626,6 +1643,32 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
         merchant_record_id: 'HP-1042',
       },
     ]);
+    // The confirmation page resolved it, from the page, with no block and nothing for main to settle.
+    expect(await getDb().get('SELECT resolution_source FROM gws_ea_browser_purchase_attempts')).toEqual({
+      resolution_source: 'page',
+    });
+    expect(await blocks()).toEqual([]);
+    expect(await unconfirmedNotes()).toEqual([]);
+  });
+
+  it('never resolves a second attempt from an order number its contact email already used', async () => {
+    await open(GENERIC.review);
+    await purchase('Place order');
+    await approve((await approvals())[0]);
+    // The merchant shows the same order number again after a second order.
+    await open(GENERIC.review);
+    expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+    await approve((await approvals())[0]);
+    expect(posts()).toEqual([GENERIC.placed, GENERIC.placed]);
+    const [first, second] = await authorities();
+    expect(JSON.parse(first.outcome_json!)).toMatchObject({ status: 'placed', order_number: 'HP-1042' });
+    expect(JSON.parse(second.outcome_json!)).toMatchObject({ status: 'unconfirmed' });
+    expect(second.state).toBe('unknown');
+    expect(await attempts()).toMatchObject([
+      { resolution: 'committed', merchant_record_id: 'HP-1042' },
+      { resolution: null, merchant_record_id: null },
+    ]);
+    expect(await blocks()).toEqual([{ site: 'pottery.example' }]);
   });
 
   it("keeps the picture's bytes out of the card's rows, the approval row, the databases and the logs", async () => {
@@ -1857,9 +1900,95 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     await approve((await approvals())[0]);
     expect(posts()).toEqual([GENERIC.placed]);
     const [authority] = await authorities();
-    expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'outcome_unknown', purchase_blocked: true });
+    expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'unconfirmed' });
     expect(await attempts()).toMatchObject([{ resolution: null }]);
-    expect(await getDb().all('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual([{ site: 'pottery.example' }]);
+    expect(await blocks()).toEqual([{ site: 'pottery.example' }]);
+    // Main hears once, and reads the attempt id from the job's state, in the principal's time.
+    const view = await readBrowserJob(session.thread_id!);
+    expect(view?.unconfirmed).toEqual([
+      {
+        attempt_id: expect.stringMatching(/^attempt-/u),
+        what: 'purchase on pottery.example',
+        total: '$42.00',
+        pressed: expect.stringMatching(/ Los Angeles time$/u),
+      },
+    ]);
+    const told = await unconfirmedNotes();
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain(`(attempt ${view!.unconfirmed![0].attempt_id})`);
+    await notifyPendingUnconfirmed();
+    expect(await unconfirmedNotes()).toHaveLength(1);
+  });
+
+  it('resolves a press the merchant declines as not placed, from its step, with nothing left to wait on', async () => {
+    fixture.serve(
+      GENERIC.placed,
+      checkoutPage({
+        action: '/checkout/placed',
+        commit: 'Place order',
+        items: ['Celadon mug × 2', 'Ash glaze bowl × 1'],
+        total: '$42.00',
+        payment: 'Visa ending in 4242',
+        email: ALIAS,
+        lines: ['Your card was declined. Try another card.'],
+      }),
+    );
+    try {
+      await open(GENERIC.review);
+      await purchase('Place order');
+      await approve((await approvals())[0]);
+      expect(posts()).toEqual([GENERIC.placed]);
+      const [authority] = await authorities();
+      expect(authority.state).toBe('revoked');
+      expect(JSON.parse(authority.outcome_json!)).toMatchObject({ status: 'not_placed', reason: 'declined' });
+      expect(
+        await getDb().all('SELECT resolution,resolution_source,evidence_json FROM gws_ea_browser_purchase_attempts'),
+      ).toEqual([
+        {
+          resolution: 'not_committed',
+          resolution_source: 'step',
+          evidence_json: expect.stringContaining('Your card was declined'),
+        },
+      ]);
+      expect(await blocks()).toEqual([]);
+      expect(await unconfirmedNotes()).toEqual([]);
+      // The next purchase there needs no answer from the principal.
+      await open(GENERIC.review);
+      expect(await purchase('Place order')).toMatchObject({ status: 'awaiting_principal' });
+    } finally {
+      fixture.serve(GENERIC.placed, placedPage('HP-1042', '$42.00'));
+    }
+  });
+
+  it('leaves a free booking with no confirmation unconfirmed, and makes the next booking there wait until main records it', async () => {
+    fixture.serve(GENERIC.booked, '<!doctype html><title>Processing</title><p>Processing your request</p>');
+    await open(GENERIC.freeTable);
+    const pressed = await purchase('Reserve now');
+    expect(pressed).toMatchObject({ status: 'unconfirmed', attempt_id: expect.stringMatching(/^free-attempt-/u) });
+    const attemptId = String(pressed.attempt_id);
+    expect(await getDb().all('SELECT resolution FROM gws_ea_browser_free_attempts')).toEqual([{ resolution: null }]);
+    expect(await blocks()).toEqual([{ site: 'table.example' }]);
+    const told = await unconfirmedNotes();
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain(`free booking on table.example`);
+    expect(told[0]).toContain(attemptId);
+    // Browsing the site goes on; another booking there waits.
+    await open(GENERIC.freeTable);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'waiting_on_earlier', site: 'table.example' });
+    expect(posts()).toEqual([GENERIC.booked]);
+    fixture.serve(GENERIC.booked, genericCheckoutPages()[GENERIC.booked]);
+    expect(
+      await recordPurchaseOutcome(
+        { thread: session.thread_id!, attempt_id: attemptId, outcome: 'not_placed', source: 'principal' },
+        main,
+        () => queue,
+      ),
+    ).toMatchObject({ status: 'recorded', outcome: 'not_placed', source: 'principal' });
+    expect(await blocks()).toEqual([]);
+    expect((await texts(session)).filter((text) => text.includes('"site":"table.example"'))).toHaveLength(1);
+    await open(GENERIC.freeTable);
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-2210' });
+    expect(posts()).toEqual([GENERIC.booked, GENERIC.booked]);
   });
 
   it('keeps the merchant’s lease and block through a payment platform’s own page, binding the platform origin', async () => {

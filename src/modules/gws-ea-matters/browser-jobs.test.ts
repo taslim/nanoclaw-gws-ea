@@ -75,6 +75,41 @@ it('places a job once, renders state and delivered report freshly, then cancels 
   expect(await readBrowserJob(THREAD)).toMatchObject({ state: 'cancelled' });
 });
 
+it("shows main a job's unconfirmed purchase with the attempt id it records the outcome against", async () => {
+  const matter = (
+    await openMatter({ title: 'Mugs', openLoop: 'Order the mugs.', links: [{ kind: 'job', reference: THREAD }] })
+  ).matter;
+  await readBrowserJob(THREAD);
+  const at = new Date().toISOString();
+  const facts = {
+    flowId: 'generic-checkout-v1',
+    site: 'pottery.example',
+    totalMinor: 4200,
+    dueNowMinor: 4200,
+    currency: 'USD',
+    generic: { guest: true, contactEmail: 'aya.web@example.test', items: ['Celadon mug × 2'], payment: 'Visa' },
+  };
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_authorities (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+     VALUES('authority-mugs',?,'checkout','unknown',?,'{}','[]','attempt-mugs',?,?)`,
+    THREAD,
+    JSON.stringify(facts),
+    at,
+    at,
+  );
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at,unconfirmed_at)
+     VALUES('attempt-mugs','authority-mugs',?,'pottery.example',?,?,?)`,
+    THREAD,
+    JSON.stringify(facts),
+    at,
+    at,
+  );
+  expect(await renderMatter(matter)).toMatch(
+    /unconfirmed purchase on pottery\.example for \$42\.00, pressed .+ \(attempt attempt-mugs\)/u,
+  );
+});
+
 it('cancels jobs linked to closed matters during startup reconciliation', async () => {
   const matter = (
     await openMatter({ title: 'Find a table', openLoop: 'Pending.', links: [{ kind: 'job', reference: THREAD }] })

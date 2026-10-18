@@ -3,6 +3,7 @@ import { requestWake } from '../../request-wake.js';
 import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { hasBrowserAccess } from './access.js';
 
 /** Browser continuations are host chat turns; system rows are reserved for tool answers. */
 export function writeBrowserNotice(session: Session, id: string, eventJson: string): Promise<void> {
@@ -63,4 +64,18 @@ export async function tellDelegator(
   const fresh = await getSession(session.id);
   if (fresh) await requestWake(fresh, 'inbound-message');
   return 'written';
+}
+
+/**
+ * Tell the agent that delegated a browser errand of its purchase, as `tellDelegator` does; once its group's
+ * browser access was removed, main hears instead, since main is the one left to record the purchase's outcome
+ * (KTD9). The note names no job: main never holds another group's errand.
+ */
+export async function tellOfPurchase(
+  errand: BrowserErrand,
+  note: { readonly id: string; readonly timestamp: string; readonly text: string },
+): Promise<DelegatorNotice> {
+  if (await hasBrowserAccess(errand.source)) return tellDelegator(errand, note);
+  const { writeNoteForMain } = await import('../gws-ea-profile/main-note.js');
+  return writeNoteForMain({ ...note, wake: true });
 }

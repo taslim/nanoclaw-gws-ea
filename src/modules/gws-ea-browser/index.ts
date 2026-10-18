@@ -16,6 +16,7 @@ import {
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
   browserPurchaseMigration,
+  browserPurchaseOutcomesMigration,
   browserReservationBoundsMigration,
   browserQueueMigration,
   browserRecipesMigration,
@@ -52,6 +53,7 @@ import {
   resumeBrowserPurchaseCommits,
   sweepBrowserPurchaseState,
 } from './purchase.js';
+import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { registerConsentGrantsDelivery } from './consent-approval.js';
 import { registerDisclosureDelivery } from './disclosures.js';
@@ -73,6 +75,7 @@ registerMigration(browserIncidentsMigration);
 registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
+registerMigration(browserPurchaseOutcomesMigration);
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
@@ -435,6 +438,7 @@ for (const name of ['watch', 'list_watches', 'cancel_watch']) registerBrowserAct
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
+registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerConsentGrantsDelivery();
 registerDisclosureDelivery();

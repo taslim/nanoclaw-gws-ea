@@ -12,18 +12,81 @@ import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
-import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
+import { PurchaseAuthorityStore } from './authority.js';
+import { cardTime, detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
+import { formatMoney, type PurchaseFacts } from './fingerprint.js';
+import { principalClock } from './watch-policy.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
 
 export type BrowserJobState = 'idle' | 'working' | 'awaiting_principal' | 'watching' | 'cancelled';
+/** The purchase card the principal is asked: its merchant and money, and when it lapses on their clock. */
+export interface BrowserJobCard {
+  readonly site: string;
+  readonly total: string;
+  readonly due_now: string;
+  readonly expires: string;
+}
+/**
+ * A purchase of the job's with no page proof (KTD8), and the attempt id main records its outcome against: never
+ * one a browser report gives (KTD9). Its press is on the principal's clock.
+ */
+export interface BrowserJobUnconfirmed {
+  readonly attempt_id: string;
+  readonly what: string;
+  readonly total?: string;
+  readonly pressed: string;
+}
 export interface BrowserJobView {
   readonly job: BrowserJob;
   readonly state: BrowserJobState;
   readonly held_sites: readonly string[];
   readonly waiting_sign_in?: { readonly site: string; readonly origin: string; readonly expires_at: string };
+  readonly open_card?: BrowserJobCard;
+  readonly unconfirmed?: readonly BrowserJobUnconfirmed[];
   /** The delivered report's raw text; the rendering boundary frames it as untrusted. */
   readonly last_report?: { readonly at: string; readonly text: string };
+}
+
+/** The job's open card and unconfirmed purchases, as main reads them in the principal's time (KTD18). */
+async function purchaseState(
+  store: BrowserStore,
+  jobId: string,
+): Promise<{ open_card?: BrowserJobCard; unconfirmed?: BrowserJobUnconfirmed[] }> {
+  if (!(await store.db.hasTable('gws_ea_browser_purchase_cards'))) return {};
+  const card = await store.db.get<{ facts_json: string; expires_at: string }>(
+    "SELECT facts_json,expires_at FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1",
+    jobId,
+  );
+  const attempts = await new PurchaseAuthorityStore(store.db).unconfirmedOf(jobId);
+  if (!card && !attempts.length) return {};
+  const [{ attemptSummary }, zone] = await Promise.all([import('./purchase-outcome.js'), principalClock()]);
+  const facts = card ? (JSON.parse(card.facts_json) as PurchaseFacts) : undefined;
+  return {
+    ...(card && facts
+      ? {
+          open_card: {
+            site: facts.site,
+            total: formatMoney(facts.totalMinor, facts.currency),
+            due_now: formatMoney(facts.dueNowMinor, facts.currency),
+            expires: cardTime(card.expires_at, zone),
+          },
+        }
+      : {}),
+    ...(attempts.length
+      ? {
+          unconfirmed: attempts.map((attempt) => {
+            const { what, total } = attemptSummary(attempt);
+            return {
+              attempt_id: attempt.id,
+              what,
+              ...(total ? { total } : {}),
+              pressed: cardTime(attempt.attempted_at, zone),
+            };
+          }),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -121,6 +184,7 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
               : 'idle',
     held_sites: leases.map((lease) => lease.site),
     ...(waitingSignIn ? { waiting_sign_in: waitingSignIn } : {}),
+    ...(await purchaseState(store, job.id)),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
   };
 }

@@ -75,20 +75,45 @@ export function cardEventTime(at: string, venueTimeZone: string, principalTimeZo
     ? venue
     : `${venue} (${cardTime(at, principalTimeZone)})`;
 }
-/** Earlier attempts on the site with no recorded outcome, by their count: an attempt's id means nothing to the principal. */
-function duplicateWarning(exceptions: readonly string[]): string[] {
-  if (!exceptions.length) return [];
-  const earlier =
-    exceptions.length > 1
-      ? `${exceptions.length} earlier purchases on this site have`
+/** An earlier purchase on the site main recorded as not placed, from the merchant's email or the principal (KTD9). */
+export interface RecordedNotPlaced {
+  readonly attemptedAt: string;
+  readonly source: 'email' | 'principal';
+}
+/**
+ * What a card says of earlier purchases on its site, never by id, which means nothing to the principal: how many
+ * have no recorded outcome (the card's one-attempt exception), and each that main recorded as not placed since
+ * the site's last card.
+ */
+export interface EarlierPurchases {
+  readonly unresolved: number;
+  readonly recordedNotPlaced: readonly RecordedNotPlaced[];
+}
+export const NO_EARLIER_PURCHASES: EarlierPurchases = { unresolved: 0, recordedNotPlaced: [] };
+function earlierLines(earlier: EarlierPurchases, principalTimeZone: string): string[] {
+  const lines = earlier.recordedNotPlaced.map(
+    (recorded) =>
+      `Earlier purchase here, tried ${cardTime(recorded.attemptedAt, principalTimeZone)}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
+  );
+  if (!earlier.unresolved) return lines;
+  const count =
+    earlier.unresolved > 1
+      ? `${earlier.unresolved} earlier purchases on this site have`
       : 'An earlier purchase on this site has';
   return [
-    `Possible duplicate: ${earlier} no recorded outcome. Approving permits exactly one new attempt and may buy the same thing twice.`,
+    ...lines,
+    `Possible duplicate: ${count} no recorded outcome. Approving permits exactly one new attempt and may buy the same thing twice.`,
   ];
 }
 /** Who the card shows for the assistant's web address: the principal knows it as their assistant's. */
 export interface CardIdentity {
   readonly alias?: string | null;
+}
+/** Whether `address` is the assistant's own web address. */
+function isAssistantAddress(address: string, identity: CardIdentity): boolean {
+  return (
+    Boolean(identity.alias) && identityMatchKey(`email:${address}`) === identityMatchKey(`email:${identity.alias}`)
+  );
 }
 /** The terms a card lists, each with its amounts, trigger and dates. */
 function termLines(
@@ -120,7 +145,7 @@ function termLines(
  */
 function renderGenericCard(
   facts: PurchaseFacts,
-  exceptions: readonly string[],
+  earlier: EarlierPurchases,
   principalTimeZone: string,
   change: string | undefined,
   identity: CardIdentity,
@@ -128,13 +153,12 @@ function renderGenericCard(
   const generic = facts.generic;
   if (!generic) throw new Error('A generic card needs the generic facts');
   const money = (amount: number): string => formatMoney(amount, facts.currency);
-  const assistant = (address: string): boolean =>
-    Boolean(identity.alias) && identityMatchKey(`email:${address}`) === identityMatchKey(`email:${identity.alias}`);
+  const assistant = (address: string): boolean => isAssistantAddress(address, identity);
   const booking = generic.booking;
   const lines = [
     "I'd like to place this purchase using the facts I read from the checkout.",
     ...(change ? [change] : []),
-    ...duplicateWarning(exceptions),
+    ...earlierLines(earlier, principalTimeZone),
     `Site: ${facts.site}`,
     ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
     `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quotePurchaseText(facts.account)}`,
@@ -166,23 +190,19 @@ function renderGenericCard(
 export function renderPurchaseCard(
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
-  exceptions: readonly string[],
+  earlier: EarlierPurchases,
   principalTimeZone: string,
   change?: string,
   identity: CardIdentity = {},
 ): string {
-  if (facts.generic) return renderGenericCard(facts, exceptions, principalTimeZone, change, identity);
+  if (facts.generic) return renderGenericCard(facts, earlier, principalTimeZone, change, identity);
   const money = (amount: number): string => formatMoney(amount, facts.currency);
   const lines = [
     "I'd like to place this purchase using the facts I read from the merchant's review page.",
     ...(change ? [change] : []),
-    ...(exceptions.length
-      ? [
-          `Possible duplicate: the earlier attempt${exceptions.length > 1 ? 's' : ''} ${exceptions.map((id) => quotePurchaseText(id)).join(', ')} remain unresolved. Approving permits exactly one new attempt and may buy the same thing twice.`,
-        ]
-      : []),
+    ...earlierLines(earlier, principalTimeZone),
     `Site: ${quotePurchaseText(facts.origin)}`,
-    `Account: ${quotePurchaseText(facts.account)}`,
+    `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quotePurchaseText(facts.account)}`,
     `Commit control: ${quotePurchaseText(facts.control.label)}`,
     ...facts.items.map(
       (item) =>

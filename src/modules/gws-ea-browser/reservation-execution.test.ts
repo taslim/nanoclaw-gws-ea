@@ -241,10 +241,10 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     expect(fixture.submitted()).toBe(0);
     expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
   });
-  it('blocks the whole site when a submitted reservation has no bound native confirmation', async () => {
+  it('leaves a submitted reservation with no bound native confirmation unconfirmed, holding back the next purchase on the site', async () => {
     fixtureState.responseToken = '';
     const outcome = await purchase('unknown');
-    expect(outcome).toMatchObject({ status: 'outcome_unknown', purchase_blocked: true });
+    expect(outcome).toMatchObject({ status: 'unconfirmed', attempt_id: expect.any(String) });
     expect(fixture.submitted()).toBe(1);
     expect(await getDb().get('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual({ site: 'resy.com' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
@@ -298,10 +298,18 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       expect(await getDb().get('SELECT COUNT(*) AS count FROM pending_approvals')).toEqual({ count: 0 });
       expect(
         await getDb().all(
-          'SELECT site,platform,account_key,resolution,merchant_record_id FROM gws_ea_browser_free_attempts',
+          'SELECT site,platform,account_key,resolution,resolution_source,merchant_record_id FROM gws_ea_browser_free_attempts',
         ),
       ).toEqual([
-        { site: 'resy.com', platform: null, account_key: null, resolution: 'committed', merchant_record_id: '90123' },
+        {
+          site: 'resy.com',
+          platform: null,
+          // The reviewed merchant's account keys its reservation numbers, as a paid attempt's does.
+          account_key: 'resy:72',
+          resolution: 'committed',
+          resolution_source: 'page',
+          merchant_record_id: '90123',
+        },
       ]);
       expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
       expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_authorities')).toEqual({ count: 0 });

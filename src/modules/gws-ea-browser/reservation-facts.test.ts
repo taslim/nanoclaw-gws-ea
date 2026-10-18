@@ -57,8 +57,8 @@ it('uses each currency exponent and refuses hidden precision instead of rounding
 });
 
 it('shows the exact reservation and explicit no-commitment terms on its approval card', async () => {
-  const { renderPurchaseCard } = await import('./cards.js');
-  const card = renderPurchaseCard(free, {}, [], 'UTC');
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
+  const card = renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, 'UTC');
   expect(card).toContain('Bistro');
   expect(card).toContain('Party size: 2');
   expect(card).toContain('Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM UTC\n');
@@ -67,7 +67,7 @@ it('shows the exact reservation and explicit no-commitment terms on its approval
 });
 
 it("shows a Tokyo dinner on the venue's clock with the principal's alongside, and its deadline on theirs", async () => {
-  const { renderPurchaseCard } = await import('./cards.js');
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
   const dinner: PurchaseFacts = {
     ...free,
     currency: 'JPY',
@@ -91,19 +91,19 @@ it("shows a Tokyo dinner on the venue's clock with the principal's alongside, an
       timeZone: 'Asia/Tokyo',
     },
   };
-  const card = renderPurchaseCard(dinner, {}, [], 'America/Los_Angeles');
+  const card = renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, 'America/Los_Angeles');
   expect(card).toContain(
     'Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM Tokyo time (Oct 20, 2026, 3:00 AM through 4:30 AM Los Angeles time)',
   );
   expect(card).toContain('Cancellation deadline: Oct 19, 2026, 3:00 AM Los Angeles time');
   // A principal on the venue's clock reads it once.
-  expect(renderPurchaseCard(dinner, {}, [], 'Asia/Tokyo')).toContain(
+  expect(renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, 'Asia/Tokyo')).toContain(
     'Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM Tokyo time\n',
   );
 });
 
 it('shows a needed-by deadline and a trial conversion on the principal’s clock, labelled', async () => {
-  const { renderPurchaseCard } = await import('./cards.js');
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
   const trial: PurchaseFacts = {
     ...free,
     reservation: undefined,
@@ -123,7 +123,7 @@ it('shows a needed-by deadline and a trial conversion on the principal’s clock
   const card = renderPurchaseCard(
     trial,
     { neededBy: '2026-10-21T06:59:59.999Z', principalTimeZone: 'America/Los_Angeles' },
-    [],
+    NO_EARLIER_PURCHASES,
     'America/Los_Angeles',
   );
   expect(card).toContain('Needed by: Oct 20, 2026, 11:59 PM Los Angeles time');
@@ -181,10 +181,17 @@ const booking: PurchaseFacts = {
 };
 
 it("shows an unreviewed booking's account, quoted items, note and time, naming the assistant's address and no internal id", async () => {
-  const { renderPurchaseCard } = await import('./cards.js');
-  const card = renderPurchaseCard(booking, {}, ['attempt-1a2b'], 'America/New_York', undefined, {
-    alias: 'Aya.Web@example.test',
-  });
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
+  const card = renderPurchaseCard(
+    booking,
+    {},
+    { unresolved: 1, recordedNotPlaced: [] },
+    'America/New_York',
+    undefined,
+    {
+      alias: 'Aya.Web@example.test',
+    },
+  );
   for (const line of [
     'Site: trattoria.example',
     'Account: guest checkout',
@@ -201,12 +208,12 @@ it("shows an unreviewed booking's account, quoted items, note and time, naming t
     'Possible duplicate: An earlier purchase on this site has no recorded outcome.',
   ])
     expect(card).toContain(line);
-  expect(card).not.toContain('attempt-1a2b');
+  expect(card).not.toMatch(/attempt-|authority-/u);
   expect(card).not.toContain('aya.web@example.test');
   const signedIn = renderPurchaseCard(
     { ...booking, account: 'aya.web+tables@example.test', generic: { ...booking.generic!, guest: false } },
     {},
-    [],
+    NO_EARLIER_PURCHASES,
     'America/New_York',
     undefined,
     { alias: 'aya.web@example.test' },
@@ -216,10 +223,46 @@ it("shows an unreviewed booking's account, quoted items, note and time, naming t
     renderPurchaseCard(
       { ...booking, account: 'Morgan Ellery', generic: { ...booking.generic!, guest: false } },
       {},
-      [],
+      NO_EARLIER_PURCHASES,
       'America/New_York',
     ),
   ).toContain('Account: "Morgan Ellery"');
+});
+
+it("names earlier purchases on a reviewed card by count and time, never by id, and the assistant's own account as its", async () => {
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
+  const card = renderPurchaseCard(
+    free,
+    {},
+    {
+      unresolved: 2,
+      recordedNotPlaced: [
+        { attemptedAt: '2026-10-17T22:04:00.000Z', source: 'principal' },
+        { attemptedAt: '2026-10-16T17:30:00.000Z', source: 'email' },
+      ],
+    },
+    'America/Los_Angeles',
+  );
+  for (const line of [
+    'Earlier purchase here, tried Oct 17, 2026, 3:04 PM Los Angeles time: I recorded it as not placed, from what you told me.',
+    "Earlier purchase here, tried Oct 16, 2026, 10:30 AM Los Angeles time: I recorded it as not placed, from the merchant's email.",
+    'Possible duplicate: 2 earlier purchases on this site have no recorded outcome. Approving permits exactly one new attempt and may buy the same thing twice.',
+  ])
+    expect(card).toContain(line);
+  expect(card).not.toMatch(/attempt-|authority-/u);
+  expect(renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, 'UTC')).not.toMatch(/Earlier purchase|Possible duplicate/u);
+  const own = renderPurchaseCard(
+    { ...free, account: 'Aya.Web@example.test' },
+    {},
+    NO_EARLIER_PURCHASES,
+    'UTC',
+    undefined,
+    {
+      alias: 'aya.web@example.test',
+    },
+  );
+  expect(own).toContain("Account: your assistant's account");
+  expect(own).not.toContain('aya.web@example.test');
 });
 
 it('covers an unreviewed booking under the standing guarantee only when its venue, party size, time and fee are read within bounds', async () => {

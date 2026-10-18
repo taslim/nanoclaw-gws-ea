@@ -1,10 +1,11 @@
 /**
  * Incidents (KTD10): spending that may have slipped past the host. Each is a row of its own, inserted in the
  * same transaction as its job's stop, and a job records one per kind and evidence. The job's delegating group
- * hears of each at once, and tells the principal.
+ * hears of each at once, and tells the principal; once that group's browser access was removed, main hears.
  *
- * `unapproved_commit` is a confirmation page that showed a charge after an ordinary press. Its notice is
- * written after the stop commits; the host's sweep tells of any whose notice did not go out.
+ * `unapproved_commit` is a confirmation page that showed a charge after an ordinary press. `late_confirmation`
+ * is main reporting placed a purchase it had recorded not placed: the merchant's late order email, and possibly
+ * a duplicate. Each notice is written after the stop commits; the host's sweep tells of any that did not go out.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -16,10 +17,10 @@ import { cancelBrowserJobInTransaction, finishBrowserJobCancellation, type Brows
 import { showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore } from './db.js';
 import { formatMoney } from './fingerprint.js';
-import { tellDelegator } from './notices.js';
+import { tellOfPurchase } from './notices.js';
 import type { BrowserExecutionContext } from './queue.js';
 
-export type IncidentKind = 'unapproved_commit';
+export type IncidentKind = 'unapproved_commit' | 'late_confirmation';
 
 export interface BrowserIncident {
   readonly id: string;
@@ -87,11 +88,24 @@ function unapprovedCommitFacts(incident: BrowserIncident): { reference: string; 
 }
 
 function noticeText(incident: BrowserIncident, thread: string): string {
-  const { reference, charged } = unapprovedCommitFacts(incident);
-  return (
-    `Browser job ${thread} was stopped: an ordinary press on ${incident.site} landed on a confirmation showing ` +
-    `${charged ?? 'a charge'}, reference ${reference}. Nobody approved this purchase. Tell the principal now.`
-  );
+  switch (incident.kind) {
+    case 'unapproved_commit': {
+      const { reference, charged } = unapprovedCommitFacts(incident);
+      return (
+        `Browser job ${thread} was stopped: an ordinary press on ${incident.site} landed on a confirmation showing ` +
+        `${charged ?? 'a charge'}, reference ${reference}. Nobody approved this purchase. Tell the principal now.`
+      );
+    }
+    case 'late_confirmation':
+      return (
+        `Browser job ${thread} was stopped: the purchase on ${incident.site} recorded as not placed was reported ` +
+        'placed after all, so the principal may have bought it twice. Tell the principal now.'
+      );
+    default: {
+      const unknown: never = incident.kind;
+      throw new Error(`Unknown incident kind ${String(unknown)}`);
+    }
+  }
 }
 
 /** Tells the incident's delegating group of it, once; a notice that cannot go out yet is retried by the sweep. */
@@ -101,7 +115,7 @@ export async function notifyIncident(id: string, db: DbDriver = getDb()): Promis
   const job = await new BrowserStore(db).getJob(incident.job_id);
   const session = job ? await getSession(job.browser_session_id) : undefined;
   if (!job || !session) return;
-  const told = await tellDelegator(
+  const told = await tellOfPurchase(
     { job: job.thread_id, session, source: job.source_agent_group_id },
     {
       id: `browser-incident-${incident.id}`,
