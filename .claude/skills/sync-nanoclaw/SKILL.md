@@ -33,7 +33,7 @@ git remote get-url upstream   # nanocoai/nanoclaw
 gh repo view taslim/nanoclaw-gws-ea --json viewerPermission --jq .viewerPermission
 ```
 
-Continue only when `origin` points at `taslim/nanoclaw-gws-ea` (`https://github.com/taslim/nanoclaw-gws-ea` or `git@github.com:taslim/nanoclaw-gws-ea`, with or without `.git`) and the permission is `ADMIN`, `MAINTAIN` or `WRITE`. Otherwise stop: *"This skill is for GWS-EA's maintainer. To update GWS-EA, run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`."* When the `upstream` remote is missing, the maintainer adds it with `git remote add upstream https://github.com/nanocoai/nanoclaw.git`.
+Continue only when `origin` points at `taslim/nanoclaw-gws-ea`, `upstream` at `nanocoai/nanoclaw` (each as `https://github.com/<owner>/<repo>` or `git@github.com:<owner>/<repo>`, with or without `.git`), and the permission is `ADMIN`, `MAINTAIN` or `WRITE`. An `upstream` that points anywhere else would merge someone else's code into `rebuild-v2` as NanoClaw: stop and show the maintainer the URL. Otherwise stop: *"This skill is for GWS-EA's maintainer. To update GWS-EA, run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`."* When the `upstream` remote is missing, the maintainer adds it with `git remote add upstream https://github.com/nanocoai/nanoclaw.git`.
 
 "Latest" means `upstream/main`. When the maintainer names a release tag (`vYYYY.MM.N` or `-rc.N`), use that ref everywhere this skill says `upstream/main`.
 
@@ -47,7 +47,7 @@ git show upstream/main:package.json | grep '"version"'                     # the
 Each command call starts a fresh shell, so variables do not carry over. Start every later command block with these lines, with today's date and the operator checkout's path written literally:
 
 ```bash
-D=<YYYY-MM-DD>; OPERATOR=<operator checkout path>
+D='<YYYY-MM-DD>'; OPERATOR='<operator checkout path>'
 SCRATCH="${TMPDIR:-/tmp}/sync-nanoclaw-$D"; mkdir -p "$SCRATCH/analysis"   # lists, reports and diffs, outside the repo
 MB=$(git merge-base origin/rebuild-v2 upstream/main)
 ```
@@ -190,7 +190,7 @@ git push origin HEAD:rebuild-v2    # fast-forward only; never --force, never a P
 ### 11. Afterwards
 
 - Watch CI on the push, since a sync never had a PR to run it: `gh run list --repo taslim/nanoclaw-gws-ea --branch rebuild-v2 --limit 3`. A red run is fixed forward in an ordinary PR.
-- In the operator checkout (`$OPERATOR`): `git pull --ff-only`, then `pnpm install --frozen-lockfile`, since `gws-ea` runs from that checkout's source. Confirm `gws-ea --help` loads.
+- Bring the operator checkout (`$OPERATOR`) to the new `rebuild-v2`, since `gws-ea` runs from its source. When `git branch --show-current` there prints `rebuild-v2`, run `git pull --ff-only`, then `pnpm install --frozen-lockfile`, and confirm `gws-ea --help` loads. On any other branch, leave it: that is the maintainer's work in progress; tell them `rebuild-v2` moved.
 - `git worktree remove .claude/worktrees/sync-nanoclaw-$D` and `git branch -d chore/sync-nanoclaw-$D`.
 - Tell the maintainer that assistants get the sync through `gws-ea update`, their call. Say when the update rebuilds the agent image (a `container/` change).
 
