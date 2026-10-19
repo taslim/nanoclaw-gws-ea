@@ -5,7 +5,9 @@ import type { AudioSource, SpeechResult } from '../../channels/inbound-content.j
 import { getDb } from '../../db/index.js';
 import { log } from '../../log.js';
 
-export const MAX_WHATSAPP_MEDIA_BYTES = 25 * 1024 * 1024;
+import { MAX_WHATSAPP_MEDIA_BYTES, WhatsAppMediaTooLargeError } from './media-limits.js';
+
+export { MAX_WHATSAPP_MEDIA_BYTES } from './media-limits.js';
 export interface WhatsAppAttachment {
   readonly type: 'image' | 'audio' | 'video' | 'file';
   readonly name: string;
@@ -106,6 +108,11 @@ export async function inboundMedia(
     if (bytes.length > MAX_WHATSAPP_MEDIA_BYTES) return failed('too-large');
     return [{ ...base, data: bytes.toString('base64') }];
   } catch (error) {
+    if (
+      error instanceof WhatsAppMediaTooLargeError ||
+      (error instanceof Error && error.cause instanceof WhatsAppMediaTooLargeError)
+    )
+      return failed('too-large');
     log.warn('Could not download WhatsApp attachment', { messageId: raw.key.id, err: error });
     return failed('media-download-failed');
   }

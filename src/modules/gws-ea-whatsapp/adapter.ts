@@ -1,7 +1,6 @@
 import {
   Browsers,
   DisconnectReason,
-  downloadMediaMessage,
   makeWASocket,
   type BaileysEventEmitter,
   type BaileysEventMap,
@@ -30,6 +29,7 @@ import { createWhatsAppOutreach, type WhatsAppGroupOutreach } from './outreach.j
 import { createWhatsAppGroupEvents, type WhatsAppGroup } from './events.js';
 import { normalizedJid, resolvePerson } from './identity.js';
 import { createWhatsAppInbound } from './inbound.js';
+import { downloadWhatsAppMedia } from './media-download.js';
 import { WhatsAppIndex } from './index-store.js';
 import { observeWhatsAppConnection, observeWhatsAppGroup } from './observers.js';
 import { createWhatsAppOutbound } from './outbound.js';
@@ -126,6 +126,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
   let replayTimer: ReturnType<typeof setTimeout> | undefined;
   let failures = 0;
   let inbound: ReturnType<typeof createWhatsAppInbound> | undefined;
+  let mediaAbort = new AbortController();
   const contacts = new WhatsAppContacts(
     options.directory,
     () => {
@@ -239,6 +240,9 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     const version = await (options.resolveVersion ?? resolveWaWebVersion)();
     if (stopped) return;
     const previous = socket;
+    mediaAbort.abort();
+    mediaAbort = new AbortController();
+    const mediaSignal = mediaAbort.signal;
     socket = undefined;
     connected = false;
     await previous?.end(undefined);
@@ -291,17 +295,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       onDirectMessage: (person, at) => contacts.received(person.lid, at),
       answers,
       download:
-        options.downloadMedia ??
-        ((message) =>
-          downloadMediaMessage(
-            message,
-            'buffer',
-            {},
-            {
-              logger,
-              reuploadRequest: current.updateMediaMessage,
-            },
-          )),
+        options.downloadMedia ?? ((message) => downloadWhatsAppMedia(message, current.updateMediaMessage, mediaSignal)),
       now,
     });
     listen(current, 'creds.update', async (update) => {
@@ -423,6 +417,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       if (stopped) return;
       stopped = true;
       connected = false;
+      mediaAbort.abort();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (replayTimer) clearTimeout(replayTimer);
       await socket?.end(undefined);
