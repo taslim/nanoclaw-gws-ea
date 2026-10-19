@@ -89,6 +89,10 @@ const DAY = 24 * 60 * 60 * 1000;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const RECURRENCE_LINE = /^(?:RRULE|EXRULE|RDATE|EXDATE)[:;]\S+$/u;
 
+/** Refusing an event Google returned only part of the guest list of: written back whole, the list would lose the rest. */
+const INCOMPLETE_LIST =
+  "Google didn't return this event's whole guest list, so changing it could drop guests: ask the principal to change it in Google Calendar.";
+
 /** People named in prose: "a, b, and c". */
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
@@ -515,6 +519,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           `${current.organizer ?? 'Someone else'} organizes that event: only they change who it invites. Ask them, through external-email when they are outside.`,
         );
       }
+      if (current.attendeesOmitted === true) throw forbidden(INCOMPLETE_LIST);
 
       const { next, added, removed, invited, answer, absent, already } = guestChange(
         entry.id,

@@ -3,10 +3,11 @@
  * the scheduling tools' tests. It keeps what Google keeps: a deleted event
  * stays under its id as `cancelled`, an id is never issued twice, and a
  * Meet link is created once per request id, as `meetCreation` says it goes.
- * A guest a write gives no answer awaits one, and the calendar's own owner is
- * the organizer, as the live Calendar showed (2026-10-07). Every change to
- * an event gives it a new etag, and a guest-list write over an older one
- * is refused, as Google refuses it with 412.
+ * A guest a write gives no answer awaits one, and the event's organizer is
+ * flagged as such on its guest list, as the live Calendar showed
+ * (2026-10-07). Every change to an event gives it a new etag, and a
+ * guest-list write over an older one is refused, as Google refuses it with
+ * 412; one on an event that is not there is `gone`.
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
@@ -20,6 +21,7 @@ import type {
   EventGuests,
   EventWrite,
   GuestRecord,
+  GuestWriteResult,
   MeetingsCalendarApi,
   NewEvent,
   SendUpdates,
@@ -46,7 +48,8 @@ export interface StoredEvent extends Omit<CalendarEvent, 'organizer' | 'attendee
 }
 
 export interface CalendarWriteRecord {
-  readonly op: 'insert' | 'patch' | 'guests' | 'delete';
+  /** `own` writes only the calendar's own guest entry, the rest of the list left out. */
+  readonly op: 'insert' | 'patch' | 'guests' | 'own' | 'delete';
   readonly calendarId: string;
   readonly eventId: string;
   readonly sendUpdates: SendUpdates;
@@ -73,14 +76,14 @@ function overlapsInterval(event: CalendarEvent, min: number, max: number): boole
   return Date.parse(start) - slack < max && Date.parse(end) + slack > min;
 }
 
-/** A guest as Google stores one a write lists: awaiting an answer unless given one, the calendar's owner its organizer. */
-function stored(calendarId: string, guest: GuestRecord): GuestRecord {
+/** A guest as Google stores one a write lists: awaiting an answer unless given one, the event's organizer flagged. */
+function stored(event: StoredEvent, guest: GuestRecord): GuestRecord {
   const email = typeof guest.email === 'string' ? guest.email.toLowerCase() : undefined;
   return {
     ...guest,
     ...(email === undefined ? {} : { email }),
     ...(typeof guest.responseStatus === 'string' ? {} : { responseStatus: 'needsAction' }),
-    ...(email === calendarId.toLowerCase() ? { organizer: true } : {}),
+    ...(email !== undefined && email === event.organizer?.email?.toLowerCase() ? { organizer: true } : {}),
   };
 }
 
@@ -96,7 +99,7 @@ function attendee(guest: GuestRecord): EventAttendee {
 
 /** An event with these guests, stored as Google stores them. */
 function withGuests(event: StoredEvent, guests: readonly GuestRecord[]): StoredEvent {
-  const kept = guests.map((guest) => stored(event.calendarId, guest));
+  const kept = guests.map((guest) => stored(event, guest));
   return { ...event, guests: kept, attendees: kept.map(attendee) };
 }
 
@@ -284,13 +287,43 @@ export class FakeCalendar implements MeetingsCalendarApi {
       ...(event.etag === undefined ? {} : { etag: event.etag }),
       ...(event.status === undefined ? {} : { status: event.status }),
       ...(event.organizer?.email === undefined ? {} : { organizer: event.organizer.email.toLowerCase() }),
-      guests: event.guests ?? (event.attendees ?? []).map((guest) => ({ ...guest })),
+      guests: this.guestsOf(event),
+      ...(event.attendeesOmitted === true ? { attendeesOmitted: true } : {}),
+      ...(event.recurringEventId === undefined ? {} : { recurringEventId: event.recurringEventId }),
+      ...(event.recurrence === undefined ? {} : { recurrence: event.recurrence }),
       ...(event.summary === undefined ? {} : { summary: event.summary }),
       ...(event.description === undefined ? {} : { description: event.description }),
       ...(event.location === undefined ? {} : { location: event.location }),
     };
     this.afterGuestReads.shift()?.();
     return read;
+  }
+
+  /** Each guest of a stored event whole, as a guest read returns them. */
+  private guestsOf(event: StoredEvent): GuestRecord[] {
+    return [...(event.guests ?? (event.attendees ?? []).map((guest) => ({ ...guest })))];
+  }
+
+  /** One guest-list write: refused as Google refuses it, else the event at its new guests. */
+  private writeGuests(
+    record: Omit<CalendarWriteRecord, 'guests'> & {
+      readonly op: 'guests' | 'own';
+      readonly guests: readonly GuestRecord[];
+    },
+    etag: string | undefined,
+    next: (event: StoredEvent) => readonly GuestRecord[],
+  ): GuestWriteResult {
+    this.call();
+    const failure = this.injectedFor(record.op);
+    if (failure && !failure.afterApplying) throw failure.error;
+    const index = this.find(record.calendarId, record.eventId);
+    const result = index < 0 ? 'gone' : etag !== undefined && etag !== this.events[index].etag ? 'changed' : 'set';
+    if (result === 'set') {
+      this.events.splice(index, 1, this.revised(withGuests(this.events[index], next(this.events[index]))));
+      this.writes.push(record);
+    }
+    if (failure) throw failure.error;
+    return result;
   }
 
   async setGuests(
@@ -300,20 +333,18 @@ export class FakeCalendar implements MeetingsCalendarApi {
     sendUpdates: SendUpdates,
     etag?: string,
   ) {
-    this.call();
-    const failure = this.injectedFor('guests');
-    if (failure && !failure.afterApplying) throw failure.error;
-    const index = this.find(calendarId, eventId);
-    if (index < 0)
-      throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
-    if (etag !== undefined && etag !== this.events[index].etag) {
-      if (failure) throw failure.error;
-      return 'changed' as const;
-    }
-    this.events.splice(index, 1, this.revised(withGuests(this.events[index], guests)));
-    this.writes.push({ op: 'guests', calendarId, eventId, sendUpdates, guests });
-    if (failure) throw failure.error;
-    return 'set' as const;
+    return this.writeGuests({ op: 'guests', calendarId, eventId, sendUpdates, guests }, etag, () => guests);
+  }
+
+  /** Google changes the entry with the address given and keeps every other guest as it holds them. */
+  async setOwnEntry(calendarId: string, eventId: string, entry: GuestRecord, sendUpdates: SendUpdates, etag?: string) {
+    const email = typeof entry.email === 'string' ? entry.email.toLowerCase() : undefined;
+    const isEntry = (guest: GuestRecord): boolean =>
+      typeof guest.email === 'string' && guest.email.toLowerCase() === email;
+    return this.writeGuests({ op: 'own', calendarId, eventId, sendUpdates, guests: [entry] }, etag, (event) => {
+      const guests = this.guestsOf(event);
+      return guests.some(isEntry) ? guests.map((guest) => (isEntry(guest) ? entry : guest)) : [...guests, entry];
+    });
   }
 
   async deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates) {
@@ -347,6 +378,8 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     getGuests: (calendarId, eventId) => current().getGuests(calendarId, eventId),
     setGuests: (calendarId, eventId, guests, sendUpdates, etag) =>
       current().setGuests(calendarId, eventId, guests, sendUpdates, etag),
+    setOwnEntry: (calendarId, eventId, entry, sendUpdates, etag) =>
+      current().setOwnEntry(calendarId, eventId, entry, sendUpdates, etag),
     deleteEvent: (calendarId, eventId, sendUpdates) => current().deleteEvent(calendarId, eventId, sendUpdates),
   };
 }

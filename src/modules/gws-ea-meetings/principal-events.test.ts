@@ -828,6 +828,26 @@ describe('change_guests', () => {
     expect(calendar.writes).toEqual([]);
   });
 
+  it('refuses, writing nothing, a guest list Google returned incomplete: written back, it would drop the guests left out (R9)', async () => {
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+      attendeesOmitted: true,
+    });
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      "Google didn't return this event's whole guest list, so changing it could drop guests: ask the principal to change it in Google Calendar.",
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses, having written nothing, an event deleted between its read of the list and its write', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'teamsync01'));
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      'No event teamsync01 on that calendar.',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
   it('refuses an event on a calendar neither the principal’s nor its own, though it may write there', async () => {
     calendar.put({
       ...teamSync([{ email: COLLEAGUE_CALENDAR, responseStatus: 'accepted', organizer: true }]),
