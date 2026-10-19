@@ -1,7 +1,8 @@
 /**
  * The matter a tool's request names (KTD11): `main` names one of its open
- * matters, and what the tool writes joins it. `create_event` and
- * `change_guests` link their event, and `email_handoff` its thread.
+ * matters, and what the tool writes joins it. `create_event`,
+ * `change_guests` and `respond_to_event` link their event, and
+ * `email_handoff` its thread.
  *
  * The matter is checked before the tool writes anything, so a refusal writes
  * nothing; what the tool wrote stands whether or not it then joins. Matters

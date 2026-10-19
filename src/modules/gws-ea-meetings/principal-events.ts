@@ -1,13 +1,15 @@
 /**
- * main's two writes on events, which `gog` cannot make with the principal
+ * main's three writes on events, which `gog` cannot make with the principal
  * on the guest list (it sets no answer, and refuses to answer an event they
  * organize), nor with the private-details check on its invitations:
  *
- *   create_event   { calendar, title, start, end, all_day?, timezone?, notes?, location?,
- *                    guests?, free?, private?, recurrence?, video_call?, matter? }
+ *   create_event      { calendar, title, start, end, all_day?, timezone?, notes?, location?,
+ *                       guests?, free?, private?, recurrence?, video_call?, matter? }
  *                                        → { calendar, event, start, end, message }
- *   change_guests  { calendar, event, add?, remove?, matter? }
+ *   change_guests     { calendar, event, add?, remove?, matter? }
  *                                        → { calendar, event, guests, message }
+ *   respond_to_event  { calendar, event, response, matter? }
+ *                                        → { calendar, event, response, message }
  *
  * - Each writes only to a calendar Google lets the assistant change that is
  *   the principal's or the assistant's own (KTD10), and `change_guests` only
@@ -34,10 +36,20 @@
  *   check as its guests outside the principal would see it: its title,
  *   notes and place, the calendar's name, and every address on its guest
  *   list but their own.
- * - A write on a principal calendar is recorded as the assistant's own
- *   change, so Google's notification of it makes no note; one on the
- *   assistant's own calendar is not, so a guest's answer to it reaches main
- *   (KTD12).
+ * - `respond_to_event` sets the principal's own answer, accepted, tentative
+ *   or declined, on an event on one of their calendars, and changes nothing
+ *   else: on their own event it writes the guest list back with only their
+ *   entry changed, emailing no one, and refuses a list Google returned
+ *   incomplete; on someone else's it writes their entry alone, and Google
+ *   is asked to tell the organizer unless that is another of their own
+ *   addresses. It reads the answer back and says what Google holds. An
+ *   answer carries no note: a word to the organizer goes through
+ *   external-email.
+ * - A `create_event` or `change_guests` write on a principal calendar is
+ *   recorded as the assistant's own change, so Google's notification of it
+ *   makes no note; one on the assistant's own calendar is not, so a guest's
+ *   answer to it reaches main (KTD12). An answer is never recorded: Google
+ *   may not notify it, and a record would swallow the next real notice.
  * - With `matter`, one of main's open matters, the event either writes on
  *   joins it (Slice 5 KTD11), checked before anything is written.
  *
@@ -59,7 +71,14 @@ import {
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
-import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
+import {
+  allowsMeet,
+  type CalendarEntry,
+  type EventGuests,
+  type GuestRecord,
+  type MeetingsCalendarApi,
+  type SendUpdates,
+} from './calendar-api.js';
 import {
   assertInvitationShareable,
   conferenceWords,
@@ -82,7 +101,7 @@ const RECURRENCE_LINE_MAX = 500;
 const MAX_EVENT_DAYS = 366;
 /** Google's longest calendar id is an address. */
 const CALENDAR_ID_MAX = 254;
-/** How many times `change_guests` reads and writes a guest list that keeps changing under it before it gives up. */
+/** How many times `change_guests` and `respond_to_event` read and write a guest list that keeps changing under them before they give up. */
 const GUEST_WRITE_ATTEMPTS = 3;
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -171,6 +190,30 @@ type Answer = 'accepted' | 'declined' | 'tentative';
 function answerOf(guest: GuestRecord | undefined): Answer | undefined {
   const status = guest?.responseStatus;
   return status === 'accepted' || status === 'declined' || status === 'tentative' ? status : undefined;
+}
+
+function responseOf(value: unknown): Answer {
+  if (value === 'accepted' || value === 'tentative' || value === 'declined') return value;
+  throw invalidArgs('response must be accepted, tentative or declined');
+}
+
+/** An answer, or its absence, as people say it, with Google's own word for it. */
+function answerWords(status: unknown): string {
+  const words =
+    status === 'accepted'
+      ? 'going'
+      : status === 'tentative'
+        ? 'maybe going'
+        : status === 'declined'
+          ? 'not going'
+          : 'not yet answered';
+  return `${words} (${typeof status === 'string' ? status : 'needsAction'})`;
+}
+
+/** Which occurrences of an event an answer on it covers, ending a sentence. */
+function scopeWords(guests: EventGuests): string {
+  if (guests.recurringEventId !== undefined) return ' on this occurrence only';
+  return guests.recurrence === undefined ? '' : ' on every occurrence';
 }
 
 /** The principal on an event's guest list, as the end of a sentence naming its other guests. */
@@ -573,5 +616,95 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     throw forbidden("The event's guests kept changing while this ran: try again in a moment.");
   };
 
-  return { createEvent, changeGuests };
+  const respondToEvent: ActionAnswer = async (content, session) => {
+    const calendarId = calendarIdOf(content.calendar);
+    const eventId = eventIdOf(content.event);
+    const response = responseOf(content.response);
+    const matterId = await requestedMatter(content.matter, session);
+    const { entry, owner, principal } = await writableCalendarOf(calendarId);
+    if (owner === 'assistant') {
+      throw forbidden("That is your own calendar: the principal's answer lives on their calendar, so answer there.");
+    }
+    const noEvent = `No event ${eventId} on that calendar.`;
+    /** The answer for the event as Google now holds it, which joins the matter the request named. */
+    const answered = async (held: Answer, message: string) => ({
+      calendar: entry.id,
+      event: eventId,
+      response: held,
+      message:
+        matterId === undefined
+          ? message
+          : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })}`,
+    });
+
+    // Each write goes over the version of the event it read, so an answer the
+    // principal gives themselves meanwhile is never overwritten.
+    let first: unknown;
+    for (let attempt = 0; attempt < GUEST_WRITE_ATTEMPTS; attempt += 1) {
+      const current = await calendar().getGuests(entry.id, eventId);
+      if (current === undefined || current.status === 'cancelled') throw forbidden(noEvent);
+      const own = current.guests.find((guest) => guest.self === true);
+      if (own === undefined) {
+        if (hidesPrivateEvents(entry)) {
+          throw forbidden(
+            "You can't see the principal on that event. That calendar is shared with you without their private events, so if it is private, only they can answer it; otherwise bring it to them.",
+          );
+        }
+        throw forbidden(
+          current.organizer === entry.id.toLowerCase()
+            ? "The principal organizes that event and isn't on its guest list, so they have no answer to set."
+            : "The principal isn't on that event's guest list on that calendar, as when they're invited through a group: bring it to them.",
+        );
+      }
+      const status = own.responseStatus;
+      if (status === response) {
+        return answered(
+          response,
+          `Nothing changed: Google already shows the principal as ${answerWords(response)}${scopeWords(current)}.`,
+        );
+      }
+      if (attempt === 0) first = status;
+      else if (status !== first) {
+        throw forbidden(
+          `The principal answered ${answerWords(status)} themselves while this ran, so nothing was written: their answer stands unless they ask you to change it.`,
+        );
+      }
+
+      // Their entry as Google holds it, under the address it names, with the new answer and no earlier note.
+      const { comment: _comment, ...kept } = own;
+      const next: GuestRecord = { ...kept, responseStatus: response };
+      const organizes = own.organizer === true;
+      if (organizes && current.attendeesOmitted === true) throw forbidden(INCOMPLETE_LIST);
+      const sendUpdates: SendUpdates = organizes || principal.has(current.organizer) ? 'none' : 'all';
+      const written = organizes
+        ? await calendar().setGuests(
+            entry.id,
+            eventId,
+            current.guests.map((guest) => (guest === own ? next : guest)),
+            sendUpdates,
+            current.etag,
+          )
+        : await calendar().setOwnEntry(entry.id, eventId, next, sendUpdates, current.etag);
+      if (written === 'gone') throw forbidden(noEvent);
+      if (written === 'changed') continue;
+
+      const after = await calendar().getGuests(entry.id, eventId);
+      if (after === undefined || after.status === 'cancelled') throw forbidden(noEvent);
+      const held = after.guests.find((guest) => guest.self === true)?.responseStatus;
+      if (held !== response) {
+        throw forbidden(
+          `Google took the answer but still shows the principal as ${answerWords(held)}, so it didn't take: ask them to answer it in Google Calendar.`,
+        );
+      }
+      return answered(
+        response,
+        `Google now shows the principal as ${answerWords(response)}${scopeWords(current)}. ${
+          sendUpdates === 'all' ? 'Google was asked to tell the organizer.' : 'Google emailed no one.'
+        }`,
+      );
+    }
+    throw forbidden('The event kept changing while this ran: try again in a moment.');
+  };
+
+  return { createEvent, changeGuests, respondToEvent };
 }
