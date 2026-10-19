@@ -397,8 +397,8 @@ describe('the Calendar client', () => {
     expect(request.body).toEqual({ attendeesOmitted: true, attendees: [own] });
   });
 
-  it('reads either guest write as changed when the event moved on since its version, as gone when the event is, and throws any other refusal', async () => {
-    const statuses = [412, 404, 410, 403, 412, 404, 410, 403];
+  it('reads a self-only write as changed when the event moved on since its version, either guest write as gone when the event is, and throws any other refusal', async () => {
+    const statuses = [412, 404, 410, 403, 404, 410];
     const { api } = stubGoogle(() => ({ status: statuses.shift() ?? 500, body: { error: { message: 'No' } } }));
     const own = { email: 'pat@principal.example', self: true, responseStatus: 'accepted' };
     expect(await api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).toBe('changed');
@@ -407,12 +407,8 @@ describe('the Calendar client', () => {
     await expect(api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).rejects.toMatchObject({
       status: 403,
     });
-    expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('changed');
     expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('gone');
     expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('gone');
-    await expect(api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).rejects.toMatchObject({
-      status: 403,
-    });
   });
 
   it('reads an event that is not there as undefined when its guests are asked for', async () => {

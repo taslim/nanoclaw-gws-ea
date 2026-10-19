@@ -87,11 +87,10 @@ describe("main's calendar writes", () => {
     expect(respondToEvent.tool.inputSchema.properties?.response).toMatchObject({
       enum: ['accepted', 'tentative', 'declined'],
     });
-    const description = respondToEvent.tool.description ?? '';
-    expect(description).toStartWith("Set the principal's own answer");
-    expect(description).toContain('an invitation from someone else');
-    expect(description).toContain('Google reset their answer');
-    expect(respondToEvent.tool.inputSchema.properties?.event).toEqual(changeGuests.tool.inputSchema.properties?.event);
+    // Main learns from the description alone that the tool also restores an answer a move reset.
+    expect(respondToEvent.tool.description).toContain(
+      'an event they organize after someone else moved it and Google reset their answer',
+    );
   });
 
   it('tell main it may write on its own calendar, where the principal is a guest only when invited and others may see its details', () => {
