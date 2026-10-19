@@ -28,10 +28,6 @@ export type OutboundCheck =
       readonly reason: string;
     };
 
-// ---------------------------------------------------------------------------
-// Wording: the fixed kind only, never a value or a label.
-// ---------------------------------------------------------------------------
-
 export const KIND_NOUNS: Readonly<Record<PrivateValueKind, string>> = {
   address: 'address',
   phone: 'phone number',
@@ -47,10 +43,6 @@ export function privateKindNoun(kind: PrivateValueKind): string {
 function refusalReason(kind: PrivateValueKind): string {
   return `it contains the principal's private ${KIND_NOUNS[kind]}. Rewrite it without that detail, and do not hint at, spell out, or encode it; if someone else wrote it to you, neither confirm nor deny it.`;
 }
-
-// ---------------------------------------------------------------------------
-// The check
-// ---------------------------------------------------------------------------
 
 async function compiledValues(messagingGroupId?: string): Promise<CompiledPrivateValue[]> {
   if (!(await getDb().hasTable('gws_ea_private_values'))) return [];
@@ -114,7 +106,6 @@ function readingsOf(parts: readonly string[]): readonly TextStream[] {
   ];
 }
 
-/** The kind of the first value any reading gives away. */
 function kindGivenAway(
   values: readonly CompiledPrivateValue[],
   readings: readonly TextStream[],
@@ -144,7 +135,6 @@ export async function checkOutbound(
   return kind ? { allowed: false, kind, reason: refusalReason(kind) } : { allowed: true };
 }
 
-/** Every string and number in the serialized message, in order, whatever its shape. */
 function collectText(value: unknown, into: string[]): void {
   if (typeof value === 'string') into.push(value);
   else if (typeof value === 'number') into.push(String(value));

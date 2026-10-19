@@ -25,7 +25,6 @@ function splitProtectedRegions(text: string): TextSegment[] {
 }
 
 function transformForWhatsApp(text: string): string {
-  // Order matters: italic before bold to avoid **bold** → *bold* → _bold_
   text = text.replace(/(?<!\*)\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?!\*)/g, '_$1_');
   text = text.replace(/\*\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*\*/g, '*$1*');
   text = text.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
