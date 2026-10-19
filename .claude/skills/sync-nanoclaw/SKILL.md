@@ -1,6 +1,6 @@
 ---
 name: sync-nanoclaw
-description: "Maintainer only: merge the latest official NanoClaw (nanocoai/nanoclaw) into GWS-EA's integration line rebuild-v2, re-deriving every place the fork and upstream meet so GWS-EA's divergence shrinks wherever upstream now does the job. Use when the GWS-EA maintainer says 'pull in latest from nanocoai/nanoclaw', 'sync with upstream', 'merge upstream NanoClaw', or 'update our fork to the latest NanoClaw'. Not for updating an install or an assistant: in GWS-EA nobody runs /update-nanoclaw; operators run git pull, bash gws-ea.sh, then gws-ea update."
+description: "Maintainer only: merge the latest official NanoClaw (nanocoai/nanoclaw) into GWS-EA's integration line rebuild-v2, re-deriving every place the fork and upstream meet so GWS-EA's divergence shrinks wherever upstream now does the job. Use when the GWS-EA maintainer says 'pull in latest from nanocoai/nanoclaw', 'sync with upstream', 'merge upstream NanoClaw', or 'update our fork to the latest NanoClaw'. Not for updating an install or an assistant: in GWS-EA nobody runs /update-nanoclaw; operators run git pull, bash gws-ea.sh, then gws-ea update --all."
 ---
 
 # Sync NanoClaw into GWS-EA
@@ -34,7 +34,7 @@ gh repo view taslim/nanoclaw-gws-ea --json viewerPermission --jq .viewerPermissi
 Continue only when `origin` is `taslim/nanoclaw-gws-ea` and the permission is `ADMIN`, `MAINTAIN` or `WRITE`. Otherwise stop: *"This skill is for GWS-EA's maintainer. To update GWS-EA, run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`."* When the `upstream` remote is missing, the maintainer adds it with `git remote add upstream https://github.com/nanocoai/nanoclaw.git`.
 
 ```bash
-git fetch upstream --tags && git fetch origin rebuild-v2
+git fetch upstream --tags && git fetch origin +refs/heads/rebuild-v2:refs/remotes/origin/rebuild-v2
 MB=$(git merge-base origin/rebuild-v2 upstream/main)
 git rev-list --count origin/rebuild-v2..upstream/main   # 0 means already current: stop
 git log --oneline -1 "$MB"
@@ -95,14 +95,14 @@ Ask only the genuine decisions, with a recommendation first. Decide product ques
 
 ```bash
 git merge --no-ff --no-commit upstream/main
-git diff --name-only --diff-filter=U
+git diff --name-only --diff-filter=U | tee "$SCRATCH/conflicts.txt"   # step 9 reviews every one of these
 ```
 
 Resolve per the decisions, then `git add` each resolved path:
 
 | Situation | Resolution |
 |---|---|
-| Upstream now owns the intent | `git checkout --theirs <path>`, so the file equals upstream's again; move what GWS-EA still needs into a GWS-EA-owned file under `src/gws-ea/` with a test. |
+| Upstream now owns the intent | `git checkout upstream/main -- <path>`, which restores upstream's file whether the path conflicted or merged cleanly; move what GWS-EA still needs into a GWS-EA-owned file under `src/gws-ea/` with a test. |
 | GWS-EA keeps its change | Start from upstream's file (`git show upstream/main:<path> > <path>`) and re-apply GWS-EA's seam on top. |
 | Upstream restructured code around a GWS-EA decision | Take upstream's structure; keep only GWS-EA's decision (for example, a failed turn is still `turn_failed` to the host, never a chat message). |
 | Upstream-only files | Take them unchanged. |
@@ -138,7 +138,7 @@ Save the merge commit only once the tree is green (step 7). Changes that shrink 
 | Container tests | `cd container/agent-runner && bun run test` |
 | Skill pins | `pnpm run skill-pins:check` |
 
-A full local `vitest run` times out in a few heavy suites under load (often upstream's `scripts/update/transaction.e2e.test.ts`). Re-run each failing file alone; a failure that passes alone is load, not a regression. Report it either way. After every behavior change, re-run the whole suite, not just the files you touched.
+A full local `vitest run` times out in a few heavy suites under load (often upstream's `scripts/update/transaction.e2e.test.ts`). Re-run each failing file alone. A timeout that passes when its file runs alone is load; an assertion failure, or any failure CI reproduces, is a regression to fix. Report it either way, and let CI decide. After every behavior change, re-run the whole suite, not just the files you touched.
 
 Commit the merge: `Merge upstream NanoClaw <version> into rebuild-v2`, with one bullet per area saying what was re-derived and where GWS-EA's code shrank.
 
@@ -150,14 +150,15 @@ Commit the merge: `Merge upstream NanoClaw <version> into rebuild-v2`, with one 
 
 ### 9. Review gate
 
-Run `/ce-code-review` over GWS-EA's part only: the follow-up commits (base: the merge commit) plus the merge's own resolutions. The resolutions are the files that differ from both of the merge's parents:
+Run `/ce-code-review` over GWS-EA's part only: the follow-up commits (base: the merge commit) plus the merge's own resolutions. The resolutions are every path that conflicted (step 6's `conflicts.txt`, which includes a conflict resolved wholly to GWS-EA's side) and every file that differs from both of the merge's parents. Review each against both parents:
 
 ```bash
 M=<merge commit>
-git diff --name-only "$M^1" "$M" | while read -r f; do
+{ cat "$SCRATCH/conflicts.txt"; git diff --name-only "$M^1" "$M" | while read -r f; do
   [ "$(git rev-parse -q --verify "$M:$f")" != "$(git rev-parse -q --verify "$M^2:$f")" ] && echo "$f"
-done > "$SCRATCH/resolution-files.txt"
-git diff "$M^1" "$M" -- $(cat "$SCRATCH/resolution-files.txt") > "$SCRATCH/resolution.diff"
+done; } | sort -u > "$SCRATCH/resolution-files.txt"
+git diff "$M^1" "$M" -- $(cat "$SCRATCH/resolution-files.txt") > "$SCRATCH/resolution-vs-ours.diff"
+git diff "$M^2" "$M" -- $(cat "$SCRATCH/resolution-files.txt") > "$SCRATCH/resolution-vs-upstream.diff"
 ```
 
 Fix confirmed findings in one follow-up commit and re-run step 7.
@@ -165,7 +166,7 @@ Fix confirmed findings in one follow-up commit and re-run step 7.
 ### 10. Land
 
 ```bash
-git fetch origin rebuild-v2
+git fetch origin +refs/heads/rebuild-v2:refs/remotes/origin/rebuild-v2
 git merge-base --is-ancestor origin/rebuild-v2 HEAD && echo fast-forward
 git log origin/rebuild-v2..HEAD --first-parent --oneline
 git diff --stat origin/rebuild-v2...HEAD | tail -1

@@ -341,8 +341,8 @@ included, on its next `create`, `update`, or `cleanup`.
 - Bringing official NanoClaw into `rebuild-v2` is the maintainer's job: use
   `/sync-nanoclaw`. Nobody runs `/update-nanoclaw` in a GWS-EA checkout: it
   updates a plain NanoClaw install in place. An operator updates GWS-EA with
-  `git pull` in the tool checkout, `bash gws-ea.sh`, then `gws-ea update`, which
-  deploys each assistant at an exact commit.
+  `git pull` in the tool checkout, `bash gws-ea.sh`, then `gws-ea update --all`,
+  which deploys each assistant at an exact commit.
 
 ## Skills
 
