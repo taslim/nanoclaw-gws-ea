@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
 
+import { createWhatsAppGroupEvents } from './events.js';
+import { WhatsAppIndex } from './index-store.js';
 import { registerWhatsAppObserver } from './observers.js';
+import type { WhatsAppPerson } from './paths.js';
 import { transportHarness, type TransportHarness } from './testing/harness.js';
 
 let h: TransportHarness;
@@ -43,16 +46,47 @@ it('reports a silent group join with resolved people and author through the prod
             name: 'Pat',
             isPrincipal: false,
           },
-          {
-            key: 'whatsapp:999000',
-            person: { lid: '999000', phoneJid: '15550000000@s.whatsapp.net' },
-            isPrincipal: false,
-          },
         ],
       },
       author: { lid: '12000', phoneJid: '15551112222@s.whatsapp.net' },
     },
   ]);
+});
+
+it('filters only the account in the current link, resolving its native phone alias first', async () => {
+  await h.start();
+  h.socket().groups.set('team@g.us', {
+    id: 'team@g.us',
+    owner: undefined,
+    subject: 'Dinner',
+    participants: [{ id: '15550000000:8@s.whatsapp.net' }, { id: '13000@lid' }, { id: '12000@lid' }],
+  });
+  const index = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+  let account: WhatsAppPerson | undefined = { lid: '13000' };
+  const events = createWhatsAppGroupEvents({
+    socket: h.socket,
+    index,
+    link: () => ({ schema_version: 1, state: 'connected', account }),
+  });
+  try {
+    expect((await events.fetchGroupMembers('team@g.us')).members.map(({ key }) => key)).toEqual([
+      'whatsapp:999000',
+      'whatsapp:12000',
+    ]);
+    account = { lid: '999000' };
+    expect((await events.fetchGroupMembers('team@g.us')).members.map(({ key }) => key)).toEqual([
+      'whatsapp:13000',
+      'whatsapp:12000',
+    ]);
+    account = undefined;
+    expect((await events.fetchGroupMembers('team@g.us')).members.map(({ key }) => key)).toEqual([
+      'whatsapp:999000',
+      'whatsapp:13000',
+      'whatsapp:12000',
+    ]);
+  } finally {
+    index.close();
+  }
 });
 
 it('updates later participants and group names, then detaches on own removal or native deletion', async () => {
@@ -71,10 +105,7 @@ it('updates later participants and group names, then detaches on own removal or 
     participants: [{ id: '12000@lid' }, { id: '999000@lid' }],
   });
   expect(await adapter.fetchGroupMembers('team@g.us')).toMatchObject({
-    members: [
-      { key: 'whatsapp:12000', isPrincipal: true },
-      { key: 'whatsapp:999000', isPrincipal: false },
-    ],
+    members: [{ key: 'whatsapp:12000', isPrincipal: true }],
   });
   await h.socket().emit('group-participants.update', {
     id: 'team@g.us',
@@ -85,7 +116,7 @@ it('updates later participants and group names, then detaches on own removal or 
   expect(events.at(-1)).toMatchObject({
     kind: 'roster',
     group: {
-      members: [{ key: 'whatsapp:12000' }, { key: 'whatsapp:999000' }, { key: 'whatsapp:13000', name: 'Remy' }],
+      members: [{ key: 'whatsapp:12000' }, { key: 'whatsapp:13000', name: 'Remy' }],
     },
     author: { lid: '12000' },
   });
@@ -99,7 +130,7 @@ it('updates later participants and group names, then detaches on own removal or 
   });
   expect(events.at(-1)).toMatchObject({
     kind: 'roster',
-    group: { members: [{ key: 'whatsapp:12000' }, { key: 'whatsapp:999000' }] },
+    group: { members: [{ key: 'whatsapp:12000' }] },
   });
   await h.socket().emit('group-participants.update', {
     id: 'team@g.us',

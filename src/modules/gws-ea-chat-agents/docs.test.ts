@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
@@ -44,10 +45,14 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { generateDriveFileId } from '../gws-ea-workspace/drive-api.js';
 import { JOB_DOCUMENT_ACTIONS } from './docs.js';
+import { createWhatsAppGroupEvents } from '../gws-ea-whatsapp/events.js';
+import { WhatsAppIndex } from '../gws-ea-whatsapp/index-store.js';
+import { FakeSocket } from '../gws-ea-whatsapp/testing/fake-socket.js';
 let drive: FakeDrive;
 let job: Session;
 let external: Session;
 let sequence = 0;
+let nativeGroups: ReturnType<typeof createWhatsAppGroupEvents> | undefined;
 let members = [
   { key: 'whatsapp:22', isPrincipal: false },
   { key: 'whatsapp:11', isPrincipal: true },
@@ -73,7 +78,8 @@ registerChannelAdapter('whatsapp', {
     teardown: async () => {},
     isConnected: () => true,
     deliver: async () => undefined,
-    fetchGroupMembers: async (platformId: string) => ({ platformId, name: 'Trip', members }),
+    fetchGroupMembers: async (platformId: string) =>
+      nativeGroups ? nativeGroups.fetchGroupMembers(platformId) : { platformId, name: 'Trip', members },
   }),
 });
 
@@ -133,6 +139,7 @@ beforeEach(async () => {
   loseFolderResponse = false;
   loseCreateResponse = false;
   loseEditResponse = false;
+  nativeGroups = undefined;
   members = [
     { key: 'whatsapp:22', isPrincipal: false },
     { key: 'whatsapp:11', isPrincipal: true },
@@ -331,6 +338,86 @@ it('creates in the job folder, records ownership, reads and edits through the ho
     { type: 'user', emailAddress: 'mira@example.com', role: 'reader' },
   ]);
   expect(vi.mocked(hostGoogleAccessToken).mock.calls.every(([service]) => service === 'drive-host')).toBe(true);
+});
+it('returns the actual created file ID and URL through the runner tool mailbox', async () => {
+  const frame = await request(job, 'doc_create', { title: 'Trip plan', text: 'Friday at the lake.' });
+  const data = accepted(frame);
+  expect(typeof data.file).toBe('string');
+  const runner = new URL('../../../container/agent-runner/src/', import.meta.url).href;
+  const script = `
+    await import(${JSON.stringify(`${runner}modules/index.ts`)});
+    const { initTestSessionDb, getInboundDb, closeSessionDb } = await import(${JSON.stringify(`${runner}mailbox/sqlite/connection.ts`)});
+    const { getUndeliveredMessages } = await import(${JSON.stringify(`${runner}db/messages-out.ts`)});
+    const { docCreate } = await import(${JSON.stringify(`${runner}mcp-tools/gws-ea-chat-docs.ts`)});
+    const frame = JSON.parse(await Bun.stdin.text());
+    initTestSessionDb();
+    try {
+      const waiting = docCreate.handler({ title: 'Trip plan', text: 'Friday at the lake.' });
+      while (getUndeliveredMessages().length === 0) await Bun.sleep(1);
+      const request = getUndeliveredMessages()[0];
+      getInboundDb().prepare('INSERT INTO messages_in(id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)').run(
+        'action-resp-' + request.id, 'system', new Date().toISOString(),
+        JSON.stringify({ type: 'action_response', requestId: request.id, frame })
+      );
+      console.log(JSON.stringify(await waiting));
+    } finally { closeSessionDb(); }
+  `;
+  const rendered: unknown = JSON.parse(
+    execFileSync('bun', ['--eval', script], { input: JSON.stringify(frame), encoding: 'utf8', timeout: 5000 }),
+  );
+  expect(rendered).toMatchObject({
+    content: [
+      {
+        type: 'text',
+        text: expect.stringContaining(`https://docs.google.com/document/d/${String(data.file)}/edit`),
+      },
+    ],
+  });
+  accepted(await request(job, 'doc_share', { file: data.file }));
+  expect((await drive.listPermissions(String(data.file))).map((permission) => permission.emailAddress)).toContain(
+    'mira@example.com',
+  );
+});
+it('shares and reads job documents from a native WhatsApp roster with only human member emails', async () => {
+  const socket = new FakeSocket();
+  socket.mappings.set('999000@lid', '15550000000@s.whatsapp.net');
+  socket.groups.set('trip@g.us', {
+    id: 'trip@g.us',
+    owner: undefined,
+    subject: 'Trip',
+    participants: [{ id: '22@lid' }, { id: '11@lid' }, { id: socket.user.id }],
+  });
+  fs.mkdirSync(`${ROOT}/secrets`, { recursive: true, mode: 0o700 });
+  const index = new WhatsAppIndex(`${ROOT}/secrets/whatsapp`, () => '15550000000@s.whatsapp.net');
+  nativeGroups = createWhatsAppGroupEvents({
+    socket: () => socket,
+    index,
+    link: () => ({
+      schema_version: 1,
+      state: 'connected',
+      account: { lid: '999000', phoneJid: '15550000000@s.whatsapp.net' },
+      principal: { lid: '11' },
+    }),
+  });
+  try {
+    const file = await made();
+    accepted(await request(job, 'doc_share', { file }));
+    expect((await drive.listPermissions(file)).map((permission) => permission.emailAddress)).toEqual([
+      'assistant@example.com',
+      'mira@example.com',
+    ]);
+    const outside = await outsideFile();
+    await drive.createPermission(outside, { emailAddress: 'mira@example.com', role: 'reader' });
+    expect(accepted(await request(job, 'doc_read', { file: outside })).text).toContain('Everyone may read this.');
+    expect(
+      await getDb().all<{ member_key: string }>(
+        "SELECT member_key FROM gws_ea_chat_members WHERE messaging_group_id='trip' ORDER BY member_key",
+      ),
+    ).toEqual([{ member_key: 'whatsapp:11' }, { member_key: 'whatsapp:22' }]);
+  } finally {
+    nativeGroups = undefined;
+    index.close();
+  }
 });
 it('checks each fresh member before reading a document it did not make', async () => {
   const file = await outsideFile();

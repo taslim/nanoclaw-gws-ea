@@ -303,10 +303,11 @@ const create: ActionAnswer = async (content, session, requestId) => {
       }
     }
     const created = file;
+    const url = `https://docs.google.com/document/d/${created}/edit`;
     const answer = {
       file: created,
-      url: `https://docs.google.com/document/d/${created}/edit`,
-      message: 'The document was made for this job. Use doc_share to give members access.',
+      url,
+      message: `Created document ${created}: ${url}\nUse doc_share to give members access.`,
     };
     await getDb().transaction(async () => {
       await getDb().run(

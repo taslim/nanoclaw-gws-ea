@@ -56,10 +56,12 @@ export function createWhatsAppGroupEvents(options: {
     };
   }
   async function snapshot(metadata: GroupMetadata): Promise<WhatsAppGroup> {
+    const members = await Promise.all(metadata.participants.map(member));
+    const self = options.link()?.account?.lid;
     return {
       platformId: metadata.id,
       name: metadata.subject,
-      members: await Promise.all(metadata.participants.map(member)),
+      members: members.filter(({ person }) => person.lid !== self),
     };
   }
   async function author(jid?: string, phone?: string): Promise<WhatsAppPerson | undefined> {
