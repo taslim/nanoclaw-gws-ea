@@ -4,7 +4,9 @@
  * details, so creating an event and changing who an event invites go to the
  * host, on the principal's calendars or the assistant's own. It keeps the
  * principal on every event it writes on theirs, and puts them on one of the
- * assistant's only when main invites them
+ * assistant's only when main invites them. gog refuses to answer an event
+ * the principal organizes, so every answer for them goes to the host too,
+ * which changes their own entry alone
  * (src/modules/gws-ea-meetings/principal-events.ts). Whether a time is
  * free and who the principal meets are counted by the host from every page
  * of their calendars (src/modules/gws-ea-meetings/calendar-facts.ts), so no
@@ -23,6 +25,10 @@ export const CALENDAR_REQUEST_TIMEOUT_MS = 120_000;
 const CALENDAR = {
   type: 'string',
   description: "The calendar's ID: the principal's address for their primary calendar, or your own address for yours.",
+} as const;
+const EVENT = {
+  type: 'string',
+  description: "The event's id, as gog calendar events gives it: an occurrence's own id changes that one alone.",
 } as const;
 const ADDRESSES = { type: 'array', items: { type: 'string' } } as const;
 const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it, such as 2026-10-12T09:00:00-07:00';
@@ -65,15 +71,34 @@ export const changeGuests = requestTool({
     "Invite people to an event the principal organizes or one you organize on your own calendar, or take them off it. Everyone's answer stays as it was, and the principal stays on their own events: accepted, unless they answered otherwise. Google tells the guests whenever someone joins or leaves, except the principal on their own events.",
   properties: {
     calendar: CALENDAR,
-    event: {
-      type: 'string',
-      description: "The event's id, as gog calendar events gives it: an occurrence's own id changes that one alone.",
-    },
+    event: EVENT,
     add: { ...ADDRESSES, description: 'Email addresses to invite.' },
     remove: { ...ADDRESSES, description: 'Email addresses to take off it.' },
     matter: MATTER,
   },
   required: ['calendar', 'event'],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+
+export const respondToEvent = requestTool({
+  name: 'respond_to_event',
+  description:
+    "Set the principal's own answer on an event on one of their calendars: an invitation from someone else, or an event they organize after someone else moved it and Google reset their answer, so its guests see them as unconfirmed. Only their entry changes. On their own events Google emails no one; on someone else's, Google is asked to tell the organizer, unless that is another of the principal's addresses. Answers with what Google now shows.",
+  properties: {
+    calendar: {
+      type: 'string',
+      description: "The principal's calendar the event is on: their address for their primary calendar.",
+    },
+    event: EVENT,
+    response: {
+      type: 'string',
+      enum: ['accepted', 'tentative', 'declined'],
+      description: "The principal's answer: accepted, tentative (maybe), or declined.",
+    },
+    matter: MATTER,
+  },
+  required: ['calendar', 'event', 'response'],
   repeatable: true,
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });
@@ -107,4 +132,4 @@ export const peopleStats = requestTool({
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });
 
-registerTools([createEvent, changeGuests, findConflicts, peopleStats], CALENDAR_CAPABILITY);
+registerTools([createEvent, changeGuests, respondToEvent, findConflicts, peopleStats], CALENDAR_CAPABILITY);

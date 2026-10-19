@@ -59,7 +59,7 @@ const EXTERNAL_EMAIL_TOOLS = [
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
-const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats'];
+const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats', 'respond_to_event'];
 const BROWSER_TOOLS = [
   'browser',
   'cancel_watch',

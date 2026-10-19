@@ -1,13 +1,13 @@
 /**
- * main's two calendar writes, through the host: `create_event` and
- * `change_guests` send a typed request the host answers once, carrying the
- * fields exactly as the agent gave them.
+ * main's three calendar writes, through the host: `create_event`,
+ * `change_guests` and `respond_to_event` send a typed request the host
+ * answers once, carrying the fields exactly as the agent gave them.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
-import { CALENDAR_REQUEST_TIMEOUT_MS, changeGuests, createEvent } from './calendar-write.js';
+import { CALENDAR_REQUEST_TIMEOUT_MS, changeGuests, createEvent, respondToEvent } from './calendar-write.js';
 import type { McpToolDefinition } from './types.js';
 
 beforeEach(() => initTestSessionDb());
@@ -68,6 +68,32 @@ describe("main's calendar writes", () => {
     expect(text(result)).toBe('Its guests now: noel@friends.example.');
   });
 
+  it("set the principal's answer on an event", async () => {
+    const args = {
+      calendar: 'morgan@northwind.example',
+      event: 'abc123_20261012T160000Z',
+      response: 'accepted',
+      matter: 'm-1a2b3c4d5e6f',
+    };
+    const [result, request] = await Promise.all([
+      respondToEvent.handler(args),
+      answerNext({ response: 'accepted', message: 'Google now shows the principal as going (accepted).' }),
+    ]);
+    expect(request).toMatchObject({ action: 'respond_to_event', ...args });
+    expect(text(result)).toBe('Google now shows the principal as going (accepted).');
+  });
+
+  it("offer main only the principal's three answers, for both an invitation and their own event a move reset", () => {
+    expect(respondToEvent.tool.inputSchema.properties?.response).toMatchObject({
+      enum: ['accepted', 'tentative', 'declined'],
+    });
+    const description = respondToEvent.tool.description ?? '';
+    expect(description).toStartWith("Set the principal's own answer");
+    expect(description).toContain('an invitation from someone else');
+    expect(description).toContain('Google reset their answer');
+    expect(respondToEvent.tool.inputSchema.properties?.event).toEqual(changeGuests.tool.inputSchema.properties?.event);
+  });
+
   it('tell main it may write on its own calendar, where the principal is a guest only when invited and others may see its details', () => {
     const create = createEvent.tool.description ?? '';
     expect(create).toStartWith("Put an event on one of the principal's calendars or on your own.");
@@ -94,13 +120,16 @@ describe("main's calendar writes", () => {
         /title is required/,
       ],
       [changeGuests, { calendar: 'morgan@northwind.example' }, /event is required/],
+      [respondToEvent, { event: 'abc123', response: 'accepted' }, /calendar is required/],
+      [respondToEvent, { calendar: 'morgan@northwind.example', response: 'accepted' }, /event is required/],
+      [respondToEvent, { calendar: 'morgan@northwind.example', event: 'abc123' }, /response is required/],
     ] as const) {
       expect(text(await tool.handler(args)), tool.tool.name).toMatch(problem);
     }
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('say an event that timed out must not be created again, and a guest change may be repeated', async () => {
+  it('say an event that timed out must not be created again, and a guest change or an answer may be repeated', async () => {
     async function timedOut(tool: McpToolDefinition, args: Record<string, unknown>) {
       const realNow = Date.now;
       const start = realNow();
@@ -125,6 +154,15 @@ describe("main's calendar writes", () => {
     expect(
       text(
         await timedOut(changeGuests, { calendar: 'morgan@northwind.example', event: 'abc123', add: ['a@b.example'] }),
+      ),
+    ).toMatch(/a repeat changes nothing twice/);
+    expect(
+      text(
+        await timedOut(respondToEvent, {
+          calendar: 'morgan@northwind.example',
+          event: 'abc123',
+          response: 'declined',
+        }),
       ),
     ).toMatch(/a repeat changes nothing twice/);
   });
