@@ -13,6 +13,41 @@ afterEach(async () => {
   await h.close();
 });
 describe('durable WhatsApp inbound and trusted context', () => {
+  it('retains a DM through a transient identity lookup failure and replays it once', async () => {
+    vi.useFakeTimers();
+    try {
+      await h.start();
+      h.socket().usync.set('15553334444@s.whatsapp.net', '13000@lid');
+      vi.spyOn(h.socket().signalRepository.lidMapping, 'getLIDForPN').mockRejectedValueOnce(
+        new Error('temporary identity lookup outage'),
+      );
+      await h.socket().emit('messages.upsert', {
+        type: 'notify',
+        messages: [
+          incoming('identity-retry', 'Keep this request', {
+            key: { id: 'identity-retry', remoteJid: '15553334444@s.whatsapp.net' },
+          }),
+        ],
+      });
+      const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+      try {
+        expect(disk.unrouted().map((message) => message.key.id)).toEqual(['identity-retry']);
+        expect(h.messages()).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(h.messages()).toMatchObject([
+          { id: 'identity-retry', authenticatedSender: { userId: 'whatsapp:13000' } },
+        ]);
+        expect(h.content()[0].text).toBe('Keep this request');
+        expect(disk.unrouted()).toEqual([]);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(h.messages()).toHaveLength(1);
+      } finally {
+        disk.close();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it.each(['direct', 'group'] as const)(
     'retains the authenticated %s sender phone alias across raw intake and a fresh socket',
     async (kind) => {

@@ -54,13 +54,12 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
     const rawSender = raw.key.participant || rawChat;
     const alternate = isGroup ? raw.key.participantAlt : raw.key.remoteJidAlt;
     let person;
-    /* eslint-disable no-catch-all/no-catch-all -- an unresolvable group sender is retained without identity authority */
     try {
       person = await resolvePerson(socket, options.index, rawSender, alternate);
     } catch (error) {
+      if (!isGroup) throw error;
       log.warn('WhatsApp sender could not be resolved', { sender: rawSender, err: error });
     }
-    /* eslint-enable no-catch-all/no-catch-all */
     if (!person) {
       log.warn('WhatsApp sender has no resolved LID', { sender: rawSender, isGroup });
       if (!isGroup) {
