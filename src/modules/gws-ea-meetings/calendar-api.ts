@@ -445,6 +445,11 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
   });
 }
 
+/** Google's refusal of a call on an event that does not exist, or no longer does. */
+function isGone(error: unknown): boolean {
+  return error instanceof GoogleApiError && (error.status === 404 || error.status === 410);
+}
+
 /** A guest-list write's result, from Google's refusal when it refused. */
 async function guestWrite(write: Promise<unknown>): Promise<GuestWriteResult> {
   try {
@@ -453,7 +458,7 @@ async function guestWrite(write: Promise<unknown>): Promise<GuestWriteResult> {
   } catch (error) {
     // 412 Precondition Failed: the event is no longer the version the list was read from.
     if (error instanceof GoogleApiError && error.status === 412) return 'changed';
-    if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) return 'gone';
+    if (isGone(error)) return 'gone';
     throw error;
   }
 }
@@ -615,7 +620,7 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, { method: 'DELETE' });
         return 'deleted';
       } catch (error) {
-        if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) return 'gone';
+        if (isGone(error)) return 'gone';
         throw error;
       }
     },

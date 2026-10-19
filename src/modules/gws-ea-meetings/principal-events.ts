@@ -187,27 +187,30 @@ function daysLabel(first: number, last: number): string {
 /** An answer a guest gave an event; `needsAction`, or none, is no answer yet. */
 type Answer = 'accepted' | 'declined' | 'tentative';
 
+function isAnswer(value: unknown): value is Answer {
+  return value === 'accepted' || value === 'declined' || value === 'tentative';
+}
+
 function answerOf(guest: GuestRecord | undefined): Answer | undefined {
   const status = guest?.responseStatus;
-  return status === 'accepted' || status === 'declined' || status === 'tentative' ? status : undefined;
+  return isAnswer(status) ? status : undefined;
 }
 
 function responseOf(value: unknown): Answer {
-  if (value === 'accepted' || value === 'tentative' || value === 'declined') return value;
+  if (isAnswer(value)) return value;
   throw invalidArgs('response must be accepted, tentative or declined');
 }
 
+/** Each answer as people say it. */
+const ANSWER_WORDS: Readonly<Record<Answer, string>> = {
+  accepted: 'going',
+  tentative: 'maybe going',
+  declined: 'not going',
+};
+
 /** An answer, or its absence, as people say it, with Google's own word for it. */
 function answerWords(status: unknown): string {
-  const words =
-    status === 'accepted'
-      ? 'going'
-      : status === 'tentative'
-        ? 'maybe going'
-        : status === 'declined'
-          ? 'not going'
-          : 'not yet answered';
-  return `${words} (${typeof status === 'string' ? status : 'needsAction'})`;
+  return isAnswer(status) ? `${ANSWER_WORDS[status]} (${status})` : 'not yet answered (needsAction)';
 }
 
 /** Which occurrences of an event an answer on it covers, ending a sentence. */
@@ -222,6 +225,13 @@ const PRINCIPAL_WORDS: Readonly<Record<Answer, string>> = {
   declined: 'and the principal, who declined it',
   tentative: 'and the principal, who answered maybe',
 };
+
+/** A tool's message, ending with whether the event joined the matter the request named, when it named one. */
+async function withMatter(message: string, matterId: string | undefined, calendarId: string, eventId: string) {
+  return matterId === undefined
+    ? message
+    : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${calendarId}/${eventId}` })}`;
+}
 
 /** Whose calendar the tools write on (KTD10): one of the principal's, or the assistant's own. */
 type CalendarOwner = 'principal' | 'assistant';
@@ -543,10 +553,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       calendar: entry.id,
       event: eventId,
       guests,
-      message:
-        matterId === undefined
-          ? message
-          : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })}`,
+      message: await withMatter(message, matterId, entry.id, eventId),
     });
 
     // The list is written back only over the version of the event it was
@@ -631,10 +638,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       calendar: entry.id,
       event: eventId,
       response: held,
-      message:
-        matterId === undefined
-          ? message
-          : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })}`,
+      message: await withMatter(message, matterId, entry.id, eventId),
     });
 
     // Each write goes over the version of the event it read, so an answer the
