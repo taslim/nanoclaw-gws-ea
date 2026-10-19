@@ -198,10 +198,10 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's eight, in order, and the meetings store registers none", () => {
+  it("keeps the inbox's eight in order and registers chat booking recovery separately", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
-      .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
+      .filter((name) => name.startsWith('module:gws-ea-inbox:'));
     expect(names).toEqual([
       CREATE_INBOX,
       EMAIL_CHANNEL,
@@ -212,6 +212,11 @@ describe('the inbox migrations', () => {
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
     ]);
+    expect(
+      getRegisteredMigrations()
+        .map((migration) => migration.name)
+        .filter((name) => name.startsWith('module:gws-ea-meetings:')),
+    ).toEqual(['module:gws-ea-meetings:chat-booking-requests']);
   });
 
   it('are portable: async, and free of every banned construct', () => {

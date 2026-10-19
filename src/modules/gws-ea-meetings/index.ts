@@ -21,12 +21,15 @@
  * refusals included. The runner's tool for each carries the same name.
  *
  * What a thread booked lives in the inbox's thread map (`thread-calendar.ts`);
- * this module has no tables of its own.
+ * chat bookings retain mutation intents here until Google and main's note are confirmed.
  */
 import { answeredGuard, answeringAction, forbidden, type ActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
 import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { registerChatLifecycleTask } from '../gws-ea-chats/lifecycle.js';
+import { chatBookingRequestsMigration } from './chat-booking-migration.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarFactTools } from './calendar-facts.js';
@@ -83,7 +86,9 @@ for (const [action, answer] of SCHEDULING_REQUESTS) {
   );
 }
 
+registerMigration(chatBookingRequestsMigration);
 const chatScheduling = createChatSchedulingTools({ calendar: calendarApi });
+registerChatLifecycleTask('gws-ea-meetings:chat-bookings', chatScheduling.resumePending);
 for (const [action, answer] of [
   ['chat_free_time', chatScheduling.freeTime],
   ['chat_book', chatScheduling.book],
