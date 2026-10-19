@@ -5,9 +5,9 @@
  *
  * - the scheduling tools (KTD7): only `external-email`, from the session of
  *   one email thread; every call acts on that thread alone;
- * - `create_event`, `change_guests`, `find_conflicts` and `people_stats`: a
- *   group holding Google Calendar, as `gog`'s calendar commands are, which
- *   `main` does and external-email never does.
+ * - `create_event`, `change_guests`, `respond_to_event`, `find_conflicts`
+ *   and `people_stats`: a group holding Google Calendar, as `gog`'s calendar
+ *   commands are, which `main` does and external-email never does.
  *
  * No decision here ever holds for approval: these are structural checks.
  */

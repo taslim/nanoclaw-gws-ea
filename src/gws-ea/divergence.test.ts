@@ -922,8 +922,8 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
       }).containers[0].contributedEnv ?? {};
 
     const main = spawnEnv('ag-main', resolveCapabilities('all', 'main'));
-    // Calendar without gog's create, and without its conflict check: main
-    // creates events and checks overlaps through the host. Gmail read-only,
+    // Calendar without gog's create, its conflict check, or its answer: main
+    // creates events, checks overlaps and answers through the host. Gmail read-only,
     // the directory's search, and the whole of Drive, Docs, Sheets, Slides and Forms.
     const services = [
       'calendar.calendars',
@@ -934,7 +934,6 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
       'calendar.freebusy',
       'calendar.update',
       'calendar.delete',
-      'calendar.respond',
       'gmail.search',
       'gmail.messages.search',
       'gmail.thread.get',

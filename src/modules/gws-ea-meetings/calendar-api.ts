@@ -15,8 +15,9 @@
  * never for external-email. main's guest-list change reads each guest whole,
  * only to write them back as they were, and the event's title, notes and
  * place, only to check them against whoever it invites; it writes over only
- * the version of the event it read, and none of it reaches an agent. Tests
- * use a fake with the same interface.
+ * the version of the event it read, and none of it reaches an agent. main's
+ * answer for the principal writes only the principal's own entry. Tests use
+ * a fake with the same interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -134,6 +135,12 @@ export interface EventGuests {
   /** The organizer's address, lowercased: the calendar the event belongs to. */
   readonly organizer?: string;
   readonly guests: readonly GuestRecord[];
+  /** Google left guests out of `guests`: written back whole, the list would lose them. */
+  readonly attendeesOmitted?: boolean;
+  /** The series this occurrence belongs to: a write on it changes that occurrence alone. */
+  readonly recurringEventId?: string;
+  /** The event repeats: a write on it changes every occurrence. */
+  readonly recurrence?: readonly string[];
   /** What the event says, which everyone it invites reads: its title, notes and place. */
   readonly summary?: string;
   readonly description?: string;
@@ -167,6 +174,13 @@ export interface EventWrite {
   /** Restores an event deleted earlier under the same id. */
   readonly status?: 'confirmed';
 }
+
+/**
+ * How a guest-list write went: `changed`, and nothing written, when the
+ * event is no longer the version it was read at; `gone` when the event no
+ * longer exists.
+ */
+export type GuestWriteResult = 'set' | 'changed' | 'gone';
 
 /** A new event: a write with its times. */
 export type NewEvent = EventWrite & { readonly start: string; readonly end: string };
@@ -204,7 +218,19 @@ export interface MeetingsCalendarApi {
     guests: readonly GuestRecord[],
     sendUpdates: SendUpdates,
     etag?: string,
-  ): Promise<'set' | 'changed'>;
+  ): Promise<GuestWriteResult>;
+  /**
+   * Write only the calendar's own entry on an event's guest list, the rest
+   * of the list left as Google holds it (`attendeesOmitted`), over `etag`'s
+   * version: how a guest's own answer is written.
+   */
+  setOwnEntry(
+    calendarId: string,
+    eventId: string,
+    entry: GuestRecord,
+    sendUpdates: SendUpdates,
+    etag?: string,
+  ): Promise<GuestWriteResult>;
   /** Delete an event; `gone` when it was already deleted or never existed. */
   deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
 }
@@ -419,6 +445,24 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
   });
 }
 
+/** Google's refusal of a call on an event that does not exist, or no longer does. */
+function isGone(error: unknown): boolean {
+  return error instanceof GoogleApiError && (error.status === 404 || error.status === 410);
+}
+
+/** A guest-list write's result, from Google's refusal when it refused. */
+async function guestWrite(write: Promise<unknown>): Promise<GuestWriteResult> {
+  try {
+    await write;
+    return 'set';
+  } catch (error) {
+    // 412 Precondition Failed: the event is no longer the version the list was read from.
+    if (error instanceof GoogleApiError && error.status === 412) return 'changed';
+    if (isGone(error)) return 'gone';
+    throw error;
+  }
+}
+
 /** The real client, over the Calendar API. */
 export function createMeetingsCalendarApi(options: GoogleClientOptions): MeetingsCalendarApi {
   /**
@@ -516,16 +560,27 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
 
     async getGuests(calendarId, eventId) {
       const params = new URLSearchParams({
-        fields: 'etag,status,organizer(email),attendees,summary,description,location',
+        fields:
+          'etag,status,organizer(email),attendees,attendeesOmitted,recurringEventId,recurrence,summary,description,location',
       });
-      const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
-        allowNotFound: true,
-      });
+      let payload: unknown;
+      try {
+        payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          allowNotFound: true,
+        });
+      } catch (error) {
+        if (isGone(error)) return undefined;
+        throw error;
+      }
       if (payload === undefined) return undefined;
       if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
       const etag = optionalString(payload.etag);
       const status = optionalString(payload.status);
       const organizer = isRecord(payload.organizer) ? optionalString(payload.organizer.email) : undefined;
+      const recurringEventId = optionalString(payload.recurringEventId);
+      const recurrence = Array.isArray(payload.recurrence)
+        ? payload.recurrence.filter((line): line is string => typeof line === 'string')
+        : undefined;
       const summary = optionalString(payload.summary);
       const description = optionalString(payload.description);
       const location = optionalString(payload.location);
@@ -534,26 +589,35 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         ...(status === undefined ? {} : { status }),
         ...(organizer === undefined ? {} : { organizer: organizer.toLowerCase() }),
         guests: Array.isArray(payload.attendees) ? payload.attendees.filter(isRecord) : [],
+        ...(payload.attendeesOmitted === true ? { attendeesOmitted: true } : {}),
+        ...(recurringEventId === undefined ? {} : { recurringEventId }),
+        ...(recurrence === undefined || recurrence.length === 0 ? {} : { recurrence }),
         ...(summary === undefined ? {} : { summary }),
         ...(description === undefined ? {} : { description }),
         ...(location === undefined ? {} : { location }),
       };
     },
 
-    async setGuests(calendarId, eventId, guests, sendUpdates, etag) {
+    setGuests(calendarId, eventId, guests, sendUpdates, etag) {
       const params = new URLSearchParams({ sendUpdates, fields: 'id' });
-      try {
-        await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+      return guestWrite(
+        googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
           method: 'PATCH',
           body: { attendees: guests },
           ...(etag === undefined ? {} : { ifMatch: etag }),
-        });
-        return 'set';
-      } catch (error) {
-        // 412 Precondition Failed: the event is no longer the version the list was read from.
-        if (error instanceof GoogleApiError && error.status === 412) return 'changed';
-        throw error;
-      }
+        }),
+      );
+    },
+
+    setOwnEntry(calendarId, eventId, entry, sendUpdates, etag) {
+      const params = new URLSearchParams({ sendUpdates, fields: 'id' });
+      return guestWrite(
+        googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          method: 'PATCH',
+          body: { attendeesOmitted: true, attendees: [entry] },
+          ...(etag === undefined ? {} : { ifMatch: etag }),
+        }),
+      );
     },
 
     async deleteEvent(calendarId, eventId, sendUpdates) {
@@ -562,7 +626,7 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, { method: 'DELETE' });
         return 'deleted';
       } catch (error) {
-        if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) return 'gone';
+        if (isGone(error)) return 'gone';
         throw error;
       }
     },

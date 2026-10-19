@@ -323,7 +323,7 @@ describe('the Calendar client', () => {
       location: 'Boardroom',
     });
     expect(requests[0].url.searchParams.get('fields')).toBe(
-      'etag,status,organizer(email),attendees,summary,description,location',
+      'etag,status,organizer(email),attendees,attendeesOmitted,recurringEventId,recurrence,summary,description,location',
     );
 
     expect(
@@ -362,8 +362,59 @@ describe('the Calendar client', () => {
     expect(requests[2].headers).not.toHaveProperty('if-match');
   });
 
-  it('reads an event that is not there as undefined when its guests are asked for', async () => {
-    const { api } = stubGoogle(() => ({ status: 404, body: { error: { message: 'Not Found' } } }));
+  it('reads whether Google left guests out, and the series an occurrence belongs to or the series itself', async () => {
+    const replies = [
+      {
+        attendeesOmitted: true,
+        recurringEventId: 'series-1',
+        attendees: [{ email: 'pat@principal.example', self: true }],
+      },
+      { recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] },
+    ];
+    const { api } = stubGoogle(() => ({ status: 200, body: { etag: '"1"', ...replies.shift() } }));
+    expect(await api.getGuests('pat@principal.example', 'series-1_20261012T090000Z')).toEqual({
+      etag: '"1"',
+      guests: [{ email: 'pat@principal.example', self: true }],
+      attendeesOmitted: true,
+      recurringEventId: 'series-1',
+    });
+    expect(await api.getGuests('pat@principal.example', 'series-1')).toEqual({
+      etag: '"1"',
+      guests: [],
+      recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+    });
+  });
+
+  it("writes only the calendar's own guest entry, telling Google the rest of the list is left out, over the version read", async () => {
+    const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'evt-1' } }));
+    const own = { email: 'pat.alias@principal.example', self: true, responseStatus: 'declined' };
+    expect(await api.setOwnEntry('pat@principal.example', 'evt-1', own, 'all', '"7"')).toBe('set');
+    const [request] = requests;
+    expect(request.method).toBe('PATCH');
+    expect(request.url.pathname).toBe('/calendar/v3/calendars/pat%40principal.example/events/evt-1');
+    expect(Object.fromEntries(request.url.searchParams)).toEqual({ sendUpdates: 'all', fields: 'id' });
+    expect(request.headers['if-match']).toBe('"7"');
+    expect(request.body).toEqual({ attendeesOmitted: true, attendees: [own] });
+  });
+
+  it('reads a self-only write as changed when the event moved on since its version, either guest write as gone when the event is, and throws any other refusal', async () => {
+    const statuses = [412, 404, 410, 403, 404, 410];
+    const { api } = stubGoogle(() => ({ status: statuses.shift() ?? 500, body: { error: { message: 'No' } } }));
+    const own = { email: 'pat@principal.example', self: true, responseStatus: 'accepted' };
+    expect(await api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).toBe('changed');
+    expect(await api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).toBe('gone');
+    expect(await api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).toBe('gone');
+    await expect(api.setOwnEntry('pat@principal.example', 'evt-1', own, 'none', '"1"')).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('gone');
+    expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('gone');
+  });
+
+  it('reads an event that is not there, or no longer is, as undefined when its guests are asked for', async () => {
+    const statuses = [404, 410];
+    const { api } = stubGoogle(() => ({ status: statuses.shift() ?? 500, body: { error: { message: 'Not Found' } } }));
     expect(await api.getGuests('pat@principal.example', 'missing')).toBeUndefined();
+    expect(await api.getGuests('pat@principal.example', 'deleted')).toBeUndefined();
   });
 });

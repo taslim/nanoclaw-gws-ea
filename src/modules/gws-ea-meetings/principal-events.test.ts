@@ -77,6 +77,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import './index.js';
@@ -828,6 +829,35 @@ describe('change_guests', () => {
     expect(calendar.writes).toEqual([]);
   });
 
+  it('refuses, writing nothing, a guest list Google returned incomplete: written back, it would drop the guests left out (R9)', async () => {
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+      attendeesOmitted: true,
+    });
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      "Google didn't return this event's whole guest list, so changing it could drop guests: ask the principal to change it in Google Calendar.",
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses, having written nothing, an event deleted between its read of the list and its write', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'teamsync01'));
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      'No event teamsync01 on that calendar.',
+    );
+
+    // Deleted after the list changed under it twice: still gone, not "kept changing".
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.changeAfterNextGuestRead(() => calendar.put(teamSync([PRINCIPAL_GUEST, { email: REMY }])));
+    calendar.changeAfterNextGuestRead(() => calendar.put(teamSync([PRINCIPAL_GUEST])));
+    calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'teamsync01'));
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      'No event teamsync01 on that calendar.',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
   it('refuses an event on a calendar neither the principal’s nor its own, though it may write there', async () => {
     calendar.put({
       ...teamSync([{ email: COLLEAGUE_CALENDAR, responseStatus: 'accepted', organizer: true }]),
@@ -838,6 +868,339 @@ describe('change_guests', () => {
       refusal(await send(main, 'change_guests', { calendar: COLLEAGUE_CALENDAR, event: 'teamsync01', add: [NOEL] })),
     ).toBe(
       `${COLLEAGUE_CALENDAR} is not one of the principal's calendars in your list, nor your own: you write only on those.`,
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+});
+
+describe('respond_to_event', () => {
+  /** The principal's own entry on a copy on their calendar, as Google marks it. */
+  const self = (responseStatus: string, more: Record<string, unknown> = {}) => ({
+    email: PRINCIPAL,
+    responseStatus,
+    self: true,
+    ...more,
+  });
+  const REMY_ACCEPTED = { email: REMY, responseStatus: 'accepted', comment: 'Bringing the deck', optional: true };
+  const NOEL_DECLINED = { email: NOEL, responseStatus: 'declined' };
+
+  /** A meeting the principal organizes, after a guest moved it: Google reset their own answer. */
+  function ownMeeting(answer = 'needsAction', more: Partial<StoredEvent> = {}): StoredEvent {
+    return { ...teamSync([self(answer, { organizer: true }), REMY_ACCEPTED, NOEL_DECLINED]), ...more };
+  }
+
+  /** Remy's invitation, on the principal's calendar. */
+  function invitation(
+    entry: Record<string, unknown> = self('needsAction'),
+    more: Partial<StoredEvent> = {},
+  ): StoredEvent {
+    const guests = [{ email: REMY, responseStatus: 'accepted', organizer: true }, entry, NOEL_DECLINED];
+    return { ...teamSync(guests), id: 'remyinvite1', organizer: { email: REMY }, summary: 'Pilot review', ...more };
+  }
+
+  function answer(event: string, response: string, more: Record<string, unknown> = {}) {
+    return send(main, 'respond_to_event', { calendar: PRINCIPAL, event, response, ...more });
+  }
+
+  it('puts the principal back as accepted on a meeting they organize, changing no one else and emailing no one (R2)', async () => {
+    calendar.put(ownMeeting());
+
+    const answered = data(await answer('teamsync01', 'accepted'));
+
+    expect(calendar.writes).toEqual([
+      {
+        op: 'guests',
+        calendarId: PRINCIPAL,
+        eventId: 'teamsync01',
+        sendUpdates: 'none',
+        guests: [self('accepted', { organizer: true }), REMY_ACCEPTED, NOEL_DECLINED],
+      },
+    ]);
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.guests).toEqual([
+      self('accepted', { organizer: true }),
+      REMY_ACCEPTED,
+      NOEL_DECLINED,
+    ]);
+    expect(answered).toEqual({
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      response: 'accepted',
+      message: 'Google now shows the principal as going (accepted). Google emailed no one.',
+    });
+  });
+
+  it('refuses, writing nothing, a meeting they organize whose guest list Google returned incomplete', async () => {
+    calendar.put(ownMeeting('needsAction', { attendeesOmitted: true }));
+    expect(refusal(await answer('teamsync01', 'accepted'))).toBe(
+      "Google didn't return this event's whole guest list, so changing it could drop guests: ask the principal to change it in Google Calendar.",
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it("answers someone else's invitation by writing only the principal's own entry, and Google is asked to tell the organizer (R3)", async () => {
+    calendar.put(invitation());
+
+    const answered = data(await answer('remyinvite1', 'declined'));
+
+    expect(calendar.writes).toEqual([
+      {
+        op: 'own',
+        calendarId: PRINCIPAL,
+        eventId: 'remyinvite1',
+        sendUpdates: 'all',
+        guests: [self('declined')],
+      },
+    ]);
+    // The organizer stays Remy's, and nobody else's answer moves.
+    expect(calendar.event(PRINCIPAL, 'remyinvite1')?.guests).toEqual([
+      { email: REMY, responseStatus: 'accepted', organizer: true },
+      self('declined'),
+      NOEL_DECLINED,
+    ]);
+    expect(answered.message).toBe(
+      'Google now shows the principal as not going (declined). Google was asked to tell the organizer.',
+    );
+  });
+
+  it("emails no one when the invitation comes from another of the principal's own addresses", async () => {
+    calendar.put({
+      ...invitation(),
+      organizer: { email: READ_ONLY },
+      guests: [{ email: READ_ONLY, responseStatus: 'accepted', organizer: true }, self('needsAction')],
+    });
+
+    const answered = data(await answer('remyinvite1', 'tentative'));
+
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'own', sendUpdates: 'none' })]);
+    expect(answered.message).toBe('Google now shows the principal as maybe going (tentative). Google emailed no one.');
+  });
+
+  it('sends their entry back as Google holds it, under the address it names, and drops a note left with an earlier answer (KTD5)', async () => {
+    const alias = 'morgan.e@northwind.example';
+    calendar.put(invitation(self('accepted', { email: alias, comment: 'See you there', displayName: 'Morgan' })));
+
+    data(await answer('remyinvite1', 'declined'));
+
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({
+        op: 'own',
+        guests: [{ email: alias, responseStatus: 'declined', self: true, displayName: 'Morgan' }],
+      }),
+    ]);
+  });
+
+  it('writes nothing when the answer already holds, and says so (R6)', async () => {
+    calendar.put(ownMeeting('accepted'));
+    calendar.put(invitation(self('declined')));
+
+    expect(data(await answer('teamsync01', 'accepted')).message).toBe(
+      'Nothing changed: Google already shows the principal as going (accepted).',
+    );
+    expect(data(await answer('remyinvite1', 'declined')).message).toBe(
+      'Nothing changed: Google already shows the principal as not going (declined).',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('says whether the answer covers one occurrence or every occurrence of a series (R4)', async () => {
+    calendar.put(invitation(self('needsAction'), { id: 'weekly1_20261012T160000Z', recurringEventId: 'weekly1' }));
+    calendar.put(invitation(self('needsAction'), { id: 'weekly1', recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] }));
+
+    expect(data(await answer('weekly1_20261012T160000Z', 'accepted')).message).toBe(
+      'Google now shows the principal as going (accepted) on this occurrence only. Google was asked to tell the organizer.',
+    );
+    expect(data(await answer('weekly1', 'accepted')).message).toBe(
+      'Google now shows the principal as going (accepted) on every occurrence. Google was asked to tell the organizer.',
+    );
+  });
+
+  it("refuses, writing nothing, any calendar but the principal's, one it may only read, and an event that is not there (R5)", async () => {
+    calendar.put({ ...invitation(), calendarId: ASSISTANT });
+    calendar.put({ ...invitation(), calendarId: COLLEAGUE_CALENDAR });
+    calendar.put({ ...invitation(), calendarId: READ_ONLY });
+    calendar.put({ ...invitation(), id: 'cancelled1', status: 'cancelled' });
+
+    for (const [calendarId, event, reason] of [
+      [
+        ASSISTANT,
+        'remyinvite1',
+        "That is your own calendar: the principal's answer lives on their calendar, so answer there.",
+      ],
+      [
+        COLLEAGUE_CALENDAR,
+        'remyinvite1',
+        `${COLLEAGUE_CALENDAR} is not one of the principal's calendars in your list, nor your own: you write only on those.`,
+      ],
+      [READ_ONLY, 'remyinvite1', 'Google lets you see that calendar but not change it.'],
+      [PRINCIPAL, 'nosuchevent', 'No event nosuchevent on that calendar.'],
+      [PRINCIPAL, 'cancelled1', 'No event cancelled1 on that calendar.'],
+    ] as const) {
+      expect(
+        refusal(await send(main, 'respond_to_event', { calendar: calendarId, event, response: 'accepted' })),
+        calendarId,
+      ).toBe(reason);
+    }
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses, writing nothing, an event that lists no entry of the principal’s on that calendar, and says why it may be', async () => {
+    calendar.put(teamSync([REMY_ACCEPTED]));
+    calendar.put({
+      ...invitation(),
+      guests: [{ email: REMY, responseStatus: 'accepted', organizer: true }, NOEL_DECLINED],
+    });
+
+    expect(refusal(await answer('teamsync01', 'accepted'))).toBe(
+      "The principal organizes that event and isn't on its guest list, so they have no answer to set.",
+    );
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe(
+      "The principal isn't on that event's guest list on that calendar, as when they're invited through a group: bring it to them.",
+    );
+
+    // A calendar shared without its private events shows a private one without its guests.
+    calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writerWithoutPrivateAccess' });
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe(
+      "You can't see the principal on that event. That calendar is shared with you without their private events, so if it is private, only they can answer it; otherwise bring it to them.",
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('writes over the version it read: an unrelated change in between is read again and kept', async () => {
+    calendar.put(ownMeeting());
+    calendar.changeAfterNextGuestRead(() =>
+      calendar.put(
+        teamSync([
+          self('needsAction', { organizer: true }),
+          REMY_ACCEPTED,
+          { email: NOEL, responseStatus: 'accepted' },
+        ]),
+      ),
+    );
+
+    data(await answer('teamsync01', 'accepted'));
+
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({
+        op: 'guests',
+        guests: [self('accepted', { organizer: true }), REMY_ACCEPTED, { email: NOEL, responseStatus: 'accepted' }],
+      }),
+    ]);
+  });
+
+  it('stops, writing nothing, when the principal answers it themselves while it runs (KTD6)', async () => {
+    calendar.put(invitation());
+    calendar.changeAfterNextGuestRead(() => calendar.put(invitation(self('tentative'))));
+    expect(refusal(await answer('remyinvite1', 'declined'))).toBe(
+      'The principal answered maybe going (tentative) themselves while this ran, so nothing was written: their answer stands unless they ask you to change it.',
+    );
+
+    // Their own answer, landing first, is the one asked for: nothing more to write.
+    calendar.put(invitation());
+    calendar.changeAfterNextGuestRead(() => calendar.put(invitation(self('declined'))));
+    expect(data(await answer('remyinvite1', 'declined')).message).toBe(
+      'Nothing changed: Google already shows the principal as not going (declined).',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses, writing nothing, an event that keeps changing under it, or that is deleted before its write', async () => {
+    calendar.put(ownMeeting());
+    for (const remy of ['accepted', 'tentative', 'declined']) {
+      calendar.changeAfterNextGuestRead(() =>
+        calendar.put(teamSync([self('needsAction', { organizer: true }), { email: REMY, responseStatus: remy }])),
+      );
+    }
+    expect(refusal(await answer('teamsync01', 'accepted'))).toBe(
+      'The event kept changing while this ran: try again in a moment.',
+    );
+
+    calendar.put(invitation());
+    calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'remyinvite1'));
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe('No event remyinvite1 on that calendar.');
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('says the answer is unconfirmed, not refused, when Google takes it but cannot show it back', async () => {
+    calendar.put(invitation());
+    const read = calendar.getGuests.bind(calendar);
+    let reads = 0;
+    vi.spyOn(calendar, 'getGuests').mockImplementation(async (calendarId, eventId) => {
+      reads += 1;
+      if (reads === 2) throw new GoogleApiError(503, 'Google refused the read: Backend Error');
+      return read(calendarId, eventId);
+    });
+
+    const answered = data(await answer('remyinvite1', 'accepted'));
+
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'own' })]);
+    expect(answered.message).toBe(
+      'Google took the answer but could not show it back just now, so check it with gog calendar event before you tell the principal. Google was asked to tell the organizer.',
+    );
+  });
+
+  it('refuses when the event is deleted between its answer and the read back', async () => {
+    calendar.put(invitation());
+    const write = calendar.setOwnEntry.bind(calendar);
+    vi.spyOn(calendar, 'setOwnEntry').mockImplementationOnce(async (...args) => {
+      const written = await write(...args);
+      calendar.remove(PRINCIPAL, 'remyinvite1');
+      return written;
+    });
+
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe('No event remyinvite1 on that calendar.');
+  });
+
+  it('reports, as a refusal, an answer Google did not keep', async () => {
+    calendar.put(invitation());
+    vi.spyOn(calendar, 'setOwnEntry').mockResolvedValueOnce('set');
+
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe(
+      "Google took the answer but still shows the principal as not yet answered (needsAction), so it didn't take: ask them to answer it in Google Calendar.",
+    );
+  });
+
+  it('records no change of its own: a notice of the event after an answer still reaches main (KTD7)', async () => {
+    calendar.put(invitation());
+    data(await answer('remyinvite1', 'accepted'));
+    expect(consumeOwnCalendarChange(PRINCIPAL, 'remyinvite1', new Date())).toBe(false);
+  });
+
+  it('joins a matter on a write and on an answer that already holds, and refuses an unknown one before writing', async () => {
+    const { matter } = await openMatter({ title: 'Pilot', openLoop: 'Remy reviews the pilot.', links: [] });
+    calendar.put(invitation());
+    calendar.put(ownMeeting('accepted'));
+
+    expect(data(await answer('remyinvite1', 'accepted', { matter: matter.id })).message).toMatch(
+      new RegExp(` It joins matter ${matter.id}\\.$`, 'u'),
+    );
+    expect(data(await answer('teamsync01', 'accepted', { matter: matter.id })).message).toMatch(
+      new RegExp(` It joins matter ${matter.id}\\.$`, 'u'),
+    );
+    expect(((await getMatter(matter.id))?.links ?? []).map((link) => link.reference)).toEqual([
+      `${PRINCIPAL}/remyinvite1`,
+      `${PRINCIPAL}/teamsync01`,
+    ]);
+
+    calendar.writes.length = 0;
+    calendar.put(invitation());
+    expect(refusal(await answer('remyinvite1', 'declined', { matter: 'm-000000000000' }))).toMatch(
+      /There is no matter m-000000000000/u,
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('refuses a response that is not an answer, and a request missing its calendar or event', async () => {
+    calendar.put(invitation());
+    for (const response of ['needsAction', 'yes', undefined]) {
+      expect(refusal(await answer('remyinvite1', response as string))).toBe(
+        'response must be accepted, tentative or declined',
+      );
+    }
+    expect(refusal(await send(main, 'respond_to_event', { event: 'remyinvite1', response: 'accepted' }))).toMatch(
+      /calendar must be a calendar ID/u,
+    );
+    expect(refusal(await send(main, 'respond_to_event', { calendar: PRINCIPAL, response: 'accepted' }))).toMatch(
+      /event must be the event's id/u,
     );
     expect(calendar.writes).toEqual([]);
   });
@@ -1049,6 +1412,11 @@ describe("main's calendar tools", () => {
     expect(refusal(await send(external, 'create_event', FOCUS))).toMatch(/needs Google Calendar/u);
     expect(
       refusal(await send(external, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] })),
+    ).toMatch(/needs Google Calendar/u);
+    expect(
+      refusal(
+        await send(external, 'respond_to_event', { calendar: PRINCIPAL, event: 'teamsync01', response: 'accepted' }),
+      ),
     ).toMatch(/needs Google Calendar/u);
     expect(calendar.writes).toEqual([]);
   });

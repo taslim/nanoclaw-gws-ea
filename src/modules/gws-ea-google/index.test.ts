@@ -47,7 +47,6 @@ const GOG_COMMANDS: Readonly<Record<string, readonly string[]>> = {
     'calendar.freebusy',
     'calendar.update',
     'calendar.delete',
-    'calendar.respond',
   ],
   'google-mail-read': ['gmail.search', 'gmail.messages.search', 'gmail.thread.get', 'gmail.get'],
   'google-directory': ['people.search'],
@@ -63,7 +62,7 @@ const SERVICE_COMMANDS = [
 
 /** What each Google Calendar rule must keep saying; agents in every group rely on them. */
 const REQUIRED_CALENDAR_RULES = [
-  'Use the `gog` command, through Bash, for everything you do in Google Calendar but two: create an event with the `create_event` tool, and change who an event invites with `change_guests`.',
+  'Use the `gog` command, through Bash, for everything you do in Google Calendar but three: create an event with the `create_event` tool, change who an event invites with `change_guests`, and answer for the principal with `respond_to_event`.',
   'never run `gog auth`',
   "A calendar is the principal's when its ID (their primary calendar) or its `dataOwner` is one of the principal's addresses.",
   // The one rule the host recognizes them by (R1): never the exact spelling alone.
@@ -379,7 +378,8 @@ describe("the Google services' skills", () => {
       expect(taught.length, skill).toBeGreaterThan(0);
       for (const command of taught) expect(GOG_COMMANDS[capability], `${skill} teaches ${command}`).toContain(command);
     }
-    expect(taughtGogCommands('gcalendar')).toContain('calendar.respond');
+    // gog refuses to answer an event the principal organizes: every answer goes through respond_to_event.
+    expect(taughtGogCommands('gcalendar')).not.toContain('calendar.respond');
     expect(taughtGogCommands('gworkspace')).toEqual(
       expect.arrayContaining(['docs.export', 'api.call', 'api.docs.documents.batchupdate']),
     );

@@ -6,13 +6,14 @@
  *
  *   free_time, book, change_booking, cancel_booking
  *
- * Beside them, `main`'s two writes on events, on the principal's calendars or
- * the assistant's own, which `gog` cannot make with the principal on the
- * guest list or with the private-details check (`principal-events.ts`), and
- * its two calendar facts, counted from Google's own answer
- * (`calendar-facts.ts`), for a group holding Google Calendar:
+ * Beside them, `main`'s three writes on events, on the principal's calendars
+ * or the assistant's own, which `gog` cannot make with the principal on the
+ * guest list or with the private-details check, and cannot answer an event
+ * the principal organizes (`principal-events.ts`), and its two calendar
+ * facts, counted from Google's own answer (`calendar-facts.ts`), for a group
+ * holding Google Calendar:
  *
- *   create_event, change_guests, find_conflicts, people_stats
+ *   create_event, change_guests, respond_to_event, find_conflicts, people_stats
  *
  * Each is a delivery action with a guard (`guard.ts`): the scheduling tools
  * admit only `external-email`, from one email thread's session, and main's
@@ -56,6 +57,7 @@ const facts = createCalendarFactTools({ calendar: calendarApi });
 for (const [action, answer] of [
   ['create_event', principalEvents.createEvent],
   ['change_guests', principalEvents.changeGuests],
+  ['respond_to_event', principalEvents.respondToEvent],
   ['find_conflicts', facts.findConflicts],
   ['people_stats', facts.peopleStats],
 ] as const) {

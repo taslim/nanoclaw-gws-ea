@@ -191,8 +191,8 @@ describe("GWS-EA's guidance for main", () => {
     );
   });
 
-  it('stays within 2,750 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_750);
+  it('stays within 2,875 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_875);
   });
 
   it("teaches main its email tools, and none of external-email's", async () => {
