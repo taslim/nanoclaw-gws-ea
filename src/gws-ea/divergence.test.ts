@@ -465,6 +465,55 @@ describe('recorded divergence: a Google Chat message keeps its attachments', () 
 });
 
 describe('recorded divergence: delivery consults outbound guards, and the runner reports a failed turn', () => {
+  it('rechecks a mailbox source session after guards await, while direct host sends remain available', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'source',
+      name: 'Source',
+      folder: 'source',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const { createSession, updateSession } = await import('../db/sessions.js');
+    await createSession({
+      id: 'old-conversation',
+      agent_group_id: 'source',
+      messaging_group_id: null,
+      thread_id: 'system:proof',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+    const delivery = await import('../delivery.js');
+    delivery.registerOutboundGuard('divergence:close-source', async () => {
+      await updateSession('old-conversation', { status: 'closed' });
+      return { effect: 'allow' };
+    });
+    const sent = vi.fn(async () => 'posted');
+    const guarded = delivery.setDeliveryAdapter({ deliver: sent });
+    await expect(
+      guarded.deliver(
+        'gchat',
+        'spaces/chat',
+        null,
+        'chat',
+        '{"text":"old"}',
+        undefined,
+        undefined,
+        'old-row',
+        new Date().toISOString(),
+        'old-conversation',
+      ),
+    ).rejects.toBeInstanceOf(delivery.OutboundRefusedError);
+    expect(sent).not.toHaveBeenCalled();
+    await guarded.deliver('gchat', 'spaces/chat', null, 'chat', '{"text":"host notice"}');
+    expect(sent).toHaveBeenCalledTimes(1);
+  });
   it('refuses a send that a registered outbound guard refuses, before the channel adapter sees it', async () => {
     await freshInstall();
     const delivery = await import('../delivery.js');

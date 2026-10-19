@@ -1,5 +1,8 @@
 import { getDb } from '../../db/connection.js';
+import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { updateSession } from '../../db/sessions.js';
+import { waitForSessionChannelDelivery } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { HOLD_UNTIL_RELEASED, runInConversationTail, type InboundDelay } from '../../router.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -85,6 +88,7 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
     if (!(await getChat(chatId))) return;
     const now = new Date().toISOString();
     await db.run('UPDATE gws_ea_chats SET state = ?, updated_at = ? WHERE messaging_group_id = ?', state, now, chatId);
+    await db.run("UPDATE sessions SET status = 'closed' WHERE messaging_group_id = ?", chatId);
     if (await db.hasTable('gws_ea_job_agents'))
       await db.run(
         "UPDATE gws_ea_job_agents SET state='retiring',updated_at=? WHERE messaging_group_id=? AND state IN ('creating','active')",
@@ -115,7 +119,12 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
 export async function settleChatMessages(chatId: string): Promise<void> {
   const chat = await getChat(chatId);
   const terminal = chat?.state === 'declined' || chat?.state === 'detached';
-  for (const session of await sessions(chatId))
+  for (const session of await sessions(chatId)) {
+    if (terminal) {
+      if (session.status !== 'closed') await updateSession(session.id, { status: 'closed' });
+      await stopChatSession(session.id);
+      await waitForSessionChannelDelivery(session.id);
+    }
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
       if (terminal) {
         mailbox.settleUnreadMessages(
@@ -124,8 +133,25 @@ export async function settleChatMessages(chatId: string): Promise<void> {
             .map((row) => row.id),
         );
         mailbox.cancelTask();
+        const delivered = mailbox.getDeliveredIds();
+        for (const row of mailbox.getOutboundRecords('1970-01-01T00:00:00.000Z'))
+          if (!delivered.has(row.id)) mailbox.markDeliveryFailed(row.id);
       } else mailbox.settleHeldMessages();
     });
+  }
+}
+async function stopChatSession(sessionId: string): Promise<void> {
+  if (!isContainerRunning(sessionId)) return;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error('The chat container has not stopped; chat cleanup will resume.')),
+      30_000,
+    );
+    killContainer(sessionId, 'chat-closed', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 /** Host-only primitive: the calling action authorizes main; declining grants no authority or private context. */
 export async function declineChat(chatId: string): Promise<void> {

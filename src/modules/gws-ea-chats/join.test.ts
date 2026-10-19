@@ -43,7 +43,15 @@ for (const migration of [gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaM
   registerMigration(migration);
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroupByPlatform, createMessagingGroupAgent } from '../../db/messaging-groups.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { ChannelNotConnectedError } from '../../channels/adapter.js';
+import {
+  deliverSessionMessages,
+  registerOutboundGuard,
+  setDeliveryAdapter,
+  type ChannelDeliveryAdapter,
+} from '../../delivery.js';
+import { getSession } from '../../db/sessions.js';
 import { registerInboundPreparer } from '../../inbound-preparation.js';
 import { requestWake } from '../../request-wake.js';
 import { routeInbound } from '../../router.js';
@@ -63,6 +71,34 @@ import { CHAT_WIRING } from './wiring-policy.js';
 import { sweepChatLifecycle } from './lifecycle.js';
 import { listChatMembers, refreshChatRoster, setChatMemberEmail } from './roster.js';
 import { refreshChatMembership } from './join.js';
+import type { Session } from '../../types.js';
+import * as containerRunner from '../../container-runner.js';
+import { requireServingChat } from './bridge.js';
+
+let selectedSend: { readonly entered: () => void; readonly gate: Promise<void> } | undefined;
+registerOutboundGuard('test:chat-epoch', async (send) => {
+  if (selectedSend && send.content === JSON.stringify({ text: 'old-selected' })) {
+    selectedSend.entered();
+    await selectedSend.gate;
+  }
+  return { effect: 'allow' };
+});
+
+function queueReply(session: Session, id: string): void {
+  const db = new Database(outboundDbPath(session.agent_group_id, session.id));
+  try {
+    db.prepare('INSERT INTO messages_out(id,timestamp,kind,channel_type,platform_id,content) VALUES(?,?,?,?,?,?)').run(
+      id,
+      new Date().toISOString(),
+      'chat',
+      'whatsapp',
+      'trip@g.us',
+      JSON.stringify({ text: id }),
+    );
+  } finally {
+    db.close();
+  }
+}
 
 let principal = true;
 let chatAdapter: AssistantChatAdapter;
@@ -231,10 +267,190 @@ beforeEach(async () => {
   vi.mocked(requestWake).mockClear();
 });
 afterEach(async () => {
+  selectedSend = undefined;
   await teardownChannelAdapters();
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
   vi.unstubAllEnvs();
+});
+
+it('settles a disconnected reply before rejoining without the principal and uses a fresh conversation', async () => {
+  await routeInbound(inbound('first', 'Robin'));
+  const chat = await group();
+  const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
+  if (!old) throw new Error('No original session');
+  queueReply(old, 'old-pending');
+  setDeliveryAdapter({
+    deliver: async () => {
+      throw new ChannelNotConnectedError();
+    },
+  });
+  await deliverSessionMessages(old);
+  await detachChat(chat.id);
+  principal = false;
+  await observeWhatsAppMembership({
+    kind: 'join',
+    group: {
+      platformId: 'trip@g.us',
+      name: 'Trip',
+      members: [{ key: 'whatsapp:22', person: { lid: '22' }, isPrincipal: false }],
+    },
+  });
+  expect(await getChat(chat.id)).toMatchObject({ state: 'asking' });
+  const sent = vi.fn<ChannelDeliveryAdapter['deliver']>(async () => 'platform-reply');
+  setDeliveryAdapter({ deliver: sent });
+  await deliverSessionMessages(old);
+  expect(sent).not.toHaveBeenCalled();
+  expect(await getSession(old.id)).toMatchObject({ status: 'closed' });
+  expect(
+    await sessionManager.withExistingMailboxSession('external', old.id, (mailbox) => ({
+      terminal: [...mailbox.getDeliveredIds()],
+      successful: [...mailbox.getDeliveredIds('delivered')],
+    })),
+  ).toEqual({ terminal: ['old-pending'], successful: [] });
+  await routeInbound(inbound('new-held', 'Robin'));
+  await routeInbound(
+    inbound('principal-admits', 'Robin', { authenticatedSender: { userId: 'whatsapp:11', kind: 'human' } }),
+  );
+  const fresh = await getDb().get<Session>(
+    "SELECT * FROM sessions WHERE messaging_group_id=? AND status='active'",
+    chat.id,
+  );
+  if (!fresh) throw new Error('No fresh session');
+  expect(fresh.id).not.toBe(old.id);
+  await expect(requireServingChat(old)).rejects.toThrow('serving session');
+  expect(await requireServingChat(fresh)).toMatchObject({ state: 'connected' });
+  queueReply(fresh, 'current-reply');
+  await deliverSessionMessages(fresh);
+  expect(sent).toHaveBeenCalledTimes(1);
+  expect(sent.mock.calls[0]?.[4]).toBe(JSON.stringify({ text: 'current-reply' }));
+});
+
+it('refuses a prior conversation reply already selected before detach and principal-free rejoin', async () => {
+  await routeInbound(inbound('first', 'Robin'));
+  const chat = await group();
+  const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
+  if (!old) throw new Error('No original session');
+  queueReply(old, 'old-selected');
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  selectedSend = {
+    entered: enter,
+    gate: new Promise<void>((resolve) => {
+      release = resolve;
+    }),
+  };
+  const sent = vi.fn<ChannelDeliveryAdapter['deliver']>(async () => 'platform-reply');
+  setDeliveryAdapter({ deliver: sent });
+  const pending = deliverSessionMessages(old);
+  try {
+    await entered;
+    await detachChat(chat.id);
+    await observeWhatsAppMembership({
+      kind: 'join',
+      group: {
+        platformId: 'trip@g.us',
+        name: 'Trip',
+        members: [{ key: 'whatsapp:22', person: { lid: '22' }, isPrincipal: false }],
+      },
+    });
+    expect(await getChat(chat.id)).toMatchObject({ state: 'asking' });
+  } finally {
+    release();
+    await pending;
+  }
+  expect(sent).not.toHaveBeenCalled();
+});
+
+it('finishes stopping the previous chat container before opening another admission epoch', async () => {
+  await routeInbound(inbound('first', 'Robin'));
+  const chat = await group();
+  const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
+  if (!old) throw new Error('No original session');
+  let stopping!: () => void;
+  let exit: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    stopping = resolve;
+  });
+  const running = vi.spyOn(containerRunner, 'isContainerRunning').mockReturnValue(true);
+  const kill = vi.spyOn(containerRunner, 'killContainer').mockImplementation((_id, _reason, onExit) => {
+    exit = onExit;
+    stopping();
+  });
+  const closing = detachChat(chat.id);
+  let rejoining: Promise<void> | undefined;
+  try {
+    await started;
+    expect(await getSession(old.id)).toMatchObject({ status: 'closed' });
+    queueReply(old, 'written-during-stop');
+    rejoining = observeWhatsAppMembership({
+      kind: 'join',
+      group: {
+        platformId: 'trip@g.us',
+        name: 'Trip',
+        members: [{ key: 'whatsapp:22', person: { lid: '22' }, isPrincipal: false }],
+      },
+    });
+    expect(await getChat(chat.id)).toMatchObject({ state: 'detached' });
+    running.mockReturnValue(false);
+    exit?.();
+    await closing;
+    await rejoining;
+    expect(await getChat(chat.id)).toMatchObject({ state: 'asking' });
+    expect(
+      await sessionManager.withExistingMailboxSession('external', old.id, (mailbox) => [...mailbox.getDeliveredIds()]),
+    ).toEqual(['written-during-stop']);
+  } finally {
+    running.mockReturnValue(false);
+    exit?.();
+    await closing;
+    await rejoining;
+    running.mockRestore();
+    kill.mockRestore();
+  }
+});
+
+it('records an already entered channel send before settling the closed conversation outbox', async () => {
+  await routeInbound(inbound('first', 'Robin'));
+  const chat = await group();
+  const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
+  if (!old) throw new Error('No original session');
+  queueReply(old, 'already-sending');
+  queueReply(old, 'never-started');
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const sent = vi.fn<ChannelDeliveryAdapter['deliver']>(async () => {
+    enter();
+    await gate;
+    return 'accepted-before-close';
+  });
+  setDeliveryAdapter({ deliver: sent });
+  const sending = deliverSessionMessages(old);
+  await entered;
+  const closing = detachChat(chat.id);
+  try {
+    await vi.waitFor(async () => expect(await getSession(old.id)).toMatchObject({ status: 'closed' }));
+  } finally {
+    release();
+    await sending;
+    await closing;
+  }
+  expect(sent).toHaveBeenCalledTimes(1);
+  expect(
+    await sessionManager.withExistingMailboxSession('external', old.id, (mailbox) => ({
+      terminal: [...mailbox.getDeliveredIds()].sort(),
+      successful: [...mailbox.getDeliveredIds('delivered')],
+    })),
+  ).toEqual({ terminal: ['already-sending', 'never-started'], successful: ['already-sending'] });
 });
 
 it('silently joins from actual membership and preserves the first unmentioned message in one unthreaded session', async () => {

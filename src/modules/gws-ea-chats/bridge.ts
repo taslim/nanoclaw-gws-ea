@@ -66,8 +66,14 @@ const mainAction = defineGuardedAction({
 
 /** Native worker identity comes from the profile and active registry, never from an action field. */
 export async function requireServingChat(session: Session): Promise<Chat> {
+  const current = await getSession(session.id);
   const chat = session.messaging_group_id === null ? undefined : await getChat(session.messaging_group_id);
   if (
+    !current ||
+    current.status !== 'active' ||
+    current.agent_group_id !== session.agent_group_id ||
+    current.messaging_group_id !== session.messaging_group_id ||
+    current.thread_id !== session.thread_id ||
     !chat ||
     chat.serving_agent_group_id !== session.agent_group_id ||
     session.thread_id !== null ||

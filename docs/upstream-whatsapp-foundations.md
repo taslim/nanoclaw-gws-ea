@@ -36,6 +36,17 @@ Evidence: `src/delivery-not-connected.test.ts`, the existing delivery suites and
 the recorded-divergence tests exercise outage recovery, unaffected channels,
 attempt accounting and the real registry bridge.
 
+Mailbox sends also carry their host-owned source session to the guarded delivery
+boundary. The poll skips a session that has closed, and the boundary rechecks it
+after outbound guards finish awaiting. A queued reply from a closed conversation
+cannot borrow a later admission of the same channel chat. Direct host notices
+have no source session and retain their existing path. A bounded native wait
+lets closure finish an already entered channel send through its delivery receipt
+before settling the remaining outbox; queued guards and host actions do not hold
+that wait. Native chat rejoin tests
+cover both a disconnected queued reply and a batch paused inside a guard; the
+recorded-divergence proof pins the source recheck and direct-host behavior.
+
 ## Let a module decide engagement after preparing content
 
 The opt-in `module` engagement mode calls a channel decider after sender
