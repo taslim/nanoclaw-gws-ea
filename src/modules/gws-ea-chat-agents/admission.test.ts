@@ -23,9 +23,9 @@ vi.mock('../../env.js', async (original) => ({
 import { getGroupCapabilities, registerCapability } from '../../capabilities.js';
 import { processLock } from '../../community-portal/process-lock.js';
 import { readEnvFile } from '../../env.js';
-import { assertSessionAdmitted, buildMounts } from '../../container-runner.js';
+import { assertSessionAdmitted, buildMounts, syncSkillSymlinks } from '../../container-runner.js';
 import { configFromDb } from '../../container-config.js';
-import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import {
   closeDb,
   createAgentGroup,
@@ -40,6 +40,7 @@ import {
   runMigrations,
 } from '../../db/index.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
+import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
@@ -51,6 +52,7 @@ import { createJobAgent, activateJobAgent, getJobAgentForChat, listJobAgents } f
 import { EXTERNAL_CHAT_CAPABILITIES } from './shape.js';
 import { getJobAgent } from './jobs.js';
 import { retireJobAgent } from './retire.js';
+import '../gws-ea-main/index.js';
 
 const agents = new Map<
   string,
@@ -126,6 +128,92 @@ function admit(group: string) {
     key: { installSlug: 'test', agentGroupId: group, sessionId: 'session' },
   });
 }
+
+async function documentFor(groupId: string): Promise<string> {
+  const group = await getAgentGroup(groupId);
+  if (!group) throw new Error('No chat group');
+  const directory = path.join(ROOT, 'groups', group.folder);
+  await composeGroupProjectDoc(group, directory, { fileName: 'CLAUDE.md' });
+  return fs.readFileSync(path.join(directory, 'CLAUDE.md'), 'utf8');
+}
+
+it.each(['external-chat', 'job'] as const)(
+  'composes %s guidance and the exact shell-free WhatsApp skill baseline without main context',
+  async (kind) => {
+    await createAgentGroup({
+      id: 'main',
+      name: 'main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await ensureContainerConfig('main');
+    await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'main' WHERE singleton = 1");
+    const mainDoc = await documentFor('main');
+    expect(mainDoc).toContain('# Executive Assistant');
+    expect(mainDoc).toContain('assistant@example.test');
+    const group =
+      kind === 'external-chat' ? await ensureExternalChatGroup() : (await createJobAgent('trip')).agent_group_id;
+    const config = await getContainerConfig(group);
+    expect(config).toMatchObject({ cli_scope: 'disabled', skills: JSON.stringify(['whatsapp-formatting']) });
+    expect(await getGroupCapabilities(group)).not.toContain('shell');
+    const agent = await getAgentGroup(group);
+    if (!config || !agent) throw new Error('No configured chat group');
+    const skillHome = path.join(ROOT, 'skill-links', group);
+    expect(syncSkillSymlinks(skillHome, configFromDb(config, agent))).toEqual(['whatsapp-formatting']);
+    expect(fs.readlinkSync(path.join(skillHome, 'skills/whatsapp-formatting'))).toBe('/app/skills/whatsapp-formatting');
+
+    const doc = await documentFor(group);
+
+    const file = path.resolve('src/modules/gws-ea-chat-agents', `${kind === 'job' ? 'job' : kind}.guidance.md`);
+    expect(doc).toContain(fs.readFileSync(file, 'utf8').trim());
+    expect(doc).toContain('# NanoClaw Skill: whatsapp-formatting');
+    expect(doc).toContain('LID digits are not phone digits');
+    expect(doc).toContain('`content.sender` is a display name');
+    expect(doc).toContain('real phone number already known');
+    expect(doc).toContain('Code spans and fenced code blocks pass through unchanged');
+    expect(doc).toContain('`expect_reply`');
+    expect(doc).not.toContain('# Executive Assistant');
+    expect(doc).not.toContain('assistant@example.test');
+    expect(doc).not.toContain('ncl people');
+    expect(doc).not.toContain('# NanoClaw Module: connect');
+    expect(doc).not.toContain('# Browser delegation');
+
+    for (const changed of [
+      [],
+      ['whatsapp-formatting', 'agent-browser'],
+      ['whatsapp-formatting', 'whatsapp-formatting'],
+    ]) {
+      await updateContainerConfigJson(group, 'skills', changed);
+      await expect(admit(group)).rejects.toThrow('unapproved shared skills');
+    }
+    await reconcileChatAgents();
+    expect((await getContainerConfig(group))?.skills).toBe(JSON.stringify(['whatsapp-formatting']));
+  },
+);
+
+it('composes browser guidance only for an explicitly granted active job and removes it on revocation', async () => {
+  const external = await ensureExternalChatGroup();
+  const job = await createJobAgent('trip');
+  expect(await documentFor(external)).not.toContain('# Browser delegation');
+  expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
+  policy([job.agent_group_id]);
+  expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
+  await activateJobAgent(job.agent_group_id);
+  await reconcileChatAgents();
+
+  const granted = await documentFor(job.agent_group_id);
+
+  expect(granted).toContain('# Browser delegation');
+  expect(granted).toContain('shared signed-in profile and vault');
+  expect(granted).toContain('`record_disclosure`');
+  expect(granted).toContain('principal approvals');
+  expect(granted).not.toContain('# Executive Assistant');
+  expect(granted).not.toContain('assistant@example.test');
+  expect(await documentFor(external)).not.toContain('# Browser delegation');
+  policy([]);
+  expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
+});
 
 it('creates one sealed shared agent and a job agent with separate exact stored shapes and model-only gateway identities', async () => {
   const external = await ensureExternalChatGroup();

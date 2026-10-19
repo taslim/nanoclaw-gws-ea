@@ -10,7 +10,13 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import { chatGatewayDrift } from './gateway.js';
-import { EXTERNAL_CHAT_CAPABILITIES, EXTERNAL_CHAT_PLUGIN, JOB_CHAT_CAPABILITIES, JOB_CHAT_PLUGIN } from './shape.js';
+import {
+  CHAT_SHARED_SKILLS,
+  EXTERNAL_CHAT_CAPABILITIES,
+  EXTERNAL_CHAT_PLUGIN,
+  JOB_CHAT_CAPABILITIES,
+  JOB_CHAT_PLUGIN,
+} from './shape.js';
 
 function sameKeys(held: readonly string[], wanted: readonly string[]): boolean {
   return (
@@ -60,7 +66,7 @@ export async function chatAgentDrift(
     problems.push('it carries extra packages');
   if (carries(config.additional_mounts, 'array')) problems.push('it carries extra mounts');
   const skills = parseSkillSelection(config.skills, group.name);
-  if (skills === 'all' || skills.length !== 0) problems.push('it carries unapproved shared skills');
+  if (skills === 'all' || !sameKeys(skills, CHAT_SHARED_SKILLS)) problems.push('it carries unapproved shared skills');
   const plugin = kind === 'external-chat' ? EXTERNAL_CHAT_PLUGIN : JOB_CHAT_PLUGIN;
   if (directories(path.join(GROUPS_DIR, group.folder, 'plugins')).some((name) => name !== plugin))
     problems.push('it carries another stamped plugin');

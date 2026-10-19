@@ -3,14 +3,19 @@ import { updateContainerConfigJson, updateContainerConfigScalars } from '../../d
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import { getExternalChatAgentGroupId, recordExternalChatAgentGroupId } from '../gws-ea-profile/db.js';
 import { reconcileChatGateway } from './gateway.js';
-import { EXTERNAL_CHAT_CAPABILITIES, EXTERNAL_CHAT_TEMPLATE, JOB_CHAT_CAPABILITIES } from './shape.js';
+import {
+  CHAT_SHARED_SKILLS,
+  EXTERNAL_CHAT_CAPABILITIES,
+  EXTERNAL_CHAT_TEMPLATE,
+  JOB_CHAT_CAPABILITIES,
+} from './shape.js';
 
 export async function reconcileChatShape(group: string, kind: 'external-chat' | 'job'): Promise<void> {
   await updateContainerConfigScalars(group, { cli_scope: 'disabled' });
   await updateContainerConfigJson(group, 'capabilities', [
     ...(kind === 'external-chat' ? EXTERNAL_CHAT_CAPABILITIES : JOB_CHAT_CAPABILITIES),
   ]);
-  await updateContainerConfigJson(group, 'skills', []);
+  await updateContainerConfigJson(group, 'skills', [...CHAT_SHARED_SKILLS]);
 }
 
 /** The pointer and group are published atomically; gateway readiness is checked before any session starts. */

@@ -3,6 +3,20 @@
 These general channel seams support GWS-EA's WhatsApp and group-chat behavior.
 This is a proposal draft; no upstream pull request has been published.
 
+## Classify WhatsApp formatting under reply
+
+The existing `reply` capability names `whatsapp-formatting` alongside `welcome`.
+A group can select this text-formatting skill without a shell. Skills that no
+capability names still require shell, and an unselected skill stays out of the
+composed document. This adds no tools, commands, network access or credentials;
+formatting prose applies only to WhatsApp conversations.
+
+Evidence: the native capability filter and project-document composition tests
+exercise reply-only selection, absence of shell instructions and omission when
+unselected. The recorded-divergence suite pins the classification. The GWS-EA
+chat-agent tests compose the exact skill baseline for both chat audiences while
+keeping browser delegation conditional on the existing explicit grant.
+
 ## Queue sends while a linked adapter is disconnected
 
 An adapter can throw `ChannelNotConnectedError` before attempting a send. The
@@ -39,6 +53,12 @@ Evidence: module-engagement, native wiring-command, DB and existing routing
 tests, plus the recorded-divergence tests.
 
 ## Stop and replace one linked channel
+
+The factory type also permits an asynchronous `null` result. Both native startup
+paths already await factories and skip that result. This lets a channel reconcile
+private account state before deciding whether credentials remain, including when
+an interrupted pairing expires. The instance-channel divergence proof checks
+that startup and hot-start skip it while another channel stays connected.
 
 `stopChannelAdapter(key)` removes only the exact active instance from delivery
 before awaiting its teardown. It returns `not-active` when the key is absent;

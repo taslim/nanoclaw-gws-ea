@@ -1453,6 +1453,16 @@ describe('recorded divergence: a module can refuse a destination on every write 
 });
 
 describe('recorded divergence: instructions follow the capabilities that use them', () => {
+  it('lets a reply-only group select WhatsApp formatting without granting shell or other skills', async () => {
+    await freshInstall();
+    const { skillsWithinCapabilities } = await import('../capabilities.js');
+
+    expect(
+      skillsWithinCapabilities(['whatsapp-formatting', 'agent-browser', 'unclassified-command'], new Set(['reply'])),
+    ).toEqual(['whatsapp-formatting']);
+    expect(skillsWithinCapabilities(['whatsapp-formatting'], new Set())).toEqual([]);
+  });
+
   it("keeps memory, conversation history, account connection, and ncl out of the base instructions, and the file tools out of reply's", async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const base = await read('container/CLAUDE.md');
@@ -1773,6 +1783,7 @@ describe('recorded divergence: WhatsApp is an instance-owned module channel', ()
     });
     registry.registerChannelAdapter('whatsapp', { factory: () => adapter('whatsapp', `wa-${++generation}`) });
     registry.registerChannelAdapter('gchat', { factory: () => adapter('gchat', 'gchat') });
+    registry.registerChannelAdapter('unlinked', { factory: async () => null });
     await registry.initChannelAdapters(() => ({
       onInbound() {},
       onInboundEvent() {},
@@ -1788,6 +1799,9 @@ describe('recorded divergence: WhatsApp is an instance-owned module channel', ()
     await expect(registry.startChannelAdapter('whatsapp')).resolves.toBe('started');
     expect(setups).toEqual(['wa-1', 'gchat', 'wa-2']);
     expect(registry.getChannelAdapterExact('whatsapp')?.isConnected()).toBe(true);
+    await expect(registry.startChannelAdapter('unlinked')).resolves.toBe('no-credentials');
+    expect(registry.getChannelAdapterExact('unlinked')).toBeUndefined();
+    expect(registry.getChannelAdapterExact('gchat')?.isConnected()).toBe(true);
   });
 
   it('registers once from the module barrel and stays inert without a link record', async () => {

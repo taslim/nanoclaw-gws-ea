@@ -269,6 +269,26 @@ describe('composeGroupProjectDoc persona', () => {
 });
 
 describe('composeGroupProjectDoc skill selection', () => {
+  it('inlines selected WhatsApp formatting with reply alone and omits it when unselected', async () => {
+    fs.symlinkSync(
+      path.join(REPO_ROOT, 'container', 'skills', 'whatsapp-formatting'),
+      path.join(process.cwd(), 'container', 'skills', 'whatsapp-formatting'),
+    );
+    const ag = await seed('ag-whatsapp-format', 'whatsapp-format');
+    await updateContainerConfigScalars(ag.id, { cli_scope: 'disabled' });
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply']);
+    await updateContainerConfigJson(ag.id, 'skills', ['whatsapp-formatting']);
+
+    const doc = await compose(ag);
+
+    expect(doc).toContain('# NanoClaw Skill: whatsapp-formatting');
+    expect(doc).toContain('LID digits are not phone digits');
+    expect(doc).not.toContain('# NanoClaw Module: connect');
+    expect(doc).not.toContain('# NanoClaw Module: cli');
+    await updateContainerConfigJson(ag.id, 'skills', []);
+    expect(await compose(ag)).not.toContain('# NanoClaw Skill: whatsapp-formatting');
+  });
+
   // Red if the walk stops filtering: the document would teach a skill whose
   // SKILL.md syncSkillSymlinks did not plant, which is a live contradiction.
   it('omits resident prose for a skill the group did not select', async () => {

@@ -6,6 +6,7 @@ export const EXTERNAL_CHAT_TEMPLATE = 'gws-ea/external-chat';
 export const JOB_CHAT_TEMPLATE = 'gws-ea/chat-job';
 export const EXTERNAL_CHAT_PLUGIN = 'gws-ea-external-chat';
 export const JOB_CHAT_PLUGIN = 'gws-ea-chat-job';
+export const CHAT_SHARED_SKILLS: readonly string[] = ['whatsapp-formatting'];
 
 registerCapability(CHAT_TOOLS_CAPABILITY, {
   description: 'Chat-addressed reporting, expected replies, reminders and host-mediated scheduling',

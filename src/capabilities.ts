@@ -76,7 +76,7 @@ registerCapability('reply', {
   description: 'send_message: reply in the conversation and message its destinations',
   default: 'on',
   instructions: ['core'],
-  skills: ['welcome'],
+  skills: ['welcome', 'whatsapp-formatting'],
 });
 registerCapability('files-send', {
   description: 'send_file, edit_message, add_reaction',
