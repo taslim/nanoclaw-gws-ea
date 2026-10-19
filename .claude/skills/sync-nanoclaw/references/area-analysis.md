@@ -1,6 +1,6 @@
 # Area analysis brief
 
-Each area of a sync gets one read-only analysis agent, launched together. Fill the placeholders and send the shared context plus that area's section as the agent's prompt. The agents decide nothing; they bring the maintainer options.
+Each area of a sync gets one read-only analysis agent, launched together. Fill each `<placeholder>` from SKILL.md steps 1 and 3 (`<scratch>` is `$SCRATCH`), and send the shared context plus the area section you wrote as the agent's prompt. The agents decide nothing; they bring the maintainer options.
 
 ## Shared context (every agent)
 
@@ -12,8 +12,9 @@ nanocoai/nanoclaw, <version>) is <N> commits ahead. Merge base: <sha> (the
 upstream commit our last sync merged). We are about to merge upstream into
 rebuild-v2.
 
-Wherever our fork's change and upstream's new work meet, do NOT adapt our
-change onto upstream. Restate our original intention from scratch, then decide
+Wherever our fork's change and upstream's new work meet, don't adapt our change
+onto upstream: re-fitting an old hunk onto new code keeps divergence we may no
+longer need. Restate our original intention from scratch, then decide
 whether a new upstream capability achieves it better (so our divergence shrinks
 or disappears), whether our approach is still best, or whether a new design
 beats both. Principles: production-ready only; no adapters or migration layers;
@@ -22,7 +23,8 @@ rest; no mechanism for hypothetical cases; a generic mechanism upstream supplies
 is inherited unchanged, and GWS-EA owns one only until NanoClaw ships an
 equivalent.
 
-Where our intent is recorded:
+Where our intent is recorded (docs/rebuild/ is gitignored and exists only in the
+operator checkout, so read these there):
 - docs/rebuild/upstream-divergence-2026-09-24.md: a row per upstream-owned file
   our fork changes (local, gitignored; later dated sections supersede earlier rows).
 - src/gws-ea/divergence.test.ts: the guard for each recorded divergence.
@@ -32,7 +34,8 @@ Where our intent is recorded:
 - Our commits: `git log <merge-base>..origin/rebuild-v2 -- <path>`, `git show <sha>`.
 Upstream's intent: `git show <sha>` and CHANGELOG.md on upstream/<ref>.
 
-Rules: READ-ONLY. Do not edit, stage, checkout, switch, merge, stash, or reset
+Rules: read-only, because the merge happens later in one place and an edit here
+would corrupt it. Do not edit, stage, checkout, switch, merge, stash, or reset
 anything in the repo. Do not run pnpm install/dev/build, container builds,
 gws-ea, launchctl, docker or onecli commands that change state. Use
 `git show <ref>:<path>`, `git diff <merge-base> <ref> -- <path>`,
@@ -54,7 +57,7 @@ a security fix. Return a compact summary (about 700 words) with a decision table
 
 ## Typical areas
 
-Shape the areas around what this window actually touches; five was the right number for a 76-commit window. Each section names the files changed on both sides, the upstream commits (short SHA and subject), and our commits, then asks the area's key questions.
+Shape the areas around what this window actually touches. About five suits a window of roughly 75 upstream commits; merge or split areas as the window demands. You write each area's section: it names the files changed on both sides, the upstream commits (short SHA and subject), and our commits, then asks that area's key questions, starting from this table.
 
 | Area | Usually covers | Key questions to ask |
 |---|---|---|
