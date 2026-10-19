@@ -102,7 +102,7 @@ Resolve per the decisions, then `git add` each resolved path:
 
 | Situation | Resolution |
 |---|---|
-| Upstream now owns the intent | `git checkout upstream/main -- <path>`, which restores upstream's file whether the path conflicted or merged cleanly; move what GWS-EA still needs into a GWS-EA-owned file under `src/gws-ea/` with a test. |
+| Upstream now owns the intent | The path ends exactly as upstream has it: upstream's file (`git checkout upstream/main -- <path>`), or gone where upstream deleted it (`git rm <path>`). Done when `git diff upstream/main -- <path>` prints nothing. Move what GWS-EA still needs into a GWS-EA-owned file under `src/gws-ea/` with a test. |
 | GWS-EA keeps its change | Start from upstream's file (`git show upstream/main:<path> > <path>`) and re-apply GWS-EA's seam on top. |
 | Upstream restructured code around a GWS-EA decision | Take upstream's structure; keep only GWS-EA's decision (for example, a failed turn is still `turn_failed` to the host, never a chat message). |
 | Upstream-only files | Take them unchanged. |
