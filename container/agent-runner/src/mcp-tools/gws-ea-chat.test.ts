@@ -70,6 +70,7 @@ it.each<[McpToolDefinition, Record<string, unknown>, string]>([
       chat: 'chat-trip',
       message: 'Find a venue.',
       matter: 'nowhere',
+      job: true,
       people: [{ member: 'whatsapp:22', email: 'mira@example.com' }],
       principal_message: 'principal-share',
     },

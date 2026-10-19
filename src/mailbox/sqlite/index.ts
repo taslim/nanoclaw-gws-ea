@@ -35,6 +35,7 @@ import {
   createDirectOutboundRecord,
   outboundDelivery,
   parseContainerRecord,
+  parseInboundRecord,
   parseDestinationRecord,
   parseOutboundRecord,
   parseProcessingAckRecord,
@@ -207,8 +208,22 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     insertMessage: async (message) => insertMessage(db, message, nextSequence()),
     countDueMessages: () => countDueMessages(db),
     countUnreadContext: (exceptChannelType) => countUnreadContext(db, exceptChannelType),
-    releaseHeldMessages: (processAfter, options) => releaseHeldMessages(db, processAfter, options),
+    releaseHeldMessages: (processAfter, options) =>
+      options?.preserveProcessAfter
+        ? db
+            .prepare(
+              "UPDATE messages_in SET status = 'pending', trigger = CASE WHEN ? THEN trigger ELSE 1 END WHERE status = 'held'",
+            )
+            .run(options.preserveTriggers ? 1 : 0).changes
+        : releaseHeldMessages(db, processAfter, options),
     settleHeldMessages: () => settleHeldMessages(db),
+    settleUnreadMessages: (ids) =>
+      db.transaction(() => {
+        const settle = db.prepare(
+          "UPDATE messages_in SET status='completed' WHERE status IN ('held','pending') AND id=?",
+        );
+        return ids.reduce((count, id) => count + settle.run(id).changes, 0);
+      })(),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
     getMessageForRetry: (messageId, status) => {
@@ -242,7 +257,46 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
             )
             .all(...messageIds) as InboundOrigin[]),
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
-    getDeliveredIds: () => getDeliveredIds(db),
+    getInboundRecords: (options = {}) => {
+      const rows = db
+        .prepare(
+          `SELECT * FROM messages_in WHERE (? IS NULL OR julianday(timestamp) >= julianday(?)) AND (? IS NULL OR status=?) ORDER BY seq`,
+        )
+        .all(options.since ?? null, options.since ?? null, options.status ?? null, options.status ?? null) as Record<
+        string,
+        unknown
+      >[];
+      return rows.map((row) =>
+        parseInboundRecord({
+          id: row.id,
+          sequence: row.seq,
+          kind: row.kind,
+          timestamp: sqliteTimestamp(String(row.timestamp)),
+          status: row.status,
+          processAfter: row.process_after === null ? null : sqliteTimestamp(String(row.process_after)),
+          recurrence: row.recurrence,
+          seriesId: row.series_id,
+          tries: row.tries,
+          trigger: row.trigger === 1,
+          platformId: row.platform_id,
+          channelType: row.channel_type,
+          threadId: row.thread_id,
+          content: row.content,
+          sourceSessionId: row.source_session_id,
+          onWake: row.on_wake === 1,
+        }),
+      );
+    },
+    getDeliveredIds: (status) =>
+      status === undefined
+        ? getDeliveredIds(db)
+        : new Set(
+            (
+              db.prepare("SELECT message_out_id FROM delivered WHERE status='delivered'").all() as {
+                message_out_id: string;
+              }[]
+            ).map((row) => row.message_out_id),
+          ),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId) => markDeliveryFailed(db, messageOutId),
     getInboundSourceSessionId: (messageId) => getInboundSourceSessionId(db, messageId),
@@ -340,6 +394,26 @@ export function wrapSqliteOutbound(
 ): OutboundMailbox {
   const readable = () => (typeof source === 'function' ? source() : source);
   return {
+    getOutboundRecords: (since) =>
+      (
+        readable()
+          .prepare('SELECT * FROM messages_out WHERE julianday(timestamp) >= julianday(?) ORDER BY seq')
+          .all(since) as Record<string, unknown>[]
+      ).map((row) =>
+        parseOutboundRecord({
+          id: row.id,
+          sequence: row.seq,
+          inReplyTo: row.in_reply_to,
+          timestamp: sqliteTimestamp(String(row.timestamp)),
+          deliverAfter: row.deliver_after === null ? null : sqliteTimestamp(String(row.deliver_after)),
+          recurrence: row.recurrence,
+          kind: row.kind,
+          platformId: row.platform_id,
+          channelType: row.channel_type,
+          threadId: row.thread_id,
+          content: row.content,
+        }),
+      ),
     getOutboundMessage: (id) => {
       const row = readable().prepare('SELECT * FROM messages_out WHERE id = ?').get(id);
       return row === undefined ? undefined : outboundMessage(row);

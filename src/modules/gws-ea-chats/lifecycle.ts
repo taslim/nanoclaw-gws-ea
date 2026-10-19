@@ -29,7 +29,11 @@ export async function sweepChatLifecycle(): Promise<void> {
         const current = await getChat(chat.messaging_group_id);
         if (!current) return;
         if (current.state === 'asking') await notifyAskingChat(current);
-        if (current.state === 'connected' || current.state === 'job')
+        const move = await getDb().get<{ move_source_session_id: string | null }>(
+          'SELECT move_source_session_id FROM gws_ea_chats WHERE messaging_group_id=?',
+          current.messaging_group_id,
+        );
+        if ((current.state === 'connected' || current.state === 'job') && !move?.move_source_session_id)
           await releaseChatMessages(current.messaging_group_id);
         if (current.state === 'declined' || current.state === 'detached')
           await settleChatMessages(current.messaging_group_id);

@@ -84,7 +84,8 @@ export async function decideJoin(facts: ChatJoinFacts): Promise<Chat | undefined
     await getDb().transaction(async () => {
       await getDb().run(
         `UPDATE gws_ea_chats SET state = ?, serving_agent_group_id = ?,
-        asking_notified_at = NULL, connected_at = ?, created_at = ?, updated_at = ? WHERE messaging_group_id = ?`,
+        asking_notified_at = NULL, connected_at = ?, created_at = ?, updated_at = ?,
+        move_source_session_id = NULL, move_request_id = NULL, move_pending_reminder_ids_json = '[]', move_failed = 0 WHERE messaging_group_id = ?`,
         state,
         external,
         state === 'connected' ? rejoinedAt : null,

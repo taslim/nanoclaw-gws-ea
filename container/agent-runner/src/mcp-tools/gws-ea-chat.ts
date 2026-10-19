@@ -50,6 +50,11 @@ export const chatHandoff = requestTool({
       description: 'Your words for the assistant working in this chat. Up to 8,000 characters.',
     },
     matter: { type: 'string', description: 'An open matter key, or nowhere. Required until this chat is placed.' },
+    job: {
+      type: 'boolean',
+      description:
+        'true when this chat needs its own standing memory and work over weeks. The host moves its conversation invisibly and keeps this handoff until ready.',
+    },
     files: FILES,
     calendar: {
       type: 'string',

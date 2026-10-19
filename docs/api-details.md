@@ -166,6 +166,16 @@ each row's original engagement. Callers wake only when `countDueMessages()` find
 a trigger. Without the option, release retains its existing behavior of making
 every held row a pending trigger.
 
+Host cutovers may also set `preserveProcessAfter: true` to retain each held
+row's deadline. `getInboundRecords({ since?, status? })` returns the canonical
+inbound identities, timestamps, engagement and source flags in arrival order;
+`getOutboundRecords(since)` supplies stable outbound identities and deadlines.
+`getDeliveredIds('delivered')` selects successful deliveries for conversation
+history, while the existing no-argument read includes failed settlements for
+send deduplication. After a destination insert is durable,
+`settleUnreadMessages(ids)` completes only those pending/held source rows.
+These are native mailbox operations; no module reads session SQLite directly.
+
 ### Chat SDK Bridge
 
 Wraps a Chat SDK adapter + Chat instance to conform to the NanoClaw ChannelAdapter interface. Trunk ships the bridge and the channel registry only — platform-specific Chat SDK adapters (Discord, Slack, Telegram, etc.) and native adapters (WhatsApp/Baileys) are installed by the `/add-<channel>` skills from the `channels` branch.

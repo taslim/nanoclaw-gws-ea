@@ -8,6 +8,7 @@ import { deleteChatClearances } from '../gws-ea-privacy/clearance.js';
 import { requirePrincipalDirectMessage, requirePrincipalMessage } from '../gws-ea-profile/marks.js';
 import { chatIsActive, getChat, type Chat } from './db.js';
 import { ensureChatWiring } from './wiring-policy.js';
+import { resumeRetiringJobAgents } from '../gws-ea-chat-agents/index.js';
 
 async function sessions(chat: string): Promise<Session[]> {
   return getDb().all<Session>('SELECT * FROM sessions WHERE messaging_group_id = ?', chat);
@@ -57,7 +58,7 @@ export async function releaseChatMessages(chatId: string, options: { readonly wa
   for (const session of await sessions(chatId)) {
     if (session.agent_group_id !== chat.serving_agent_group_id || session.status !== 'active') continue;
     const releasedDue = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      const released = mailbox.releaseHeldMessages(null, { preserveTriggers: true });
+      const released = mailbox.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
       return released > 0 && mailbox.countDueMessages() > 0;
     });
     if (releasedDue && options.wake !== false) await requestWake(session, 'due-message');
@@ -84,6 +85,12 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
     if (!(await getChat(chatId))) return;
     const now = new Date().toISOString();
     await db.run('UPDATE gws_ea_chats SET state = ?, updated_at = ? WHERE messaging_group_id = ?', state, now, chatId);
+    if (await db.hasTable('gws_ea_job_agents'))
+      await db.run(
+        "UPDATE gws_ea_job_agents SET state='retiring',updated_at=? WHERE messaging_group_id=? AND state IN ('creating','active')",
+        now,
+        chatId,
+      );
     await db.run('DELETE FROM messaging_group_agents WHERE messaging_group_id = ?', chatId);
     if (await db.hasTable('agent_destinations'))
       await db.run("DELETE FROM agent_destinations WHERE target_type = 'channel' AND target_id = ?", chatId);
@@ -102,11 +109,23 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
     }
   });
   await settleChatMessages(chatId);
+  await resumeRetiringJobAgents();
 }
 /** After the central transition commits; safe to repeat after an interrupted detach. */
 export async function settleChatMessages(chatId: string): Promise<void> {
+  const chat = await getChat(chatId);
+  const terminal = chat?.state === 'declined' || chat?.state === 'detached';
   for (const session of await sessions(chatId))
-    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.settleHeldMessages());
+    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      if (terminal) {
+        mailbox.settleUnreadMessages(
+          [...mailbox.getInboundRecords({ status: 'pending' }), ...mailbox.getInboundRecords({ status: 'held' })]
+            .filter((row) => row.kind !== 'task')
+            .map((row) => row.id),
+        );
+        mailbox.cancelTask();
+      } else mailbox.settleHeldMessages();
+    });
 }
 /** Host-only primitive: the calling action authorizes main; declining grants no authority or private context. */
 export async function declineChat(chatId: string): Promise<void> {

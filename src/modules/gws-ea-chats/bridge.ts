@@ -50,6 +50,7 @@ import {
 import { admitChat, declineChat, detachChat, releaseChatMessages, connectPrivateChatHandoff } from './hold.js';
 import { refreshChatMembership } from './join.js';
 import { setChatMemberEmail, type ChatMember } from './roster.js';
+import { admitChatMove, pauseMoveReminders, prepareChatMove } from './move.js';
 
 export const CHAT_TELL_MAIN_ACTION = 'chat_tell_main';
 const MAX_MESSAGE = 8_000;
@@ -209,9 +210,14 @@ function handoffId(session: Session, requestId: string): string {
   return `chat-handoff-${createHash('sha256').update(`${session.id}\0${requestId}`).digest('hex')}`;
 }
 /** Caller owns the chat conversation tail. U12 calls this after its actual serving-pointer swap. */
-export async function flushChatHandoffs(chatId: string): Promise<void> {
+export async function flushChatHandoffs(chatId: string, options: { readonly wake?: boolean } = {}): Promise<void> {
   const chat = await getChat(chatId);
   if (!chat || !chatIsActive(chat)) return;
+  const move = await getDb().get<{ move_source_session_id: string | null }>(
+    'SELECT move_source_session_id FROM gws_ea_chats WHERE messaging_group_id=?',
+    chatId,
+  );
+  if (move?.move_source_session_id && options.wake !== false) return;
   await requireServingAgent(chat);
   const group = await getMessagingGroup(chatId);
   if (!group) throw new Error('The chat disappeared.');
@@ -248,15 +254,14 @@ export async function flushChatHandoffs(chatId: string): Promise<void> {
       if (!isDuplicateNote(error)) throw error;
     }
     await getDb().run('UPDATE gws_ea_chat_handoffs SET delivered_session_id=? WHERE id=?', session.id, handoff.id);
-    if (written) await requestWake(session, 'inbound-message');
+    if (written && options.wake !== false) await requestWake(session, 'inbound-message');
   }
 }
 const handoff: ActionAnswer = async (content, session, requestId) => {
   assertFields(content, ['chat', 'message', 'matter', 'files', 'calendar', 'people', 'principal_message', 'job']);
   const chatId = targetId(content);
   const message = textOf(content.message, 'message', MAX_MESSAGE);
-  if (content.job !== undefined && content.job !== false)
-    throw invalidArgs('Job promotion is not available; nothing was handed over.');
+  if (content.job !== undefined && typeof content.job !== 'boolean') throw invalidArgs('job must be true or false.');
   const people = peopleOf(content.people);
   const members = await refreshChatMembership(chatId);
   return inChatConversation(chatId, async () => {
@@ -302,6 +307,8 @@ const handoff: ActionAnswer = async (content, session, requestId) => {
         throw invalidArgs('calendar must be one of the principal’s calendars the assistant can write to.');
       calendar = entry.id;
     }
+    const move =
+      content.job === true && chat.state !== 'moving' && chat.state !== 'job' ? await prepareChatMove(chat) : undefined;
     await getDb().transaction(async () => {
       if (privateAdmission) await connectPrivateChatHandoff(chatId);
       if (principalMessage !== undefined && values.length > 0)
@@ -324,7 +331,13 @@ const handoff: ActionAnswer = async (content, session, requestId) => {
         },
         files,
       );
+      if (content.job === true) {
+        const admitted = await getChat(chatId);
+        if (!admitted) throw new Error('The chat disappeared.');
+        await admitChatMove(admitted, move, id);
+      }
     });
+    if (content.job === true) await pauseMoveReminders(chatId);
     await flushChatHandoffs(chatId);
     return { chat: chatId, message: 'Your words are kept for this chat.' };
   });

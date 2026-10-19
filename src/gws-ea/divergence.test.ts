@@ -68,6 +68,64 @@ async function freshInstall(): Promise<string> {
   return directory;
 }
 
+describe('recorded divergence: resumable native mailbox cutovers', () => {
+  it('keeps source identity, deadlines and settlement in the native mailbox while existing delivery reads retain their meaning', async () => {
+    await freshInstall();
+    const { wrapSqliteInbound, wrapSqliteOutbound } = await import('../mailbox/sqlite/index.js');
+    const { INBOUND_SCHEMA, OUTBOUND_SCHEMA } = await import('../mailbox/sqlite/schema.js');
+    const raw = new Database(':memory:');
+    try {
+      raw.exec(INBOUND_SCHEMA);
+      raw.exec(OUTBOUND_SCHEMA);
+      const inbound = wrapSqliteInbound(raw);
+      const outbound = wrapSqliteOutbound(raw);
+      await inbound.insertMessage({
+        id: 'source',
+        kind: 'chat',
+        timestamp: '2026-10-15T12:00:00.000Z',
+        channelType: 'whatsapp',
+        platformId: 'trip',
+        threadId: null,
+        content: '{"text":"Reply later"}',
+        processAfter: '2999-01-01T00:00:00.000Z',
+        recurrence: null,
+        trigger: false,
+        status: 'held',
+        sourceSessionId: 'source-session',
+        onWake: true,
+      });
+      expect(inbound.getInboundRecords({ since: '2026-10-01T00:00:00.000Z', status: 'held' })).toMatchObject([
+        { id: 'source', trigger: false, sourceSessionId: 'source-session', onWake: true },
+      ]);
+      inbound.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
+      expect(inbound.getInboundRecords({ status: 'pending' })).toMatchObject([
+        { id: 'source', processAfter: '2999-01-01T00:00:00.000Z', trigger: false },
+      ]);
+      expect(inbound.settleUnreadMessages(['source'])).toBe(1);
+      expect(inbound.settleUnreadMessages(['source'])).toBe(0);
+      for (const id of ['posted', 'failed'])
+        await outbound.writeDirect({
+          id,
+          kind: 'chat',
+          platformId: 'trip',
+          channelType: 'whatsapp',
+          threadId: null,
+          content: '{"text":"An answer"}',
+        });
+      inbound.markDelivered('posted', 'posted-on-platform');
+      inbound.markDeliveryFailed('failed');
+      expect(outbound.getOutboundRecords('2020-01-01T00:00:00.000Z').map((row) => row.id)).toEqual([
+        'posted',
+        'failed',
+      ]);
+      expect(inbound.getDeliveredIds('delivered')).toEqual(new Set(['posted']));
+      expect(inbound.getDeliveredIds()).toEqual(new Set(['posted', 'failed']));
+    } finally {
+      raw.close();
+    }
+  });
+});
+
 describe('recorded divergence: the installed OneCLI adapter', () => {
   it('is exactly what add-onecli installs: every file it copies equals its payload source', async () => {
     const skill = path.join(originalCwd, '.claude/skills/add-onecli');

@@ -25,6 +25,7 @@ import { chatAgentsMigration } from './migration.js';
 import { retireJobAgent } from './retire.js';
 import { JOB_DOCUMENT_ACTIONS } from './docs.js';
 import { jobDocumentsMigration } from './docs-migration.js';
+import { getChat } from '../gws-ea-chats/db.js';
 
 export { ensureExternalChatGroup } from './external-chat.js';
 export {
@@ -55,18 +56,28 @@ async function kind(group: string): Promise<'external-chat' | 'job' | undefined>
 export async function reconcileChatAgents(): Promise<void> {
   const external = await ensureExternalChatGroup();
   await reconcileChatShape(external, 'external-chat');
+  await resumeRetiringJobAgents();
   for (const job of await listJobAgents()) {
     if (job.state === 'retired' || job.state === 'retiring') continue;
     await reconcileChatShape(job.agent_group_id, 'job');
+    if (job.state === 'creating' && (await getChat(job.messaging_group_id))?.state === 'moving') continue;
     await reconcileChatGateway(job.agent_group_id);
   }
-  await resumeRetiringJobAgents();
 }
 
 /** Startup and the chat lifecycle loop resume cleanup once the control-plane operation releases its lock. */
 export async function resumeRetiringJobAgents(): Promise<void> {
   for (const job of await listJobAgents()) {
-    if (job.state !== 'retiring') continue;
+    if (job.state === 'retired') continue;
+    const chat = await getChat(job.messaging_group_id);
+    const unserved =
+      chat &&
+      (chat.state === 'detached' ||
+        chat.state === 'declined' ||
+        (job.state === 'active'
+          ? chat.serving_agent_group_id !== job.agent_group_id
+          : job.state === 'creating' && chat.state !== 'moving'));
+    if (job.state !== 'retiring' && !unserved) continue;
     try {
       await retireJobAgent(job.agent_group_id);
     } catch (error) {

@@ -31,6 +31,9 @@ import { chatToolsMigration } from './tools-migration.js';
 import { EXPECT_REPLY_ACTION, consumeExpectedChatReply, expireExpectedChatReplies } from './expect.js';
 import { REMIND_ACTION } from './remind.js';
 import { CHAT_OUTREACH_ACTIONS } from './outreach.js';
+import { chatMoveMigration } from './move-migration.js';
+import { resumeChatMoves } from './move.js';
+import { resumeRetiringJobAgents } from '../gws-ea-chat-agents/index.js';
 
 export * from './db.js';
 export * from './hold.js';
@@ -43,6 +46,9 @@ export { registerChatLifecycleTask, sweepChatLifecycle } from './lifecycle.js';
 registerMigration(chatsMigration);
 registerMigration(chatHandoffMigration);
 registerMigration(chatToolsMigration);
+registerMigration(chatMoveMigration);
+registerChatLifecycleTask('gws-ea-chats:moves', resumeChatMoves);
+registerChatLifecycleTask('gws-ea-chats:retirement', resumeRetiringJobAgents);
 registerDeliveryAction(...EXPECT_REPLY_ACTION);
 registerDeliveryAction(...REMIND_ACTION);
 registerExpectedChatReplyReader('gws-ea-chats:expected', consumeExpectedChatReply);
@@ -51,7 +57,24 @@ for (const [action, handler, guard] of CHAT_BRIDGE_ACTIONS) registerDeliveryActi
 for (const [action, handler, guard] of CHAT_OUTREACH_ACTIONS) registerDeliveryAction(action, handler, guard);
 registerSessionAdmissionPolicy('gws-ea-chats:context', async ({ key }) => {
   const session = await getSession(key.sessionId);
-  if (session) await writeChatContext(session);
+  if (session) {
+    const chat = session.messaging_group_id === null ? undefined : await getChat(session.messaging_group_id);
+    if (chat && chat.serving_agent_group_id !== session.agent_group_id)
+      throw new Error('This session no longer serves the chat.');
+    const move = chat
+      ? await getDb().get<{ move_source_session_id: string | null; move_failed: number }>(
+          'SELECT move_source_session_id,move_failed FROM gws_ea_chats WHERE messaging_group_id=?',
+          chat.messaging_group_id,
+        )
+      : undefined;
+    if (
+      chat?.serving_agent_group_id === session.agent_group_id &&
+      move?.move_source_session_id &&
+      (move.move_source_session_id !== session.id || move.move_failed === 1)
+    )
+      throw new Error('The chat move has not finished delivering its context.');
+    await writeChatContext(session);
+  }
 });
 registerChatLifecycleTask('gws-ea-chats:handoffs', async () => {
   for (const chat of await listChats())

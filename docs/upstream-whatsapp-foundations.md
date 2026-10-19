@@ -105,3 +105,22 @@ Evidence: the reminder test replays an action after its task was made but before
 its answer was written. The recorded-divergence test drives the native helper in
 a temporary install, observes one task on replay, and checks that omitted IDs
 still produce separate tasks.
+
+## Resume a conversation cutover through the native mailbox
+
+The host needs stable row identities and lifecycle facts to seed recent chat
+history and move unread input without losing a delayed reply. The optional
+`getInboundRecords({ since?, status? })` and `getOutboundRecords(since)` reads
+return canonical records in arrival order. `getDeliveredIds('delivered')`
+distinguishes an assistant's posted replies from failed settlements; omitted
+status retains existing send-deduplication behavior. A cutover inserts the
+destination first, then calls `settleUnreadMessages(ids)` to complete only its
+pending/held source rows. `releaseHeldMessages` additionally accepts
+`preserveProcessAfter: true`; omitted options retain existing behavior.
+
+Evidence: native mailbox tests cover full source flags, selective settlement,
+deadlines and successful-delivery filtering. The recorded-divergence test pins
+those opt-in operations. Chat move integration reopens central and session
+stores after each durable step, including the atomic wiring swap, and proves
+that delayed and held input, recent conversation and native reminder rows
+survive once with the original serving session closed.

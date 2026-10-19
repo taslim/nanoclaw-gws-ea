@@ -7,6 +7,11 @@ import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.
 import { inChatConversation, requireServingChat } from './bridge.js';
 import { assertChatToolFields, chatToolsAction } from './expect.js';
 
+/** Stable native task identity across an interrupted chat cutover. */
+export function movedReminderId(sourceSession: string, sourceId: string): string {
+  return `chat-move-reminder-${createHash('sha256').update(`${sourceSession}\0${sourceId}`).digest('hex')}`;
+}
+
 const remind: ActionAnswer = async (content, session, requestId) => {
   assertChatToolFields(content, ['at', 'note']);
   const chat = await requireServingChat(session);

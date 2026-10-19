@@ -267,7 +267,7 @@ it('refuses unplaced chats and private details until the principal’s own exact
     await getDb().all('SELECT private_value_id FROM gws_ea_chat_clearances WHERE messaging_group_id=?', id),
   ).toHaveLength(1);
 });
-it('resolves a job chat by the active registry, holds moving handoffs and refuses an unimplemented promotion', async () => {
+it('resolves a job chat by the active registry and holds moving handoffs including a repeated job request', async () => {
   const id = await chat();
   await getDb().run(
     "INSERT INTO gws_ea_job_agents(agent_group_id,messaging_group_id,state,created_at,updated_at) VALUES('job',?,'active',?,?)",
@@ -282,9 +282,9 @@ it('resolves a job chat by the active registry, holds moving handoffs and refuse
   await getDb().run("UPDATE gws_ea_job_agents SET state='creating' WHERE agent_group_id='job'");
   accepted(await request(main, 'chat_handoff', { chat: id, message: 'After the move.' }));
   expect(rows(await serving(id, 'job')).some((row) => row.content.text?.includes('After the move.'))).toBe(false);
-  expect(refused(await request(main, 'chat_handoff', { chat: id, message: 'Promote.', job: true }))).toMatch(
-    /promotion/,
-  );
+  accepted(await request(main, 'chat_handoff', { chat: id, message: 'Promote.', job: true }));
+  expect((await getChat(id))?.state).toBe('moving');
+  expect(rows(await serving(id, 'job')).some((row) => row.content.text?.includes('Promote.'))).toBe(false);
 });
 it('keeps accounts on the named or only open matter link and reports principal words outside the untrusted frame', async () => {
   const id = await chat();
