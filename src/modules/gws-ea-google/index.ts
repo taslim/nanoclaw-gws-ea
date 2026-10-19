@@ -37,7 +37,7 @@ const TICK_MS = 60_000;
 
 const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
   'google-calendar':
-    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, create_event and change_guests, and the host's find_conflicts and people_stats",
+    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, create_event, change_guests and respond_to_event, and the host's find_conflicts and people_stats",
   'google-mail-read': "the assistant's Gmail, read-only: the gmail skill and a gmail.readonly token",
   'google-directory': 'the Workspace directory, read-only: the gpeople skill and a directory.readonly token',
   'google-workspace':
@@ -52,7 +52,9 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
  * changing it, and only searches the directory. Overlaps go through the
  * host's `find_conflicts`, so `calendar.conflicts` is off. gog cannot list
  * the principal as an accepted guest, so events are created through the
- * host's `create_event` and `calendar.create` is off. Workspace's are gog's
+ * host's `create_event` and `calendar.create` is off. gog refuses to answer
+ * an event the principal organizes, so every answer goes through the host's
+ * `respond_to_event` and `calendar.respond` is off. Workspace's are gog's
  * whole surface for its five products, generated (`./workspace-commands.ts`).
  */
 const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
@@ -65,7 +67,6 @@ const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
     'calendar.freebusy',
     'calendar.update',
     'calendar.delete',
-    'calendar.respond',
   ],
   'google-mail-read': ['gmail.search', 'gmail.messages.search', 'gmail.thread.get', 'gmail.get'],
   'google-directory': ['people.search'],
