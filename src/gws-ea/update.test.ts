@@ -19,6 +19,8 @@ import { BrowserStore, browserRequestId } from '../modules/gws-ea-browser/db.js'
 import { browserQueueMigration, browserRecipesMigration } from '../modules/gws-ea-browser/migration.js';
 import { loadRecipe } from '../modules/gws-ea-browser/recipe-store.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
+import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
 
 import {
   ADDED_MIGRATION,
@@ -622,6 +624,19 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const host = await machine();
     const a = await assistant(host);
     const b = await assistant(host, { port: 38_001 });
+    for (const runtime of [a, b]) {
+      const directory = path.join(host.paths.instanceRoot(runtime.instance_id), 'secrets/whatsapp');
+      await writeWhatsAppLink(directory, {
+        schema_version: 1,
+        state: 'connected',
+        number: runtime === a ? '+15550000000' : '+15550000001',
+      });
+      const auth = new WhatsAppAuthStore(directory);
+      auth.saveCreds({ registered: true });
+      auth.close();
+    }
+    const privateFile = path.join(host.paths.instanceRoot(a.instance_id), 'secrets/whatsapp/auth.sqlite');
+    const privateBefore = await readFile(privateFile);
     const next = await nextRelease(host);
     const bRoot = host.paths.instanceRoot(b.instance_id);
     const before = await snapshot(bRoot);
@@ -630,6 +645,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
 
     expect(await snapshot(bRoot)).toEqual(before);
+    expect(await readFile(privateFile)).toEqual(privateBefore);
     expect(releaseOf(await getInstanceReservation(host.paths, b.instance_id))).toEqual(release(host, host.first));
     expect(state.commands.some((command) => JSON.stringify(command).includes(b.install_id))).toBe(false);
   });

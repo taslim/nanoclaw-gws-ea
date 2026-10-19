@@ -19,7 +19,8 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
 import { chatAgentDrift } from './drift.js';
 import { ensureExternalChatGroup, reconcileChatShape } from './external-chat.js';
-import { reconcileChatGateway } from './gateway.js';
+import { reconcileChatGateway, retiredChatGatewayDrift } from './gateway.js';
+import { safeErrorMessage } from '../../gws-ea/redact.js';
 import { getJobAgent, listJobAgents } from './jobs.js';
 import { chatAgentsMigration } from './migration.js';
 import { retireJobAgent } from './retire.js';
@@ -141,6 +142,32 @@ register({
     return undefined;
   },
   async handler() {
-    return { external_chat_agent_group_id: await getExternalChatAgentGroupId(), jobs: await listJobAgents() };
+    const external = await getExternalChatAgentGroupId();
+    const health = async (group: string, retired = false) => {
+      try {
+        const problems = retired ? await retiredChatGatewayDrift(group) : await chatAgentHealth(group);
+        return {
+          status: problems.length ? ('degraded' as const) : ('ok' as const),
+          reason: problems.length ? problems.join('; ') : null,
+        };
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Each unavailable observation belongs to this group, not the whole report.
+      } catch (error) {
+        return { status: 'unknown' as const, reason: safeErrorMessage(error) };
+      }
+    };
+    return {
+      external_chat: {
+        agent_group_id: external,
+        ...(external
+          ? await health(external)
+          : { status: 'degraded' as const, reason: 'External-chat has not been created.' }),
+      },
+      jobs: await Promise.all(
+        (await listJobAgents()).map(async (job) => ({
+          ...job,
+          health: await health(job.agent_group_id, job.state === 'retired'),
+        })),
+      ),
+    };
   },
 });

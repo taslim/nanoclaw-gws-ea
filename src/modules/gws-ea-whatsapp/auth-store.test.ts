@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { transportHarness, type TransportHarness } from './testing/harness.js';
+import { WhatsAppAuthStore } from './auth-store.js';
 
 let h: TransportHarness;
 beforeEach(async () => {
@@ -56,12 +57,25 @@ describe('the private transactional Baileys auth state', () => {
     const disk = new Database(path.join(h.directory, 'auth.sqlite'), { readonly: true });
     expect(disk.prepare('SELECT count(*) AS n FROM auth').get()).toEqual({ n: 0 });
     disk.close();
+    const loggedOut = new WhatsAppAuthStore(h.directory);
+    expect(loggedOut.loggedOut('15550000000@s.whatsapp.net')).toBe(true);
+    loggedOut.close();
     await h.writeLink({ schema_version: 1, state: 'linking' });
     expect(await adapter.requestPairingCode('15551112222')).toBe('12345678');
     expect(h.socketConfigs).toHaveLength(2);
     expect(h.socketConfigs[1].auth?.creds.registered).toBe(false);
     expect(h.socketConfigs[1].auth?.creds.signedIdentityKey.public).not.toEqual(oldIdentity);
     expect(await h.socketConfigs[1].auth?.keys.get('session', ['peer'])).toEqual({});
+    const relink = new WhatsAppAuthStore(h.directory);
+    expect(relink.loggedOut('15550000000@s.whatsapp.net')).toBe(true);
+    relink.close();
+    await h.socket().emit('creds.update', {
+      account: { details: Buffer.from('native paired account') },
+      me: { id: '15550000000:2@s.whatsapp.net', name: 'Assistant' },
+    });
+    const paired = new WhatsAppAuthStore(h.directory);
+    expect(paired.loggedOut('15550000000@s.whatsapp.net')).toBe(false);
+    paired.close();
   });
   it('re-resolves the Web version for each linked reconnect with backoff', async () => {
     vi.useFakeTimers();

@@ -21,6 +21,9 @@ export class WhatsAppAuthStore {
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS auth (category TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(category,id))',
     );
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS logout_proof (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account TEXT NOT NULL)',
+    );
     this.state = {
       creds: this.read<AuthenticationCreds>('credentials', 'current') ?? initAuthCreds(),
       keys: {
@@ -40,6 +43,7 @@ export class WhatsAppAuthStore {
         },
         set: (data): void => {
           this.db.transaction(() => {
+            if (this.authenticated) this.db.exec('DELETE FROM logout_proof');
             for (const [category, values] of Object.entries(data)) {
               for (const [id, value] of Object.entries(values)) {
                 if (value === null || value === undefined)
@@ -70,11 +74,30 @@ export class WhatsAppAuthStore {
 
   saveCreds(update: Partial<AuthenticationCreds> = {}): void {
     Object.assign(this.state.creds, update);
-    this.db.transaction(() => this.write('credentials', 'current', this.state.creds))();
+    this.db.transaction(() => {
+      if (this.authenticated) this.db.exec('DELETE FROM logout_proof');
+      this.write('credentials', 'current', this.state.creds);
+    })();
   }
 
-  clear(): void {
-    this.db.transaction(() => this.db.exec('DELETE FROM auth'))();
+  loggedOut(account: string): boolean {
+    return this.loggedOutAccount() === account;
+  }
+  loggedOutAccount(): string | undefined {
+    if (this.authenticated) return undefined;
+    return this.db.prepare<[], { account: string }>('SELECT account FROM logout_proof WHERE singleton=1').get()
+      ?.account;
+  }
+  get authenticated(): boolean {
+    return this.state.creds.registered || this.state.creds.account !== undefined;
+  }
+  clear(reason: { readonly kind: 'discarded' } | { readonly kind: 'logged-out'; readonly account: string }): void {
+    if (reason.kind === 'logged-out' && !/^\d+@s\.whatsapp\.net$/u.test(reason.account))
+      throw new Error('A native WhatsApp logout needs its authenticated phone account');
+    this.db.transaction(() => {
+      this.db.exec('DELETE FROM auth; DELETE FROM logout_proof');
+      if (reason.kind === 'logged-out') this.db.prepare('INSERT INTO logout_proof VALUES(1,?)').run(reason.account);
+    })();
     this.state.creds = initAuthCreds();
   }
   close(): void {

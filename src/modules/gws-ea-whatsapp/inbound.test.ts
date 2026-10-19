@@ -13,6 +13,38 @@ afterEach(async () => {
   await h.close();
 });
 describe('durable WhatsApp inbound and trusted context', () => {
+  it.each(['direct', 'group'] as const)(
+    'retains the authenticated %s sender phone alias across raw intake and a fresh socket',
+    async (kind) => {
+      const first = await h.start({}, false);
+      const key =
+        kind === 'direct'
+          ? { id: 'native-alias', remoteJid: '12000@lid', remoteJidAlt: '447700900123@s.whatsapp.net' }
+          : {
+              id: 'native-alias',
+              remoteJid: 'team@g.us',
+              participant: '12000@lid',
+              participantAlt: '447700900123@s.whatsapp.net',
+            };
+      await h
+        .socket()
+        .emit('messages.upsert', { type: 'notify', messages: [incoming('native-alias', 'Original request', { key })] });
+      await first.teardown();
+      const seen = vi.fn(async () => 'route' as const);
+      const unobserve = registerWhatsAppObserver({ onMessage: seen });
+      try {
+        await h.start();
+        expect(seen).toHaveBeenCalledWith(
+          expect.objectContaining({ person: { lid: '12000', phoneJid: '447700900123@s.whatsapp.net' } }),
+        );
+        expect(h.messages()).toHaveLength(1);
+        expect(h.content()[0]?.text).toBe('Original request');
+        expect(h.socket().mappings.get('12000@lid')).toBe('447700900123@s.whatsapp.net');
+      } finally {
+        unobserve();
+      }
+    },
+  );
   it('retries a failed route on the next replay without requiring another platform receipt', async () => {
     vi.useFakeTimers();
     try {

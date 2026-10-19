@@ -111,6 +111,12 @@ export interface DiscardSummary {
   readonly files: { readonly count: number; readonly paths: readonly string[] };
   /** Agent groups created since: their OneCLI agents and grants stay in the vault, orphaned. */
   readonly orphanedAgents: readonly string[];
+  /** Job registry entries absent from the snapshot, with the chat each served. */
+  readonly jobAgents: readonly {
+    readonly agent_group_id: string;
+    readonly messaging_group_id: string;
+    readonly state: string;
+  }[];
 }
 
 export interface DiscardedRows {
@@ -341,15 +347,22 @@ function agentGroups(database: Database.Database): string[] {
     (row) => row.id,
   );
 }
+function jobAgents(database: Database.Database): DiscardSummary['jobAgents'] {
+  if (!hasTable(database, 'gws_ea_job_agents')) return [];
+  return database
+    .prepare('SELECT agent_group_id, messaging_group_id, state FROM gws_ea_job_agents ORDER BY agent_group_id')
+    .all() as DiscardSummary['jobAgents'];
+}
 
 /** Rows the central database gained since the snapshot, by table, and the agent groups among them. */
 async function centralGains(
   current: string,
   snapshot: string,
-): Promise<Pick<DiscardSummary, 'centralRows' | 'orphanedAgents'>> {
+): Promise<Pick<DiscardSummary, 'centralRows' | 'orphanedAgents' | 'jobAgents'>> {
   const before = await withCentralCopy(snapshot, (database) => ({
     keys: new Map(userTables(database).map((table) => [table, rowKeys(database, table)])),
     groups: new Set(agentGroups(database)),
+    jobs: new Set(jobAgents(database).map((job) => job.agent_group_id)),
   }));
   return withCentralCopy(current, (database) => {
     const centralRows: Array<{ table: string; count: number }> = [];
@@ -359,7 +372,11 @@ async function centralGains(
       for (const key of rowKeys(database, table)) if (!known.has(key)) count += 1;
       if (count > 0) centralRows.push({ table, count });
     }
-    return { centralRows, orphanedAgents: agentGroups(database).filter((id) => !before.groups.has(id)) };
+    return {
+      centralRows,
+      orphanedAgents: agentGroups(database).filter((id) => !before.groups.has(id)),
+      jobAgents: jobAgents(database).filter((job) => !before.jobs.has(job.agent_group_id)),
+    };
   });
 }
 
@@ -449,7 +466,8 @@ function isLossless(summary: DiscardSummary): boolean {
     summary.redelivered.count === 0 &&
     summary.centralRows.length === 0 &&
     summary.files.count === 0 &&
-    summary.orphanedAgents.length === 0
+    summary.orphanedAgents.length === 0 &&
+    summary.jobAgents.length === 0
   );
 }
 
@@ -486,6 +504,7 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
     `  Central rows added since: ${tables || 'none'}`,
     `  Memory and group files changed since: ${discarded.files.count === 0 ? 'none' : `${discarded.files.count} (${discarded.files.paths.map(printableName).join(', ')}${more})`}`,
     `  OneCLI agents left orphaned with their grants: ${discarded.orphanedAgents.map(printableName).join(', ') || 'none'}`,
+    `  Job agents created since: ${discarded.jobAgents.map((job) => `${printableName(job.agent_group_id)} (chat ${printableName(job.messaging_group_id)}, ${printableName(job.state)})`).join(', ') || 'none'}`,
     `The discarded state is kept in ${preview.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
   ];
 }

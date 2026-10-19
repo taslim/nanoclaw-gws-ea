@@ -40,7 +40,11 @@ import { reserveInstance } from '../../gws-ea/journal.js';
 import { getInstanceReservation } from '../../gws-ea/registry.js';
 import { preparePrincipalMessageContent } from '../gws-ea-profile/marks.js';
 import { isVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
-import { bindPrincipalIdentity } from '../gws-ea-profile/bind.js';
+import {
+  bindPrincipalIdentity,
+  bindWhatsAppPrincipal,
+  removeWhatsAppPrincipalBinding,
+} from '../gws-ea-profile/bind.js';
 import { createMessagingGroup, getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { gwsEaPrivacyMigration } from '../gws-ea-privacy/migration.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
@@ -49,10 +53,13 @@ import { createWhatsAppAdapter, type WhatsAppAdapter } from './adapter.js';
 import { readWhatsAppLink, writeWhatsAppLink } from './paths.js';
 import { FakeSocket, incoming } from './testing/fake-socket.js';
 import { WhatsAppIndex } from './index-store.js';
+import { WhatsAppAuthStore } from './auth-store.js';
 import { WhatsAppLinking, whatsAppLinking } from './link.js';
 import { deliverSessionMessages, getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { registerWhatsAppObserver, type WhatsAppLinkNotice } from './observers.js';
+import * as channelRegistry from '../../channels/channel-registry.js';
+import * as instanceRegistry from '../../gws-ea/registry.js';
 
 const instanceId = '12345678-1234-4234-8234-123456789abc';
 let root: string;
@@ -686,4 +693,186 @@ it('refuses a delayed reply to the unlinked principal DM at the native delivery 
   await deliverSessionMessages(session);
   expect((await getDeliveryAttempt('late-origin-reply'))?.last_error).toContain('detached');
   expect(fresh.sends).toHaveLength(0);
+});
+
+it('repairs a rollback across linking with the exact private proof and routes the next principal message to main', async () => {
+  const { socket, code } = await connect();
+  await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('proof', code)] });
+  const proof = (await readWhatsAppLink(linking.options.directory))?.principalVerifiedAt;
+  await removeWhatsAppPrincipalBinding('12000');
+  expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+  await linking.reconcile();
+  await linking.reconcile();
+  expect(await getDb().get("SELECT verified_at FROM gws_ea_principal_users WHERE user_id = 'whatsapp:12000'")).toEqual({
+    verified_at: proof,
+  });
+  expect(await isVerifiedPrincipalUser('gchat:users/1')).toBe(true);
+  await socket.emit('messages.upsert', {
+    type: 'notify',
+    messages: [principalMessage('after-rollback', 'Continue my errand')],
+  });
+  expect((await mailboxRows()).filter(({ id }) => id === 'after-rollback:main')).toHaveLength(1);
+  expect(socket.sends).toHaveLength(0);
+});
+
+it('withdraws resurrected WhatsApp authority in favor of the current private proof, including after unlink', async () => {
+  const { socket, code } = await connect();
+  await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('proof', code)] });
+  const proof = (await readWhatsAppLink(linking.options.directory))?.principalVerifiedAt;
+  await bindWhatsAppPrincipal({ lid: '14000', phoneJid: '447700900999@s.whatsapp.net' }, '2026-01-01T00:00:00.000Z');
+  await bindWhatsAppPrincipal({ lid: '12000', phoneJid: '447700900123@s.whatsapp.net' }, '2026-01-02T00:00:00.000Z');
+  await linking.reconcile();
+  expect(await isVerifiedPrincipalUser('whatsapp:14000')).toBe(false);
+  expect(await getDb().get("SELECT verified_at FROM gws_ea_principal_users WHERE user_id = 'whatsapp:12000'")).toEqual({
+    verified_at: proof,
+  });
+  const stale = await getMessagingGroupByPlatform('whatsapp', '14000@lid', 'whatsapp');
+  expect(stale?.detached_at).toEqual(expect.any(String));
+  await linking.unlink();
+  await bindWhatsAppPrincipal({ lid: '12000', phoneJid: '447700900123@s.whatsapp.net' }, proof!);
+  await linking.reconcile();
+  expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+  expect(await isVerifiedPrincipalUser('gchat:users/1')).toBe(true);
+});
+
+it('keeps authenticated proof durable when the central binding fails, then finishes from that same proof', async () => {
+  const { socket, code } = await connect();
+  const db = getDb();
+  const run = db.run.bind(db);
+  const fail = vi.spyOn(db, 'run').mockImplementation(async (sql, ...params) => {
+    if (sql.includes('INSERT INTO gws_ea_principal_users')) throw new Error('Central binding unavailable');
+    return run(sql, ...params);
+  });
+  await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('proof-retry', code)] });
+  fail.mockRestore();
+  expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+  const saved = await readWhatsAppLink(linking.options.directory);
+  expect(saved?.principal).toEqual({ lid: '12000', phoneJid: '447700900123@s.whatsapp.net' });
+  expect(saved?.principalVerifiedAt).toEqual(expect.any(String));
+  await socket.emit('messages.upsert', { type: 'append', messages: [principalMessage('proof-retry', code)] });
+  await vi.waitFor(async () => expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(true));
+  expect(await getDb().get("SELECT verified_at FROM gws_ea_principal_users WHERE user_id = 'whatsapp:12000'")).toEqual({
+    verified_at: saved?.principalVerifiedAt,
+  });
+  expect((await readWhatsAppLink(linking.options.directory))?.binding).toBeUndefined();
+  expect((await mailboxRows()).some(({ id }) => id === 'proof-retry:main')).toBe(false);
+  expect(socket.sends).toHaveLength(0);
+});
+
+it.each(['transport-stopped', 'link-removed', 'claim-released', 'auth-removed'] as const)(
+  'finishes an unlink interrupted after %s without losing native logout proof or repeating signout',
+  async (boundary) => {
+    const { socket, code } = await connect();
+    await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('proof', code)] });
+    const logout = vi.spyOn(socket, 'logout');
+    const crash = new Error(`Interrupted after ${boundary}`);
+    const nativeRm = fs.promises.rm;
+    const rm = vi.spyOn(fs.promises, 'rm').mockImplementation(async (...args) => {
+      await nativeRm(...args);
+      if (
+        (boundary === 'link-removed' && String(args[0]).endsWith('/link.json')) ||
+        (boundary === 'auth-removed' && String(args[0]).endsWith('/auth.sqlite'))
+      )
+        throw crash;
+    });
+    const nativeStop = channelRegistry.stopChannelAdapter;
+    const stop = vi.spyOn(channelRegistry, 'stopChannelAdapter').mockImplementation(async (...args) => {
+      const result = await nativeStop(...args);
+      if (boundary === 'transport-stopped') throw crash;
+      return result;
+    });
+    const nativeClaim = instanceRegistry.claimInstanceWhatsApp;
+    const claim = vi.spyOn(instanceRegistry, 'claimInstanceWhatsApp').mockImplementation(async (...args) => {
+      const result = await nativeClaim(...args);
+      if (boundary === 'claim-released') throw crash;
+      return result;
+    });
+    try {
+      await expect(linking.unlink()).rejects.toThrow(crash.message);
+    } finally {
+      rm.mockRestore();
+      stop.mockRestore();
+      claim.mockRestore();
+    }
+    linking.close();
+    linking = new WhatsAppLinking(linking.options);
+    await linking.unlink();
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(sockets).toHaveLength(1);
+    expect(await linking.status()).toEqual({ state: 'unlinked' });
+    expect(
+      (await getInstanceReservation(linking.options.paths, instanceId)).exclusive_resource_claims.whatsapp_number,
+    ).toBeUndefined();
+    expect(fs.existsSync(path.join(linking.options.directory, 'auth.sqlite'))).toBe(false);
+    expect(await isVerifiedPrincipalUser('gchat:users/1')).toBe(true);
+    logout.mockRestore();
+  },
+);
+
+it('finishes native pairing received before open with the retained authenticated credentials and admitted-number check', async () => {
+  await marked('numbers', 'Use +15550000000; mine is +447700900123.');
+  await linking.link('+15550000000', '+447700900123', caller);
+  const pairing = sockets[0];
+  await pairing.emit('messages.upsert', {
+    type: 'notify',
+    messages: [principalMessage('before-paired-open', 'Keep this request through native restart')],
+  });
+  await pairing.emit('creds.update', {
+    account: { details: Buffer.from('native paired account') },
+    me: { id: '15550000000:1@s.whatsapp.net', name: 'Assistant', lid: '999000@lid' },
+  });
+  await pairing.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: {
+      error: Object.assign(new Error('Restart required after native pairing'), { output: { statusCode: 515 } }),
+      date: new Date(),
+    },
+  });
+  await vi.waitFor(() => expect(sockets).toHaveLength(2));
+  expect(pairing.ended).toBe(true);
+  const auth = new WhatsAppAuthStore(linking.options.directory);
+  expect(auth.state.creds.account?.details).toEqual(Buffer.from('native paired account'));
+  auth.close();
+  const intake = new WhatsAppIndex(linking.options.directory, () => '15550000000@s.whatsapp.net');
+  expect(intake.unrouted().map((message) => message.key.id)).toContain('before-paired-open');
+  intake.close();
+  await sockets[1].emit('connection.update', { connection: 'open' });
+  expect(await linking.status()).toMatchObject({ state: 'connected', bindingPending: true });
+  expect(onInbound).not.toHaveBeenCalled();
+  const pendingProof = await readWhatsAppLink(linking.options.directory);
+  if (!pendingProof?.binding) throw new Error('The native reconnect did not issue principal proof');
+  await sockets[1].emit('messages.upsert', {
+    type: 'notify',
+    messages: [principalMessage('proof-after-native-restart', pendingProof.binding.code)],
+  });
+  await vi.waitFor(
+    async () => expect((await mailboxRows()).filter(({ id }) => id === 'before-paired-open:main')).toHaveLength(1),
+    { timeout: 2500 },
+  );
+  expect(
+    (await getInstanceReservation(linking.options.paths, instanceId)).exclusive_resource_claims.whatsapp_number,
+  ).toBe('+15550000000');
+});
+
+it('retains exact native logout proof through an unregistered re-link expiry and can then unlink without another socket', async () => {
+  const { socket, code } = await connect();
+  await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('proof', code)] });
+  await socket.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: {
+      error: Object.assign(new Error('logged out'), { output: { statusCode: 401 } }),
+      date: new Date(),
+    },
+  });
+  await marked('relink', 'Please re-link WhatsApp.');
+  await linking.link(undefined, undefined, { ...caller, principalMessages: ['relink'] });
+  await sockets[1].emit('connection.update', { connection: 'close' });
+  await vi.waitFor(async () => expect(await linking.status()).toMatchObject({ state: 'needs-relink' }));
+  expect(fs.existsSync(path.join(linking.options.directory, 'auth.sqlite'))).toBe(true);
+  const auth = new WhatsAppAuthStore(linking.options.directory);
+  expect(auth.loggedOut('15550000000@s.whatsapp.net')).toBe(true);
+  auth.close();
+  await linking.unlink();
+  expect(sockets).toHaveLength(2);
+  expect(await linking.status()).toEqual({ state: 'unlinked' });
 });

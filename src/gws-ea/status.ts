@@ -135,6 +135,19 @@ export interface MainIdentityFacts {
 export interface ExternalEmailFacts {
   readonly agent_group_id: string | null;
 }
+export interface WhatsAppFacts {
+  readonly state: 'unlinked' | 'linking' | 'connected' | 'needs-relink' | null;
+  readonly number: string | null;
+}
+export interface ChatAgentView extends ProbeResult {
+  readonly agent_group_id: string | null;
+  readonly messaging_group_id: string | null;
+  readonly state: string | null;
+}
+export interface JobAgentFacts {
+  readonly count: number | null;
+  readonly jobs: readonly ChatAgentView[] | null;
+}
 /** Calendar notifications for the principal's calendars, as the inbox records turning them on. */
 export interface CalendarNotificationsView {
   readonly state: 'unknown' | 'ok' | 'failing';
@@ -208,6 +221,9 @@ export interface AssistantProbes {
   readonly main_identity: ProbeResult & MainIdentityFacts;
   /** external-email as the host stamped it, no destination joining it to main or reaching its inbox. */
   readonly external_email: ProbeResult & ExternalEmailFacts;
+  readonly whatsapp: ProbeResult & WhatsAppFacts;
+  readonly external_chat: ProbeResult & MainIdentityFacts;
+  readonly job_agents: ProbeResult & JobAgentFacts;
   /**
    * The assistant's inbox as the host reports it: polling healthy, and
    * calendar notifications on for the principal's calendars. Beside it,
@@ -237,6 +253,9 @@ export const PROBE_NAMES = [
   'onecli',
   'main_identity',
   'external_email',
+  'whatsapp',
+  'external_chat',
+  'job_agents',
   'inbox',
   'workspace',
   'principal',
@@ -802,6 +821,77 @@ async function externalEmailProbe(subject: Subject): Promise<ProbeResult & Exter
   return { ...OK, agent_group_id: agentGroupId };
 }
 
+async function whatsAppProbe(subject: Subject): Promise<ProbeResult & WhatsAppFacts> {
+  const report = unwrapData(
+    await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-whatsapp', 'status']),
+  );
+  if (
+    !isRecord(report) ||
+    !oneOf(['unlinked', 'linking', 'connected', 'needs-relink'] as const, report.state) ||
+    (report.number !== undefined && typeof report.number !== 'string')
+  )
+    throw new Unobservable('ncl returned an invalid WhatsApp report');
+  const facts = { state: report.state, number: optionalString(report.number) ?? null };
+  return report.state === 'needs-relink' || report.state === 'linking'
+    ? { ...facts, status: 'degraded', reason: `WhatsApp ${report.state}${facts.number ? ` (${facts.number})` : ''}.` }
+    : { ...OK, ...facts };
+}
+
+/** Every group retains its own failed observation; one malformed row cannot hide the others. */
+function reportedChatAgent(value: unknown): ProbeResult {
+  if (
+    !isRecord(value) ||
+    !oneOf(['ok', 'degraded', 'unknown'] as const, value.status) ||
+    !(value.reason === null || typeof value.reason === 'string')
+  )
+    return { status: 'unknown', reason: 'ncl returned an invalid chat-agent observation' };
+  return { status: value.status, reason: value.reason };
+}
+async function externalChatProbe(report: () => Promise<unknown>): Promise<ProbeResult & MainIdentityFacts> {
+  const data = await report();
+  const external = isRecord(data) && isRecord(data.external_chat) ? data.external_chat : undefined;
+  if (!external || !(typeof external.agent_group_id === 'string' || external.agent_group_id === null))
+    return { status: 'unknown', reason: 'ncl returned an invalid external-chat observation', agent_group_id: null };
+  return { ...reportedChatAgent(external), agent_group_id: optionalString(external?.agent_group_id) ?? null };
+}
+async function jobAgentsProbe(report: () => Promise<unknown>): Promise<ProbeResult & JobAgentFacts> {
+  const data = await report();
+  if (!isRecord(data) || !Array.isArray(data.jobs)) throw new Unobservable('ncl returned an invalid job-agent report');
+  const jobs: ChatAgentView[] = data.jobs.map((value: unknown) => {
+    const row = isRecord(value) ? value : undefined;
+    const valid =
+      row &&
+      optionalString(row.agent_group_id) &&
+      optionalString(row.messaging_group_id) &&
+      oneOf(['creating', 'active', 'retiring', 'retired'] as const, row.state);
+    return {
+      ...(valid
+        ? reportedChatAgent(row.health)
+        : { status: 'unknown' as const, reason: 'ncl returned an invalid job-agent observation' }),
+      agent_group_id: optionalString(row?.agent_group_id) ?? null,
+      messaging_group_id: optionalString(row?.messaging_group_id) ?? null,
+      state: optionalString(row?.state) ?? null,
+    };
+  });
+  const status = jobs.some((job) => job.status === 'degraded')
+    ? 'degraded'
+    : jobs.some((job) => job.status === 'unknown')
+      ? 'unknown'
+      : 'ok';
+  return {
+    status,
+    reason:
+      status === 'ok'
+        ? null
+        : jobs
+            .filter((job) => job.status !== 'ok')
+            .map((job) => `${job.agent_group_id ?? 'Unknown job'}: ${job.reason ?? job.status}`)
+            .join('; '),
+    count: jobs.length,
+    jobs,
+  };
+}
+
 const INBOX_STATES = ['healthy', 'unhealthy'] as const;
 const CALENDAR_NOTIFICATION_STATES = ['unknown', 'ok', 'failing'] as const;
 const CALENDAR_ACCESS = ['unchecked', 'bookable', 'readable', 'free-busy', 'none'] as const;
@@ -1152,6 +1242,9 @@ export async function observeAssistantStatus(
   const subject: Subject = { context, observers, reservation, inspection, runtime, current };
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
+  const chatAgents = once(async () =>
+    unwrapData(await observers.ncl(requireRuntime(runtime), ['gws-ea-chat-agents', 'health'])),
+  );
   const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
   const [
     checkout,
@@ -1162,6 +1255,9 @@ export async function observeAssistantStatus(
     onecli,
     mainIdentity,
     externalEmail,
+    whatsapp,
+    externalChat,
+    jobAgents,
     inbox,
     workspace,
     principal,
@@ -1184,6 +1280,9 @@ export async function observeAssistantStatus(
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
     probe<ExternalEmailFacts>(() => externalEmailProbe(subject), { agent_group_id: null }),
+    probe<WhatsAppFacts>(() => whatsAppProbe(subject), { state: null, number: null }),
+    probe<MainIdentityFacts>(() => externalChatProbe(chatAgents), { agent_group_id: null }),
+    probe<JobAgentFacts>(() => jobAgentsProbe(chatAgents), { count: null, jobs: null }),
     probe<InboxFacts>(() => inboxProbe(subject), {
       state: null,
       since: null,
@@ -1223,6 +1322,9 @@ export async function observeAssistantStatus(
       onecli,
       main_identity: mainIdentity,
       external_email: externalEmail,
+      whatsapp,
+      external_chat: externalChat,
+      job_agents: jobAgents,
       inbox,
       workspace,
       principal,
@@ -1423,6 +1525,12 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       return probes.main_identity.agent_group_id ?? '';
     case 'external_email':
       return probes.external_email.agent_group_id ?? '';
+    case 'whatsapp':
+      return [probes.whatsapp.state ?? 'unknown', probes.whatsapp.number].filter(Boolean).join(' ');
+    case 'external_chat':
+      return probes.external_chat.agent_group_id ?? '';
+    case 'job_agents':
+      return probes.job_agents.count === null ? 'unknown' : `${probes.job_agents.count} registered`;
     case 'inbox': {
       const polled = probes.inbox.last_success_at;
       return polled ? `last polled ${formatLocalTime(polled, timezone)}` : '';
@@ -1503,6 +1611,10 @@ function calendarAccessLines(views: readonly CalendarAccessView[] | null, timezo
   );
 }
 
+function jobAgentLine(job: ChatAgentView): string {
+  return `    ${job.agent_group_id ?? '(unknown)'}: ${job.state ?? 'unknown'}; chat ${job.messaging_group_id ?? '(unknown)'}; ${job.status}${job.reason ? `; ${job.reason}` : ''}`;
+}
+
 function renderStatusDetails(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
@@ -1529,6 +1641,7 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
         ? [probeDetail(name, status.probes, timezone), ...(result.reason ? [result.reason] : [])].join('; ')
         : (result.reason ?? probeDetail(name, status.probes, timezone));
     lines.push(probeLine(result.status, name, detail));
+    if (name === 'job_agents') lines.push(...(status.probes.job_agents.jobs ?? []).map(jobAgentLine));
     if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
@@ -1570,6 +1683,10 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  Account: ${status.registry.account}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
     `  Conversation: ${conversationSummary(status)}`,
+    `  WhatsApp: ${probeDetail('whatsapp', status.probes, timezone)}${status.probes.whatsapp.reason ? `; ${status.probes.whatsapp.reason}` : ''}`,
+    `  External chat: ${status.probes.external_chat.agent_group_id ?? 'unknown'}; ${status.probes.external_chat.status}${status.probes.external_chat.reason ? `; ${status.probes.external_chat.reason}` : ''}`,
+    `  Job agents: ${probeDetail('job_agents', status.probes, timezone)}; ${status.probes.job_agents.status}`,
+    ...(status.probes.job_agents.jobs ?? []).map(jobAgentLine),
     ...(status.probes.web_alias.state === 'not_needed'
       ? []
       : [`  Web alias: ${webAliasSummary(status.probes.web_alias)}`]),

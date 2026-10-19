@@ -67,6 +67,17 @@ export async function chatGatewayDrift(group: string): Promise<string[]> {
   return assigned.length === 1 && assigned[0] === secret ? [] : ['its gateway secret assignments are not model-only'];
 }
 
+/** Retirement keeps no usable secret; an already removed identity is equally safe. */
+export async function retiredChatGatewayDrift(group: string): Promise<string[]> {
+  const client = admin();
+  const current = await identity(client, group);
+  if (!current) return [];
+  if (current.secretMode !== 'selective') return ['its retired gateway secret mode is not selective'];
+  return (await client.listAgentSecretIds(current.id)).length === 0
+    ? []
+    : ['its retired gateway identity still has secret assignments'];
+}
+
 /** A retired group keeps its gateway identity with no usable secret. */
 export async function retireChatGateway(group: string): Promise<void> {
   const client = admin();

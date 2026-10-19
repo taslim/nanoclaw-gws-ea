@@ -137,6 +137,15 @@ export class WhatsAppIndex {
       this.finishIntake(rawChat, id);
     })();
   }
+  hasUnrouted(): boolean {
+    return (
+      this.db
+        .prepare(
+          'SELECT 1 FROM intake i WHERE i.account=? AND NOT EXISTS(SELECT 1 FROM held_intake h WHERE h.account=i.account AND h.chat=i.chat AND h.id=i.id) LIMIT 1',
+        )
+        .get(this.account()) !== undefined
+    );
+  }
   unrouted(): WAMessage[] {
     const rows = this.db
       .prepare(
@@ -144,9 +153,18 @@ export class WhatsAppIndex {
       )
       .all(this.account()) as { raw: string }[];
     return rows.map(({ raw }) => {
-      const parsed = proto.WebMessageInfo.fromObject(JSON.parse(raw, BufferJSON.reviver) as Record<string, unknown>);
+      const stored = JSON.parse(raw, BufferJSON.reviver) as WAMessage;
+      const parsed = proto.WebMessageInfo.fromObject(stored);
       if (!parsed.key) throw new Error('WhatsApp inbox record has no message key');
-      return { ...parsed, key: parsed.key };
+      // These authenticated Baileys aliases are WAMessageKey extensions, absent from the protobuf schema.
+      return {
+        ...parsed,
+        key: {
+          ...parsed.key,
+          ...(stored.key.remoteJidAlt !== undefined ? { remoteJidAlt: stored.key.remoteJidAlt } : {}),
+          ...(stored.key.participantAlt !== undefined ? { participantAlt: stored.key.participantAlt } : {}),
+        },
+      };
     });
   }
   hold(rawChat: string, id: string, lid: string): void {

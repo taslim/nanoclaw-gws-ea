@@ -435,6 +435,10 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { main_agent_group_id: MAIN, assistant_display_name: 'Aya' };
       case 'gws-ea-external-email health':
         return { agent_group_id: EXTERNAL_EMAIL, problems: [] };
+      case 'gws-ea-whatsapp status':
+        return { state: 'unlinked' };
+      case 'gws-ea-chat-agents health':
+        return { external_chat: { agent_group_id: 'ag-external-chat', status: 'ok', reason: null }, jobs: [] };
       case 'gws-ea-inbox health':
         return HEALTHY_INBOX;
       case 'gws-ea-chat health':
@@ -766,6 +770,62 @@ describe('status', () => {
     for (const name of Object.keys(missing.status.probes).filter((probe) => probe !== 'external_email')) {
       expect(missing.status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it('shows a disconnected WhatsApp number and each chat agent without hiding other observations', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const observed = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      ncl: async (runtime, args) => {
+        if (args.join(' ') === 'gws-ea-whatsapp status') return { state: 'needs-relink', number: '+15550000000' };
+        if (args.join(' ') === 'gws-ea-chat-agents health')
+          return {
+            external_chat: { agent_group_id: 'ag-external-chat', status: 'ok', reason: null },
+            jobs: [
+              {
+                agent_group_id: 'job-a',
+                messaging_group_id: 'chat-a',
+                state: 'active',
+                health: { status: 'degraded', reason: 'Its gateway secret mode is not selective.' },
+              },
+              {
+                agent_group_id: 'job-b',
+                messaging_group_id: 'chat-b',
+                state: 'active',
+                health: { status: 'unknown', reason: 'OneCLI is unavailable.' },
+              },
+              { agent_group_id: 'job-c', messaging_group_id: 'chat-c', state: 'active', health: { malformed: true } },
+              {
+                agent_group_id: 'job-d',
+                messaging_group_id: 'chat-d',
+                state: 'active',
+                health: { status: 'ok', reason: null },
+              },
+            ],
+          };
+        return healthy.ncl(runtime, args);
+      },
+    });
+    expect(observed.status.probes.whatsapp).toMatchObject({
+      status: 'degraded',
+      state: 'needs-relink',
+      number: '+15550000000',
+    });
+    expect(observed.status.probes.external_chat).toMatchObject({ status: 'ok', agent_group_id: 'ag-external-chat' });
+    expect(observed.status.probes.job_agents).toMatchObject({
+      status: 'degraded',
+      count: 4,
+      jobs: [
+        { agent_group_id: 'job-a', status: 'degraded' },
+        { agent_group_id: 'job-b', status: 'unknown' },
+        { agent_group_id: 'job-c', status: 'unknown' },
+        { agent_group_id: 'job-d', status: 'ok' },
+      ],
+    });
+    expect(observed.status.probes.external_email).toMatchObject({ status: 'ok' });
   });
 
   it('reports the web alias an enabled browser needs: not needed, pending with what to do, then verified', async () => {

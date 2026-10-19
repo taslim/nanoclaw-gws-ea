@@ -8,6 +8,7 @@ import { ChannelNotConnectedError, type ChannelSetup } from '../../channels/adap
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createWhatsAppAdapter } from './adapter.js';
 import { WhatsAppIndex } from './index-store.js';
+import { WhatsAppAuthStore } from './auth-store.js';
 import { readWhatsAppLink, writeWhatsAppLink } from './paths.js';
 import { FakeSocket, incoming } from './testing/fake-socket.js';
 
@@ -44,6 +45,28 @@ afterEach(async () => {
 });
 
 describe('WhatsApp transport lifecycle', () => {
+  it('retains registered credentials when native logout has no connected socket or the platform write fails', async () => {
+    const saved = new WhatsAppAuthStore(directory);
+    saved.saveCreds({ registered: true, me: { id: '15550000000:1@s.whatsapp.net', name: 'Aya' } });
+    saved.close();
+    const adapter = create();
+    await adapter.setup(setup());
+    await adapter.reconnect();
+    const before = fs.readFileSync(path.join(directory, 'auth.sqlite'));
+    await expect(adapter.logout()).rejects.toBeInstanceOf(ChannelNotConnectedError);
+    expect(fs.readFileSync(path.join(directory, 'auth.sqlite'))).toEqual(before);
+    await sockets[0].emit('connection.update', { connection: 'open' });
+    const linkBefore = fs.readFileSync(path.join(directory, 'link.json'));
+    vi.spyOn(sockets[0], 'logout').mockRejectedValueOnce(new Error('Platform logout unavailable'));
+    await expect(adapter.logout()).rejects.toThrow('Platform logout unavailable');
+    const retained = new WhatsAppAuthStore(directory);
+    expect(retained.state.creds.registered).toBe(true);
+    retained.close();
+    expect(fs.readFileSync(path.join(directory, 'link.json'))).toEqual(linkBefore);
+    await adapter.logout();
+    expect(sockets[0].loggedOut).toBe(true);
+    await adapter.teardown();
+  });
   it('starts without waiting for an open socket and holds offline sends', async () => {
     const adapter = create();
     await adapter.setup(setup());

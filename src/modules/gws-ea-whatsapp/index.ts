@@ -1,6 +1,5 @@
 /** Always compiled; a durable link record, including needs-relink, enables the adapter. */
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { getChannelAdapterExact, registerChannelAdapter } from '../../channels/channel-registry.js';
 import { registerPostDeliveryHook } from '../../delivery.js';
@@ -14,15 +13,12 @@ export function activeWhatsAppAdapter(): WhatsAppAdapter | undefined {
 }
 registerChannelAdapter('whatsapp', {
   defaults: WHATSAPP_DEFAULTS,
-  factory: () => {
+  factory: async () => {
     const directory = whatsappDirectory();
-    if (!directory || !fs.existsSync(path.join(directory, 'link.json'))) return null;
-    return readWhatsAppLink(directory).then(async (record) => {
-      if (!record) throw new Error('WhatsApp link disappeared during channel startup');
-      if (record.number) await whatsAppLinking().reconcile();
-      if (!(await readWhatsAppLink(directory))) throw new Error('WhatsApp pairing expired before channel startup');
-      return createWhatsAppAdapter({ directory });
-    });
+    if (!directory || !fs.existsSync(directory)) return null;
+    await whatsAppLinking().reconcile();
+    if (!(await readWhatsAppLink(directory))) return null;
+    return createWhatsAppAdapter({ directory });
   },
 });
 registerPostDeliveryHook((message) => {

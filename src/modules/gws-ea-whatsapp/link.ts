@@ -1,5 +1,6 @@
 /** Pairing and principal proof are host-owned; credentials and binding codes never enter a group conversation. */
 import { randomBytes } from 'node:crypto';
+import { isErrno } from '../../community-portal/errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -14,11 +15,13 @@ import { claimInstanceWhatsApp } from '../../gws-ea/registry.js';
 import { log } from '../../log.js';
 import { onHostShutdown } from '../../host-lifecycle.js';
 import { bindWhatsAppPrincipal, removeWhatsAppPrincipalBinding } from '../gws-ea-profile/bind.js';
-import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, getMainAgentGroupId, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import { requirePrincipalDirectMessage } from '../gws-ea-profile/marks.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import type { WhatsAppAdapter } from './adapter.js';
 import { WhatsAppIndex } from './index-store.js';
+import { WhatsAppAuthStore } from './auth-store.js';
+import { logoutWhatsAppAccount } from './logout.js';
 import {
   observeWhatsAppLinkNotice,
   registerWhatsAppObserver,
@@ -62,6 +65,9 @@ function containsNumber(text: string, number: string): boolean {
   return [...text.matchAll(/\+?\d(?:[\d\s().-]*\d)?/gu)].some(
     ([written]) => written.replace(/\D/gu, '') === number.slice(1),
   );
+}
+function containsBindingCode(text: string, code: string): boolean {
+  return text.split(/\s+/u).some((word) => word.replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/gu, '') === code);
 }
 function transport(): WhatsAppAdapter | undefined {
   return getChannelAdapterExact('whatsapp') as WhatsAppAdapter | undefined;
@@ -127,6 +133,16 @@ export class WhatsAppLinking {
   /** Before channel startup, an interrupted attempt retains its deadline and restores the former state once expired. */
   async reconcile(): Promise<void> {
     const record = await readWhatsAppLink(this.options.directory);
+    // Account state is outside release snapshots. Withdraw authority resurrected by restoring the central DB.
+    for (const principal of await listVerifiedPrincipalUsers()) {
+      if (!principal.user_id.startsWith('whatsapp:')) continue;
+      if (
+        principal.user_id !== `whatsapp:${record?.principal?.lid ?? ''}` ||
+        principal.verified_at !== record?.principalVerifiedAt
+      )
+        await removeWhatsAppPrincipalBinding(principal.user_id.slice('whatsapp:'.length));
+    }
+    if (record?.principal && record.principalVerifiedAt) await this.completeBinding(record);
     if (record?.state === 'needs-relink' && !record.pairing) await this.connection('close');
     if (!record?.pairing) return;
     if (record.pairing.expiresAt <= Date.now() || this.pairingDeadline !== record.pairing.expiresAt)
@@ -274,6 +290,11 @@ export class WhatsAppLinking {
         });
         return 'consume';
       }
+      if (record.binding && record.principalVerifiedAt) {
+        await this.completeBinding(record);
+        await transport()?.releaseHeldPrincipal(received.person.lid);
+        return containsBindingCode(received.content.text, record.binding.code) ? 'consume' : 'route';
+      }
       return 'route';
     }
     if (
@@ -283,22 +304,27 @@ export class WhatsAppLinking {
     )
       return 'route';
     const binding = record.binding;
-    const carriesCode =
-      binding &&
-      received.content.text
-        .split(/\s+/u)
-        .some((word) => word.replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/gu, '') === binding.code);
+    const carriesCode = binding && containsBindingCode(received.content.text, binding.code);
     if (!binding || binding.expiresAt <= Date.now() || received.content.forwarded || !carriesCode) return 'hold';
     const verifiedAt = new Date().toISOString();
-    await bindWhatsAppPrincipal(received.person, verifiedAt);
-    const { binding: _binding, ...bound } = record;
-    await writeWhatsAppLink(this.options.directory, {
-      ...bound,
+    const verified = {
+      ...record,
       principal: received.person,
       principalVerifiedAt: verifiedAt,
-    });
+    };
+    // Persist authenticated proof before central state, so a failed binding retries without asking the person again.
+    await writeWhatsAppLink(this.options.directory, verified);
+    await this.completeBinding(verified);
     await transport()?.releaseHeldPrincipal(received.person.lid);
     return 'consume';
+  }
+  private async completeBinding(record: WhatsAppLink): Promise<void> {
+    if (!record.principal || !record.principalVerifiedAt) return;
+    await bindWhatsAppPrincipal(record.principal, record.principalVerifiedAt);
+    if (record.binding) {
+      const { binding: _binding, ...bound } = record;
+      await writeWhatsAppLink(this.options.directory, bound);
+    }
   }
   private discardPending(record: WhatsAppLink): void {
     const number = record.number;
@@ -315,11 +341,38 @@ export class WhatsAppLinking {
     if (!record?.pairing) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    transport()?.clearAuth();
+    const hadAdapter = transport() !== undefined;
     await stopChannelAdapter('whatsapp');
     this.pairingDeadline = undefined;
+    const authFile = path.join(this.options.directory, 'auth.sqlite');
+    const exists = await fs.access(authFile).then(
+      () => true,
+      (error: unknown) => {
+        if (isErrno(error, 'ENOENT')) return false;
+        throw error;
+      },
+    );
+    let authenticated = false;
+    let logoutProven = false;
+    if (exists) {
+      const auth = new WhatsAppAuthStore(this.options.directory);
+      try {
+        authenticated = auth.authenticated;
+        logoutProven = !!record.number && auth.loggedOut(`${record.number.slice(1)}@s.whatsapp.net`);
+      } finally {
+        auth.close();
+      }
+    }
+    if (authenticated) {
+      // rc14 can emit authenticated pairing credentials before its required socket restart, without an open event.
+      const { pairing: _pairing, ...paired } = record;
+      await writeWhatsAppLink(this.options.directory, { ...paired, state: 'connected' });
+      // Factory reconciliation has an outer startup in flight; only runtime expiry replaces an existing adapter.
+      if (hadAdapter) await startChannelAdapter('whatsapp');
+      return;
+    }
     this.discardPending(record);
-    await fs.rm(path.join(this.options.directory, 'auth.sqlite'), { force: true });
+    if (!logoutProven) await fs.rm(authFile, { force: true });
     if (record.pairing.previousState) {
       const { pairing: _pairing, binding: _binding, ...previous } = record;
       await writeWhatsAppLink(this.options.directory, { ...previous, state: record.pairing.previousState });
@@ -336,15 +389,18 @@ export class WhatsAppLinking {
     return this.serialize(async () => {
       if (this.timer) clearTimeout(this.timer);
       this.timer = undefined;
-      await transport()?.logout();
+      const adapter = transport();
+      if (adapter) await adapter.logout();
+      else await logoutWhatsAppAccount({ directory: this.options.directory });
       await stopChannelAdapter('whatsapp');
       const record = await readWhatsAppLink(this.options.directory);
       this.pairingDeadline = undefined;
       if (record) this.discardPending(record);
       if (record?.principal) await removeWhatsAppPrincipalBinding(record.principal.lid);
-      for (const file of ['auth.sqlite', 'link.json'])
-        await fs.rm(path.join(this.options.directory, file), { force: true });
+      // Keep the native proof until both the durable link and its exclusive claim are gone.
+      await fs.rm(path.join(this.options.directory, 'link.json'), { force: true });
       await claimInstanceWhatsApp(this.options.paths, this.options.instanceId, undefined);
+      await fs.rm(path.join(this.options.directory, 'auth.sqlite'), { force: true });
       return { state: 'unlinked' };
     });
   }

@@ -2,7 +2,6 @@ import {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
-  fetchLatestWaWebVersion,
   makeWASocket,
   type BaileysEventEmitter,
   type BaileysEventMap,
@@ -34,6 +33,8 @@ import { createWhatsAppInbound } from './inbound.js';
 import { WhatsAppIndex } from './index-store.js';
 import { observeWhatsAppConnection, observeWhatsAppGroup } from './observers.js';
 import { createWhatsAppOutbound } from './outbound.js';
+import { resolveWaWebVersion } from './socket.js';
+export { resolveWaWebVersion } from './socket.js';
 import { readWhatsAppLink, writeWhatsAppLink, type WhatsAppLink, type WhatsAppPerson } from './paths.js';
 
 export type WhatsAppSocket = Pick<
@@ -81,7 +82,6 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   releaseHeldPrincipal(lid: string): Promise<void>;
   setProfile(name: string, about: string): Promise<void>;
   logout(): Promise<void>;
-  clearAuth(): void;
   fetchGroupMembers(platformId: string): Promise<WhatsAppGroup>;
   leaveGroup(platformId: string): Promise<void>;
   resolveNumber(number: string): Promise<WhatsAppPerson | undefined>;
@@ -108,32 +108,6 @@ export const WHATSAPP_DEFAULTS: ChannelDefaults = {
   mentions: 'platform',
 };
 const logger = pino({ level: 'silent' });
-
-/** Refuse Baileys' baked-in fallback: it is returned with isLatest=false/error when the lookup fails. */
-export async function resolveWaWebVersion(): Promise<[number, number, number]> {
-  const failures: unknown[] = [];
-  /* eslint-disable no-catch-all/no-catch-all -- both network lookups may fail; never substitute Baileys' built-in version */
-  try {
-    const response = await fetch('https://wppconnect.io/whatsapp-versions/', { signal: AbortSignal.timeout(5000) });
-    if (response.ok) {
-      const match = /\b2\.3000\.(\d+)\b/u.exec(await response.text());
-      if (match) return [2, 3000, Number(match[1])];
-    }
-  } catch (error) {
-    failures.push(error);
-  }
-  try {
-    const result = await fetchLatestWaWebVersion({ signal: AbortSignal.timeout(5000) });
-    if (result.isLatest && !result.error) return result.version;
-    failures.push(result.error);
-  } catch (error) {
-    failures.push(error);
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-  throw new Error('Could not resolve the current WhatsApp Web version; no socket was opened', {
-    cause: new AggregateError(failures),
-  });
-}
 
 export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsAppAdapter {
   const now = options.now ?? Date.now;
@@ -234,7 +208,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     reconnectTimer.unref();
   }
   function scheduleReplay(): void {
-    if (stopped || replayTimer || !connected || index.unrouted().length === 0) return;
+    if (stopped || replayTimer || !connected || !index.hasUnrouted()) return;
     replayTimer = setTimeout(() => {
       replayTimer = undefined;
       void inbound?.replay().then(scheduleReplay).catch(report);
@@ -386,7 +360,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
         if (link?.number && account?.phoneJid !== `${link.number.slice(1)}@s.whatsapp.net`) {
           socket = undefined;
           discardInbound = true;
-          auth.clear();
+          auth.clear({ kind: 'discarded' });
           await current.end(new Error('Linked WhatsApp account does not match the admitted assistant number'));
           await observeWhatsAppConnection({ connection: 'close' }, link);
           return;
@@ -405,7 +379,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
         const error = update.lastDisconnect?.error;
         const code = error && 'output' in error ? (error.output as { statusCode?: number }).statusCode : undefined;
         if (code === DisconnectReason.loggedOut) {
-          auth.clear();
+          auth.clear({ kind: 'logged-out', account: indexAccount() });
           await record({
             state: 'needs-relink',
             error: { message: 'WhatsApp was logged out; link the account again', at: new Date(now()).toISOString() },
@@ -501,15 +475,32 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       await socket.updateProfileStatus(about);
     },
     async logout() {
-      discardInbound = true;
+      if (!socket || !connected) {
+        const record = await readWhatsAppLink(options.directory);
+        const account = record?.number ? `${record.number.slice(1)}@s.whatsapp.net` : record?.account?.phoneJid;
+        if (account && auth.loggedOut(account)) {
+          discardInbound = true;
+          return;
+        }
+        if (!auth.authenticated && record?.state === 'linking' && !record.account) {
+          unlinking = true;
+          await socket?.end(undefined);
+          discardInbound = true;
+          return;
+        }
+        throw new ChannelNotConnectedError();
+      }
       unlinking = true;
-      if (socket && connected) await socket.logout();
-      connected = false;
-      auth.clear();
-    },
-    clearAuth() {
+      try {
+        await socket.logout();
+        await socket.end(undefined);
+      } catch (error) {
+        unlinking = false;
+        throw error;
+      }
       discardInbound = true;
-      auth.clear();
+      connected = false;
+      auth.clear({ kind: 'logged-out', account: indexAccount() });
     },
     async leaveGroup(platformId) {
       if (!/^[A-Za-z0-9-]+@g\.us$/u.test(platformId)) throw new Error('Leaving requires a WhatsApp group address.');
