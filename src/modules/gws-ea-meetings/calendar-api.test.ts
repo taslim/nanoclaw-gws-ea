@@ -411,8 +411,10 @@ describe('the Calendar client', () => {
     expect(await api.setGuests('pat@principal.example', 'evt-1', [own], 'none', '"1"')).toBe('gone');
   });
 
-  it('reads an event that is not there as undefined when its guests are asked for', async () => {
-    const { api } = stubGoogle(() => ({ status: 404, body: { error: { message: 'Not Found' } } }));
+  it('reads an event that is not there, or no longer is, as undefined when its guests are asked for', async () => {
+    const statuses = [404, 410];
+    const { api } = stubGoogle(() => ({ status: statuses.shift() ?? 500, body: { error: { message: 'Not Found' } } }));
     expect(await api.getGuests('pat@principal.example', 'missing')).toBeUndefined();
+    expect(await api.getGuests('pat@principal.example', 'deleted')).toBeUndefined();
   });
 });

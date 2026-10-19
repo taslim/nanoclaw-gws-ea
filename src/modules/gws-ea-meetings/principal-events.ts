@@ -68,6 +68,7 @@ import {
   isPrincipalCalendar,
   recordOwnCalendarChange,
 } from '../gws-ea-inbox/calendar-notifications.js';
+import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
 import { getGwsEaProfile, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
@@ -612,7 +613,9 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       }
       const tellsGuests = googleTells(owner, principal, [...added, ...removed]);
       const sendUpdates = tellsGuests ? 'all' : 'none';
-      if ((await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag)) === 'set') {
+      const written = await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag);
+      if (written === 'gone') throw forbidden(`No event ${eventId} on that calendar.`);
+      if (written === 'set') {
         recordOwnChange(owner, entry.id, eventId);
         return answered(
           invited,
@@ -692,7 +695,18 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       if (written === 'gone') throw forbidden(noEvent);
       if (written === 'changed') continue;
 
-      const after = await calendar().getGuests(entry.id, eventId);
+      const notice = sendUpdates === 'all' ? 'Google was asked to tell the organizer.' : 'Google emailed no one.';
+      let after: EventGuests | undefined;
+      try {
+        after = await calendar().getGuests(entry.id, eventId);
+      } catch (error) {
+        // Google took the write; only reading it back failed, so the answer is unconfirmed, not refused.
+        if (!(error instanceof GoogleApiError)) throw error;
+        return answered(
+          response,
+          `Google took the answer but could not show it back just now, so check it with gog calendar event before you tell the principal. ${notice}`,
+        );
+      }
       if (after === undefined || after.status === 'cancelled') throw forbidden(noEvent);
       const held = after.guests.find((guest) => guest.self === true)?.responseStatus;
       if (held !== response) {
@@ -702,9 +716,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       }
       return answered(
         response,
-        `Google now shows the principal as ${answerWords(response)}${scopeWords(current)}. ${
-          sendUpdates === 'all' ? 'Google was asked to tell the organizer.' : 'Google emailed no one.'
-        }`,
+        `Google now shows the principal as ${answerWords(response)}${scopeWords(current)}. ${notice}`,
       );
     }
     throw forbidden('The event kept changing while this ran: try again in a moment.');

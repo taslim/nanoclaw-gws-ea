@@ -77,6 +77,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import './index.js';
@@ -845,6 +846,15 @@ describe('change_guests', () => {
     expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
       'No event teamsync01 on that calendar.',
     );
+
+    // Deleted after the list changed under it twice: still gone, not "kept changing".
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.changeAfterNextGuestRead(() => calendar.put(teamSync([PRINCIPAL_GUEST, { email: REMY }])));
+    calendar.changeAfterNextGuestRead(() => calendar.put(teamSync([PRINCIPAL_GUEST])));
+    calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'teamsync01'));
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      'No event teamsync01 on that calendar.',
+    );
     expect(calendar.writes).toEqual([]);
   });
 
@@ -1108,6 +1118,36 @@ describe('respond_to_event', () => {
     calendar.changeAfterNextGuestRead(() => calendar.remove(PRINCIPAL, 'remyinvite1'));
     expect(refusal(await answer('remyinvite1', 'accepted'))).toBe('No event remyinvite1 on that calendar.');
     expect(calendar.writes).toEqual([]);
+  });
+
+  it('says the answer is unconfirmed, not refused, when Google takes it but cannot show it back', async () => {
+    calendar.put(invitation());
+    const read = calendar.getGuests.bind(calendar);
+    let reads = 0;
+    vi.spyOn(calendar, 'getGuests').mockImplementation(async (calendarId, eventId) => {
+      reads += 1;
+      if (reads === 2) throw new GoogleApiError(503, 'Google refused the read: Backend Error');
+      return read(calendarId, eventId);
+    });
+
+    const answered = data(await answer('remyinvite1', 'accepted'));
+
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'own' })]);
+    expect(answered.message).toBe(
+      'Google took the answer but could not show it back just now, so check it with gog calendar event before you tell the principal. Google was asked to tell the organizer.',
+    );
+  });
+
+  it('refuses when the event is deleted between its answer and the read back', async () => {
+    calendar.put(invitation());
+    const write = calendar.setOwnEntry.bind(calendar);
+    vi.spyOn(calendar, 'setOwnEntry').mockImplementationOnce(async (...args) => {
+      const written = await write(...args);
+      calendar.remove(PRINCIPAL, 'remyinvite1');
+      return written;
+    });
+
+    expect(refusal(await answer('remyinvite1', 'accepted'))).toBe('No event remyinvite1 on that calendar.');
   });
 
   it('reports, as a refusal, an answer Google did not keep', async () => {

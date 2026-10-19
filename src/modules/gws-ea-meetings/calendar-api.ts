@@ -563,9 +563,15 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         fields:
           'etag,status,organizer(email),attendees,attendeesOmitted,recurringEventId,recurrence,summary,description,location',
       });
-      const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
-        allowNotFound: true,
-      });
+      let payload: unknown;
+      try {
+        payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          allowNotFound: true,
+        });
+      } catch (error) {
+        if (isGone(error)) return undefined;
+        throw error;
+      }
       if (payload === undefined) return undefined;
       if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
       const etag = optionalString(payload.etag);
