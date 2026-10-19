@@ -727,6 +727,46 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     await delivery.deliverSessionMessages(session);
     expect(sent).toEqual([{ id: 'durable-send', timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u) }]);
   });
+  it('keeps a spent task session open while its reply waits for the channel', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'principal-dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('ag-1', 'mg-1', 'system:tasks:reminder', 'per-thread');
+    await manager.writeOutboundDirect('ag-1', session.id, {
+      id: 'task-reply',
+      kind: 'chat',
+      platformId: 'principal-dm',
+      channelType: 'whatsapp',
+      threadId: null,
+      content: JSON.stringify({ text: 'Your cabin choice is due today.' }),
+    });
+    const delivery = await import('../delivery.js');
+    const { ChannelNotConnectedError } = await import('../channels/adapter.js');
+    delivery.setDeliveryAdapter({
+      async deliver() {
+        throw new ChannelNotConnectedError();
+      },
+    });
+    await delivery.deliverSessionMessages(session);
+    const { reconcileSession } = await import('../reconcile-session.js');
+    const { getSession } = await import('../db/sessions.js');
+    await reconcileSession(session.id);
+    expect((await getSession(session.id))?.status).toBe('active');
+  });
 });
 
 describe('recorded divergence: request-addressed conversation reminders', () => {

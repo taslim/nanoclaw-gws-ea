@@ -91,6 +91,7 @@ async function freshHost() {
     container: await import('../../container-runner.js'),
     bridge: await import('./bridge.js'),
     lifecycle: await import('./lifecycle.js'),
+    hostLifecycle: await import('../../host-lifecycle.js'),
     agents: await import('../gws-ea-chat-agents/index.js'),
     hold: await import('./hold.js'),
     matter: await import('../gws-ea-matters/db.js'),
@@ -504,6 +505,31 @@ it('waits for a claimed reminder and its actual outbound delivery before stoppin
   expect(runtime.kill).toHaveBeenCalledOnce();
   expect((await read(await jobSession())).filter((row) => row.kind === 'task')).toEqual([]);
   expect(deliveredU11).toHaveBeenCalledOnce();
+});
+
+it('carries an admitted move through on the running host without waiting for the sweep', async () => {
+  const out = new Database(outboundDbPath(old.agent_group_id, old.id));
+  out
+    .prepare('INSERT INTO processing_ack(message_id,status,status_changed) VALUES(?,?,?)')
+    .run('answering-now', 'processing', new Date().toISOString());
+  const abort = new AbortController();
+  await host.hostLifecycle.startHostModules({
+    db: host.db.getDb(),
+    deliveryAdapter: host.channels.createChannelDeliveryAdapter(),
+    signal: abort.signal,
+  });
+  try {
+    await promote();
+    await vi.waitFor(() => expect(requestWake).toHaveBeenCalledWith(old, 'due-message'));
+    expect((await host.chat.getChat(chatId))?.state).toBe('moving');
+    out.prepare("UPDATE processing_ack SET status='completed' WHERE message_id='answering-now'").run();
+    await vi.waitFor(async () => expect((await host.chat.getChat(chatId))?.state).toBe('job'), { timeout: 5_000 });
+    expect(await host.handoffs.listChatHandoffs(chatId, true)).toEqual([]);
+  } finally {
+    out.close();
+    abort.abort();
+    await host.hostLifecycle.stopHostModules();
+  }
 });
 
 it('undoes a gateway creation failure, releases the intact old session and names the chat to main', async () => {

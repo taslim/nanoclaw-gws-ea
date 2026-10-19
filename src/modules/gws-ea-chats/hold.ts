@@ -87,7 +87,12 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
   await db.transaction(async () => {
     if (!(await getChat(chatId))) return;
     const now = new Date().toISOString();
-    await db.run('UPDATE gws_ea_chats SET state = ?, updated_at = ? WHERE messaging_group_id = ?', state, now, chatId);
+    await db.run(
+      'UPDATE gws_ea_chats SET state = ?, settled_at = NULL, updated_at = ? WHERE messaging_group_id = ?',
+      state,
+      now,
+      chatId,
+    );
     await db.run("UPDATE sessions SET status = 'closed' WHERE messaging_group_id = ?", chatId);
     if (await db.hasTable('gws_ea_job_agents'))
       await db.run(
@@ -115,7 +120,7 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
   await settleChatMessages(chatId);
   await resumeRetiringJobAgents();
 }
-/** After the central transition commits; safe to repeat after an interrupted detach. */
+/** After the central transition commits; safe to repeat after an interrupted detach, which the sweep does until it finishes. */
 export async function settleChatMessages(chatId: string): Promise<void> {
   const chat = await getChat(chatId);
   const terminal = chat?.state === 'declined' || chat?.state === 'detached';
@@ -139,6 +144,13 @@ export async function settleChatMessages(chatId: string): Promise<void> {
       } else mailbox.settleHeldMessages();
     });
   }
+  if (terminal)
+    await getDb().run(
+      'UPDATE gws_ea_chats SET settled_at = ? WHERE messaging_group_id = ? AND state = ?',
+      new Date().toISOString(),
+      chatId,
+      chat.state,
+    );
 }
 async function stopChatSession(sessionId: string): Promise<void> {
   if (!isContainerRunning(sessionId)) return;

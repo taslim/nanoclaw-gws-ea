@@ -23,9 +23,11 @@ import {
 } from './channels/channel-registry.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
 import { getDeliveryAttempt } from './db/coordination.js';
+import { getSession } from './db/sessions.js';
 import { deliverSessionMessages, registerDeliveryAction, setDeliveryAdapter } from './delivery.js';
 import { unguarded } from './guard/index.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
+import { reconcileSession } from './reconcile-session.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { resolveSession, withMailboxSession } from './session-manager.js';
 import type { Session } from './types.js';
@@ -132,6 +134,30 @@ describe('delivery during a channel outage', () => {
     await deliverSessionMessages(session);
     await deliverSessionMessages(session);
     expect(sent).toEqual(['gchat-reply', 'wa-first', 'wa-second']);
+  });
+
+  it('keeps a spent task session open until its waiting reply is delivered', async () => {
+    await conversation();
+    const task = (await resolveSession('main', 'whatsapp', 'system:tasks:reminder', 'per-thread')).session;
+    enqueue(task, 'task-reply', 'whatsapp');
+    let connected = false;
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(channel, _platform, _thread, _kind, _content, _files, _instance, messageId) {
+        if (channel === 'whatsapp' && !connected) throw new ChannelNotConnectedError();
+        sent.push(messageId!);
+        return `platform-${messageId}`;
+      },
+    });
+    await deliverSessionMessages(task);
+    await reconcileSession(task.id);
+    expect((await getSession(task.id))?.status).toBe('active');
+    connected = true;
+    vi.setSystemTime(Date.now() + 1_000);
+    await deliverSessionMessages(task);
+    expect(sent).toEqual(['task-reply']);
+    await reconcileSession(task.id);
+    expect((await getSession(task.id))?.status).toBe('closed');
   });
 
   it('passes the durable outbound id and original time through the real registry bridge', async () => {

@@ -8,6 +8,8 @@ export interface IndexedMessage {
   readonly chat: string;
   readonly id: string;
   readonly sender: string;
+  /** In a group, the member's address exactly as WhatsApp keyed the message; a reaction must name it. */
+  readonly participant?: string;
   readonly fromMe: boolean;
   readonly forwarded: boolean;
   readonly text: string;
@@ -18,6 +20,7 @@ interface MessageRow {
   chat: string;
   id: string;
   sender: string;
+  participant: string | null;
   from_me: number;
   forwarded: number;
   text: string;
@@ -66,7 +69,7 @@ export class WhatsAppIndex {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS intake(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,raw TEXT NOT NULL,PRIMARY KEY(account,chat,id));
       CREATE TABLE IF NOT EXISTS held_intake(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,lid TEXT NOT NULL,PRIMARY KEY(account,chat,id));
-      CREATE TABLE IF NOT EXISTS messages(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,from_me INTEGER NOT NULL,forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,PRIMARY KEY(account,chat,id));
+      CREATE TABLE IF NOT EXISTS messages(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,participant TEXT,from_me INTEGER NOT NULL,forwarded INTEGER NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,routed INTEGER NOT NULL,raw TEXT,wire TEXT,PRIMARY KEY(account,chat,id));
       CREATE INDEX IF NOT EXISTS messages_prune ON messages(at) WHERE from_me=0 AND routed=1;
       CREATE TABLE IF NOT EXISTS pending_sends(row_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS completed_sends(row_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,created_at INTEGER NOT NULL,accepted INTEGER NOT NULL CHECK(accepted=1),message_id TEXT NOT NULL);
@@ -84,7 +87,7 @@ export class WhatsAppIndex {
   message(chat: string, id: string): IndexedMessage | undefined {
     const row = this.db
       .prepare(
-        'SELECT chat,id,sender,from_me,forwarded,text,at,routed FROM messages WHERE account=? AND chat=? AND id=?',
+        'SELECT chat,id,sender,participant,from_me,forwarded,text,at,routed FROM messages WHERE account=? AND chat=? AND id=?',
       )
       .get(this.account(), chat, id) as MessageRow | undefined;
     return row === undefined
@@ -93,6 +96,7 @@ export class WhatsAppIndex {
           chat: row.chat,
           id: row.id,
           sender: row.sender,
+          ...(row.participant === null ? {} : { participant: row.participant }),
           fromMe: row.from_me === 1,
           forwarded: row.forwarded === 1,
           text: row.text,
@@ -103,13 +107,14 @@ export class WhatsAppIndex {
   receive(message: IndexedMessage, raw: WAMessage): void {
     this.db
       .prepare(
-        'INSERT INTO messages(account,chat,id,sender,from_me,forwarded,text,at,routed,raw) VALUES(?,?,?,?,?,?,?,?,0,?) ON CONFLICT(account,chat,id) DO NOTHING',
+        'INSERT INTO messages(account,chat,id,sender,participant,from_me,forwarded,text,at,routed,raw) VALUES(?,?,?,?,?,?,?,?,?,0,?) ON CONFLICT(account,chat,id) DO NOTHING',
       )
       .run(
         this.account(),
         message.chat,
         message.id,
         message.sender,
+        message.participant ?? null,
         Number(message.fromMe),
         Number(message.forwarded),
         message.text,

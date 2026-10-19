@@ -675,6 +675,11 @@ it('recovers terminal held settlement when the mailbox is unavailable after the 
   await sweepChatLifecycle();
   expect(await rows()).toEqual([expect.objectContaining({ status: 'completed' })]);
   vi.restoreAllMocks();
+  const opened = vi.spyOn(sessionManager, 'withExistingMailboxSession');
+  await sweepChatLifecycle();
+  await sweepChatLifecycle();
+  expect(opened).not.toHaveBeenCalled();
+  vi.restoreAllMocks();
 });
 it('records only a member’s own email and keeps main-supplied email authoritative', async () => {
   await routeInbound(inbound('someone-else', 'Alice’s email is alice@example.test'));

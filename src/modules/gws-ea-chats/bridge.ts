@@ -50,7 +50,7 @@ import {
 import { admitChat, declineChat, detachChat, releaseChatMessages, connectPrivateChatHandoff } from './hold.js';
 import { refreshChatMembership } from './join.js';
 import { setChatMemberEmail, type ChatMember } from './roster.js';
-import { admitChatMove, pauseMoveReminders, prepareChatMove } from './move.js';
+import { admitChatMove, driveChatMove, pauseMoveReminders, prepareChatMove } from './move.js';
 
 export const CHAT_TELL_MAIN_ACTION = 'chat_tell_main';
 const MAX_MESSAGE = 8_000;
@@ -343,7 +343,10 @@ const handoff: ActionAnswer = async (content, session, requestId) => {
         await admitChatMove(admitted, move, id);
       }
     });
-    if (content.job === true) await pauseMoveReminders(chatId);
+    if (content.job === true) {
+      await pauseMoveReminders(chatId);
+      driveChatMove(chatId);
+    }
     await flushChatHandoffs(chatId);
     return { chat: chatId, message: 'Your words are kept for this chat.' };
   });

@@ -23,7 +23,9 @@ An adapter can throw `ChannelNotConnectedError` before attempting a send. The
 delivery poll leaves the row pending without consuming a delivery attempt and
 backs off that adapter for one poll interval. Other channels and host actions in
 the same session keep delivering. Ordinary send failures retain their attempt
-limit, and missing adapters retain their existing behavior.
+limit, and missing adapters retain their existing behavior. A spent per-task
+session stays open while one of its rows waits: delivery skips closed sessions,
+so the reconcile pass closes it only once nothing due is left undelivered.
 
 The durable outbound row ID reaches `ChannelAdapter.deliver` as an optional
 fourth argument. An adapter can derive a platform message ID from it to reuse

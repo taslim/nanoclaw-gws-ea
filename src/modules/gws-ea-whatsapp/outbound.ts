@@ -104,13 +104,18 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     if (content.operation === 'reaction') {
       if (typeof content.messageId !== 'string' || typeof content.emoji !== 'string')
         throw new Error('WhatsApp reaction has no message id or emoji');
+      const target = options.index.message(platformId, content.messageId);
+      const participant = target?.participant;
+      if (platformId.endsWith('@g.us') && target?.fromMe !== true && participant === undefined)
+        throw new Error('WhatsApp cannot react to a group message whose sender it does not have');
       parts.push({
         react: {
           text: content.emoji,
           key: {
             remoteJid: platformId,
             id: content.messageId,
-            fromMe: options.index.message(platformId, content.messageId)?.fromMe ?? false,
+            fromMe: target?.fromMe ?? false,
+            ...(participant === undefined ? {} : { participant }),
           },
         },
       });

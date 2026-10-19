@@ -89,7 +89,20 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       if (person) options.index.rememberName(`${person.lid}@lid`, raw.pushName);
     }
     // Save before media/host routing: WhatsApp has already acknowledged this message.
-    options.index.receive({ chat: platformId, id, sender, fromMe: false, forwarded, text, at, routed: false }, raw);
+    options.index.receive(
+      {
+        chat: platformId,
+        id,
+        sender,
+        ...(isGroup && raw.key.participant ? { participant: raw.key.participant } : {}),
+        fromMe: false,
+        forwarded,
+        text,
+        at,
+        routed: false,
+      },
+      raw,
+    );
     if (!isGroup && person) options.onDirectMessage(person, at);
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);

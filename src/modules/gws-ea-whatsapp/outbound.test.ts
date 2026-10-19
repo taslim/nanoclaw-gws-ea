@@ -157,6 +157,32 @@ describe('durable WhatsApp outbound rows', () => {
     expect(h.socket().sends).toHaveLength(1);
     expect(h.socket().sends[0].content).toMatchObject({ image: Buffer.from('two') });
   });
+  it('names the group member who sent a message when it reacts, and its own message without one', async () => {
+    const adapter = await h.start();
+    await h.socket().emit('messages.upsert', { type: 'notify', messages: [incoming('from-pat', 'Lunch at noon?')] });
+    const own = await adapter.deliver('team@g.us', null, message, 'own-message');
+    const react = (messageId: string | undefined) => ({
+      kind: 'chat',
+      content: { operation: 'reaction', messageId, emoji: '👍' },
+    });
+    await adapter.deliver('team@g.us', null, react('from-pat'), 'react-member');
+    await adapter.deliver('team@g.us', null, react(own), 'react-own');
+    expect(
+      h
+        .socket()
+        .sends.slice(1)
+        .map((send) => send.content),
+    ).toEqual([
+      {
+        react: { text: '👍', key: { remoteJid: 'team@g.us', id: 'from-pat', fromMe: false, participant: '12000@lid' } },
+      },
+      { react: { text: '👍', key: { remoteJid: 'team@g.us', id: own, fromMe: true } } },
+    ]);
+    await expect(adapter.deliver('team@g.us', null, react('unknown'), 'react-unknown')).rejects.toThrow(
+      'does not have',
+    );
+    expect(h.socket().sends).toHaveLength(3);
+  });
   it('uses composing while a turn works and paused when it ends', async () => {
     const adapter = await h.start();
     await adapter.setTyping?.('team@g.us', null);

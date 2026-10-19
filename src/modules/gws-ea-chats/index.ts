@@ -32,6 +32,8 @@ import { EXPECT_REPLY_ACTION, consumeExpectedChatReply, expireExpectedChatReplie
 import { REMIND_ACTION } from './remind.js';
 import { CHAT_OUTREACH_ACTIONS } from './outreach.js';
 import { chatMoveMigration } from './move-migration.js';
+import { chatContextMigration } from './context-migration.js';
+import { chatSettleMigration } from './settle-migration.js';
 import { resumeChatMoves } from './move.js';
 import { resumeRetiringJobAgents } from '../gws-ea-chat-agents/index.js';
 
@@ -47,6 +49,8 @@ registerMigration(chatsMigration);
 registerMigration(chatHandoffMigration);
 registerMigration(chatToolsMigration);
 registerMigration(chatMoveMigration);
+registerMigration(chatContextMigration);
+registerMigration(chatSettleMigration);
 registerChatLifecycleTask('gws-ea-chats:moves', resumeChatMoves);
 registerChatLifecycleTask('gws-ea-chats:retirement', resumeRetiringJobAgents);
 registerDeliveryAction(...EXPECT_REPLY_ACTION);

@@ -29,13 +29,13 @@ export async function sweepChatLifecycle(): Promise<void> {
         const current = await getChat(chat.messaging_group_id);
         if (!current) return;
         if (current.state === 'asking') await notifyAskingChat(current);
-        const move = await getDb().get<{ move_source_session_id: string | null }>(
-          'SELECT move_source_session_id FROM gws_ea_chats WHERE messaging_group_id=?',
+        const upkeep = await getDb().get<{ move_source_session_id: string | null; settled_at: string | null }>(
+          'SELECT move_source_session_id,settled_at FROM gws_ea_chats WHERE messaging_group_id=?',
           current.messaging_group_id,
         );
-        if ((current.state === 'connected' || current.state === 'job') && !move?.move_source_session_id)
+        if ((current.state === 'connected' || current.state === 'job') && !upkeep?.move_source_session_id)
           await releaseChatMessages(current.messaging_group_id);
-        if (current.state === 'declined' || current.state === 'detached')
+        if ((current.state === 'declined' || current.state === 'detached') && !upkeep?.settled_at)
           await settleChatMessages(current.messaging_group_id);
       },
     );

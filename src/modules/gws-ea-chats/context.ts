@@ -51,24 +51,61 @@ function withoutUntrustedWrapperNonces(text: string): string {
   return text.replace(/^(<<<(?:END_)?EXTERNAL_UNTRUSTED_CONTENT) id="[0-9a-f]+"(>>>)$/gmu, '$1$2');
 }
 
-/** Host-owned context is written without a wake and de-duplicated by its actual contents. */
+const contextTails = new Map<string, Promise<void>>();
+
+/**
+ * Host-owned context is written without a wake, and only when the chat's
+ * facts differ from the last facts this session was told. Facts that change
+ * back are told again under a new version, so the newest context row is
+ * always the current one. Writes for one session run in order, and a write
+ * repeated after a stop between the row and its record lands once.
+ */
 export async function writeChatContext(session: Session): Promise<void> {
+  const previous = contextTails.get(session.id) ?? Promise.resolve();
+  const result = previous.then(() => writeCurrentChatContext(session));
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  contextTails.set(session.id, tail);
+  try {
+    await result;
+  } finally {
+    if (contextTails.get(session.id) === tail) contextTails.delete(session.id);
+  }
+}
+
+async function writeCurrentChatContext(session: Session): Promise<void> {
   const id = session.messaging_group_id;
   if (id === null) return;
   const chat = await getChat(id);
   if (!chat || chat.serving_agent_group_id !== session.agent_group_id) return;
   const text = await renderChatContext(id);
-  const fingerprintContent = withoutUntrustedWrapperNonces(text);
-  const key = createHash('sha256').update(fingerprintContent).digest('hex');
+  const fingerprint = createHash('sha256').update(withoutUntrustedWrapperNonces(text)).digest('hex');
+  const told = await getDb().get<{ fingerprint: string; version: number }>(
+    'SELECT fingerprint,version FROM gws_ea_chat_contexts WHERE session_id = ?',
+    session.id,
+  );
+  if (told?.fingerprint === fingerprint) return;
+  const version = (told?.version ?? 0) + 1;
+  const writtenAt = new Date().toISOString();
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `chat-context-${key}`,
+      id: `chat-context-${version}-${fingerprint}`,
       kind: 'chat',
-      timestamp: new Date().toISOString(),
+      timestamp: writtenAt,
       content: JSON.stringify({ sender: 'system', text }),
       trigger: false,
     });
   } catch (error) {
     if (!isDuplicateNote(error)) throw error;
   }
+  await getDb().run(
+    `INSERT INTO gws_ea_chat_contexts (session_id,fingerprint,version,written_at) VALUES (?,?,?,?)
+     ON CONFLICT(session_id) DO UPDATE SET fingerprint=excluded.fingerprint,version=excluded.version,written_at=excluded.written_at`,
+    session.id,
+    fingerprint,
+    version,
+    writtenAt,
+  );
 }

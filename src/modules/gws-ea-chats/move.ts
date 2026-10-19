@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import type { InboundRecord } from '../../mailbox/types.js';
 import { requestWake } from '../../request-wake.js';
@@ -130,7 +132,7 @@ async function drained(source: Session): Promise<boolean> {
       return (
         mailbox.getProcessingClaims().length === 0 &&
         mailbox.countDueMessages() === 0 &&
-        mailbox.getOutboundRecords('1970-01-01T00:00:00.000Z').every((row) => delivered.has(row.id))
+        mailbox.getDueMessages(delivered).length === 0
       );
     })) ?? true
   );
@@ -243,9 +245,9 @@ function movedInboundId(row: InboundRecord, source: Session, target: Session): s
 async function copyHolds(source: Session, target: Session): Promise<void> {
   const rows =
     (await withExistingMailboxSession(source.agent_group_id, source.id, (mailbox) =>
-      mailbox
-        .getInboundRecords()
-        .filter((row) => row.kind !== 'task' && (row.status === 'held' || row.status === 'pending')),
+      [...mailbox.getInboundRecords({ status: 'held' }), ...mailbox.getInboundRecords({ status: 'pending' })]
+        .filter((row) => row.kind !== 'task')
+        .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0)),
     )) ?? [];
   for (const row of rows) {
     await insertOnce(target, {
@@ -401,12 +403,79 @@ export async function moveChat(chatId: string): Promise<void> {
     log.warn('Chat move returned to its original conversation', { chatId, error });
   }
 }
+const moveTails = new Map<string, Promise<void>>();
+/** Move steps for one chat run one at a time, whether its driver or the sweep asks. */
+async function serialMoveChat(chatId: string): Promise<void> {
+  const previous = moveTails.get(chatId) ?? Promise.resolve();
+  const result = previous.then(() => moveChat(chatId));
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  moveTails.set(chatId, tail);
+  try {
+    await result;
+  } finally {
+    if (moveTails.get(chatId) === tail) moveTails.delete(chatId);
+  }
+}
+/** Whether moveChat still has work for this chat: the same test it starts with. */
+async function moveOwed(chatId: string): Promise<boolean> {
+  const chat = await getChat(chatId);
+  if (chat?.state !== 'moving' && chat?.state !== 'job' && chat?.state !== 'connected') return false;
+  return (await moveState(chatId)).move_source_session_id !== null;
+}
+
+const DRIVE_RETRY_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+const drives = new Map<string, Promise<void>>();
+let driving: AbortController | undefined;
+async function drive(chatId: string, signal: AbortSignal): Promise<void> {
+  /* eslint-disable no-catch-all/no-catch-all -- a failed step is retried on the next beat; it must not end the drive */
+  for (let attempt = 0; !signal.aborted; attempt++) {
+    try {
+      await serialMoveChat(chatId);
+      if (!(await moveOwed(chatId))) return;
+    } catch (error) {
+      if (!(error instanceof GwsEaError && error.code === 'instance_busy'))
+        log.error('Chat move will resume', { chatId, error });
+    }
+    try {
+      await sleep(DRIVE_RETRY_MS[Math.min(attempt, DRIVE_RETRY_MS.length - 1)], undefined, { signal, ref: false });
+    } catch {
+      return;
+    }
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+/**
+ * Carry an admitted move through now instead of at the next sweep. Each step
+ * that waits on the old conversation is retried soon, then less often, until
+ * the move finishes or is undone. Inert until the host starts.
+ */
+export function driveChatMove(chatId: string): void {
+  if (!driving || drives.has(chatId)) return;
+  const run = drive(chatId, driving.signal).finally(() => drives.delete(chatId));
+  drives.set(chatId, run);
+}
+onHostStart(() => {
+  driving = new AbortController();
+});
+onHostShutdown(async () => {
+  driving?.abort();
+  driving = undefined;
+  await Promise.all(drives.values());
+});
+
+/** The sweep's resume after a restart, and for any move its driver has left. */
 export async function resumeChatMoves(): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- each durable chat retries independently; failure must not stop the host's other moves */
   for (const chat of await listChats())
-    if (chat.state === 'moving' || chat.state === 'job' || chat.state === 'connected') {
+    if (
+      (chat.state === 'moving' || chat.state === 'job' || chat.state === 'connected') &&
+      !drives.has(chat.messaging_group_id)
+    ) {
       try {
-        await moveChat(chat.messaging_group_id);
+        await serialMoveChat(chat.messaging_group_id);
       } catch (error) {
         if (error instanceof GwsEaError && error.code === 'instance_busy') continue;
         log.error('Chat move will resume', { chatId: chat.messaging_group_id, error });

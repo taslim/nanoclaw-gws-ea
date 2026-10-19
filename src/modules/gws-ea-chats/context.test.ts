@@ -7,7 +7,7 @@ vi.mock('../../config.js', async (original) => ({
   DATA_DIR: ROOT,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
-import { closeDb } from '../../db/connection.js';
+import { closeDb, getDb } from '../../db/connection.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { renderChatContext, writeChatContext } from './context.js';
 import { seedContext } from './testing/context-fixture.js';
@@ -33,6 +33,34 @@ it('gives the chat only verified levels, framed source names, principal presence
   try {
     expect(db.prepare("SELECT trigger FROM messages_in WHERE id LIKE 'chat-context-%'").all()).toEqual([
       { trigger: 0 },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+it('tells the session again when the chat’s facts change back', async () => {
+  const { chat, session } = await seedContext();
+  const setPresent = (present: number) =>
+    getDb().run(
+      'UPDATE gws_ea_chats SET principal_present = ? WHERE messaging_group_id = ?',
+      present,
+      chat.messaging_group_id,
+    );
+  await writeChatContext(session);
+  await setPresent(0);
+  await writeChatContext(session);
+  await setPresent(1);
+  await writeChatContext(session);
+  await writeChatContext(session);
+  const db = new Database(inboundDbPath('external', session.id), { readonly: true });
+  try {
+    const rows = db.prepare("SELECT content FROM messages_in WHERE id LIKE 'chat-context-%' ORDER BY seq").all() as {
+      content: string;
+    }[];
+    expect(rows.map((row) => /Principal present: (true|false)\./u.exec(row.content)?.[1])).toEqual([
+      'true',
+      'false',
+      'true',
     ]);
   } finally {
     db.close();
