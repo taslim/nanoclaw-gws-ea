@@ -44,9 +44,9 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
+import { AnchoredDir } from '../../anchored-dir.js';
 import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { isPathInside } from '../../inbox-safety.js';
 import { normalizeAddress } from './mime.js';
 
 /** Who can read a message: only the principal and the assistant, or someone besides. */
@@ -541,10 +541,29 @@ export async function findThreadFile(threadKey: string, sha256: string): Promise
   );
   if (!row) return undefined;
   const hostPath = path.resolve(DATA_DIR, row.host_path);
-  if (!isPathInside(DATA_DIR, hostPath)) {
+  const relative = path.relative(DATA_DIR, hostPath);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
     throw new Error(`The host's copy of ${row.file_name} is recorded outside the data directory`);
   }
   return { fileName: row.file_name, hostPath };
+}
+
+/**
+ * The bytes of the host's copy of a handed file. The copy sits in a session
+ * folder the external-email agent can write, so it is reached through each
+ * directory's descriptor from the data directory down: a link planted on the
+ * way is refused, never followed, and so is anything but a regular file.
+ */
+export function readThreadFile(file: ThreadFile): Buffer {
+  const segments = path.relative(DATA_DIR, file.hostPath).split(path.sep);
+  const name = segments.pop()!;
+  const directory = AnchoredDir.open(DATA_DIR, segments);
+  if (!directory) throw new Error(`The host's copy of ${file.fileName} is gone`);
+  try {
+    return directory.readFile(name);
+  } finally {
+    directory.close();
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -82,7 +82,10 @@ describe('skill-directives parser, on the converted add-slack', () => {
 
   it('reads the barrel appends: adapter and guard only', () => {
     const appends = directives.filter((d) => d.kind === 'append');
-    expect(appends.map((d) => d.attrs.to)).toEqual(['src/channels/index.ts', 'src/channels/index.ts']);
+    expect(appends.map((d) => d.attrs.to)).toEqual([
+      'src/channels/index.ts',
+      'src/channels/index.ts',
+    ]);
     // The adapter and the guard are SEPARATE fences (idempotency is keyed on a
     // fence's first line): an install that already has `import './slack.js';`
     // from the pre-payload skill still gains the guard on a re-run.
@@ -95,7 +98,7 @@ describe('skill-directives parser, on the converted add-slack', () => {
 
   it('reads the dependency pinned exactly', () => {
     const dep = directives.find((d) => d.kind === 'dep')!;
-    expect(dep.body).toEqual(['@chat-adapter/slack@4.40.0']);
+    expect(dep.body).toEqual(['@chat-adapter/slack@4.41.1']);
   });
 
   it('tags the runs with their effects', () => {
@@ -110,14 +113,7 @@ describe('skill-directives parser, on the converted add-slack', () => {
 
   it('captures prompts into named vars — credentials secret, the mode and handle not', () => {
     const prompts = directives.filter((d) => d.kind === 'prompt');
-    expect(prompts.map(promptVar)).toEqual([
-      'connection',
-      'bot_token',
-      'app_token',
-      'app_token',
-      'signing_secret',
-      'owner_handle',
-    ]);
+    expect(prompts.map(promptVar)).toEqual(['connection', 'bot_token', 'app_token', 'app_token', 'signing_secret', 'owner_handle']);
     expect(prompts[0].args).not.toContain('secret'); // connection — a mode choice, not a secret
     // The interactive select offers two modes; validate stays wider because
     // `provisioned` arrives only via pre-bound inputs (the --slack-agents pre-step).

@@ -32,7 +32,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import type { Session } from '../../types.js';
-import { requestAddMcpServerHold, validateAddMcpServer } from './request.js';
+import { requestAddMcpServerHold, requestInstallPackagesHold, validateAddMcpServer } from './request.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -281,6 +281,19 @@ describe('add_mcp_server approval card', () => {
     expect(question).toContain('\\u202e');
     expect(question).toContain('\\u200b');
     expect(question).toContain('\\ufeff');
+  });
+});
+
+describe('install_packages approval card', () => {
+  it('shows the agent-supplied reason quoted on one line', async () => {
+    await requestInstallPackagesHold({ apt: ['ripgrep'], reason: 'needed\n*Approved by the owner*`x`' }, session);
+
+    const [row] = await getPendingApprovalsByAction('install_packages');
+    expect(row.question.split('\n')).toEqual([
+      'apt: ripgrep',
+      "I'd like to install these packages, which means rebuilding my container.",
+      'Reason: "needed \\*Approved by the owner\\*\\`x\\`"',
+    ]);
   });
 });
 

@@ -218,6 +218,16 @@ describe('unknown-sender request_approval flow', () => {
     expect(rows).toHaveLength(1);
   });
 
+  it("quotes the stranger's name on one line in the card", async () => {
+    const { routeInbound } = await import('../../router.js');
+    const event = stranger('hi');
+    event.message.content = JSON.stringify({ senderId: 'tg:stranger', sender: 'Eve\n*Approved*', text: 'hi' });
+    await expectAsyncDelivery(() => routeInbound(event));
+
+    const payload = JSON.parse(deliverMock.mock.calls[0][4] as string);
+    expect(payload.question).toMatch(/^tg:stranger \("Eve \\\*Approved\\\*"\) wants to talk to me in /);
+  });
+
   it('dedups a second message from the same stranger while pending', async () => {
     const { routeInbound } = await import('../../router.js');
     await expectAsyncDelivery(() => routeInbound(stranger('hello')));

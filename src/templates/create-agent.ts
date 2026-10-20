@@ -4,7 +4,7 @@ import path from 'path';
 
 import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
-import { createAgentGroup } from '../db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder } from '../db/agent-groups.js';
 import {
   ensureContainerConfig,
   updateContainerConfigJson,
@@ -12,7 +12,7 @@ import {
 } from '../db/container-configs.js';
 import type { McpServerConfig } from '../container-config.js';
 import { isValidTimezone } from '../timezone.js';
-import { assertValidGroupFolder, resolveGroupFolderPath } from '../group-folder.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../group-folder.js';
 import { stageGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
 import { normalizeName } from '../modules/agent-to-agent/db/agent-destinations.js';
@@ -25,9 +25,16 @@ import { parseTemplate } from './parse.js';
 import { copyPluginDir } from './plugin-dir.js';
 
 export interface CreateAgentOptions {
+  /**
+   * The new group's id, when the caller chose it to judge the group's
+   * destinations before creating it (create_agent). Omit for a fresh one.
+   */
+  id?: string;
   name?: string;
   /** IANA timezone for the new group; template task schedules fire in it. Omit to follow the install default. */
   timezone?: string;
+  /** Provider for the new group (a sub-agent takes its creator's). Omit for the install default. */
+  provider?: string;
 }
 
 export interface CreateAgentResult {
@@ -96,17 +103,21 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   const timezone = opts?.timezone && isValidTimezone(opts.timezone) ? opts.timezone : undefined;
   const tasks = prepareTemplateTasks(tpl.tasks, timezone ?? TIMEZONE);
 
-  const id = `ag-${randomUUID()}`;
+  const id = opts?.id ?? `ag-${randomUUID()}`;
   // Display-name fallback chain: explicit option → manifest extension
   // agentName → plugin folder leaf (exactly the pre-plugin derivation).
   const name = opts?.name ?? tpl.agentName ?? path.basename(dir);
   let folder = normalizeName(name);
   assertValidGroupFolder(folder);
-  if (fs.existsSync(resolveGroupFolderPath(folder))) folder = `${folder}-${randomUUID().slice(0, 8)}`;
+  // A group made by setup or a migration has its row before its folder (made at first spawn).
+  if (groupFolderExistsOnDisk(folder) || (await getAgentGroupByFolder(folder))) {
+    folder = `${folder}-${randomUUID().slice(0, 8)}`;
+    assertValidGroupFolder(folder);
+  }
 
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(group);
-  await ensureContainerConfig(id);
+  await ensureContainerConfig(id, opts?.provider);
   if (timezone) await updateContainerConfigScalars(id, { timezone });
 
   // group-init.ts owns the mkdir at first spawn, but it isn't called here — so we

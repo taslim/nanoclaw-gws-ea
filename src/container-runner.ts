@@ -66,15 +66,14 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider contracts use a separate barrel so update-skills identity detection
 // remains tied to src/providers/index.ts.
 import './provider-contracts/index.js';
-import { getProviderFileTransformer, type ProviderFileDiagnostic } from './provider-contracts/file-transformers.js';
 import {
   getProviderHostContract,
   sealedSessionContract,
   type ProviderHostContract,
 } from './provider-contracts/registry.js';
-import { writeAtomic } from './migrate-claude-memory-settings.js';
 import { resolveProviderName } from './providers/provider-name.js';
 import {
+  initializeFile,
   providerStateVolumePath,
   realizeProviderSpawnSurfaces,
   syncSharedSkillLinks,
@@ -1107,36 +1106,16 @@ async function realizeSessionSurfaces(
     selectedSkills,
     actions,
   );
+  // Through the volume directory's descriptor, as at group init: the session
+  // folder is the container's, so a symlink or FIFO planted at a file's name
+  // is refused, never followed.
+  const volumes = new Map(contract.stateVolumes.map((volume) => [volume.id, volume]));
   for (const file of contract.files) {
-    const prepare = file.prepare;
-    if (prepare.operation !== 'create-if-missing') continue;
-    const volume = contract.stateVolumes.find((candidate) => candidate.id === file.volumeId);
-    if (volume?.scope !== 'session') continue;
-    const target = path.join(providerStateVolumePath(volume, agentGroupId, sessionDirectory), file.relativePath);
-    if (!fs.existsSync(target)) {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, prepare.content, { flag: 'wx' });
-    } else if (file.reconcile) {
-      reconcileSessionFile(file.reconcile.transformer, target);
-    }
+    if (file.prepare.operation !== 'create-if-missing') continue;
+    if (volumes.get(file.volumeId)?.scope !== 'session') continue;
+    initializeFile(provider, file, volumes, agentGroupId, [], sessionDirectory);
   }
   return realization;
-}
-
-function reconcileSessionFile(transformerName: string, target: string): void {
-  const transformer = getProviderFileTransformer(transformerName);
-  if (!transformer) throw new Error(`Unknown provider file transformer '${transformerName}'`);
-  const diagnostics: ProviderFileDiagnostic[] = [];
-  /* eslint-disable no-catch-all/no-catch-all -- as at group init, a file that cannot be read or written is reported and left as it is */
-  try {
-    const result = transformer.transform(fs.readFileSync(target, 'utf-8'), target);
-    diagnostics.push(...(result.diagnostics ?? []));
-    if (result.kind === 'replace') writeAtomic(target, result.content);
-  } catch (err) {
-    diagnostics.push(transformer.mapIoFailure(err, target));
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-  for (const diagnostic of diagnostics) log[diagnostic.level](diagnostic.message, diagnostic.fields);
 }
 
 export async function buildMounts(
@@ -1556,17 +1535,12 @@ export function syncSkillSymlinks(
   claudeDir: string,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): string[] {
-  const skillsDir = path.join(claudeDir, 'skills');
-  if (!fs.existsSync(skillsDir)) {
-    fs.mkdirSync(skillsDir, { recursive: true });
-  }
-
   // Same body as the declared-contract path; real (non-symlink) entries are
   // either a template overlay (intentional; see src/group-skills.ts) or a stale
   // pre-refactor skill copy that shadows the shared skill (#3001), so the
   // skip is surfaced as a warning.
   const selected = selectedSkillNames(containerConfig);
-  syncSharedSkillLinks(skillsDir, selected, true);
+  syncSharedSkillLinks(claudeDir, ['skills'], selected, true);
   return selected;
 }
 

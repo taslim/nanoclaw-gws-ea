@@ -24,6 +24,8 @@
 import type { OutboundFile } from '../../channels/adapter.js';
 import {
   APPROVE_OPTION,
+  CardTooLongError,
+  cardQuestionTooLong,
   normalizeOptions,
   REJECT_OPTION,
   REJECT_WITH_REASON_OPTION,
@@ -244,6 +246,14 @@ function channelTypeOf(userId: string): string {
   return idx < 0 ? '' : userId.slice(0, idx);
 }
 
+/**
+ * A card joins the requester's thread only when it lands in the requester's own
+ * chat; a thread id from any other chat means nothing in the approver's DM.
+ */
+export function approvalCardThread(session: Session, target: MessagingGroup): string | null {
+  return session.messaging_group_id === target.id ? session.thread_id : null;
+}
+
 // ── Request API ──
 
 /** Send a system chat to the agent's session. Used by callers and by the response handler. */
@@ -316,6 +326,13 @@ export interface RequestPicture extends OutboundFile {
 export async function requestApproval(opts: RequestApprovalOptions): Promise<string | null> {
   const { session, action, payload, title, agentName, approverUserId } = opts;
 
+  // The approver must see the whole request: refuse what a card can't show in full.
+  const tooLong = cardQuestionTooLong(title, opts.question);
+  if (tooLong) {
+    await notifyAgent(session, `${action} failed: ${tooLong}. Shorten the request and try again.`);
+    return null;
+  }
+
   const approvers = approverUserId ? [approverUserId] : await pickApprover(session.agent_group_id);
   if (approvers.length === 0) {
     await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
@@ -365,7 +382,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
       messageId = await adapter.deliver(
         target.messagingGroup.channel_type,
         target.messagingGroup.platform_id,
-        null,
+        approvalCardThread(session, target.messagingGroup),
         'chat-sdk',
         JSON.stringify({
           type: 'ask_question',
@@ -383,7 +400,12 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
       // The single delivery target never saw the card — remove the row so it
       // can't linger as a pending approval nobody can act on.
       await deletePendingApproval(approvalId);
-      await notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
+      // A card the channel refused as too long says why, so the agent can shorten it.
+      const reason =
+        err instanceof CardTooLongError
+          ? `${err.message}. Shorten the request and try again.`
+          : `could not deliver approval request to ${target.userId}.`;
+      await notifyAgent(session, `${action} failed: ${reason}`);
       return null;
     }
     if (messageId) {
@@ -414,7 +436,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
         channelType: target.messagingGroup.channel_type,
         platformId: target.messagingGroup.platform_id,
         instance: target.messagingGroup.instance,
-        threadId: null,
+        threadId: approvalCardThread(session, target.messagingGroup),
       },
       {
         id: approvalId,

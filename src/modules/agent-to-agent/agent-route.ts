@@ -18,12 +18,12 @@
  * `channel_type === 'agent'` check. When the module is absent the check in
  * core throws with a "module not installed" message so retry → mark failed.
  */
-import fs from 'fs';
 import { createHash } from 'crypto';
-import path from 'path';
 
+import { AnchoredDir, copyRegularFile } from '../../anchored-dir.js';
+import { fenceForCard } from '../../card-text.js';
+import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
-import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { OutboundRefusedError } from '../../delivery.js';
@@ -76,106 +76,69 @@ export function forwardAttachedFiles(
     return [];
   }
 
-  const sourceDir = path.join(sessionDir(source.agentGroupId, source.sessionId), 'outbox', source.messageId);
-  if (!fs.existsSync(sourceDir)) {
-    log.warn('agent-route: source outbox dir missing, no files forwarded', {
-      sourceMsgId: source.messageId,
-      sourceDir,
-    });
+  // Both agents can write their own session folders, so either could turn
+  // `outbox`, `inbox` or a message dir into a symlink at any time. Each side is
+  // opened as an AnchoredDir (symlinks refused) and used only through it, the
+  // same way as the channel-inbound path (#2828, CWE-59).
+  let sourceDir: AnchoredDir | null;
+  try {
+    sourceDir = AnchoredDir.open(sessionDir(source.agentGroupId, source.sessionId), ['outbox', source.messageId]);
+  } catch (err) {
+    log.warn('agent-route: rejecting unsafe source outbox dir', { sourceMsgId: source.messageId, err });
+    return [];
+  }
+  if (!sourceDir) {
+    log.warn('agent-route: source outbox dir missing, no files forwarded', { sourceMsgId: source.messageId });
     return [];
   }
 
-  let realSourceDir: string;
+  let targetDir: AnchoredDir | null = null;
   try {
-    const sourceDirStat = fs.lstatSync(sourceDir);
-    if (!sourceDirStat.isDirectory() || sourceDirStat.isSymbolicLink()) {
-      log.warn('agent-route: rejecting unsafe source outbox dir', {
-        sourceMsgId: source.messageId,
-        sourceDir,
-      });
-      return [];
-    }
-    realSourceDir = fs.realpathSync(sourceDir);
+    targetDir = AnchoredDir.open(sessionDir(target.agentGroupId, target.sessionId), ['inbox', target.messageId], true);
   } catch (err) {
-    log.warn('agent-route: failed to inspect source outbox dir', {
-      sourceMsgId: source.messageId,
-      sourceDir,
+    log.warn('agent-route: rejecting unsafe target inbox dir', {
+      targetGroup: target.agentGroupId,
+      targetSession: target.sessionId,
+      targetMsgId: target.messageId,
       err,
     });
-    return [];
-  }
-
-  // Target-side containment — shared with the channel-inbound path. A
-  // compromised target agent can write inside its own session dir, so it could
-  // pre-place `inbox` (or `inbox/<future-msgId>`) as a symlink pointing
-  // anywhere host-writable; ensureContainedInboxDir refuses the symlink before
-  // any copy lands outside the sandbox (#2828, CWE-59).
-  const inboxRoot = path.join(sessionDir(target.agentGroupId, target.sessionId), 'inbox');
-  const targetInboxDir = ensureContainedInboxDir(inboxRoot, target.messageId, {
-    targetGroup: target.agentGroupId,
-    targetSession: target.sessionId,
-    targetMsgId: target.messageId,
-  });
-  if (!targetInboxDir) {
-    return [];
   }
 
   const attachments: ForwardedAttachment[] = [];
-  for (const filename of source.filenames) {
-    if (!isSafeAttachmentName(filename)) {
-      log.warn('agent-route: rejecting unsafe attachment filename (path traversal attempt?)', {
-        sourceMsgId: source.messageId,
-        filename,
-      });
-      continue;
-    }
-    const src = path.join(sourceDir, filename);
-    let realSrc: string;
-    try {
-      const srcStat = fs.lstatSync(src);
-      if (!srcStat.isFile() || srcStat.isSymbolicLink()) {
-        log.warn('agent-route: rejecting unsafe source outbox file', {
+  try {
+    if (!targetDir) return [];
+    for (const filename of source.filenames) {
+      if (!isSafeAttachmentName(filename)) {
+        log.warn('agent-route: rejecting unsafe attachment filename (path traversal attempt?)', {
           sourceMsgId: source.messageId,
           filename,
         });
         continue;
       }
-      realSrc = fs.realpathSync(src);
-    } catch {
-      log.warn('agent-route: referenced file missing in source outbox, skipped', {
-        sourceMsgId: source.messageId,
+      try {
+        // Stream source → target through both descriptors. Exclusive create on
+        // the target never follows or overwrites a pre-placed entry; neither
+        // side is addressed by path after its dir was opened.
+        copyRegularFile(sourceDir, filename, targetDir, filename);
+      } catch (err) {
+        log.warn('agent-route: skipped forwarding file (missing, unsafe, or already present)', {
+          sourceMsgId: source.messageId,
+          targetMsgId: target.messageId,
+          filename,
+          err,
+        });
+        continue;
+      }
+      attachments.push({
+        name: filename,
         filename,
+        type: 'file',
+        localPath: `inbox/${target.messageId}/${filename}`,
       });
-      continue;
     }
-    if (!isPathInside(realSourceDir, realSrc)) {
-      log.warn('agent-route: rejecting source file outside source outbox dir', {
-        sourceMsgId: source.messageId,
-        filename,
-      });
-      continue;
-    }
-    const dst = path.join(targetInboxDir, filename);
-    try {
-      // COPYFILE_EXCL: fail with EEXIST rather than follow or overwrite a
-      // pre-placed symlink / existing file at dst — the host is the sole
-      // writer of these attachments.
-      fs.copyFileSync(realSrc, dst, fs.constants.COPYFILE_EXCL);
-    } catch (err) {
-      log.warn('agent-route: refusing to write target inbox file', {
-        sourceMsgId: source.messageId,
-        targetMsgId: target.messageId,
-        filename,
-        err,
-      });
-      continue;
-    }
-    attachments.push({
-      name: filename,
-      filename,
-      type: 'file',
-      localPath: `inbox/${target.messageId}/${filename}`,
-    });
+  } finally {
+    sourceDir.close();
+    targetDir?.close();
   }
   return attachments;
 }
@@ -338,7 +301,7 @@ export async function routeAgentMessage(
       agentName: sourceName,
       action: A2A_MESSAGE_GATE_ACTION,
       approverUserId: decision.approverUserId,
-      title: 'Message approval',
+      title: GATE_CARD_TITLE,
       question: buildGateQuestion(sourceName, targetName, msg.content),
       payload: {
         id: msg.id,
@@ -360,6 +323,7 @@ export async function routeAgentMessage(
 }
 
 const GATE_CARD_BODY_MAX = 1500;
+const GATE_CARD_TITLE = 'Message approval';
 
 function parseMessageContent(contentStr: string): { text: string; files: string[] } {
   try {
@@ -375,19 +339,22 @@ function parseMessageContent(contentStr: string): { text: string; files: string[
 
 /**
  * The request for a held message, in the assistant's voice (KTD14): which of
- * its agents it passes between first, then what the sending agent wrote and
- * attached, each as one quoted line.
+ * its agents it passes between first, each as one quoted line, then what the
+ * sending agent wrote, in a fence sized to what the card limit leaves, and
+ * what it attached. Exported for tests.
  */
-function buildGateQuestion(sourceName: string, targetName: string, contentStr: string): string {
+export function buildGateQuestion(sourceName: string, targetName: string, contentStr: string): string {
   const { text, files } = parseMessageContent(contentStr);
-  const lines = [
-    `From: ${quoted(sourceName, NAME_LIMIT)}`,
-    `To: ${quoted(targetName, NAME_LIMIT)}`,
-    `Message: ${quoted(text, GATE_CARD_BODY_MAX)}`,
-    ...(files.length > 0 ? [`Attachments: ${files.map((file) => quoted(file, NAME_LIMIT)).join(', ')}`] : []),
-    "I'd like to pass this message between my agents.",
-  ];
-  return lines.join('\n');
+  const head = `From: ${quoted(sourceName, NAME_LIMIT)}\nTo: ${quoted(targetName, NAME_LIMIT)}\nMessage:\n`;
+  const tailLines =
+    files.length > 0 ? [`Attachments: ${files.map((file) => quoted(file, NAME_LIMIT)).join(', ')}`] : [];
+  tailLines.push("I'd like to pass this message between my agents.");
+  const tail = `\n${tailLines.join('\n')}`;
+  // The body gets whatever the card limit leaves once title, frame and fence
+  // count; escaping can grow text several times, so the cap is on escaped text.
+  const room = MAX_CARD_QUESTION_LENGTH - GATE_CARD_TITLE.length - head.length - tail.length - fenceForCard('').length;
+  const budget = Math.max(0, Math.min(GATE_CARD_BODY_MAX, room));
+  return head + fenceForCard(text, budget) + tail;
 }
 
 /**

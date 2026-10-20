@@ -19,7 +19,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { initTestDb, closeDb, runMigrations, getDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { AGENT_ACCESS_SCOPE_WARNING, createNewAgentGroup } from './channel-approval.js';
+import { AGENT_ACCESS_SCOPE_WARNING, createNewAgentGroup, describeResolvedRule } from './channel-approval.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import {
   initChannelAdapters,
@@ -59,6 +59,13 @@ const slackAdapter: ChannelAdapter = {
   defaults: telegramDefaults,
 };
 registerChannelAdapter('slack', { factory: () => slackAdapter, defaults: telegramDefaults });
+registerChannelAdapter('namepattern', {
+  factory: () => null,
+  defaults: {
+    ...telegramDefaults,
+    group: { ...telegramDefaults.group, engageMode: 'pattern', engagePattern: '\\b{name}\\b' },
+  },
+});
 
 // Mock container runner — prevent actual docker spawn.
 vi.mock('../../container-runner.js', () => ({
@@ -286,6 +293,7 @@ describe('unknown-channel registration flow', () => {
     const connectOption = payload.options.find((o: { value: string }) => o.value.startsWith('connect:'));
     expect(connectOption).toBeDefined();
     expect(connectOption.label).toContain('Andy');
+    expect(connectOption.selectedLabel).toBe('✅ Connected to "Andy"');
 
     const rows = await getDb().all<{ messaging_group_id: string }>('SELECT * FROM pending_channel_approvals');
     expect(rows).toHaveLength(1);
@@ -928,7 +936,7 @@ describe('channel registration answered on a channel that left it as posted', ()
 
     await answer(questionId, 'connect:ag-1');
 
-    expect(sentSinceRequest()).toEqual(['edit: ✅ Connected to Andy']);
+    expect(sentSinceRequest()).toEqual(['edit: ✅ Connected to "Andy"']);
     const [, platformId, , , content, , instance] = deliverMock.mock.calls[1]!;
     expect({ platformId, instance }).toEqual({ platformId: 'dm-owner', instance: 'telegram' });
     expect(JSON.parse(content as string)).toEqual(
@@ -1097,5 +1105,13 @@ describe('createNewAgentGroup — disk-aware folder dedupe (A4)', () => {
     expect(ag.folder).toBe('my-agent-2');
     // Residue untouched.
     expect(fs.readFileSync(path.join(residue, 'memory.md'), 'utf8')).toBe('old group memory\n');
+  });
+});
+
+describe('describeResolvedRule', () => {
+  it('shows a name-based pattern in a code span an agent name cannot leave', () => {
+    expect(describeResolvedRule('namepattern', true, 'Scout\n# Trusted `x`', 'namepattern')).toBe(
+      'will respond to messages matching `\\bScout\\u000a# Trusted \\u0060x\\u0060`',
+    );
   });
 });

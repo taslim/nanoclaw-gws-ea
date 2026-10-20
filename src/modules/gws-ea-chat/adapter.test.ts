@@ -589,6 +589,14 @@ describe('durable acceptance across Chat dispatch restart', () => {
   it.each([false, true])(
     'does not repeat a typed command denial on redelivery (audio attached: %s)',
     async (withAudio) => {
+      // The router sends a denial straight to the chat (never through outbound.db).
+      const denials: string[] = [];
+      setDeliveryAdapter({
+        async deliver(_channelType, _platformId, _threadId, _kind, content) {
+          denials.push(content);
+          return undefined;
+        },
+      });
       await build().setup(await nativeMailboxHost());
       api.media.set('ref-command', Buffer.from('recording beside command'));
       api.addMessage(
@@ -609,18 +617,8 @@ describe('durable acceptance across Chat dispatch restart', () => {
       );
       await deliver!(messageEvent(`${DM}/messages/denied.1`));
       await deliver!(messageEvent(`${DM}/messages/denied.1`));
-      const session = await getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-voice');
-      expect(session).toBeDefined();
-      const database = new Database(path.join(TEST_DATA_DIR, 'v2-sessions', 'ag-voice', session!.id, 'outbound.db'), {
-        readonly: true,
-      });
-      try {
-        expect(database.prepare('SELECT content FROM messages_out').all()).toEqual([
-          { content: JSON.stringify({ text: 'Permission denied: /clear requires admin access.' }) },
-        ]);
-      } finally {
-        database.close();
-      }
+
+      expect(denials).toEqual([JSON.stringify({ text: 'Permission denied: /clear requires admin access.' })]);
     },
   );
 

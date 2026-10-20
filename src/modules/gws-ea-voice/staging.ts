@@ -1,7 +1,13 @@
-import { constants } from 'node:fs';
-import { lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises';
+import fs from 'node:fs';
+import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { isPathInside } from '../../inbox-safety.js';
+import { promisify } from 'node:util';
+
+import { AnchoredDir } from '../../anchored-dir.js';
+
+const readAt = promisify(fs.read);
+const fstat = promisify(fs.fstat);
+const close = promisify(fs.close);
 
 export const MAX_VOICE_INPUT_BYTES = 64 * 1024 * 1024;
 
@@ -37,43 +43,45 @@ export async function readOriginalAudio(
   const lexicalRoot = path.resolve(attachmentRoot);
   const rootInfo = await lstat(lexicalRoot);
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new VoiceMediaError('unsafe-audio');
-  // Releases deliberately link data/ to their own physical state. Trust that
-  // operator-owned ancestor while refusing links at/below the adapter root.
-  const root = await realpath(lexicalRoot);
-  const supplied = path.resolve(attachment.path);
-  const file = isPathInside(lexicalRoot, supplied) ? path.join(root, path.relative(lexicalRoot, supplied)) : supplied;
-  if (!isPathInside(root, file) || file === root) throw new VoiceMediaError('unsafe-audio');
-  // Lexical and physical containment; no component may redirect the host.
-  let current = root;
-  const components = path.relative(root, file).split(path.sep);
-  const chain = ['', ...components];
-  for (let index = 0; index < chain.length; index++) {
-    const component = chain[index];
-    current = component ? path.join(current, component) : current;
-    const info = await lstat(current);
-    if (info.isSymbolicLink() || (index === chain.length - 1 ? !info.isFile() : !info.isDirectory())) {
-      throw new VoiceMediaError('unsafe-audio');
-    }
-  }
-  if ((await realpath(file)) !== file || (await realpath(root)) !== root) throw new VoiceMediaError('unsafe-audio');
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const relative = path.relative(lexicalRoot, path.resolve(attachment.path));
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new VoiceMediaError('unsafe-audio');
+  // Releases deliberately link data/ to their own physical state, so the
+  // root's operator-owned ancestors are trusted; below it, each component is
+  // opened through its parent and no link may redirect the host.
+  const segments = relative.split(path.sep);
+  const leaf = segments.pop()!;
+  let fd: number;
   try {
-    const info = await handle.stat();
-    if (!info.isFile() || (typeof process.getuid === 'function' && info.uid !== process.getuid()))
+    const directory = AnchoredDir.open(lexicalRoot, segments);
+    if (!directory) throw new VoiceMediaError('missing-audio');
+    try {
+      fd = directory.openReadFd(leaf);
+    } finally {
+      directory.close();
+    }
+  } catch (error) {
+    if (error instanceof VoiceMediaError) throw error;
+    const code = error instanceof Error && 'code' in error ? error.code : undefined;
+    if (code === 'ENOENT') throw new VoiceMediaError('missing-audio', error);
+    throw new VoiceMediaError('unsafe-audio', error);
+  }
+  try {
+    const info = await fstat(fd);
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid())
       throw new VoiceMediaError('unsafe-audio');
     if (info.size === 0) throw new VoiceMediaError('missing-audio');
     if (info.size > MAX_VOICE_INPUT_BYTES) throw new VoiceMediaError('input-limit');
     const bytes = Buffer.alloc(info.size);
     let offset = 0;
     while (offset < bytes.length) {
-      const read = await handle.read(bytes, offset, bytes.length - offset, offset);
-      if (read.bytesRead === 0) throw new VoiceMediaError('missing-audio');
-      offset += read.bytesRead;
+      const { bytesRead } = await readAt(fd, bytes, offset, bytes.length - offset, offset);
+      if (bytesRead === 0) throw new VoiceMediaError('missing-audio');
+      offset += bytesRead;
     }
-    if ((await handle.stat()).size !== info.size) throw new VoiceMediaError('unsafe-audio');
+    if ((await fstat(fd)).size !== info.size) throw new VoiceMediaError('unsafe-audio');
     return bytes;
   } finally {
-    await handle.close();
+    await close(fd);
   }
 }
 

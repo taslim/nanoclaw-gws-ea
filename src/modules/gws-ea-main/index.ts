@@ -65,10 +65,11 @@ register({
   description: "Set canonical main's NanoClaw shared skills to the release's list.",
   access: 'hidden',
   hostOnly: true,
+  // Dispatch hands over canonical keys (src/cli/args.ts): `--agent-group-id` arrives as `agent_group_id`.
   parseArgs(raw) {
-    const unknown = Object.keys(raw).filter((key) => key !== 'agent-group-id');
-    if (unknown.length > 0) throw new Error(`Unknown main field: --${unknown[0]}`);
-    const agentGroupId = raw['agent-group-id'];
+    const unknown = Object.keys(raw).filter((key) => key !== 'agent_group_id');
+    if (unknown.length > 0) throw new Error(`Unknown main field: --${unknown[0].replace(/_/g, '-')}`);
+    const agentGroupId = raw.agent_group_id;
     if (typeof agentGroupId !== 'string' || agentGroupId.length === 0) throw new Error('--agent-group-id is required');
     return agentGroupId;
   },

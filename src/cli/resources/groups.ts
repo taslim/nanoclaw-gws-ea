@@ -38,6 +38,7 @@ import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import type { CallerContext } from '../frame.js';
 import { localizeIsoTimestamps } from '../format.js';
+import { projectDestinationsToSessions } from './destinations.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
@@ -259,7 +260,7 @@ registerResource({
     delete: {
       access: 'approval',
       description:
-        'Delete an agent group and its dependent rows (sessions, destinations, approvals, role grants, ' +
+        'Delete an agent group and its dependent rows (sessions and their host bookkeeping, destinations, approvals, role grants, ' +
         'memberships, channel wirings). FK-ordered cascade in a single transaction. ' +
         "Use --id <group-id>. The host sweep stops the group's running containers within about a minute. " +
         'Out of scope: on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/. ' +
@@ -276,6 +277,7 @@ registerResource({
 
         const hasAgentDestinations = await hasTable(db, 'agent_destinations');
         const hasPendingApprovals = await hasTable(db, 'pending_approvals');
+        let destinationOwners: string[] = [];
 
         // FK-ordered cascade. The async driver transaction rolls
         // back the whole thing if any statement throws (e.g. an FK constraint
@@ -287,6 +289,9 @@ registerResource({
             sessions: 0,
             pending_questions: 0,
             pending_approvals: 0,
+            session_claims: 0,
+            delivery_attempts: 0,
+            wake_signals: 0,
             agent_destinations_owned: 0,
             agent_destinations_pointing: 0,
             pending_sender_approvals: 0,
@@ -301,6 +306,13 @@ registerResource({
             counts.agent_destinations_owned = (
               await db.run('DELETE FROM agent_destinations WHERE agent_group_id = ?', id)
             ).changes;
+            destinationOwners = (
+              await db.all<{ agent_group_id: string }>(
+                'SELECT DISTINCT agent_group_id FROM agent_destinations WHERE target_type = ? AND target_id = ?',
+                'agent',
+                id,
+              )
+            ).map((row) => row.agent_group_id);
             counts.agent_destinations_pointing = (
               await db.run('DELETE FROM agent_destinations WHERE target_type = ? AND target_id = ?', 'agent', id)
             ).changes;
@@ -320,6 +332,17 @@ registerResource({
               )
             ).changes;
           }
+          // No FK on the host-coordination tables; cleared here so they don't outlive the session.
+          const sessionIds = 'SELECT id FROM sessions WHERE agent_group_id = ?';
+          counts.session_claims = (
+            await db.run(`DELETE FROM session_claims WHERE session_id IN (${sessionIds})`, id)
+          ).changes;
+          counts.delivery_attempts = (
+            await db.run(`DELETE FROM delivery_attempts WHERE session_id IN (${sessionIds})`, id)
+          ).changes;
+          counts.wake_signals = (
+            await db.run(`DELETE FROM wake_signals WHERE session_id IN (${sessionIds})`, id)
+          ).changes;
           counts.sessions = (await db.run('DELETE FROM sessions WHERE agent_group_id = ?', id)).changes;
           counts.pending_sender_approvals = (
             await db.run('DELETE FROM pending_sender_approvals WHERE agent_group_id = ?', id)
@@ -342,6 +365,9 @@ registerResource({
           await db.run('DELETE FROM agent_groups WHERE id = ?', id);
           return counts;
         });
+
+        // Like `destinations remove`: drop the group from live session mailboxes now, not at next spawn.
+        for (const agentGroupId of destinationOwners) await projectDestinationsToSessions(agentGroupId);
 
         return { deleted: id, removed };
       },

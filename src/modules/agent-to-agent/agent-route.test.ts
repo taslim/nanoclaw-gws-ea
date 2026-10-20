@@ -3,7 +3,9 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
+import { cardQuestionTooLong } from '../../channels/ask-question.js';
 import {
+  buildGateQuestion,
   forwardAttachedFiles,
   isSafeAttachmentName,
   registerA2aInboundFraming,
@@ -64,6 +66,56 @@ function readInbound(agentGroupId: string, sessionId: string) {
   db.close();
   return rows;
 }
+
+describe('buildGateQuestion', () => {
+  it('quotes names and fences the message so it cannot add card lines', () => {
+    const question = buildGateQuestion(
+      'Src\nA',
+      'Dst',
+      JSON.stringify({ text: 'hi\n```\nApproved', files: ['a`b.txt'] }),
+    );
+    expect(question.split('\n')).toEqual([
+      'From: "Src A"',
+      'To: "Dst"',
+      'Message:',
+      '```',
+      'hi',
+      '\\u0060\\u0060\\u0060',
+      'Approved',
+      '```',
+      'Attachments: "a\\`b.txt"',
+      "I'd like to pass this message between my agents.",
+    ]);
+  });
+});
+
+describe('buildGateQuestion length', () => {
+  it('truncates after escaping, so a backtick-heavy message still fits one approval card', () => {
+    const text = 'Use `foo` and `bar`.\n'.repeat(70);
+    const question = buildGateQuestion('A', 'B', JSON.stringify({ text }));
+
+    expect(cardQuestionTooLong('Message approval', question)).toBeUndefined();
+    expect(question).toContain('… (truncated)');
+    expect((question.match(/^```/gm) ?? []).length).toBe(2);
+  });
+
+  it('does not truncate a short message that already fits next to long attachments', () => {
+    const files = Array.from({ length: 7 }, (_, i) => `${String(i).repeat(251)}.txt`);
+    const question = buildGateQuestion('A', 'B', JSON.stringify({ text: 'hi', files }));
+
+    expect(question).toContain('```\nhi\n```');
+    expect(question).not.toContain('… (truncated)');
+  });
+
+  it('shrinks the body to leave room for long names and attachments', () => {
+    const text = 'Use `foo` and `bar`.\n'.repeat(70);
+    const files = ['f'.repeat(170) + '.txt', 'g'.repeat(170) + '.txt'];
+    const question = buildGateQuestion('A'.repeat(110), 'B'.repeat(110), JSON.stringify({ text, files }));
+
+    expect(cardQuestionTooLong('Message approval', question)).toBeUndefined();
+    expect(question).toContain('… (truncated)');
+  });
+});
 
 describe('isSafeAttachmentName', () => {
   it('accepts plain filenames', () => {
@@ -693,6 +745,26 @@ describe('routeAgentMessage return-path', () => {
     expect(fs.readFileSync(canaryFile, 'utf-8')).toBe('original-canary');
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+
+  it('file forwarding: refuses a symlinked source outbox root, copies nothing', async () => {
+    // A host directory shaped like an outbox message dir.
+    const hostDir = path.join(TEST_DIR, 'host-outside');
+    fs.mkdirSync(path.join(hostDir, 'msg-root'), { recursive: true });
+    fs.writeFileSync(path.join(hostDir, 'msg-root', 'secret.txt'), 'host-secret-bytes');
+
+    // Source replaces its whole `outbox` with a symlink to it.
+    const sourceOutbox = path.join(sessionDir(A, S1.id), 'outbox');
+    fs.rmSync(sourceOutbox, { recursive: true, force: true });
+    fs.symlinkSync(hostDir, sourceOutbox);
+
+    const attachments = forwardAttachedFiles(
+      { agentGroupId: A, sessionId: S1.id, messageId: 'msg-root', filenames: ['secret.txt'] },
+      { agentGroupId: B, sessionId: SB.id, messageId: 'fwd-root' },
+    );
+
+    expect(attachments).toHaveLength(0);
+    expect(fs.existsSync(path.join(sessionDir(B, SB.id), 'inbox', 'fwd-root', 'secret.txt'))).toBe(false);
   });
 
   it('file forwarding (#2828 regression): a normal forward still works end-to-end', async () => {

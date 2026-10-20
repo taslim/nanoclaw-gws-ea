@@ -22,6 +22,7 @@ import { getContainerConfig } from '../db/container-configs.js';
 import { getMessagingGroupAgent } from '../db/messaging-groups.js';
 import { getSession } from '../db/sessions.js';
 import { ALLOW, DENY, HOLD, type GuardedActionSpec, type GuardInput } from '../guard/index.js';
+import { normalizeArgs } from './args.js';
 import { GROUP_SCOPE_RESOURCES, type CommandDef } from './registry.js';
 
 const GROUP_WIRING_COMMANDS = new Set(['wirings-get', 'wirings-update']);
@@ -58,16 +59,17 @@ export async function protectedGroupReason(agentGroupId: string): Promise<string
 }
 
 /**
- * The agent groups a command names: its group arguments, `--id` where it is
- * the group (groups, destinations) or names a row of one (a wiring, a
- * session), and both ends of an agent message policy.
+ * The agent groups a command names, read from its canonical args
+ * (./args.ts): its group arguments, `--id` where it is the group (groups,
+ * destinations) or names a row of one (a wiring, a session), and both ends of
+ * an agent message policy.
  */
 async function namedGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
   const named = new Set<string>();
   const add = (value: unknown): void => {
     if (typeof value === 'string' && value.length > 0) named.add(value);
   };
-  for (const key of ['agent_group_id', 'agent-group-id', 'group']) add(args[key]);
+  for (const key of ['agent_group_id', 'group']) add(args[key]);
   if (cmd.resource === 'policies') for (const key of ['from', 'to']) add(args[key]);
   if (typeof args.id === 'string') {
     if (cmd.resource === 'groups' || cmd.resource === 'destinations') add(args.id);
@@ -113,14 +115,23 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
     return DENY(`"${cmd.name}" is operator-only and cannot be run from inside a container.`);
   }
 
+  // Dispatch already canonicalized the payload; doing it again (idempotent)
+  // keeps this decision on the keys the handler reads whoever calls it.
+  let args: Record<string, unknown>;
+  try {
+    args = normalizeArgs(input.payload);
+  } catch (e) {
+    return DENY(e instanceof Error ? e.message : String(e));
+  }
+
+  // On the canonical keys, so no spelling of a group argument names a
+  // protected group without being seen here.
   if (protectedGroupPolicies.size > 0) {
-    for (const agentGroupId of await namedGroups(cmd, input.payload)) {
+    for (const agentGroupId of await namedGroups(cmd, args)) {
       const reason = await protectedGroupReason(agentGroupId);
       if (reason !== undefined) return DENY(`"${cmd.name}" may not address agent group ${agentGroupId}: ${reason}`);
     }
   }
-
-  const args = input.payload;
   const cliScope = (await getContainerConfig(actor.agentGroupId))?.cli_scope ?? 'group';
 
   if (cliScope === 'disabled') {
@@ -138,25 +149,29 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
     // Enforce group scope on all agent-group-related args.
     // Different resources use different arg names for the agent group ID.
     // Only check --id for resources where it IS the agent group ID.
-    for (const key of ['agent_group_id', 'group'] as const) {
-      if (args[key] && args[key] !== actor.agentGroupId) {
+    // Dispatch auto-fills these, so each must be exactly this group: handlers
+    // treat '' / 0 / false / absent as "no filter", and a missing key means
+    // the fill did not run (e.g. cli_scope changed between the two reads).
+    const scopeKeys =
+      cmd.resource === 'groups' || cmd.resource === 'destinations'
+        ? (['agent_group_id', 'group', 'id'] as const)
+        : (['agent_group_id', 'group'] as const);
+    for (const key of scopeKeys) {
+      if (args[key] !== actor.agentGroupId) {
         return DENY('CLI access is scoped to this agent group.');
       }
-    }
-    if ((cmd.resource === 'groups' || cmd.resource === 'destinations') && args.id && args.id !== actor.agentGroupId) {
-      return DENY('CLI access is scoped to this agent group.');
     }
 
     if (
       groupWiringCommand &&
       cmd.name === 'wirings-update' &&
-      Object.keys(args).some((key) => !GROUP_WIRING_UPDATE_ARGS.has(key.replace(/-/g, '_')))
+      Object.keys(args).some((key) => !GROUP_WIRING_UPDATE_ARGS.has(key))
     ) {
       return DENY('Group-scoped wiring updates may only change engage_mode or engage_pattern.');
     }
 
     // Block cli_scope changes from group-scoped agents (privilege escalation)
-    if (args.cli_scope !== undefined || args['cli-scope'] !== undefined) {
+    if (args.cli_scope !== undefined) {
       return DENY('Cannot change cli_scope from a group-scoped agent.');
     }
   }

@@ -157,13 +157,16 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
 
 registerRequiredProjectDocSection('gws-ea-profile:identity', identitySection);
 
+/** A canonical key as the flag the control plane passes (src/cli/args.ts canonicalizes `-` to `_`). */
+const flag = (key: string): string => `--${key.replace(/_/g, '-')}`;
+
 const reconcileKeys = new Set([
-  'assistant-display-name',
-  'assistant-workspace-email',
-  'principal-display-name',
-  'principal-timezone',
-  'main-agent-group-id',
-  'principal-emails',
+  'assistant_display_name',
+  'assistant_workspace_email',
+  'principal_display_name',
+  'principal_timezone',
+  'main_agent_group_id',
+  'principal_emails',
 ]);
 
 /** `--principal-emails`: a JSON array of addresses, as the control plane passes it. */
@@ -187,21 +190,21 @@ register({
   hostOnly: true,
   parseArgs(raw) {
     const unknown = Object.keys(raw).filter((key) => !reconcileKeys.has(key));
-    if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
+    if (unknown.length > 0) throw new Error(`Unknown profile field: ${flag(unknown[0])}`);
     const required = (key: string): string => {
       const value = raw[key];
-      if (typeof value !== 'string' || value.length === 0) throw new Error(`--${key} is required`);
+      if (typeof value !== 'string' || value.length === 0) throw new Error(`${flag(key)} is required`);
       return value;
     };
     // The principal's name and timezone seed the profile: create declares them, and nothing after it.
     const seed = (key: string): string | undefined => (raw[key] === undefined ? undefined : required(key));
-    const principalEmails = raw['principal-emails'];
+    const principalEmails = raw.principal_emails;
     return validateGwsEaProfileInput({
-      assistantDisplayName: required('assistant-display-name'),
-      assistantWorkspaceEmail: required('assistant-workspace-email'),
-      principalDisplayName: seed('principal-display-name'),
-      principalTimezone: seed('principal-timezone'),
-      mainAgentGroupId: required('main-agent-group-id'),
+      assistantDisplayName: required('assistant_display_name'),
+      assistantWorkspaceEmail: required('assistant_workspace_email'),
+      principalDisplayName: seed('principal_display_name'),
+      principalTimezone: seed('principal_timezone'),
+      mainAgentGroupId: required('main_agent_group_id'),
       ...(principalEmails === undefined ? {} : { principalEmails: parsePrincipalEmails(principalEmails) }),
     });
   },
@@ -215,13 +218,13 @@ register({
   hostOnly: true,
   parseArgs(raw) {
     const unknown = Object.keys(raw);
-    if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
+    if (unknown.length > 0) throw new Error(`Unknown profile field: ${flag(unknown[0])}`);
     return undefined;
   },
   handler: async () => getGwsEaProfile(),
 });
 
-const bindPrincipalKeys = new Set(['user-id', 'verified-at', 'messaging-group-id']);
+const bindPrincipalKeys = new Set(['user_id', 'verified_at', 'messaging_group_id']);
 
 register({
   name: 'gws-ea-profile-bind-principal',
@@ -231,16 +234,16 @@ register({
   hostOnly: true,
   parseArgs(raw) {
     const unknown = Object.keys(raw).filter((key) => !bindPrincipalKeys.has(key));
-    if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
+    if (unknown.length > 0) throw new Error(`Unknown profile field: ${flag(unknown[0])}`);
     const required = (key: string): string => {
       const value = raw[key];
-      if (typeof value !== 'string' || value.length === 0) throw new Error(`--${key} is required`);
+      if (typeof value !== 'string' || value.length === 0) throw new Error(`${flag(key)} is required`);
       return value;
     };
     return {
-      userId: required('user-id'),
-      verifiedAt: required('verified-at'),
-      messagingGroupId: required('messaging-group-id'),
+      userId: required('user_id'),
+      verifiedAt: required('verified_at'),
+      messagingGroupId: required('messaging_group_id'),
     };
   },
   // The DM mapping is what canonical-main wiring admission proves the

@@ -29,7 +29,13 @@ import {
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
-import { approveRejectRequest, normalizeOptions, type NormalizedOption } from './ask-question.js';
+import {
+  approveRejectRequest,
+  CardTooLongError,
+  cardQuestionTooLong,
+  normalizeOptions,
+  type NormalizedOption,
+} from './ask-question.js';
 import type {
   AuthenticatedSender,
   ChannelAdapter,
@@ -214,8 +220,8 @@ export interface AppContextEntity {
  * Latest assistant context per (instance, DM channel, user), attached to the
  * NEXT inbound DM message as content.app_context and consumed. Platforms
  * whose DM surface materializes threads and reports client context send
- * app_context as its own event (assistant_thread_started legacy /
- * app_context_changed in agent view), not on the message payload, so the
+ * app_context as its own event (assistant_thread_started /
+ * assistant_thread_context_changed), not on the message payload, so the
  * bridge has to hold it across the event → message gap. Short TTL: a stale
  * "viewing X" is worse than none.
  */
@@ -231,8 +237,8 @@ function appContextKey(instance: string, channelId: string, userId: string): str
 
 /**
  * Derive ordered entities from an SDK assistant event. The installed chat
- * core (4.40.0) parses assistant_thread_started / legacy app_context_changed into a
- * `context` object (channelId/teamId/threadEntryPoint — the legacy assistant
+ * core (4.41.1) parses assistant_thread_started /
+ * assistant_thread_context_changed into a `context` object (channelId/teamId/threadEntryPoint — the legacy assistant
  * context shape) with no entities array; prefer a real `entities` array
  * whenever a future SDK forwards the platform's ordered agent-context
  * entities.
@@ -309,6 +315,16 @@ export function attachAppContext(
 }
 
 /**
+ * Base64-encode attachment bytes. Adapters may return ArrayBuffer (Telegram
+ * since 4.39), whose toString() yields "[object ArrayBuffer]", not bytes.
+ */
+export function attachmentBytesToBase64(data: Buffer | ArrayBuffer | Uint8Array): string {
+  if (Buffer.isBuffer(data)) return data.toString('base64');
+  if (data instanceof Uint8Array) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('base64');
+  return Buffer.from(data).toString('base64');
+}
+
+/**
  * Root-thread a top-level DM message: on platforms whose DM surface
  * materializes conversation threads (agent-view semantics), every top-level
  * DM message is the root of a conversation thread — replying in-thread and
@@ -352,7 +368,7 @@ export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
  * A member joined (or left) a channel/group conversation one of our bridge
  * instances is in. Forwarded from the Chat SDK's member_joined_channel
  * dispatch; `left` is reserved for member_left_channel, which the installed
- * chat core (4.40.0) does NOT dispatch — see the TODO at the
+ * chat core (4.41.1) does NOT dispatch — see the TODO at the
  * onMemberJoinedChannel registration in setup().
  */
 export interface MembershipEvent {
@@ -492,6 +508,20 @@ export interface ChatSdkBridgeConfig {
    * quirk (e.g. Telegram's legacy Markdown parse mode).
    */
   transformOutboundText?: (text: string) => string;
+  /**
+   * Optional escape for host-built ask_question card text (open and resolved
+   * cards). Approval cards mix host wording with untrusted values (agent
+   * arguments, sender names); channels whose card text is raw platform markup
+   * set this. Questions an agent asks itself (`fromAgent`) keep their markup.
+   */
+  escapeCardText?: (text: string) => string;
+  /**
+   * For a platform that caps a whole card's text: the longest ask_question
+   * title plus card text (after escapeCardText) it shows in full. A longer
+   * card is refused with CardTooLongError. Unset, long card text is posted
+   * in several text blocks, each under CARD_TEXT_BLOCK_LENGTH.
+   */
+  maxCardTextLength?: number;
   /**
    * Maximum text length the underlying adapter accepts in a single message.
    * When set, the bridge splits outbound text longer than this on paragraph
@@ -690,6 +720,8 @@ function resolveSelectedOption(
 interface TerminalApprovalCard {
   title: string;
   question: string;
+  /** The question as separate text blocks, when it was split to fit. */
+  questionBlocks?: string[];
   resolution: string;
 }
 
@@ -698,9 +730,9 @@ interface TerminalApprovalCard {
  * replaces the actions row, making the card visibly inactive without
  * discarding the request an admin decided on.
  */
-export function buildTerminalApprovalCard({ title, question, resolution }: TerminalApprovalCard) {
+export function buildTerminalApprovalCard({ title, question, questionBlocks, resolution }: TerminalApprovalCard) {
   const children: CardChild[] = [];
-  if (question) children.push(CardText(question));
+  for (const block of questionBlocks ?? (question ? [question] : [])) children.push(CardText(block));
   children.push(CardText(resolution, { style: 'muted' }));
   return Card({ title, children });
 }
@@ -728,6 +760,63 @@ function isTerminalCard(card: Partial<TerminalApprovalCard> | undefined): card i
  */
 function handOnClick(setup: ChannelSetup, ...click: Parameters<ChannelSetup['onAction']>): void {
   void Promise.resolve(setup.onAction(...click)).catch(() => {});
+}
+
+/**
+ * Longest text in one card text block. Some platforms cap each block, and an
+ * adapter can still lengthen text (emoji names) after the bridge measures it.
+ */
+export const CARD_TEXT_BLOCK_LENGTH = 2000;
+
+const FENCE = '```';
+/** A fence opens or closes only at the start of a line; backticks mid-line are text. */
+const FENCE_LINE = /^ {0,3}```/gm;
+
+/**
+ * Split card text into blocks of at most `limit` characters after `escape`, so
+ * a per-block cap never cuts one. Prefers a line break near the limit, never
+ * splits a surrogate pair or a fence marker, and closes and reopens a code
+ * fence that spans two blocks.
+ */
+export function splitCardText(text: string, escape: (t: string) => string, limit: number): string[] {
+  const blocks: string[] = [];
+  let rest = text;
+  let reopen = false;
+  const render = (raw: string) => {
+    const body = (reopen ? `${FENCE}\n` : '') + raw;
+    const open = (body.match(FENCE_LINE)?.length ?? 0) % 2 === 1;
+    return { block: escape(open ? `${body}\n${FENCE}` : body), open };
+  };
+  const fits = (n: number) => render(rest.slice(0, n)).block.length <= limit;
+  while (rest) {
+    let cut = rest.length;
+    if (!fits(cut)) {
+      // Longest prefix that fits; the search only ever keeps lengths that fit.
+      let lo = 0;
+      let hi = rest.length - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(mid)) lo = mid;
+        else hi = mid - 1;
+      }
+      cut = lo;
+      const afterLine = rest.lastIndexOf('\n', cut - 1) + 1;
+      if (afterLine > cut / 2 && fits(afterLine)) cut = afterLine;
+      // Backing off a fence marker can change which fences close, so recheck.
+      const badCut = (n: number) => isHighSurrogate(rest.charCodeAt(n - 1)) || (rest[n - 1] === '`' && rest[n] === '`');
+      while (cut > 0 && (badCut(cut) || !fits(cut))) cut--;
+      if (cut === 0) throw new CardTooLongError('the request cannot be split into card text blocks');
+    }
+    const { block, open } = render(rest.slice(0, cut));
+    blocks.push(block);
+    rest = rest.slice(cut);
+    reopen = open;
+  }
+  return blocks;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -778,6 +867,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     );
   }
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+  const cardText = (t: string): string => (config.escapeCardText ? config.escapeCardText(t) : t);
+  const terminalMessage = (spec: TerminalApprovalCard) =>
+    terminalApprovalMessage({
+      ...spec,
+      question: cardText(spec.question),
+      questionBlocks: spec.question ? splitCardText(spec.question, cardText, CARD_TEXT_BLOCK_LENGTH) : undefined,
+      resolution: cardText(spec.resolution),
+    });
   /** Registry/routing key for this bridge — also the app-context cache
    *  namespace. Default instances key by the platform name. */
   const instanceKey = config.instance ?? adapter.name;
@@ -893,7 +990,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       render?.renderTerminal && typeof terminal?.resolution === 'string'
         ? render.renderTerminal(terminal.resolution)
         : isTerminalCard(terminal)
-          ? { markdown: transformText(textOutcome(terminal)) }
+          ? {
+              markdown: transformText(
+                textOutcome({
+                  ...terminal,
+                  question: cardText(terminal.question),
+                  resolution: cardText(terminal.resolution),
+                }),
+              ),
+            }
           : { markdown: transformText((content.text as string) || (content.markdown as string) || '') };
     await adapter.editMessage(tid, messageId, outcome);
     await state.delete(postedRequestKey(adapter.name, messageId));
@@ -926,8 +1031,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         };
         if (att.fetchData) {
           try {
-            const buffer = await att.fetchData();
-            entry.data = buffer.toString('base64');
+            entry.data = attachmentBytesToBase64(await att.fetchData());
           } catch (err) {
             log.warn('Failed to download attachment', { type: att.type, err });
             if (att.type === 'audio') entry.speech = { status: 'failed', reason: 'media-download-failed' };
@@ -1137,9 +1241,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       });
 
       // Agent-mode assistant context: cache the latest "what the user is
-      // viewing" per (channel, user). The installed chat core (4.40.0)
-      // dispatches both the legacy assistant_thread_started and the
-      // agent_view app_context_changed events into these handlers.
+      // viewing" per (channel, user). The installed chat core (4.41.1)
+      // dispatches assistant_thread_started and
+      // assistant_thread_context_changed into these handlers. Agent-view
+      // app_context_changed goes to onAppContextChanged, not registered here.
       const rememberAppContext = (event: AssistantThreadStartedEvent | AssistantContextChangedEvent): void => {
         cacheAppContext(instanceKey, event.channelId, event.userId, appContextEntities(event));
       };
@@ -1153,7 +1258,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // channel type (setMembershipHandler); no-op when none is registered.
       // The chat core dispatches only member_joined_channel;
       // member_left_channel arrives at the adapter but has no SDK handler
-      // in 4.40.0.
+      // in 4.41.1.
       // TODO(member-left): when the chat core grows an onMemberLeftChannel
       // dispatch, register it here and forward with { left: true } — the
       // MembershipEvent type and dispatchMembership already carry it.
@@ -1208,7 +1313,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             tid,
             event.messageId,
             render?.question
-              ? terminalApprovalMessage({ title, question: render.question, resolution })
+              ? terminalMessage({ title, question: render.question, resolution })
               : { markdown: `${title}\n\n${resolution}` },
           );
         } catch (err) {
@@ -1355,7 +1460,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
         const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
         if (isTerminalCard(terminalCard)) {
-          await adapter.editMessage(tid, content.messageId as string, terminalApprovalMessage(terminalCard));
+          await adapter.editMessage(tid, content.messageId as string, terminalMessage(terminalCard));
         } else {
           await adapter.editMessage(tid, content.messageId as string, {
             markdown: transformText((content.text as string) || (content.markdown as string) || ''),
@@ -1390,18 +1495,29 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         if (content.requirePresentation) throw new Error('Approval presentation adapter is unavailable');
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
         const pictures = requestPictures(content, message.files);
+        // Questions an agent asks itself keep their own markup (`fromAgent`).
+        const escape = content.fromAgent === true ? (t: string) => t : cardText;
         if (textRequests) {
+          // One message, so a quote or reaction answering it maps to the request.
           const asked = typeof question === 'string' ? question : '';
           const posted = await postWithPictures(tid, pictures, (missing) => ({
-            markdown: transformText(textRequest(title, asked, options, missing)),
+            markdown: transformText(textRequest(title, escape(asked), options, missing)),
           }));
           return rememberRequest(platformId, questionId, posted);
+        }
+        // Long text goes out as several blocks, measured after escaping, so no
+        // per-block cap cuts it. A platform that caps the whole card refuses
+        // what it can't show, counting the fences the split adds.
+        const blocks = splitCardText(question, escape, CARD_TEXT_BLOCK_LENGTH);
+        if (config.maxCardTextLength !== undefined) {
+          const tooLong = cardQuestionTooLong(title, blocks.join('\n'), config.maxCardTextLength);
+          if (tooLong) throw new CardTooLongError(tooLong);
         }
         const result = await postWithPictures(tid, pictures, (missing) => ({
           card: Card({
             title,
             children: [
-              CardText(question),
+              ...blocks.map((block) => CardText(block)),
               ...(missing === undefined ? [] : [CardText(missing)]),
               Actions(
                 // Encode button id/value with the option index rather than the
@@ -1416,7 +1532,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             ],
           }),
           fallbackText:
-            `${title}\n\n${question}${missing === undefined ? '' : `\n\n${missing}`}\n` +
+            `${title}\n\n${escape(question)}${missing === undefined ? '' : `\n\n${missing}`}\n` +
             `Options: ${options.map((o) => o.label).join(', ')}`,
         }));
         return result?.id;

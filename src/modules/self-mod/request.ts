@@ -14,13 +14,14 @@
  */
 import { createHash } from 'node:crypto';
 
+import { escapeInvisibles } from '../../card-text.js';
 import { mcpServerPluginOwner, parseMcpServerConfig, validateMcpServerName } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
-import { escapeInvisibles, quoted, REASON_LIMIT } from '../approvals/request-text.js';
+import { quoted, REASON_LIMIT } from '../approvals/request-text.js';
 
 export async function validateInstallPackages(content: Record<string, unknown>, session: Session): Promise<boolean> {
   const agentGroup = await getAgentGroup(session.agent_group_id);

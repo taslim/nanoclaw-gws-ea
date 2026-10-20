@@ -180,7 +180,7 @@ describe('agent message policies', () => {
     expect(JSON.parse(String(opts.payload.content)).text).toBe('sensitive');
   });
 
-  it('asks in the assistant’s voice, with what the agent wrote and attached as quoted lines', async () => {
+  it('asks in the assistant’s voice, with what the agent wrote in a fence and what it attached quoted', async () => {
     await setMessagePolicy(A, B, 'telegram:dana', now());
 
     await routeAgentMessage(
@@ -197,7 +197,11 @@ describe('agent message policies', () => {
       [
         'From: "A"',
         'To: "B"',
-        'Message: "Tell ‹users/all›: \\[the plan\\]\\(https://example.test\\)"',
+        'Message:',
+        '```',
+        'Tell <users/all>:',
+        '[the plan](https://example.test)',
+        '```',
         'Attachments: "notes.txt"',
         "I'd like to pass this message between my agents.",
       ].join('\n'),

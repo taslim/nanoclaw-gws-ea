@@ -729,7 +729,8 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
       "taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),",
     );
     expect(formatter).toContain('escapeXml(JSON.stringify(content.scriptOutput, null, 2))');
-    expect(pollLoop).toContain('routing.tasksOnly === true ? blockUndelivered : !!scratchpad');
+    // A conversation turn of only tasks keeps its prose as scratchpad; a missed block still asks for a re-send.
+    expect(pollLoop).toContain('(missed > 0 || (routing.tasksOnly !== true && replied === 0 && !!scratchpad))');
     expect(destinations).toContain('- `<task>` — a scheduled task you set to come back to this conversation');
   });
 });

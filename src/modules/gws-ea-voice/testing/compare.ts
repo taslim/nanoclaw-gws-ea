@@ -6,7 +6,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SpeechResult } from '../../../channels/inbound-content.js';
 import { isRecord } from '../../../gws-ea/validation.js';
-import { isPathInside } from '../../../inbox-safety.js';
 import {
   verifyVoiceInstallation,
   type VerifiedVoiceInstallation,
@@ -114,6 +113,12 @@ export function parseComparisonManifest(value: unknown): ComparisonManifest {
     };
   });
   return { schemaVersion: 1, repetitions: manifest.repetitions, installations, notes };
+}
+
+/** True if `child` is `parent` itself or below it. */
+function isPathInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 async function externalPath(file: string): Promise<string> {

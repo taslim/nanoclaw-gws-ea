@@ -1,28 +1,21 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
-const uploadRace = vi.hoisted(() => ({
-  beforeOpen: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
+const stagingRace = vi.hoisted(() => ({
   beforeLstat: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
-  afterLstat: undefined as ((file: import('node:fs').PathLike) => void) | undefined,
 }));
 
-// Keep real filesystem operations; move the attacker's directory at the exact syscall boundary.
+// Keep real filesystem operations; rename Chrome's partial file at the exact syscall boundary.
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
     ...actual,
-    async open(...args: Parameters<typeof actual.open>) {
-      uploadRace.beforeOpen?.(args[0]);
-      return actual.open(...args);
-    },
     async lstat(...args: Parameters<typeof actual.lstat>) {
-      uploadRace.beforeLstat?.(args[0]);
-      const stat = await actual.lstat(...args);
-      uploadRace.afterLstat?.(args[0]);
-      return stat;
+      stagingRace.beforeLstat?.(args[0]);
+      return actual.lstat(...args);
     },
   };
 });
@@ -34,9 +27,7 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-files-'));
 });
 afterEach(() => {
-  uploadRace.beforeOpen = undefined;
-  uploadRace.beforeLstat = undefined;
-  uploadRace.afterLstat = undefined;
+  stagingRace.beforeLstat = undefined;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -59,53 +50,26 @@ it('copies uploads before use and refuses traversal and symlinks', async () => {
   expect(fs.existsSync(copy.path)).toBe(false);
 });
 
-it.each(['file', 'directory'] as const)(
-  'never stages outside bytes when a %s is swapped and then restored',
-  async (kind) => {
-    const session = path.join(root, 'session');
-    const nested = path.join(session, 'documents');
-    const saved = path.join(session, 'original');
-    const outside = path.join(root, 'outside');
-    fs.mkdirSync(nested, { recursive: true });
-    fs.mkdirSync(outside);
-    fs.writeFileSync(path.join(nested, 'report.txt'), 'session-owned bytes');
-    fs.writeFileSync(path.join(outside, 'report.txt'), 'outside private bytes');
-    const source = fs.realpathSync(path.join(nested, 'report.txt'));
-    const swappedPath = kind === 'file' ? path.join(nested, 'report.txt') : nested;
-    const symlinkTarget = kind === 'file' ? path.join(outside, 'report.txt') : outside;
-    let swapped = false;
-    let attacked = false;
-    function restore() {
-      if (!swapped) return;
-      fs.unlinkSync(swappedPath);
-      fs.renameSync(saved, swappedPath);
-      swapped = false;
-    }
-    uploadRace.beforeOpen = (file) => {
-      if (attacked || (file !== source && !/^\/proc\/self\/fd\/\d+\/report\.txt$/u.test(String(file)))) return;
-      fs.renameSync(swappedPath, saved);
-      fs.symlinkSync(symlinkTarget, swappedPath);
-      swapped = true;
-      attacked = true;
-    };
-    // The vulnerable implementation validates the outside inode, then sees the safe path again.
-    uploadRace.afterLstat = (file) => {
-      if (attacked && file === source) restore();
-    };
-    const result = await stageBrowserUpload(session, path.join(root, 'staging'), 'documents/report.txt').then(
-      (upload) => ({ upload }),
-      (error: unknown) => ({ error }),
-    );
-    try {
-      expect(attacked).toBe(true);
-      if ('upload' in result) expect(fs.readFileSync(result.upload.path, 'utf8')).toBe('session-owned bytes');
-      else expect(result.error).toBeInstanceOf(Error);
-    } finally {
-      restore();
-      if ('upload' in result) await result.upload.remove();
-    }
-  },
-);
+it('refuses an upload that is a second name for a file elsewhere, or a FIFO, without blocking', async () => {
+  const session = path.join(root, 'session');
+  const staging = path.join(root, 'staging');
+  const documents = path.join(session, 'documents');
+  const outside = path.join(root, 'outside.txt');
+  const upload = path.join(documents, 'report.txt');
+  fs.mkdirSync(documents, { recursive: true });
+  fs.writeFileSync(outside, 'outside private bytes');
+
+  fs.linkSync(outside, upload);
+  await expect(stageBrowserUpload(session, staging, 'documents/report.txt')).rejects.toThrow(
+    'not a regular session file',
+  );
+  fs.unlinkSync(upload);
+
+  execFileSync('mkfifo', [upload]);
+  await expect(stageBrowserUpload(session, staging, 'documents/report.txt')).rejects.toThrow(
+    'not a regular session file',
+  );
+});
 
 it('retains the only host download on failed handoff, then hands off once durably', async () => {
   const host = path.join(root, 'download');
@@ -123,7 +87,7 @@ it('retains the only host download on failed handoff, then hands off once durabl
   expect(fs.statSync(result).mode & 0o777).toBe(0o600);
 });
 
-it('compares every download byte on replay and retains a changed host original', async () => {
+it('compares every download byte on replay and replaces a target that is not the host original', async () => {
   const host = path.join(root, 'download');
   const inbox = path.join(root, 'session', 'inbox');
   fs.mkdirSync(path.dirname(inbox));
@@ -133,13 +97,18 @@ it('compares every download byte on replay and retains a changed host original',
   fs.writeFileSync(host, bytes);
   expect(await handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).toBe(result);
   expect(fs.existsSync(host)).toBe(false);
+  // A target that is not the host original (a copy cut short, a change, a link) is replaced by it.
   bytes[bytes.length - 1] = 8;
   fs.writeFileSync(host, bytes);
-  await expect(handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).rejects.toThrow(
-    'incomplete or changed',
-  );
-  expect(fs.readFileSync(host)).toEqual(bytes);
-  expect(fs.readFileSync(result).at(-1)).toBe(7);
+  expect(await handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).toBe(result);
+  expect(fs.readFileSync(result)).toEqual(bytes);
+  expect(fs.existsSync(host)).toBe(false);
+  fs.writeFileSync(host, bytes);
+  fs.unlinkSync(result);
+  fs.symlinkSync('/etc/passwd', result);
+  expect(await handoffBrowserDownload(host, inbox, 'browser-replay', 'invoice.bin')).toBe(result);
+  expect(fs.lstatSync(result).isSymbolicLink()).toBe(false);
+  expect(fs.readFileSync(result)).toEqual(bytes);
 });
 
 it("counts a download's staged bytes across Chrome's rename of its partial file, and refuses anything but files", async () => {
@@ -148,9 +117,9 @@ it("counts a download's staged bytes across Chrome's rename of its partial file,
   const guid = '76347a02-c21a-4763-839a-327c7e0cbb9e';
   fs.writeFileSync(path.join(staging, `${guid}.crdownload`), Buffer.alloc(120));
   // Chrome completes the download between the listing and the size read: the partial name is gone.
-  uploadRace.beforeLstat = (file) => {
+  stagingRace.beforeLstat = (file) => {
     if (String(file).endsWith('.crdownload')) {
-      uploadRace.beforeLstat = undefined;
+      stagingRace.beforeLstat = undefined;
       fs.renameSync(path.join(staging, `${guid}.crdownload`), path.join(staging, guid));
     }
   };

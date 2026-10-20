@@ -60,7 +60,6 @@
  */
 import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 
 import type { OutboundFile, OutboundMessage } from '../../channels/adapter.js';
 import {
@@ -107,6 +106,7 @@ import {
 } from './send.js';
 import {
   findThreadFile,
+  readThreadFile,
   getThread,
   threadAddresses,
   threadMessages,
@@ -233,7 +233,7 @@ async function handedFiles(threadKey: string, files: readonly OutboundFile[]): P
     if (handed === undefined) {
       throw refused(`${file.filename} is not a file main handed over for this thread, so it cannot go out.`);
     }
-    const copy = await readFile(handed.hostPath);
+    const copy = readThreadFile(handed);
     if (sha256(copy) !== hash) {
       throw new Error(`The host's copy of ${handed.fileName} changed after main handed it over`);
     }

@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   discover:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.skills.outputs.matrix }}
       core: ${{ steps.refs.outputs.core }}
@@ -73,7 +73,7 @@ jobs:
 
   test:
     needs: discover
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -102,7 +102,7 @@ jobs:
 
   combined-providers:
     needs: discover
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -125,7 +125,7 @@ jobs:
 
   pre-contract-providers:
     needs: discover
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -145,7 +145,7 @@ jobs:
 
   old-provider-refresh:
     needs: discover
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -165,11 +165,17 @@ jobs:
           REGISTRY_CHANNELS_SHA: ${{ needs.discover.outputs.channels }}
           REGISTRY_PROVIDERS_SHA: ${{ needs.discover.outputs.providers }}
         run: pnpm exec tsx scripts/test-registry-skills.ts --old-provider-refresh 99283f3e274b2b1dae47b141ac4f11f56ad8eb2d
+      # d61af17b is the last trunk whose provider skills copied from the providers branch.
+      - name: Refresh branch-installed providers to their skill payloads
+        env:
+          REGISTRY_CHANNELS_SHA: ${{ needs.discover.outputs.channels }}
+          REGISTRY_PROVIDERS_SHA: ${{ needs.discover.outputs.providers }}
+        run: pnpm exec tsx scripts/test-registry-skills.ts --provider-payload-switch d61af17b541f52632c6194692a166184839a926f
 
   provider-promotion:
     if: always()
     needs: [test, combined-providers, pre-contract-providers, old-provider-refresh]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Require every provider composition gate
         run: |
@@ -189,7 +195,7 @@ jobs:
     if: always()
     needs: [discover, test, combined-providers, pre-contract-providers, old-provider-refresh, provider-promotion]
     permissions: {}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: every needed job succeeded

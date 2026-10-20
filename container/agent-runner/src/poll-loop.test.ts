@@ -856,20 +856,24 @@ describe('a conversation turn of only scheduled tasks', () => {
     expect(pushes).toEqual([]);
   });
 
-  it.each([
-    ['to an unknown destination', '<message to="nobody">Remy Vance sent the venue options.</message>'],
-    ['left empty', '<message to="main">  </message>'],
-  ])('still asks for a re-send of a block that did not go out: %s', async (_label, resultText) => {
-    const { pushes } = await runTaskTurn(resultText);
+  it('still asks for a re-send of a block that did not go out', async () => {
+    const { pushes } = await runTaskTurn('<message to="nobody">Remy Vance sent the venue options.</message>');
 
     expect(getUndeliveredMessages()).toEqual([]);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
   });
 
+  it('stays quiet for an empty block, which has nothing to send', async () => {
+    const { pushes } = await runTaskTurn('<message to="main">  </message>');
+
+    expect(getUndeliveredMessages()).toEqual([]);
+    expect(pushes).toEqual([]);
+  });
+
   it('nudges for a block the streaming door missed, never for prose', async () => {
     const routing = { ...ERR_ROUTING, taskRun: false, tasksOnly: true };
-    const missed = { suppressDelivery: true, turnDelivered: false };
+    const missed = { suppressDelivery: true as const, turnStartSeq: 0 };
 
     expect(
       (await dispatchResultText('<message to="main">The venue is booked.</message>', routing, missed)).hasUnwrapped,
@@ -1017,8 +1021,11 @@ describe('the batch a turn answers', () => {
 
   it('leaves a later segment re-emitting a block the turn already sent recognized as a repeat', async () => {
     const block = '<message to="dm">Thursday is on.</message>';
+    const pushes: string[] = [];
     const query: AgentQuery = {
-      push() {},
+      push(prompt) {
+        pushes.push(prompt);
+      },
       end() {},
       abort() {},
       events: (async function* (): AsyncGenerator<ProviderEvent> {
@@ -1032,6 +1039,8 @@ describe('the batch a turn answers', () => {
     await processQuery(query, routing, ['m-ask'], 'mock', undefined, 'prompt', undefined, true);
 
     expect(written()).toEqual([['chat', { text: 'Thursday is on.', batch: ['m-ask'] }]]);
+    // The batch beside the row's text must not hide the repeat from the result door (isDoorText).
+    expect(pushes).toEqual([]);
   });
 
   it('is never written onto a message to another agent, which reads its content as sent', async () => {

@@ -1,23 +1,36 @@
-import { constants, type Stats } from 'node:fs';
-import { chmod, link, lstat, open, readdir, realpath, rmdir, unlink, type FileHandle } from 'node:fs/promises';
+import fs, { constants, type Stats } from 'node:fs';
+import { chmod, lstat, open, readdir, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
 import type { Download, Page } from 'playwright-core';
 
+import { AnchoredDir } from '../../anchored-dir.js';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { isErrno } from '../../community-portal/errors.js';
-import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { sessionDir } from '../../session-manager.js';
 import { withBrowserDownload } from './connection.js';
 import { ensurePrivateDirectory } from './paths.js';
 import type { BrowserExecutionContext } from './queue.js';
 import { redactPageText } from './observe.js';
 
+const readAt = promisify(fs.read);
+const fstat = promisify(fs.fstat);
+const fsync = promisify(fs.fsync);
+const close = promisify(fs.close);
+
 export const BROWSER_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024;
 export const BROWSER_JOB_DOWNLOAD_MAX_BYTES = 500 * 1024 * 1024;
 
+/**
+ * Make a directory's entries durable. Opened without following its last name
+ * and without blocking, so a container-made link or FIFO there costs nothing.
+ */
 async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, constants.O_RDONLY);
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
     await handle.sync();
   } finally {
@@ -25,56 +38,54 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-async function readChunk(file: FileHandle, buffer: Buffer): Promise<number> {
+async function readChunk(fd: number, buffer: Buffer, position: number): Promise<number> {
   let offset = 0;
   while (offset < buffer.length) {
-    const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, null);
+    const { bytesRead } = await readAt(fd, buffer, offset, buffer.length - offset, position + offset);
     if (!bytesRead) break;
     offset += bytesRead;
   }
   return offset;
 }
 
-async function equalFiles(left: FileHandle, right: FileHandle): Promise<boolean> {
+async function equalFiles(left: number, right: number): Promise<boolean> {
   const leftBytes = Buffer.alloc(64 * 1024);
   const rightBytes = Buffer.alloc(64 * 1024);
-  for (;;) {
-    const [leftCount, rightCount] = await Promise.all([readChunk(left, leftBytes), readChunk(right, rightBytes)]);
+  for (let position = 0; ; position += leftBytes.length) {
+    const [leftCount, rightCount] = await Promise.all([
+      readChunk(left, leftBytes, position),
+      readChunk(right, rightBytes, position),
+    ]);
     if (leftCount !== rightCount || !leftBytes.subarray(0, leftCount).equals(rightBytes.subarray(0, rightCount)))
       return false;
-    if (!leftCount) return true;
+    if (leftCount < leftBytes.length) return true;
   }
 }
 
-/** Bind every path component to the open, so a directory swap cannot redirect the copy. */
-async function openUploadSource(source: string): Promise<FileHandle> {
-  if (process.platform === 'darwin') {
-    // Darwin's open(2) protects the entire lookup. Combining this with O_NOFOLLOW is EINVAL.
-    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h
-    const noFollowAny = 0x20000000;
-    return open(source, constants.O_RDONLY | noFollowAny);
-  }
-  if (process.platform !== 'linux') throw new Error('Safe upload opening requires macOS or Linux');
-  // Node has no openat API. Linux procfs resolves each child from the held directory inode,
-  // including after its original name is renamed or replaced with a symlink.
-  const components = source.split(path.sep).filter(Boolean);
-  let directory = await open(
-    path.parse(source).root,
-    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-  );
-  try {
-    for (const component of components.slice(0, -1)) {
-      const next = await open(
-        `/proc/self/fd/${directory.fd}/${component}`,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
-      const previous = directory;
-      directory = next;
-      await previous.close();
+async function copyInto(input: number, output: number): Promise<void> {
+  const buffer = Buffer.alloc(64 * 1024);
+  for (let position = 0; ; ) {
+    const bytes = await readChunk(input, buffer, position);
+    for (let written = 0; written < bytes; ) {
+      written += fs.writeSync(output, buffer, written, bytes - written, position + written);
     }
-    return await open(`/proc/self/fd/${directory.fd}/${components.at(-1)!}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    position += bytes;
+    if (bytes < buffer.length) return;
+  }
+}
+
+/**
+ * Open a file in an agent-writable tree, reached through each directory's
+ * descriptor from `root` down: a link or anything but a real directory on the
+ * way, or anything but a regular file at the end, is refused, never followed.
+ */
+function openAnchoredFile(root: string, segments: readonly string[], name: string): number {
+  const directory = AnchoredDir.open(root, segments);
+  if (!directory) throw Object.assign(new Error('No such file'), { code: 'ENOENT' });
+  try {
+    return directory.openReadFd(name);
   } finally {
-    await directory.close();
+    directory.close();
   }
 }
 
@@ -87,50 +98,44 @@ export async function stageBrowserUpload(
   const relative = requested.startsWith('/workspace/') ? requested.slice('/workspace/'.length) : requested;
   if (!relative || path.isAbsolute(relative) || relative.split(/[\\/]/u).some((part) => part === '..' || part === '.'))
     throw new Error('Unsafe upload path');
-  const base = await realpath(sessionRoot);
-  const source = path.join(base, relative);
-  let component = base;
-  for (const part of relative.split('/')) {
-    component = path.join(component, part);
-    if ((await lstat(component)).isSymbolicLink()) throw new Error('Upload symlink refused');
-  }
-  if (!isPathInside(base, await realpath(source))) throw new Error('Upload escaped session');
-  await ensurePrivateDirectory(stagingRoot);
-  const input = await openUploadSource(source);
-  const directory = path.join(stagingRoot, `upload-${randomUUID()}`);
-  await ensurePrivateDirectory(directory);
-  const target = path.join(directory, path.basename(source));
+  const segments = relative.split('/');
+  const name = segments.pop()!;
+  let input: number;
   try {
-    const stat = await input.stat();
-    if (!stat.isFile() || stat.nlink !== 1) throw new Error('Upload is not a regular session file');
-    const output = await open(
-      target,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      const buffer = Buffer.alloc(64 * 1024);
-      let bytes: number;
-      while ((bytes = (await input.read(buffer, 0, buffer.length, null)).bytesRead))
-        await output.writeFile(buffer.subarray(0, bytes));
-      await output.sync();
-    } finally {
-      await output.close();
-    }
-    await syncDirectory(stagingRoot);
-    return {
-      path: target,
-      async remove() {
-        await unlink(target).catch(() => undefined);
-        await rmdir(directory).catch(() => undefined);
-      },
-    };
+    input = openAnchoredFile(sessionRoot, segments, name);
   } catch (error) {
-    await unlink(target).catch(() => undefined);
-    await rmdir(directory).catch(() => undefined);
-    throw error;
+    throw new Error('Upload is not a regular session file', { cause: error });
+  }
+  try {
+    if ((await fstat(input)).nlink !== 1) throw new Error('Upload is not a regular session file');
+    await ensurePrivateDirectory(stagingRoot);
+    const directory = path.join(stagingRoot, `upload-${randomUUID()}`);
+    await ensurePrivateDirectory(directory);
+    const target = path.join(directory, name);
+    const remove = async () => {
+      await unlink(target).catch(() => undefined);
+      await rmdir(directory).catch(() => undefined);
+    };
+    try {
+      const output = await open(
+        target,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await copyInto(input, output.fd);
+        await output.sync();
+      } finally {
+        await output.close();
+      }
+      await syncDirectory(stagingRoot);
+      return { path: target, remove };
+    } catch (error) {
+      await remove();
+      throw error;
+    }
   } finally {
-    await input.close();
+    await close(input);
   }
 }
 
@@ -162,7 +167,13 @@ export function releaseBrowserUploads(page: Page): Promise<void> {
   return cleanup;
 }
 
-/** A failed copy retains the host original. An existing completed target is recognized on replay. */
+/**
+ * Hand a download from the host's staging to the session inbox, then remove
+ * the host original. A failed copy retains it. The inbox is the container's,
+ * so `inbox/<artifact>` is reached by descriptor and written there alone: a
+ * target already holding the same bytes is kept on replay, and anything else
+ * under its name (a partial copy, a change, a link) is removed and copied again.
+ */
 export async function handoffBrowserDownload(
   hostPath: string,
   inboxRoot: string,
@@ -170,82 +181,83 @@ export async function handoffBrowserDownload(
   filename: string,
 ): Promise<string> {
   if (!isSafeAttachmentName(artifactId) || !isSafeAttachmentName(filename)) throw new Error('Unsafe download name');
-  const directory = ensureContainedInboxDir(inboxRoot, artifactId, { artifactId });
-  if (!directory) throw new Error('Unsafe download inbox');
-  await chmod(directory, 0o700);
-  const target = path.join(directory, filename);
-  let input;
+  const target = path.join(inboxRoot, artifactId, filename);
+  let directory: AnchoredDir | null;
   try {
-    input = await open(hostPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    directory = AnchoredDir.open(path.dirname(inboxRoot), [path.basename(inboxRoot), artifactId], true);
   } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
-    const existing = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      if (!(await existing.stat()).isFile()) throw new Error('Unsafe existing download', { cause: error });
-    } finally {
-      await existing.close();
-    }
-    return target;
+    throw new Error('Unsafe download inbox', { cause: error });
   }
-  let output;
-  let temporary: string | undefined;
+  if (!directory) throw new Error('Unsafe download inbox');
   try {
-    const stat = await input.stat();
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > BROWSER_DOWNLOAD_MAX_BYTES)
-      throw new Error('Unsafe host download');
-    let existing;
+    let input: number;
     try {
-      existing = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+      input = fs.openSync(hostPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
-    }
-    if (existing) {
-      try {
-        const existingStat = await existing.stat();
-        if (
-          !existingStat.isFile() ||
-          existingStat.nlink !== 1 ||
-          existingStat.size !== stat.size ||
-          !(await equalFiles(existing, input))
-        )
-          throw new Error('Download target is incomplete or changed');
-      } finally {
-        await existing.close();
-      }
-      await syncDirectory(directory);
-      await syncDirectory(inboxRoot);
-      await syncDirectory(path.dirname(inboxRoot));
-      await unlink(hostPath);
+      if (!isErrno(error, 'ENOENT')) throw error;
+      // Handed off before: the inbox copy is all that remains.
+      const existing = directory.openReadFd(filename);
+      await close(existing);
       return target;
     }
-    temporary = path.join(directory, `.browser-${randomUUID()}.partial`);
-    output = await open(
-      temporary,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
-    const buffer = Buffer.alloc(64 * 1024);
-    let bytes: number;
-    while ((bytes = (await input.read(buffer, 0, buffer.length, null)).bytesRead))
-      await output.writeFile(buffer.subarray(0, bytes));
-    await output.sync();
-    await output.close();
-    output = undefined;
-    if ((await realpath(path.dirname(target))) !== directory) throw new Error('Download inbox changed during handoff');
-    // Publish a complete file atomically without ever replacing an existing target.
-    await link(temporary, target);
-    await unlink(temporary);
-    temporary = undefined;
-    await syncDirectory(directory);
+    try {
+      const stat = await fstat(input);
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > BROWSER_DOWNLOAD_MAX_BYTES)
+        throw new Error('Unsafe host download');
+      if (!(await holdsSameFile(directory, filename, input, stat.size))) {
+        removeEntry(directory, filename);
+        const output = directory.openNewFd(filename);
+        try {
+          fs.fchmodSync(output, 0o600);
+          await copyInto(input, output);
+          await fsync(output);
+        } finally {
+          await close(output);
+        }
+      }
+    } finally {
+      await close(input);
+    }
+    await syncDirectory(path.dirname(target));
     await syncDirectory(inboxRoot);
     await syncDirectory(path.dirname(inboxRoot));
     await unlink(hostPath);
     return target;
   } finally {
-    await output?.close();
-    if (temporary) await unlink(temporary).catch(() => undefined);
-    await input.close();
+    directory.close();
   }
+}
+
+/** Whether `name` in the inbox is a regular single-link file holding exactly the host original's bytes. */
+async function holdsSameFile(directory: AnchoredDir, name: string, original: number, size: number): Promise<boolean> {
+  let existing: number;
+  try {
+    existing = directory.openReadFd(name);
+  } catch (error) {
+    // openReadFd refuses a non-regular file with an Error carrying no code.
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ELOOP') || !(error instanceof Error && 'code' in error))
+      return false;
+    throw error;
+  }
+  try {
+    const stat = await fstat(existing);
+    return stat.nlink === 1 && stat.size === size && (await equalFiles(existing, original));
+  } finally {
+    await close(existing);
+  }
+}
+
+/** Remove whatever holds `name` in the inbox, a link itself and never its target. */
+function removeEntry(directory: AnchoredDir, name: string): void {
+  let entry: Stats;
+  try {
+    entry = directory.lstat(name);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return;
+    throw error;
+  }
+  if (entry.isDirectory()) throw new Error('Download target is a directory');
+  directory.unlink(name);
 }
 
 /**
@@ -270,10 +282,9 @@ export async function browserStagingBytes(directory: string): Promise<number> {
   return total;
 }
 
-async function workspaceDownloadPath(sessionRoot: string, target: string): Promise<string> {
-  const base = await realpath(sessionRoot);
-  if (!isPathInside(base, target)) throw new Error('Download escaped its session');
-  return path.posix.join('/workspace', ...path.relative(base, target).split(path.sep));
+/** Where the agent reads a handed-off download: its inbox folder, as the container mounts the session. */
+function workspaceDownloadPath(artifactId: string, filename: string): string {
+  return path.posix.join('/workspace', 'inbox', artifactId, filename);
 }
 
 export async function captureBrowserDownload(
@@ -292,12 +303,8 @@ export async function captureBrowserDownload(
   }>('SELECT * FROM gws_ea_browser_downloads WHERE id = ?', id);
   const inboxRoot = path.join(sessionDir(context.session.agent_group_id, context.session.id), 'inbox');
   if (prior) {
-    const target = await handoffBrowserDownload(prior.host_path, inboxRoot, id, prior.filename);
-    return {
-      path: await workspaceDownloadPath(sessionDir(context.session.agent_group_id, context.session.id), target),
-      filename: prior.filename,
-      bytes: prior.bytes,
-    };
+    await handoffBrowserDownload(prior.host_path, inboxRoot, id, prior.filename);
+    return { path: workspaceDownloadPath(id, prior.filename), filename: prior.filename, bytes: prior.bytes };
   }
   const used = await context.store.db.get<{ bytes: number }>(
     'SELECT COALESCE(SUM(bytes),0) AS bytes FROM gws_ea_browser_downloads WHERE job_id = ?',
@@ -368,11 +375,7 @@ export async function captureBrowserDownload(
         new Date().toISOString(),
         id,
       );
-      return {
-        path: await workspaceDownloadPath(sessionDir(context.session.agent_group_id, context.session.id), target),
-        filename,
-        bytes: stat.size,
-      };
+      return { path: workspaceDownloadPath(id, filename), filename, bytes: stat.size };
     });
   } catch (error) {
     if (overCap) {

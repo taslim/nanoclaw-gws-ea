@@ -35,6 +35,13 @@ export type GatewayCredentialTarget = {
   name: string;
   /** Exact DNS hostname the credential is scoped to. */
   host: string;
+  /**
+   * Exact URL path on `host` the credential is limited to; absent means every
+   * path. It keeps the key off other requests to a host already trusted with
+   * it, not a boundary between paths. Only gateways declaring
+   * `connectionPaths` accept it.
+   */
+  path?: string;
   /** Non-secret marker the runtime sends; gateways doing selective replacement match it. */
   proxyValue: string;
 } & (
