@@ -150,10 +150,15 @@ afterAll(() => {
   api.stop(true);
 });
 
-/** What the pinned SDK offers on the wire: its first model request's tools, and the skills it tells the model of. */
+/**
+ * What the pinned SDK offers on the wire: its first model request's tools and
+ * the skills it tells the model of, and the skills and commands its `init`
+ * message advertises for a user to type.
+ */
 interface WireSurface {
   tools: string[];
   skills: string[];
+  init: { skills: string[]; slashCommands: string[] };
 }
 
 /**
@@ -194,19 +199,24 @@ async function wire(options: CapturedOptions, mountedSkills: readonly string[] =
       },
     } as never,
   });
+  let resolveInit: (init: WireSurface['init']) => void = () => {};
+  const init = new Promise<WireSurface['init']>((resolve) => (resolveInit = resolve));
   void (async () => {
     try {
-      for await (const _message of run) {
+      for await (const message of run) {
         // The stub answers 401; the run ends on its own.
+        if (message.type === 'system' && message.subtype === 'init') {
+          resolveInit({ skills: [...message.skills].sort(), slashCommands: [...message.slash_commands].sort() });
+        }
       }
     } catch {
       // Expected: the stub refuses every request.
     }
   })();
   try {
-    const body = await request;
+    const [body, advertised] = await Promise.all([request, init]);
     const tools = (JSON.parse(body) as { tools?: Array<{ name: string }> }).tools ?? [];
-    return { tools: tools.map((tool) => tool.name).sort(), skills: listedSkills(body) };
+    return { tools: tools.map((tool) => tool.name).sort(), skills: listedSkills(body), init: advertised };
   } finally {
     run.close();
   }
@@ -316,6 +326,14 @@ describe('the skills the pinned SDK lists', () => {
     },
     60_000,
   );
+
+  it('advertises for typing no skill but the ones NanoClaw mounts', async () => {
+    const { init } = await wire(await optionsFor(ALL), ['research-notes']);
+
+    expect(init.skills).toEqual(['research-notes']);
+    expect(init.slashCommands).toContain('research-notes');
+    for (const bundled of ['design', 'doctor']) expect(init.slashCommands).not.toContain(bundled);
+  }, 60_000);
 });
 
 describe('the SDK options a group holding every key gets', () => {

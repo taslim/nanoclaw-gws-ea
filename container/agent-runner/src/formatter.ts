@@ -530,38 +530,56 @@ function attachmentText(value: unknown): string {
 const SPEECH_READING_NOTE =
   "Recognition can mishear a word, so read the speech for what was meant. A self-correction replaces what it corrects. Keep every point, number, negation and condition, even in a rambling note. Don't repeat the transcript back.";
 
-const NOT_LISTENED_HERE = "This recording can't be listened to here.";
+/**
+ * Why voice notes could not hear a recording, as the principal may hear it:
+ * each names their operator, the only one who can change it.
+ */
+const OPERATOR_LIMITS: ReadonlyMap<string, string> = new Map([
+  ['operator-setup-required', "voice notes are off, and only the principal's operator can turn them on"],
+  ['operator-enablement-required', "voice notes are off, and only the principal's operator can turn them on"],
+  ['operator-update-required', "voice notes need an update only the principal's operator can make"],
+  [
+    'voice-installation-unhealthy',
+    "voice notes aren't working right now, and only the principal's operator can fix that",
+  ],
+]);
+
+/** Anyone but the principal hears no reason: it is about their operator's setup. */
+const NOT_LISTENED_ELSEWHERE =
+  "You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual.";
 
 /**
- * Why a recording was not heard, worded for its reader. Only the principal's
+ * The status line of a recording that was not heard, worded for its reader.
+ * Its sender believes it was heard, so each line says to tell them and what
+ * to ask for, or silence would read as if it had been. Only the principal's
  * own private conversation, as the host marked it, hears that their operator
  * can change it; a missing mark reads as anywhere else.
  */
-function speechLimitation(speech: Record<string, unknown>): string {
-  if (speech.status === 'no-speech') return 'No speech was heard in this recording.';
+function speechStatusLine(speech: Record<string, unknown>): string {
   const principals = speech.inPrincipalPrivateConversation === true;
-  switch (speech.reason) {
-    case 'operator-setup-required':
-    case 'operator-enablement-required':
-      return principals
-        ? "This recording wasn't listened to: voice notes are off, and only the principal's operator can turn them on."
-        : NOT_LISTENED_HERE;
-    case 'operator-update-required':
-      return principals
-        ? "This recording wasn't listened to: voice notes need an update only the principal's operator can make."
-        : NOT_LISTENED_HERE;
-    case 'voice-installation-unhealthy':
-      return principals
-        ? "This recording wasn't listened to: voice notes aren't working right now, and only the principal's operator can fix that."
-        : NOT_LISTENED_HERE;
+  const told = (fact: string, ask: string): string =>
+    principals
+      ? `${fact} They expect you heard it, so tell them so in a line of your reply, ask them to ${ask}, and handle the rest of their message as usual.`
+      : `${fact} Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to ${ask}; handle the rest of the message as usual.`;
+  if (speech.status === 'no-speech')
+    return told('No speech was heard in this recording.', 'type anything it was meant to say');
+  const reason = typeof speech.reason === 'string' ? speech.reason : '';
+  switch (reason) {
     case 'voice-busy':
     case 'aborted':
-      return "This recording wasn't listened to and won't be retried; the sender can send it again or type it.";
+      return told("This recording wasn't listened to and won't be retried.", 'send it again or type it');
     case 'media-download-failed':
-      return "This recording couldn't be fetched.";
-    default:
-      return speech.status === 'unavailable' ? NOT_LISTENED_HERE : "This recording couldn't be understood.";
+      return told("This recording couldn't be fetched.", 'send it again');
   }
+  const limit = OPERATOR_LIMITS.get(reason);
+  if (limit || speech.status === 'unavailable') {
+    if (!principals) return NOT_LISTENED_ELSEWHERE;
+    return told(
+      limit ? `You didn't listen to this recording: ${limit}.` : "You can't listen to this recording here.",
+      'type anything it held',
+    );
+  }
+  return told("This recording couldn't be understood.", 'type anything it held');
 }
 
 function isRecognizedSpeech(speech: Record<string, unknown> | undefined): boolean {
@@ -583,7 +601,7 @@ function formatSpeech(attachment: Record<string, unknown>): string {
     return `\n<speech status="recognized"${sourceAttrs}${languageAttr}>${escapeXml(attachmentText(speech.text))}</speech>`;
   }
   const status = speech.status === 'unavailable' || speech.status === 'no-speech' ? speech.status : 'failed';
-  return `\n<speech status="${status}"${sourceAttrs}>${speechLimitation(speech)} Handle the rest of the message as usual.</speech>`;
+  return `\n<speech status="${status}"${sourceAttrs}>${speechStatusLine(speech)}</speech>`;
 }
 
 function formatAttachments(attachments: unknown): string {

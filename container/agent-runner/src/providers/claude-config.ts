@@ -211,6 +211,7 @@ export interface ClaudePolicySettings {
   syncClaudeAiSkills: false;
   syncClaudeAiPlugins: false;
   disableBundledSkills: true;
+  skillOverrides: { design: 'off'; doctor: 'off' };
   enabledPlugins: { [BUILTIN_PLUGIN_AUTHORING]: false };
 }
 
@@ -228,9 +229,12 @@ export interface ClaudePolicySettings {
  * so an agent gets the skills nanoclaw mounts, not the operator's own. For
  * the same reason the skills Claude Code ships are off: they claim
  * reminders, loops and coding chores that nanoclaw's own tools own. The
- * bundled-skills switch leaves plugins alone, so the built-in plugin that
- * teaches making Claude Code mods is switched off by its id; the mounted
- * skills stay listed.
+ * two bundled skills the switch spares, both typed by a user only, are
+ * turned off by name: `design` (Claude Design consent, for an account that
+ * has it) and `doctor` (a check of the operator's own Claude Code setup), so
+ * a session advertises only the skills nanoclaw mounts. The bundled-skills
+ * switch leaves plugins alone, so the built-in plugin that teaches making
+ * Claude Code mods is switched off by its id; the mounted skills stay listed.
  */
 export function resolveClaudeExecutionPolicy(): {
   permissionMode: 'bypassPermissions';
@@ -248,6 +252,7 @@ export function resolveClaudeExecutionPolicy(): {
       syncClaudeAiSkills: false,
       syncClaudeAiPlugins: false,
       disableBundledSkills: true,
+      skillOverrides: { design: 'off', doctor: 'off' },
       enabledPlugins: { [BUILTIN_PLUGIN_AUTHORING]: false },
     },
   };

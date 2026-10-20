@@ -1517,7 +1517,8 @@ describe('recorded divergence: the agent runner words delivery for the tools the
     expect(index).toContain("taskId ? { kind: 'task', taskId } : { kind: 'chat' },\n    config.capabilities,\n  );");
     expect(compaction).toContain('const canReply = capabilities.has(REPLY_CAPABILITY);');
     expect(compaction).toContain("'A turn with nothing to send ends with only <internal>...</internal>.'");
-    expect(compaction).toContain('buildCompactInstructions(names, getTaskSeriesId(), loadConfig().capabilities)');
+    expect(compaction).toContain('console.log(buildCompactInstructions(names, taskId, loadConfig().capabilities));');
+    expect(compaction).toContain('taskId: getTaskSeriesId(),');
     expect(pollLoop).not.toContain('Please re-send your reply');
     expect(pollLoop).toContain(
       'If the turn had nothing to send, respond with only <internal>done</internal> and nothing will be sent.',
@@ -1541,6 +1542,8 @@ describe('recorded divergence: compaction keeps the relationship and the work in
       'The people you serve are whoever your own instructions say may direct you.',
       '4. Leave out standing instructions and memory: both are loaded again after the summary',
       'never a rule to follow from now on.',
+      'Leave out how to use tools and commands too: the skills and tool',
+      'descriptions carry that, and a command remembered from a summary is not the skill that teaches it.',
     ]) {
       expect(compaction).toContain(line);
     }
@@ -1557,8 +1560,17 @@ describe('recorded divergence: recognized speech carries its reading note and an
     );
     expect(formatter).toContain('`\\n<speech_note>${SPEECH_READING_NOTE}</speech_note>`');
     expect(formatter).toContain('const principals = speech.inPrincipalPrivateConversation === true;');
-    expect(formatter).toContain(`const NOT_LISTENED_HERE = "This recording can't be listened to here.";`);
-    expect(formatter).toContain('${speechLimitation(speech)} Handle the rest of the message as usual.</speech>');
+    expect(formatter).toContain('const NOT_LISTENED_ELSEWHERE =');
+    expect(formatter).toContain(
+      `"You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual."`,
+    );
+    expect(formatter).toContain(
+      'They expect you heard it, so tell them so in a line of your reply, ask them to ${ask}, and handle the rest of their message as usual.',
+    );
+    expect(formatter).toContain(
+      'Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to ${ask}; handle the rest of the message as usual.',
+    );
+    expect(formatter).toContain('`\\n<speech status="${status}"${sourceAttrs}>${speechStatusLine(speech)}</speech>`');
   });
 });
 
@@ -1708,6 +1720,7 @@ describe('recorded divergence: an agent sees only the skills NanoClaw mounts for
     expect(policy.settings).toMatchObject({
       disableBundledSkills: true,
       enabledPlugins: { 'plugin-authoring@builtin': false },
+      skillOverrides: { design: 'off', doctor: 'off' },
     });
     expect(policy.disallowedTools).toEqual(expect.arrayContaining(['RemoteTrigger', 'PushNotification']));
   });
@@ -1727,5 +1740,19 @@ describe('recorded divergence: an agent sees only the skills NanoClaw mounts for
     await import('../modules/gws-ea-google/index.js');
 
     expect(gateway.selectGatewayAgentSkills(['welcome'], true)).toEqual(['welcome']);
+  });
+});
+
+describe('recorded divergence: the PreCompact hook composes the mailbox it reads', () => {
+  it('imports the mailbox composition slot and starts the mailbox from the session context before reading', async () => {
+    const compaction = await readFile(
+      path.join(originalCwd, 'container/agent-runner/src/compact-instructions.ts'),
+      'utf8',
+    );
+
+    expect(compaction).toContain("import './mailbox/compose.js';");
+    expect(compaction).toContain('await mailbox.start(await readMailboxContext());');
+    expect(compaction).toContain('await mailbox.run(() => ({');
+    expect(compaction).toContain('await mailbox.stop();');
   });
 });

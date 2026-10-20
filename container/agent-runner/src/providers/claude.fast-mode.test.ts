@@ -60,6 +60,7 @@ const POLICY_SETTINGS = {
   syncClaudeAiSkills: false,
   syncClaudeAiPlugins: false,
   disableBundledSkills: true,
+  skillOverrides: { design: 'off', doctor: 'off' },
   enabledPlugins: { 'plugin-authoring@builtin': false },
 };
 

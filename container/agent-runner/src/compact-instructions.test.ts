@@ -110,6 +110,19 @@ describe('compaction keeps the relationship and the work in flight', () => {
     expect(instructions).toContain('never a rule to follow from now on.');
   });
 
+  it('leaves out how to use tools and commands, so the agent reads the skill again rather than a remembered command', () => {
+    for (const instructions of [
+      buildCompactInstructions(['family'], null, REPLY),
+      buildCompactInstructions(['family'], 'weekly-report', NO_REPLY),
+    ]) {
+      expect(instructions).toContain('Leave out how to use tools and commands too: the skills and tool');
+      expect(instructions).toContain('a command remembered from a summary is not the skill that teaches it');
+      expect(instructions.indexOf('Leave out how to use tools')).toBeLessThan(
+        instructions.indexOf('include this verbatim reminder'),
+      );
+    }
+  });
+
   it('names no product, audience role or tool beyond delivery', () => {
     const instructions = buildCompactInstructions(['family'], null, NO_REPLY);
 

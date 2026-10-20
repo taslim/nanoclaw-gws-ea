@@ -422,35 +422,51 @@ describe('audio source speech in the ordinary message', () => {
     expect(isClearCommand(typed!)).toBe(true);
   });
 
-  const HERE = "This recording can't be listened to here. Handle the rest of the message as usual.";
-  const OFF =
-    "This recording wasn't listened to: voice notes are off, and only the principal's operator can turn them on. Handle the rest of the message as usual.";
-  const UPDATE =
-    "This recording wasn't listened to: voice notes need an update only the principal's operator can make. Handle the rest of the message as usual.";
-  const BROKEN =
-    "This recording wasn't listened to: voice notes aren't working right now, and only the principal's operator can fix that. Handle the rest of the message as usual.";
-  const AGAIN =
-    "This recording wasn't listened to and won't be retried; the sender can send it again or type it. Handle the rest of the message as usual.";
-  const SILENT = 'No speech was heard in this recording. Handle the rest of the message as usual.';
-  const UNFETCHED = "This recording couldn't be fetched. Handle the rest of the message as usual.";
-  const UNCLEAR = "This recording couldn't be understood. Handle the rest of the message as usual.";
+  /** The principal, in their own private conversation: the fact, then tell them and ask for it in writing. */
+  const own = (fact: string, ask: string) =>
+    `${fact} They expect you heard it, so tell them so in a line of your reply, ask them to ${ask}, and handle the rest of their message as usual.`;
+  /** Anyone else: say so only where it matters to the thread. */
+  const elsewhere = (fact: string, ask: string) =>
+    `${fact} Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to ${ask}; handle the rest of the message as usual.`;
+  const HERE =
+    "You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual.";
+  const OWN_HERE = own("You can't listen to this recording here.", 'type anything it held');
+  const OFF = own(
+    "You didn't listen to this recording: voice notes are off, and only the principal's operator can turn them on.",
+    'type anything it held',
+  );
+  const UPDATE = own(
+    "You didn't listen to this recording: voice notes need an update only the principal's operator can make.",
+    'type anything it held',
+  );
+  const BROKEN = own(
+    "You didn't listen to this recording: voice notes aren't working right now, and only the principal's operator can fix that.",
+    'type anything it held',
+  );
+  const AGAIN: [string, string] = [
+    "This recording wasn't listened to and won't be retried.",
+    'send it again or type it',
+  ];
+  const SILENT: [string, string] = ['No speech was heard in this recording.', 'type anything it was meant to say'];
+  const UNFETCHED: [string, string] = ["This recording couldn't be fetched.", 'send it again'];
+  const UNCLEAR: [string, string] = ["This recording couldn't be understood.", 'type anything it held'];
 
   it.each([
     ['unavailable', 'operator-setup-required', OFF, HERE],
     ['unavailable', 'operator-enablement-required', OFF, HERE],
     ['unavailable', 'operator-update-required', UPDATE, HERE],
     ['unavailable', 'voice-installation-unhealthy', BROKEN, HERE],
-    ['unavailable', 'retired-reason', HERE, HERE],
-    ['failed', 'voice-busy', AGAIN, AGAIN],
-    ['failed', 'aborted', AGAIN, AGAIN],
-    ['no-speech', undefined, SILENT, SILENT],
-    ['failed', 'media-download-failed', UNFETCHED, UNFETCHED],
-    ['failed', 'recognition-failed', UNCLEAR, UNCLEAR],
-    ['failed', 'duration-limit', UNCLEAR, UNCLEAR],
-    ['recognized', undefined, UNCLEAR, UNCLEAR],
+    ['unavailable', 'retired-reason', OWN_HERE, HERE],
+    ['failed', 'voice-busy', own(...AGAIN), elsewhere(...AGAIN)],
+    ['failed', 'aborted', own(...AGAIN), elsewhere(...AGAIN)],
+    ['no-speech', undefined, own(...SILENT), elsewhere(...SILENT)],
+    ['failed', 'media-download-failed', own(...UNFETCHED), elsewhere(...UNFETCHED)],
+    ['failed', 'recognition-failed', own(...UNCLEAR), elsewhere(...UNCLEAR)],
+    ['failed', 'duration-limit', own(...UNCLEAR), elsewhere(...UNCLEAR)],
+    ['recognized', undefined, own(...UNCLEAR), elsewhere(...UNCLEAR)],
   ] as const)(
     "words %s / %s for the principal's own private conversation and for anyone else",
-    (status, reason, own, elsewhere) => {
+    (status, reason, ownLine, elsewhereLine) => {
       const limited = (inPrincipalPrivateConversation?: boolean) => ({
         sender: 'Morgan',
         text: 'And please check my calendar.',
@@ -474,9 +490,9 @@ describe('audio source speech in the ordinary message', () => {
       const [ownRow, elsewhereRow, unmarkedRow] = getPendingMessages();
 
       for (const [row, line] of [
-        [ownRow!, own],
-        [elsewhereRow!, elsewhere],
-        [unmarkedRow!, elsewhere],
+        [ownRow!, ownLine],
+        [elsewhereRow!, elsewhereLine],
+        [unmarkedRow!, elsewhereLine],
       ] as const) {
         const result = formatMessages([row]);
         expect(result).toContain('And please check my calendar.');
@@ -515,6 +531,33 @@ describe('audio source speech in the ordinary message', () => {
     const result = formatMessages(getPendingMessages());
 
     expect(result).not.toMatch(/install|add_mcp_server|setup|set up|enable|approv|card|request|in full/iu);
+  });
+
+  it.each([
+    'operator-setup-required',
+    'operator-enablement-required',
+    'operator-update-required',
+    'voice-installation-unhealthy',
+    'voice-busy',
+    'media-download-failed',
+    'recognition-failed',
+  ])('names no operator to anyone else for %s, and still asks its sender for it in writing', (reason) => {
+    for (const mark of [{ inPrincipalPrivateConversation: false }, {}]) {
+      insertMessage(`${reason}-${String(mark.inPrincipalPrivateConversation)}`, 'chat', {
+        sender: 'Juno Hale',
+        text: 'Thursday works for me.',
+        attachments: [{ type: 'audio', speech: { status: 'unavailable', reason, ...mark } }],
+      });
+    }
+
+    const rows = getPendingMessages();
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      const line = /<speech status="[^"]+" source="audio">([^<]*)<\/speech>/u.exec(formatMessages([row]))?.[1] ?? '';
+      expect(line).not.toMatch(/operator|voice notes/iu);
+      expect(line).toContain('Its sender expects you heard it, so if it bears on the thread,');
+      expect(line).toContain('handle the rest of the message as usual.');
+    }
   });
 
   it('says how to read recognized speech once, after the attachments, whatever the number of recordings', () => {
@@ -612,7 +655,7 @@ describe('audio source speech in the ordinary message', () => {
     const result = formatMessages(getPendingMessages());
 
     expect(result).toContain(
-      `<speech status="failed" source="audio">This recording couldn't be understood. Handle the rest of the message as usual.</speech>`,
+      `<speech status="failed" source="audio">This recording couldn't be understood. Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to type anything it held; handle the rest of the message as usual.</speech>`,
     );
     expect(result).not.toContain('PARTIAL:');
     expect(result).not.toContain('/private/');
