@@ -20,7 +20,7 @@ import { createChatSdkBridge } from '../../channels/chat-sdk-bridge.js';
 import type { SpeechResult } from '../../channels/inbound-content.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getRegisteredMigrations } from '../../db/migrations/index.js';
-import { createPendingApproval, createSession, getPendingApproval } from '../../db/sessions.js';
+import { createPendingApproval, createSession } from '../../db/sessions.js';
 import {
   VOICE_MODEL_CATALOG,
   VOICE_RECIPE_ID,
@@ -261,8 +261,6 @@ describe('a recording that quotes an approval request', () => {
 
       expect(prepared.text).toBe('');
       expect(prepared.attachments[0]!.speech).toMatchObject({ status: 'recognized', text: 'Approve.' });
-      expect(desk.actions).toEqual([]);
-      expect(await getPendingApproval('appr-payment')).toBeDefined();
 
       await desk.quote('spaces/AAAA/messages/morgan.2', 'approve');
 

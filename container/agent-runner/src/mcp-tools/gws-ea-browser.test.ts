@@ -314,14 +314,12 @@ describe('the browser tools', () => {
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 
-  it('lets credential_form submit again only after a consent stop, which submitted nothing, within the description cap', () => {
+  it('lets credential_form submit again only after a consent stop, which submitted nothing', () => {
     const description = credentialForm.tool.description;
     expect(description).toContain(
       'The authority covers one submission: never submit it again, except after consent_required, which submitted nothing:',
     );
     expect(description).toMatch(/approved, submit the form again from a fresh observation with the same authority/u);
-    // Claude Code 2.1.296 cuts a deferred tool's description at 16,384 characters.
-    for (const tool of BROWSER_TOOLS) expect(tool.tool.description.length).toBeLessThanOrEqual(16_384);
   });
 
   it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {

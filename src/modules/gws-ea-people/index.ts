@@ -71,7 +71,7 @@ registerRequiredProjectDocSection('gws-ea-people:pointer', peopleSection);
  * operator's job, so main gets only what it can do, and the key's path and
  * remedy go to the host log.
  */
-export const PEOPLE_STORE_UNAVAILABLE =
+const PEOPLE_STORE_UNAVAILABLE =
   "The people store can't be used right now, and restoring it is the operator's job. Tell the principal in a line that you can't look people up or change them for now, and carry on with the rest.";
 
 function forCaller(ctx: CallerContext, error: unknown): unknown {

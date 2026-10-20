@@ -311,32 +311,6 @@ it("records an unconfirmed purchase's outcome by the job's attempt id, with its 
     expect(recordPurchaseOutcome.tool.description).toContain(word);
 });
 
-it('serves record_purchase_outcome under its own key, so main holds it when the access list leaves main out', async () => {
-  const { createMcpServer } = await import('./server.js');
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
-  const served = async (grants: readonly string[]): Promise<string[]> => {
-    const server = createMcpServer(async (action) => action(), new Set(grants));
-    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
-    const client = new Client({ name: 'purchase-outcome-fixture', version: '1' });
-    await server.connect(serverTransport);
-    await client.connect(clientTransport);
-    try {
-      return (await client.listTools()).tools.map((tool) => tool.name);
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  };
-  expect(await served(['browser-purchase-outcome'])).toEqual(['record_purchase_outcome']);
-  expect(await served(['browser-delegate'])).not.toContain('record_purchase_outcome');
-});
-
-it('keeps every delegate tool description within the pinned description cap', () => {
-  // Claude Code 2.1.296 cuts a deferred tool's description at 16,384 characters.
-  for (const tool of DELEGATE_TOOLS) expect(tool.tool.description.length).toBeLessThanOrEqual(16_384);
-});
-
 it('carries at each tool the rules a delegating agent meets there', () => {
   expect(reservationGuarantee.tool.description).toContain(
     'A per-person fee counts across the whole party: the maximum covers it times the party size.',

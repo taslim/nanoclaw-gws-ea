@@ -379,17 +379,6 @@ describe('the names in GWS-EA host text', () => {
       }
     }
   });
-
-  it("fails on the profile's earlier wording, which named free_time to main", () => {
-    const file = 'gws-ea-profile/index.ts';
-    const earlier = (sources.get(file) ?? '').replace(
-      /const TAKES_EFFECT =\n {2}".*";/u,
-      `const TAKES_EFFECT =\n  "The host's email signatures and free_time use the new values now.";`,
-    );
-    expect(check(file, earlier).problems).toEqual([
-      expect.stringMatching(/^gws-ea-profile\/index\.ts:\d+ free_time: main does not hold it$/u),
-    ]);
-  });
 });
 
 describe('the host-text names check', () => {

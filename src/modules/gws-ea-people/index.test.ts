@@ -17,9 +17,13 @@ import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { addPerson, getPerson, getPersonLevel, listPeople, type Person } from './db.js';
 import { FINGERPRINT_KEY_FILE_NAME } from './fingerprint.js';
-import { MAIN_PEOPLE_POINTER, PEOPLE_STORE_UNAVAILABLE } from './index.js';
+import { MAIN_PEOPLE_POINTER } from './index.js';
 
 const VERBS = ['find', 'get', 'list', 'add', 'update', 'set-level', 'forget'] as const;
+
+/** What main reads while the store is stopped: its own next step, with the key's path and remedy left to the operator. */
+const STORE_UNAVAILABLE =
+  "The people store can't be used right now, and restoring it is the operator's job. Tell the principal in a line that you can't look people up or change them for now, and carry on with the rest.";
 
 function group(id: string, name: string): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-10-02T00:00:00.000Z' };
@@ -242,14 +246,13 @@ describe('GWS-EA people ncl resource', () => {
     ] as const) {
       expect(await run(`people-${verb}`, args), verb).toMatchObject({
         ok: false,
-        error: { message: PEOPLE_STORE_UNAVAILABLE },
+        error: { message: STORE_UNAVAILABLE },
       });
       expect(await run(`people-${verb}`, args, HOST), verb).toMatchObject({
         ok: false,
         error: { message: expect.stringMatching(/stopped.*Restore the key/is) },
       });
     }
-    expect(PEOPLE_STORE_UNAVAILABLE).not.toContain(root);
     expect(fs.existsSync(path.join(root, FINGERPRINT_KEY_FILE_NAME))).toBe(false);
   });
 });

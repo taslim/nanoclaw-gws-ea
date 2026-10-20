@@ -187,6 +187,18 @@ describe('NanoClaw tool server capabilities', () => {
     }
   });
 
+  it('keeps every tool description within the length Claude Code keeps', async () => {
+    // Claude Code 2.1.296 cuts a deferred tool's description at 16,384 characters.
+    const { client, close } = await connect([...ALL, 'browser', ...EXTERNAL_EMAIL]);
+    try {
+      const { tools } = await client.listTools();
+      expect(tools.length).toBeGreaterThan(DEFAULT_ON_TOOLS.length);
+      expect(tools.filter((tool) => (tool.description ?? '').length > 16_384).map((tool) => tool.name)).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
     for (const tool of ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking']) {
