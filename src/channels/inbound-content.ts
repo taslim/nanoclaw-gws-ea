@@ -13,6 +13,12 @@ export type SpeechResult = (
   /** Diagnostic identifiers stay inside stored content, outside ordinary replies. */
   engine?: string;
   model?: string;
+  /**
+   * The recording came in the principal's own private conversation, as the
+   * host judged when it arrived, so a status line may name who can change
+   * voice notes. Absent reads as anywhere else.
+   */
+  inPrincipalPrivateConversation?: boolean;
 };
 
 function record(value: unknown): Record<string, unknown> | undefined {

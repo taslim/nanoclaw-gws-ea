@@ -522,6 +522,52 @@ function attachmentText(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+/**
+ * How to read recognized speech, said once after a message's attachments. It
+ * covers reading a transcript only: whose words a recording holds is decided
+ * as for any attachment.
+ */
+const SPEECH_READING_NOTE =
+  "Recognition can mishear a word, so read the speech for what was meant. A self-correction replaces what it corrects. Keep every point, number, negation and condition, even in a rambling note. Don't repeat the transcript back.";
+
+const NOT_LISTENED_HERE = "This recording can't be listened to here.";
+
+/**
+ * Why a recording was not heard, worded for its reader. Only the principal's
+ * own private conversation, as the host marked it, hears that their operator
+ * can change it; a missing mark reads as anywhere else.
+ */
+function speechLimitation(speech: Record<string, unknown>): string {
+  if (speech.status === 'no-speech') return 'No speech was heard in this recording.';
+  const principals = speech.inPrincipalPrivateConversation === true;
+  switch (speech.reason) {
+    case 'operator-setup-required':
+    case 'operator-enablement-required':
+      return principals
+        ? "This recording wasn't listened to: voice notes are off, and only the principal's operator can turn them on."
+        : NOT_LISTENED_HERE;
+    case 'operator-update-required':
+      return principals
+        ? "This recording wasn't listened to: voice notes need an update only the principal's operator can make."
+        : NOT_LISTENED_HERE;
+    case 'voice-installation-unhealthy':
+      return principals
+        ? "This recording wasn't listened to: voice notes aren't working right now, and only the principal's operator can fix that."
+        : NOT_LISTENED_HERE;
+    case 'voice-busy':
+    case 'aborted':
+      return "This recording wasn't listened to and won't be retried; the sender can send it again or type it.";
+    case 'media-download-failed':
+      return "This recording couldn't be fetched.";
+    default:
+      return speech.status === 'unavailable' ? NOT_LISTENED_HERE : "This recording couldn't be understood.";
+  }
+}
+
+function isRecognizedSpeech(speech: Record<string, unknown> | undefined): boolean {
+  return speech?.status === 'recognized' && attachmentText(speech.text).trim() !== '';
+}
+
 /** Speech remains nested source material; engine/model diagnostics stay in storage. */
 function formatSpeech(attachment: Record<string, unknown>): string {
   const speech = attachmentRecord(attachment.speech);
@@ -531,29 +577,13 @@ function formatSpeech(attachment: Record<string, unknown>): string {
     ` source="${source?.kind === 'voice-note' ? 'voice-note' : 'audio'}"` +
     (source?.forwarded === true ? ' forwarded="true"' : '') +
     (source?.quoted === true ? ' quoted="true"' : '');
-  const text = attachmentText(speech.text);
-  if (speech.status === 'recognized' && text.trim()) {
+  if (isRecognizedSpeech(speech)) {
     const language = attachmentText(speech.language);
     const languageAttr = language ? ` language="${escapeXml(language)}"` : '';
-    return `\n<speech status="recognized"${sourceAttrs}${languageAttr}>${escapeXml(text)}</speech>`;
+    return `\n<speech status="recognized"${sourceAttrs}${languageAttr}>${escapeXml(attachmentText(speech.text))}</speech>`;
   }
   const status = speech.status === 'unavailable' || speech.status === 'no-speech' ? speech.status : 'failed';
-  let consequence = 'The recording could not be understood in full.';
-  if (status === 'no-speech') consequence = 'No usable speech was detected in the recording.';
-  else if (status === 'unavailable') {
-    switch (speech.reason) {
-      case 'operator-setup-required':
-      case 'operator-enablement-required':
-        consequence = 'Voice notes need operator enablement.';
-        break;
-      case 'operator-update-required':
-        consequence = 'Voice notes need an operator update.';
-        break;
-      default:
-        consequence = 'Voice notes are currently unavailable.';
-    }
-  } else if (speech.reason === 'media-download-failed') consequence = 'The recording could not be obtained.';
-  return `\n<speech status="${status}"${sourceAttrs}>${consequence}</speech>`;
+  return `\n<speech status="${status}"${sourceAttrs}>${speechLimitation(speech)} Handle the rest of the message as usual.</speech>`;
 }
 
 function formatAttachments(attachments: unknown): string {
@@ -574,7 +604,10 @@ function formatAttachments(attachments: unknown): string {
       : `[${escapeXml(type)}: ${escapeXml(name)}]`;
     return description + speech;
   });
-  return '\n' + parts.join('\n');
+  const heard = attachments.some((value: unknown) =>
+    isRecognizedSpeech(attachmentRecord(attachmentRecord(value)?.speech)),
+  );
+  return '\n' + parts.join('\n') + (heard ? `\n<speech_note>${SPEECH_READING_NOTE}</speech_note>` : '');
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
