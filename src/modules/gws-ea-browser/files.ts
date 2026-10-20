@@ -1,5 +1,5 @@
 import fs, { constants, type Stats } from 'node:fs';
-import { chmod, lstat, open, readdir, rmdir, unlink } from 'node:fs/promises';
+import { chmod, lstat, open, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -181,10 +181,21 @@ export async function handoffBrowserDownload(
   filename: string,
 ): Promise<string> {
   if (!isSafeAttachmentName(artifactId) || !isSafeAttachmentName(filename)) throw new Error('Unsafe download name');
-  const target = path.join(inboxRoot, artifactId, filename);
+  // The session folder is the host's (the container's mount point), so its
+  // physical place is recorded: a path through a release's data link would
+  // go stale once an update prunes that release.
+  const sessionRoot = await realpath(path.dirname(inboxRoot));
+  const target = path.join(sessionRoot, path.basename(inboxRoot), artifactId, filename);
   let directory: AnchoredDir | null;
   try {
-    directory = AnchoredDir.open(path.dirname(inboxRoot), [path.basename(inboxRoot), artifactId], true);
+    const inbox = AnchoredDir.open(sessionRoot, [path.basename(inboxRoot)], true);
+    if (!inbox) throw new Error('Inbox missing');
+    try {
+      directory = inbox.openDir(artifactId, true);
+      if (directory) makePrivate(inbox, path.dirname(target), artifactId);
+    } finally {
+      inbox.close();
+    }
   } catch (error) {
     throw new Error('Unsafe download inbox', { cause: error });
   }
@@ -225,6 +236,27 @@ export async function handoffBrowserDownload(
     return target;
   } finally {
     directory.close();
+  }
+}
+
+/**
+ * Make the inbox folder `name` private (0700). Node cannot chmod through a
+ * directory descriptor it did not open, so the folder is opened by path,
+ * never following its own name, and changed only when it is the very folder
+ * the anchored inbox holds under `name`.
+ */
+function makePrivate(inbox: AnchoredDir, folder: string, name: string): void {
+  const fd = fs.openSync(
+    folder,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const opened = fs.fstatSync(fd);
+    const held = inbox.lstat(name);
+    if (opened.dev !== held.dev || opened.ino !== held.ino) throw new Error('Download inbox changed during handoff');
+    fs.fchmodSync(fd, 0o700);
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
