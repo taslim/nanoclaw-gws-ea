@@ -180,7 +180,7 @@ function are(addresses: readonly string[]): string {
   return `${LIST.format(addresses)} ${addresses.length === 1 ? 'is' : 'are'}`;
 }
 
-/** An all-day span, its days at UTC midnight, as people say it: "Monday 12 Oct", or "Monday 12 Oct to Tuesday 13 Oct". */
+/** An all-day span, its days at UTC midnight, as people say it: "Monday, Oct 12", or "Monday, Oct 12 to Tuesday, Oct 13". */
 function daysLabel(first: number, last: number): string {
   return first === last ? dayLabel(first, 'UTC') : `${dayLabel(first, 'UTC')} to ${dayLabel(last, 'UTC')}`;
 }

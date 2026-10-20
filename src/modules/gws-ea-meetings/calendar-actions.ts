@@ -241,17 +241,23 @@ export function conferenceWords(conference: EventConference | undefined): string
 }
 
 /**
- * A slot as people write it, in `timezone`: "Tuesday 6 Oct, 10:00–10:30
- * BST", its zone by the short name people know rather than its IANA name.
+ * A slot as US readers write it, in `timezone`: "Tuesday, Oct 6, 10:00–10:30
+ * AM BST", its zone by the short name people know rather than its IANA name.
  */
 export function slotLabel(span: Span, timezone: string): string {
-  return `${dayLabel(span.start, timezone)}, ${clockLabel(span.start, timezone)}–${clockLabel(span.end, timezone)} ${zoneName(span.start, timezone)}`;
+  const start = clockOf(span.start, timezone);
+  const end = clockOf(span.end, timezone);
+  const times =
+    start.period === end.period
+      ? `${start.time}–${end.time} ${end.period}`
+      : `${start.time} ${start.period}–${end.time} ${end.period}`;
+  return `${dayLabel(span.start, timezone)}, ${times} ${zoneName(span.start, timezone)}`;
 }
 
 /**
- * A span as people write it, in `timezone`: a slot when it starts and ends
- * on one day, and both days otherwise, "Thursday 8 Oct, 09:00 PDT to
- * Saturday 10 Oct, 17:00 PDT". Ending at midnight stays the same day.
+ * A span as US readers write it, in `timezone`: a slot when it starts and
+ * ends on one day, and both days otherwise, "Thursday, Oct 8, 9:00 AM PDT to
+ * Saturday, Oct 10, 5:00 PM PDT". Ending at midnight stays the same day.
  */
 export function spanLabel(span: Span, timezone: string): string {
   return dayLabel(span.start, timezone) === dayLabel(span.end - 1, timezone)
@@ -259,13 +265,26 @@ export function spanLabel(span: Span, timezone: string): string {
     : `${momentLabel(span.start, timezone)} to ${momentLabel(span.end, timezone)}`;
 }
 
-/** One instant as people write it, in `timezone`: "Thursday 8 Oct, 09:00 PDT". */
+/** One instant as US readers write it, in `timezone`: "Thursday, Oct 8, 9:00 AM PDT". */
 export function momentLabel(instant: number, timezone: string): string {
-  return `${dayLabel(instant, timezone)}, ${clockLabel(instant, timezone)} ${zoneName(instant, timezone)}`;
+  const clock = clockOf(instant, timezone);
+  return `${dayLabel(instant, timezone)}, ${clock.time} ${clock.period} ${zoneName(instant, timezone)}`;
 }
 
-function clockLabel(instant: number, timezone: string): string {
-  return new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
+/**
+ * An instant's 12-hour clock in `timezone`, "10:00" and "AM", read from its
+ * parts so the space before AM or PM is a plain one whatever the ICU version
+ * writes there.
+ */
+function clockOf(instant: number, timezone: string): { time: string; period: string } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).formatToParts(new Date(instant));
+  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((each) => each.type === type)?.value ?? '';
+  return { time: `${part('hour')}:${part('minute')}`, period: part('dayPeriod') };
 }
 
 /**
@@ -277,19 +296,17 @@ function clockLabel(instant: number, timezone: string): string {
 const YEARLESS_PAST_MS = 120 * 24 * 60 * 60 * 1000;
 const YEARLESS_AHEAD_MS = 300 * 24 * 60 * 60 * 1000;
 
-/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct", with its year when far from now. */
+/** The day an instant falls on in `timezone`, as US readers write it: "Tuesday, Oct 6", with its year when far from now. */
 export function dayLabel(instant: number, timezone: string): string {
   const now = Date.now();
   const near = instant >= now - YEARLESS_PAST_MS && instant < now + YEARLESS_AHEAD_MS;
-  return new Date(instant)
-    .toLocaleDateString('en-GB', {
-      timeZone: timezone,
-      weekday: 'long',
-      day: 'numeric',
-      month: 'short',
-      ...(near ? {} : { year: 'numeric' }),
-    })
-    .replace(',', '');
+  return new Date(instant).toLocaleDateString('en-US', {
+    timeZone: timezone,
+    weekday: 'long',
+    day: 'numeric',
+    month: 'short',
+    ...(near ? {} : { year: 'numeric' }),
+  });
 }
 
 /**

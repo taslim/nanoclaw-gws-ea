@@ -28,25 +28,65 @@ import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import '../gws-ea-privacy/index.js';
+import { findWeekdayMismatch } from '../gws-ea-dates/weekday-check.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import {
   assertInvitationShareable,
+  dayLabel,
   ensureEvent,
   guestsOn,
   slotLabel,
+  spanLabel,
   TAG_ROLE,
   type Invitation,
 } from './calendar-actions.js';
 import { FakeCalendar } from './testing/fake-calendar.js';
 
 describe('a slot as people write it', () => {
-  it('names its day, its times and its zone the way people do, never an IANA name', () => {
-    const span = { start: Date.parse('2026-10-06T09:00:00Z'), end: Date.parse('2026-10-06T09:30:00Z') };
-    expect(slotLabel(span, 'Europe/London')).toBe('Tuesday 6 Oct, 10:00–10:30 BST');
-    expect(slotLabel(span, 'America/New_York')).toBe('Tuesday 6 Oct, 05:00–05:30 EDT');
-    expect(slotLabel(span, 'Africa/Lagos')).toBe('Tuesday 6 Oct, 10:00–10:30 GMT+1');
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.parse('2026-10-01T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('names its day, its times and its zone as US readers write them, never an IANA name', () => {
+    const morning = { start: Date.parse('2026-10-06T09:00:00Z'), end: Date.parse('2026-10-06T09:30:00Z') };
+    expect(slotLabel(morning, 'Europe/London')).toBe('Tuesday, Oct 6, 10:00–10:30 AM BST');
+    expect(slotLabel(morning, 'America/New_York')).toBe('Tuesday, Oct 6, 5:00–5:30 AM EDT');
+    expect(slotLabel(morning, 'Africa/Lagos')).toBe('Tuesday, Oct 6, 10:00–10:30 AM GMT+1');
+    const afternoon = { start: Date.parse('2026-10-06T19:00:00Z'), end: Date.parse('2026-10-06T20:00:00Z') };
+    expect(slotLabel(afternoon, 'America/New_York')).toBe('Tuesday, Oct 6, 3:00–4:00 PM EDT');
+    const overNoon = { start: Date.parse('2026-10-06T10:30:00Z'), end: Date.parse('2026-10-06T11:30:00Z') };
+    expect(slotLabel(overNoon, 'Europe/London')).toBe('Tuesday, Oct 6, 11:30 AM–12:30 PM BST');
+  });
+
+  it('gives both days when a span crosses midnight, and keeps a span ending at midnight on its day', () => {
+    const late = { start: Date.parse('2026-10-08T05:00:00Z'), end: Date.parse('2026-10-08T08:00:00Z') };
+    expect(spanLabel(late, 'America/Los_Angeles')).toBe(
+      'Wednesday, Oct 7, 10:00 PM PDT to Thursday, Oct 8, 1:00 AM PDT',
+    );
+    const toMidnight = { start: Date.parse('2026-10-06T22:00:00Z'), end: Date.parse('2026-10-06T23:00:00Z') };
+    expect(spanLabel(toMidnight, 'Europe/London')).toBe('Tuesday, Oct 6, 11:00 PM–12:00 AM BST');
+  });
+
+  it('writes September as US readers do, and gives the year of a day far from now', () => {
+    expect(dayLabel(Date.parse('2026-09-01T12:00:00Z'), 'Europe/London')).toBe('Tuesday, Sep 1');
+    expect(dayLabel(Date.parse('2027-10-05T12:00:00Z'), 'Europe/London')).toBe('Tuesday, Oct 5, 2027');
+  });
+
+  it('reads as the right weekday to the outgoing check when copied into mail', () => {
+    const morning = { start: Date.parse('2026-10-06T09:00:00Z'), end: Date.parse('2026-10-06T09:30:00Z') };
+    const later = { start: Date.parse('2027-10-05T09:00:00Z'), end: Date.parse('2027-10-05T09:30:00Z') };
+    const today = { year: 2026, month: 10, day: 1 };
+    for (const label of [slotLabel(morning, 'Europe/London'), slotLabel(later, 'Europe/London')]) {
+      expect(findWeekdayMismatch(`Would ${label} work for you?`, today)).toBeUndefined();
+      const wrong = label.replace('Tuesday', 'Wednesday');
+      expect(findWeekdayMismatch(`Would ${wrong} work for you?`, today)?.weekday).toBe('Wednesday');
+    }
   });
 });
 

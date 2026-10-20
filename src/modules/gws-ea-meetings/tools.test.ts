@@ -386,13 +386,13 @@ describe('free_time', () => {
 
     // New York wakes at 12:00 London, Wednesday's meeting is gone, and Tuesday's protected afternoon says so.
     expect(windows.map((free) => [free.principal_time, free.their_time, free.fit])).toEqual([
-      ['Tuesday 6 Oct, 12:00–15:00 BST', 'Tuesday 6 Oct, 07:00–10:00 EDT', 'acceptable'],
-      ['Tuesday 6 Oct, 15:00–17:00 BST', 'Tuesday 6 Oct, 10:00–12:00 EDT', 'protected time'],
-      ['Tuesday 6 Oct, 17:00–22:00 BST', 'Tuesday 6 Oct, 12:00–17:00 EDT', 'outside usual hours'],
-      ['Wednesday 7 Oct, 14:00–17:00 BST', 'Wednesday 7 Oct, 09:00–12:00 EDT', 'acceptable'],
-      ['Wednesday 7 Oct, 17:00–22:00 BST', 'Wednesday 7 Oct, 12:00–17:00 EDT', 'outside usual hours'],
-      ['Thursday 8 Oct, 12:00–17:00 BST', 'Thursday 8 Oct, 07:00–12:00 EDT', 'acceptable'],
-      ['Thursday 8 Oct, 17:00–22:00 BST', 'Thursday 8 Oct, 12:00–17:00 EDT', 'outside usual hours'],
+      ['Tuesday, Oct 6, 12:00–3:00 PM BST', 'Tuesday, Oct 6, 7:00–10:00 AM EDT', 'acceptable'],
+      ['Tuesday, Oct 6, 3:00–5:00 PM BST', 'Tuesday, Oct 6, 10:00 AM–12:00 PM EDT', 'protected time'],
+      ['Tuesday, Oct 6, 5:00–10:00 PM BST', 'Tuesday, Oct 6, 12:00–5:00 PM EDT', 'outside usual hours'],
+      ['Wednesday, Oct 7, 2:00–5:00 PM BST', 'Wednesday, Oct 7, 9:00 AM–12:00 PM EDT', 'acceptable'],
+      ['Wednesday, Oct 7, 5:00–10:00 PM BST', 'Wednesday, Oct 7, 12:00–5:00 PM EDT', 'outside usual hours'],
+      ['Thursday, Oct 8, 12:00–5:00 PM BST', 'Thursday, Oct 8, 7:00 AM–12:00 PM EDT', 'acceptable'],
+      ['Thursday, Oct 8, 5:00–10:00 PM BST', 'Thursday, Oct 8, 12:00–5:00 PM EDT', 'outside usual hours'],
     ]);
     expect(windows_not_listed).toBe(0);
     for (const free of windows) {
@@ -406,7 +406,7 @@ describe('free_time', () => {
     // Each line leads with the window on the principal's clock, with its offset, which the tools take back.
     expect(message.split('\n').slice(0, 2)).toEqual([
       "Free for 30 minutes: any start that ends by a window's end.",
-      '- 2026-10-06T12:00+01:00 to 2026-10-06T15:00+01:00: Tuesday 6 Oct, 12:00–15:00 BST; for them, Tuesday 6 Oct, 07:00–10:00 EDT (acceptable)',
+      '- 2026-10-06T12:00+01:00 to 2026-10-06T15:00+01:00: Tuesday, Oct 6, 12:00–3:00 PM BST; for them, Tuesday, Oct 6, 7:00–10:00 AM EDT (acceptable)',
     ]);
     const [, firstLine] = message.split('\n');
     const firstStart = firstLine.slice('- '.length, firstLine.indexOf(' to '));
@@ -435,13 +435,13 @@ describe('free_time', () => {
     // Berlin is nine hours ahead: its waking day ends at 13:00 in Los Angeles.
     const shown = windows.map((free) => [free.principal_time, free.their_time, free.fit]);
     expect(shown.slice(0, 3)).toEqual([
-      ['Monday 5 Oct, 07:00–09:00 PDT', 'Monday 5 Oct, 16:00–18:00 CEST', 'outside usual hours'],
-      ['Monday 5 Oct, 09:00–12:00 PDT', 'Monday 5 Oct, 18:00–21:00 CEST', 'preferred'],
-      ['Monday 5 Oct, 12:00–13:00 PDT', 'Monday 5 Oct, 21:00–22:00 CEST', 'acceptable'],
+      ['Monday, Oct 5, 7:00–9:00 AM PDT', 'Monday, Oct 5, 4:00–6:00 PM CEST', 'outside usual hours'],
+      ['Monday, Oct 5, 9:00 AM–12:00 PM PDT', 'Monday, Oct 5, 6:00–9:00 PM CEST', 'preferred'],
+      ['Monday, Oct 5, 12:00–1:00 PM PDT', 'Monday, Oct 5, 9:00–10:00 PM CEST', 'acceptable'],
     ]);
     expect(shown).toContainEqual([
-      'Saturday 10 Oct, 07:00–13:00 PDT',
-      'Saturday 10 Oct, 16:00–22:00 CEST',
+      'Saturday, Oct 10, 7:00 AM–1:00 PM PDT',
+      'Saturday, Oct 10, 4:00–10:00 PM CEST',
       'outside usual hours',
     ]);
     expect(windows).toHaveLength(20);
@@ -457,9 +457,9 @@ describe('free_time', () => {
       }),
     ) as { windows: Free[] };
     expect(windows.map((free) => [free.principal_time, free.fit])).toEqual([
-      ['Tuesday 6 Oct, 14:00–15:00 BST', 'acceptable'],
-      ['Tuesday 6 Oct, 15:00–17:00 BST', 'protected time'],
-      ['Tuesday 6 Oct, 17:00–18:00 BST', 'outside usual hours'],
+      ['Tuesday, Oct 6, 2:00–3:00 PM BST', 'acceptable'],
+      ['Tuesday, Oct 6, 3:00–5:00 PM BST', 'protected time'],
+      ['Tuesday, Oct 6, 5:00–6:00 PM BST', 'outside usual hours'],
     ]);
   });
 
@@ -475,7 +475,7 @@ describe('free_time', () => {
       {
         start: '2026-10-10T06:00:00.000Z',
         end: '2026-10-10T21:00:00.000Z',
-        principal_time: 'Saturday 10 Oct, 07:00–22:00 BST',
+        principal_time: 'Saturday, Oct 10, 7:00 AM–10:00 PM BST',
         fit: 'outside usual hours',
       },
     ]);
@@ -491,8 +491,8 @@ describe('free_time', () => {
     ) as { windows: Free[] };
     // It is 08:00 in London: 07:00 has passed.
     expect(windows.map((free) => [free.principal_time, free.fit])).toEqual([
-      ['Monday 5 Oct, 08:00–09:00 BST', 'outside usual hours'],
-      ['Monday 5 Oct, 09:00–10:00 BST', 'preferred'],
+      ['Monday, Oct 5, 8:00–9:00 AM BST', 'outside usual hours'],
+      ['Monday, Oct 5, 9:00–10:00 AM BST', 'preferred'],
     ]);
   });
 
@@ -531,8 +531,8 @@ describe('busy time on the principal’s other calendars', () => {
       }),
     ) as { windows: Free[] };
     expect(windows.map((free) => free.principal_time)).toEqual([
-      'Wednesday 7 Oct, 09:00–10:00 BST',
-      'Wednesday 7 Oct, 10:30–12:00 BST',
+      'Wednesday, Oct 7, 9:00–10:00 AM BST',
+      'Wednesday, Oct 7, 10:30 AM–12:00 PM BST',
     ]);
     for (const free of windows) {
       expect(overlaps({ start: Date.parse(free.start), end: Date.parse(free.end) }, taken), free.start).toBe(false);
@@ -556,7 +556,7 @@ describe('busy time on the principal’s other calendars', () => {
       refusal(
         await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
       ),
-    ).toBe(gone('Wednesday 7 Oct, 10:00–10:30 BST'));
+    ).toBe(gone('Wednesday, Oct 7, 10:00–10:30 AM BST'));
     expect(calendar.live(TEAM).map((event) => event.id)).toEqual(['evt-team']);
   });
 
@@ -594,8 +594,8 @@ describe('busy time on the principal’s other calendars', () => {
       }),
     ) as { windows: Free[] };
     expect(windows.map((free) => free.principal_time)).toEqual([
-      'Wednesday 7 Oct, 09:00–11:00 BST',
-      'Wednesday 7 Oct, 11:30–12:00 BST',
+      'Wednesday, Oct 7, 9:00–11:00 AM BST',
+      'Wednesday, Oct 7, 11:30 AM–12:00 PM BST',
     ]);
     expect(read.mock.calls.map(([calendarId]) => calendarId)).not.toContain(JUNO);
   });
@@ -627,7 +627,7 @@ describe('book', () => {
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
     expect(booked.message).toBe(
-      `Booked: Tuesday 6 Oct, 10:00–10:30 BST. Google sends ${REMY} the invitation from the principal's calendar, ` +
+      `Booked: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends ${REMY} the invitation from the principal's calendar, ` +
         `with a Google Meet link (${String(event.conference?.uri)}). main hears of it. ` +
         `To change or cancel it, give booking ${event.id}.`,
     );
@@ -636,7 +636,7 @@ describe('book', () => {
     const [fact] = mainHeard();
     expect(
       fact.startsWith(
-        `Booked a meeting with ${REMY} for Tuesday 6 Oct, 11:00–11:30 CEST (30 minutes), by video call. ` +
+        `Booked a meeting with ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), by video call. ` +
           'Google sent them the invitation. Its title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
       ),
       fact,
@@ -662,7 +662,7 @@ describe('book', () => {
       }),
     );
     expect(booked.message).toMatch(
-      /^Booked: Tuesday 6 Oct, 10:00–10:30 BST; for them, Tuesday 6 Oct, 05:00–05:30 EDT\. /u,
+      /^Booked: Tuesday, Oct 6, 10:00–10:30 AM BST; for them, Tuesday, Oct 6, 5:00–5:30 AM EDT\. /u,
     );
 
     const misdated = await send(sessionB, 'book', {
@@ -684,7 +684,7 @@ describe('book', () => {
     // Without a Meet link, main hears of no video call.
     expect(mainHeard()[0]).toMatch(
       new RegExp(
-        `^Booked a meeting with ${JANE} and ${REMY} for Tuesday 6 Oct, 11:00–11:30 CEST \\(30 minutes\\)\\. Google sent them the invitation\\. Its title`,
+        `^Booked a meeting with ${JANE} and ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST \\(30 minutes\\)\\. Google sent them the invitation\\. Its title`,
         'u',
       ),
     );
@@ -726,12 +726,12 @@ describe('book', () => {
 
     expect(
       refusal(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
-    ).toBe(gone('Tuesday 6 Oct, 10:00–10:30 BST'));
+    ).toBe(gone('Tuesday, Oct 6, 10:00–10:30 AM BST'));
     expect(
       refusal(
         await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
       ),
-    ).toBe(gone('Wednesday 7 Oct, 10:00–10:30 BST'));
+    ).toBe(gone('Wednesday, Oct 7, 10:00–10:30 AM BST'));
     expect(bookings().map((event) => [event.id, event.tags?.gwsEaThread])).toEqual([[first.booking, threadB]]);
   });
 
@@ -845,7 +845,7 @@ describe('book', () => {
     const winners = answers.flatMap((frame, index) => (frame.ok ? [[threadA, threadB][index]] : []));
     expect(winners).toHaveLength(1);
     expect(answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]))).toEqual([
-      gone('Tuesday 6 Oct, 10:00–10:30 BST'),
+      gone('Tuesday, Oct 6, 10:00–10:30 AM BST'),
     ]);
     expect(
       calendar
@@ -917,8 +917,8 @@ describe('the calendar a thread books on is main’s to set (R11, R12)', () => {
     const offered = data(await send(session, 'free_time', wednesdayMorning)) as { windows: Free[]; message: string };
     // Busy time on every calendar of theirs counts, with none set for the thread.
     expect(offered.windows.map((free) => free.principal_time)).toEqual([
-      'Wednesday 7 Oct, 09:00–10:00 BST',
-      'Wednesday 7 Oct, 11:00–12:00 BST',
+      'Wednesday, Oct 7, 9:00–10:00 AM BST',
+      'Wednesday, Oct 7, 11:00 AM–12:00 PM BST',
     ]);
     expect(offered.message.split('\n').at(-1)).toBe(NO_CALENDAR_YET);
     // Nor does a range with nothing free leave it out.
@@ -977,7 +977,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const moved = data(await send(sessionA, 'change_booking', { booking: first.booking, start: THURSDAY_2PM }));
     expect(moved).toMatchObject({ booking: first.booking, start: THURSDAY_2PM, end: '2026-10-08T13:45:00.000Z' });
     expect(moved.message).toBe(
-      'Changed: Thursday 8 Oct, 14:00–14:45 BST. Google sends the invitees the update, and main hears of it.',
+      'Changed: Thursday, Oct 8, 2:00–2:45 PM BST. Google sends the invitees the update, and main hears of it.',
     );
     expect(calendar.event(PRINCIPAL, String(first.booking))).toMatchObject({
       start: { dateTime: THURSDAY_2PM },
@@ -991,7 +991,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       { email: REMY, responseStatus: 'needsAction' },
     ]);
     expect(mainHeard().at(-1)).toBe(
-      `Rescheduled the meeting with ${REMY} to Thursday 8 Oct, 15:00–15:45 CEST (45 minutes), from Tuesday 6 Oct, 11:00–11:45 CEST. ` +
+      `Rescheduled the meeting with ${REMY} to Thursday, Oct 8, 3:00–3:45 PM CEST (45 minutes), from Tuesday, Oct 6, 11:00–11:45 AM CEST. ` +
         `Google sent them the update. (thread ${threadA}; event ${String(first.booking)} on calendar ${PRINCIPAL})`,
     );
 
@@ -1034,7 +1034,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       start: { dateTime: TUESDAY_10AM },
       conference: { status: 'success' },
     });
-    expect(changed.message).toMatch(/^Changed: Tuesday 6 Oct, 10:00–10:30 BST, with a Google Meet link \(https:/u);
+    expect(changed.message).toMatch(/^Changed: Tuesday, Oct 6, 10:00–10:30 AM BST, with a Google Meet link \(https:/u);
     const [patch] = calendar.writes.filter((write) => write.op === 'patch');
     expect(patch).toMatchObject({ eventId: booked.booking, sendUpdates: 'all' });
     expect(patch.fields?.start).toBeUndefined();
@@ -1042,7 +1042,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const fact = mainHeard().at(-1) ?? '';
     expect(
       fact.startsWith(
-        `Changed the meeting with ${REMY} on Tuesday 6 Oct, 11:00–11:30 CEST: a new title, place, notes, and Google Meet link. ` +
+        `Changed the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST: a new title, place, notes, and Google Meet link. ` +
           'Google sent them the update. Its new title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
       ),
       fact,
@@ -1088,7 +1088,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       /at least one change/u,
     );
     expect(data(await send(sessionA, 'change_booking', { booking: booked.booking, start: TUESDAY_10AM })).message).toBe(
-      'The booking already stands at Tuesday 6 Oct, 10:00–10:30 BST: nothing changed.',
+      'The booking already stands at Tuesday, Oct 6, 10:00–10:30 AM BST: nothing changed.',
     );
     expect(calendar.writes).toHaveLength(writes);
     expect(mainHeard()).toHaveLength(1);
@@ -1110,7 +1110,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const moved = answers.flatMap((frame, index) => (frame.ok ? [[ours.booking, theirs.booking][index]] : []));
     expect(moved).toHaveLength(1);
     expect(answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]))).toEqual([
-      gone('Thursday 8 Oct, 14:00–14:30 BST'),
+      gone('Thursday, Oct 8, 2:00–2:30 PM BST'),
     ]);
     expect(
       calendar
@@ -1268,13 +1268,13 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     );
 
     expect(data(await send(sessionA, 'cancel_booking', { booking: booked.booking })).message).toBe(
-      'Cancelled: Tuesday 6 Oct, 10:00–10:30 BST. Google sends the invitees the cancellation, and main hears of it.',
+      'Cancelled: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends the invitees the cancellation, and main hears of it.',
     );
     expect(calendar.event(PRINCIPAL, String(booked.booking))?.status).toBe('cancelled');
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'delete', sendUpdates: 'all' });
     expect(mainHeard()).toEqual([
       expect.stringMatching(/^Booked a meeting /u),
-      `Cancelled the meeting with ${REMY} on Tuesday 6 Oct, 11:00–11:30 CEST. Google sent them the cancellation. ` +
+      `Cancelled the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST. Google sent them the cancellation. ` +
         `(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`,
     ]);
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
