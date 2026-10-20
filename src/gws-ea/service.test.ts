@@ -692,6 +692,30 @@ describe('GWS-EA instance runtime', () => {
 });
 
 describe('the service definition a switch installs', () => {
+  it("gives the launcher upstream NanoClaw's service PATH under each service manager", async () => {
+    const { config, home } = await fixture();
+    const upstream = (await import(path.join(process.cwd(), 'setup', 'service.ts'))) as {
+      renderLaunchdPlist(projectRoot: string, nodePath: string, homeDir: string): string;
+      renderSystemdUnit(projectRoot: string, nodePath: string, homeDir: string, runningAsRoot: boolean): string;
+    };
+    const plistPath = (plist: string) => /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/u.exec(plist)?.[1];
+    const unitPath = (unit: string) => /^Environment="?PATH=([^"\n]*)"?$/mu.exec(unit)?.[1];
+    for (const nodePath of [config.node_path, '/opt/homebrew/opt/node@22/bin/node', '/usr/bin/node']) {
+      const runtime = { ...config, node_path: nodePath, home_directory: home };
+      const ours = (platform: 'macos' | 'linux', runningAsRoot: boolean) =>
+        renderInstanceServiceDefinition(runtime, { platform, homeDirectory: home, runningAsRoot });
+
+      const launchd = plistPath(ours('macos', false));
+      expect(launchd).toContain(path.dirname(nodePath));
+      expect(launchd).toBe(plistPath(upstream.renderLaunchdPlist('/p', nodePath, home)));
+      for (const root of [false, true]) {
+        const systemd = unitPath(ours('linux', root));
+        expect(systemd).toContain('/usr/bin');
+        expect(systemd).toBe(unitPath(upstream.renderSystemdUnit('/p', nodePath, home, root)));
+      }
+    }
+  });
+
   it('installs a kept definition only when it differs, and has systemd read it before every start', async () => {
     const { config, home } = await fixture();
     const calls: SanitizedCommand[] = [];

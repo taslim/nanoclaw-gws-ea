@@ -471,13 +471,29 @@ function createInstanceServiceLayout(
 /** The runtime values a service manager's environment derives from. */
 export type ServiceManagerRuntime = Pick<PersistedInstanceRuntime, 'home_directory' | 'docker_endpoint'>;
 
-/** What the service manager starts the launcher with: upstream NanoClaw's minimal service PATH. */
+/** The environment the service manager's own commands run with, upstream NanoClaw's minimal service PATH; the launcher's PATH is launcherPath's. */
 function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
     PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
     DOCKER_HOST: config.docker_endpoint,
   };
+}
+
+/**
+ * The launcher's PATH, as upstream NanoClaw gives its own service
+ * (setup/service.ts): the directory of the node it runs first, unless already
+ * listed, then Homebrew's under launchd, the system's, and ~/.local/bin. A
+ * Docker CLI installed by Homebrew is then found as it is by NanoClaw.
+ */
+function launcherPath(config: InstanceRuntimeConfig, manager: InstanceServiceLayout['manager']): string {
+  const directories = [
+    ...(manager === 'launchd' ? ['/opt/homebrew/bin', '/opt/homebrew/sbin'] : []),
+    ...SERVICE_PATH.split(':'),
+    path.join(config.home_directory, '.local', 'bin'),
+  ];
+  const nodeDirectory = path.dirname(config.node_path);
+  return (directories.includes(nodeDirectory) ? directories : [nodeDirectory, ...directories]).join(':');
 }
 
 /**
@@ -489,7 +505,7 @@ function renderInstanceService(config: InstanceRuntimeConfig, layout: InstanceSe
   const input = {
     programArguments: [config.node_path, layout.launcherEntrypoint, 'launch-host', layout.runtimeConfigFile],
     workingDirectory: config.checkout_root,
-    environment: serviceEnvironment(config),
+    environment: { ...serviceEnvironment(config), PATH: launcherPath(config, layout.manager) },
     standardOutputPath: layout.standardOutputPath,
     standardErrorPath: layout.standardErrorPath,
   };
