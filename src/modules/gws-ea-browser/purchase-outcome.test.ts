@@ -385,13 +385,53 @@ describe('main recording an unconfirmed purchase', () => {
     // The recorder heard it in its answer: no second alarm reaches it, now or from the sweep.
     await notifyPendingIncidents();
     expect((await notes(main)).filter((text) => text.includes('bought it twice'))).toEqual([]);
-    // The recorded outcome stands, and the same report again raises nothing new and asks for no second alarm.
+    // The recorded outcome stands, and a later report raises nothing new: it asks the recorder to make sure the
+    // principal has heard, which a second telling never harms.
     const again = await record(job.thread_id, id, 'placed', 'principal');
     expect(again).toMatchObject({ status: 'possible_duplicate' });
     expect(again.message).toBe(
-      `The purchase on ${SITE} for $42.00 was already reported as a possible duplicate, and the host stopped this errand then.`,
+      `The purchase on ${SITE} for $42.00 was already reported as a possible duplicate, and the host stopped this errand then. The principal may have bought it twice, so make sure they have heard.`,
     );
     expect(await attempt(id)).toMatchObject({ resolution: 'not_committed', resolution_source: 'principal' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_incidents')).toHaveLength(1);
+  });
+
+  it('still alarms in the answer to a replay of the request that raised the duplicate incident', async () => {
+    const { job } = await errand('main-p', 'mugs');
+    const id = await unconfirmed(job, 'mugs');
+    await record(job.thread_id, id, 'not_placed', 'principal');
+    // The host raised the incident for this request, then stopped before its answer was written.
+    const fields = { thread: job.thread_id, attempt_id: id, outcome: 'placed', source: 'email' };
+    await recordPurchaseOutcome(
+      { ...fields, action: 'record_purchase_outcome', requestId: 'outcome-replayed' },
+      main,
+      () => new BrowserQueue(new BrowserStore(), runtime),
+    );
+    expect(await getDb().get('SELECT notified_at FROM gws_ea_browser_incidents WHERE job_id = ?', job.id)).toEqual({
+      notified_at: expect.any(String),
+    });
+    // The restarted host delivers the same request again: its one answer carries the alarm.
+    await getDeliveryAction('record_purchase_outcome')!(
+      { ...fields, action: 'record_purchase_outcome', requestId: 'outcome-replayed' },
+      main,
+    );
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+    try {
+      const row = inbound
+        .prepare('SELECT content FROM messages_in WHERE id = ?')
+        .get('action-resp-outcome-replayed') as {
+        content: string;
+      };
+      expect((JSON.parse(row.content) as { frame: ResponseFrame }).frame).toMatchObject({
+        ok: true,
+        data: {
+          status: 'possible_duplicate',
+          message: `The purchase on ${SITE} for $42.00 was recorded as not placed and is now reported placed after all, so the principal may have bought it twice. The host stopped this errand. Tell the principal now.`,
+        },
+      });
+    } finally {
+      inbound.close();
+    }
     expect(await getDb().all('SELECT id FROM gws_ea_browser_incidents')).toHaveLength(1);
   });
 

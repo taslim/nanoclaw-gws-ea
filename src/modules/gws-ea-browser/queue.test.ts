@@ -1279,6 +1279,13 @@ describe('the notice after an approved purchase that went no further', () => {
       /another errand holds this site.*wakes you when it is free.*call purchase again.*approval holds until it expires/s,
     ],
     [
+      'a checkout that went back to the principal as a new card',
+      { status: 'awaiting_principal', repeat_safe: false },
+      false,
+      false,
+      /principal has a new card with the checkout's current facts.*Stay on the checkout and wait for its outcome/s,
+    ],
+    [
       'a checkout with no saved card',
       { status: 'card_needed', repeat_safe: false },
       false,
@@ -1291,6 +1298,20 @@ describe('the notice after an approved purchase that went no further', () => {
       false,
       false,
       /could not read the total.*Report it to main/s,
+    ],
+    [
+      'a checkout whose terms the host could not read',
+      { status: 'terms_unavailable', repeat_safe: false },
+      false,
+      false,
+      /could not read the site’s terms.*Report it to main/s,
+    ],
+    [
+      'a checkout whose terms can charge more than the maximum',
+      { status: 'terms_over_bounds', repeat_safe: false },
+      false,
+      false,
+      /terms can charge more than the principal’s maximum.*Report it to main/s,
     ],
     [
       'an unknown status',
@@ -1332,18 +1353,30 @@ describe('the notice after an approved purchase that went no further', () => {
     expect(notice.message).not.toMatch(/cancelled/);
   });
 
-  it('tells the browser the host stopped an errand an incident ended', async () => {
+  it.each([
+    [
+      'a late confirmation',
+      'late_confirmation',
+      /placed after all, so the host stopped this errand.*Report it to main/s,
+    ],
+    [
+      'an unapproved commit',
+      'unapproved_commit',
+      /confirmation showing a charge nobody approved, so the host stopped this errand.*Report it to main/s,
+    ],
+  ] as const)('tells the browser the host stopped an errand %s ended', async (_name, kind, words) => {
     const notice = await deliverCommit({ status: 'checkout_lapsed', repeat_safe: true }, async (job) => {
       await cancel(job);
       await store.db.run(
         `INSERT INTO gws_ea_browser_incidents(id,kind,site,job_id,evidence_key,evidence_json,created_at)
-         VALUES('incident-notice','late_confirmation','amazon.com',?,'order-1','{}',?)`,
+         VALUES('incident-notice',?,'amazon.com',?,'order-1','{}',?)`,
+        kind,
         job.id,
         new Date().toISOString(),
       );
     });
     expect(notice).toMatchObject({ safe_to_rebuild: false });
-    expect(notice.message).toMatch(/placed after all, so the host stopped this errand.*Report it to main/s);
+    expect(notice.message).toMatch(words);
   });
 
   it('tells the browser an expired approval no longer covers the checkout', async () => {

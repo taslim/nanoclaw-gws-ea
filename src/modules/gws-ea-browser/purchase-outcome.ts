@@ -8,10 +8,11 @@
  * Every recording goes through the authority store's one resolve function: the first source to record an
  * outcome wins, and a later recording gets the recorded outcome back. A "placed" for an attempt recorded not
  * placed is the merchant's late confirmation of a possible duplicate: an incident, whose alarm is the recorder's
- * own answer (KTD15). Main records the attempts of a group whose browser access was removed, and that group hears
+ * own answer (KTD15), so the request that raised it carries the alarm in every answer it is given, a replay's
+ * included. Main records the attempts of a group whose browser access was removed, and that group hears
  * only that its errand stopped.
  */
-import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
+import { answeredGuard, answeringAction, forbidden, invalidArgs, requestIdOf } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -131,17 +132,18 @@ export async function recordPurchaseOutcome(
     case 'already_resolved': {
       const recorded = recordedAs(result.attempt);
       if (placed && recorded.outcome === 'not_placed') {
-        const created = await lateConfirmation(job, result.attempt, source, session.agent_group_id, queue());
+        const raised = await lateConfirmation(job, result.attempt, source, session, requestIdOf(content), queue());
         const { what, total } = attemptSummary(result.attempt);
         const purchase = `The ${what}${total ? ` for ${total}` : ''}`;
         return {
           status: 'possible_duplicate',
           thread: job.thread_id,
           recorded,
-          message: created
+          message: raised
             ? `${purchase} was recorded as not placed and is now reported placed after all, so the principal may ` +
               'have bought it twice. The host stopped this errand. Tell the principal now.'
-            : `${purchase} was already reported as a possible duplicate, and the host stopped this errand then.`,
+            : `${purchase} was already reported as a possible duplicate, and the host stopped this errand then. ` +
+              'The principal may have bought it twice, so make sure they have heard.',
         };
       }
       return { status: 'already_recorded', thread: job.thread_id, ...recorded };
@@ -156,30 +158,41 @@ export async function recordPurchaseOutcome(
   }
 }
 
+/** The request that raised a late confirmation: the one whose answer is its alarm. */
+interface RaisedBy {
+  readonly session: string;
+  readonly request?: string;
+}
+
 /**
  * A purchase recorded not placed, reported placed after all (KTD10): the incident and its job's stop in one
  * transaction, then the cancellation's own work. The recorder's answer is the alarm, so the incident is recorded
- * told (KTD15); a delegating group other than the recorder hears only that its errand stopped. Whether this
- * report raised the incident, rather than finding it raised.
+ * told (KTD15) along with the request that raised it; a delegating group other than the recorder hears only that
+ * its errand stopped. Whether this request raised the incident: now, or before the host stopped short of answering
+ * it, so that its replay still carries the alarm and finishes the notice.
  */
 async function lateConfirmation(
   job: BrowserJob,
   attempt: PurchaseAttemptRow,
   source: 'email' | 'principal',
-  recorder: string,
+  recorder: Session,
+  requestId: string | undefined,
   queue: BrowserQueue,
 ): Promise<boolean> {
+  const raisedBy: RaisedBy = { session: recorder.id, ...(requestId ? { request: requestId } : {}) };
   const { incident, stop, created } = await recordIncidentWithStop(new BrowserStore(), job.thread_id, {
     kind: 'late_confirmation',
     site: attempt.site,
     attemptId: attempt.id,
     evidenceKey: attempt.id,
-    evidence: { reported: 'placed', source, recorded: recordedAs(attempt) },
+    evidence: { reported: 'placed', source, recorded: recordedAs(attempt), raised_by: raisedBy },
     told: true,
   });
+  const first = (JSON.parse(incident.evidence_json) as { raised_by?: RaisedBy }).raised_by;
+  const raised = created || (requestId !== undefined && first?.session === recorder.id && first.request === requestId);
   /* eslint-disable no-catch-all/no-catch-all -- the incident and the job's stop are recorded, and the recorder's
      answer carries the alarm: a notice or cleanup that fails never turns the possible duplicate into an error */
-  if (created && job.source_agent_group_id !== recorder)
+  if (raised && job.source_agent_group_id !== recorder.agent_group_id)
     try {
       const session = await getSession(job.browser_session_id);
       const told = session
@@ -212,7 +225,7 @@ async function lateConfirmation(
     });
   }
   /* eslint-enable no-catch-all/no-catch-all */
-  return created;
+  return raised;
 }
 
 export function registerPurchaseOutcomeDelivery(queue: () => BrowserQueue): void {
