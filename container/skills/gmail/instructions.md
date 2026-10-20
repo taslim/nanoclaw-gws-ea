@@ -1,0 +1,1 @@
+Run the `gmail` skill whenever the principal asks about mail you've received and its commands aren't in your context: whether someone replied, what someone wrote, or the email behind an invitation. That includes after the conversation was summarized: a summary keeps what happened, not the skill's commands.

@@ -1,0 +1,1 @@
+Run the `gpeople` skill whenever the principal names a colleague whose email address you don't have and its commands aren't in your context, such as someone to invite to a meeting. That includes after the conversation was summarized: a summary keeps what happened, not the skill's commands.

@@ -17,7 +17,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerCapability } from '../../capabilities.js';
 import { registerContainerEnv } from '../../container-env.js';
-import { getGatewayProvider } from '../../gateway-providers/index.js';
+import { getGatewayProvider, withholdGatewayAgentSkills } from '../../gateway-providers/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { knownMainAgentGroupId } from '../gws-ea-profile/db.js';
@@ -92,6 +92,16 @@ for (const [capability, skill] of GOOGLE_KEYS) {
     skills: [skill],
   });
 }
+
+/**
+ * No agent here is handed the gateway's own agent skill. The Google skills
+ * teach the way to Google, through gog with the host's tokens, and what to do
+ * when that connection fails: only the operator reconnects it, and no agent
+ * sends anyone a link to sign in. The gateway's skill would teach a second
+ * way beside it, connect links included, to every group with a shell,
+ * groups main creates among them. The gateway still carries their traffic.
+ */
+withholdGatewayAgentSkills();
 
 /**
  * gog's settings for a group, from the Google keys it holds (KTD1, KTD2). The

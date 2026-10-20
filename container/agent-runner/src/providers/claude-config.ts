@@ -31,6 +31,10 @@ import type { McpServerConfig } from './types.js';
 //   headless container (~9.3KB/turn schema).
 // - ReportFindings: code-review-reporting UI affordance with no headless
 //   host surface to receive it (~1.9KB/turn schema).
+// - RemoteTrigger: schedules a claude.ai cloud agent, outside the container
+//   and outside nanoclaw's follow-through; durable scheduling is `ncl tasks`.
+// - PushNotification: notifies the signed-in account's own Claude app, never
+//   the person in the conversation; mcp__nanoclaw__send_message reaches them.
 export const SDK_DISALLOWED_TOOLS = [
   'CronCreate',
   'CronDelete',
@@ -44,6 +48,8 @@ export const SDK_DISALLOWED_TOOLS = [
   'ExitWorktree',
   'DesignSync',
   'ReportFindings',
+  'RemoteTrigger',
+  'PushNotification',
 ];
 
 // The built-in half of the SDK's `allowedTools`; `resolveClaudeMcpServers`
@@ -197,6 +203,17 @@ export function mcpAllowPattern(serverName: string): string {
   return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
 }
 
+/** Claude Code's built-in plugin for authoring mods to its own interface, which a headless agent has no use for. */
+export const BUILTIN_PLUGIN_AUTHORING = 'plugin-authoring@builtin';
+
+/** The flag-level settings every Claude agent runs under. */
+export interface ClaudePolicySettings {
+  syncClaudeAiSkills: false;
+  syncClaudeAiPlugins: false;
+  disableBundledSkills: true;
+  enabledPlugins: { [BUILTIN_PLUGIN_AUTHORING]: false };
+}
+
 /**
  * Claude runs unrestricted inside the container: NanoClaw's container
  * isolation and the OneCLI allow-list are the security boundary, not the
@@ -208,13 +225,18 @@ export function mcpAllowPattern(serverName: string): string {
  * own settings files, so it holds for every group, existing ones included.
  * Since 2.1.275 Claude Code syncs the skills and plugins enabled on the
  * signed-in claude.ai account into terminal sessions; the sync keys opt out,
- * so an agent gets the skills nanoclaw mounts, not the operator's own.
+ * so an agent gets the skills nanoclaw mounts, not the operator's own. For
+ * the same reason the skills Claude Code ships are off: they claim
+ * reminders, loops and coding chores that nanoclaw's own tools own. The
+ * bundled-skills switch leaves plugins alone, so the built-in plugin that
+ * teaches making Claude Code mods is switched off by its id; the mounted
+ * skills stay listed.
  */
 export function resolveClaudeExecutionPolicy(): {
   permissionMode: 'bypassPermissions';
   allowDangerouslySkipPermissions: true;
   disallowedTools: string[];
-  settings: { syncClaudeAiSkills: false; syncClaudeAiPlugins: false };
+  settings: ClaudePolicySettings;
 } {
   return {
     permissionMode: 'bypassPermissions',
@@ -222,7 +244,12 @@ export function resolveClaudeExecutionPolicy(): {
     // A copy: the contract value is deep-frozen on registration, and the
     // exported constant must stay a plain mutable array.
     disallowedTools: [...SDK_DISALLOWED_TOOLS],
-    settings: { syncClaudeAiSkills: false, syncClaudeAiPlugins: false },
+    settings: {
+      syncClaudeAiSkills: false,
+      syncClaudeAiPlugins: false,
+      disableBundledSkills: true,
+      enabledPlugins: { [BUILTIN_PLUGIN_AUTHORING]: false },
+    },
   };
 }
 

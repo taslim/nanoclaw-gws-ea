@@ -150,16 +150,32 @@ afterAll(() => {
   api.stop(true);
 });
 
+/** What the pinned SDK offers on the wire: its first model request's tools, and the skills it tells the model of. */
+interface WireSurface {
+  tools: string[];
+  skills: string[];
+}
+
 /**
- * Replay `options` into the pinned SDK and return the tool names its first
- * model request offers. Each run gets its own home, workspace and prompt
- * nonce, so a request from an earlier run can never be mistaken for this one.
- * The Claude Code binary is the SDK's own (the same version the image pins),
- * and MCP servers are left out: NanoClaw's tool server gates its own tools.
+ * Replay `options` into the pinned SDK and return what its first model
+ * request offers. Each run gets its own home, workspace and prompt nonce, so
+ * a request from an earlier run can never be mistaken for this one. The
+ * Claude Code binary is the SDK's own (the same version the image pins), and
+ * MCP servers are left out: NanoClaw's tool server gates its own tools.
+ * `mountedSkills` are planted where NanoClaw links a group's skills
+ * (`~/.claude/skills`), each a plain SKILL.md.
  */
-async function wireTools(options: CapturedOptions): Promise<string[]> {
+async function wire(options: CapturedOptions, mountedSkills: readonly string[] = []): Promise<WireSurface> {
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const cwd = fs.mkdtempSync(path.join(tmp, 'cwd-'));
+  for (const skill of mountedSkills) {
+    const dir = path.join(home, '.claude', 'skills', skill);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'SKILL.md'),
+      `---\nname: ${skill}\ndescription: A skill NanoClaw mounts for this group.\n---\n\nFollow the steps.\n`,
+    );
+  }
   const nonce = `capability-wire-${randomUUID()}`;
   const request = new Promise<string>((resolve) => waiting.set(nonce, resolve));
   const { pathToClaudeCodeExecutable: _binary, hooks: _hooks, mcpServers: _servers, ...replayed } = options;
@@ -190,10 +206,39 @@ async function wireTools(options: CapturedOptions): Promise<string[]> {
   try {
     const body = await request;
     const tools = (JSON.parse(body) as { tools?: Array<{ name: string }> }).tools ?? [];
-    return tools.map((tool) => tool.name).sort();
+    return { tools: tools.map((tool) => tool.name).sort(), skills: listedSkills(body) };
   } finally {
     run.close();
   }
+}
+
+/**
+ * The skills a model request lists for the Skill tool, from the listing
+ * Claude Code writes into the conversation: one `- <name>: <description>`
+ * line each, after its heading. A request with no skill to offer has none.
+ */
+function listedSkills(body: string): string[] {
+  const heading = 'The following skills are available for use with the Skill tool:\n\n';
+  const texts: string[] = [];
+  const collect = (value: unknown): void => {
+    if (typeof value === 'string') texts.push(value);
+    else if (Array.isArray(value)) value.forEach(collect);
+    else if (value && typeof value === 'object') Object.values(value).forEach(collect);
+  };
+  collect((JSON.parse(body) as { messages?: unknown }).messages);
+  const text = texts.find((candidate) => candidate.includes(heading));
+  if (text === undefined) return [];
+  const lines = text.slice(text.indexOf(heading) + heading.length).split('\n');
+  const end = lines.findIndex((line) => !line.startsWith('- '));
+  return lines
+    .slice(0, end === -1 ? lines.length : end)
+    .map((line) => line.slice(2, line.indexOf(':')))
+    .sort();
+}
+
+/** The tool names the pinned SDK's first model request offers. */
+async function wireTools(options: CapturedOptions): Promise<string[]> {
+  return (await wire(options)).tools;
 }
 
 /** The surface today's options offer: what the provider sent before capabilities existed. */
@@ -254,6 +299,23 @@ describe('the pinned SDK offers only granted built-in tools', () => {
     expect(await wireTools(await optionsFor(ALL))).toEqual(today);
     expect(today).toContain('Bash');
   }, 60_000);
+});
+
+describe('the skills the pinned SDK lists', () => {
+  // Bundled skills claim reminders, loops and coding chores that NanoClaw's
+  // own tools own, so an agent sees only the skills NanoClaw mounts for it.
+  it.each([
+    ['every key', ALL],
+    ['reply and time', REPLY_AND_TIME],
+  ])(
+    'lists a group holding %s the skills NanoClaw mounts and none that Claude Code bundles',
+    async (_label, keys) => {
+      const { skills } = await wire(await optionsFor(keys), ['research-notes']);
+
+      expect(skills).toEqual(['research-notes']);
+    },
+    60_000,
+  );
 });
 
 describe('the SDK options a group holding every key gets', () => {
