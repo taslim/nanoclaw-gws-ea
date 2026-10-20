@@ -838,7 +838,7 @@ async function readGenericPurchase(
       );
     } catch (error) {
       if (!(error instanceof Error)) throw error;
-      return { status: 'facts_incomplete', missing: ['a commit control the host can find again'] };
+      return { status: 'facts_incomplete', missing: ["the checkout's place-order button"] };
     }
     const decision = decideGenericCheckout(read, { merchant, locator, controlBox });
     switch (decision.status) {

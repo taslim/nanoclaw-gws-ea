@@ -858,6 +858,10 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(vaultState()).toBe(before);
     expect(fake.items.get(released!.candidate_item_id!)?.tags).toContain(`gws-ea-pending/${id}`);
     expect(notes().at(-1)).toContain('released');
+    // The candidate is the login named for the site, so main can tell the principal where the password is.
+    expect(notes().at(-1)).toContain(
+      'Its password stays in the assistant\'s 1Password vault, in the login "shop.example", which the host has not finished saving.',
+    );
     // The account is no longer busy: a new errand may sign up for it.
     const next = (await resolveSystemSession('browser', 'system:a2a:main:next-errand')).session;
     expect(
@@ -886,7 +890,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
     expect(fake.value(itemId, 'password')).toBe('principal-chosen-password-1');
     expect(fake.value(candidateId, 'password')).toBe(next);
-    expect(notes().at(-1)).toContain('"New password for shop.example"');
+    expect(notes().at(-1)).toContain(
+      'as its own item, "New password for shop.example"; the login was changed or removed in 1Password meanwhile, and the host left it as it is.',
+    );
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
       status: 'recorded',
     });
@@ -952,7 +958,10 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
     expect(await lease()).toBeUndefined();
     expect(notes().at(-1)).toContain('was not released: 1Password could be reached again');
-    expect(notes().at(-1)).toContain('password_changed, vault updated');
+    expect(notes().at(-1)).toContain(
+      "the host finished it: the site took the new password, and the login in the assistant's 1Password vault now holds it.",
+    );
+    expect(notes().at(-1)).not.toMatch(/password_changed|vault updated|\(/u);
   });
 
   it('describes a promoted change it cannot finish by what is left: the login has it, the separate item may too', async () => {
@@ -1045,7 +1054,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     await click('approve');
     expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
     expect(notes().at(-1)).toContain(
-      'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+      'Its login was changed or removed in 1Password before the host finished saving it, and the host left it as it is.',
     );
     expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
   });

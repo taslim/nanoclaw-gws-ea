@@ -173,7 +173,6 @@ const AGENT_FACING_FILES = [
   './gws-ea-browser.ts',
   './gws-ea-browser.instructions.md',
   './gws-ea-browser-delegate.ts',
-  './gws-ea-browser-delegate.instructions.md',
   '../../../../templates/gws-ea/browser/instructions.md',
   '../../../../templates/gws-ea/browser/README.md',
   '../../../../src/modules/gws-ea-browser/main-guidance.md',
@@ -411,6 +410,16 @@ describe('the browser tools', () => {
     for (const needed_by of ['2026-10-23T17:00:00', 'October 23', '23/10/2026'])
       expect(validate({ target, needed_by })).toBe(false);
     expect(purchase.tool.inputSchema.properties?.needed_by).not.toHaveProperty('format');
+  });
+
+  it('reads main as whichever agent sent the errand, in its guidance, its tools and the host’s answers and notices', () => {
+    const guidance = fs.readFileSync(
+      new URL('../../../../templates/gws-ea/browser/instructions.md', import.meta.url),
+      'utf8',
+    );
+    expect(guidance.split('\n')[0]).toContain(
+      "When another of the assistant's agents delegated this errand, read main as that agent wherever it appears: in this guidance, in your tools' descriptions, and in the host's answers and notices.",
+    );
   });
 
   it('names only real tools in its mechanics instructions', async () => {

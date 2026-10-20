@@ -24,6 +24,7 @@ import { getDomain, getDomainWithoutSuffix } from 'tldts';
 
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
+import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { isolationSelector } from './authentication-submit.js';
 import {
   CHOICE_SOURCE,
@@ -1134,6 +1135,19 @@ export async function runConsentPass(
   } finally {
     await second.close();
   }
+}
+
+/**
+ * A site's consent wording as an agent reads it, in an answer, a notice or a grant list: the site wrote it, so it
+ * arrives inside untrusted markers that name the site. The principal's card quotes it plainly.
+ */
+export function siteWording(wording: string, site: string): string {
+  return untrusted(wording, 2000, site);
+}
+
+/** The stops an answer gives the browser, each wording as `siteWording` frames it. */
+export function consentStopsForAgent(stops: readonly ConsentStopView[]): ConsentStopView[] {
+  return stops.map((stop) => ({ ...stop, wording: siteWording(stop.wording, stop.site) }));
 }
 
 /** A submission stopped for wording only the principal can agree to (`consent_required`). */

@@ -2,8 +2,8 @@
  * Purchase outcomes the page could not prove (KTD8, KTD9; R10, R11). An attempt with no page proof either way is
  * unconfirmed: its delegating group hears so once, and another purchase on its site waits on it while browsing
  * there goes on. The merchant's order email reaches main like any mail, and otherwise main asks the principal
- * once; main records what it learned through `record_purchase_outcome`, by the attempt id the job's state shows,
- * never one a browser report gives.
+ * once; main records what it learned through `record_purchase_outcome`, by the attempt id the host's unconfirmed
+ * notice gave, never one a browser report gives.
  *
  * Every recording goes through the authority store's one resolve function: the first source to record an
  * outcome wins, and a later recording gets the recorded outcome back. A "placed" for an attempt recorded not
@@ -26,6 +26,10 @@ import { BrowserStore, type BrowserJob } from './db.js';
 import { recordIncidentWithStop } from './incidents.js';
 import { attemptSummary, notifyUnconfirmedPurchase, tellDelegator } from './notices.js';
 import type { BrowserQueue } from './queue.js';
+
+/** Every delegator reads the attempt id in the host's unconfirmed notice; only main also reads job state. */
+const NO_SUCH_ATTEMPT =
+  "That job made no purchase with that attempt id: use the attempt id the host's unconfirmed notice gave.";
 
 /** The host's sweep: every unconfirmed attempt whose delegating group has not heard of it yet. */
 export async function notifyPendingUnconfirmed(db: DbDriver = getDb()): Promise<void> {
@@ -74,7 +78,7 @@ function recordedAs(attempt: PurchaseAttemptRow): {
 
 /**
  * Main records the outcome of an attempt its errand left unconfirmed, from the merchant's order email or the
- * principal's answer. The attempt is one of that errand's, named by the id its state shows. The first recording
+ * principal's answer. The attempt is one of that errand's, named by the id the host's unconfirmed notice gave. The first recording
  * stands; a later one returns it, and a "placed" against a recorded "not placed" is a possible duplicate.
  */
 export async function recordPurchaseOutcome(
@@ -92,7 +96,7 @@ export async function recordPurchaseOutcome(
     (source !== 'email' && source !== 'principal')
   )
     throw invalidArgs(
-      'record_purchase_outcome needs the job thread, the attempt id its state shows, placed or not_placed, and the source: email or principal.',
+      "record_purchase_outcome needs the job thread, the attempt id the host's unconfirmed notice gave, placed or not_placed, and the source: email or principal.",
     );
   const browser = new BrowserStore();
   const job = await browser.getJob(thread);
@@ -104,8 +108,7 @@ export async function recordPurchaseOutcome(
     throw forbidden('No browser job of yours exists for that thread.');
   const store = new PurchaseAuthorityStore(browser.db);
   const attempt = await store.attempt(attemptId);
-  if (!attempt || attempt.job_id !== job.id)
-    throw forbidden("That job made no purchase with that attempt id: use the id the job's state shows.");
+  if (!attempt || attempt.job_id !== job.id) throw forbidden(NO_SUCH_ATTEMPT);
   // A press still in progress settles from its own page first.
   if (!attempt.resolution && !attempt.unconfirmed_at) return { status: 'in_progress', thread: job.thread_id };
   const placed = outcome === 'placed';
@@ -144,7 +147,7 @@ export async function recordPurchaseOutcome(
     }
     case 'record_used':
     case 'no_attempt':
-      throw forbidden("That job made no purchase with that attempt id: use the id the job's state shows.");
+      throw forbidden(NO_SUCH_ATTEMPT);
     default: {
       const unknown: never = result;
       throw new Error(`Unknown resolution ${JSON.stringify(unknown)}`);

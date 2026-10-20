@@ -64,6 +64,11 @@ it('shows the exact reservation and explicit no-commitment terms on its approval
   expect(card).toContain('Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM UTC\n');
   expect(card).toContain(free.noCommitmentTerms);
   expect(card).not.toContain('One-time retail purchase');
+  // The principal reads the button the host will press and the item as the site names it, never internal ids.
+  expect(card).toContain('Button I\'ll press: "Reserve"');
+  expect(card).toContain('Item: "Dinner for two"; quantity 1\n');
+  expect(card).toContain('Venue: "Bistro"\n');
+  expect(card).not.toMatch(/Commit control|merchant id|venue-1/u);
 });
 
 it("shows a Tokyo dinner on the venue's clock with the principal's alongside, and its deadline on theirs", async () => {

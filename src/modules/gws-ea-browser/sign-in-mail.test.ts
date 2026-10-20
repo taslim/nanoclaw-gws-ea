@@ -688,6 +688,16 @@ it.each(['fill', 'restart'] as const)(
   },
 );
 
+it("refuses a principal relay aimed at the email field, sending the browser to the code field the host's send fills", async () => {
+  const f = fixture(true);
+  await observePage(f.page);
+  await expect(executeSignInCode(f.context, { ...payload, from: 'principal' })).rejects.toThrow(
+    "For a code the principal relays, target the site's one-time-code field: the host presses send itself once the wait is recorded.",
+  );
+  expect(f.values).toEqual([]);
+  expect(await getSignInClaim('signin-request')).toBeUndefined();
+});
+
 it('refuses a relay after cancellation cleanup instead of reusing its pinned field', async () => {
   const f = fixture();
   await observePage(f.page);

@@ -39,6 +39,7 @@ import { setBrowserAdmissionReady } from './group.js';
 import { CONSENT, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
 import { BrowserQueue } from './queue.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
+import { siteWordingPattern } from './testing/site-wording.js';
 import { deliverAction } from './testing/delivery-answer.js';
 
 const PRINCIPAL = 'gchat:users/principal';
@@ -222,8 +223,14 @@ describe('asking the principal for consent', () => {
       }),
     ]);
     expect(await stopStatus(id)).toBe('approved');
+    // The job reads the site's wording as text the site wrote; the card above keeps it in plain quotes.
     expect(await notices()).toEqual([
-      expect.objectContaining({ type: 'browser_consent_outcome', stop_id: id, status: 'approved', wording: WORDING }),
+      expect.objectContaining({
+        type: 'browser_consent_outcome',
+        stop_id: id,
+        status: 'approved',
+        wording: expect.stringMatching(siteWordingPattern(WORDING, 'join.example')),
+      }),
     ]);
     // A replayed approval after a restart records nothing twice.
     await createPendingApproval({ ...approval, status: 'approved' });
@@ -254,6 +261,10 @@ describe('asking the principal for consent', () => {
       expect(await notices()).toEqual([
         expect.objectContaining({ status, stop_id: id, message: expect.stringContaining(message) }),
       ]);
+      // The errand may come from a group other than main: the browser reports to whichever sent it.
+      const [notice] = await notices();
+      expect(notice?.message).toMatch(/report this to the agent that sent the errand\.$/u);
+      expect(notice?.message).not.toContain('main');
     },
   );
 
@@ -326,7 +337,7 @@ describe('asking the principal for consent', () => {
             grant_id: grant.id,
             site: 'join.example',
             origin: 'https://join.example',
-            wording: WORDING,
+            wording: expect.stringMatching(siteWordingPattern(WORDING, 'join.example')),
             approved_at: expect.any(String),
           },
         ],

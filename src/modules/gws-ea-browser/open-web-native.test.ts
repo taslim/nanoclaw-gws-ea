@@ -89,6 +89,7 @@ import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
+import { siteWordingPattern } from './testing/site-wording.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -580,7 +581,14 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     expect(stopped).toMatchObject({
       status: 'stopped',
       reason: 'consent_required',
-      consent: [{ stop_id: stop.id, site: 'join.example', wording: 'I agree to receive marketing' }],
+      // The browser reads the site's wording as text the site wrote.
+      consent: [
+        {
+          stop_id: stop.id,
+          site: 'join.example',
+          wording: expect.stringMatching(siteWordingPattern('I agree to receive marketing', 'join.example')),
+        },
+      ],
       actions: [{ status: 'stopped', reason: 'consent_required' }],
     });
     expect(submitted('/required-marketing/joined')).toBeUndefined();

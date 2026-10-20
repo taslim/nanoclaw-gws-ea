@@ -175,6 +175,13 @@ export function withinReservationBounds(
 }
 
 /**
+ * A change opens the principal's fresh card and is the browser's `checkout_changing` reason, so it reads in the
+ * principal's words: how the host tells the checkout's flow, frame and button apart is no concern of theirs.
+ */
+const CHECKOUT_PAGE_CHANGED = 'The checkout page changed.';
+const OUTSIDE_BOUNDS = 'The reservation no longer fits what you approved.';
+
+/**
  * The generic floor's material change (KTD5): a total or due-now increase, the currency, the items, the payment
  * method, the terms, the contact email, the note, the checkout origin, the booking and the consent facts. The
  * commit label is not one: a checkout's next step names its own. Volatile text never reaches these facts.
@@ -184,7 +191,7 @@ function genericMaterialChange(
   current: PurchaseFacts,
   bounds: PurchaseBounds,
 ): string | undefined {
-  if (approved.flowId !== current.flowId || !approved.generic || !current.generic) return 'The merchant flow changed.';
+  if (approved.flowId !== current.flowId || !approved.generic || !current.generic) return CHECKOUT_PAGE_CHANGED;
   if (approved.currency !== current.currency) return 'The currency changed.';
   if (current.totalMinor > approved.totalMinor)
     return `The total rose to ${formatMoney(current.totalMinor, current.currency)}, from ${formatMoney(approved.totalMinor, approved.currency)}.`;
@@ -192,7 +199,7 @@ function genericMaterialChange(
     return `The amount due now rose to ${formatMoney(current.dueNowMinor, current.currency)}, from ${formatMoney(approved.dueNowMinor, approved.currency)}.`;
   for (const [changed, label] of [
     [approved.site !== current.site, 'site'],
-    [approved.origin !== current.origin, 'checkout origin'],
+    [approved.origin !== current.origin, 'checkout page'],
     [!same(approved.generic.items, current.generic.items), 'items'],
     [
       approved.generic.payment !== current.generic.payment || approved.cardEnding !== current.cardEnding,
@@ -206,8 +213,7 @@ function genericMaterialChange(
   ] as const)
     if (changed) return `The ${label} changed.`;
   if (bounds.reservation) {
-    if (!withinReservationBounds(bookedReservation(current), bounds.reservation))
-      return 'The reservation is outside the delegated bounds.';
+    if (!withinReservationBounds(bookedReservation(current), bounds.reservation)) return OUTSIDE_BOUNDS;
   } else if (!same(approved.generic.booking, current.generic.booking)) return 'The booking changed.';
   return undefined;
 }
@@ -224,10 +230,10 @@ export function materialPurchaseChange(
   if (current.totalMinor > approved.totalMinor)
     return `The total rose to ${formatMoney(current.totalMinor, current.currency)}, from ${formatMoney(approved.totalMinor, approved.currency)}.`;
   for (const [key, label] of [
-    ['flowId', 'merchant flow'],
+    ['flowId', 'checkout page'],
     ['site', 'site'],
-    ['origin', 'frame origin'],
-    ['control', 'commit control'],
+    ['origin', 'checkout page'],
+    ['control', 'checkout page'],
     ['account', 'account'],
     ['items', 'items or quantities'],
     ['cardEnding', 'card'],
@@ -247,7 +253,7 @@ export function materialPurchaseChange(
       reservation.at < bounds.reservation.windowStart ||
       reservation.at > bounds.reservation.windowEnd
     )
-      return 'The reservation is outside the delegated bounds.';
+      return OUTSIDE_BOUNDS;
   } else if (!same(approved.reservation, current.reservation)) return 'The reservation changed.';
   const retail = approved.commitments.length === 1 && approved.commitments[0].kind === 'retail';
   if (

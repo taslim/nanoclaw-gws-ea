@@ -690,15 +690,41 @@ describe('who may ask, and for whom', () => {
     expectNoSecrets(notes(main));
   });
 
-  it("gives main the operator's message when a confirmed alternate email cannot be shared", async () => {
+  it("gives main the operator's message when a confirmed alternate email cannot be shared, with 1Password's reason", async () => {
     await ask({ operation: 'share', email: ALTERNATE_EMAIL });
     const [approval] = await pendingApprovals();
     await click(approval!, 'approve');
     const note = notes(main).at(-1) ?? '';
     expect(note).toContain('exactly as written');
     for (const fact of [ACCOUNT_ID, VAULT_ID, ALTERNATE_EMAIL]) expect(note).toContain(fact);
+    // main's guidance asks first whether their account uses another email, so the note names why it failed.
+    expect(note).toContain(
+      '1Password has no member with that email; first ask whether their 1Password account uses another one.',
+    );
+    expect(note).toContain('Sharing with this email later asks the principal to confirm it again.');
     expect(onePassword.count('grantVaultAccess')).toBe(0);
   });
+
+  it.each([
+    ['rate_limited', () => onePassword.fail('getUser', 'rate_limited'), /request limit is spent/u],
+    ['vault_unavailable', () => writeHostPolicy(MANAGEMENT_ID, false), /vault cannot be used right now/u],
+  ] as const)(
+    'tells main plainly that nothing was shared after %s on a confirmed alternate email, and never to ask again',
+    async (_status, failNext, fact) => {
+      await ask({ operation: 'share', email: ALTERNATE_EMAIL });
+      const [approval] = await pendingApprovals();
+      await failNext();
+      await click(approval!, 'approve');
+      const note = notes(main).at(-1) ?? '';
+      expect(note).toMatch(fact);
+      expect(note).toContain(
+        "Tell the principal plainly the vault can't be shared right now. Sharing with this email later asks the principal to confirm it again.",
+      );
+      // Asking again would put a second confirmation card in front of the principal.
+      expect(note).not.toMatch(/ask again|vault_access/iu);
+      expect(onePassword.count('grantVaultAccess')).toBe(0);
+    },
+  );
 });
 
 describe("the principal's retry after adding a login (AE6)", () => {

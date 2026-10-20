@@ -30,10 +30,13 @@ export type MerchantCheckoutRead =
   | { status: 'facts_incomplete'; missing: readonly string[] }
   | { status: 'terms_unavailable' | 'checkout_lapsed' };
 
-/** What a reviewed flow answers for a page it no longer matches: it fails closed, naming its checkout. */
+/**
+ * What a reviewed flow answers for a page it no longer matches: it fails closed, naming what was missing in words
+ * main can pass to the principal.
+ */
 export const REVIEWED_CHECKOUT_MISSING: MerchantCheckoutRead = {
   status: 'facts_incomplete',
-  missing: ["the site's reviewed checkout"],
+  missing: ['the checkout page in the form the site normally shows it'],
 };
 
 export interface MerchantPurchaseEvidence {

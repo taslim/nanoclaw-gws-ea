@@ -335,7 +335,7 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
       });
       expect(await resyReservationSignature.readPurchase(fixture.page, unknown)).toEqual({
         status: 'facts_incomplete',
-        missing: ["the site's reviewed checkout"],
+        missing: ['the checkout page in the form the site normally shows it'],
       });
       expect(fixture.submitted()).toBe(0);
     } finally {

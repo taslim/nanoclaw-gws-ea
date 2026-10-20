@@ -79,6 +79,7 @@ import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
+import { siteWordingPattern } from './testing/site-wording.js';
 
 registerMigration(gwsEaInboxMigration);
 
@@ -973,7 +974,13 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(result).toEqual({
         status: 'refused',
         reason: 'consent_required',
-        consent: [{ stop_id: stops[0].id, site: 'shop.example', wording: label }],
+        consent: [
+          {
+            stop_id: stops[0].id,
+            site: 'shop.example',
+            wording: expect.stringMatching(siteWordingPattern(label, 'shop.example')),
+          },
+        ],
       });
       expect(posts).toEqual([]);
       expect(fake.calls).not.toContain('create');
@@ -1029,7 +1036,13 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(held).toEqual({
         status: 'refused',
         reason: 'consent_required',
-        consent: [{ stop_id: stop.id, site: 'shop.example', wording: WAIVER }],
+        consent: [
+          {
+            stop_id: stop.id,
+            site: 'shop.example',
+            wording: expect.stringMatching(siteWordingPattern(WAIVER, 'shop.example')),
+          },
+        ],
       });
       expect(posts).toEqual([]);
       expect(await attempts.get(authority.id)).toMatchObject({

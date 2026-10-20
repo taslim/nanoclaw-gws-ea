@@ -566,6 +566,8 @@ describe('native watch bounds and one booking claim', () => {
     expect(cards[0]).toContain('Bistro');
     expect(cards[0]).toContain('$50.00');
     expect(cards[0]).toContain(terms);
+    // The venue reads by its name: the site's own id for it means nothing to the principal.
+    expect(cards[0]).not.toContain('merchant identity');
     const approval = (
       await getDb().all<import('../../types.js').PendingApproval>(
         "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",

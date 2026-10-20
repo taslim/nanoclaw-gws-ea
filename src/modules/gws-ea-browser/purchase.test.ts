@@ -604,7 +604,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await buy();
     expect(await request('buy')).toMatchObject({
       status: 'facts_incomplete',
-      missing: ["the site's reviewed checkout"],
+      missing: ['the checkout page in the form the site normally shows it'],
     });
     expect(await approvals()).toHaveLength(0);
     expect(sent).toHaveLength(0);

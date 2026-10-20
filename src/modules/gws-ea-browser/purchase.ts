@@ -41,7 +41,7 @@ import {
 } from './commit-classifier.js';
 import { ControlFactsUnavailableError, readCheckoutRegion } from './control-facts.js';
 import { readConfirmation, readPageLines, showsCharge } from './confirmation.js';
-import { recordConsentGrant, runConsentPass, type ConsentAgreement } from './consent.js';
+import { consentStopsForAgent, recordConsentGrant, runConsentPass, type ConsentAgreement } from './consent.js';
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } from './db.js';
 import {
@@ -843,7 +843,14 @@ async function commitFree(
   // The consent engine's check, as before any submission (KTD11): every choice it owns made, or a stop.
   const consent = await runConsentPass(page, free.element, { scope, assertActive: context.assertActive });
   if (consent.status === 'consent_required')
-    return { answer: { status: 'stopped', reason: 'consent_required', consent: consent.stops, repeat_safe: true } };
+    return {
+      answer: {
+        status: 'stopped',
+        reason: 'consent_required',
+        consent: consentStopsForAgent(consent.stops),
+        repeat_safe: true,
+      },
+    };
   if (consent.status === 'add_on')
     return {
       answer: {

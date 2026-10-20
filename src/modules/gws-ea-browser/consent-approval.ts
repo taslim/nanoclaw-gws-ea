@@ -26,6 +26,7 @@ import {
   getConsentStop,
   liveConsentGrants,
   recordConsentGrant,
+  siteWording,
   type ConsentGrant,
   type ConsentStop,
 } from './consent.js';
@@ -176,9 +177,11 @@ const OUTCOME_MESSAGES = {
   approved:
     'The principal agreed. Submit the form again from a fresh observation: the host ticks this box there now, and whenever this exact wording appears on the site again.',
   rejected:
-    'The principal declined. The host leaves this box unticked; do not submit a form that needs it, and report this to main.',
-  expired: 'The principal did not answer in time. The box stays unticked; report this to main.',
-  withdrawn: 'The card was withdrawn before the principal answered. The box stays unticked; report this to main.',
+    'The principal declined. The host leaves this box unticked; do not submit a form that needs it, and report this to the agent that sent the errand.',
+  expired:
+    'The principal did not answer in time. The box stays unticked; report this to the agent that sent the errand.',
+  withdrawn:
+    'The card was withdrawn before the principal answered. The box stays unticked; report this to the agent that sent the errand.',
 } as const;
 
 /** The job hears the principal's decision on its stop, once. */
@@ -196,7 +199,7 @@ async function notifyConsentOutcome(stop: ConsentStop, status: keyof typeof OUTC
         stop_id: stop.id,
         status,
         site: stop.site,
-        wording: stop.wording,
+        wording: siteWording(stop.wording, stop.site),
         message: OUTCOME_MESSAGES[status],
       }),
     );
@@ -306,7 +309,7 @@ async function consentGrantsRequest(
         grant_id: grant.id,
         site: grant.site,
         origin: grant.origin,
-        wording: grant.wording,
+        wording: siteWording(grant.wording, grant.site),
         approved_at: grant.created_at,
       })),
     };

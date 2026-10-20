@@ -54,6 +54,35 @@ describe('principal-approved material purchase bounds', () => {
   ])('requires a fresh card for %s', (_name, change) => {
     expect(materialPurchaseChange(retailFacts, { ...retailFacts, ...change }, {})).toBeTypeOf('string');
   });
+  it.each([
+    ['flow', { flowId: 'amazon-us-retail-v2' }],
+    ['frame origin', { origin: 'https://smile.amazon.com' }],
+    ['commit control', { control: { ...retailFacts.control, label: 'Buy now' } }],
+  ])('opens the fresh card for a changed %s with words the principal knows', (_name, change) => {
+    expect(materialPurchaseChange(retailFacts, { ...retailFacts, ...change }, {})).toBe('The checkout page changed.');
+  });
+  it('tells the principal a reservation outside the bounds they gave no longer fits what they approved', () => {
+    const dinner: PurchaseFacts = {
+      ...retailFacts,
+      reservation: {
+        venueId: 'venue-1',
+        venueName: 'Bistro',
+        partySize: 2,
+        at: '2026-10-20T19:00:00.000Z',
+        endAt: '2026-10-20T20:30:00.000Z',
+        timeZone: 'UTC',
+      },
+    };
+    const bounds = {
+      reservation: {
+        venueId: 'venue-1',
+        partySize: 4,
+        windowStart: '2026-10-20T18:00:00.000Z',
+        windowEnd: '2026-10-20T21:00:00.000Z',
+      },
+    };
+    expect(materialPurchaseChange(dinner, dinner, bounds)).toBe('The reservation no longer fits what you approved.');
+  });
   it('honours an explicit delivery window or needed-by deadline on a rebuilt checkout', () => {
     const later = { ...retailFacts, delivery: { date: '2026-10-22', text: 'October 22' } };
     expect(

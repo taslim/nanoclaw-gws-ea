@@ -256,10 +256,20 @@ describe('a purchase with no page proof', () => {
     expect(await attempt(id)).toMatchObject({ resolution: null });
     const other = await errand('main-p', 'bowls');
     await expect(record(other.job.thread_id, id, 'placed', 'email')).rejects.toThrow(
-      "That job made no purchase with that attempt id: use the id the job's state shows.",
+      "That job made no purchase with that attempt id: use the attempt id the host's unconfirmed notice gave.",
     );
     await expect(record(job.thread_id, 'attempt-invented', 'placed', 'email')).rejects.toThrow(
-      "That job made no purchase with that attempt id: use the id the job's state shows.",
+      "That job made no purchase with that attempt id: use the attempt id the host's unconfirmed notice gave.",
+    );
+    // A delegator other than main reads no matter state, so the id it is pointed to is the one its notice carried.
+    await expect(
+      recordPurchaseOutcome(
+        { thread: job.thread_id, attempt_id: id, outcome: 'unknown', source: 'email' },
+        main,
+        () => new BrowserQueue(new BrowserStore(), runtime),
+      ),
+    ).rejects.toThrow(
+      "record_purchase_outcome needs the job thread, the attempt id the host's unconfirmed notice gave, placed or not_placed, and the source: email or principal.",
     );
   });
 });

@@ -193,16 +193,13 @@ export function renderPurchaseCard(
     ...earlierLines(earlier, principalTimeZone),
     `Site: ${quoted(facts.origin, SELLER_TEXT_LIMIT)}`,
     `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
-    `Commit control: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
-    ...facts.items.map(
-      (item) =>
-        `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}; merchant id ${quoted(item.id, SELLER_TEXT_LIMIT)}`,
-    ),
+    `Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
+    ...facts.items.map((item) => `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}`),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
     ...(facts.reservation
       ? [
-          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}; merchant id ${quoted(facts.reservation.venueId, SELLER_TEXT_LIMIT)}`,
+          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}`,
           `Party size: ${facts.reservation.partySize}`,
           `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, principalTimeZone)}`,
         ]

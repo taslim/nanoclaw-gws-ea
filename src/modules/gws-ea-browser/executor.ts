@@ -18,7 +18,7 @@ import {
   type BrowserNavigationGuard,
 } from './commit-classifier.js';
 import { readConfirmations, showsCharge, type ConfirmationEvidence } from './confirmation.js';
-import { BrowserConsentStop, type ConsentStopView } from './consent.js';
+import { BrowserConsentStop, consentStopsForAgent, type ConsentStopView } from './consent.js';
 import { settleCookieBanners } from './cookie-banners.js';
 import { addressFields, personalDataStop } from './disclosures.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
@@ -725,7 +725,7 @@ async function executeBatch(
         )
           captureBrowserDiagnosticRefusal(page)('action', undefined, error.reason);
         reason = batchErrorReason(error, guard.reason(), context, page);
-        if (error instanceof BrowserConsentStop) consent = error.stops;
+        if (error instanceof BrowserConsentStop) consent = consentStopsForAgent(error.stops);
         if (error instanceof UnapprovedCommitStop) unapproved = error.commit;
         results[index] = {
           index,

@@ -74,7 +74,7 @@ import {
 } from './authentication-submit.js';
 import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
 import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
-import { runConsentPass } from './consent.js';
+import { consentStopsForAgent, runConsentPass } from './consent.js';
 import type { BrowserRequest } from './db.js';
 import {
   CredentialAttemptError,
@@ -269,6 +269,10 @@ export const credentialReleaseGuard = defineGuardedAction({
   },
 });
 
+/** What the host did with a login someone changed or removed in 1Password while it was saving it. */
+const LEFT = 'the host left it as it is.';
+const CHANGED_MEANWHILE = `the login was changed or removed in 1Password meanwhile, and ${LEFT}`;
+
 /**
  * What 1Password holds for an attempt the host could not finish, in the
  * principal's words on the card (`mine`) and in main's note (`theirs`). A
@@ -286,7 +290,7 @@ function vaultLeft(
       case 'conflict':
         return {
           mine: undefined,
-          theirs: 'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+          theirs: `Its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`,
         };
       case 'confirmed':
         return {
@@ -296,13 +300,13 @@ function vaultLeft(
       default:
         return {
           mine: 'The password I generated for it is kept in my 1Password vault.',
-          theirs: "The password generated for it stays in the assistant's 1Password vault, not saved as its login.",
+          theirs: `Its password stays in the assistant's 1Password vault, in the login "${attempt.site}", which the host has not finished saving.`,
         };
     }
   if (phase === 'conflict')
     return {
       mine: `The new password is in my 1Password vault as its own item, ${item}.`,
-      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login stays as it was changed.`,
+      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; ${CHANGED_MEANWHILE}`,
     };
   if (phase !== 'confirmed')
     return {
@@ -319,7 +323,7 @@ function vaultLeft(
     case 'kept':
       return {
         mine: `The new password is in my 1Password vault as its own item, ${item}, which may still hold the old password too.`,
-        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; the login stays as it was changed.`,
+        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; ${CHANGED_MEANWHILE}`,
       };
     case null:
       return {
@@ -362,6 +366,17 @@ function situation(attempt: CredentialAttempt, account: string): string {
       ? `The site took a new password for ${account}, and the login in my 1Password vault has it, but I can't reach 1Password to delete the separate item that held it.`
       : `The site took a new password for ${account}, but I can't reach 1Password to put it into the login.`;
   return `I tried to change the password of ${account}, but I can't tell whether the password changed.`;
+}
+
+/** What a release the host could finish after all leaves, in words: the job's outcome with its vault state. */
+function finishedWords(attempt: Pick<CredentialAttempt, 'kind' | 'site'>, vault: 'finalized' | 'conflict'): string {
+  if (attempt.kind === 'signup')
+    return vault === 'finalized'
+      ? "the site created the account, and its login in the assistant's 1Password vault holds its password."
+      : `the site created the account, but its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`;
+  return vault === 'finalized'
+    ? "the site took the new password, and the login in the assistant's 1Password vault now holds it."
+    : `the site took the new password, which is in the assistant's 1Password vault as its own item, "New password for ${attempt.site}"; ${CHANGED_MEANWHILE}`;
 }
 
 /** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
@@ -502,9 +517,8 @@ async function applyCredentialRelease(
     }
     if (result.status === 'settled') {
       await freeSite(queue, result.result.attempt, `credential-settled-${current.id}`);
-      const outcome = websiteOutcome(current.kind, result.result.status);
       await notify(
-        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it (${String(outcome.status)}, vault ${String(outcome.vault)}).`,
+        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it: ${finishedWords(current, result.result.status)}`,
       );
       return;
     }
@@ -693,7 +707,7 @@ async function finalizedOutcome(
 
 /**
  * A confirmed website change: the login holds the new password (`saved`,
- * `updated`); it was changed in 1Password meanwhile and stays as it was made
+ * `updated`); it was changed or removed in 1Password meanwhile and stays as it is
  * (`left_as_edited`); or 1Password is not updated yet (`pending`), which the
  * next reconcile finishes.
  */
@@ -994,7 +1008,10 @@ async function consentStop(
     case 'ready':
       return undefined;
     case 'consent_required':
-      return { outcome: { ...refused('consent_required'), consent: consent.stops }, firstRead: !consent.hostChanged };
+      return {
+        outcome: { ...refused('consent_required'), consent: consentStopsForAgent(consent.stops) },
+        firstRead: !consent.hostChanged,
+      };
     // No grant clears an extra the site keeps, so a stop for one is never held.
     case 'add_on':
       return { outcome: refused('purchase_control'), firstRead: false };

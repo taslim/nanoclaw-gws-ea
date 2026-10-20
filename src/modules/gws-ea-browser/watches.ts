@@ -277,7 +277,7 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
   return [
     'Approve one reservation across this errand’s watches, within these bounds:',
     `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
-    `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}; merchant identity ${quoted(bounds.venue.id, SELLER_TEXT_LIMIT)}`,
+    `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
     `Party size: ${bounds.partySize}`,
     ...bounds.windows.map(
       (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,

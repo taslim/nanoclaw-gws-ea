@@ -530,7 +530,9 @@ export async function executeSignInCode(
       if (kind !== 'username' && kind !== 'otp')
         throw invalidArgs('Choose the email or one-time-code field in a supported sign-in form.');
       if (payload.from === 'principal' && kind !== 'otp')
-        throw invalidArgs('Choose the principal code field after requesting their code.');
+        throw invalidArgs(
+          "For a code the principal relays, target the site's one-time-code field: the host presses send itself once the wait is recorded.",
+        );
       // The assistant signs in with its web address, never one it converses from (KTD14).
       const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
       if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
