@@ -536,8 +536,11 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
-    // The nudge asks for the reply, never for every line of output to be wrapped.
-    expect(pushes[0]).toContain('Please re-send your reply');
+    // The nudge offers a block for text meant for someone and a quiet ending for a turn with nothing to send,
+    // never a re-send, and never asks for every line of output to be wrapped.
+    expect(pushes[0]).toContain('If that text was meant for someone, send it now in a <message to="name">');
+    expect(pushes[0]).toContain('If the turn had nothing to send, respond with only <internal>done</internal>');
+    expect(pushes[0]).not.toContain('re-send');
     expect(pushes[0]).not.toContain('All output must be wrapped');
   });
 });

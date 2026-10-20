@@ -716,7 +716,8 @@ export async function processQuery(
               sentThisTurn.length > 0
                 ? buildInformedWrapNudge(sentThisTurn, undelivered, destinations)
                 : `<system>Your response was not delivered — nothing this turn was inside a <message to="name">...</message> block. ` +
-                    `Please re-send your reply in one: every reply must be wrapped, and text outside a block, including <internal> scratchpad, is not delivered. ` +
+                    `If that text was meant for someone, send it now in a <message to="name">...</message> block. ` +
+                    `If the turn had nothing to send, respond with only <internal>done</internal> and nothing will be sent. ` +
                     `Your destinations: ${names}.</system>`,
               { after: turnStartSeq, upto: maxOutboundSeq() },
             );
@@ -1211,7 +1212,7 @@ export function buildInformedWrapNudge(
     `<system>Your final text was not delivered — it was not wrapped in <message to="name">...</message> blocks:\n` +
     `<undelivered_text>${clip(finalText)}</undelivered_text>\n` +
     `Earlier in that turn you already sent:\n${sent.join('\n')}\n` +
-    `If what was sent is the full reply, to where it was owed, respond with only <internal>done</internal> and nothing more will be sent. ` +
+    `If what was sent is the full reply, to where it was owed, or that text was only a note to yourself, respond with only <internal>done</internal> and nothing more will be sent. ` +
     `Otherwise send only what is still missing, wrapped in <message to="name">...</message>, without repeating what already went out. ` +
     `Your destinations: ${escapePromptXml(names)}.</system>`
   );

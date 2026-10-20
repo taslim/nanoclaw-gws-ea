@@ -25,6 +25,17 @@ export interface DestinationEntry {
 
 export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
 
+/** The capability that holds `send_message` (mcp-tools/core.ts). */
+export const REPLY_CAPABILITY = 'reply';
+
+/**
+ * A chat turn with nothing to send. Every agent is told it, whatever it holds:
+ * bare text is treated as a reply that missed its block, so a quiet turn is
+ * `<internal>` alone.
+ */
+const QUIET_ENDING =
+  'When a turn has nothing to send, end it with only `<internal>…</internal>`: text outside every block reads as a reply that was never sent.';
+
 function destinationEntry(destination: Destination): DestinationEntry {
   return {
     name: destination.name,
@@ -60,9 +71,15 @@ export function findByRouting(
  *
  * Identity is injected here (not in the shared CLAUDE.md) because it's
  * per-agent-group and changes when the operator renames an agent, while
- * the shared base is identical across all agents.
+ * the shared base is identical across all agents. The delivery wording
+ * follows `capabilities`: only an agent holding `reply` has `send_message`,
+ * so only it is taught the tool and the pacing that rests on it.
  */
-export function buildSystemPromptAddendum(assistantName?: string, mode: SessionMode = { kind: 'chat' }): string {
+export function buildSystemPromptAddendum(
+  assistantName: string | undefined,
+  mode: SessionMode,
+  capabilities: ReadonlySet<string>,
+): string {
   const sections: string[] = [];
 
   if (assistantName) {
@@ -70,12 +87,12 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
       [
         '# You are ' + assistantName,
         '',
-        `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
+        `Your name is **${assistantName}**. Use it when the channel asks who you are and when introducing yourself. Sign only where your guidance asks for it.`,
       ].join('\n'),
     );
   }
 
-  sections.push(buildDestinationsSection(mode));
+  sections.push(buildDestinationsSection(mode, capabilities.has(REPLY_CAPABILITY)));
   if (mode.kind === 'chat') sections.push(buildReadingSection());
 
   return sections.join('\n\n');
@@ -98,13 +115,16 @@ function buildReadingSection(): string {
   ].join('\n');
 }
 
-function buildDestinationsSection(mode: SessionMode): string {
+function buildDestinationsSection(mode: SessionMode, canReply: boolean): string {
   const all = getAllDestinations();
   const lines = ['## Sending messages', ''];
 
   if (all.length === 0) {
     lines.push('You currently have no configured destinations. You cannot send messages until an admin wires one up.');
-    if (mode.kind === 'chat') return lines.join('\n');
+    if (mode.kind === 'chat') {
+      lines.push('', QUIET_ENDING);
+      return lines.join('\n');
+    }
   } else if (all.length === 1) {
     const d = all[0];
     lines.push(`Your destination is \`${d.name}\`${destinationLabel(d)}.`);
@@ -118,21 +138,29 @@ function buildDestinationsSection(mode: SessionMode): string {
   lines.push('');
   if (all.some((destination) => destination.sessionMode === 'per-thread')) {
     lines.push(
-      'For a destination marked per-thread, start a separate errand with `send_message({ to: "name", thread: "new", text: "outcome, bounds, account" })`. The tool returns its thread. Every follow-up and file needs `thread` explicitly. A `<message to>` block may reply only when this batch has exactly one thread from that destination; otherwise use the tool with the thread. A closed thread cannot be reopened.',
+      canReply
+        ? 'For a destination marked per-thread, start a separate errand with `send_message({ to: "name", thread: "new", text: "outcome, bounds, account" })`. The tool returns its thread. Every follow-up and file needs `thread` explicitly. A `<message to>` block may reply only when this batch has exactly one thread from that destination; otherwise use the tool with the thread. A closed thread cannot be reopened.'
+        : 'A destination marked per-thread takes a `<message to>` block only as a reply, when this batch has exactly one thread from that destination. A closed thread cannot be reopened.',
     );
     lines.push('');
   }
 
   if (mode.kind === 'task') {
-    lines.push(
-      'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
-    );
-    const channelDestinations = all.filter((destination) => destination.type === 'channel');
-    if (channelDestinations.length > 0) {
-      const channelNames = channelDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+    if (canReply) {
       lines.push(
-        '',
-        `For user-visible escalation output, default to your own channel destination(s): ${channelNames} — that's the operator's actual conversation with you. Use an agent-type destination like \`parent\` only when the task explicitly calls for routing through another agent, not as your default escalation path.`,
+        'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
+      );
+      const channelDestinations = all.filter((destination) => destination.type === 'channel');
+      if (channelDestinations.length > 0) {
+        const channelNames = channelDestinations.map((destination) => `\`${destination.name}\``).join(', ');
+        lines.push(
+          '',
+          `For user-visible escalation output, default to your own channel destination(s): ${channelNames} — that's the operator's actual conversation with you. Use an agent-type destination like \`parent\` only when the task explicitly calls for routing through another agent, not as your default escalation path.`,
+        );
+      }
+    } else {
+      lines.push(
+        'This is an isolated task run with no attached chat, and a `<message>` block in it is not delivered. Only notify someone when the task asks you to, with a tool your instructions give you for it.',
       );
     }
     lines.push(
@@ -146,10 +174,16 @@ function buildDestinationsSection(mode: SessionMode): string {
     'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly. Include several blocks in one response to address several destinations; each block lands as its own message.',
   );
   lines.push('');
+  lines.push(QUIET_ENDING);
+  lines.push('');
   lines.push(
     'When replying to an incoming message, default to addressing the destination it came `from` (every inbound `<message>` tag carries a `from="name"` attribute). Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
   );
   lines.push('');
+  if (!canReply) {
+    lines.push('Do not narrate your work: make each message the outcome, not a play-by-play.');
+    return lines.join('\n');
+  }
   lines.push(
     'The `send_message` MCP tool is the same delivery, available mid-turn. Always pass its explicit `to` destination. It is handy for a quick acknowledgment ("on it") before a slow tool call, but your answer still has to be sent after it. Each `send_message` call and each `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );

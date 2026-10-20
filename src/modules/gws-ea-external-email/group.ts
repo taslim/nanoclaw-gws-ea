@@ -22,7 +22,11 @@ import { getProviderHostContract } from '../../provider-contracts/index.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
-import { getExternalEmailAgentGroupId, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  getExternalEmailAgentGroupId,
+  nameAssistantAgent,
+  recordExternalEmailAgentGroupId,
+} from '../gws-ea-profile/db.js';
 
 /**
  * The email channel's tool keys, one for each part (KTD4), registered
@@ -75,7 +79,8 @@ export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
  * group, its configuration, and the pointer are written in one transaction,
  * so a host stopped part-way leaves no group the pointer misses; files the
  * template stamped before such a stop stay in a folder the next attempt does
- * not reuse. Once the pointer is recorded this changes nothing.
+ * not reuse. Once the profile names the assistant, the group carries that
+ * name from creation. Once the pointer is recorded this changes nothing.
  */
 export async function ensureExternalEmailGroup(): Promise<string> {
   const existing = await getExternalEmailAgentGroupId();
@@ -86,6 +91,7 @@ export async function ensureExternalEmailGroup(): Promise<string> {
     await updateContainerConfigJson(group.id, 'capabilities', [...EXTERNAL_EMAIL_CAPABILITIES]);
     await updateContainerConfigJson(group.id, 'skills', []);
     await recordExternalEmailAgentGroupId(group.id);
+    await nameAssistantAgent(group.id);
     log.info('Created external-email', { agentGroupId: group.id, folder: group.folder });
     return group.id;
   });

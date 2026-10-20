@@ -24,7 +24,7 @@ import { getProviderHostContract } from '../../provider-contracts/index.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
-import { getBrowserAgentGroupId, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { getBrowserAgentGroupId, nameAssistantAgent, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const BROWSER_TEMPLATE = 'gws-ea/browser';
@@ -57,7 +57,8 @@ export const BROWSER_CAPABILITIES: readonly string[] = [
  * group, its configuration, and the pointer are written in one transaction,
  * so a host stopped part-way leaves no group the pointer misses; files the
  * template stamped before such a stop stay in a folder the next attempt does
- * not reuse. Once the pointer is recorded this changes nothing.
+ * not reuse. Once the profile names the assistant, the group carries that
+ * name from creation. Once the pointer is recorded this changes nothing.
  */
 export async function ensureBrowserGroup(): Promise<string> {
   const existing = await getBrowserAgentGroupId();
@@ -68,6 +69,7 @@ export async function ensureBrowserGroup(): Promise<string> {
     await updateContainerConfigJson(group.id, 'capabilities', [...BROWSER_CAPABILITIES]);
     await updateContainerConfigJson(group.id, 'skills', []);
     await setBrowserAgentGroupId(group.id);
+    await nameAssistantAgent(group.id);
     log.info('Created browser', { agentGroupId: group.id, folder: group.folder });
     return group.id;
   });

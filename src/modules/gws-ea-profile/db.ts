@@ -426,6 +426,47 @@ async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: s
   }
 }
 
+/**
+ * The assistant's own agents, main and whichever of `external-email` and the
+ * browser exist, are named by its display name (KTD1): each one's container
+ * config copy is derived here, from the groups the profile records, whenever
+ * the profile is reconciled, so a rename reaches each on its next spawn.
+ * Written only when it differs. Any other group keeps its own name.
+ */
+async function keepAssistantAgentsNamed(name: string): Promise<void> {
+  const row = await getDb().get<
+    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+  >(
+    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  for (const agentGroupId of [
+    row?.main_agent_group_id,
+    row?.external_email_agent_group_id,
+    row?.browser_agent_group_id,
+  ]) {
+    if (agentGroupId) await keepAssistantNamed(agentGroupId, name);
+  }
+}
+
+async function keepAssistantNamed(agentGroupId: string, name: string): Promise<void> {
+  const config = await getContainerConfig(agentGroupId);
+  if (config !== undefined && config.assistant_name !== name) {
+    await updateContainerConfigScalars(agentGroupId, { assistant_name: name });
+  }
+}
+
+/**
+ * Name a group the host just created as one of the assistant's own agents,
+ * when the profile already holds the assistant's name; one created before
+ * that is named by the reconcile that sets it.
+ */
+export async function nameAssistantAgent(agentGroupId: string): Promise<void> {
+  const row = await getDb().get<{ assistant_display_name: string | null }>(
+    'SELECT assistant_display_name FROM gws_ea_profile WHERE singleton = 1',
+  );
+  if (row?.assistant_display_name) await keepAssistantNamed(agentGroupId, row.assistant_display_name);
+}
+
 /** The principal's name and home timezone, as the profile holds them. */
 export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
   const row = await getDb().get<{ principal_display_name: string | null; principal_timezone: string | null }>(
@@ -480,6 +521,7 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
       throw new Error("A profile that names main needs the principal's name and timezone");
     }
     await keepMainInPrincipalTimezone(validated.mainAgentGroupId, principal.timezone);
+    await keepAssistantAgentsNamed(validated.assistantDisplayName);
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
