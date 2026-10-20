@@ -56,7 +56,10 @@ function withConnectionStep(action: string, answer: ActionAnswer, nextStep: stri
   };
 }
 
-/** What external-email does meanwhile: main tells the principal. */
+/**
+ * What external-email does meanwhile: main tells the principal.
+ * to: external-email
+ */
 const EXTERNAL_EMAIL_STEP = "Wake main with tell_main, saying what you couldn't do on this thread, and wait for main.";
 /** What main does meanwhile, as its guidance has it for any account of its own that stops working. */
 const MAIN_STEP = "Tell the principal in a line what you can't do, and carry on with the rest.";

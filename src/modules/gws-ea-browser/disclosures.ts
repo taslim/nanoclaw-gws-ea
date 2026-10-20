@@ -49,6 +49,7 @@ function disclosureSite(named: string): string | undefined {
  * An agent with browser access records that one errand of its own may give one site one of the principal's
  * stored values, named by its id. None of the principal's addresses is ever disclosed (R34): a site gets the
  * assistant's web address. A repeat changes nothing.
+ * to: main, delegator
  */
 async function recordDisclosureRequest(
   content: Record<string, unknown>,

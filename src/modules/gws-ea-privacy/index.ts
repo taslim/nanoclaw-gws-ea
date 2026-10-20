@@ -431,6 +431,7 @@ const KIND_ARG: ColumnDef = {
   enum: [...PRIVATE_VALUE_KINDS],
 };
 
+/** to: main */
 registerResource({
   name: 'private value',
   plural: 'private-values',

@@ -130,7 +130,10 @@ const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
-/** What external-email does when only main can settle what comes next: an account alone never reaches main in time. */
+/**
+ * What external-email does when only main can settle what comes next: an account alone never reaches main in time.
+ * to: external-email
+ */
 const WAIT_FOR_MAIN = 'wake main with tell_main and wait for its answer';
 
 /**
@@ -144,15 +147,20 @@ const PRIVATE_DETAIL_ADVICE = `Write it without that detail, and do not hint at,
  * What a booking's answer says of main: the host tells main of each booking,
  * change and cancellation, so no wake is needed, and external-email still
  * ends its turn with its account of the thread.
+ * to: external-email
  */
 const MAIN_IS_TOLD = 'The host tells main of it, so no wake is needed; still leave your account with tell_main.';
 
-/** What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13). */
+/**
+ * What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13).
+ * to: external-email
+ */
 const ASK_FOR_CALENDAR = 'wake main with tell_main to ask which calendar to book on';
 /**
  * What `free_time` adds while main has set no calendar for the thread: every
  * call says it, so "once" spares main a second wake, and a time offered now
  * could be one main's choice of calendar rules out (KTD18).
+ * to: external-email
  */
 const NO_CALENDAR_YET =
   "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
@@ -300,6 +308,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * Refuse, naming each, any time that has passed or is no longer free:
    * what `book` and `change_booking` never place. A time no longer free is
    * refused with word to offer others.
+   * to: external-email
    */
   async function assertAvailable(
     view: ThreadView,

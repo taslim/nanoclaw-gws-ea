@@ -57,7 +57,7 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
  * `respond_to_event` and `calendar.respond` is off. Workspace's are gog's
  * whole surface for its five products, generated (`./workspace-commands.ts`).
  */
-const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
+export const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
   'google-calendar': [
     'calendar.calendars',
     'calendar.subscribe',

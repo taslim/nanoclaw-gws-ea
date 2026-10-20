@@ -160,6 +160,7 @@ function vaultOutcome(reason: BrowserVaultReason): Outcome {
  * Login, an edited one, or an account with no saved Login is refused here,
  * before the browser can act. Sign-in email, phone, two-factor and
  * payment-method changes have no operation.
+ * to: main, delegator
  */
 export async function credentialAuthorityRequest(
   content: Record<string, unknown>,

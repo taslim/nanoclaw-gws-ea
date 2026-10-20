@@ -386,6 +386,7 @@ async function askPrincipal(email: string, session: Session): Promise<Record<str
   return { status: 'awaiting_principal', email };
 }
 
+/** to: main, delegator */
 async function vaultAccessRequest(
   content: Record<string, unknown>,
   session: Session,

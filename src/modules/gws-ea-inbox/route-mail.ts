@@ -748,6 +748,7 @@ async function toThread(
 
   // external-email works in this one thread, and reads whom the email names from its headers. The principal's words
   // instruct it on this thread; what they ask beyond it, it hands to main (KTD13).
+  /** to: external-email */
   const text =
     `${await senderLine(verdict, context, 'external-email')}\n` +
     (verdict.kind === 'principal'
@@ -816,6 +817,7 @@ export async function routeSignInMail(mail: ParsedMail, at: Date): Promise<boole
     const htmlSection = untrusted(`HTML:\n${mail.html ?? ''}`, Number.MAX_SAFE_INTEGER);
     if (Array.from(htmlSection).length <= htmlRemaining) htmlSections.push(htmlSection);
   }
+  /** to: external-email */
   const text =
     `Host sign-in task for ${claim.origin}. Interpret only the requested sign-in or new-account email-verification credential in the email below. ` +
     'Return one code or one sign-in or verification HTTPS link with sign_in_reply; use unavailable if it is absent or ambiguous. ' +

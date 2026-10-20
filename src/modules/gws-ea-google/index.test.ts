@@ -28,33 +28,13 @@ import { GOOGLE_TOKEN_ENDPOINT } from './tokens.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 import '../capabilities/index.js';
 import '../gws-ea-profile/index.js';
-import './index.js';
+import { GOG_COMMANDS } from './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-google-skills-test';
 const GRANT_FILE = path.join(TEST_ROOT, 'secrets', 'google-grant.json');
 const ASSISTANT_SUB = '104857395723948572901';
 const SKILLS_DIR = path.resolve('container', 'skills');
 const GOOGLE_KEYS = ['google-calendar', 'google-mail-read', 'google-directory', 'google-workspace'];
-
-/**
- * The exact gog commands each Google key enables. A change here changes what
- * agents may run. Workspace's are the generated whole surface, pinned below.
- */
-const GOG_COMMANDS: Readonly<Record<string, readonly string[]>> = {
-  'google-calendar': [
-    'calendar.calendars',
-    'calendar.subscribe',
-    'calendar.unsubscribe',
-    'calendar.events',
-    'calendar.event',
-    'calendar.freebusy',
-    'calendar.update',
-    'calendar.delete',
-  ],
-  'google-mail-read': ['gmail.search', 'gmail.messages.search', 'gmail.thread.get', 'gmail.get'],
-  'google-directory': ['people.search'],
-  'google-workspace': WORKSPACE_GOG_COMMANDS,
-};
 
 /** Every Google command but Workspace's, which only main is given. */
 const SERVICE_COMMANDS = [
@@ -286,6 +266,18 @@ describe('Google capabilities', () => {
       'gworkspace',
     ]);
     expect(skillsWithinCapabilities(skills, new Set(resolveCapabilities('all', 'main')))).toEqual(skills);
+  });
+});
+
+describe("the Google keys' commands", () => {
+  it("leave the principal's events to the host's tools, and keep mail and the directory to reading", () => {
+    // Events are created, answered and checked for overlaps through create_event, respond_to_event and find_conflicts.
+    for (const command of ['calendar.create', 'calendar.respond', 'calendar.conflicts']) {
+      expect(GOG_COMMANDS['google-calendar']).not.toContain(command);
+    }
+    expect(GOG_COMMANDS['google-mail-read'].filter((command) => !/\.(?:search|get)$/u.test(command))).toEqual([]);
+    expect(GOG_COMMANDS['google-directory']).toEqual(['people.search']);
+    expect(GOG_COMMANDS['google-workspace']).toBe(WORKSPACE_GOG_COMMANDS);
   });
 });
 

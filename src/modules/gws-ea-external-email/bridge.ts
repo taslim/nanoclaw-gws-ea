@@ -379,6 +379,7 @@ async function assertLinksOpenable(texts: readonly string[], target: Target): Pr
  * Check everything a handoff carries before anything is written: its
  * fields, its thread or people, its files, its matter, the private-values
  * check over every part that crosses, the link check, and its calendar.
+ * to: main
  */
 async function admit(content: Record<string, unknown>, session: Session, requestId: string): Promise<Admitted> {
   const message = messageOf(content.message);

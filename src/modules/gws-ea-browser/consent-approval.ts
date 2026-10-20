@@ -94,6 +94,7 @@ function consentQuestion(stop: ConsentStop): string {
   ].join('\n');
 }
 
+/** to: browser */
 export function validateConsentRequest(content: Record<string, unknown>): Record<string, unknown> {
   if (Object.keys(content).some((key) => !['action', 'requestId', 'budget_ms', 'stop_id'].includes(key)))
     throw invalidArgs('Unknown request_consent field.');
@@ -284,6 +285,7 @@ const GRANT_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'opera
 /**
  * Main reads the principal's standing agreements, or withdraws one the principal asked to withdraw: from then
  * on that wording stops again on its site, and a purchase approved with it asks again before it commits.
+ * to: main, delegator
  */
 async function consentGrantsRequest(
   content: Record<string, unknown>,

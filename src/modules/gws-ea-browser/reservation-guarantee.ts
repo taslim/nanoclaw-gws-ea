@@ -101,7 +101,10 @@ export async function deriveReservationGuaranteeAuthority(
   });
 }
 
-/** A delegating agent records the principal's errand scope; this grants no financial authority by itself. */
+/**
+ * A delegating agent records the principal's errand scope; this grants no financial authority by itself.
+ * to: main, delegator
+ */
 async function reservationBoundsRequest(
   content: Record<string, unknown>,
   session: Session,
@@ -258,6 +261,7 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
     );
 });
 
+/** to: main, delegator */
 export async function reservationGuaranteeRequest(
   content: Record<string, unknown>,
   session: Session,

@@ -142,7 +142,10 @@ export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'kind' | 'facts
   };
 }
 
-/** What the delegating group reads of an unconfirmed attempt: what, when, its attempt id, and what settles it. */
+/**
+ * What the delegating group reads of an unconfirmed attempt: what, when, its attempt id, and what settles it.
+ * to: main, delegator
+ */
 async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Promise<string> {
   const { what, total } = attemptSummary(attempt);
   return (

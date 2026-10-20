@@ -3,13 +3,14 @@
  * tools and each agent's email tools: each should name only a tool
  * the runner actually exports, or a word this file's own not-tools list
  * explicitly carves out as something else (a request field, a sender, an
- * outcome word, and so on).
+ * outcome word, and so on). And the capability key each tool is read to
+ * have, and the words read from the tools' definitions.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { unknownToolNames } from './runner-tools.js';
+import { runnerToolCapabilities, runnerToolNames, runnerToolVocabulary, unknownToolNames } from './runner-tools.js';
 
 const MODULES = path.resolve('container', 'agent-runner', 'src', 'mcp-tools');
 
@@ -30,4 +31,40 @@ describe('the mcp-tools instruction files', () => {
       expect(unknownToolNames(instructions(name), notTools)).toEqual([]);
     });
   }
+});
+
+describe("the runner's tools, read from their sources", () => {
+  it('grant each tool through one capability key, as its registerTools call or module load names it', () => {
+    const keys = runnerToolCapabilities();
+    expect([...runnerToolNames()].filter((tool) => !keys.has(tool))).toEqual([]);
+    expect({
+      send_message: keys.get('send_message'),
+      add_reaction: keys.get('add_reaction'),
+      send_card: keys.get('send_card'),
+      time_now: keys.get('time_now'),
+      email_handoff: keys.get('email_handoff'),
+      free_time: keys.get('free_time'),
+      find_conflicts: keys.get('find_conflicts'),
+      purchase: keys.get('purchase'),
+      relay_code: keys.get('relay_code'),
+      record_purchase_outcome: keys.get('record_purchase_outcome'),
+    }).toEqual({
+      send_message: 'reply',
+      add_reaction: 'files-send',
+      send_card: 'interactive',
+      time_now: 'time',
+      email_handoff: 'gws-ea-email',
+      free_time: 'gws-ea-email-external',
+      find_conflicts: 'google-calendar',
+      purchase: 'browser',
+      relay_code: 'browser-delegate',
+      record_purchase_outcome: 'browser-purchase-outcome',
+    });
+  });
+
+  it("give the words their definitions use: fields, an action's kind, and an enum value", () => {
+    const words = runnerToolVocabulary();
+    for (const word of ['thread_key', 'stop_id', 'form_input', 'change_password']) expect(words, word).toContain(word);
+    expect(words).not.toContain('gmail_quote');
+  });
 });

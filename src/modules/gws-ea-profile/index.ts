@@ -124,6 +124,7 @@ function browserWebSentence(assistant: string, principal: string, alias: string 
  * poll keeps each one's calendar access, so it reads both live: a copy
  * composed when its container started would go stale the moment either
  * changed (R9).
+ * to: main
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
   " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it in the conversation; the command says when it does, and you are told the result.";
@@ -429,6 +430,7 @@ const EMAIL_ARGUMENT = {
   description: "One of the principal's email addresses; stored lowercased.",
 } as const;
 
+/** to: main */
 registerResource({
   name: 'principal address',
   plural: 'principal-addresses',
@@ -501,7 +503,10 @@ function receiptText(changes: readonly ProfileChange[]): string {
   return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
-/** What follows the change, and when: the host's readers now, main's own copies on its next start. */
+/**
+ * What follows the change, and when: the host's readers now, main's own copies on its next start.
+ * to: main
+ */
 const TAKES_EFFECT =
   "The host's email signatures and external-email's offered times use the new values now. Your own clock and the identity in your instructions follow at your next start, with nothing for you to do.";
 
@@ -536,6 +541,7 @@ const TIMEZONE_ARGUMENT = {
   description: 'Their home time zone, as an IANA id such as Europe/London.',
 } as const;
 
+/** to: main */
 registerResource({
   name: 'principal profile',
   plural: 'principal-profile',

@@ -80,6 +80,7 @@ function recordedAs(attempt: PurchaseAttemptRow): {
  * Main records the outcome of an attempt its errand left unconfirmed, from the merchant's order email or the
  * principal's answer. The attempt is one of that errand's, named by the id the host's unconfirmed notice gave. The first recording
  * stands; a later one returns it, and a "placed" against a recorded "not placed" is a possible duplicate.
+ * to: main, delegator
  */
 export async function recordPurchaseOutcome(
   content: Record<string, unknown>,
