@@ -739,6 +739,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(card.question).toContain("I can't tell whether the password changed");
     expect(card.question).toContain('Both the original and the new password are kept in my 1Password vault');
     await click('reject');
+    const declined = notes().at(-1) ?? '';
+    expect(declined).toContain(`The principal chose to keep waiting on the password change for "${USERNAME}"`);
+    expect(declined).not.toMatch(/admin|browser_credential_release|appr-/u);
     expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
     expect(await lease()).toEqual({ job_id: job.thread_id });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });

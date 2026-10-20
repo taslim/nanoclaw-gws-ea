@@ -257,6 +257,21 @@ describe('asking the principal for consent', () => {
     },
   );
 
+  it('tells the job of a declined card once, as the principal’s decision', async () => {
+    const id = await stop();
+    await ask(id, 'consent-1');
+    await click((await approvals())[0], 'reject');
+    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundHistory(100),
+    );
+    const told = (rows ?? [])
+      .map((row) => (JSON.parse(row.content) as { text?: string }).text ?? '')
+      .filter((text) => /declined|rejected/u.test(text));
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain('The principal declined.');
+    expect(told[0]).not.toMatch(/admin|browser_consent\b(?!_outcome)/u);
+  });
+
   it('refuses an unknown stop, another job’s stop and a stop already used, with no card', async () => {
     const id = await stop();
     expect(await ask('0b5c3a52-8f4e-4c1d-9a7b-2e6f1d3c4b5a', 'unknown')).toEqual(

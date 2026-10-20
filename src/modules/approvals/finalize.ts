@@ -15,16 +15,19 @@ import { deletePendingApproval, transitionPendingApprovalStatus } from '../../db
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { notifyApprovalResolved } from './primitive.js';
+import { getApprovalRejectionNote, notifyApprovalResolved } from './primitive.js';
 
 /**
  * Notify the requesting agent that its action was rejected, drop the pending
  * row, fire approval-resolved callbacks, and wake the container.
  *
- * When `reason` is provided it's appended to the agent-facing note with generic
- * attribution — the why, not the who (the rejecting admin may belong to a
- * different owner than the requesting agent). Callers are responsible for
- * clamping the reason length before passing it in.
+ * The note is the action's registered `rejectionNote` when it has one, and
+ * none when that returns null: the module's approval-resolved callback tells
+ * the agent itself, before the wake below. Otherwise it is the generic note,
+ * with `reason` appended under generic attribution — the why, not the who
+ * (the rejecting admin may belong to a different owner than the requesting
+ * agent). Callers are responsible for clamping the reason length before
+ * passing it in.
  */
 export async function finalizeReject(
   approval: PendingApproval,
@@ -33,21 +36,26 @@ export async function finalizeReject(
   reason?: string,
   expectedStatus: 'pending' | 'awaiting_reason' = approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending',
 ): Promise<boolean> {
+  // Worded before the claim, so a note that fails leaves the row open to answer again.
+  const rejectionNote = getApprovalRejectionNote(approval.action);
+  const text = rejectionNote
+    ? await rejectionNote(approval, reason)
+    : reason
+      ? `Your ${approval.action} request was rejected by admin: "${reason}"`
+      : `Your ${approval.action} request was rejected by admin.`;
+
   if (!(await transitionPendingApprovalStatus(approval.approval_id, expectedStatus, 'rejected'))) return false;
 
-  const text = reason
-    ? `Your ${approval.action} request was rejected by admin: "${reason}"`
-    : `Your ${approval.action} request was rejected by admin.`;
-
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-  });
+  if (text !== null)
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+    });
 
   log.info('Approval rejected', {
     approvalId: approval.approval_id,

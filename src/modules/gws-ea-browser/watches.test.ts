@@ -3,6 +3,7 @@ import { repairBrowserWatchChecks } from './scheduler.js';
 import {
   type WatchBounds,
   type WatchRow,
+  deliverWatchNotices,
   getBrowserWatch,
   compareWatchBounds,
   claimWatchBooking,
@@ -25,7 +26,9 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { setDeliveryAdapter } from '../../delivery.js';
-import { resolveSystemSession } from '../../session-manager.js';
+import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
+import { getPendingApproval, getSession } from '../../db/sessions.js';
+import type { PendingApproval, Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
@@ -35,12 +38,15 @@ import { browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
 import { createBrowserWatch, renderWatchCard, validateWatchRequest } from './watches.js';
 import { prepareWatchPurchase } from './watch-purchase.js';
+
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
 import * as watchRuntime from './watch-runtime.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import { finalizeReject } from '../approvals/finalize.js';
+import { requestApproval } from '../approvals/index.js';
 import { saveBrowserRecipe } from './recipes.js';
 
 import { cancelBrowserJob } from './cancel.js';
@@ -1215,5 +1221,77 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(card).toContain('Arrival window: Oct 16, 2026, 7:00 PM through 9:00 PM Los Angeles time');
     expect(card).toContain('Any other booking, a recurring charge included, comes to you on its own card.');
     expect(card).not.toContain('merchant identity');
+  });
+});
+
+describe('a watch the principal declines', () => {
+  /** A financial watch of the job awaiting its card, posted to the principal as the job asks for one. */
+  async function awaitingCard(id: string): Promise<{ approval: PendingApproval; session: Session; cards: string[] }> {
+    const cards = await bindPrincipal();
+    await seedWatch(id);
+    await getDb().run("UPDATE gws_ea_browser_watches SET status = 'awaiting_principal' WHERE id = ?", id);
+    const job = (await new BrowserStore().getJob(jobId))!;
+    const session = (await getSession(job.browser_session_id))!;
+    const approvalId = await requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'browser_watch_setup',
+      payload: { watchId: id, jobId, bounds },
+      title: 'Approve this reservation watch?',
+      question: 'Watch Bistro for a table for 4.',
+      approverUserId: 'gchat:users/watch-principal',
+      originLine: ERRAND_ORIGIN_LINE,
+    });
+    const approval = (await getPendingApproval(approvalId!))!;
+    await getDb().run(
+      'UPDATE gws_ea_browser_watches SET approval_id = ?,approval_json = ? WHERE id = ?',
+      approval.approval_id,
+      JSON.stringify(approval),
+      id,
+    );
+    return { approval, session, cards };
+  }
+  /** What the job's session heard about a decision on its watch. */
+  async function told(session: Session): Promise<string[]> {
+    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundHistory(100),
+    );
+    return (rows ?? [])
+      .map((row) => (JSON.parse(row.content) as { text?: string }).text ?? '')
+      .filter((text) => /declined|rejected/u.test(text));
+  }
+
+  it('tells the job once, as the principal’s decision, and leaves the card as the principal answered it', async () => {
+    const { approval, session, cards } = await awaitingCard('declined');
+    await handleApprovalsResponse({
+      questionId: approval.approval_id,
+      value: 'reject',
+      userId: 'gchat:users/watch-principal',
+      channelType: 'gchat',
+      platformId: 'spaces/watch-principal',
+      threadId: null,
+    });
+    await deliverWatchNotices();
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect(JSON.parse(notes[0])).toMatchObject({
+      type: 'browser_watch_outcome',
+      watch_id: 'declined',
+      status: 'rejected',
+      message: expect.stringContaining('The principal declined this watch'),
+    });
+    expect(notes[0]).not.toMatch(/admin|browser_watch_setup|appr-/u);
+    expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'declined')).toEqual({
+      status: 'cancelled',
+    });
+    expect(cards.some((card) => card.includes('Withdrawn'))).toBe(false);
+  });
+
+  it('carries the reason the principal gave', async () => {
+    const { approval, session } = await awaitingCard('declined-why');
+    await finalizeReject(approval, session, 'gchat:users/watch-principal', 'too late on a weeknight');
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late on a weeknight"');
   });
 });

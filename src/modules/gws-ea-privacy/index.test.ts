@@ -43,6 +43,7 @@ import {
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { finalizeReject } from '../approvals/finalize.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -357,7 +358,23 @@ describe('removing a private value', () => {
       threadId: null,
     });
     expect(await listPrivateValues()).toHaveLength(1);
-    expect(notes(main).at(-1)).toMatch(/rejected/i);
+    const note = notes(main).at(-1) ?? '';
+    expect(note).toBe(
+      `The principal declined to stop protecting their private address "${HOME_LABEL}". It stays protected.`,
+    );
+    expect(note).not.toMatch(/admin|private_value_remove|appr-/u);
+  });
+
+  it('tells main the reason the principal gave for keeping the value protected', async () => {
+    const id = await addHome();
+    await run('private-values-remove', { id }, agent(main));
+    const [approval] = await pendingApprovals();
+
+    await finalizeReject(approval, main, PRINCIPAL, 'I still need it kept private');
+    expect(await listPrivateValues()).toHaveLength(1);
+    expect(notes(main).at(-1)).toBe(
+      `The principal declined to stop protecting their private address "${HOME_LABEL}": "I still need it kept private". It stays protected.`,
+    );
   });
 
   it('keeps the value when the clicker is no longer the verified principal, though another one is', async () => {

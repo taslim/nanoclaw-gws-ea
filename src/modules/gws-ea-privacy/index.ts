@@ -374,28 +374,39 @@ async function requestRemovalCard(ctx: CallerContext, value: PrivateValue, appro
   } as const;
 }
 
-registerApprovalHandler(REMOVAL_APPROVAL, async ({ session, payload, approval, userId, notify }) => {
-  const id = typeof payload.id === 'string' ? payload.id : '';
-  // The card names its approver; this re-check holds even if the principal
-  // identity changed after the card went out.
-  if (!(await isVerifiedPrincipalUser(userId))) {
-    await notify('The private value was not removed: only the principal can confirm removing one.');
-    return;
-  }
-  const decision = await guard(removePrivateValueAction, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    payload: { id },
-    grant: approval,
-  });
-  if (decision.effect !== 'allow') {
-    await notify(`The private value was not removed: ${decision.reason}`);
-    return;
-  }
-  const removed = await removePrivateValue(id);
-  await notify(
-    `The principal confirmed. Their private ${KIND_NOUNS[removed.kind]} "${removed.label}" is removed and no longer checked.`,
-  );
-});
+registerApprovalHandler(
+  REMOVAL_APPROVAL,
+  async ({ session, payload, approval, userId, notify }) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    // The card names its approver; this re-check holds even if the principal
+    // identity changed after the card went out.
+    if (!(await isVerifiedPrincipalUser(userId))) {
+      await notify('The private value was not removed: only the principal can confirm removing one.');
+      return;
+    }
+    const decision = await guard(removePrivateValueAction, {
+      actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+      payload: { id },
+      grant: approval,
+    });
+    if (decision.effect !== 'allow') {
+      await notify(`The private value was not removed: ${decision.reason}`);
+      return;
+    }
+    const removed = await removePrivateValue(id);
+    await notify(
+      `The principal confirmed. Their private ${KIND_NOUNS[removed.kind]} "${removed.label}" is removed and no longer checked.`,
+    );
+  },
+  {
+    rejectionNote: async (approval, reason) => {
+      const { id } = JSON.parse(approval.payload) as { id?: unknown };
+      const value = typeof id === 'string' ? await getPrivateValue(id) : undefined;
+      const detail = value ? `their private ${KIND_NOUNS[value.kind]} "${value.label}"` : 'that private detail';
+      return `The principal declined to stop protecting ${detail}${reason ? `: "${reason}"` : ''}. It stays protected.`;
+    },
+  },
+);
 
 // ---------------------------------------------------------------------------
 // `ncl private-values list | add | remove` — main's path to the store.

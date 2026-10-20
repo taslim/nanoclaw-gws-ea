@@ -602,18 +602,27 @@ registerApprovalHandler(
       );
     });
   },
-  { restartSafe: true },
+  // A no reaches the job once, as the watch's outcome from the resolved callback below.
+  { restartSafe: true, rejectionNote: () => null },
 );
-registerApprovalResolvedHandler(async ({ approval, outcome }) => {
+registerApprovalResolvedHandler(async ({ approval, outcome, reason }) => {
   if (approval.action !== APPROVAL_ACTION || outcome === 'approve') return;
   const payload = JSON.parse(approval.payload) as { watchId?: string };
-  if (payload.watchId)
-    await getDb().run(
-      "UPDATE gws_ea_browser_watches SET status = ?,updated_at = ? WHERE id = ? AND status = 'awaiting_principal'",
-      outcome === 'expired' ? 'expired' : 'cancelled',
-      new Date().toISOString(),
-      payload.watchId,
-    );
+  if (!payload.watchId) return;
+  // The card already shows its outcome, so the ended watch never withdraws it again.
+  const at = new Date().toISOString();
+  const ended = await getDb().run(
+    "UPDATE gws_ea_browser_watches SET status = ?,approval_finished_at = COALESCE(approval_finished_at, ?),updated_at = ? WHERE id = ? AND status = 'awaiting_principal'",
+    outcome === 'expired' ? 'expired' : 'cancelled',
+    at,
+    at,
+    payload.watchId,
+  );
+  const watch = ended.changes && outcome === 'reject' ? await getBrowserWatch(payload.watchId) : undefined;
+  if (watch)
+    await emitWatchNotice(watch, 'rejected', 'rejected', {
+      message: `The principal declined this watch${reason ? `: "${reason}"` : ''}. It is cancelled and books nothing; report this to main.`,
+    });
 });
 
 export const watchAction: BrowserQueuedAction = {

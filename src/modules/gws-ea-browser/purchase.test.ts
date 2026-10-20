@@ -985,6 +985,20 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         ?.revoked_at,
     ).toBeTruthy();
   });
+  it('tells the job of a declined card once, as the principal’s decision', async () => {
+    await buy();
+    await click((await approvals())[0], 'reject');
+    const told = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+        .filter((text) => /declined|rejected/u.test(text)),
+    );
+    expect(told).toHaveLength(1);
+    expect(told?.[0]).toContain('The principal declined.');
+    expect(told?.[0]).not.toMatch(/admin|browser_purchase\b(?!_outcome)/u);
+    expect(submitted).toBe(0);
+  });
   it('expires a waiting card through native approvals and reports the rejection/expiry once', async () => {
     await buy();
     const [row] = await approvals();

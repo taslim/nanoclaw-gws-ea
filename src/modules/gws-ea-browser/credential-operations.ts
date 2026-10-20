@@ -570,7 +570,17 @@ export function registerCredentialAuthorityDelivery(
   registerApprovalHandler(
     CREDENTIAL_RELEASE_APPROVAL,
     (context) => applyCredentialRelease(context, queue(), dependencies.attempts),
-    { restartSafe: true },
+    {
+      restartSafe: true,
+      rejectionNote: async (approval, reason) => {
+        const { attemptId } = JSON.parse(approval.payload) as { attemptId?: unknown };
+        const attempt = typeof attemptId === 'string' ? await dependencies.attempts.get(attemptId) : undefined;
+        const errand = attempt
+          ? `the ${attempt.kind === 'signup' ? 'account signup' : 'password change'} for "${attempt.username}" on ${attempt.site}`
+          : 'that signup or password change';
+        return `The principal chose to keep waiting on ${errand}${reason ? `: "${reason}"` : ''}. It stays as it is.`;
+      },
+    },
   );
 }
 

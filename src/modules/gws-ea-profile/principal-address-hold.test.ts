@@ -44,6 +44,7 @@ import { setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { finalizeReject } from '../approvals/finalize.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -257,7 +258,22 @@ describe('a new principal address once the inbox exists', () => {
     await click(approval!, 'reject');
     expect(await addresses()).not.toContain(NEW_ADDRESS);
     expect(await pendingApprovals()).toEqual([]);
-    expect(notes(main).at(-1)).toMatch(/rejected/i);
+    const note = notes(main).at(-1) ?? '';
+    expect(note).toBe(
+      `The principal declined to add ${NEW_ADDRESS} as one of their addresses. Mail from it carries no authority of theirs.`,
+    );
+    expect(note).not.toMatch(/admin|principal_address_add|appr-/u);
+  });
+
+  it('tells main the reason the principal gave for keeping an address out', async () => {
+    await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main));
+    const [approval] = await pendingApprovals();
+
+    await finalizeReject(approval!, main, PRINCIPAL, 'that one is my partner’s');
+    expect(await addresses()).not.toContain(NEW_ADDRESS);
+    expect(notes(main).at(-1)).toBe(
+      `The principal declined to add ${NEW_ADDRESS} as one of their addresses: "that one is my partner’s". Mail from it carries no authority of theirs.`,
+    );
   });
 
   it.each([

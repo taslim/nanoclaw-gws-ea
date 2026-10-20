@@ -336,30 +336,40 @@ async function requestAddAddressCard(ctx: CallerContext, email: string, approver
   } as const;
 }
 
-registerApprovalHandler(ADD_ADDRESS_APPROVAL, async ({ session, payload, approval, userId, notify }) => {
-  const email = typeof payload.email === 'string' ? payload.email : '';
-  // The card names its approver; this re-check holds even if the principal
-  // identity changed after the card went out.
-  if (!(await isVerifiedPrincipalUser(userId))) {
-    await notify(`${email} was not added: only the principal can confirm one of their addresses.`);
-    return;
-  }
-  const decision = await guard(addPrincipalAddressAction, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    payload: addAddressPayload(email),
-    grant: approval,
-  });
-  if (decision.effect !== 'allow') {
-    await notify(`${email} was not added: ${decision.reason}`);
-    return;
-  }
-  const { added } = await addPrincipalAddress(email);
-  await notify(
-    added
-      ? `The principal confirmed. ${email} is now one of their addresses.`
-      : `The principal confirmed. ${email} was already one of their addresses.`,
-  );
-});
+registerApprovalHandler(
+  ADD_ADDRESS_APPROVAL,
+  async ({ session, payload, approval, userId, notify }) => {
+    const email = typeof payload.email === 'string' ? payload.email : '';
+    // The card names its approver; this re-check holds even if the principal
+    // identity changed after the card went out.
+    if (!(await isVerifiedPrincipalUser(userId))) {
+      await notify(`${email} was not added: only the principal can confirm one of their addresses.`);
+      return;
+    }
+    const decision = await guard(addPrincipalAddressAction, {
+      actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+      payload: addAddressPayload(email),
+      grant: approval,
+    });
+    if (decision.effect !== 'allow') {
+      await notify(`${email} was not added: ${decision.reason}`);
+      return;
+    }
+    const { added } = await addPrincipalAddress(email);
+    await notify(
+      added
+        ? `The principal confirmed. ${email} is now one of their addresses.`
+        : `The principal confirmed. ${email} was already one of their addresses.`,
+    );
+  },
+  {
+    rejectionNote: (approval, reason) => {
+      const { email } = JSON.parse(approval.payload) as { email?: unknown };
+      const address = typeof email === 'string' ? email : 'that address';
+      return `The principal declined to add ${address} as one of their addresses${reason ? `: "${reason}"` : ''}. Mail from it carries no authority of theirs.`;
+    },
+  },
+);
 
 /**
  * Add an address: directly for the operator, and for main until the inbox

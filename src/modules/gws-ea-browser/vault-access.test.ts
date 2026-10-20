@@ -658,6 +658,11 @@ describe('who may ask, and for whom', () => {
     await click(approval!, 'reject');
     expect(await pendingApprovals()).toEqual([]);
     expect(onePassword.calls).toEqual([]);
+    const declined = notes(main).at(-1) ?? '';
+    expect(declined).toBe(
+      'The principal declined to share the vault with helper@attacker.example.test. Nothing was shared.',
+    );
+    expect(declined).not.toMatch(/admin|browser_vault_email|appr-/u);
   });
 
   it("binds a principal-confirmed alternate 1Password email without changing the principal's addresses", async () => {

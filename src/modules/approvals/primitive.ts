@@ -87,12 +87,31 @@ export interface ApprovalHandlerContext {
 
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
 
+/**
+ * What the requesting agent reads when its request is rejected, given the
+ * rejected row and the approver's reason, if any (already clamped). `null`
+ * writes no note: the module tells the agent itself, from an approval-resolved
+ * callback, which runs before the rejection wakes the agent.
+ */
+export type ApprovalRejectionNote = (
+  approval: PendingApproval,
+  reason: string | undefined,
+) => string | null | Promise<string | null>;
+
 export interface ApprovalHandlerOptions {
   /** The handler is idempotent and may resume an approved row after a host restart. */
   restartSafe?: boolean;
+  /** Words the rejection for this action; without it the agent reads the generic note (finalize.ts). */
+  rejectionNote?: ApprovalRejectionNote;
 }
 
-const approvalHandlers = new Map<string, { handler: ApprovalHandler; restartSafe: boolean }>();
+interface ApprovalHandlerRegistration {
+  handler: ApprovalHandler;
+  restartSafe: boolean;
+  rejectionNote?: ApprovalRejectionNote;
+}
+
+const approvalHandlers = new Map<string, ApprovalHandlerRegistration>();
 
 export function registerApprovalHandler(
   action: string,
@@ -102,11 +121,19 @@ export function registerApprovalHandler(
   if (approvalHandlers.has(action)) {
     log.warn('Approval handler re-registered (overwriting)', { action });
   }
-  approvalHandlers.set(action, { handler, restartSafe: options.restartSafe === true });
+  approvalHandlers.set(action, {
+    handler,
+    restartSafe: options.restartSafe === true,
+    rejectionNote: options.rejectionNote,
+  });
 }
 
 export function getApprovalHandler(action: string): ApprovalHandler | undefined {
   return approvalHandlers.get(action)?.handler;
+}
+
+export function getApprovalRejectionNote(action: string): ApprovalRejectionNote | undefined {
+  return approvalHandlers.get(action)?.rejectionNote;
 }
 
 export function getRegisteredApprovalActions(): readonly string[] {

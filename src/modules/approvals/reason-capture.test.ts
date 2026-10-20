@@ -336,3 +336,74 @@ describe('plain reject (regression)', () => {
     expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin.');
   });
 });
+
+describe('a rejection worded by its module', () => {
+  async function rejectPlainly(approvalId: string): Promise<void> {
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    await handleApprovalsResponse({
+      questionId: approvalId,
+      value: 'reject',
+      userId: 'admin-1',
+      channelType: DM_CHANNEL,
+      platformId: '',
+      threadId: null,
+    });
+  }
+
+  it('relays the registered note in place of the generic text, with the reason it was given', async () => {
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { captureReasonReply } = await import('./reason-capture.js');
+    const seen: Array<{ action: string; reason: string | undefined }> = [];
+    registerApprovalHandler('worded_reject', async () => undefined, {
+      rejectionNote: (approval, reason) => {
+        seen.push({ action: approval.action, reason });
+        return reason ? `The principal said no to the trip: "${reason}"` : 'The principal said no to the trip.';
+      },
+    });
+
+    await seedApproval('appr-worded', 'worded_reject');
+    await rejectPlainly('appr-worded');
+    expect(lastRelayedText()).toBe('The principal said no to the trip.');
+
+    await seedApproval('appr-worded-reason', 'worded_reject');
+    await clickRejectWithReason('appr-worded-reason');
+    await captureReasonReply(dmReply('not this month'));
+    expect(lastRelayedText()).toBe('The principal said no to the trip: "not this month"');
+    expect(seen).toEqual([
+      { action: 'worded_reject', reason: undefined },
+      { action: 'worded_reject', reason: 'not this month' },
+    ]);
+  });
+
+  it('writes no note when the module tells the agent itself, and its notice is in the inbox before the wake', async () => {
+    const { notifyAgent, registerApprovalHandler, registerApprovalResolvedHandler } = await import('./primitive.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    registerApprovalHandler('self_told_reject', async () => undefined, { rejectionNote: () => null });
+    registerApprovalResolvedHandler(async ({ approval, session, outcome }) => {
+      if (approval.action === 'self_told_reject' && outcome === 'reject')
+        await notifyAgent(session, 'The principal declined the booking.');
+    });
+
+    await seedApproval('appr-self-told', 'self_told_reject');
+    await rejectPlainly('appr-self-told');
+
+    const written = vi.mocked(writeSessionMessage).mock;
+    expect(written.calls.map((call) => (JSON.parse(call[2].content) as { text: string }).text)).toEqual([
+      'The principal declined the booking.',
+    ]);
+    const wakes = vi.mocked(wakeContainer).mock;
+    expect(wakes.calls.length).toBeGreaterThan(0);
+    expect(written.invocationCallOrder[0]).toBeLessThan(wakes.invocationCallOrder.at(-1)!);
+    expect(await getPendingApproval('appr-self-told')).toBeUndefined();
+  });
+
+  it('keeps the generic text for an action registered without a note', async () => {
+    const { registerApprovalHandler } = await import('./primitive.js');
+    registerApprovalHandler('unworded_reject', async () => undefined, { restartSafe: true });
+
+    await seedApproval('appr-unworded', 'unworded_reject');
+    await rejectPlainly('appr-unworded');
+
+    expect(lastRelayedText()).toBe('Your unworded_reject request was rejected by admin.');
+  });
+});

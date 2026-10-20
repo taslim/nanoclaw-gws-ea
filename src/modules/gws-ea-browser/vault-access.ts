@@ -446,7 +446,14 @@ export function registerVaultAccessDelivery(dependencies: VaultAccessDependencie
       }
       await notify(confirmedNote(email, await oneAtATime(() => shareVault(email, dependencies))));
     },
-    // Sharing reads access before any grant, so resuming an approved row after a restart is safe.
-    { restartSafe: true },
+    {
+      // Sharing reads access before any grant, so resuming an approved row after a restart is safe.
+      restartSafe: true,
+      rejectionNote: (approval, reason) => {
+        const { email } = JSON.parse(approval.payload) as { email?: unknown };
+        const recipient = typeof email === 'string' ? email : 'that email';
+        return `The principal declined to share the vault with ${recipient}${reason ? `: "${reason}"` : ''}. Nothing was shared.`;
+      },
+    },
   );
 }

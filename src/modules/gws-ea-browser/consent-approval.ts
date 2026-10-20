@@ -236,7 +236,8 @@ registerApprovalHandler(
     });
     if (approved) await notifyConsentOutcome(stop, 'approved');
   },
-  { restartSafe: true },
+  // A no reaches the job once, from the resolved callback below.
+  { restartSafe: true, rejectionNote: () => null },
 );
 
 registerApprovalResolvedHandler(async ({ approval, outcome }) => {

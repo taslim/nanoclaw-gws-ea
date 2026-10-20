@@ -482,7 +482,8 @@ registerApprovalHandler(
     // Acceptance is quick and never awaits a browser operation. Early host replay persists only.
     if (authorityId && commitsReady && getPurchaseQueue) await enqueuePurchaseCommit(getPurchaseQueue(), authorityId);
   },
-  { restartSafe: true },
+  // A no reaches the job once, as the card's outcome from the resolved callback below.
+  { restartSafe: true, rejectionNote: () => null },
 );
 
 registerApprovalResolvedHandler(async ({ approval, outcome }) => {

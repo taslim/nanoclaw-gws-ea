@@ -222,8 +222,31 @@ registerApprovalHandler(
       );
     });
   },
-  { restartSafe: true },
+  { restartSafe: true, rejectionNote: guaranteeRejectionNote },
 );
+/**
+ * What the agent that proposed a standing guarantee reads when the principal declines it: their decision, with
+ * any reason they gave, and what still holds, since an earlier guarantee stays until a newer one is approved.
+ */
+async function guaranteeRejectionNote(approval: PendingApproval, reason: string | undefined): Promise<string> {
+  const { proposalId } = JSON.parse(approval.payload) as { proposalId?: unknown };
+  const proposal =
+    typeof proposalId === 'string'
+      ? await getDb().get<GuaranteeProposal>(
+          'SELECT * FROM gws_ea_browser_guarantee_proposals WHERE id = ?',
+          proposalId,
+        )
+      : undefined;
+  const current = await getDb().get<StandingGuarantee>(
+    'SELECT * FROM gws_ea_browser_reservation_guarantees WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',
+  );
+  const limit = (grant: Pick<StandingGuarantee, 'currency' | 'max_total_minor'>) =>
+    `${formatMoney(grant.max_total_minor, grant.currency)} (${grant.currency})`;
+  const declined = `The principal declined to allow reservation guarantees${proposal ? ` of up to ${limit(proposal)}` : ''}${reason ? `: "${reason}"` : ''}.`;
+  return current
+    ? `${declined} The guarantee they already allow, up to ${limit(current)}, stays as it is.`
+    : `${declined} A reservation with a cancellation or no-show fee still goes to them on its own card.`;
+}
 registerApprovalResolvedHandler(async ({ approval, outcome }) => {
   if (approval.action !== GUARANTEE_APPROVAL || outcome === 'approve') return;
   const payload = JSON.parse(approval.payload) as { proposalId?: string };
