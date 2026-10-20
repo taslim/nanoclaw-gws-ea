@@ -750,19 +750,16 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
   });
 
-  /** A signup whose filled form waits on the principal's card for a wording on the site (KTD11). */
-  async function heldForConsent(): Promise<{ id: string; approvalId: string }> {
-    const id = await disclosedSignup();
-    await attempts.markAwaitingConsent(id, { signal: 'consent', held: true });
-    await holdSite();
+  const WAIVER = 'I have read and accept the liability waiver';
+  /** A stop of this job's consent pass for one wording, recorded under the page's site, its card out to the principal. */
+  async function consentCard(
+    site: string,
+    wording: string,
+    fingerprint: string,
+  ): Promise<{ stopId: string; approvalId: string }> {
     const [stop] = await recordConsentStops(
       { jobId: job.thread_id!, db: getDb() },
-      {
-        site: 'shop.example',
-        origin: ORIGIN,
-        fingerprint: 'join-form',
-        items: [{ id: 0, wording: 'I have read and accept the liability waiver', kind: 'agreement' }],
-      },
+      { site, origin: ORIGIN, fingerprint, items: [{ id: 0, wording, kind: 'agreement' }] },
     );
     await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'requested' WHERE id = ?", stop.stop_id);
     const approvalId = await requestApproval({
@@ -770,28 +767,36 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       agentName: 'browser',
       action: CONSENT_APPROVAL,
       payload: { stopId: stop.stop_id, jobId: job.thread_id },
-      title: 'Agree to this on shop.example?',
-      question: 'shop.example asks me to agree to this: "I have read and accept the liability waiver"',
+      title: `Agree to this on ${site}?`,
+      question: `${site} asks me to agree to this: "${wording}"`,
       approverUserId: PRINCIPAL,
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
-    if (!approvalId) throw new Error('No consent card');
+    if (!approvalId || !stop.stop_id) throw new Error('No consent card');
+    return { stopId: stop.stop_id, approvalId };
+  }
+  /** A signup whose filled form waits on the principal's card for a wording on the page's site (KTD11). */
+  async function heldForConsent(site = 'shop.example'): Promise<{ id: string; approvalId: string }> {
+    const id = await disclosedSignup();
+    await holdSite();
+    const { stopId, approvalId } = await consentCard(site, WAIVER, 'join-form');
+    expect(await attempts.markAwaitingConsent(id, { signal: 'consent' }, [stopId])).toMatchObject({
+      phase: 'awaiting_consent',
+    });
     return { id, approvalId };
   }
+  const decline = (approvalId: string) =>
+    handleApprovalsResponse({
+      questionId: approvalId,
+      value: 'reject',
+      userId: PRINCIPAL,
+      channelType: DM.channelType,
+      platformId: DM.platformId,
+      threadId: null,
+    });
 
   it.each([
-    [
-      'declines',
-      async (approvalId: string) =>
-        handleApprovalsResponse({
-          questionId: approvalId,
-          value: 'reject',
-          userId: PRINCIPAL,
-          channelType: DM.channelType,
-          platformId: DM.platformId,
-          threadId: null,
-        }),
-    ],
+    ['declines', decline],
     [
       'lets lapse',
       async () => {
@@ -819,6 +824,50 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       expect(await lease()).toBeUndefined();
     },
   );
+
+  it('ends a hold when its card is declined though its form sits in a page from another site', async () => {
+    // A signup form another site embeds: the stop names the page's site, the attempt its own form's.
+    const { id, approvalId } = await heldForConsent('parent.example');
+    await decline(approvalId);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+  });
+
+  it('keeps a hold whose own stop the principal approved when they decline another stop on the site', async () => {
+    const id = await disclosedSignup();
+    await holdSite();
+    const [own] = await recordConsentStops(
+      { jobId: job.thread_id!, db: getDb() },
+      {
+        site: 'shop.example',
+        origin: ORIGIN,
+        fingerprint: 'join-form',
+        items: [{ id: 0, wording: WAIVER, kind: 'agreement' }],
+      },
+    );
+    await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'approved' WHERE id = ?", own.stop_id);
+    await attempts.markAwaitingConsent(id, { signal: 'consent' }, [own.stop_id!]);
+    const other = await consentCard('shop.example', 'I agree to share my details with travel partners', 'offers-form');
+    await decline(other.approvalId);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_consent' });
+    expect(await release(id)).toEqual({ status: 'not_releasable' });
+  });
+
+  it('warns of a second account once a held signup is filled again after the grant and its outcome is unknown', async () => {
+    const { id } = await heldForConsent();
+    // The fill after the grant: the same authority discloses its candidate again, and the control runs.
+    expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toMatchObject({
+      status: 'disclosed',
+    });
+    await attempts.markAwaitingVerification(id);
+    await attempts.markUnknown(id);
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
+    expect(question).toContain(
+      `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the account was created.`,
+    );
+    expect(question).toContain('Trying again could create a second account.');
+  });
 
   it('ends a held signup as unknown when its job is cancelled, keeping the site for the release', async () => {
     const { id } = await heldForConsent();

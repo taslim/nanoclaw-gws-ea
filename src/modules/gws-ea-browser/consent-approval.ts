@@ -4,7 +4,7 @@
  * stop's id, and the principal approves or rejects it on a card showing the site and the exact wording. An
  * approval stands for that wording on that site and frame origin until the wording changes, which stops
  * again, or the principal withdraws it through main. A rejection leaves the box unticked, and the job is told; a
- * credential form held for the wording is left unknown, never filled again.
+ * credential form held for that stop is left unknown, never filled again.
  */
 import { getDomain } from 'tldts';
 
@@ -166,12 +166,13 @@ export async function executeConsentRequest(
 }
 
 /**
- * A credential form held for a stop of this job's site will not be agreed to now: its attempt is unknown, which
- * the job's reconcile or the principal's release settles (KTD11).
+ * A credential form held for this stop will not be agreed to now: its attempt is unknown, which the job's
+ * reconcile or the principal's release settles (KTD11). The attempt names its own stops, since a form framed by
+ * another site's page is held under its own site while the stop names the page's.
  */
 async function endHeldCredentialForms(stop: ConsentStop): Promise<void> {
   if (await getDb().hasTable('gws_ea_browser_credential_attempts'))
-    await credentialAttempts.endConsentHolds(stop.job_id, stop.site);
+    await credentialAttempts.endConsentHolds(stop.job_id, stop.id);
 }
 
 const OUTCOME_MESSAGES = {

@@ -991,10 +991,14 @@ async function bindGroup(
   };
 }
 
-/** A submission the consent engine stopped, and whether it stopped on its first read, before setting any choice. */
+/**
+ * A submission the consent engine stopped, whether it stopped on its first read, before setting any choice,
+ * and the stops it recorded, whose cards a held attempt waits on.
+ */
 interface ConsentStopped {
   readonly outcome: Outcome;
   readonly firstRead: boolean;
+  readonly stops: readonly string[];
 }
 
 /**
@@ -1017,10 +1021,11 @@ async function consentStop(
       return {
         outcome: { ...refused('consent_required'), consent: consentStopsForAgent(consent.stops) },
         firstRead: !consent.hostChanged,
+        stops: consent.stops.flatMap((stop) => (stop.stop_id === null ? [] : [stop.stop_id])),
       };
     // No grant clears an extra the site keeps, so a stop for one is never held.
     case 'add_on':
-      return { outcome: refused('purchase_control'), firstRead: false };
+      return { outcome: refused('purchase_control'), firstRead: false, stops: [] };
   }
 }
 
@@ -1469,8 +1474,8 @@ async function disclosingStep(
     if (stopped) {
       if (stopped.firstRead && !navigated) {
         try {
-          await attempts.markAwaitingConsent(saved.id, { ...evidence('consent', filled, 'none'), held: true });
-          return stopped.outcome;
+          if (await attempts.markAwaitingConsent(saved.id, evidence('consent', filled, 'none'), stopped.stops))
+            return stopped.outcome;
         } catch (error) {
           if (!(error instanceof CredentialAttemptError)) throw error;
         }

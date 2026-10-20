@@ -290,7 +290,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
           }
           if (host === 'parent.example')
             html(
-              `<input id="untrusted" aria-label="Untrusted"><iframe src="${SITE}${path === '/get' ? '/get-signup' : '/native-signup'}"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
+              `<input id="untrusted" aria-label="Untrusted"><iframe src="${SITE}${({ '/get': '/get-signup', '/waiver': '/waiver-on-fill' } as Record<string, string>)[path] ?? '/native-signup'}"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
             );
           else html(PAGES[path] ?? '<h1>Not found</h1>');
           return;
@@ -1069,6 +1069,22 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       // One candidate, one disclosure's value, and no answer that carries it.
       expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
       expect(JSON.stringify([held, done])).not.toContain(password);
+    }, 30_000);
+
+    it('holds a form framed by a page from another site against its own stop, which names the page', async () => {
+      await page.goto('https://parent.example/waiver');
+      const authority = await signupAuthority();
+      expect(await fill(authority, await refs(SIGNUP))).toMatchObject({
+        status: 'refused',
+        reason: 'consent_required',
+      });
+      const [stop] = await stops();
+      expect(stop).toMatchObject({ site: 'parent.example', origin: SITE });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'awaiting_consent', site: 'shop.example' });
+      // The principal's no on that stop's card is what ends the hold.
+      expect(await attempts.endConsentHolds(JOB, stop.id)).toEqual([authority.id]);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      expect(posts).toEqual([]);
     }, 30_000);
 
     it('keeps the hold across a host restart, and completes after the grant', async () => {
