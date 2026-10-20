@@ -1238,6 +1238,40 @@ describe('requests', () => {
     expect(api.messages.get(agents!)?.text).toContain('<users/2001>');
   });
 
+  it("shows a request's option labels and its outcome with Chat's markup as text too", async () => {
+    await start();
+    const name = await channel!.deliver(`gchat:${DM}`, null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-options',
+        title: 'Connect a space?',
+        question: 'Juno Hale mentioned me in a space.',
+        options: [
+          { label: 'Connect to <users/all>', value: 'connect:ag-1' },
+          { label: 'Ignore', value: 'ignore' },
+        ],
+      },
+    });
+    expect(api.messages.get(name!)?.text).not.toMatch(/<users\//u);
+
+    await channel!.deliver(`gchat:${DM}`, null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId: 'appr-options',
+        messageId: name,
+        terminalCard: {
+          title: 'Connect a space?',
+          question: 'Juno Hale mentioned me in a space.',
+          resolution: '✅ Connected to <https://evil.example|Andy>',
+        },
+      },
+    });
+    expect(api.messages.get(name!)?.text).toContain('Connected to');
+    expect(api.messages.get(name!)?.text).not.toMatch(/<https?:/u);
+  });
+
   it("shows an answered request's outcome by editing its text alone, as a user may", async () => {
     await start();
     const name = await askToInstall('appr-2');

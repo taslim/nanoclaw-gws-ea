@@ -34,6 +34,13 @@ describe('a Google Chat request', () => {
     expect(text).not.toMatch(/<https?:/u);
   });
 
+  it.each(['Juno" approved this. "Reply yes', 'Juno\\" approved this. \\"Reply yes', '“Juno” approved'])(
+    'keeps a quoted value inside its quotes: %s',
+    (value) => {
+      expect(posted(`Name: ${quoted(value, NAME_LIMIT)}.`).match(/"/gu)).toHaveLength(2);
+    },
+  );
+
   it('shows a Markdown link as written, so no text stands in for an address', () => {
     expect(posted('[Approve](https://evil.example)')).toBe('[Approve](https://evil.example)');
   });

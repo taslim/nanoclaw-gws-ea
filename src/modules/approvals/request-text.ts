@@ -23,12 +23,14 @@ const BREAKS = /[\s\p{Cc}\p{Zl}\p{Zp}]+/gu;
 
 /**
  * Someone else's text as a request shows it: on one line, at most `limit`
- * characters, as `quoteForCard` quotes it: in double quotes it cannot close,
- * with invisible and direction characters shown as \uXXXX escapes and no
- * character reference or Markdown link left to decode.
+ * characters, as `quoteForCard` quotes it, with invisible and direction
+ * characters shown as \uXXXX escapes and no character reference or Markdown
+ * link left to decode. Its own double quotes become single ones first:
+ * Markdown, which a text request is posted as, turns the escaped quote back
+ * into one that would close the quotes around it.
  */
 export function quoted(text: string, limit: number): string {
-  return quoteForCard(cap(text.replace(BREAKS, ' ').trim(), limit));
+  return quoteForCard(cap(text.replace(BREAKS, ' ').trim(), limit).replace(/["“”]/gu, "'"));
 }
 
 /** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted; `unknown` with neither. */

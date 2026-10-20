@@ -1500,8 +1500,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         if (textRequests) {
           // One message, so a quote or reaction answering it maps to the request.
           const asked = typeof question === 'string' ? question : '';
+          // Every word of it shown, the options' labels too; answers match the stored options.
+          const shown = options.map((option) => ({ ...option, label: escape(option.label) }));
           const posted = await postWithPictures(tid, pictures, (missing) => ({
-            markdown: transformText(textRequest(title, escape(asked), options, missing)),
+            markdown: transformText(textRequest(escape(title), escape(asked), shown, missing)),
           }));
           return rememberRequest(platformId, questionId, posted);
         }

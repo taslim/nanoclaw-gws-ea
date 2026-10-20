@@ -377,7 +377,7 @@ describe('an answer on a channel that left the request as posted', () => {
     await handleApprovalsResponse(answer('reject', 'users/2001', 'too expensive, ask <users/all> "first" *today*'));
 
     // How quoted text reads is request-text.test.ts's; here, that the outcome shows the reason that way.
-    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "too expensive, ask <users/all> \\"first\\" *today*"`)]);
+    expect(edits).toEqual([outcomeEdit(`❌ Rejected: "too expensive, ask <users/all> 'first' *today*"`)]);
     expect(agentNotes()).toEqual([
       'Your install_packages_text request was rejected by admin: "too expensive, ask <users/all> "first" *today*"',
     ]);
