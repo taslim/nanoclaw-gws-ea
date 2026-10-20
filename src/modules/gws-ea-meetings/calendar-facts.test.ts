@@ -55,6 +55,7 @@ import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
+import { GoogleGrantRevokedError, GoogleScopeNotGrantedError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import type { DetailedAttendee } from './calendar-api.js';
 import { findPrincipalCalendarConflicts, type Conflict, type PersonStats } from './calendar-facts.js';
@@ -433,6 +434,25 @@ describe('find_conflicts', () => {
     expect(refusal(await send(main, 'find_conflicts', { start: at('10:00'), end: at('11:00') }))).toMatch(
       /could not do it: Google refused the HOME calendar/u,
     );
+  });
+
+  it.each([
+    [
+      'Google no longer accepts the sign-in',
+      new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again"),
+    ],
+    ['the sign-in never granted the calendar', new GoogleScopeNotGrantedError('calendar-host')],
+  ])('tells main the operator reconnects Google when %s, and what to do meanwhile', async (_label, error) => {
+    calendar.failure = error;
+    for (const [action, fields] of [
+      ['find_conflicts', { start: at('10:00'), end: at('11:00') }],
+      ['people_stats', { people: [ALICE] }],
+    ] as const) {
+      expect(refusal(await send(main, action, fields)), action).toBe(
+        "Your Google connection isn't working right now, and reconnecting it is the operator's job. Tell the principal in a line what you can't do, and carry on with the rest.",
+      );
+    }
+    calendar.failure = undefined;
   });
 
   it("says when none of the calendars it sees is the principal's, rather than calling a time free", async () => {

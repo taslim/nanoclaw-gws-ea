@@ -66,7 +66,7 @@ import { probeLink, ProbeUnavailableError, type ProbeTarget, type ProbeVerdict }
 export const LINK_ACCESS_REFUSER = 'gws-ea-workspace:link-access';
 
 /** What an answering action answers when Google was too briefly unavailable to check its links. */
-export const LINKS_UNCHECKED = "I couldn't check the links in it just now; try again shortly.";
+export const LINKS_UNCHECKED = "the host couldn't check the links in it just now; try again shortly.";
 
 /** Who wrote a message, so its refusal speaks to them. */
 export type LinkWriter = 'main' | 'external-email';

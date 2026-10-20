@@ -23,8 +23,10 @@
  * What a thread booked lives in the inbox's thread map (`thread-calendar.ts`);
  * this module has no tables of its own.
  */
-import { answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
+import { answeredGuard, answeringAction, forbidden, type ActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
+import { log } from '../../log.js';
+import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarFactTools } from './calendar-facts.js';
@@ -37,6 +39,28 @@ let calendar: MeetingsCalendarApi | undefined;
 const calendarApi = (): MeetingsCalendarApi =>
   (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
 
+/**
+ * An answer whose Google connection only the operator can restore tells
+ * its agent so, and what to do meanwhile (R25): the error's own words, which
+ * name the service and the remedy, go to the host log.
+ */
+function withConnectionStep(action: string, answer: ActionAnswer, nextStep: string): ActionAnswer {
+  return async (content, session, requestId) => {
+    try {
+      return await answer(content, session, requestId);
+    } catch (error) {
+      if (!isGoogleConnectionDown(error)) throw error;
+      log.error('A calendar tool found the Google connection down', { action, sessionId: session.id, err: error });
+      throw forbidden(`${GOOGLE_CONNECTION_DOWN} ${nextStep}`);
+    }
+  };
+}
+
+/** What external-email does meanwhile: main tells the principal. */
+const EXTERNAL_EMAIL_STEP = "Wake main with tell_main, saying what you couldn't do on this thread, and wait for main.";
+/** What main does meanwhile, as its guidance has it for any account of its own that stops working. */
+const MAIN_STEP = "Tell the principal in a line what you can't do, and carry on with the rest.";
+
 const scheduling = createSchedulingTools({ calendar: calendarApi });
 
 /** external-email's scheduling tools, by action name; each acts on the calling thread alone. */
@@ -48,7 +72,11 @@ const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, ActionAnswer]> = [
 ];
 
 for (const [action, answer] of SCHEDULING_REQUESTS) {
-  registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(threadCalendarAction));
+  registerDeliveryAction(
+    action,
+    answeringAction(action, withConnectionStep(action, answer, EXTERNAL_EMAIL_STEP)),
+    answeredGuard(threadCalendarAction),
+  );
 }
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });
@@ -61,7 +89,11 @@ for (const [action, answer] of [
   ['find_conflicts', facts.findConflicts],
   ['people_stats', facts.peopleStats],
 ] as const) {
-  registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(principalEventAction));
+  registerDeliveryAction(
+    action,
+    answeringAction(action, withConnectionStep(action, answer, MAIN_STEP)),
+    answeredGuard(principalEventAction),
+  );
 }
 
 export { createMeetingsCalendarApi, type CalendarEvent, type MeetingsCalendarApi } from './calendar-api.js';

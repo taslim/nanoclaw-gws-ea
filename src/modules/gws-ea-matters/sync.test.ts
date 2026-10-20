@@ -135,6 +135,8 @@ describe('the daily sync', () => {
     expect(sync).toMatchObject({ status: 'pending', recurrence: '0 7 * * *' });
     expect(localClock(sync.process_after)).toBe('7:00 AM');
     expect(taskContent(sync).script).toBe('ncl matters sync');
+    // What needs the principal reaches them as one message for their morning.
+    expect(taskContent(sync).prompt).toContain('what needs them as one message, timed for their morning');
     // The next pass keeps the same series.
     await keepMattersOnTime();
     expect(await syncs()).toEqual([sync]);

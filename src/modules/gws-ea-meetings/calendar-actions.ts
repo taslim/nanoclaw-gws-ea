@@ -27,7 +27,7 @@ import { principalMatchKey } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
-import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
+import { audienceForAddresses, checkOutbound, privateKindNoun } from '../gws-ea-privacy/index.js';
 import {
   checkLinksOpenable,
   LinkCheckUnavailableError,
@@ -121,7 +121,7 @@ export async function assertInvitationShareable(
   );
   if (!check.allowed) {
     throw forbidden(
-      `${refused}: as its guests would see it, the invitation carries one of the principal's private details (${check.kind}). ${advice}`,
+      `${refused}: as its guests would see it, the invitation carries the principal's private ${privateKindNoun(check.kind)}. ${advice}`,
     );
   }
   const links = await checkLinksOpenable({

@@ -29,7 +29,7 @@ import {
 } from './grant.js';
 import { googleGrantFilePath, readGoogleGrantFile } from './grant-file.js';
 import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER } from './refresher.js';
-import { createHostTokenSource, type HostTokenSource } from './tokens.js';
+import { createHostTokenSource, GoogleNotSignedInError, type HostTokenSource } from './tokens.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 
 /** How often the host checks whether a token needs renewing. */
@@ -174,7 +174,9 @@ onHostStart(async ({ signal }) => {
  * `GoogleScopeNotGrantedError` without asking Google.
  */
 export function hostGoogleAccessToken(service: HostGoogleServiceId): Promise<string> {
-  if (!hostTokens) return Promise.reject(new Error('Google access is off on this host: it has no Google sign-in'));
+  if (!hostTokens) {
+    return Promise.reject(new GoogleNotSignedInError('Google access is off on this host: it has no Google sign-in'));
+  }
   return hostTokens.accessToken(service);
 }
 

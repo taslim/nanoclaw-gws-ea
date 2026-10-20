@@ -85,7 +85,7 @@ async function createSync(conversation: Session, recurrence: string, timezone: s
   const prepared = prepareScheduledTask({
     name: SYNC_TASK_NAME,
     prompt:
-      "Your daily sync: what has waited for you since your last turn comes with this. Act on it as you would on any note; the principal hears only what can't wait for them.",
+      'Your daily sync: what has waited for you since your last turn comes with this. Act on it as you would on any note, and give the principal what needs them as one message, timed for their morning.',
     script: 'ncl matters sync',
     recurrence,
     timezone,
@@ -209,7 +209,8 @@ async function looksBefore(before: string): Promise<DueLook[]> {
  * Today as matters hold it, from the host's own records alone: today's
  * looks, by time and title, the matters the host handed back for lack of a
  * look (R14), and the threads still waiting to be placed (R27). It always
- * wakes main: it is the script of a rundown the principal asked for.
+ * wakes main: it runs as the script of a rundown the principal asked for,
+ * main's own list to fold into a rundown built from their calendar.
  */
 export async function todayVerdict(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();

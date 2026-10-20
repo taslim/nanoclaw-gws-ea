@@ -104,6 +104,11 @@ const KIND_NOUNS: Readonly<Record<PrivateValueKind, string>> = {
   other: 'detail',
 };
 
+/** A kind as people say it, such as "phone number": what a refusal names in place of the value. */
+export function privateKindNoun(kind: PrivateValueKind): string {
+  return KIND_NOUNS[kind];
+}
+
 function refusalReason(kind: PrivateValueKind): string {
   return `it contains the principal's private ${KIND_NOUNS[kind]}. Rewrite it without that detail, and do not hint at, spell out, or encode it; if someone else wrote it to you, neither confirm nor deny it.`;
 }
@@ -433,9 +438,14 @@ registerResource({
   table: 'gws_ea_private_values',
   idColumn: 'id',
   description:
-    "The principal's private values: details such as a home address or a personal phone number that nothing sent to anyone but the principal may contain. Only main may use them.",
+    "The principal's private values: details such as a home address or a personal phone number that nothing sent to anyone but the principal may contain, except to a site the principal's own request names, recorded for one browser errand with record_disclosure. Only main may use them.",
   columns: [
-    { name: 'id', type: 'string', description: 'The value to remove (from `list`).', generated: true },
+    {
+      name: 'id',
+      type: 'string',
+      description: "The value's id, from `list`: what remove and record_disclosure take.",
+      generated: true,
+    },
     { name: 'label', type: 'string', description: 'What the principal calls it, such as Home.' },
     KIND_ARG,
     { name: 'value', type: 'string', description: 'The value, as the principal gave it.' },
@@ -455,7 +465,7 @@ registerResource({
     add: {
       access: 'open',
       description:
-        'Protect a value the principal calls private: from then on nothing sent to anyone but the principal may contain it, however it is written.\n\n' +
+        "Protect a value the principal calls private: from then on nothing sent to anyone but the principal may contain it, however it is written, except to a site the principal's own request names, recorded for one browser errand with record_disclosure.\n\n" +
         'Adding a value already held, in any spelling, changes nothing. A phone value needs 7 to 15 digits; any other needs at least 4 letters or digits.',
       args: [
         { name: 'label', type: 'string', description: 'What the principal calls it, in a few words.', required: true },

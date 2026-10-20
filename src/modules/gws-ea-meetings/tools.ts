@@ -140,6 +140,13 @@ const WAIT_FOR_MAIN = 'wake main with tell_main and wait for its answer';
  */
 const PRIVATE_DETAIL_ADVICE = `Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, ${WAIT_FOR_MAIN}.`;
 
+/**
+ * What a booking's answer says of main: the host tells main of each booking,
+ * change and cancellation, so no wake is needed, and external-email still
+ * ends its turn with its account of the thread.
+ */
+const MAIN_IS_TOLD = 'The host tells main of it, so no wake is needed; still leave your account with tell_main.';
+
 /** What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13). */
 const ASK_FOR_CALENDAR = 'wake main with tell_main to ask which calendar to book on';
 /**
@@ -649,7 +656,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       end: iso(span.end),
       message:
         `Booked: ${bothZones(span, timezone, theirs)}. Google sends ${invitees.join(', ')} the invitation from the principal's calendar` +
-        `${conferenceWords(conference)}. main hears of it. To change or cancel it, give booking ${eventId}.`,
+        `${conferenceWords(conference)}. ${MAIN_IS_TOLD} To change or cancel it, give booking ${eventId}.`,
     };
   };
 
@@ -776,7 +783,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       end: iso(span.end),
       message:
         `Changed: ${bothZones(span, timezone, theirs)}${conferenceWords(conference)}. ` +
-        'Google sends the invitees the update, and main hears of it.',
+        `Google sends the invitees the update. ${MAIN_IS_TOLD}`,
     };
   };
 
@@ -792,7 +799,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     await deleteThreadBooking(booking.calendarId, booking.eventId);
     return {
       booking: booking.eventId,
-      message: `Cancelled: ${bothZones(span, timezone, theirs)}. Google sends the invitees the cancellation, and main hears of it.`,
+      message: `Cancelled: ${bothZones(span, timezone, theirs)}. Google sends the invitees the cancellation. ${MAIN_IS_TOLD}`,
     };
   };
 

@@ -123,6 +123,7 @@ describe("a matter's next look", () => {
     const content = taskContent(look);
     expect(content.script).toBe(`ncl matters look ${acme.id}`);
     expect(content.prompt).toContain(acme.id);
+    expect(content.prompt).toContain('Act on it, then set its next look or close it.');
     // The title comes from the live render, never from the task.
     expect(content.prompt).not.toContain('Acme');
     // A turn of main's conversation, never a task session of its own.

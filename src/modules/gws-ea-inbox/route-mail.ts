@@ -361,17 +361,17 @@ async function senderRecord(
   return person === undefined ? undefined : { level: person.level, name: person.name };
 }
 
-/** A level as main's guidance speaks of one, in a clause about the sender. */
+/** A level as the relationship it stands for, in a clause about the sender: never the level's own name. */
 function levelClause(level: PersonLevel, principal: string): string {
   switch (level) {
     case 'inner-circle':
-      return `who is in ${principal}'s inner circle`;
+      return `who is one of the people closest to ${principal}`;
     case 'close':
       return `who is close to ${principal}`;
     case 'active':
-      return `who is one of ${principal}'s active contacts`;
+      return `whom ${principal} deals with regularly`;
     case 'known':
-      return `who is one of ${principal}'s known contacts`;
+      return `whom ${principal} knows`;
     default: {
       const unreachable: never = level;
       throw new Error(`Unknown level: ${String(unreachable)}`);

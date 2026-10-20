@@ -16,7 +16,9 @@
  *
  * Every link is read at once with the others, under its own five-second
  * deadline, as the link check's Drive reads are. One that fails or is late
- * renders "couldn't read just now", and the rest render all the same.
+ * renders "couldn't read just now", or that the Google connection is the
+ * operator's to restore when only a new sign-in would help, and the rest
+ * render all the same.
  *
  * The host's own words name someone only from what Google and the people
  * store say of an address: the principal and the assistant as themselves,
@@ -27,6 +29,7 @@
  */
 import { log } from '../../log.js';
 import { formatLocalTime } from '../../timezone.js';
+import { isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createGmailApi, GoogleApiError, type GmailApi } from '../gws-ea-inbox/gmail-api.js';
 import {
@@ -64,6 +67,9 @@ import type { LinkRef, MatterLink } from './db.js';
 /** How long one read may take before its link renders as unread. */
 export const READ_DEADLINE_MS = 5_000;
 const UNREAD = "couldn't read just now";
+/** A read only the operator's new Google sign-in would let through, in main's terms (R25). */
+const NO_CONNECTION =
+  "couldn't read: your Google connection isn't working right now, and reconnecting it is the operator's job";
 const FORGOTTEN = 'someone forgotten';
 const FRAME_LIMIT = 1_200;
 /** The guests an answer names before it counts the rest. */
@@ -135,6 +141,11 @@ async function who(value: string, lens: Lens): Promise<string> {
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** What a failed read renders as: the operator's to fix, or worth reading again later. */
+function unread(error: unknown): string {
+  return isGoogleConnectionDown(error) ? NO_CONNECTION : UNREAD;
 }
 
 type Read<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
@@ -308,14 +319,14 @@ async function fileState(fileId: string, drive: LiveSources['drive'], lens: Lens
     within(`file ${fileId}`, () => drive.getFile(fileId)),
     within(`comments on file ${fileId}`, () => commentsOn(fileId, drive)),
   ]);
-  if (!read.ok) return { line: UNREAD };
+  if (!read.ok) return { line: unread(read.error) };
   const file = read.value;
   if (file === undefined) return { line: 'gone, or not shared with the assistant' };
 
   const parts = [...(file.trashed === true ? ['in the trash'] : []), ...(await changed(file, lens))];
   const open = comments.ok && comments.value !== undefined ? forAssistant(comments.value, lens.assistant) : [];
   if (!comments.ok) {
-    parts.push(`comments: ${UNREAD}`);
+    parts.push(`comments: ${unread(comments.error)}`);
   } else if (comments.value !== undefined && file.mimeType !== FOLDER_MIME_TYPE) {
     const latest = open[0]?.modifiedTime;
     parts.push(
@@ -354,7 +365,7 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
   const what = `${link.kind} ${link.reference}`;
   const settled = async (read: () => Promise<LinkState>): Promise<LinkState> => {
     const state = await within(what, read);
-    return state.ok ? state.value : { line: UNREAD };
+    return state.ok ? state.value : { line: unread(state.error) };
   };
   switch (link.kind) {
     case 'job':

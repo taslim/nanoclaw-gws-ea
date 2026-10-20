@@ -360,7 +360,7 @@ describe('create_event', () => {
       const refused = refusal(await send(main, 'create_event', { ...FOCUS, guests: [REMY], ...fields }));
 
       expect(refused).toMatch(
-        /^The event was not added: as its guests would see it, the invitation carries one of the principal's private details \((address|email)\)\./u,
+        /^The event was not added: as its guests would see it, the invitation carries the principal's private (address|email address)\./u,
       );
       expect(refused).not.toContain('Rosewood');
       expect(refused).not.toContain(JUNO_PERSONAL);
@@ -712,7 +712,7 @@ describe('change_guests', () => {
       );
 
       expect(refused).toMatch(
-        /^The guests were not changed: as its guests would see it, the invitation carries one of the principal's private details \((address|email)\)\./u,
+        /^The guests were not changed: as its guests would see it, the invitation carries the principal's private (address|email address)\./u,
       );
       expect(refused).not.toContain('Rosewood');
       expect(refused).not.toContain(JUNO_PERSONAL);
@@ -731,7 +731,7 @@ describe('change_guests', () => {
     calendar.put(teamSync([principal, { email: REMY, responseStatus: 'accepted' }]));
     expect(
       refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [JUNO_PERSONAL] })),
-    ).toMatch(/private details \(email\)/u);
+    ).toMatch(/the principal's private email address\./u);
     expect(calendar.writes).toEqual([]);
   });
 
@@ -1289,14 +1289,14 @@ describe('the assistant’s own calendar (R19)', () => {
     const dinner = { ...FOCUS, calendar: ASSISTANT, title: 'Dinner', location: HOME };
 
     expect(refusal(await send(main, 'create_event', { ...dinner, guests: [NOEL] }))).toMatch(
-      /^The event was not added: as its guests would see it, the invitation carries one of the principal's private details \(address\)\./u,
+      /^The event was not added: as its guests would see it, the invitation carries the principal's private address\./u,
     );
     expect(calendar.writes).toEqual([]);
 
     const event = String(data(await send(main, 'create_event', dinner)).event);
     calendar.writes.length = 0;
     expect(refusal(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [NOEL] }))).toMatch(
-      /^The guests were not changed: as its guests would see it, the invitation carries one of the principal's private details \(address\)\./u,
+      /^The guests were not changed: as its guests would see it, the invitation carries the principal's private address\./u,
     );
     expect(calendar.writes).toEqual([]);
 

@@ -28,6 +28,11 @@ export class GoogleGrantRevokedError extends Error {
   readonly code = 'google_grant_revoked';
 }
 
+/** The host holds no Google sign-in for the assistant: only the operator's sign-in gives it one. */
+export class GoogleNotSignedInError extends Error {
+  readonly code = 'google_not_signed_in';
+}
+
 /** Google could not mint a token this time, or minted one other than asked for. */
 export class GoogleTokenError extends Error {
   readonly code = 'google_token_failed';
@@ -220,7 +225,7 @@ export function createHostTokenSource(options: HostTokenSourceOptions): HostToke
 
   async function mint(service: HostGoogleServiceId): Promise<string> {
     const grant = await options.readGrant();
-    if (!grant) throw new Error('The assistant is not signed in to Google yet');
+    if (!grant) throw new GoogleNotSignedInError('The assistant is not signed in to Google yet');
     const identity = googleGrantIdentity(grant);
     if (revoked === identity) {
       throw new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again");

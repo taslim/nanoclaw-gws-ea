@@ -94,14 +94,16 @@ export const MAIN_PREFERENCES_POINTER =
 /**
  * The preferences each audience is given (KTD14). `external-email` gets
  * none: it learns the principal's time only as free slots from the host.
- * Other groups cannot read the store, so they get the values as of their
- * container's start, never a basis or a reason.
+ * The browser gets none either: it sees only its errand, and the brief that
+ * sends one carries whatever bounds the errand needs. Other groups cannot
+ * read the store, so they get the values as of their container's start,
+ * never a basis or a reason.
  */
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
   const audience = await projectDocAudience(group.id);
   if (audience === 'main') return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
-  if (audience === 'external-email') return undefined;
+  if (audience === 'external-email' || audience === 'browser') return undefined;
   const body = summarizeSchedulingPreferences(await getSchedulingPreferenceValues());
   return body === undefined ? undefined : { name: 'Scheduling Preferences', body };
 }

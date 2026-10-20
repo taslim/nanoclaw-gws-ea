@@ -15,6 +15,7 @@ import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
 import { onHostStart } from '../../host-lifecycle.js';
+import { log } from '../../log.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerMessageInterceptor } from '../../router.js';
 import type { AgentGroup } from '../../types.js';
@@ -28,6 +29,7 @@ import {
   getPerson,
   IDENTITY_SOURCES,
   listPeople,
+  PeopleStoreStoppedError,
   PERSON_LEVELS,
   setPersonLevel,
   updatePerson,
@@ -65,14 +67,37 @@ registerRequiredProjectDocSection('gws-ea-people:pointer', peopleSection);
 // ---------------------------------------------------------------------------
 
 /**
+ * What main hears while the store can't be used: restoring its key is the
+ * operator's job, so main gets only what it can do, and the key's path and
+ * remedy go to the host log.
+ */
+export const PEOPLE_STORE_UNAVAILABLE =
+  "The people store can't be used right now, and restoring it is the operator's job. Tell the principal in a line that you can't look people up or change them for now, and carry on with the rest.";
+
+function forCaller(ctx: CallerContext, error: unknown): unknown {
+  if (ctx.caller !== 'agent') return error;
+  log.error('The people store refused main until the operator restores it', { err: error });
+  return new Error(PEOPLE_STORE_UNAVAILABLE);
+}
+
+/**
  * The guard admits the host and any agent whose CLI scope reaches this
  * resource; the people belong to the canonical main alone. A stopped store
- * refuses every verb, so main learns of it at once.
+ * refuses every verb, so main learns of it at once, in its own terms; the
+ * operator's host caller gets the remedy.
  */
 async function asMain<T>(ctx: CallerContext, work: () => Promise<T>): Promise<T> {
   await assertMainCaller(ctx, 'people');
-  await assertPeopleStoreRunning();
-  return work();
+  try {
+    await assertPeopleStoreRunning();
+  } catch (error) {
+    throw forCaller(ctx, error);
+  }
+  try {
+    return await work();
+  } catch (error) {
+    throw error instanceof PeopleStoreStoppedError ? forCaller(ctx, error) : error;
+  }
 }
 
 function flag(name: string): string {
@@ -103,7 +128,7 @@ const LEVEL_ARG: ColumnDef = {
   type: 'string',
   enum: [...PERSON_LEVELS],
   description:
-    'inner-circle and close are usually the principal’s word; a level you judged yourself is --source learned.',
+    'inner-circle and close are usually the principal’s word. A level you judged yourself is learned: --source learned, or on add, --level-source learned.',
 };
 const BASIS_ARG: ColumnDef = {
   name: 'basis',
@@ -183,7 +208,7 @@ registerResource({
       access: 'open',
       description:
         'Keep a new person with exactly one level.\n\n' +
-        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar or the directory: a learned level is active or known, and a learned identity names where you found it with --identity-source. When the principal gives you someone but not where they stand, add --level-source learned: the level is then your judgment, and learning may revise it. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
+        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar or the directory: a learned identity names where you found it with --identity-source. When the principal gives you someone but not where they stand, add --level-source learned: the level is then your judgment, and learning may revise it. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
       args: [
         { ...NAME_ARG, required: true },
         { ...LEVEL_ARG, required: true },

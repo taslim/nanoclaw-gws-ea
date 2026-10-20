@@ -1249,6 +1249,8 @@ describe('a Google link in an email to outsiders', () => {
     expect(refusalOf(await emailSend(session, { text: `Again: ${docUrl(agenda)}` }))).toBe(
       `Your email was not sent: ${LINKS_UNCHECKED}`,
     );
+    // The host speaks of itself in the third person, as everywhere else it answers.
+    expect(LINKS_UNCHECKED).toBe("the host couldn't check the links in it just now; try again shortly.");
     expect(gmail.sent).toHaveLength(1);
   });
 

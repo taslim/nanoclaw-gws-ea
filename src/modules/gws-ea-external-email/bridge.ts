@@ -390,8 +390,9 @@ async function admit(content: Record<string, unknown>, session: Session, request
   const matter = await requestedMatter(content.matter, session);
   if (target.kind === 'thread' && matter === undefined && !(await isPlaced(target.threadKey))) {
     throw forbidden(
-      `Nothing was handed over: thread ${target.threadKey} is not placed yet. Place it first with ncl matters place, ` +
-        'in an open matter, a new one or nowhere, or name its open matter here.',
+      `Nothing was handed over: thread ${target.threadKey} is not placed yet. Place it first: in an open matter with ` +
+        'ncl matters place, in a new one with ncl matters open, or nowhere with ncl matters place --nowhere. ' +
+        'Or name its open matter here.',
     );
   }
   const fileTexts = files.flatMap((file) => [
@@ -658,7 +659,7 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
   const result = await writeNoteForMain({
     id: `tell-main-${session.id}-${requestId}`,
     timestamp: now.toISOString(),
-    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, THREAD_ACCOUNT_MAX)}`,
+    text: `${tellMainStamp(threadKey, people, bookingCalendar, files)}\n${untrusted(account, THREAD_ACCOUNT_MAX, 'external-email')}`,
     wake: true,
     files,
     pieces: [{ kind: 'thread', reference: threadKey }],

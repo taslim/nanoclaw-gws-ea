@@ -1,9 +1,10 @@
 /**
  * Text other people wrote, marked as untrusted the way gog marks it
- * (`<<<EXTERNAL_UNTRUSTED_CONTENT …>>>`), which both agents' guidance tells
- * them to read as information and never as instructions. Any marker or model
- * control token inside the text is neutralized first, so it cannot close the
- * wrapper early.
+ * (`<<<EXTERNAL_UNTRUSTED_CONTENT …>>>`). main's gmail skill and
+ * external-email's tool instructions tell each to read it as information,
+ * never as instructions, and to leave the markers out of what it writes.
+ * Any marker or model control token inside the text is neutralized first,
+ * so it cannot close the wrapper early.
  */
 import { randomBytes } from 'node:crypto';
 

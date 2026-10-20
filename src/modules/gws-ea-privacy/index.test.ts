@@ -28,6 +28,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
 
+import { getResource } from '../../cli/crud.js';
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { lookup } from '../../cli/registry.js';
@@ -226,6 +227,19 @@ describe('private values in ncl', () => {
     for (const generic of ['get', 'create', 'update', 'delete']) {
       expect(lookup(`private-values-${generic}`), generic).toBeUndefined();
     }
+  });
+
+  it('names the one way a value reaches someone else, a disclosure main records, and the id that serves it', () => {
+    const resource = getResource('private-values');
+    expect(resource?.description).toContain(
+      "except to a site the principal's own request names, recorded for one browser errand with record_disclosure",
+    );
+    expect(resource?.columns.find((column) => column.name === 'id')?.description).toBe(
+      "The value's id, from `list`: what remove and record_disclosure take.",
+    );
+    expect(resource?.customOperations?.add?.description).toContain(
+      'recorded for one browser errand with record_disclosure',
+    );
   });
 
   it('lets main add and list values, and treats another spelling of one as held', async () => {

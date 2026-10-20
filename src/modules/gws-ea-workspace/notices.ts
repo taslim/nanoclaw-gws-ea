@@ -5,7 +5,8 @@
  * files it can share reach its inbox as Google's own notification mail,
  * which the inbox takes only when Gmail verified Google sent it
  * (`gws-ea-inbox/authentication.ts`). Nothing here changes a file or sends
- * anything: `main` reads comments and answers requests with the Google tool.
+ * anything: `main` reads comments and answers requests with `gog`, as its
+ * gworkspace skill shows.
  *
  * - Reading a notice, as the inbox routes it: the file, any comment, and the
  *   kind of activity, from Google's own Docs and Drive links, never from the
@@ -444,7 +445,7 @@ async function describeAccessRequest(
     else if (proposals.value.length === 0) status = ' Drive shows no request still waiting on it.';
     else
       requests =
-        '\nDrive shows these requests waiting on it; answer them with the Google tool:' +
+        '\nDrive shows these requests waiting on it; answer them with gog, as your gworkspace skill shows:' +
         proposals.value.map((proposal) => proposalLine(proposal, context)).join('');
   }
   return (
@@ -542,7 +543,7 @@ export async function workspaceNoteText(
       ? [`…and ${rest} more ${rest === 1 ? 'notice' : 'notices'} from Google Docs and Drive this note leaves out.`]
       : []),
     ...(listed.some((notice) => notice.activity === 'comment')
-      ? ['Read each comment in its file with the Google tool before you act on it.']
+      ? ['Read each comment in its file with gog, as your gworkspace skill shows, before you act on it.']
       : []),
   ].join('\n');
 }

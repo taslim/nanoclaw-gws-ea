@@ -89,6 +89,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-people/index.js';
 import { addPerson, forgetPerson } from '../gws-ea-people/db.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
+import { GoogleGrantRevokedError, GoogleScopeNotGrantedError } from '../gws-ea-google/tokens.js';
 import { getSession } from '../../db/sessions.js';
 import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
@@ -371,6 +372,29 @@ describe('the scheduling tools', () => {
   });
 });
 
+describe('a Google connection only the operator can restore', () => {
+  it.each([
+    [
+      'Google no longer accepts the sign-in',
+      new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again"),
+    ],
+    ['the sign-in never granted the calendar', new GoogleScopeNotGrantedError('calendar-host')],
+  ])('tells external-email what it can do when %s, in no host terms', async (_label, error) => {
+    calendar.failure = error;
+    for (const [action, fields] of [
+      ['free_time', { ...RANGE, minutes: 30 }],
+      ['book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }],
+    ] as const) {
+      const said = refusal(await send(sessionA, action, fields));
+      expect(said, action).toBe(
+        "Your Google connection isn't working right now, and reconnecting it is the operator's job. Wake main with tell_main, saying what you couldn't do on this thread, and wait for main.",
+      );
+    }
+    calendar.failure = undefined;
+    expect(bookings()).toEqual([]);
+  });
+});
+
 describe('free_time', () => {
   it("lists free windows in date order, inside both sides' waking day, labeled in both zones with a fixed fit note", async () => {
     // The principal is busy Wednesday 12:00 to 14:00 London.
@@ -628,7 +652,7 @@ describe('book', () => {
     expect(booked.booking).toBe(event.id);
     expect(booked.message).toBe(
       `Booked: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends ${REMY} the invitation from the principal's calendar, ` +
-        `with a Google Meet link (${String(event.conference?.uri)}). main hears of it. ` +
+        `with a Google Meet link (${String(event.conference?.uri)}). The host tells main of it, so no wake is needed; still leave your account with tell_main. ` +
         `To change or cancel it, give booking ${event.id}.`,
     );
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
@@ -771,7 +795,7 @@ describe('book', () => {
           ...fields,
         }),
       );
-      expect(answer).toMatch(/private details \(address\)/u);
+      expect(answer).toMatch(/the principal's private address\./u);
       expect(answer).toMatch(/If it is the calendar's name, wake main with tell_main and wait for its answer\.$/u);
       expect(answer).not.toContain('Rosewood');
       expect(calendar.writes).toEqual([]);
@@ -978,7 +1002,8 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const moved = data(await send(sessionA, 'change_booking', { booking: first.booking, start: THURSDAY_2PM }));
     expect(moved).toMatchObject({ booking: first.booking, start: THURSDAY_2PM, end: '2026-10-08T13:45:00.000Z' });
     expect(moved.message).toBe(
-      'Changed: Thursday, Oct 8, 2:00–2:45 PM BST. Google sends the invitees the update, and main hears of it.',
+      'Changed: Thursday, Oct 8, 2:00–2:45 PM BST. Google sends the invitees the update. ' +
+        'The host tells main of it, so no wake is needed; still leave your account with tell_main.',
     );
     expect(calendar.event(PRINCIPAL, String(first.booking))).toMatchObject({
       start: { dateTime: THURSDAY_2PM },
@@ -1063,13 +1088,13 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
 
     for (const fields of [{ location: '12 Rosewood Lane' }, { notes: 'Come round to 12 Rosewood Lane.' }]) {
       const answer = refusal(await send(sessionA, 'change_booking', { booking: booked.booking, ...fields }));
-      expect(answer).toMatch(/^The booking was not changed: .*private details \(address\)/u);
+      expect(answer).toMatch(/^The booking was not changed: .*the principal's private address\./u);
       expect(answer).not.toContain('Rosewood');
     }
     // Invitees see the name of the calendar the event is on, beside the new title.
     calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', summary: 'Pat – 12 Rosewood Lane' });
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, title: 'Catch-up' }))).toMatch(
-      /private details \(address\)/u,
+      /the principal's private address\./u,
     );
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, video_call: true }))).toMatch(
       /does not allow Google Meet links/u,
@@ -1271,7 +1296,8 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     );
 
     expect(data(await send(sessionA, 'cancel_booking', { booking: booked.booking })).message).toBe(
-      'Cancelled: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends the invitees the cancellation, and main hears of it.',
+      'Cancelled: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends the invitees the cancellation. ' +
+        'The host tells main of it, so no wake is needed; still leave your account with tell_main.',
     );
     expect(calendar.event(PRINCIPAL, String(booked.booking))?.status).toBe('cancelled');
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'delete', sendUpdates: 'all' });

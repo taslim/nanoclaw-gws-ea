@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
@@ -16,6 +16,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 import { recordCalendarAccess } from '../gws-ea-inbox/db.js';
 import { gwsEaInboxCalendarAccessMigration } from '../gws-ea-inbox/migration.js';
 import { emailSignature } from '../gws-ea-inbox/render.js';
+import { writeBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -819,8 +820,34 @@ describe("the assistant's web address in each identity section (KTD14)", () => {
         " Juno's web address is `onuj@example.test`: Juno's email on every website, for Juno's own accounts and for bookings and checkouts made for Morgan." +
         `${ACCOUNTS}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`,
     );
-    // Another group's section is as it was: the browser alone gives an email to websites.
+    // A group the browser access setting doesn't list sends no errand, so it gets no web address.
     expect(await identity(research)).not.toContain('onuj@example.test');
+  });
+
+  it('gives the web address to another group the browser access setting lists, as main gets it', async () => {
+    await recordWebAlias('onuj@example.test');
+    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
+    try {
+      expect(await identity(research)).toBe(
+        `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.` +
+          " Juno's web address is `onuj@example.test`: Juno's email on every website, for Juno's own accounts and for bookings and checkouts made for Morgan." +
+          `${ACCOUNTS} Morgan's email address is \`morgan@example.test\`.`,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("leaves the web address and the browser's stops out of main's section when the access setting omits main", async () => {
+    await recordWebAlias('onuj@example.test');
+    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
+    try {
+      expect(await identity(main)).toBe(
+        `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.${MAIN_PRINCIPAL_ADDRESSES_POINTER}`,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('tells main and the browser that no web address is set up while none is recorded (R23)', async () => {
@@ -938,6 +965,14 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
         timezone: 'America/Los_Angeles',
         changed: ['name'],
         message: expect.stringMatching(/next start/u),
+      },
+    });
+    // What takes effect when, naming no tool main lacks.
+    expect(response).toMatchObject({
+      data: {
+        message: expect.stringContaining(
+          "The host's email signatures and external-email's offered times use the new values now. Your own clock and the identity in your instructions follow at your next start, with nothing for you to do.",
+        ),
       },
     });
     expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
