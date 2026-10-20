@@ -307,7 +307,7 @@ describe('find_conflicts', () => {
     } satisfies Conflict);
     expect(message).toBe(
       'Tuesday, Oct 6, 10:00–11:00 AM BST overlaps:\n' +
-        `- Tuesday, Oct 6, 10:30–11:30 AM BST (overlapping 30 minutes); on ${WORK}; organized by the principal; the principal's answer: accepted; title:\n${standup.title}`,
+        `- Tuesday, Oct 6, 10:30–11:30 AM BST (overlapping 30 minutes); on the principal's calendar at northwind.example; organized by the principal; the principal's answer: accepted; title:\n${standup.title}`,
     );
   });
 
@@ -524,7 +524,7 @@ describe('find_conflicts', () => {
       "- Tuesday, Oct 6, 10:00–11:00 AM BST (overlapping 60 minutes); on Northwind; organized by the principal; the principal's answer: accepted; title:",
     );
     expect(coffee).toBe(
-      `- Tuesday, Oct 6, 10:30–11:30 AM BST (overlapping 30 minutes); on ${HOME}; organized by ${STRANGER}; the principal's answer: not answered yet; title:`,
+      `- Tuesday, Oct 6, 10:30–11:30 AM BST (overlapping 30 minutes); on the principal's Gmail calendar; organized by ${STRANGER}; the principal's answer: not answered yet; title:`,
     );
     expect(demo).toContain("the principal's answer: maybe");
     expect(text).toContain('Quarterly review');
@@ -548,6 +548,51 @@ describe('find_conflicts', () => {
       '- Tuesday, Oct 6, 10:15–10:45 AM BST (overlapping 30 minutes): busy, no details',
     ]);
     expect(text).not.toContain(HOME);
+  });
+
+  it('names a calendar Google calls by its address as the principal would hear it, never by the address', async () => {
+    // Google names an account's main calendar by its address, so its name is no better than its ID.
+    calendar.calendars.set(WORK, { id: WORK, accessRole: 'writer', summary: WORK });
+    calendar.calendars.set(HOME, { id: HOME, accessRole: 'reader', summary: ` ${HOME} ` });
+    const mine = (calendarId: string, from: string, to: string, summary: string) =>
+      calendar.put(
+        timed(calendarId, at(from), at(to), {
+          summary,
+          organizer: { email: calendarId, self: true },
+          attendees: [own(calendarId)],
+        }),
+      );
+    mine(WORK, '10:00', '11:00', 'Quarterly review');
+    mine(HOME, '10:30', '11:30', 'School pickup');
+
+    const text = await message('find_conflicts', { start: at('10:00'), end: at('11:00') });
+
+    expect(entries(text).map((entry) => entry.split('; ')[1])).toEqual([
+      "on the principal's calendar at northwind.example",
+      "on the principal's Gmail calendar",
+    ]);
+    expect(hostWords(text)).not.toContain(WORK);
+    expect(hostWords(text)).not.toContain(HOME);
+  });
+
+  it("calls the principal's only calendar their calendar, and keeps the address of two that would read alike", async () => {
+    calendar.calendars.delete(HOME);
+    calendar.put(timed(WORK, at('10:00'), at('11:00'), { summary: 'Quarterly review', attendees: [own(WORK)] }));
+    expect(entries(await message('find_conflicts', { start: at('10:00'), end: at('11:00') }))[0]).toContain(
+      "; on the principal's calendar;",
+    );
+
+    // Two Gmail accounts would both be "their Gmail calendar": only the address tells them apart.
+    const other = 'pat.lee.home@googlemail.com';
+    await addPrincipalAddress(other);
+    calendar.calendars.set(HOME, { id: HOME, accessRole: 'reader' });
+    calendar.calendars.set(other, { id: other, accessRole: 'reader' });
+    calendar.put(timed(HOME, at('10:00'), at('11:00'), { summary: 'Dentist', attendees: [own(HOME)] }));
+    calendar.put(timed(other, at('10:00'), at('11:00'), { summary: 'Gym', attendees: [own(other)] }));
+    const lines = entries(await message('find_conflicts', { start: at('10:00'), end: at('11:00') }));
+    expect(lines.map((entry) => entry.split('; ')[1]).sort()).toEqual(
+      ["on the principal's calendar at northwind.example", `on ${HOME}`, `on ${other}`].sort(),
+    );
   });
 
   it('keeps a title that gives orders inside its untrusted markers', async () => {
@@ -851,8 +896,8 @@ describe('people_stats', () => {
       'Counted 5 meetings the principal organized or accepted since Sunday, Apr 5, 2026, with 3 people.',
     );
     expect(entries(text)).toEqual([
-      `- ${ALICE}: 3 meetings: 2 on Northwind and 1 on ${HOME}; 3 one-on-ones; no recurring series; first met Tuesday, Sep 1; last met Thursday, Sep 10; their name on invitations:`,
-      `- ${BOB}: 2 meetings: 1 on ${HOME} and 1 on Northwind; 1 one-on-one; no recurring series; first met Saturday, Sep 12; last met Tuesday, Sep 15; their name on invitations:`,
+      `- ${ALICE}: 3 meetings: 2 on Northwind and 1 on the principal's Gmail calendar; 3 one-on-ones; no recurring series; first met Tuesday, Sep 1; last met Thursday, Sep 10; their name on invitations:`,
+      `- ${BOB}: 2 meetings: 1 on the principal's Gmail calendar and 1 on Northwind; 1 one-on-one; no recurring series; first met Saturday, Sep 12; last met Tuesday, Sep 15; their name on invitations:`,
       `- ${CAROL}: 1 meeting, all on Northwind; no one-on-ones; no recurring series; first met Tuesday, Sep 15; last met Tuesday, Sep 15; their name on invitations:`,
     ]);
     for (const name of ['Juno Hale', 'Remy Vance', 'Morgan Ellery']) expect(text).toContain(name);

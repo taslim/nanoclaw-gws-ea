@@ -103,6 +103,18 @@ describe('renderMemorySection', () => {
     expect(MEMORY_SECTION_BUDGET_CHARS - renderMemorySectionWithIndex('').length).toBeGreaterThanOrEqual(3_500);
   });
 
+  it('gives a correction that governs every conversation its own Core Memory line, even when a file also keeps it', () => {
+    // An existing preferences file is the faithful reading of "update that entity's existing file"; only
+    // Core Memory is in front of the agent every time, so the rule itself must live there too (R15).
+    const definition = RELEASE_DEFINITION.replace(/\s+/gu, ' ');
+
+    expect(definition).toContain(
+      'A correction that governs every conversation gets its own short dated line in Core Memory, even when a file for preferences or corrections also keeps it:',
+    );
+    expect(definition).toContain('a linked file is read only when you think to open it.');
+    expect(definition).toContain('Beyond Core Memory, write to the smallest useful file');
+  });
+
   it("reads the definition from the release, never from a copy in the agent's tree", () => {
     writeIndex('# Memory Index\n');
     fs.mkdirSync(path.join(BASE, 'memory', 'system'), { recursive: true });

@@ -40,13 +40,14 @@
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
-import { identityMatchKey } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   createMeetingsCalendarApi,
+  type CalendarEntry,
   type DetailedAttendee,
   type DetailedEvent,
   type EventTime,
@@ -178,7 +179,7 @@ interface FactsView {
   readonly timezone: string;
   readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
-  /** Each calendar's name as Google lists it, which main speaks of it by; its ID when it has none. */
+  /** Each calendar's name as main speaks of it to the principal (`calendarNames`). */
   readonly names: ReadonlyMap<string, string>;
 }
 
@@ -193,6 +194,33 @@ function overlap(a: Span, b: Span): number {
 /** An address's key across the spellings that reach one mailbox: who is the assistant, never who is the principal. */
 function mailbox(email: string): string {
   return identityMatchKey(`email:${email}`);
+}
+
+/**
+ * Each of the principal's calendars by the name main speaks of it by: its
+ * name as Google lists it, or its ID when it has none. Google names an
+ * account's main calendar by its address, and an address is no name the
+ * principal calls their calendar by, so one called by an address is named
+ * as they would hear it: their calendar when it is their only one, else by
+ * its account, their Gmail calendar or their calendar at its domain. Two
+ * that would read alike keep their addresses, the only thing that tells
+ * them apart.
+ */
+function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRecognizer): Map<string, string> {
+  const heard = (name: string): string => {
+    if (entries.length === 1) return "the principal's calendar";
+    if (!addresses.has(name)) return "one of the principal's calendars";
+    const key = mailbox(name);
+    const domain = key.slice(key.lastIndexOf('@') + 1);
+    return domain === 'gmail.com' ? "the principal's Gmail calendar" : `the principal's calendar at ${domain}`;
+  };
+  const named = entries.map((entry) => {
+    const name = entry.summary?.replace(/\s+/gu, ' ').trim() || entry.id;
+    return { id: entry.id, name, spoken: EMAIL_PATTERN.test(name) ? heard(name) : name };
+  });
+  const uses = new Map<string, number>();
+  for (const { spoken } of named) uses.set(spoken, (uses.get(spoken) ?? 0) + 1);
+  return new Map(named.map(({ id, name, spoken }) => [id, uses.get(spoken) === 1 ? spoken : name] as const));
 }
 
 function isRoom(attendee: DetailedAttendee): boolean {
@@ -279,10 +307,12 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
         "None of the calendars you can see is the principal's yet, so there is nothing to count: the host adds each of their addresses' calendars to yours once they share it with you.",
       );
     }
-    const names = new Map(
-      principal.map((entry) => [entry.id, entry.summary?.replace(/\s+/gu, ' ').trim() || entry.id] as const),
-    );
-    return { timezone: profile.principal_timezone ?? TIMEZONE, addresses, calendars, names };
+    return {
+      timezone: profile.principal_timezone ?? TIMEZONE,
+      addresses,
+      calendars,
+      names: calendarNames(principal, addresses),
+    };
   }
 
   /**

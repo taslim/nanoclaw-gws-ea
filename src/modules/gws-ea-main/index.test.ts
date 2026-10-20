@@ -154,6 +154,10 @@ describe("GWS-EA's guidance for main", () => {
     expect(memoryHome).toMatch(/current priorities/u);
     expect(memoryHome).toMatch(/corrections/u);
     expect(memoryHome).toMatch(/short dated facts/u);
+    // A file kept for preferences or corrections never replaces the Core Memory line: only Core Memory is read every time.
+    expect(memoryHome).toMatch(
+      /short dated facts, even when a file also keeps their detail: only Core Memory is in front of you every time you act\./u,
+    );
     expect(GUIDANCE).toMatch(/priorities when they state or reveal them, and update them when they change/u);
     // The persona file is named only as the operator's: nothing the principal teaches goes there.
     expect(GUIDANCE.match(/`instructions\.prepend\.md`[^.]*\./gu)).toEqual([
@@ -212,11 +216,12 @@ describe("GWS-EA's guidance for main", () => {
   });
 
   // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's),
-  // current priorities beside them, with their rule beside the correction rule (D3), and the one-actor clause on
-  // threads handed to external-email (KTD13): 2,920 words, plus a small margin (KTD20). Delivery 2 replaces this
-  // cap with a budget (D5).
-  it('stays within 2,930 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_930);
+  // current priorities beside them, with their rule beside the correction rule (D3), the one-actor clause on
+  // threads handed to external-email (KTD13), and the reason a correction's Core Memory line stands even when a
+  // file keeps its detail (R15): 2,940 words, plus a small margin (KTD20). Delivery 2 replaces this cap with a
+  // budget (D5).
+  it('stays within 2,950 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_950);
   });
 
   it("teaches main its email tools, and none of external-email's", async () => {

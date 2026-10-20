@@ -15,9 +15,11 @@ at startup, on resume when memory has changed, after clear, and after
 compaction. When the index runs over, its end is cut, so keep it lean:
 headlines and pointers there, detail in linked files. Core Memory comes first
 in the index, before the Map, so it always loads whole. It holds the durable
-facts relevant in nearly every conversation, current priorities and the
-corrections that govern every conversation among them, each as a short dated
-fact.
+facts relevant in nearly every conversation, current priorities among them,
+each as a short dated fact. A correction that governs every conversation gets
+its own short dated line in Core Memory, even when a file for preferences or
+corrections also keeps it: only Core Memory is in front of you every time you
+act, and a linked file is read only when you think to open it.
 
 ## Open Knowledge Format
 
@@ -87,9 +89,9 @@ update all affected indexes.
 Where your instructions name a dedicated store for something, the store keeps
 its contents and memory points to it rather than copying them.
 
-Write to the smallest useful file for the entity the fact is about. Update
-that entity's existing file rather than creating duplicates, and don't default
-to whichever file was most recently discussed. Be concise and
+Beyond Core Memory, write to the smallest useful file for the entity the fact
+is about. Update that entity's existing file rather than creating duplicates,
+and don't default to whichever file was most recently discussed. Be concise and
 source-aware; include dates when timing matters.
 
 ## Keep it true

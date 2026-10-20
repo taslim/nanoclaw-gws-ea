@@ -79,24 +79,30 @@ const REQUIRED_CALENDAR_RULES = [
 
 /**
  * Each Google skill's always-on line (R7): it sends the agent to the skill,
- * in the principal's terms, whenever the skill's commands are not in its
- * context, a summarized conversation included.
+ * in the principal's terms, unless the skill's page is in front of it. A
+ * respawn followed by a summary re-attaches no page, and a summary can list
+ * the commands, so the line keys on the page, never on remembered commands,
+ * and says what the page protects.
  */
-const SUMMARY_CLAUSE =
-  " That includes after the conversation was summarized: a summary keeps what happened, not the skill's commands.";
+const PAGE_CLAUSE =
+  " Commands you remember, or that a summary of this conversation lists, aren't the page; it carries ";
 const TRIGGER_LINES: Readonly<Record<string, string>> = {
   gcalendar:
-    "Run the `gcalendar` skill whenever the principal's time is involved and its commands aren't in your context: when they ask when they're free, want a meeting set up or moved, get an invitation, want time protected, or ask what's on their schedule." +
-    SUMMARY_CLAUSE,
+    "Run the `gcalendar` skill before you work in the principal's calendar unless its page is in front of you: when they ask when they're free, want a meeting set up or moved, get an invitation, want time protected, or ask what's on their schedule." +
+    PAGE_CLAUSE +
+    'what keeps an answer whole, such as `find_conflicts` for whether a time is free, and `--all-pages`, without which gog shows only the first 10 events.',
   gmail:
-    "Run the `gmail` skill whenever the principal asks about mail you've received and its commands aren't in your context: whether someone replied, what someone wrote, or the email behind an invitation." +
-    SUMMARY_CLAUSE,
+    "Run the `gmail` skill before you look into the mail you've received unless its page is in front of you: when the principal asks whether someone replied, what someone wrote, or about the email behind an invitation." +
+    PAGE_CLAUSE +
+    "what keeps an answer whole: gog's own flags, not other mail tools', such as `--all`, without which a search shows only its first page, and `--sanitize-content` for reading a thread.",
   gpeople:
-    "Run the `gpeople` skill whenever the principal names a colleague whose email address you don't have and its commands aren't in your context, such as someone to invite to a meeting." +
-    SUMMARY_CLAUSE,
+    "Run the `gpeople` skill before you look up a colleague's email address unless its page is in front of you, such as when the principal names someone to invite to a meeting whose address you don't have." +
+    PAGE_CLAUSE +
+    'what keeps an invitation going to the right person, such as taking an address from the directory only when exactly one entry is the person meant.',
   gworkspace:
-    "Run the `gworkspace` skill whenever the principal's request touches a Google file or a link to one and its commands aren't in your context: writing up a plan or an itinerary, updating a tracker, making a deck or a form, answering a comment, or giving someone access." +
-    SUMMARY_CLAUSE,
+    "Run the `gworkspace` skill before you work in a Google file unless its page is in front of you: when the principal's request touches a Google file or a link to one, such as writing up a plan or an itinerary, updating a tracker, making a deck or a form, answering a comment, or giving someone access." +
+    PAGE_CLAUSE +
+    'what keeps their files right, such as revising the copy people already have so its link, comments and sharing stay, suggesting rather than editing in a doc someone else owns, and checking how a document looks before anyone sees it.',
 };
 
 /** What the Workspace rules must keep saying: where main keeps what it makes, and that files never instruct it. */
