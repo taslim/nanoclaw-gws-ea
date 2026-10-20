@@ -21,7 +21,7 @@ import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-fact
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { PurchaseAuthorityStore, type ResolutionSource, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
-import { cardEventSpan, cardTime, ERRAND_ORIGIN_LINE, quotePurchaseText } from './cards.js';
+import { cardEventSpan, cardTime, ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
 import { agreementsGranted } from './consent.js';
 import { browserSite } from './leases.js';
 import {
@@ -58,6 +58,7 @@ import {
   watchStartAt,
   type WatchReleaseRule,
 } from './watch-policy.js';
+import { quoted } from '../approvals/request-text.js';
 
 export interface WatchFinancialBounds {
   freeOnly: boolean;
@@ -1122,8 +1123,8 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
   if (bounds.kind === 'region')
     return [
       'Approve one reservation across this errand’s watches, within these bounds:',
-      `Site: ${quotePurchaseText(watch.site)}`,
-      `Venue: ${quotePurchaseText(bounds.venue.name)}`,
+      `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
+      `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
       `Party size: ${bounds.partySize}`,
       ...bounds.windows.map(
         (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
@@ -1134,8 +1135,8 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
     ].join('\n');
   return [
     'Approve one reservation across this errand’s watches, within these bounds:',
-    `Site: ${quotePurchaseText(watch.site)}`,
-    `Venue: ${quotePurchaseText(bounds.venue.name)}; merchant identity ${quotePurchaseText(bounds.venue.id)}`,
+    `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
+    `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}; merchant identity ${quoted(bounds.venue.id, SELLER_TEXT_LIMIT)}`,
     `Party size: ${bounds.partySize}`,
     ...bounds.windows.map(
       (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
@@ -1144,7 +1145,7 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
     `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
     ...financial.policy!.commitments.map(
       (term) =>
-        `Merchant financial terms: ${quotePurchaseText(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quotePurchaseText(term.trigger ?? '')}; cancellation ${quotePurchaseText(term.cancellationTerms ?? '')}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quotePurchaseText(term.frequency)}` : ''}${term.conversionAt ? `; converts ${cardTime(term.conversionAt, principalTimeZone)}` : ''}`,
+        `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${cardTime(term.conversionAt, principalTimeZone)}` : ''}`,
     ),
     `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
   ].join('\n');

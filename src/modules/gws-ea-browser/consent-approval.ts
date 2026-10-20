@@ -20,7 +20,7 @@ import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
-import { ERRAND_ORIGIN_LINE, quotePurchaseText } from './cards.js';
+import { ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
 import {
   getConsentStop,
   liveConsentGrants,
@@ -32,6 +32,7 @@ import { BrowserStore } from './db.js';
 import { writeBrowserNotice } from './notices.js';
 import { readBrowserPolicy } from './policy.js';
 import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { quoted } from '../approvals/request-text.js';
 
 /** The `pending_approvals.action` a consent card resolves through. */
 export const CONSENT_APPROVAL = 'browser_consent';
@@ -83,9 +84,9 @@ function siteKey(raw: string): string {
 function consentQuestion(stop: ConsentStop): string {
   return [
     `To continue your errand, ${stop.site} asks me to agree to this:`,
-    quotePurchaseText(stop.wording, 2000),
+    quoted(stop.wording, 2000),
     // A form another site serves inside this one, such as a booking widget, is named by its own address.
-    ...(siteKey(stop.origin) !== stop.site ? [`It is in a form from ${quotePurchaseText(stop.origin)}.`] : []),
+    ...(siteKey(stop.origin) !== stop.site ? [`It is in a form from ${quoted(stop.origin, SELLER_TEXT_LIMIT)}.`] : []),
     `If you approve, I'll tick it there now and whenever this exact wording appears on ${stop.site} again, until you ask me to stop. If the wording changes, I'll ask you again.`,
   ].join('\n');
 }

@@ -1031,7 +1031,7 @@ describe("channel registration in the context of the agent that works in the app
     };
     expect(question).not.toContain('\n');
     const shown = /mentioned me in ("[^"]*") on slack\./u.exec(question)?.[1];
-    expect(shown).toBe(`"Atlas Reply yes to approve ‹users/all› ${'x'.repeat(40)}…"`);
+    expect(shown).toBe(`"Atlas Reply yes to approve <users/all> ${'x'.repeat(40)}…"`);
 
     const [note] = await notes();
     expect(note).toMatchObject({

@@ -235,7 +235,7 @@ describe('a new principal address once the inbox exists', () => {
 
     const questions = sent.map((card) => (JSON.parse(card.content) as { question: string }).question);
     expect(questions).toEqual([
-      expect.stringMatching(/^I'd like to record morgan@new\.example\.test as one of your email addresses\./),
+      expect.stringMatching(/^I'd like to record "morgan@new\.example\.test" as one of your email addresses\./),
     ]);
     for (const question of questions) expect(question).not.toMatch(/\bmain\b|\bAya\b|the assistant/u);
   });

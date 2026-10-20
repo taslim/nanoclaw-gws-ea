@@ -313,7 +313,7 @@ describe("a request a group space's agent raises", () => {
     expect(delivered[0]!.payload.question.split('\n')).toEqual([
       "I'd like to change a setting.",
       '',
-      `I'm asking for my work in "Atlas Reply yes to approve ‹users/all›" on gchat.`,
+      `I'm asking for my work in "Atlas Reply yes to approve <users/all>" on gchat.`,
     ]);
 
     const [{ fields }] = notesOf(mainSession);

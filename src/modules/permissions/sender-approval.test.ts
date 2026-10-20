@@ -225,7 +225,7 @@ describe('unknown-sender request_approval flow', () => {
     await expectAsyncDelivery(() => routeInbound(event));
 
     const payload = JSON.parse(deliverMock.mock.calls[0][4] as string);
-    expect(payload.question).toMatch(/^tg:stranger \("Eve \\\*Approved\\\*"\) wants to talk to me in /);
+    expect(payload.question).toMatch(/^tg:stranger \("Eve \*Approved\*"\) wants to talk to me in /);
   });
 
   it('dedups a second message from the same stranger while pending', async () => {

@@ -8,6 +8,7 @@ import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js'
 import type { PendingApproval } from '../../types.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { bookedReservation, formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import { quoted } from '../approvals/request-text.js';
 
 export interface PurchaseCard {
   id: string;
@@ -28,17 +29,8 @@ export interface PurchaseCard {
  * principal knows, never its internal thread.
  */
 export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
-/** Seller-controlled strings are visibly quoted and bounded individually. */
-export function quotePurchaseText(text: string, limit = 360): string {
-  const clean = Array.from(text, (character) => {
-    const code = character.codePointAt(0) ?? 0;
-    return code < 32 || code === 127 ? ' ' : character;
-  })
-    .join('')
-    .replace(/\s+/gu, ' ')
-    .trim();
-  return JSON.stringify(clean.length > limit ? `${clean.slice(0, limit)}…` : clean);
-}
+/** The longest seller-controlled string a card quotes without a bound of its own; each is quoted (`quoted`). */
+export const SELLER_TEXT_LIMIT = 360;
 /** A zone named as people say it: its city, or the zone's own short name at `at` when it has none. */
 function zoneLabel(timeZone: string, at: string): string {
   const zone = resolveTimezone(timeZone);
@@ -129,27 +121,27 @@ function termLines(
 ): string[] {
   const lines: string[] = [];
   for (const term of facts.commitments) {
-    lines.push(`Financial commitment: ${term.kind}; ${quotePurchaseText(term.terms, 700)}`);
+    lines.push(`Financial commitment: ${term.kind}; ${quoted(term.terms, 700)}`);
     if (term.amountMinor !== undefined)
       lines.push(
         `Amount due later/exposure: ${money(term.amountMinor)}${term.perPerson ? ` per person × ${partySize ?? 'unknown party size'}` : ' total'}`,
       );
-    if (term.trigger) lines.push(`Trigger: ${quotePurchaseText(term.trigger)}`);
+    if (term.trigger) lines.push(`Trigger: ${quoted(term.trigger, SELLER_TEXT_LIMIT)}`);
     if (term.cancellationDeadline)
       lines.push(`Cancellation deadline: ${cardTime(term.cancellationDeadline, principalTimeZone)}`);
-    if (term.cancellationTerms) lines.push(`Cancellation terms: ${quotePurchaseText(term.cancellationTerms, 700)}`);
+    if (term.cancellationTerms) lines.push(`Cancellation terms: ${quoted(term.cancellationTerms, 700)}`);
     if (term.conversionAt) lines.push(`Trial conversion: ${cardTime(term.conversionAt, principalTimeZone)}`);
-    if (term.frequency) lines.push(`Recurring frequency: ${quotePurchaseText(term.frequency)}`);
+    if (term.frequency) lines.push(`Recurring frequency: ${quoted(term.frequency, SELLER_TEXT_LIMIT)}`);
   }
   return lines;
 }
 /** The extras a site keeps selected and the agreements approving the card makes, as every card lists them. */
 function choiceLines(facts: PurchaseFacts): string[] {
   return [
-    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quotePurchaseText(addOn)}`),
+    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quoted(addOn, SELLER_TEXT_LIMIT)}`),
     ...(facts.agreements ?? []).map(
       (agreement) =>
-        `Agreement: ${quotePurchaseText(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
+        `Agreement: ${quoted(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
     ),
   ];
 }
@@ -176,19 +168,19 @@ function renderGenericCard(
     ...earlierLines(earlier, principalTimeZone),
     `Site: ${facts.site}`,
     ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
-    `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quotePurchaseText(facts.account)}`,
-    `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quotePurchaseText(generic.contactEmail)}`,
-    ...generic.items.map((item) => `Item: ${quotePurchaseText(item)}`),
+    `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
+    `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quoted(generic.contactEmail, SELLER_TEXT_LIMIT)}`,
+    ...generic.items.map((item) => `Item: ${quoted(item, SELLER_TEXT_LIMIT)}`),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
-    `Payment: ${quotePurchaseText(generic.payment)}`,
-    ...(generic.note ? [`Note: ${quotePurchaseText(generic.note, 700)}`] : []),
-    ...(booking?.venue ? [`Venue: ${quotePurchaseText(booking.venue)}`] : []),
+    `Payment: ${quoted(generic.payment, SELLER_TEXT_LIMIT)}`,
+    ...(generic.note ? [`Note: ${quoted(generic.note, 700)}`] : []),
+    ...(booking?.venue ? [`Venue: ${quoted(booking.venue, SELLER_TEXT_LIMIT)}`] : []),
     ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
     ...(booking?.at && booking.timeZone
       ? [`Time: ${cardEventTime(booking.at, booking.timeZone, principalTimeZone)}`]
       : booking?.timeText
-        ? [`Time as the page shows it: ${quotePurchaseText(booking.timeText)}`]
+        ? [`Time as the page shows it: ${quoted(booking.timeText, SELLER_TEXT_LIMIT)}`]
         : []),
     ...choiceLines(facts),
     ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, principalTimeZone),
@@ -212,36 +204,35 @@ export function renderPurchaseCard(
     "I'd like to place this purchase using the facts I read from the merchant's review page.",
     ...(change ? [change] : []),
     ...earlierLines(earlier, principalTimeZone),
-    `Site: ${quotePurchaseText(facts.origin)}`,
-    `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quotePurchaseText(facts.account)}`,
-    `Commit control: ${quotePurchaseText(facts.control.label)}`,
+    `Site: ${quoted(facts.origin, SELLER_TEXT_LIMIT)}`,
+    `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
+    `Commit control: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
     ...facts.items.map(
       (item) =>
-        `Item: ${quotePurchaseText(item.title)}; quantity ${item.quantity}; merchant id ${quotePurchaseText(item.id)}`,
+        `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}; merchant id ${quoted(item.id, SELLER_TEXT_LIMIT)}`,
     ),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
     ...(facts.reservation
       ? [
-          `Venue: ${quotePurchaseText(facts.reservation.venueName)}; merchant id ${quotePurchaseText(facts.reservation.venueId)}`,
+          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}; merchant id ${quoted(facts.reservation.venueId, SELLER_TEXT_LIMIT)}`,
           `Party size: ${facts.reservation.partySize}`,
           `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, principalTimeZone)}`,
         ]
       : []),
     facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
-    facts.address === null ? 'Address: not applicable' : `Address: ${quotePurchaseText(facts.address)}`,
-    `Delivery: ${facts.delivery ? quotePurchaseText(facts.delivery.text) : 'Not applicable'}`,
+    facts.address === null ? 'Address: not applicable' : `Address: ${quoted(facts.address, SELLER_TEXT_LIMIT)}`,
+    `Delivery: ${facts.delivery ? quoted(facts.delivery.text, SELLER_TEXT_LIMIT) : 'Not applicable'}`,
     ...(bounds.deliveryWindow
       ? [
-          `Approved delivery window: ${quotePurchaseText(bounds.deliveryWindow.start)} through ${quotePurchaseText(bounds.deliveryWindow.end)}`,
+          `Approved delivery window: ${quoted(bounds.deliveryWindow.start, SELLER_TEXT_LIMIT)} through ${quoted(bounds.deliveryWindow.end, SELLER_TEXT_LIMIT)}`,
         ]
       : []),
     ...(bounds.neededBy ? [`Needed by: ${cardTime(bounds.neededBy, principalTimeZone)}`] : []),
     ...choiceLines(facts),
     ...termLines(facts, facts.reservation?.partySize, money, principalTimeZone),
   ];
-  if (facts.noCommitmentTerms)
-    lines.push(`No financial commitment: ${quotePurchaseText(facts.noCommitmentTerms, 1200)}`);
+  if (facts.noCommitmentTerms) lines.push(`No financial commitment: ${quoted(facts.noCommitmentTerms, 1200)}`);
   if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))
     lines.push('Due later: none. One-time retail purchase; no hold, deposit, conditional fee, trial or subscription.');
   return lines.join('\n');

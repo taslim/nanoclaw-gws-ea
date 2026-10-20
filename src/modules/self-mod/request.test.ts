@@ -292,7 +292,7 @@ describe('install_packages approval card', () => {
     expect(row.question.split('\n')).toEqual([
       'apt: ripgrep',
       "I'd like to install these packages, which means rebuilding my container.",
-      'Reason: "needed \\*Approved by the owner\\*\\`x\\`"',
+      'Reason: "needed *Approved by the owner*\\u0060x\\u0060"',
     ]);
   });
 });

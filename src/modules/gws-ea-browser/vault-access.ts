@@ -27,6 +27,7 @@ import { identityMatchKey, normalizePrincipalEmail, resolvePrincipalAddress } fr
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 import {
   assistantOwnAddresses,
   getGwsEaProfile,
@@ -377,7 +378,7 @@ async function askPrincipal(email: string, session: Session): Promise<Record<str
     action: EMAIL_APPROVAL,
     payload,
     title: 'Share my 1Password vault with this email?',
-    question: `I'd like to give ${email} view and edit access to my 1Password vault, as the email your own 1Password account uses. Whoever signs in to 1Password with it can see and change every login I keep there, so approve only if it is yours.`,
+    question: `I'd like to give ${quoted(email, NAME_LIMIT)} view and edit access to my 1Password vault, as the email your own 1Password account uses. Whoever signs in to 1Password with it can see and change every login I keep there, so approve only if it is yours.`,
     approverUserId: decision.approverUserId,
     details: { facts: { email } },
   });

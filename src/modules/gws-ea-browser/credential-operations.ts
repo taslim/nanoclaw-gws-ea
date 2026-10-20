@@ -63,7 +63,6 @@ import {
   type NativeFieldFacts,
 } from './authentication-submit.js';
 import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
-import { quotePurchaseText } from './cards.js';
 import {
   BrowserSiteBusyError,
   classifyCredentialActivation,
@@ -109,6 +108,7 @@ import {
   takeSignupVerification,
 } from './sign-in-mail.js';
 import { signupAccountStop } from './web-address.js';
+import { quoted } from '../approvals/request-text.js';
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
@@ -355,7 +355,7 @@ function situation(attempt: CredentialAttempt, account: string): string {
 
 /** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
 function releaseQuestion(attempt: CredentialAttempt): string {
-  const account = `${quotePurchaseText(attempt.username, 256)} on ${attempt.site}`;
+  const account = `${quoted(attempt.username, 256)} on ${attempt.site}`;
   const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
   const consequence =
     attempt.kind === 'signup'

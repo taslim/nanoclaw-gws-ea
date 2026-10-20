@@ -10,6 +10,7 @@ import type { CallerContext } from '../../cli/frame.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
 import { registerApprovalHandler } from '../approvals/index.js';
+import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
 import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
@@ -324,7 +325,7 @@ async function requestAddAddressCard(ctx: CallerContext, email: string, approver
     action: ADD_ADDRESS_APPROVAL,
     payload: addAddressPayload(email),
     title: 'Add one of your email addresses?',
-    asks: `to record ${email} as one of your email addresses. Mail I receive from your addresses is treated as yours, with your authority, and each of them can open the Google Drive folder where I keep what I make for you, so approve only if this address is yours.`,
+    asks: `to record ${quoted(email, NAME_LIMIT)} as one of your email addresses. Mail I receive from your addresses is treated as yours, with your authority, and each of them can open the Google Drive folder where I keep what I make for you, so approve only if this address is yours.`,
     details: { facts: { email } },
   });
   return {

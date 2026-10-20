@@ -1216,6 +1216,28 @@ describe('requests', () => {
     });
   });
 
+  it("posts a host's request with Chat's markup shown as text, and an agent's own question as written", async () => {
+    await start();
+    const ask = (questionId: string, question: string, fromAgent?: true) =>
+      channel!.deliver(`gchat:${DM}`, null, {
+        kind: 'chat-sdk',
+        content: {
+          type: 'ask_question',
+          questionId,
+          title: 'Add a sender?',
+          question,
+          options: [{ label: 'Approve', value: 'approve' }],
+          ...(fromAgent ? { fromAgent } : {}),
+        },
+      });
+
+    const hosts = await ask('appr-markup', 'From "&lt;users/all&gt;" <https://evil.example|Approve>');
+    const agents = await ask('q-agent', 'Which of <users/2001> or <users/2002>?', true);
+
+    expect(api.messages.get(hosts!)?.text).not.toMatch(/<users\/|<https?:/u);
+    expect(api.messages.get(agents!)?.text).toContain('<users/2001>');
+  });
+
   it("shows an answered request's outcome by editing its text alone, as a user may", async () => {
     await start();
     const name = await askToInstall('appr-2');

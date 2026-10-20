@@ -338,9 +338,7 @@ describe('removing a private value', () => {
       expect.stringMatching(
         /^I'd like to stop protecting your private address "Home"\. Once it is removed, I may share it/u,
       ),
-      expect.stringMatching(
-        /^I'd like to stop protecting your private phone number "Mobile ‹users\/all› \\\*work\\\*"\./u,
-      ),
+      expect.stringMatching(/^I'd like to stop protecting your private phone number "Mobile <users\/all> \*work\*"\./u),
     ]);
     for (const question of questions) expect(question).not.toMatch(/\bmain\b/);
   });

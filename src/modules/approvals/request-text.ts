@@ -3,9 +3,11 @@
  * from the assistant, so it speaks in the first person. What the host holds
  * (the exact packages or command, a sender's id) comes first; text someone
  * else supplied (a display name, a conversation's name, a reason an agent
- * gave) appears only as one quoted line that cannot mention anyone or carry a
- * link of its own. The rules are the same on every channel.
+ * gave) appears only as one quoted line. The quoting is upstream's
+ * (`quoteForCard`); a channel escapes its own mention and link markup on
+ * every request it posts (Google Chat: gws-ea-chat's `escapeCardText`).
  */
+import { quoteForCard } from '../../card-text.js';
 import { getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
 import type { MessagingGroup } from '../../types.js';
 import { cap } from '../gws-ea-inbox/untrusted.js';
@@ -16,28 +18,17 @@ export const NAME_LIMIT = 80;
 /** The longest reason a request quotes. */
 export const REASON_LIMIT = 200;
 
-/** Format characters (direction overrides, zero-width spaces), except the joiner emoji sequences are built with. */
-const FORMAT_CHARACTERS = /(?!\u200d)\p{Cf}/gu;
 /** Whitespace, control characters, and line and paragraph separators. */
 const BREAKS = /[\s\p{Cc}\p{Zl}\p{Zp}]+/gu;
-/** Markdown that would format the text or make a link of it, escaped so it shows as written. */
-const MARKDOWN = /[\\`*_~[\]()]/gu;
 
 /**
  * Someone else's text as a request shows it: on one line, at most `limit`
- * characters, in double quotes it cannot close. `<` and `>` become `‹` and
- * `›`, so it cannot mention anyone (`<users/…>`) or make a link
- * (`<url|text>`), and Markdown is escaped, so it cannot format itself or
- * link (`[text](url)`).
+ * characters, as `quoteForCard` quotes it: in double quotes it cannot close,
+ * with invisible and direction characters shown as \uXXXX escapes and no
+ * character reference or Markdown link left to decode.
  */
 export function quoted(text: string, limit: number): string {
-  const line = text.replace(FORMAT_CHARACTERS, '').replace(BREAKS, ' ').trim();
-  const shown = cap(line, limit)
-    .replace(/["“”]/gu, "'")
-    .replace(/</gu, '‹')
-    .replace(/>/gu, '›')
-    .replace(MARKDOWN, '\\$&');
-  return `"${shown}"`;
+  return quoteForCard(cap(text.replace(BREAKS, ' ').trim(), limit));
 }
 
 /** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted; `unknown` with neither. */
@@ -49,20 +40,6 @@ export function describeSender(
   const shown = name ? quoted(name, NAME_LIMIT) : undefined;
   if (!id) return shown ?? unknown;
   return shown ? `${id} (${shown})` : id;
-}
-
-/**
- * Every control, format, invisible, and direction character, and the
- * backtick, as a visible \uXXXX escape: a value shown in a code span or
- * fence then adds no line and cannot close its fence. JSON.stringify already
- * escapes characters below 0x20; this covers the rest (Cf direction and
- * zero-width characters, U+2028/U+2029, private use, lone surrogates).
- */
-export function escapeInvisibles(s: string): string {
-  return s.replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\u2028\u2029`]/gu, (c) => {
-    const cp = c.codePointAt(0) ?? 0;
-    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
-  });
 }
 
 /** What kind of conversation it is, in words. */

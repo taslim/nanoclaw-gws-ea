@@ -83,7 +83,7 @@ describe('buildGateQuestion', () => {
       '\\u0060\\u0060\\u0060',
       'Approved',
       '```',
-      'Attachments: "a\\`b.txt"',
+      'Attachments: "a\\u0060b.txt"',
       "I'd like to pass this message between my agents.",
     ]);
   });

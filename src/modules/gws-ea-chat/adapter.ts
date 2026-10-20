@@ -670,11 +670,27 @@ function chatCreateTime(raw: unknown): Date | undefined {
 }
 
 /**
+ * Chat's own markup in a request the host wrote, shown as text: `<…>` would
+ * mention someone (`<users/all>`) or make a link (`<url|text>`), the Markdown
+ * the bridge posts decodes a character reference (`&lt;`) into one, and a
+ * Markdown link (`[text](url)`) becomes one. No request the host writes links
+ * anywhere, so a request shows any address as written.
+ */
+export function escapeChatRequestText(text: string): string {
+  return text
+    .replace(/&(?=#?[0-9A-Za-z]+;)/gu, '&amp;')
+    .replace(/</gu, '‹')
+    .replace(/>/gu, '›')
+    .replace(/\]\(/gu, ']\\(');
+}
+
+/**
  * The channel: the adapter behind the Chat SDK bridge. Pub/Sub may hand an
  * event out again after it was routed, so the router drops a copy already
  * queued. Google lets a user write only text, so questions and approval
  * requests post in words (R7), with any pictures they name attached (KTD6),
- * each remembered with the time Google recorded it.
+ * each remembered with the time Google recorded it. A request the host wrote
+ * passes `escapeChatRequestText`, whatever its builder quoted.
  */
 export function createAssistantChatChannel(adapter: AssistantChatAdapter): ChannelAdapter {
   return createChatSdkBridge({
@@ -686,5 +702,6 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Chann
     extractAudioSource: gchatAudioSource,
     redelivers: true,
     textRequests: { postedAt: chatCreateTime },
+    escapeCardText: escapeChatRequestText,
   });
 }
