@@ -1105,9 +1105,13 @@ describe('recorded divergence: a module can refuse a destination on every write 
     expect(writer).toContain('await assertDestinationAdmitted({ proposed: row });');
     // create_agent judges both of its rows before it writes the group, so a refusal leaves nothing behind.
     expect(createAgent).toContain('destinationRefusal({ proposed })');
-    expect(createAgent.indexOf('destinationRefusal({ proposed })')).toBeLessThan(
-      createAgent.indexOf('const newGroup: AgentGroup = {'),
-    );
+    // Before either kind of create fetches or writes: the template's download, and the group's row.
+    for (const create of ['ensureTemplateLocal(template)', 'await createAgentGroup(newGroup)']) {
+      expect(createAgent.indexOf('destinationRefusal({ proposed })'), create).toBeLessThan(createAgent.indexOf(create));
+    }
+    // A template is stamped under the id whose destinations were judged.
+    expect(createAgent).toMatch(/createAgentFromTemplate\(template, \{\s+id: wiring\.toParent\.agent_group_id,/u);
+    expect(await read('src/templates/create-agent.ts')).toContain('const id = opts?.id ?? `ag-${randomUUID()}`;');
     expect(cli).toContain('await createDestination({');
     expect(cli).not.toContain('INSERT INTO agent_destinations');
   });
@@ -1434,5 +1438,64 @@ describe("recorded divergence: Google Chat is the assistant's own channel, on th
     for (const method of [...overridden, ...called]) expect(typeof sdk[method], method).toBe('function');
     expect(overridden.filter((method) => !own(AssistantChatAdapter.prototype, method))).toEqual([]);
     expect(called.filter((method) => own(AssistantChatAdapter.prototype, method))).toEqual([]);
+  });
+});
+
+describe('recorded divergence: upstream sync 2026-10-19 re-applied these on upstream code', () => {
+  const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+
+  it("the result door's repeat check reads a row's text beside its batch, and a sent email is quoted in the nudge", async () => {
+    const pollLoop = await read('container/agent-runner/src/poll-loop.ts');
+
+    // Without it, every Claude turn whose result re-emits a streamed block draws a nudge.
+    expect(pollLoop).toContain('isDoorText(message.content, body)');
+    expect(pollLoop).toContain('const sentThisTurn = sentSince(turnStartSeq);');
+    expect(pollLoop).toContain("row.kind === 'system'\n      ? 'email'");
+  });
+
+  it("seeds a sealed session's own provider files through upstream's anchored initializeFile", async () => {
+    const runner = await read('src/container-runner.ts');
+    const realize = await read('src/provider-contracts/realize.ts');
+
+    expect(runner).toContain('initializeFile(provider, file, volumes, agentGroupId, [], sessionDirectory);');
+    expect(runner).not.toContain('reconcileSessionFile');
+    expect(realize).toMatch(/export function initializeFile\([^)]*sessionDirectory\?: string,\n\): void/u);
+  });
+
+  it('decides a protected group on the canonical args, so no spelling of a group flag slips past', async () => {
+    const guard = await read('src/cli/guard.ts');
+
+    expect(guard.indexOf('args = normalizeArgs(input.payload);')).toBeGreaterThan(-1);
+    expect(guard.indexOf('args = normalizeArgs(input.payload);')).toBeLessThan(
+      guard.indexOf('await namedGroups(cmd, args)'),
+    );
+  });
+
+  it('keeps a Chat attachment folder named by hash, reusing only the identical file a retry staged', async () => {
+    const sessions = await read('src/session-manager.ts');
+
+    expect(sessions).toContain("AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['inbox', inboxFolder], true)");
+    expect(sessions).toContain('if (!holdsStagedOriginal(inbox, filename, bytes)) {');
+  });
+
+  it("draws gws-ea's prompts where it asks for them, and its context note follows the card's thread", async () => {
+    const select = await read('setup/lib/bright-select.ts');
+    const primitive = await read('src/modules/approvals/primitive.ts');
+
+    expect(select).toContain('output?: Writable;');
+    expect(select).toContain('output: opts.output,');
+    expect(primitive).toContain('threadId: approvalCardThread(session, target.messagingGroup),');
+  });
+
+  it("keeps GWS-EA's own templates tracked while library templates stay install state", async () => {
+    const ignored = (file: string) =>
+      new Promise<boolean>((resolve, reject) => {
+        const check = spawn('git', ['check-ignore', '--no-index', '-q', file], { cwd: originalCwd });
+        check.on('error', reject);
+        check.on('close', (code) => resolve(code === 0));
+      });
+
+    expect(await ignored('templates/gws-ea/main/new-file.md')).toBe(false);
+    expect(await ignored('templates/sales/sdr/plugin.json')).toBe(true);
   });
 });
