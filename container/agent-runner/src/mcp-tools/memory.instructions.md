@@ -1,8 +1,8 @@
 ## Memory
 
-Your persistent memory lives under `/workspace/agent/memory/`. The session-start memory context contains the live top-level index and system definition. Follow that definition when deciding what to store and keep the index accurate so you can retrieve details later.
+Your persistent memory lives under `/workspace/agent/memory/`. The session-start memory context contains the live top-level index and the release's memory definition. Follow that definition when deciding what to store and keep the index accurate so you can retrieve details later.
 
-Standing role, persona, and behavioral instructions belong in `/workspace/agent/instructions.prepend.md`; durable facts belong in memory. Changes to standing instructions take effect after the group container restarts, so say that when confirming an edit.
+What the people you serve teach you, including how they want things done and the corrections they give, belongs in memory as facts, so it is with you in every session. `/workspace/agent/instructions.prepend.md` is your operator's persona file; leave it to them.
 
 {{provider-memory-note}}
 

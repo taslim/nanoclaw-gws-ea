@@ -148,6 +148,20 @@ describe("GWS-EA's guidance for main", () => {
     for (const layout of ['`memory/people/`', '`type: person`', 'aliases']) expect(GUIDANCE, layout).toContain(layout);
   });
 
+  it('keeps current priorities and corrections in Core Memory, and leaves the persona file to the operator', () => {
+    const memoryHome = GUIDANCE.split('\n').find((line) => line.includes('Core Memory'));
+
+    expect(memoryHome).toMatch(/current priorities/u);
+    expect(memoryHome).toMatch(/corrections/u);
+    expect(memoryHome).toMatch(/short dated facts/u);
+    expect(GUIDANCE).toMatch(/priorities when they state or reveal them, and update them when they change/u);
+    // The persona file is named only as the operator's: nothing the principal teaches goes there.
+    expect(GUIDANCE.match(/`instructions\.prepend\.md`[^.]*\./gu)).toEqual([
+      "`instructions.prepend.md`, is your operator's.",
+    ]);
+    expect(GUIDANCE).not.toMatch(/after a restart/u);
+  });
+
   it('names only `ncl` commands that exist, in the guidance and in the welcome', () => {
     for (const [name, text] of [
       ['guidance', GUIDANCE],
@@ -191,8 +205,11 @@ describe("GWS-EA's guidance for main", () => {
     );
   });
 
-  it('stays within 2,875 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_875);
+  // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's) and
+  // current priorities beside them, with their rule beside the correction rule (D3): 2,891 words, plus a small
+  // margin. Delivery 2 replaces this cap with a budget (D5).
+  it('stays within 2,900 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_900);
   });
 
   it("teaches main its email tools, and none of external-email's", async () => {

@@ -1,9 +1,20 @@
+import { createHash } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
 import { renderMemorySection } from './context.js';
 
-const MEMORY_CONTEXT_SOURCES = ['startup', 'clear', 'compact'] as const;
+const MEMORY_CONTEXT_SOURCES = ['startup', 'resume', 'clear', 'compact'] as const;
 
 export type MemorySessionHookSource = (typeof MEMORY_CONTEXT_SOURCES)[number];
-export type MemorySessionStartSource = MemorySessionHookSource | 'resume';
+export type MemorySessionStartSource = MemorySessionHookSource;
+
+/**
+ * Where the hook keeps a fingerprint of the section it last delivered to each
+ * provider session: the NanoClaw session's own host-backed workspace, which
+ * outlives the container and is never shared with another session's.
+ */
+export const MEMORY_DELIVERY_STATE_DIR = '/workspace/.memory-delivered';
 
 export interface MemorySessionHookRegistration {
   readonly command: string;
@@ -29,7 +40,59 @@ export const SEALED_MEMORY_SESSION_HOOK: MemorySessionHookRegistration = {
   sources: [],
 };
 
-/** Return memory only when a provider is establishing a new context window. */
-export function memoryContextForSessionStart(source: MemorySessionStartSource, baseDir?: string): string | undefined {
-  return source === 'resume' ? undefined : renderMemorySection(baseDir);
+/** The provider session a hook runs for, as its input names it. */
+export interface MemoryHookSession {
+  readonly id: string;
+  readonly stateDir?: string;
+}
+
+/**
+ * Return the memory section for a session start, or nothing.
+ *
+ * A new context window (startup, clear, compact) always gets it. A resumed
+ * one already holds the section last delivered to it, so it gets the section
+ * only when that changed: an unchanged section would only grow the context
+ * toward compaction on every respawn. A resume the hook cannot key to a
+ * session gets nothing, as it can't tell what that session holds.
+ */
+export function memoryContextForSessionStart(
+  source: MemorySessionStartSource,
+  baseDir?: string,
+  session?: MemoryHookSession,
+): string | undefined {
+  if (!session) return source === 'resume' ? undefined : renderMemorySection(baseDir);
+
+  const section = renderMemorySection(baseDir);
+  const fingerprint = createHash('sha256').update(section).digest('hex');
+  const file = path.join(
+    session.stateDir ?? MEMORY_DELIVERY_STATE_DIR,
+    createHash('sha256').update(session.id).digest('hex'),
+  );
+  if (source === 'resume' && readFingerprint(file) === fingerprint) return undefined;
+  writeFingerprint(file, fingerprint);
+  return section;
+}
+
+function readFingerprint(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, 'utf-8');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best effort: a fingerprint that can't be kept only means the next resume delivers the section again. */
+function writeFingerprint(file: string, fingerprint: string): void {
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(temporary, fingerprint);
+    fs.renameSync(temporary, file);
+  } catch {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      // Nothing was written where the state directory should be.
+    }
+  }
 }
