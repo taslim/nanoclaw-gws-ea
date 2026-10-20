@@ -1256,6 +1256,21 @@ describe('requests', () => {
     const edits = api.requests.filter((request) => request.method === 'PUT' || request.method === 'PATCH');
     expect(edits.map((request) => request.url.searchParams.get('updateMask'))).toEqual(['text']);
   });
+
+  it("never edits a message outside the conversation's own space", async () => {
+    await start();
+    const name = await askToInstall('appr-3');
+    const elsewhere = name!.replace(DM, 'spaces/OTHER');
+
+    await expect(
+      channel!.deliver(`gchat:${DM}`, null, {
+        kind: 'chat-sdk',
+        content: { operation: 'edit', messageId: elsewhere, text: 'Approved' },
+      }),
+    ).rejects.toThrow('does not belong to space');
+    const edits = api.requests.filter((request) => request.method === 'PUT' || request.method === 'PATCH');
+    expect(edits).toEqual([]);
+  });
 });
 
 describe('a picture on an approval request (KTD6)', () => {

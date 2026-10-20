@@ -129,7 +129,7 @@ const WORKING_EMOJI = '👀';
 const WORKING_RECORD = 'gws-ea-chat:working';
 /** How many messages whose work ended are remembered, so a late pulse never shows 👀 on one again. */
 const ENDED_KEPT = 1_000;
-/** chat@4.40.0's default dedupe lifetime, retained for a completed audio dispatch. */
+/** The Chat SDK core's default dedupe lifetime, retained for a completed audio dispatch. */
 const SDK_DEDUPE_TTL_MS = 10 * 60_000;
 const AUDIO_DISPATCH_COMPLETE = { gwsEaAudioCompleted: true } as const;
 
@@ -261,6 +261,13 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     messageId: string,
     message: AdapterPostableMessage,
   ): Promise<RawMessage<unknown>> {
+    // A message's name says its space on its own, so, as the SDK's own edit
+    // does, one outside the thread's space is refused: a permitted thread
+    // never carries an edit to a message somewhere else.
+    const { spaceName } = this.decodeThreadId(threadId);
+    if (spaceOfMessage(messageId) !== spaceName) {
+      throw new Error(`Message "${messageId}" does not belong to space "${spaceName}" of thread "${threadId}"`);
+    }
     const text = convertEmojiPlaceholders(this.formatConverter.renderPostable(message), 'gchat');
     try {
       const response = await this.chatApi.spaces.messages.update({
