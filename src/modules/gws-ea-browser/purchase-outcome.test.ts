@@ -36,7 +36,7 @@ import { getSession } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { resolveSession } from '../../session-manager.js';
+import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
@@ -46,6 +46,7 @@ import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
 import { SiteLeaseStore } from './leases.js';
 import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
+import { notifyPendingIncidents } from './incidents.js';
 import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
 
@@ -343,15 +344,19 @@ describe('main recording an unconfirmed purchase', () => {
     expect(await attempt(id)).toMatchObject({ resolution: 'committed', resolution_source: winner.source });
   });
 
-  it('raises a duplicate incident when the order email confirms a purchase recorded not placed, told at once and once', async () => {
+  it('raises a duplicate incident when the order email confirms a purchase recorded not placed, alarming once, in the answer', async () => {
     const { job } = await errand('main-p', 'mugs');
     const id = await unconfirmed(job, 'mugs');
     await record(job.thread_id, id, 'not_placed', 'principal');
-    expect(await record(job.thread_id, id, 'placed', 'email')).toEqual({
+    const answer = await record(job.thread_id, id, 'placed', 'email');
+    expect(answer).toMatchObject({
       status: 'possible_duplicate',
       thread: job.thread_id,
       recorded: { outcome: 'not_placed', source: 'principal' },
     });
+    expect(answer.message).toBe(
+      `The purchase on ${SITE} for $42.00 was recorded as not placed and is now reported placed after all, so the principal may have bought it twice. The host stopped this errand. Tell the principal now.`,
+    );
     expect(
       await getDb().all('SELECT kind,site,job_id,attempt_id,evidence_key,notified_at FROM gws_ea_browser_incidents'),
     ).toEqual([
@@ -367,15 +372,44 @@ describe('main recording an unconfirmed purchase', () => {
     expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
       cancelled: 1,
     });
-    const duplicate = (await notes(main)).filter((text) => text.includes('bought it twice'));
-    expect(duplicate).toEqual([
-      `Browser job ${job.thread_id} was stopped: the purchase on ${SITE} recorded as not placed was reported placed after all, so the principal may have bought it twice. Tell the principal now.`,
-    ]);
-    // The recorded outcome stands, and the same report again raises and tells nothing new.
-    expect(await record(job.thread_id, id, 'placed', 'principal')).toMatchObject({ status: 'possible_duplicate' });
+    // The recorder heard it in its answer: no second alarm reaches it, now or from the sweep.
+    await notifyPendingIncidents();
+    expect((await notes(main)).filter((text) => text.includes('bought it twice'))).toEqual([]);
+    // The recorded outcome stands, and the same report again raises nothing new and asks for no second alarm.
+    const again = await record(job.thread_id, id, 'placed', 'principal');
+    expect(again).toMatchObject({ status: 'possible_duplicate' });
+    expect(again.message).toBe(
+      `The purchase on ${SITE} for $42.00 was already reported as a possible duplicate, and the host stopped this errand then.`,
+    );
     expect(await attempt(id)).toMatchObject({ resolution: 'not_committed', resolution_source: 'principal' });
     expect(await getDb().all('SELECT id FROM gws_ea_browser_incidents')).toHaveLength(1);
-    expect((await notes(main)).filter((text) => text.includes('bought it twice'))).toHaveLength(1);
+  });
+
+  it('tells a delegating group other than the recorder that its errand stopped, as information only', async () => {
+    policy(['main-p', 'desk-p']);
+    const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
+    const { session, job } = await errand('desk-p', 'aprons');
+    await writeSessionMessage('browser-p', session.id, {
+      id: 'desk-delegation',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: 'desk-p',
+      channelType: 'agent',
+      threadId: session.thread_id,
+      content: JSON.stringify({ text: 'Order the aprons.' }),
+      sourceSessionId: desk.id,
+    });
+    const id = await unconfirmed(job, 'aprons');
+    // Removed from the browser setting, the desk's purchase falls to main to record.
+    policy(['main-p']);
+    await record(job.thread_id, id, 'not_placed', 'principal');
+    const answer = await record(job.thread_id, id, 'placed', 'email');
+    expect(answer.message).toContain('Tell the principal now.');
+    expect((await notes(main)).filter((text) => text.includes('bought it twice'))).toEqual([]);
+    const told = (await notes(desk)).filter((text) => text.includes('was stopped'));
+    expect(told).toEqual([
+      `Browser job ${job.thread_id} was stopped: the purchase on ${SITE} recorded as not placed was reported placed after all. Main is telling the principal, so nothing more is needed from you.`,
+    ]);
   });
 
   it('answers possible_duplicate with the incident told when the stopped job’s cleanup fails', async () => {

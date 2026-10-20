@@ -12,7 +12,7 @@ import {
   writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from './onepassword-policy.js';
-import { browserCredentialAttemptsMigration } from './migration.js';
+import { browserCredentialAttemptsMigration, browserCredentialConsentHoldMigration } from './migration.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
@@ -904,6 +904,30 @@ describe('password changes', () => {
 });
 
 describe('phases', () => {
+  it('copies every attempt as it was when the consent hold joins the phases, then holds and ends one', async () => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    await subject.save(attempt.id);
+    const before = await rows();
+    await browserCredentialConsentHoldMigration.up(getDb());
+    expect(await rows()).toEqual(before);
+    await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
+    expect(await subject.markAwaitingConsent(attempt.id, { signal: 'consent', held: true })).toMatchObject({
+      phase: 'awaiting_consent',
+    });
+    // The same authority discloses its one candidate again for the fill after the grant.
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
+    expect(await phase(attempt.id)).toBe('exposed');
+    await subject.markAwaitingConsent(attempt.id, { signal: 'consent', held: true });
+    expect(await subject.endConsentHolds(JOB, 'other.example')).toEqual([]);
+    expect(await subject.endConsentHolds(OTHER_JOB)).toEqual([]);
+    expect(await subject.endConsentHolds(JOB, 'shop.example')).toEqual([attempt.id]);
+    expect(await phase(attempt.id)).toBe('unknown');
+    await expect(
+      getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'held' WHERE id = ?", attempt.id),
+    ).rejects.toThrow();
+  });
+
   it('moves only along the diagram and records flat evidence that never carries a value', async () => {
     const subject = service();
     const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));

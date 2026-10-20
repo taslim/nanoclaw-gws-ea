@@ -139,7 +139,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     windows: [{ start: '2026-10-24T19:00:00-07:00', end: '2026-10-24T21:00:00-07:00' }],
     until: '2026-10-24T12:00:00-07:00',
   };
-  const FREE = { currency: 'USD', max_total: '0', terms: 'Nothing due' };
+  const FREE = { currency: 'USD', max_total: '0' };
   let fixture: OpenWebFixture;
   let page: Page;
   let queue: BrowserQueue;
@@ -517,7 +517,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
 
   it('books a paid table a change found under the watch’s approval when the host-read total is within it', async () => {
     site.deposit = 40;
-    expect(await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' })).toMatchObject({
+    expect(await setWatch({ currency: 'USD', max_total: '50.00' })).toMatchObject({
       status: 'awaiting_principal',
     });
     await approve((await approvals())[0]);
@@ -539,7 +539,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
 
   it('sends a card for a paid table above the watch’s maximum, and only an approved booking it fits ends the watch', async () => {
     site.deposit = 80;
-    await setWatch({ currency: 'USD', max_total: '50.00', terms: 'A deposit of up to $50' });
+    await setWatch({ currency: 'USD', max_total: '50.00' });
     await approve((await approvals())[0]);
     const purchaseCard = async (): Promise<PendingApproval> => {
       const card = (await approvals()).find((approval) => approval.action === 'browser_purchase');

@@ -295,3 +295,24 @@ it("records an unconfirmed purchase's outcome by the job's attempt id, with its 
   for (const word of ['recorded', 'already_recorded', 'possible_duplicate', 'in_progress', 'email', 'principal'])
     expect(recordPurchaseOutcome.tool.description).toContain(word);
 });
+
+it('serves record_purchase_outcome under its own key, so main holds it when the access list leaves main out', async () => {
+  const { createMcpServer } = await import('./server.js');
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const served = async (grants: readonly string[]): Promise<string[]> => {
+    const server = createMcpServer(async (action) => action(), new Set(grants));
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'purchase-outcome-fixture', version: '1' });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      return (await client.listTools()).tools.map((tool) => tool.name);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  };
+  expect(await served(['browser-purchase-outcome'])).toEqual(['record_purchase_outcome']);
+  expect(await served(['browser-delegate'])).not.toContain('record_purchase_outcome');
+});

@@ -29,6 +29,7 @@ import { setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { requestApproval, sweepExpiredApprovals } from '../approvals/index.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
@@ -36,6 +37,8 @@ import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
+import { CONSENT_APPROVAL } from './consent-approval.js';
+import { recordConsentStops } from './consent.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import {
   credentialAuthorityRequest,
@@ -745,6 +748,84 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
     expect(await lease()).toEqual({ job_id: job.thread_id });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
+  });
+
+  /** A signup whose filled form waits on the principal's card for a wording on the site (KTD11). */
+  async function heldForConsent(): Promise<{ id: string; approvalId: string }> {
+    const id = await disclosedSignup();
+    await attempts.markAwaitingConsent(id, { signal: 'consent', held: true });
+    await holdSite();
+    const [stop] = await recordConsentStops(
+      { jobId: job.thread_id!, db: getDb() },
+      {
+        site: 'shop.example',
+        origin: ORIGIN,
+        fingerprint: 'join-form',
+        items: [{ id: 0, wording: 'I have read and accept the liability waiver', kind: 'agreement' }],
+      },
+    );
+    await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'requested' WHERE id = ?", stop.stop_id);
+    const approvalId = await requestApproval({
+      session: job,
+      agentName: 'browser',
+      action: CONSENT_APPROVAL,
+      payload: { stopId: stop.stop_id, jobId: job.thread_id },
+      title: 'Agree to this on shop.example?',
+      question: 'shop.example asks me to agree to this: "I have read and accept the liability waiver"',
+      approverUserId: PRINCIPAL,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    if (!approvalId) throw new Error('No consent card');
+    return { id, approvalId };
+  }
+
+  it.each([
+    [
+      'declines',
+      async (approvalId: string) =>
+        handleApprovalsResponse({
+          questionId: approvalId,
+          value: 'reject',
+          userId: PRINCIPAL,
+          channelType: DM.channelType,
+          platformId: DM.platformId,
+          threadId: null,
+        }),
+    ],
+    [
+      'lets lapse',
+      async () => {
+        await getDb().run("UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z'");
+        await sweepExpiredApprovals();
+      },
+    ],
+  ] as const)(
+    'leaves a held signup unknown when the principal %s its consent card, for the release path to end',
+    async (_case, decide) => {
+      const { id, approvalId } = await heldForConsent();
+      expect(await release(id)).toEqual({ status: 'not_releasable' });
+      await decide(approvalId);
+      expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+      expect(await lease()).toEqual({ job_id: job.thread_id });
+      expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+      // The host never submitted the form, and the card says so.
+      const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
+      expect(question).toContain(
+        `I filled in the signup for "${USERNAME}" on shop.example, but the site needed an agreement you didn't give, so I never submitted it.`,
+      );
+      expect(question).not.toContain('Trying again could');
+      await click('approve');
+      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+      expect(await lease()).toBeUndefined();
+    },
+  );
+
+  it('ends a held signup as unknown when its job is cancelled, keeping the site for the release', async () => {
+    const { id } = await heldForConsent();
+    const { cancelBrowserJob } = await import('./cancel.js');
+    expect(await cancelBrowserJob(job.thread_id!)).toMatchObject({ status: 'in_progress' });
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
   });
 
   it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, leaving 1Password untouched', async () => {

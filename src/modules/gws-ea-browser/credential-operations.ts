@@ -16,7 +16,11 @@
  * a URL change alone (KTD8). Values never leave host memory and 1Password.
  *
  * Phases are the attempt's: an attempt past its one disclosure is never
- * filled again, so a retry or restart cannot submit a second time. A request
+ * filled again, so a retry or restart cannot submit a second time. The one
+ * exception is a form the consent engine stopped on its first read after the
+ * fill, with no choice changed and no navigation since: it provably went
+ * unsubmitted, so the attempt waits (`awaiting_consent`, KTD11) and the same
+ * authority fills it again once the principal grants the wording. A request
  * cut off after its disclosure leaves the attempt `unknown` (KTD8), with its
  * site held for its job; nothing about it becomes a purchase record.
  *
@@ -325,8 +329,16 @@ function vaultLeft(
   }
 }
 
+/** Whether an attempt was held for the principal's consent before it became unknown: the host never submitted it. */
+function wasHeld(attempt: CredentialAttempt): boolean {
+  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+  return attempt.phase === 'unknown' && isRecord(evidence) && evidence.held === true;
+}
+
 /** What happened, as the principal reads it first on the card. */
 function situation(attempt: CredentialAttempt, account: string): string {
+  if (wasHeld(attempt))
+    return `I filled in ${attempt.kind === 'signup' ? 'the signup' : 'the new password'} for ${account}, but the site needed an agreement you didn't give, so I never submitted it.`;
   if (attempt.kind === 'signup')
     switch (attempt.phase) {
       case 'conflict':
@@ -355,7 +367,7 @@ function situation(attempt: CredentialAttempt, account: string): string {
 /** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
 function releaseQuestion(attempt: CredentialAttempt): string {
   const account = `${quoted(attempt.username, 256)} on ${attempt.site}`;
-  const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
+  const uncertain = (attempt.phase === 'unknown' && !wasHeld(attempt)) || attempt.phase === 'awaiting_verification';
   const consequence =
     attempt.kind === 'signup'
       ? `If you release it, I stop waiting on it and free the site, and I change nothing more in 1Password.${uncertain ? ' Trying again could create a second account.' : ''}`
@@ -697,7 +709,11 @@ function websiteOutcome(kind: CredentialKind, vault: VaultState): Outcome {
   }
 }
 
-/** An attempt past its one disclosure is reported, never filled again. */
+/**
+ * An attempt past its one disclosure is reported, never filled again, except one held unsubmitted for the
+ * principal's consent (KTD11), which the same authority fills again: the fill revalidates the frame and the
+ * form, and the consent engine stops it again until the principal agrees.
+ */
 async function settledOutcome(
   attempt: CredentialAttempt,
   attempts: CredentialAttempts,
@@ -706,6 +722,7 @@ async function settledOutcome(
   switch (attempt.phase) {
     case 'preparing':
     case 'saved':
+    case 'awaiting_consent':
       return undefined;
     case 'exposed':
     case 'unknown':
@@ -954,15 +971,21 @@ async function bindGroup(
   };
 }
 
+/** A submission the consent engine stopped, and whether it stopped on its first read, before setting any choice. */
+interface ConsentStopped {
+  readonly outcome: Outcome;
+  readonly firstRead: boolean;
+}
+
 /**
  * The consent engine's check before a credential submission (KTD11): it accepts the site's own terms, opts
- * out of marketing and stops for any other agreement. An outcome only when the submission must not go ahead.
+ * out of marketing and stops for any other agreement. A stop only when the submission must not go ahead.
  */
 async function consentStop(
   context: BrowserExecutionContext,
   page: Page,
   group: CredentialGroup,
-): Promise<Outcome | undefined> {
+): Promise<ConsentStopped | undefined> {
   const consent = await runConsentPass(page, group.element, {
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
@@ -971,9 +994,10 @@ async function consentStop(
     case 'ready':
       return undefined;
     case 'consent_required':
-      return { ...refused('consent_required'), consent: consent.stops };
+      return { outcome: { ...refused('consent_required'), consent: consent.stops }, firstRead: !consent.hostChanged };
+    // No grant clears an extra the site keeps, so a stop for one is never held.
     case 'add_on':
-      return refused('purchase_control');
+      return { outcome: refused('purchase_control'), firstRead: false };
   }
 }
 
@@ -1162,7 +1186,7 @@ async function runStep(
     await leaseSite(context, group);
     // The form's choices are made, or stopped for, before anything is saved or disclosed.
     const stopped = await consentStop(context, page, group);
-    if (stopped) return stopped;
+    if (stopped) return stopped.outcome;
     // Only a new password is a disclosure; a username-only step of a multi-step signup reveals nothing.
     return payload.new_password
       ? await disclosingStep(context, page, attempt, bind, group, attempts)
@@ -1225,7 +1249,7 @@ async function usernameStep(
   if (filled === 'not_inserted') return refused('form_changed');
   // The check again just before the press: a controlled form may have reset a choice as it took the values.
   const stopped = await consentStop(context, page, group);
-  if (stopped) return stopped;
+  if (stopped) return stopped.outcome;
   return activateWithin(context, page, group, values, [], async (activation) => {
     if (activation === 'uncertain') return { status: 'outcome_unknown' };
     if (activation !== 'activated') return refused('form_changed');
@@ -1243,7 +1267,8 @@ async function ensureSaved(
   attempts: CredentialAttempts,
   assertActive: () => Promise<void>,
 ): Promise<{ readonly saved: CredentialAttempt } | Stopped> {
-  if (attempt.phase === 'saved') return { saved: attempt };
+  // A held attempt's candidate was saved before its first fill.
+  if (attempt.phase === 'saved' || attempt.phase === 'awaiting_consent') return { saved: attempt };
   const saved =
     attempt.save_started_at === null
       ? await attempts.save(attempt.id, assertActive)
@@ -1414,11 +1439,21 @@ async function disclosingStep(
       return refused('form_changed');
     }
     // The check again just before the press. The values are in the page by now, so a stop here leaves the
-    // attempt unknown, as any activation that did not run does.
+    // attempt unknown, as any activation that did not run does, unless it provably went unsubmitted: stopped on
+    // its first read, before the host changed a choice, with no navigation since the fill. That one waits for
+    // the principal, keeping its stops, and the same authority fills it again after the grant (KTD11).
     const stopped = await consentStop(context, page, group);
     if (stopped) {
+      if (stopped.firstRead && !navigated) {
+        try {
+          await attempts.markAwaitingConsent(saved.id, { ...evidence('consent', filled, 'none'), held: true });
+          return stopped.outcome;
+        } catch (error) {
+          if (!(error instanceof CredentialAttemptError)) throw error;
+        }
+      }
       await settle(() => attempts.markUnknown(saved.id, evidence('consent', filled, 'none')));
-      return { ...stopped, status: 'outcome_unknown' };
+      return { ...stopped.outcome, status: 'outcome_unknown' };
     }
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
       if (activation === 'activated') await attempts.markAwaitingVerification(saved.id);
@@ -1544,6 +1579,9 @@ async function reconcile(
     case 'preparing':
     case 'saved':
       return refused('not_disclosed');
+    // Nothing was submitted: the form waits on the principal's consent, then credential_form fills it again.
+    case 'awaiting_consent':
+      return refused('consent_required');
     case 'confirmed':
       return await finalizedOutcome(attempt, attempts, context.assertActive);
     case 'unknown': {
@@ -1612,6 +1650,7 @@ async function verify(
   payload: CredentialVerifyPayload,
   attempts: CredentialAttempts,
 ): Promise<Outcome> {
+  if (attempt.phase === 'awaiting_consent') return refused('consent_required');
   if (attempt.phase !== 'awaiting_verification')
     return (await settledOutcome(attempt, attempts, context.assertActive)) ?? refused('not_disclosed');
   const arrived = await takeSignupVerification(context, attempt.id, context.remaining() - VERIFY_MARGIN_MS);
@@ -1659,7 +1698,8 @@ async function verify(
       await leaseSite(context, group);
       // The answer stays for the next verify when the form's choices stop the code's submission.
       return (
-        (await consentStop(context, page, group)) ?? enterCode(context, page, attempt, group, reply.value, attempts)
+        (await consentStop(context, page, group))?.outcome ??
+        enterCode(context, page, attempt, group, reply.value, attempts)
       );
     }),
   );

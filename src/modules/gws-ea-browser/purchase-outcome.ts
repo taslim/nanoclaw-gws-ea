@@ -7,11 +7,13 @@
  *
  * Every recording goes through the authority store's one resolve function: the first source to record an
  * outcome wins, and a later recording gets the recorded outcome back. A "placed" for an attempt recorded not
- * placed is the merchant's late confirmation of a possible duplicate: an incident, told at once. Main records the
- * attempts of a group whose browser access was removed.
+ * placed is the merchant's late confirmation of a possible duplicate: an incident, whose alarm is the recorder's
+ * own answer (KTD15). Main records the attempts of a group whose browser access was removed, and that group hears
+ * only that its errand stopped.
  */
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
+import { getSession } from '../../db/sessions.js';
 import type { DbDriver } from '../../db/driver.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
@@ -21,8 +23,8 @@ import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import { PurchaseAuthorityStore, type PurchaseAttemptRow, type ResolutionSource } from './authority.js';
 import { finishBrowserJobCancellation } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
-import { notifyIncident, recordIncidentWithStop } from './incidents.js';
-import { attemptSummary, notifyUnconfirmedPurchase } from './notices.js';
+import { recordIncidentWithStop } from './incidents.js';
+import { attemptSummary, notifyUnconfirmedPurchase, tellDelegator } from './notices.js';
 import type { BrowserQueue } from './queue.js';
 
 /** The host's sweep: every unconfirmed attempt whose delegating group has not heard of it yet. */
@@ -125,8 +127,18 @@ export async function recordPurchaseOutcome(
     case 'already_resolved': {
       const recorded = recordedAs(result.attempt);
       if (placed && recorded.outcome === 'not_placed') {
-        await lateConfirmation(job, result.attempt, source, queue());
-        return { status: 'possible_duplicate', thread: job.thread_id, recorded };
+        const created = await lateConfirmation(job, result.attempt, source, session.agent_group_id, queue());
+        const { what, total } = attemptSummary(result.attempt);
+        const purchase = `The ${what}${total ? ` for ${total}` : ''}`;
+        return {
+          status: 'possible_duplicate',
+          thread: job.thread_id,
+          recorded,
+          message: created
+            ? `${purchase} was recorded as not placed and is now reported placed after all, so the principal may ` +
+              'have bought it twice. The host stopped this errand. Tell the principal now.'
+            : `${purchase} was already reported as a possible duplicate, and the host stopped this errand then.`,
+        };
       }
       return { status: 'already_recorded', thread: job.thread_id, ...recorded };
     }
@@ -142,31 +154,50 @@ export async function recordPurchaseOutcome(
 
 /**
  * A purchase recorded not placed, reported placed after all (KTD10): the incident and its job's stop in one
- * transaction, then the urgent notice and the cancellation's own work.
+ * transaction, then the cancellation's own work. The recorder's answer is the alarm, so the incident is recorded
+ * told (KTD15); a delegating group other than the recorder hears only that its errand stopped. Whether this
+ * report raised the incident, rather than finding it raised.
  */
 async function lateConfirmation(
   job: BrowserJob,
   attempt: PurchaseAttemptRow,
   source: 'email' | 'principal',
+  recorder: string,
   queue: BrowserQueue,
-): Promise<void> {
-  const { incident, stop } = await recordIncidentWithStop(new BrowserStore(), job.thread_id, {
+): Promise<boolean> {
+  const { incident, stop, created } = await recordIncidentWithStop(new BrowserStore(), job.thread_id, {
     kind: 'late_confirmation',
     site: attempt.site,
     attemptId: attempt.id,
     evidenceKey: attempt.id,
     evidence: { reported: 'placed', source, recorded: recordedAs(attempt) },
+    told: true,
   });
-  /* eslint-disable no-catch-all/no-catch-all -- the incident and the job's stop are recorded: the sweep retries a
-     notice that fails here, and cleanup that fails never turns the possible duplicate into an error */
-  try {
-    await notifyIncident(incident.id);
-  } catch (error) {
-    log.warn('A browser incident notice will be retried', {
-      incident: incident.id,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
+  /* eslint-disable no-catch-all/no-catch-all -- the incident and the job's stop are recorded, and the recorder's
+     answer carries the alarm: a notice or cleanup that fails never turns the possible duplicate into an error */
+  if (created && job.source_agent_group_id !== recorder)
+    try {
+      const session = await getSession(job.browser_session_id);
+      const told = session
+        ? await tellDelegator(
+            { job: job.thread_id, session, source: job.source_agent_group_id },
+            {
+              id: `browser-incident-${incident.id}-stopped`,
+              timestamp: new Date().toISOString(),
+              text:
+                `Browser job ${job.thread_id} was stopped: the purchase on ${attempt.site} recorded as not placed was ` +
+                'reported placed after all. Main is telling the principal, so nothing more is needed from you.',
+            },
+          )
+        : 'no-delegating-session';
+      if (told !== 'written' && told !== 'already-written')
+        log.warn('A stopped errand’s delegating group could not be told', { incident: incident.id, result: told });
+    } catch (error) {
+      log.warn('A stopped errand’s delegating group could not be told', {
+        incident: incident.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   try {
     await finishBrowserJobCancellation(stop, queue);
   } catch (error) {
@@ -177,6 +208,7 @@ async function lateConfirmation(
     });
   }
   /* eslint-enable no-catch-all/no-catch-all */
+  return created;
 }
 
 export function registerPurchaseOutcomeDelivery(queue: () => BrowserQueue): void {

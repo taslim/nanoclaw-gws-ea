@@ -12,6 +12,7 @@ import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
+  browserCredentialConsentHoldMigration,
   browserDisclosuresMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
@@ -93,6 +94,7 @@ registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
+registerMigration(browserCredentialConsentHoldMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady);
 export function getBrowserRuntime(): BrowserRuntime {

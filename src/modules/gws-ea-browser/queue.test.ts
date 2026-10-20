@@ -1193,3 +1193,166 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await queue.stop();
   });
 });
+
+describe('the notice after an approved purchase that went no further', () => {
+  const live = new Date(Date.now() + 60 * 60_000).toISOString();
+  /** Delivers `frame` as the answer of the job's approved commit, and returns the notice the browser reads. */
+  async function deliverCommit(
+    data: Record<string, unknown>,
+    setup: (job: BrowserJob) => Promise<void> = async () => undefined,
+    expiresAt = live,
+  ): Promise<Record<string, unknown>> {
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Expected browser job');
+    await store.db.run(
+      `INSERT INTO gws_ea_browser_authorities
+       (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+       VALUES('notice-live',?,'checkout','live',?,'{}','[]','notice-attempt',?,?)`,
+      job.id,
+      JSON.stringify({ site: 'amazon.com' }),
+      expiresAt,
+      new Date().toISOString(),
+    );
+    await store.accept(
+      job,
+      session,
+      'notice-commit',
+      'browser_purchase_commit',
+      { authority_id: 'notice-live' },
+      90_000,
+    );
+    // What befell the job while its commit ran.
+    await setup(job);
+    const id = browserRequestId(session.id, 'notice-commit');
+    await store.answer(id, { id: 'notice-commit', ok: true, data }, new Date().toISOString());
+    const request = await store.request(id);
+    if (!request) throw new Error('Expected the commit request');
+    await new BrowserQueue(store, runtime).deliver(request);
+    const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    try {
+      const rows = inbound.prepare("SELECT content FROM messages_in WHERE id LIKE 'browser-commit-%'").all() as Array<{
+        content: string;
+      }>;
+      expect(rows).toHaveLength(1);
+      return JSON.parse((JSON.parse(rows[0].content) as { text: string }).text) as Record<string, unknown>;
+    } finally {
+      inbound.close();
+    }
+  }
+  const cancel = (job: BrowserJob) =>
+    store.db.run('UPDATE gws_ea_browser_jobs SET cancelled = 1 WHERE id = ?', job.id).then(() => undefined);
+
+  it.each([
+    [
+      'a lapsed checkout',
+      { status: 'checkout_lapsed', repeat_safe: true },
+      true,
+      false,
+      /Rebuild the checkout from a fresh observation and call purchase/,
+    ],
+    [
+      'an interrupted commit',
+      { status: 'stopped', reason: 'interrupted', repeat_safe: true },
+      true,
+      false,
+      /Rebuild the checkout from a fresh observation and call purchase/,
+    ],
+    [
+      'a browser that failed under the commit',
+      { status: 'stopped', reason: 'browser_unavailable', repeat_safe: false },
+      true,
+      false,
+      /Rebuild the checkout from a fresh observation and call purchase/,
+    ],
+    [
+      'an earlier purchase awaiting its outcome',
+      { status: 'waiting_on_earlier', site: 'amazon.com', repeat_safe: true },
+      false,
+      false,
+      /earlier purchase on this site is waiting for its outcome.*Browse on.*when the host wakes you.*call purchase.*approval holds until it expires/s,
+    ],
+    [
+      'a site another errand holds',
+      { status: 'stopped', reason: 'site_busy', repeat_safe: true },
+      false,
+      true,
+      /another errand holds this site.*wakes you when it is free.*call purchase again.*approval holds until it expires/s,
+    ],
+    [
+      'a checkout with no saved card',
+      { status: 'card_needed', repeat_safe: false },
+      false,
+      false,
+      /no payment method saved.*Report it to main/s,
+    ],
+    [
+      'a checkout missing facts',
+      { status: 'facts_incomplete', missing: ['the total'], repeat_safe: false },
+      false,
+      false,
+      /could not read the total.*Report it to main/s,
+    ],
+    [
+      'an unknown status',
+      { status: 'withdrawn', reason: 'authority_unavailable', repeat_safe: false },
+      false,
+      false,
+      /withdrawn.*as the purchase tool describes/s,
+    ],
+  ] as const)('tells the browser the truth about %s', async (_name, data, rebuild, repeatSafe, words) => {
+    const notice = await deliverCommit(data);
+    expect(notice).toMatchObject({ safe_to_rebuild: rebuild, repeat_safe: repeatSafe });
+    expect(notice.message).toMatch(/^No purchase was attempted/);
+    expect(notice.message).toMatch(words);
+    expect(notice.message).not.toMatch(/internal commit request/);
+  });
+
+  it('tells the browser a cancelled errand stops, whatever its checkout answered', async () => {
+    const notice = await deliverCommit({ status: 'checkout_lapsed', repeat_safe: true }, cancel);
+    expect(notice).toMatchObject({ safe_to_rebuild: false, repeat_safe: false });
+    expect(notice.message).toMatch(/this errand was cancelled.*stop/is);
+    expect(notice.message).not.toMatch(/call purchase/);
+  });
+
+  it('gives the host-written change when the host stopped a checkout that kept changing', async () => {
+    const notice = await deliverCommit(
+      {
+        status: 'checkout_changing',
+        reason: 'The total rose to $45.00, from $42.00.',
+        message:
+          'The checkout changed again after three changed cards (The total rose to $45.00, from $42.00.), so the host stopped this errand.',
+        repeat_safe: false,
+      },
+      cancel,
+    );
+    expect(notice).toMatchObject({ safe_to_rebuild: false, reason: 'The total rose to $45.00, from $42.00.' });
+    expect(notice.message).toMatch(
+      /\(The total rose to \$45\.00, from \$42\.00\.\), so the host stopped this errand.*Report it to main/s,
+    );
+    expect(notice.message).not.toMatch(/cancelled/);
+  });
+
+  it('tells the browser the host stopped an errand an incident ended', async () => {
+    const notice = await deliverCommit({ status: 'checkout_lapsed', repeat_safe: true }, async (job) => {
+      await cancel(job);
+      await store.db.run(
+        `INSERT INTO gws_ea_browser_incidents(id,kind,site,job_id,evidence_key,evidence_json,created_at)
+         VALUES('incident-notice','late_confirmation','amazon.com',?,'order-1','{}',?)`,
+        job.id,
+        new Date().toISOString(),
+      );
+    });
+    expect(notice).toMatchObject({ safe_to_rebuild: false });
+    expect(notice.message).toMatch(/placed after all, so the host stopped this errand.*Report it to main/s);
+  });
+
+  it('tells the browser an expired approval no longer covers the checkout', async () => {
+    const notice = await deliverCommit(
+      { status: 'checkout_lapsed', repeat_safe: true },
+      undefined,
+      new Date(Date.now() - 60_000).toISOString(),
+    );
+    expect(notice).toMatchObject({ safe_to_rebuild: false });
+    expect(notice.message).toMatch(/approval expired.*Report it to main/s);
+  });
+});

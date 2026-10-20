@@ -499,3 +499,58 @@ export const browserPurchaseOutcomesMigration: PortableMigration & { name: Modul
     `);
   },
 };
+
+/**
+ * A credential attempt held for the principal's consent (KTD11): a consent stop on the first read after the host
+ * filled the form, with no choice changed and no navigation since, so the form was provably not submitted. The
+ * table is rebuilt to add the `awaiting_consent` phase to its check; every row is copied as it is.
+ */
+export const browserCredentialConsentHoldMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:credential-consent-hold',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_browser_credential_attempts_held (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
+        job_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        vault_id TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        site TEXT NOT NULL,
+        username TEXT NOT NULL,
+        source_item_id TEXT,
+        source_version INTEGER,
+        candidate_item_id TEXT,
+        candidate_version INTEGER,
+        phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_consent','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
+        save_started_at TEXT,
+        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
+        settlement TEXT CHECK(settlement IN ('promoted','kept')),
+        evidence_json TEXT,
+        owned_item_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        exposed_at TEXT,
+        finalized_at TEXT,
+        CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
+        CHECK(owned_item_id IS NULL OR phase = 'finalized'),
+        CHECK(settlement IS NULL OR kind = 'rotation'),
+        CHECK(settlement IS NULL OR settlement = 'promoted' OR conflict_reason IS NOT NULL)
+      );
+      INSERT INTO gws_ea_browser_credential_attempts_held
+        (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
+         candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
+         owned_item_id,created_at,updated_at,exposed_at,finalized_at)
+        SELECT id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
+               candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
+               owned_item_id,created_at,updated_at,exposed_at,finalized_at
+          FROM gws_ea_browser_credential_attempts;
+      DROP TABLE gws_ea_browser_credential_attempts;
+      ALTER TABLE gws_ea_browser_credential_attempts_held RENAME TO gws_ea_browser_credential_attempts;
+      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
+      CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;
+    `);
+  },
+};

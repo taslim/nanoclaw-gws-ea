@@ -40,6 +40,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'host-only',
     reason: 'the log line written while nobody can be told yet',
   },
+  'gws-ea-browser/purchase-outcome.ts recordPurchaseOutcome: recorded, status, thread': {
+    kind: 'rendered',
+    reason:
+      "the possible duplicate's alarm says what was recorded first and what to do (KTD15); the thread is the recorder's own input",
+  },
   'gws-ea-browser/purchase-outcome.ts notifyUnconfirmedPurchase: kind': {
     kind: 'host-only',
     reason: 'the log line written while nobody can be told yet',

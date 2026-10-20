@@ -542,7 +542,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(result).toMatchObject({ status: 'refused', reason: 'read_only_recipe_required' });
@@ -558,7 +558,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(pending).toMatchObject({ status: 'awaiting_principal' });
@@ -598,7 +598,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(cards).toHaveLength(1);
@@ -792,9 +792,102 @@ const free = {
   venue: bounds.venue,
   party_size: 4,
   windows: bounds.windows,
-  financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+  financial: { currency: 'USD', max_total: '0' },
   until: bounds.until,
 };
+
+describe('a paid reader watch reads the venue’s terms itself (KTD12)', () => {
+  const NO_SHOW = 'No-show fee: $25 per guest, charged if you miss your reservation.';
+  /** A watch on Resy's Bistro for four, whose policy the host reads as `policy`, under the browser's own `financial`. */
+  async function watchBistro(
+    policy: Awaited<ReturnType<typeof watchRuntime.readBrowserWatchSetup>> extends infer Setup
+      ? Setup extends { policy?: infer Policy }
+        ? Policy
+        : never
+      : never,
+    financial: Record<string, unknown>,
+  ): Promise<{ result: Record<string, unknown>; cards: string[] }> {
+    const cards = await bindPrincipal();
+    const { context } = await executionContext('paid-watch');
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      availability: {
+        status: 'ready',
+        site: 'resy.com',
+        venue: bounds.venue,
+        partySize: 4,
+        currency: 'USD',
+        timeZone: 'UTC',
+        slots: [],
+      },
+      policy,
+    });
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+      jobId,
+      new Date().toISOString(),
+    );
+    const result = await createBrowserWatch(context, {
+      site: 'https://resy.com/search',
+      recipe_id: 'check-recipe',
+      parameters: {},
+      venue: bounds.venue,
+      party_size: 4,
+      windows: bounds.windows,
+      financial,
+      until: bounds.until,
+    });
+    return { result, cards };
+  }
+  const noShow = (amountMinor: number | undefined) => ({
+    currency: 'USD',
+    dueNowMinor: 0,
+    commitments: [
+      {
+        kind: 'conditional_fee' as const,
+        terms: NO_SHOW,
+        ...(amountMinor === undefined ? {} : { amountMinor }),
+        perPerson: true,
+        trigger: 'No-show',
+        conditionalTrigger: 'no_show' as const,
+        cancellationTerms: 'Cancel at least 24 hours before arrival',
+        cancellationBeforeMs: 86_400_000,
+      },
+    ],
+  });
+
+  it('arms through its card, with the terms the host read, whatever the browser called them', async () => {
+    const { result, cards } = await watchBistro(noShow(2500), {
+      currency: 'USD',
+      max_total: '100.00',
+      terms: 'a no-show fee of about $25 a head',
+    });
+    expect(result).toMatchObject({ status: 'awaiting_principal' });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toContain(NO_SHOW);
+    expect(cards[0]).not.toContain('about $25 a head');
+  });
+
+  it('arms with no terms from the browser at all', async () => {
+    const { result } = await watchBistro(noShow(2500), { currency: 'USD', max_total: '100.00' });
+    expect(result).toMatchObject({ status: 'awaiting_principal' });
+  });
+
+  it('refuses a fee above the maximum as such, stating the fee it read and the exposure', async () => {
+    const { result, cards } = await watchBistro(noShow(2500), { currency: 'USD', max_total: '80.00' });
+    expect(result).toMatchObject({ status: 'refused', reason: 'terms_over_bounds', exposure: '$100.00' });
+    expect(result.message).toContain('$100.00');
+    expect(result.message).toContain('$80.00');
+    expect(result.message).toContain(NO_SHOW);
+    expect(result.message).toMatch(/EXTERNAL_UNTRUSTED_CONTENT/);
+    expect(cards).toEqual([]);
+  });
+
+  it('still answers terms_unavailable for a policy it could not read', async () => {
+    const { result, cards } = await watchBistro(noShow(undefined), { currency: 'USD', max_total: '100.00' });
+    expect(result).toEqual({ status: 'refused', reason: 'terms_unavailable' });
+    expect(cards).toEqual([]);
+  });
+});
 
 describe('venue release schedules and card times', () => {
   it('reads a release rule apart from the bounds and refuses one it could not schedule', () => {
@@ -874,7 +967,7 @@ describe('venue release schedules and card times', () => {
     const request = {
       ...free,
       windows: [{ start: '2026-11-24T19:00:00+09:00', end: '2026-11-24T21:00:00+09:00' }],
-      financial: { currency: 'JPY', max_total: '20000', terms },
+      financial: { currency: 'JPY', max_total: '20000' },
       until: '2026-11-24T00:00:00Z',
     };
     const created = await createBrowserWatch(context, {
@@ -1010,7 +1103,7 @@ describe('watches on sites with no reader (KTD20)', () => {
     venue: { id: 'the-larder', name: 'The Larder' },
     party_size: 2,
     windows: regionBounds.windows,
-    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+    financial: { currency: 'USD', max_total: '0' },
     until: regionBounds.until,
   };
 

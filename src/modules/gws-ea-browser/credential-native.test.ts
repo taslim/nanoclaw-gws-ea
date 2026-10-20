@@ -56,13 +56,15 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
-import { executeCredentialForm } from './credential-operations.js';
+import { executeCredentialForm, recoverCredentialAttempts } from './credential-operations.js';
+import { recordConsentGrant } from './consent.js';
 import { executeBrowserBatch } from './executor.js';
 
 import './index.js';
 import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
+  browserCredentialConsentHoldMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
@@ -92,6 +94,28 @@ const nativeForm = (action: string, button = 'Create account', extra = ''): stri
   `<h1>Join</h1><form method="post" action="${action}">${signupFields}${extra}<button type="submit">${button}</button></form><p>Password must be at least 12 characters.</p>`;
 const checkbox = (name: string, label: string, required: string): string =>
   `<label><input type="checkbox" name="${name}"${required}> ${label}</label>`;
+const WAIVER = 'I have read and accept the liability waiver';
+/**
+ * A form's own reaction to the password reaching it: `run` with `box(name, label)`, which adds an unticked box
+ * with that label before the submit control, or finds and unticks the one added before.
+ */
+const onFill = (run: string): string => `<script>
+  const form = document.querySelector('form');
+  const box = (name, label) => {
+    let input = form.querySelector('[name=' + name + ']');
+    if (!input) {
+      const wrapper = document.createElement('label');
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.name = name;
+      wrapper.append(input, ' ' + label);
+      form.insertBefore(wrapper, form.querySelector('button'));
+    }
+    input.checked = false;
+    return input;
+  };
+  form.querySelector('[name=password]').addEventListener('input', (event) => { if (event.target.value) { ${run} } });
+</script>`;
 /** A React-like controlled form: state changes only on input events whose value its own tracker has not seen. */
 const controlled = (submit: string, endpoint = '/api/signup'): string => `<div id="result"></div><script>
   const state = {};
@@ -183,6 +207,14 @@ const PAGES: Record<string, string> = {
     });
   </script>`,
   '/agree-signup': nativeForm('/signup', 'Agree and create account'),
+  // Each fill resets a box only the principal can agree to: the form shows it, unticked, once a password is typed.
+  '/waiver-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}');`)}`,
+  // The fill also moves the page to a new address, as a single-page app's router does.
+  '/waiver-and-route-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}'); history.pushState({}, '', '/join/password');`)}`,
+  // After the fill the page ticks an offers box again whenever the host unticks it.
+  '/offers-on-fill': `${nativeForm('/signup')}${onFill(`const offers = box('offers', 'Send me news and special offers'); offers.checked = true; offers.addEventListener('change', () => { if (!offers.checked) setTimeout(() => { offers.checked = true; }, 20); });`)}`,
+  // After the fill the page adds a paid extra it keeps.
+  '/donation-on-fill': `${nativeForm('/signup')}${onFill(`const gift = box('donation', 'Add a $1 donation to the Food Bank'); gift.required = true; gift.checked = true;`)}`,
   '/agree-money': `${nativeForm('/signup', 'Agree and create account')}<p>Premium is $9.99 per month after you join.</p>`,
   '/agree-outside': `<h1>Join</h1><form method="post" action="/signup">${signupFields}</form><div role="button" tabindex="0" id="go">Agree and create account</div><script>
     document.getElementById('go').addEventListener('click', () => document.querySelector('form').requestSubmit());
@@ -329,6 +361,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     const db = await initSqliteTestDb();
     await browserSiteLeasesMigration.up(db);
     await browserCredentialAttemptsMigration.up(db);
+    await browserCredentialConsentHoldMigration.up(db);
     // Consent stops name their job; this suite's job needs no other row.
     await db.exec(
       `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
@@ -964,6 +997,113 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         });
         expect(posts).toEqual([]);
         expect(await attempts.get(authority.id)).toMatchObject({ exposed_at: null });
+      }, 30_000);
+  });
+
+  describe('a box only the principal can agree to, which the form resets on every fill (KTD11)', () => {
+    const stops = () =>
+      getDb().all<{ id: string; site: string; origin: string; wording: string }>(
+        'SELECT id,site,origin,wording FROM gws_ea_browser_consent_stops ORDER BY created_at',
+      );
+    /** The principal's yes on the card for the form's stop, as the consent card's approval records it. */
+    async function grant(): Promise<void> {
+      const [stop] = await stops();
+      await recordConsentGrant(getDb(), {
+        site: stop.site,
+        origin: stop.origin,
+        wording: stop.wording,
+        approvalId: 'approval-waiver',
+        principalUserId: 'gchat:users/principal',
+      });
+      await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'approved' WHERE id = ?", stop.id);
+    }
+    /** What the page's fields hold and what an observation shows, where the password must not be. */
+    const pageText = async (): Promise<string> =>
+      `${JSON.stringify(await page.evaluate("Array.from(document.querySelectorAll('input'), (input) => input.value)"))}${(await observePage(page)).snapshot}`;
+
+    it('covers AE4: holds the filled form unsubmitted, and after one grant the same authority completes it', async () => {
+      await page.goto(`${SITE}/waiver-on-fill`);
+      const authority = await signupAuthority();
+      const held = await fill(authority, await refs(SIGNUP));
+      const [stop] = await stops();
+      expect(held).toEqual({
+        status: 'refused',
+        reason: 'consent_required',
+        consent: [{ stop_id: stop.id, site: 'shop.example', wording: WAIVER }],
+      });
+      expect(posts).toEqual([]);
+      expect(await attempts.get(authority.id)).toMatchObject({
+        phase: 'awaiting_consent',
+        exposed_at: expect.any(String),
+      });
+      const password = await candidatePassword(authority.id);
+      expect(await pageText()).not.toContain(password);
+      await grant();
+      const done = await fill(authority, await refs(SIGNUP));
+      expect(done).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts).toEqual([
+        {
+          host: 'accounts.shop.example',
+          path: '/signup',
+          body: new URLSearchParams({
+            email: USERNAME,
+            password,
+            password_confirmation: password,
+            waiver: 'on',
+          }).toString(),
+        },
+      ]);
+      // One candidate, one disclosure's value, and no answer that carries it.
+      expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
+      expect(JSON.stringify([held, done])).not.toContain(password);
+    }, 30_000);
+
+    it('keeps the hold across a host restart, and completes after the grant', async () => {
+      await page.goto(`${SITE}/waiver-on-fill`);
+      const authority = await signupAuthority();
+      expect(await fill(authority, await refs(SIGNUP))).toMatchObject({ reason: 'consent_required' });
+      // A fresh process knows only the durable record and 1Password.
+      const restarted = new CredentialAttempts({ db: getDb(), vault });
+      await recoverCredentialAttempts(restarted);
+      expect(await restarted.get(authority.id)).toMatchObject({ phase: 'awaiting_consent' });
+      await grant();
+      expect(
+        await executeCredentialForm(
+          context(),
+          { authority: authority.id, ...(await refs(SIGNUP)) },
+          { attempts: restarted },
+        ),
+      ).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts.map((post) => post.path)).toEqual(['/signup']);
+    }, 30_000);
+
+    it('asks again, still holding, when the form is submitted before the principal answers', async () => {
+      await page.goto(`${SITE}/waiver-on-fill`);
+      const authority = await signupAuthority();
+      await fill(authority, await refs(SIGNUP));
+      expect(await fill(authority, await refs(SIGNUP))).toMatchObject({
+        status: 'refused',
+        reason: 'consent_required',
+      });
+      expect(posts).toEqual([]);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'awaiting_consent' });
+    }, 30_000);
+
+    for (const [path, outcome, why] of [
+      [
+        '/offers-on-fill',
+        { status: 'outcome_unknown', reason: 'consent_required' },
+        'a page that undoes a choice the host set after the fill',
+      ],
+      ['/waiver-and-route-on-fill', { status: 'outcome_unknown', reason: 'consent_required' }, 'a fill that navigated'],
+      ['/donation-on-fill', { status: 'outcome_unknown', reason: 'purchase_control' }, 'a paid extra after the fill'],
+    ] as const)
+      it(`leaves the attempt unknown, never held, after ${why}`, async () => {
+        await page.goto(`${SITE}${path}`);
+        const authority = await signupAuthority();
+        expect(await fill(authority, await refs(SIGNUP))).toMatchObject(outcome);
+        expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+        expect(posts).toEqual([]);
       }, 30_000);
   });
 

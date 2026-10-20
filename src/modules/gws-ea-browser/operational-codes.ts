@@ -46,6 +46,7 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'expired',
   'superseded',
   'terms_unavailable',
+  'terms_over_bounds',
   'facts_incomplete',
   'card_needed',
   'checkout_changing',

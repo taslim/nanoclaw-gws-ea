@@ -6,7 +6,9 @@
  * saved for it, and the phase it reached:
  *
  *   preparing → saved → exposed → awaiting_verification → confirmed → finalized
+ *   exposed → awaiting_consent → exposed, when a consent stop held the filled form unsubmitted until a grant
  *   exposed | awaiting_verification → unknown → confirmed | rejected
+ *   awaiting_consent → unknown, when the principal declines, the card lapses or the job is cancelled
  *   unknown → awaiting_verification, when the site's late response asks for email verification
  *   awaiting_verification → rejected;  confirmed → conflict, when the login changed in 1Password meanwhile
  *   preparing | saved → rejected, when abandoned before any disclosure
@@ -52,6 +54,7 @@ export type CredentialAttemptPhase =
   | 'preparing'
   | 'saved'
   | 'exposed'
+  | 'awaiting_consent'
   | 'awaiting_verification'
   | 'unknown'
   | 'rejected'
@@ -662,7 +665,8 @@ export class CredentialAttempts {
   ): Promise<CredentialDisclosure> {
     const attempt = await this.require(id);
     if (attempt.job_id !== binding.jobId) return refused('wrong_job');
-    if (attempt.phase !== 'saved' && attempt.phase !== 'exposed') return refused('not_saved');
+    if (attempt.phase !== 'saved' && attempt.phase !== 'exposed' && attempt.phase !== 'awaiting_consent')
+      return refused('not_saved');
     if (registrableDomain(binding.origin) !== attempt.site) return refused('origin_mismatch');
     const candidate = await this.candidate(attempt, assertActive);
     if (!('secret' in candidate)) return candidate.status === 'mismatch' ? refused('candidate_mismatch') : candidate;
@@ -680,7 +684,7 @@ export class CredentialAttempts {
     const at = now();
     const changed = await this.db.run(
       `UPDATE ${TABLE} SET phase = 'exposed', exposed_at = COALESCE(exposed_at, ?), updated_at = ?
-       WHERE id = ? AND job_id = ? AND phase IN ('saved','exposed')`,
+       WHERE id = ? AND job_id = ? AND phase IN ('saved','exposed','awaiting_consent')`,
       at,
       at,
       id,
@@ -740,6 +744,36 @@ export class CredentialAttempts {
     }
     if (to === 'rejected') this.secrets.delete(id);
     return this.require(id);
+  }
+
+  /**
+   * A consent stop on the first read after the fill, with no choice changed and no navigation since: the form
+   * provably went unsubmitted, so the same authority may fill it again once the principal grants the wording.
+   */
+  markAwaitingConsent(id: string, evidence: CredentialEvidence): Promise<CredentialAttempt> {
+    return this.move(id, ['exposed'], 'awaiting_consent', evidence);
+  }
+
+  /**
+   * The held attempts of `jobId`, on `site` when given, become unknown, DB-only so a cancellation can join its
+   * transaction: the principal declined, the card lapsed or the job is ending, and only reconciliation or the
+   * principal's release settles them now.
+   */
+  async endConsentHolds(jobId: string, site?: string): Promise<string[]> {
+    const ended: string[] = [];
+    for (const { id } of await this.db.all<{ id: string }>(
+      `SELECT id FROM ${TABLE} WHERE job_id = ? AND phase = 'awaiting_consent'${site === undefined ? '' : ' AND site = ?'} ORDER BY created_at, id`,
+      jobId,
+      ...(site === undefined ? [] : [site]),
+    )) {
+      const changed = await this.db.run(
+        `UPDATE ${TABLE} SET phase = 'unknown', updated_at = ? WHERE id = ? AND phase = 'awaiting_consent'`,
+        now(),
+        id,
+      );
+      if (changed.changes) ended.push(id);
+    }
+    return ended;
   }
 
   /** The bounded activation ran after disclosure; its outcome is not yet verified. */

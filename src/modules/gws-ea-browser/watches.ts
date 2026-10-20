@@ -39,6 +39,7 @@ import { type StructuredBrowserLocator } from './locators.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { principalClock, watchSitePolicy, watchStartAt, type WatchReleaseRule } from './watch-policy.js';
 import { quoted } from '../approvals/request-text.js';
+import { untrusted } from '../gws-ea-inbox/untrusted.js';
 
 interface WatchReleaseInput {
   schedule: WatchReleaseRule['schedule'];
@@ -54,7 +55,7 @@ interface WatchInput extends Record<string, unknown> {
   venue: { id: string; name: string };
   party_size: number;
   windows: Array<{ start: string; end: string }>;
-  financial: { currency: string; max_total: string; terms: string };
+  financial: { currency: string; max_total: string };
   until: string;
   release?: WatchReleaseInput;
   /** On a site with no reader, the observation ref of the region that shows availability (KTD20). */
@@ -149,11 +150,9 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     typeof financial.currency !== 'string' ||
     !/^[A-Z]{3}$/u.test(financial.currency) ||
     typeof financial.max_total !== 'string' ||
-    amountMinor(financial.max_total, financial.currency) === undefined ||
-    typeof financial.terms !== 'string' ||
-    !financial.terms.trim()
+    amountMinor(financial.max_total, financial.currency) === undefined
   )
-    throw invalidArgs('Financial bounds need a currency, exact nonnegative amount and terms.');
+    throw invalidArgs('Financial bounds need a currency and an exact nonnegative maximum.');
   try {
     if (new URL(raw.site).protocol !== 'https:') throw new Error('HTTPS required');
     browserSite(raw.site);
@@ -183,7 +182,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     venue: { id: raw.venue.id, name: raw.venue.name },
     party_size: Number(raw.party_size),
     windows,
-    financial: { currency: financial.currency, max_total: financial.max_total, terms: financial.terms },
+    financial: { currency: financial.currency, max_total: financial.max_total },
     until,
     ...(release ? { release } : {}),
     ...(region ? { region } : {}),
@@ -301,7 +300,31 @@ type PreparedWatch =
       venueTimeZone: string | undefined;
       region?: { locator: StructuredBrowserLocator; text: string };
     }
-  | { status: 'refused'; reason: string };
+  | { status: 'refused'; reason: string; exposure?: string; max_total?: string; message?: string };
+/**
+ * A paid venue whose terms can charge more than the principal's maximum: the terms the host read and what they come
+ * to for the party, so main can ask the principal for a higher maximum.
+ */
+function termsOverBounds(
+  site: string,
+  policy: ReservationPolicy,
+  exposureMinor: number,
+  maxTotalMinor: number,
+  partySize: number,
+): PreparedWatch {
+  const exposure = formatMoney(exposureMinor, policy.currency);
+  const maximum = formatMoney(maxTotalMinor, policy.currency);
+  return {
+    status: 'refused',
+    reason: 'terms_over_bounds',
+    exposure,
+    max_total: maximum,
+    message:
+      `No watch was set: the venue's terms can charge up to ${exposure} for a party of ${partySize}, above the ` +
+      `maximum of ${maximum}. Report it to main with the terms as the host read them, so main can ask the ` +
+      `principal for a higher maximum:\n${untrusted(policy.commitments.map((term) => term.terms).join('\n'), 1200, site)}`,
+  };
+}
 /** A reader watch's bounds and release (Resy): the venue, its zone and its terms as the host reads them. */
 async function prepareReaderWatch(
   context: BrowserExecutionContext,
@@ -325,16 +348,13 @@ async function prepareReaderWatch(
   const freeOnly = maxTotalMinor === 0;
   const policy = setup.policy;
   if (!freeOnly) {
-    const expectedTerms = policy?.commitments.map((term) => term.terms).join('; ');
-    const exposure = policy ? financialExposure(policy.commitments, input.party_size) : Infinity;
+    // The host reads the venue's terms itself: the card shows them, and the principal's maximum bounds them.
     if (
       !policy ||
       policy.currency !== input.financial.currency ||
       !policy.commitments.length ||
-      expectedTerms !== input.financial.terms ||
       !Number.isSafeInteger(policy.dueNowMinor) ||
       policy.dueNowMinor < 0 ||
-      Math.max(exposure, policy.dueNowMinor) > maxTotalMinor ||
       policy.commitments.some(
         (term) =>
           !term.terms ||
@@ -347,6 +367,8 @@ async function prepareReaderWatch(
       )
     )
       return { status: 'refused', reason: 'terms_unavailable' };
+    const exposure = Math.max(financialExposure(policy.commitments, input.party_size), policy.dueNowMinor);
+    if (exposure > maxTotalMinor) return termsOverBounds(site, policy, exposure, maxTotalMinor, input.party_size);
   }
   return {
     status: 'ready',

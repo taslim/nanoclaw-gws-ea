@@ -230,7 +230,8 @@ registerTools(
     credentialAuthority,
     consentGrants,
     recordDisclosure,
-    recordPurchaseOutcome,
   ],
   'browser-delegate',
 );
+// Main records the purchases of a group that lost browser access, so this one reaches main and every delegator.
+registerTools([recordPurchaseOutcome], 'browser-purchase-outcome');
