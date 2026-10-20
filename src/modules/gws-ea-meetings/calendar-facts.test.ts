@@ -306,7 +306,7 @@ describe('find_conflicts', () => {
       organizer: WORK,
     } satisfies Conflict);
     expect(message).toBe(
-      'Tuesday, Oct 6, 10:00–11:00 AM BST overlaps:\n' +
+      "Tuesday, Oct 6, 10:00–11:00 AM BST is not free. Each block below takes the principal's time, including any their calendar shows with no details:\n" +
         `- Tuesday, Oct 6, 10:30–11:30 AM BST (overlapping 30 minutes); on the principal's calendar at northwind.example; organized by the principal; the principal's answer: accepted; title:\n${standup.title}`,
     );
   });
@@ -532,7 +532,7 @@ describe('find_conflicts', () => {
     expect(hostWords(text)).not.toMatch(/needsAction|tentative/u);
   });
 
-  it('says a free/busy-only block is busy with no details, naming no calendar address', async () => {
+  it('says a free/busy-only block takes all of its time though it shows no details, naming its calendar but no address', async () => {
     calendar.put({
       calendarId: HOME,
       id: 'busy-only',
@@ -544,10 +544,58 @@ describe('find_conflicts', () => {
     const text = await message('find_conflicts', { start: at('10:00'), end: at('11:00') });
 
     expect(entries(text)).toEqual([
-      '- Tuesday, Oct 6, all day: busy, no details',
-      '- Tuesday, Oct 6, 10:15–10:45 AM BST (overlapping 30 minutes): busy, no details',
+      "- Tuesday, Oct 6, all day; on the principal's Gmail calendar; busy, with no details shown: the principal is taken for all of it",
+      "- Tuesday, Oct 6, 10:15–10:45 AM BST (overlapping 30 minutes); on the principal's Gmail calendar; busy, with no details shown: the principal is taken for all of it",
     ]);
     expect(text).not.toContain(HOME);
+  });
+
+  it('lists a no-details block that runs past a titled meeting as taking the time to its own end', async () => {
+    calendar.calendars.set(WORK, { id: WORK, accessRole: 'writer', summary: 'Northwind' });
+    calendar.put(
+      timed(WORK, at('10:00'), at('10:30'), {
+        summary: 'Design review',
+        organizer: { email: WORK, self: true },
+        attendees: [own(WORK), guest(ALICE)],
+      }),
+    );
+    calendar.put({
+      calendarId: HOME,
+      id: 'busy-only',
+      start: { dateTime: at('10:00') },
+      end: { dateTime: at('11:00') },
+    });
+
+    const text = await message('find_conflicts', { start: at('10:00'), end: at('10:30') });
+
+    const [header, ...rest] = hostWords(text).split('\n');
+    expect(header).toBe(
+      "Tuesday, Oct 6, 10:00–10:30 AM BST is not free. Each block below takes the principal's time, including any their calendar shows with no details:",
+    );
+    expect(entries(rest.join('\n'))).toEqual([
+      "- Tuesday, Oct 6, 10:00–10:30 AM BST (overlapping 30 minutes); on Northwind; organized by the principal; the principal's answer: accepted; title:",
+      "- Tuesday, Oct 6, 10:00–11:00 AM BST (overlapping 30 minutes); on the principal's Gmail calendar; busy, with no details shown: the principal is taken for all of it",
+    ]);
+    expect(text).toContain('Design review');
+  });
+
+  it('names no address for a no-details block whose calendar only its address tells apart', async () => {
+    const other = 'pat.lee.home@googlemail.com';
+    await addPrincipalAddress(other);
+    calendar.calendars.set(other, { id: other, accessRole: 'reader' });
+    calendar.put({
+      calendarId: other,
+      id: 'busy-only',
+      start: { dateTime: at('10:00') },
+      end: { dateTime: at('11:00') },
+    });
+
+    const text = await message('find_conflicts', { start: at('10:00'), end: at('11:00') });
+
+    expect(entries(text)).toEqual([
+      '- Tuesday, Oct 6, 10:00–11:00 AM BST (overlapping 60 minutes); busy, with no details shown: the principal is taken for all of it',
+    ]);
+    expect(text).not.toContain(other);
   });
 
   it('names a calendar Google calls by its address as the principal would hear it, never by the address', async () => {

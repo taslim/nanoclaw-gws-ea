@@ -252,13 +252,24 @@ function listMessage(head: string, entries: readonly string[], total: number): s
 
 /**
  * One conflict as main reads it. A block with no title, free/busy-only or
- * hidden, says only that the time is busy, naming no calendar: Google shows
- * nothing more of it, and it is no meeting main could speak of.
+ * hidden, says in words that it takes all of its own time: a bare "busy" line
+ * next to a titled meeting at the same start reads as that meeting's shadow,
+ * and main once answered from the meeting's end alone. It names its calendar,
+ * so it reads as a block of its own, but never by an address: two calendars
+ * told apart only by their addresses need no telling apart for a busy block.
  */
 function conflictLine(conflict: Conflict, view: FactsView): string {
   const overlapping = conflict.overlap_minutes === 0 ? 'under a minute' : count(conflict.overlap_minutes, 'minute');
   const when = conflict.all_day ? conflict.when : `${conflict.when} (overlapping ${overlapping})`;
-  if (conflict.title === null) return `- ${when}: busy, no details`;
+  const calendars = conflict.calendars.map((id) => view.names.get(id) ?? id);
+  if (conflict.title === null) {
+    const named = calendars.filter((name) => !EMAIL_PATTERN.test(name));
+    return [
+      `- ${when}`,
+      ...(named.length === 0 ? [] : [`on ${LIST.format(named)}`]),
+      'busy, with no details shown: the principal is taken for all of it',
+    ].join('; ');
+  }
   const answer = conflict.principal_response === null ? undefined : ANSWER_WORDS[conflict.principal_response];
   const organizer =
     conflict.organizer === null
@@ -266,7 +277,7 @@ function conflictLine(conflict: Conflict, view: FactsView): string {
       : `organized by ${view.addresses.has(conflict.organizer) ? 'the principal' : conflict.organizer}`;
   return [
     `- ${when}`,
-    `on ${LIST.format(conflict.calendars.map((id) => view.names.get(id) ?? id))}`,
+    `on ${LIST.format(calendars)}`,
     ...(organizer === undefined ? [] : [organizer]),
     ...(answer === undefined ? [] : [`the principal's answer: ${answer}`]),
     `title:\n${conflict.title}`,
@@ -402,7 +413,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
         conflicts.length === 0
           ? `${checked} is free on the principal's calendars.`
           : listMessage(
-              `${checked} overlaps:`,
+              `${checked} is not free. Each block below takes the principal's time, including any their calendar shows with no details:`,
               listed.map((conflict) => conflictLine(conflict, view)),
               conflicts.length,
             ),
