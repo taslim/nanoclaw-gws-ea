@@ -192,7 +192,14 @@ export async function handoffBrowserDownload(
     if (!inbox) throw new Error('Inbox missing');
     try {
       directory = inbox.openDir(artifactId, true);
-      if (directory) makePrivate(inbox, path.dirname(target), artifactId);
+      if (directory) {
+        try {
+          makePrivate(inbox, path.dirname(target), artifactId);
+        } catch (error) {
+          directory.close();
+          throw error;
+        }
+      }
     } finally {
       inbox.close();
     }
@@ -251,9 +258,16 @@ function makePrivate(inbox: AnchoredDir, folder: string, name: string): void {
     constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
   );
   try {
-    const opened = fs.fstatSync(fd);
+    const opened = fs.fstatSync(fd, { bigint: true });
     const held = inbox.lstat(name);
-    if (opened.dev !== held.dev || opened.ino !== held.ino) throw new Error('Download inbox changed during handoff');
+    // The anchored side reads identities as numbers: only one below 2^53 is
+    // exact, so a larger one is refused rather than compared rounded.
+    const same =
+      Number.isSafeInteger(held.dev) &&
+      Number.isSafeInteger(held.ino) &&
+      opened.dev === BigInt(held.dev) &&
+      opened.ino === BigInt(held.ino);
+    if (!same) throw new Error('Download inbox changed during handoff');
     fs.fchmodSync(fd, 0o700);
   } finally {
     fs.closeSync(fd);
