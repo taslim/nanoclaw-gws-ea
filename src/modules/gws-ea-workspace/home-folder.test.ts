@@ -191,7 +191,7 @@ describe('the home folder', () => {
     ]);
   });
 
-  it('tells main where the new folder is, once, without waking it', async () => {
+  it('tells main where the new folder is, once, without waking it, and to use its id until its environment carries it', async () => {
     await setUpProfile();
     await world.home.tick();
     await world.home.tick();
@@ -200,7 +200,9 @@ describe('the home folder', () => {
       {
         id: `gws-ea-workspace-home-folder-${folderId()}`,
         timestamp: AT,
-        text: expect.stringContaining(`\`${folderId()}\``),
+        text:
+          `Your home folder in Google Drive is ready, with the id \`${folderId()}\`: every one of the principal's addresses can open it. ` +
+          'Your environment carries it from your next start; until then, use that id wherever the gworkspace skill reads `$GWS_EA_HOME_FOLDER_ID`.',
         wake: false,
       },
     ]);
@@ -500,8 +502,10 @@ describe('the home folder', () => {
       `gws-ea-workspace-home-folder-${old}`,
       `gws-ea-workspace-home-folder-${id}`,
     ]);
-    expect(world.notes[1].text).toContain(`\`${id}\``);
-    expect(world.notes[1].text).toMatch(/deleted/u);
+    expect(world.notes[1].text).toBe(
+      `Your home folder in Google Drive was deleted for good, so there is a new one, with the id \`${id}\`. ` +
+        'Your environment carries it from your next start; until then, use that id wherever the gworkspace skill reads `$GWS_EA_HOME_FOLDER_ID`.',
+    );
   });
 
   it("keeps a folder's name: one made before this release, or before the principal's name changed, is never renamed", async () => {

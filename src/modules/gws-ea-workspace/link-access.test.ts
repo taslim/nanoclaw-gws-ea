@@ -180,7 +180,9 @@ describe('a file the assistant can only view (AE3)', () => {
     expect(drive.calls.filter((call) => call.op === 'listPermissions')).toEqual([]);
 
     const told = refusal(await check({ texts: [`Deck: ${deckUrl(id)}`], writer: 'external-email' }));
-    expect(told).toBe(`${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`);
+    expect(told).toBe(
+      `${REMY} can't open ${deckUrl(id)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
+    );
     expect(told).not.toContain(MORGAN);
     expect(told).not.toContain('Board deck');
   });
@@ -279,7 +281,27 @@ describe('a message with many links and recipients', () => {
     for (const person of [REMY, NOEL]) await drive.createPermission(id, { emailAddress: person, role: 'reader' });
     expect(
       refusal(await check({ texts: [docUrl(id)], recipients: [REMY, NOEL, SALES], writer: 'external-email' })),
-    ).toBe(`${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`);
+    ).toBe(
+      `${SALES} can't open ${docUrl(id)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
+    );
+  });
+
+  it('names to external-email each link someone cannot open, with who, so main hears which', async () => {
+    const { drive, check, owned } = world();
+    const agenda = await owned('Agenda');
+    const notes = await owned('Notes');
+    await drive.createPermission(agenda, { emailAddress: REMY, role: 'reader' });
+    expect(
+      refusal(
+        await check({
+          texts: [`Agenda: ${docUrl(agenda)}\nNotes: ${docUrl(notes)}`],
+          recipients: [REMY, NOEL],
+          writer: 'external-email',
+        }),
+      ),
+    ).toBe(
+      `${NOEL} can't open ${docUrl(agenda)}. ${REMY} and ${NOEL} can't open ${docUrl(notes)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
+    );
   });
 
   it('names to main, in one sentence, every recipient who cannot open a link for the same reason', async () => {
@@ -434,7 +456,7 @@ describe('when the host has no Drive access', () => {
     expect(reason).toContain(docUrl(id));
   });
 
-  it('still lets a public link through, and tells external-email only to tell main otherwise', async () => {
+  it('still lets a public link through, and otherwise tells external-email only which link to wake main about', async () => {
     const { drive, answers, check, owned } = world();
     const id = await owned();
     drive.failNext('getFile', new GoogleScopeNotGrantedError('drive-host'));
@@ -442,9 +464,12 @@ describe('when the host has no Drive access', () => {
     expect(await check({ texts: [docUrl(id)] })).toEqual({ allowed: true });
 
     drive.failNext('getFile', new GoogleScopeNotGrantedError('drive-host'));
-    expect(refusal(await check({ texts: [docUrl(id)], writer: 'external-email' }))).toBe(
-      `a Google link in it can't be checked, because ${OPERATOR}. Tell main.`,
+    const told = refusal(await check({ texts: [docUrl(id)], writer: 'external-email' }));
+    expect(told).toBe(
+      `Who may open ${docUrl(id)} can't be checked yet. Wake main with tell_main, naming the link, and wait for its answer.`,
     );
+    // Reconnecting the sign-in is the operator's, which main brings to the principal: external-email can't act on it.
+    expect(told).not.toContain('operator');
   });
 });
 

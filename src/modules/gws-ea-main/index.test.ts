@@ -205,11 +205,18 @@ describe("GWS-EA's guidance for main", () => {
     );
   });
 
-  // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's) and
-  // current priorities beside them, with their rule beside the correction rule (D3): 2,891 words, plus a small
-  // margin. Delivery 2 replaces this cap with a budget (D5).
-  it('stays within 2,900 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_900);
+  it("leaves the principal's email on a thread it handed over to external-email, but for a part it hands back (KTD13)", () => {
+    expect(GUIDANCE).toContain(
+      'On a thread you handed to external-email, it acts on their words there; you act only on a part it hands you, as far as their own words ask.',
+    );
+  });
+
+  // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's),
+  // current priorities beside them, with their rule beside the correction rule (D3), and the one-actor clause on
+  // threads handed to external-email (KTD13): 2,920 words, plus a small margin (KTD20). Delivery 2 replaces this
+  // cap with a budget (D5).
+  it('stays within 2,930 words', () => {
+    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_930);
   });
 
   it("teaches main its email tools, and none of external-email's", async () => {

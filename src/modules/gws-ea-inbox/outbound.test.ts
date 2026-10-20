@@ -1165,17 +1165,17 @@ describe('a Google link in an email to outsiders', () => {
     return id;
   }
 
-  it('is refused when one of three recipients cannot open it, telling external-email only who, and to tell main', async () => {
+  it('is refused when one of three recipients cannot open it, telling external-email only who and which link, and to wake main', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, cc: [JANE, SALES], body: 'Agenda?' });
     const agenda = await shared('Acme agenda', [SAM, JANE]);
 
     await reply(session, key, `Here it is: ${docUrl(agenda)}`);
     expect(gmail.sent).toEqual([]);
     expect(refusals(session)).toEqual([
-      `Your message was not sent: ${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`,
+      `Your message was not sent: ${SALES} can't open ${docUrl(agenda)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
     ]);
     expect(refusalOf(await emailSend(session, { text: `The agenda: ${docUrl(agenda)}` }))).toBe(
-      `Your email was not sent: ${SALES} can't open a Google link in it. Tell main which link, and who can't open it.`,
+      `Your email was not sent: ${SALES} can't open ${docUrl(agenda)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
     );
 
     await drive.createPermission(agenda, { emailAddress: SALES, role: 'reader' });
@@ -1187,7 +1187,7 @@ describe('a Google link in an email to outsiders', () => {
   it('reads every link the assistant wrote: in a first email’s subject, and in the text of a file it sends', async () => {
     const { key, session } = await handedOver([REMY]);
     const agenda = await shared('Acme agenda', []);
-    const refused = `Your email was not sent: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`;
+    const refused = `Your email was not sent: ${REMY} can't open ${docUrl(agenda)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`;
 
     expect(
       refusalOf(await emailSend(session, { subject: `Agenda ${docUrl(agenda)}`, text: 'The agenda for Tuesday.' })),
@@ -1211,7 +1211,7 @@ describe('a Google link in an email to outsiders', () => {
     await reply(session, key, `Directions: ${docUrl(directions)}`);
     expect(refusals(session)).toEqual([
       expect.stringMatching(/private address/u),
-      `Your message was not sent: ${SAM} can't open a Google link in it. Tell main which link, and who can't open it.`,
+      `Your message was not sent: ${SAM} can't open ${docUrl(directions)}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
     ]);
     expect(gmail.sent).toEqual([]);
   });

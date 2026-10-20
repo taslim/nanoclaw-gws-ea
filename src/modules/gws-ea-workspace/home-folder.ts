@@ -85,10 +85,18 @@ function homeFolderName(assistant: string): string {
   return `Principal · ${assistant}`;
 }
 
+/**
+ * A running session's `$GWS_EA_HOME_FOLDER_ID` keeps what its spawn read, so
+ * the note gives the id for main to use in its place until the next spawn
+ * carries it. Where a file belongs stays the gworkspace skill's to say.
+ */
+const USE_UNTIL_RESPAWN =
+  'Your environment carries it from your next start; until then, use that id wherever the gworkspace skill reads `$GWS_EA_HOME_FOLDER_ID`.';
+
 function noteText(folderId: string, replacing: boolean): string {
   return replacing
-    ? `Your home folder in Google Drive was deleted for good, so there is a new one, with the id \`${folderId}\`. Make what you create for the principal there from now on, not in the old folder.`
-    : `Your home folder in Google Drive is ready, with the id \`${folderId}\`. Make what you create for the principal there: every one of their addresses can open it.`;
+    ? `Your home folder in Google Drive was deleted for good, so there is a new one, with the id \`${folderId}\`. ${USE_UNTIL_RESPAWN}`
+    : `Your home folder in Google Drive is ready, with the id \`${folderId}\`: every one of the principal's addresses can open it. ${USE_UNTIL_RESPAWN}`;
 }
 
 export function createHomeFolder(options: HomeFolderOptions): HomeFolder {

@@ -682,22 +682,27 @@ export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person
  * An `email:` user that NanoClaw grants access to is the operator's to
  * revoke; forgetting never removes a role or a membership on its own.
  */
-async function assertNoGrantedAccess(userIds: readonly string[]): Promise<void> {
+async function assertNoGrantedAccess(name: string, userIds: readonly string[]): Promise<void> {
   const db = getDb();
   for (const userId of userIds) {
-    const role = await db.get(
-      'SELECT 1 AS present FROM user_roles WHERE user_id = ? OR granted_by = ? LIMIT 1',
+    const holds = await db.get(
+      `SELECT 1 AS present FROM user_roles WHERE user_id = ?
+       UNION ALL SELECT 1 FROM agent_group_members WHERE user_id = ? LIMIT 1`,
       userId,
       userId,
     );
-    const member = await db.get(
-      'SELECT 1 AS present FROM agent_group_members WHERE user_id = ? OR added_by = ? LIMIT 1',
+    const granted = await db.get(
+      `SELECT 1 AS present FROM user_roles WHERE granted_by = ?
+       UNION ALL SELECT 1 FROM agent_group_members WHERE added_by = ? LIMIT 1`,
       userId,
       userId,
     );
-    if (role || member) {
+    if (holds || granted) {
+      // main relays this to the principal, whose operator alone changes who may use the assistant.
+      const address = userId.slice('email:'.length);
       throw new Error(
-        `${userId} holds access in NanoClaw (a role or an agent-group membership); remove that access before forgetting this person`,
+        `${name} ${holds ? 'has' : 'gave someone'} access to the assistant as ${address}, which only the principal's operator can remove: ` +
+          'tell the principal their operator must remove that access before you can forget them.',
       );
     }
   }
@@ -718,7 +723,10 @@ export async function forgetPerson(input: ForgetPersonInput): Promise<ForgetAnsw
   await loadFingerprintKey();
   const person = await requirePerson(id);
   const handles = person.identities.map((identity) => identity.handle);
-  await assertNoGrantedAccess(handles.filter((handle) => handle.startsWith('email:')));
+  await assertNoGrantedAccess(
+    person.name,
+    handles.filter((handle) => handle.startsWith('email:')),
+  );
   const key = await forgetKey();
 
   const rewrite = new Set<string>();

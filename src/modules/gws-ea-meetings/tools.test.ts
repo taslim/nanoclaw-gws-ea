@@ -196,18 +196,18 @@ function gone(label: string): string {
   return `${label}: no longer free. Call free_time for times to offer instead.`;
 }
 
-/** What `free_time` adds while main has set no calendar for the thread's bookings (R12). */
+/** What `free_time` adds while main has set no calendar for the thread's bookings (R12, KTD18). */
 const NO_CALENDAR_YET =
-  "No calendar is set for this thread's bookings yet: ask main with tell_main which calendar to book on, before a time is agreed.";
+  "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
 /** What `book` answers while main has set no calendar for the thread's bookings (R12). */
 const BOOKS_NOTHING_YET =
-  "No calendar is set for this thread's bookings yet, so nothing was booked: ask main with tell_main which calendar to book on, and book once it answers.";
+  "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
 /** What `book` answers when the calendar main set can no longer be booked on (R8). */
 const CANNOT_BOOK_THERE =
-  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: ask main with tell_main which calendar to book on, and book once it answers.";
+  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
 /** What a change or cancellation answers when Google no longer shows the booking's calendar's events (R14). */
 const BOOKING_OUT_OF_SIGHT =
-  'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: ask main with tell_main.';
+  'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: wake main with tell_main and wait for its answer.';
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
@@ -772,12 +772,13 @@ describe('book', () => {
         }),
       );
       expect(answer).toMatch(/private details \(address\)/u);
+      expect(answer).toMatch(/If it is the calendar's name, wake main with tell_main and wait for its answer\.$/u);
       expect(answer).not.toContain('Rosewood');
       expect(calendar.writes).toEqual([]);
     },
   );
 
-  it('refuses a booking whose notes link a pre-read an invitee cannot open, telling external-email to tell main (Slice 6 R4)', async () => {
+  it('refuses a booking whose notes link a pre-read an invitee cannot open, naming the link and telling external-email to wake main (Slice 6 R4)', async () => {
     const drive = new FakeDrive(JUNO);
     for (const person of [PRINCIPAL, REMY]) drive.addAccount(person);
     workspace.drive = drive;
@@ -794,7 +795,7 @@ describe('book', () => {
       }),
     );
     expect(answer).toBe(
-      `The booking was not made: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`,
+      `The booking was not made: ${REMY} can't open ${url}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
     );
     expect(calendar.writes).toEqual([]);
   });
@@ -926,7 +927,7 @@ describe('the calendar a thread books on is main’s to set (R11, R12)', () => {
     expect(
       (data(await send(session, 'free_time', wednesdayMorning)) as { message: string }).message.split('\n'),
     ).toEqual([
-      'Nothing in that range is free for 30 minutes: ask for another range, or tell main with tell_main.',
+      'Nothing in that range is free for 30 minutes: ask for another range, or wake main with tell_main and wait for its answer.',
       NO_CALENDAR_YET,
     ]);
 
@@ -1149,7 +1150,9 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       ['change_booking', { booking: booked.booking, start: THURSDAY_2PM }],
       ['cancel_booking', { booking: booked.booking }],
     ] as const) {
-      expect(refusal(await send(sessionA, action, fields))).toMatch(/no longer a booking this thread may change/u);
+      expect(refusal(await send(sessionA, action, fields))).toBe(
+        'That event is no longer a booking this thread may change: wake main with tell_main and wait for its answer.',
+      );
     }
     expect(calendar.writes).toHaveLength(writes);
     expect(calendar.event(PRINCIPAL, event.id)).toMatchObject({

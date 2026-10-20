@@ -79,6 +79,12 @@ describe('GWS-EA people ncl resource', () => {
       expect(lookup(`people-${gone}`), gone).toBeUndefined();
   });
 
+  it("names in add's help only the sources a learned identity may come from", () => {
+    const help = lookup('people-add')?.description ?? '';
+    expect(help).toContain('--source learned for someone you came to know from the calendar or the directory');
+    expect(help).not.toMatch(/\bmail\b/u);
+  });
+
   it('lets main keep a person through ncl, from add to forget', async () => {
     const added = await data<Person>(
       run('people-add', {

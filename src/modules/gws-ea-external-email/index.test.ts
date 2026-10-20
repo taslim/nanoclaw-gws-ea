@@ -301,6 +301,24 @@ describe("external-email's project document", () => {
   it('teaches it to leave main an account of its thread with `tell_main`, since it keeps no timers', () => {
     expect(GUIDANCE_TEXT).toMatch(/`tell_main`[^.]*\baccount\b/u);
   });
+
+  it('wakes main for what only main can answer, and waits for it', () => {
+    expect(GUIDANCE_TEXT).toContain(
+      "When something needs the principal's context or authority, wake main with `tell_main` and wait.",
+    );
+    expect(GUIDANCE_TEXT).not.toMatch(/\bask main with `tell_main`/u);
+  });
+
+  it("does this thread's part of the principal's own email and wakes main with the rest of their ask (AE6)", () => {
+    const tools = fs.readFileSync(
+      path.resolve('container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md'),
+      'utf8',
+    );
+    expect(tools).toContain(
+      "- When the principal's own email in this thread also asks for something beyond it, do this thread's part, " +
+        "and wake main with `tell_main`, giving the rest of their ask: that part is main's to act on.",
+    );
+  });
 });
 
 describe("changes to external-email's configuration", () => {

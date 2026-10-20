@@ -1297,7 +1297,7 @@ describe('tell_main with wake', () => {
 // ---------------------------------------------------------------------------
 
 describe('the first booking on a thread an outsider started (R11–R13)', () => {
-  it('offers times and asks main, which sets the thread’s calendar; book then lands there alone (AE3)', async () => {
+  it('tells external-email to wake main before it offers a time, and books nothing until main sets the thread’s calendar; book then lands there alone (AE3, KTD18)', async () => {
     // A stranger wrote to the assistant, copying the principal, and no default exists: no calendar is set.
     const { key, session } = await inboundThread('g-intro', STRANGER);
     await recordThreadAddresses(key, [PRINCIPAL], 'message', now());
@@ -1312,17 +1312,17 @@ describe('the first booking on a thread an outsider started (R11–R13)', () => 
       }),
     );
     expect(String(offered.message).split('\n').at(-1)).toBe(
-      "No calendar is set for this thread's bookings yet: ask main with tell_main which calendar to book on, before a time is agreed.",
+      "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.",
     );
     const [first] = offered.windows as ReadonlyArray<{ readonly start: string }>;
     const agreed = { start: first.start, minutes: 30, title: 'Intro: Pat and Noel' };
     expect(refusal(await request(session, 'book', agreed))).toBe(
-      "No calendar is set for this thread's bookings yet, so nothing was booked: ask main with tell_main which calendar to book on, and book once it answers.",
+      "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.",
     );
 
     data(
       await request(session, 'tell_main', {
-        account: 'Noel agreed to the first time offered. Waiting on main: which calendar do I book it on?',
+        account: 'Noel would like 30 minutes next week. Waiting on main: which calendar do I book it on?',
         wake: true,
       }),
     );

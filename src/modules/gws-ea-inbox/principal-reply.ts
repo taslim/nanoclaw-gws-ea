@@ -56,6 +56,13 @@ async function principalAnchor(runtime: InboxRuntime, threadKey: string): Promis
   return undefined;
 }
 
+/** Whether a send is `add_reaction`'s, which names an emoji and a message rather than words. */
+function isReaction(content: unknown): boolean {
+  return (
+    typeof content === 'object' && content !== null && (content as { operation?: unknown }).operation === 'reaction'
+  );
+}
+
 /** The audience check's recipients for a send on `email:principal`: the anchor's From address, or no one. */
 export async function principalRecipients(send: OutboundSend): Promise<readonly string[]> {
   const runtime = activeInbox();
@@ -70,6 +77,13 @@ export async function sendToPrincipal(
   threadKey: string | null,
   message: OutboundMessage,
 ): Promise<string> {
+  // main reacts to say "got it" in chat; by email nothing need be sent, and a reply only to acknowledge is noise.
+  if (isReaction(message.content)) {
+    throw new OutboundRefusedError(
+      REFUSED_BY,
+      'email carries no reactions, and a closing thanks by email needs nothing sent.',
+    );
+  }
   if (threadKey === null) {
     throw new OutboundRefusedError(
       REFUSED_BY,

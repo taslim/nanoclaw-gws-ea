@@ -183,7 +183,7 @@ describe('an invitation carrying a Google link', () => {
       assertInvitationShareable(invitation(url, 'external-email'), 'The booking was not made', 'Tell main.'),
     ).rejects.toMatchObject({
       code: 'forbidden',
-      message: `The booking was not made: ${REMY} can't open a Google link in it. Tell main which link, and who can't open it.`,
+      message: `The booking was not made: ${REMY} can't open ${url}. Wake main with tell_main, naming the link and who can't open it, and wait for its answer.`,
     });
 
     await drive.createPermission(id, { emailAddress: REMY, role: 'reader' });

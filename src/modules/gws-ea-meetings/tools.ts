@@ -130,18 +130,25 @@ const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
+/** What external-email does when only main can settle what comes next: an account alone never reaches main in time. */
+const WAIT_FOR_MAIN = 'wake main with tell_main and wait for its answer';
+
 /**
  * What to do when an invitation would show its invitees a private detail.
  * Their guest list is never the detail: they are all people of the thread,
  * who see each other's addresses there.
  */
-const PRIVATE_DETAIL_ADVICE =
-  "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, tell main with tell_main.";
+const PRIVATE_DETAIL_ADVICE = `Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, ${WAIT_FOR_MAIN}.`;
 
 /** What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13). */
-const ASK_FOR_CALENDAR = 'ask main with tell_main which calendar to book on';
-/** What `free_time` adds while main has set no calendar for the thread. */
-const NO_CALENDAR_YET = `No calendar is set for this thread's bookings yet: ${ASK_FOR_CALENDAR}, before a time is agreed.`;
+const ASK_FOR_CALENDAR = 'wake main with tell_main to ask which calendar to book on';
+/**
+ * What `free_time` adds while main has set no calendar for the thread: every
+ * call says it, so "once" spares main a second wake, and a time offered now
+ * could be one main's choice of calendar rules out (KTD18).
+ */
+const NO_CALENDAR_YET =
+  "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
 
 // ---------------------------------------------------------------------------
 // The request's fields
@@ -479,7 +486,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const answer =
       windows.length === 0
         ? [
-            `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`,
+            `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or ${WAIT_FOR_MAIN}.`,
           ]
         : [
             `Free for ${minutes} minutes: any start that ends by a window's end.`,
@@ -664,7 +671,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       const entry = await calendar().getCalendar(booking.calendarId);
       if (entry === undefined || !isReadable(entry)) {
         throw forbidden(
-          'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: ask main with tell_main.',
+          `The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: ${WAIT_FOR_MAIN}.`,
         );
       }
     }
@@ -673,10 +680,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       throw forbidden('That booking is no longer on the principal’s calendar, so there is nothing to change.');
     }
     if (event.tags?.[TAG_ROLE] !== 'booking') {
-      throw forbidden('That event is no longer a booking this thread may change: tell main with tell_main.');
+      throw forbidden(`That event is no longer a booking this thread may change: ${WAIT_FOR_MAIN}.`);
     }
     const span = eventSpan(event, view.principal.timezone);
-    if (!span) throw forbidden('Google reports no readable time for that booking: tell main with tell_main.');
+    if (!span) throw forbidden(`Google reports no readable time for that booking: ${WAIT_FOR_MAIN}.`);
     // Who it invites: neither a room nor the principal, whose calendar organizes it.
     const invitees = (event.attendees ?? []).flatMap((attendee) =>
       attendee.resource === true || attendee.organizer === true || attendee.email === undefined ? [] : [attendee.email],

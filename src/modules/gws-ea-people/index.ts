@@ -183,7 +183,7 @@ registerResource({
       access: 'open',
       description:
         'Keep a new person with exactly one level.\n\n' +
-        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar, mail, or the directory: a learned level is active or known, and a learned identity names where you found it with --identity-source. When the principal gives you someone but not where they stand, add --level-source learned: the level is then your judgment, and learning may revise it. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
+        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar or the directory: a learned level is active or known, and a learned identity names where you found it with --identity-source. When the principal gives you someone but not where they stand, add --level-source learned: the level is then your judgment, and learning may revise it. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
       args: [
         { ...NAME_ARG, required: true },
         { ...LEVEL_ARG, required: true },

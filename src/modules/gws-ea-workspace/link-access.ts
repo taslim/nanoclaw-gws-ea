@@ -38,14 +38,14 @@
  *    it for delivery's own retry; an answering action answers
  *    `LINKS_UNCHECKED`. A link it could decide is refused all the same.
  * 2. The host has no Drive access (not signed in, revoked, or a sign-in
- *    without Drive): a link that is not public is refused, telling the
- *    operator to reconnect.
+ *    without Drive): a link that is not public is refused, telling main
+ *    the operator must reconnect it, and `external-email` to wake main.
  * 3. A definitive answer: refused, with a reason fitted to who wrote it.
  *    `main` hears who cannot open which link and its choices: share it with
  *    them (view-only by default), leave them out, or send it without the
  *    link; or, for a file it cannot share, whom to ask. `external-email`
- *    hears only which of its recipients cannot open a link, nothing of the
- *    file, and to tell main.
+ *    hears only which of its recipients cannot open which link it wrote,
+ *    nothing else of the file, and to wake main.
  *
  * A leaf (KTD4): it imports only the shared Google helpers, the profile's
  * addresses, the privacy module's link reading (`links.ts`), Drive, and the
@@ -473,14 +473,30 @@ function reasonForMain(refused: readonly Refused[], principal: PrincipalRecogniz
     .join(' ');
 }
 
-/** For `external-email`: only which of its recipients cannot open a link, nothing of the file, and to tell main. */
+/**
+ * For `external-email`: which link each of its recipients cannot open, the
+ * link it wrote and nothing else of the file, and to wake main for its
+ * answer, since sharing the file, or reconnecting what checks it, is never
+ * external-email's to do.
+ */
 function reasonForExternalEmail(refused: readonly Refused[]): string {
-  const blocked = [...new Set(refused.filter(({ why }) => why.kind !== 'no-drive').map(({ recipient }) => recipient))];
-  const unchecked = refused.some(({ why }) => why.kind === 'no-drive');
+  const blocked = new Map<string, string[]>();
+  const unchecked = new Set<string>();
+  for (const { link, recipient, why } of refused) {
+    if (why.kind === 'no-drive') {
+      unchecked.add(link.url);
+      continue;
+    }
+    const who = blocked.get(link.url) ?? [];
+    if (!who.includes(recipient)) who.push(recipient);
+    blocked.set(link.url, who);
+  }
   return [
-    ...(blocked.length === 0 ? [] : [`${listed(blocked)} can't open a Google link in it.`]),
-    ...(unchecked ? [`a Google link in it can't be checked, because ${OPERATOR_REASON}.`] : []),
-    blocked.length === 0 ? 'Tell main.' : "Tell main which link, and who can't open it.",
+    ...[...blocked].map(([url, who]) => `${listed(who)} can't open ${url}.`),
+    ...[...unchecked].map((url) => `Who may open ${url} can't be checked yet.`),
+    blocked.size === 0
+      ? 'Wake main with tell_main, naming the link, and wait for its answer.'
+      : "Wake main with tell_main, naming the link and who can't open it, and wait for its answer.",
   ].join(' ');
 }
 
