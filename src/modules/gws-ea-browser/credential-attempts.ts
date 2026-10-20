@@ -766,12 +766,13 @@ export class CredentialAttempts {
       jobId,
       ...(site === undefined ? [] : [site]),
     )) {
-      const changed = await this.db.run(
-        `UPDATE ${TABLE} SET phase = 'unknown', updated_at = ? WHERE id = ? AND phase = 'awaiting_consent'`,
-        now(),
-        id,
-      );
-      if (changed.changes) ended.push(id);
+      try {
+        await this.move(id, ['awaiting_consent'], 'unknown');
+        ended.push(id);
+      } catch (error) {
+        // A grant re-filled it first: it is settled through its job like any other disclosed attempt.
+        if (!(error instanceof CredentialAttemptError)) throw error;
+      }
     }
     return ended;
   }

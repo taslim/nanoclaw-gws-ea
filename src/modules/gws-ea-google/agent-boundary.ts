@@ -12,9 +12,12 @@ import {
   GoogleTokenError,
 } from './tokens.js';
 
+/** The failure in words, to set inside a sentence of the caller's. */
+export const GOOGLE_CONNECTION_DOWN_TEXT =
+  "your Google connection isn't working right now, and reconnecting it is the operator's job";
+
 /** What every agent hears first; each boundary adds that agent's own next step. */
-export const GOOGLE_CONNECTION_DOWN =
-  "Your Google connection isn't working right now, and reconnecting it is the operator's job.";
+export const GOOGLE_CONNECTION_DOWN = `Y${GOOGLE_CONNECTION_DOWN_TEXT.slice(1)}.`;
 
 /** True when only a new sign-in, which is the operator's, would let Google answer. */
 export function isGoogleConnectionDown(error: unknown): boolean {

@@ -588,8 +588,10 @@ function formatSpeech(attachment: Record<string, unknown>): string {
 
 function formatAttachments(attachments: unknown): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
+  let heard = false;
   const parts = attachments.map((value: unknown) => {
     const a = attachmentRecord(value) ?? {};
+    heard ||= isRecognizedSpeech(attachmentRecord(a.speech));
     const name = attachmentText(a.name) || attachmentText(a.filename) || 'attachment';
     const type = attachmentText(a.type) || 'file';
     const local = attachmentText(a.localPath);
@@ -604,9 +606,6 @@ function formatAttachments(attachments: unknown): string {
       : `[${escapeXml(type)}: ${escapeXml(name)}]`;
     return description + speech;
   });
-  const heard = attachments.some((value: unknown) =>
-    isRecognizedSpeech(attachmentRecord(attachmentRecord(value)?.speech)),
-  );
   return '\n' + parts.join('\n') + (heard ? `\n<speech_note>${SPEECH_READING_NOTE}</speech_note>` : '');
 }
 

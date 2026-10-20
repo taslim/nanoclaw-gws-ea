@@ -334,9 +334,14 @@ function vaultLeft(
   }
 }
 
+/** An attempt's recorded evidence, parsed; undefined when it has none. */
+function parsedEvidence(attempt: Pick<CredentialAttempt, 'evidence_json'>): unknown {
+  return attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+}
+
 /** Whether an attempt was held for the principal's consent before it became unknown: the host never submitted it. */
 function wasHeld(attempt: CredentialAttempt): boolean {
-  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+  const evidence: unknown = parsedEvidence(attempt);
   return attempt.phase === 'unknown' && isRecord(evidence) && evidence.held === true;
 }
 
@@ -353,7 +358,7 @@ function situation(attempt: CredentialAttempt, account: string): string {
       case 'awaiting_verification':
         return `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`;
       default: {
-        const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+        const evidence: unknown = parsedEvidence(attempt);
         const via = isRecord(evidence) ? evidence.via : undefined;
         return via === 'link' || via === 'code'
           ? `The site asked to confirm the account ${account} by email, and I used the ${via} it sent, but I can't tell whether the site accepted it.`
@@ -461,7 +466,7 @@ async function credentialReleaseRequest(
 
 /** The release evidence: this approval's, and the phase it released, as a resumed approval finds it. */
 function releasedFrom(attempt: CredentialAttempt, approvalId: string): CredentialAttemptPhase | undefined {
-  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+  const evidence: unknown = parsedEvidence(attempt);
   if (attempt.phase !== 'rejected' || !isRecord(evidence) || evidence.approval !== approvalId) return undefined;
   const from = evidence.released_from;
   return RELEASABLE_PHASES.find((phase) => phase === from) ?? 'unknown';

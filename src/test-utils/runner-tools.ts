@@ -11,12 +11,24 @@ import ts from 'typescript';
 
 const TOOLS_DIR = path.resolve('container', 'agent-runner', 'src', 'mcp-tools');
 
-/** The runner's tool sources, by file name, tests left out. */
+let sources: ReadonlyArray<readonly [file: string, source: string]> | undefined;
+let parsed: ReadonlyArray<readonly [file: string, source: string, tree: ts.SourceFile]> | undefined;
+
+/** The runner's tool sources, by file name, tests left out. They don't change during a test run, so they are read once. */
 function toolSources(): ReadonlyArray<readonly [file: string, source: string]> {
-  return fs
+  sources ??= fs
     .readdirSync(TOOLS_DIR)
     .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
     .map((file) => [file, fs.readFileSync(path.join(TOOLS_DIR, file), 'utf8')] as const);
+  return sources;
+}
+
+/** The tool sources with their syntax trees, each parsed once. */
+function parsedToolSources(): ReadonlyArray<readonly [file: string, source: string, tree: ts.SourceFile]> {
+  parsed ??= toolSources().map(
+    ([file, text]) => [file, text, ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)] as const,
+  );
+  return parsed;
 }
 
 function toolNamesIn(source: string): string[] {
@@ -56,8 +68,7 @@ function definedName(node: ts.Node): string | undefined {
 export function runnerToolCapabilities(): ReadonlyMap<string, string> {
   const keys = loadKeys();
   const granted = new Map<string, string>();
-  for (const [file, text] of toolSources()) {
-    const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  for (const [file, text, source] of parsedToolSources()) {
     const constants = new Map<string, ts.Expression>();
     const collect = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
@@ -102,7 +113,7 @@ export function runnerToolCapabilities(): ReadonlyMap<string, string> {
 export function runnerToolVocabulary(): Set<string> {
   const words = new Set<string>();
   const snake = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/u;
-  for (const [file, text] of toolSources()) {
+  for (const [, , source] of parsedToolSources()) {
     const visit = (node: ts.Node): void => {
       if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
         const name = ts.isStringLiteral(node.name) ? node.name.text : node.name.getText();
@@ -111,7 +122,7 @@ export function runnerToolVocabulary(): Set<string> {
       if (ts.isStringLiteral(node) && snake.test(node.text)) words.add(node.text);
       ts.forEachChild(node, visit);
     };
-    visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
+    visit(source);
   }
   return words;
 }

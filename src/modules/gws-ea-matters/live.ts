@@ -29,7 +29,7 @@
  */
 import { log } from '../../log.js';
 import { formatLocalTime } from '../../timezone.js';
-import { isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
+import { GOOGLE_CONNECTION_DOWN_TEXT, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createGmailApi, GoogleApiError, type GmailApi } from '../gws-ea-inbox/gmail-api.js';
 import {
@@ -68,8 +68,7 @@ import type { LinkRef, MatterLink } from './db.js';
 export const READ_DEADLINE_MS = 5_000;
 const UNREAD = "couldn't read just now";
 /** A read only the operator's new Google sign-in would let through, in main's terms (R25). */
-const NO_CONNECTION =
-  "couldn't read: your Google connection isn't working right now, and reconnecting it is the operator's job";
+const NO_CONNECTION = `couldn't read: ${GOOGLE_CONNECTION_DOWN_TEXT}`;
 const FORGOTTEN = 'someone forgotten';
 const FRAME_LIMIT = 1_200;
 /** The guests an answer names before it counts the rest. */
