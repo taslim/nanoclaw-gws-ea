@@ -3,7 +3,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { MEMORY_SESSION_HOOK, memoryContextForSessionStart, type MemorySessionStartSource } from './session-hook.js';
+import {
+  MEMORY_SESSION_HOOK,
+  memoryContextForSessionStart,
+  recordMemoryDelivered,
+  type MemorySessionStartSource,
+} from './session-hook.js';
 
 let base: string;
 let stateDir: string;
@@ -12,8 +17,12 @@ function writeIndex(index: string): void {
   fs.writeFileSync(path.join(base, 'memory', 'index.md'), index);
 }
 
+/** A session start as the hook runs it: the section it returns is delivered, then recorded. */
 function contextFor(source: MemorySessionStartSource, sessionId = 'session-a'): string | undefined {
-  return memoryContextForSessionStart(source, base, { id: sessionId, stateDir });
+  const session = { id: sessionId, stateDir };
+  const context = memoryContextForSessionStart(source, base, session);
+  if (context) recordMemoryDelivered(session, context);
+  return context;
 }
 
 beforeEach(() => {
@@ -70,6 +79,12 @@ describe('memory SessionStart contract', () => {
 
     expect(contextFor('resume', 'session-b')).toContain('## Memory');
     expect(contextFor('resume', 'session-a')).toBeUndefined();
+  });
+
+  it('offers a resumed session the section again until its delivery is recorded', () => {
+    expect(memoryContextForSessionStart('resume', base, { id: 'session-a', stateDir })).toContain('## Memory');
+
+    expect(memoryContextForSessionStart('resume', base, { id: 'session-a', stateDir })).toContain('## Memory');
   });
 
   it('injects nothing on a resume it cannot key to a session, as before', () => {

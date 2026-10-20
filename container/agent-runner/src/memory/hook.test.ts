@@ -36,6 +36,23 @@ describe('memory-hook script', () => {
     expect(again.stdout).toBe('');
   });
 
+  it('records nothing when it cannot print the section, so the next resume injects it again', async () => {
+    const resume = JSON.stringify({ source: 'resume', session_id: 'session-a' });
+    const unwritable = fs.openSync(path.join(BASE, 'memory', 'index.md'), 'r');
+    try {
+      const failed = Bun.spawn([process.execPath, path.join(import.meta.dir, 'hook.ts'), BASE, STATE], {
+        stdin: new Blob([resume]),
+        stdout: unwritable,
+        stderr: 'ignore',
+      });
+      expect(await failed.exited).not.toBe(0);
+    } finally {
+      fs.closeSync(unwritable);
+    }
+
+    expect((await runHook(resume)).stdout).toContain('## Memory');
+  });
+
   it('fails closed for missing or malformed source input', async () => {
     expect((await runHook('{}')).stdout).toBe('');
     expect((await runHook('{not-json')).stdout).toBe('');

@@ -1594,13 +1594,31 @@ describe('recorded divergence: memory rules come from the release, within one bu
     const hook = (await import(runner('session-hook.ts'))) as RunnerMemorySessionHookModule;
     const base = await memoryTree('# Memory Index\n');
     const session = { id: 'session-a', stateDir: path.join(base, 'state') };
+    const deliver = (source: 'startup' | 'resume' | 'clear' | 'compact') => {
+      const context = hook.memoryContextForSessionStart(source, base, session);
+      if (context) hook.recordMemoryDelivered(session, context);
+      return context;
+    };
 
     expect(hook.MEMORY_SESSION_HOOK.sources).toEqual(['startup', 'resume', 'clear', 'compact']);
-    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('## Memory');
-    expect(hook.memoryContextForSessionStart('resume', base, session)).toBeUndefined();
-    expect(hook.memoryContextForSessionStart('compact', base, session)).toContain('## Memory');
+    expect(deliver('resume')).toContain('## Memory');
+    expect(deliver('resume')).toBeUndefined();
+    expect(deliver('compact')).toContain('## Memory');
     await writeFile(path.join(base, 'memory', 'index.md'), '# Memory Index\n\n- 2026-10-19: a new correction\n');
-    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('a new correction');
+    expect(deliver('resume')).toContain('a new correction');
+  });
+
+  it('records a section only after the hook prints it, so one that never arrives is offered again', async () => {
+    const hook = (await import(runner('session-hook.ts'))) as RunnerMemorySessionHookModule;
+    const script = await readFile(runner('hook.ts'), 'utf8');
+    const base = await memoryTree('# Memory Index\n');
+    const session = { id: 'session-a', stateDir: path.join(base, 'state') };
+
+    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('## Memory');
+    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('## Memory');
+    const printed = script.indexOf('writeStdout(');
+    expect(printed).toBeGreaterThan(-1);
+    expect(printed).toBeLessThan(script.indexOf('recordMemoryDelivered(session, context)'));
   });
 
   it("seeds only the index, whose Map names the release's definition, and leaves upstream's template unseeded", async () => {
@@ -1642,6 +1660,7 @@ interface RunnerMemorySessionHookModule {
     baseDir?: string,
     session?: { id: string; stateDir?: string },
   ): string | undefined;
+  recordMemoryDelivered(session: { id: string; stateDir?: string }, section: string): void;
 }
 interface RunnerMemoryScaffoldModule {
   ensureMemoryScaffold(baseDir?: string): void;

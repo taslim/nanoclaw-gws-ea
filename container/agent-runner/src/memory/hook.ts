@@ -3,6 +3,7 @@ import fs from 'fs';
 import {
   MEMORY_SESSION_HOOK,
   memoryContextForSessionStart,
+  recordMemoryDelivered,
   type MemoryHookSession,
   type MemorySessionStartSource,
 } from './session-hook.js';
@@ -34,4 +35,14 @@ const session: MemoryHookSession | undefined = input?.sessionId
   ? { id: input.sessionId, stateDir: process.argv[3] }
   : undefined;
 const context = input ? memoryContextForSessionStart(input.source, process.argv[2], session) : undefined;
-if (context) console.log(context);
+if (context) {
+  // Print before recording, and print synchronously so a failed write throws:
+  // a section recorded but never printed would be skipped by the next resume.
+  writeStdout(`${context}\n`);
+  if (session) recordMemoryDelivered(session, context);
+}
+
+function writeStdout(text: string): void {
+  const bytes = Buffer.from(text, 'utf-8');
+  for (let offset = 0; offset < bytes.length; ) offset += fs.writeSync(1, bytes, offset);
+}

@@ -28,8 +28,9 @@
  *
  * What it cannot see: a tool named in plain words ("the Google tool"); a real
  * command used wrongly (`ncl matters place` where a new matter needs `open`);
- * and a text built in one module and sent from another, which is checked
- * against the reader of the file it is written in.
+ * a text built in one module and sent from another, which is checked
+ * against the reader of the file it is written in; and a name assembled at
+ * run time (`${tool}`), since every interpolation is blanked before the scan.
  */
 import fs from 'node:fs';
 import path from 'node:path';

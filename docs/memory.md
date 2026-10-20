@@ -57,7 +57,10 @@ To know what it last delivered, the hook keeps a fingerprint of its output per
 provider session (keyed by the hook input's `session_id`) under
 `/workspace/.memory-delivered/`, in the NanoClaw session's own directory. That
 directory outlives the container, so a respawn that resumes the session finds
-it, and no other session shares it. A fingerprint that can't be written only
+it, and no other session shares it. The hook records the fingerprint only
+after it has printed the section, so a section that never reaches the session
+(the hook is killed first, or the write fails) is delivered again on the next
+resume rather than skipped. A fingerprint that can't be written likewise only
 means the next resume delivers the section again.
 
 The hook lives in the agent-runner and is registered with whatever provider

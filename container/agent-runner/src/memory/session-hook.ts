@@ -54,6 +54,10 @@ export interface MemoryHookSession {
  * only when that changed: an unchanged section would only grow the context
  * toward compaction on every respawn. A resume the hook cannot key to a
  * session gets nothing, as it can't tell what that session holds.
+ *
+ * This records nothing: the caller records the section with
+ * `recordMemoryDelivered` once it has handed it to the provider, so a section
+ * that never arrives is offered again on the next resume instead of skipped.
  */
 export function memoryContextForSessionStart(
   source: MemorySessionStartSource,
@@ -63,14 +67,21 @@ export function memoryContextForSessionStart(
   if (!session) return source === 'resume' ? undefined : renderMemorySection(baseDir);
 
   const section = renderMemorySection(baseDir);
-  const fingerprint = createHash('sha256').update(section).digest('hex');
-  const file = path.join(
-    session.stateDir ?? MEMORY_DELIVERY_STATE_DIR,
-    createHash('sha256').update(session.id).digest('hex'),
-  );
-  if (source === 'resume' && readFingerprint(file) === fingerprint) return undefined;
-  writeFingerprint(file, fingerprint);
+  if (source === 'resume' && readFingerprint(fingerprintFile(session)) === fingerprintOf(section)) return undefined;
   return section;
+}
+
+/** Record the section a session start delivered, as the one that session's next resume compares against. */
+export function recordMemoryDelivered(session: MemoryHookSession, section: string): void {
+  writeFingerprint(fingerprintFile(session), fingerprintOf(section));
+}
+
+function fingerprintFile(session: MemoryHookSession): string {
+  return path.join(session.stateDir ?? MEMORY_DELIVERY_STATE_DIR, fingerprintOf(session.id));
+}
+
+function fingerprintOf(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
 }
 
 function readFingerprint(file: string): string | undefined {
