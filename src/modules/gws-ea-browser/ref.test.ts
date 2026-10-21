@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import { validateBrowserBatch } from './executor.js';
+
 import { validateFillSecret } from './fill.js';
 import { validateSignInCode } from './sign-in-mail.js';
 import { observePage, pinBrowserRefs, disposeBrowserRefs } from './observe.js';
@@ -34,8 +35,9 @@ it('resolves a prefixed reference and still rejects it after its observation gen
   const getByRef = vi.fn(() => ({ elementHandle: async () => element }));
   const page = {
     url: () => 'https://example.com/',
+    on() {},
     frames: () => [],
-    locator: () => ({ ariaSnapshot: async () => '- button "Continue" [ref=f2e17]' }),
+    locator: () => ({ ariaSnapshotJSON: async () => [{ role: 'button', name: 'Continue', ref: 'f2e17' }] }),
     getByRef,
   } as unknown as Page;
   const observation = await observePage(page);

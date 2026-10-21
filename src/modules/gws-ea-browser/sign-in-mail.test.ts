@@ -45,7 +45,8 @@ import {
   fillBoundBrowserSecret,
   type BoundBrowserSecretField,
 } from './fill.js';
-import { observePage, pageHasSecret, type PinnedBrowserRef } from './observe.js';
+import { observePage, type PinnedBrowserRef } from './observe.js';
+import { pageHasSecret } from './page-privacy.js';
 import { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { getDeliveryAction } from '../../delivery.js';
@@ -241,7 +242,7 @@ function fixture(username = false, current = '') {
     frames: () => [frame],
     mainFrame: () => frame,
     isClosed: () => false,
-    locator: () => ({ ariaSnapshot: async () => '- heading: Signed in' }),
+    locator: () => ({ ariaSnapshotJSON: async () => [{ role: 'heading', text: 'Signed in' }] }),
     getByRef: (ref: string) => ({ elementHandle: async () => (ref === 'e1' ? field : control) }),
     context: () => ({
       newCDPSession: async () => cdp,

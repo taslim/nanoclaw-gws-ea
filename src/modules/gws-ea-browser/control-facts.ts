@@ -64,6 +64,9 @@ export interface ControlFacts {
   visibleLabel?: string;
   formMethod?: string;
   formAction?: string;
+  inputName?: string;
+  formFieldNames?: readonly string[];
+  secretEntry?: boolean;
   authenticationForm?: boolean;
   role: string;
   tag: string;
@@ -687,6 +690,9 @@ const librarySource = String.raw`(sources) => {
     return {
       name: nameOf(node),
       visibleLabel: textOf(node),
+      inputName: node.getAttribute('name') || '',
+      formFieldNames: form ? fields.map((field) => field.getAttribute('name') || '').filter(Boolean) : [],
+      secretEntry: secretField(node),
       formMethod: form ? (own('formmethod') ? node.formMethod : formProperty(form, 'method')) : undefined,
       formAction: form ? (own('formaction') ? node.formAction : formProperty(form, 'action')) : undefined,
       authenticationForm: Boolean(form && /^post$/iu.test(formProperty(form, 'method')) &&
@@ -1080,6 +1086,9 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
   const formMethod = text(facts.formMethod);
   const formAction = text(facts.formAction);
   return {
+    inputName: text(facts.inputName),
+    formFieldNames: texts(facts.formFieldNames),
+    secretEntry: flag(facts.secretEntry),
     name,
     visibleLabel: text(facts.visibleLabel) ?? '',
     ...(formMethod !== undefined ? { formMethod } : {}),

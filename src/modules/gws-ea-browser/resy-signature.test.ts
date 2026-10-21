@@ -195,7 +195,7 @@ describe('Resy route boundary', () => {
 });
 
 import { resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
-import { redactPageText } from './observe.js';
+import { redactPageText } from './page-privacy.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 function checkoutFixture(policy: string[] = []): ResyFixtureState {
   const inv = availability();

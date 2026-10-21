@@ -58,6 +58,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { executeCredentialForm } from './credential-operations.js';
 import { executeBrowserBatch } from './executor.js';
+
 import './index.js';
 import {
   browserConsentMigration,

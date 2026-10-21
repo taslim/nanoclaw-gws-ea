@@ -19,13 +19,11 @@ import {
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerPageSecret,
-  bindPageSecretDocuments,
-  releasePageSecret,
   registerBrowserSiteInfoProvider,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
+import { registerPageSecret, bindPageSecretDocuments, releasePageSecret } from './page-privacy.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 
 export interface BoundBrowserSecretField {

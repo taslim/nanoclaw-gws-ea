@@ -91,14 +91,13 @@ import { assertBrowserSecretDiagnosticsSafe, settleFilledSecrets } from './fill.
 import { HELD_CREDENTIAL_PHASES, SiteLeaseStore } from './leases.js';
 import {
   BrowserRefError,
-  bindPageSecretDocuments,
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerPageSecret,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
+import { bindPageSecretDocuments, registerPageSecret } from './page-privacy.js';
 import { registrableDomain, type BrowserVaultReason } from './onepassword.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';

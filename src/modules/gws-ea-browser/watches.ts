@@ -40,13 +40,8 @@ import type { ReservationPolicy } from './merchant-contract.js';
 import { merchantSignatures } from './merchant-signatures.js';
 import { readBrowserRef, type BrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
-import {
-  loadRecipe,
-  recipeCheckKey,
-  executeRecipe,
-  type BrowserRecipe,
-  type StructuredBrowserLocator,
-} from './recipes.js';
+import { loadRecipe, recipeCheckKey, executeRecipe, type BrowserRecipe } from './recipes.js';
+import { type StructuredBrowserLocator } from './locators.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import {

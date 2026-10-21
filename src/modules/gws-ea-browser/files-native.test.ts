@@ -30,6 +30,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
+
 import { observePage, type BrowserRef } from './observe.js';
 import { browserPaths, writePrivateFile } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';

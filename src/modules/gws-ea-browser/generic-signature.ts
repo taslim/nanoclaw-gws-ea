@@ -42,7 +42,7 @@ import type {
   MerchantPurchaseEvidence,
   MerchantSignature,
 } from './merchant-contract.js';
-import type { StructuredBrowserLocator } from './recipes.js';
+import type { StructuredBrowserLocator } from './locators.js';
 
 const VOCABULARY = {
   /** A total, an amount due or what will be paid; a subtotal is none. */
@@ -755,7 +755,7 @@ function checkoutMerchant(page: Page): string | undefined {
 
 /** Re-finds an approved control by its locator, or undefined when the page no longer shows it there. */
 async function locate(page: Page, locator: StructuredBrowserLocator): Promise<ElementHandle | undefined> {
-  const { resolveLocator } = await import('./recipes.js');
+  const { resolveLocator } = await import('./locators.js');
   return resolveLocator(page, locator).catch(() => undefined);
 }
 
@@ -821,7 +821,7 @@ async function readGenericPurchase(
     if (!frame || frame.page() !== page || !merchant) return { status: 'checkout_lapsed' };
     const [read, controlBox] = await Promise.all([readCheckoutRegion(page, element), element.boundingBox()]);
     if (!controlBox) return { status: 'checkout_lapsed' };
-    const { captureElementLocator } = await import('./recipes.js');
+    const { captureElementLocator } = await import('./locators.js');
     let locator: StructuredBrowserLocator;
     try {
       locator = await captureElementLocator(element);

@@ -8,7 +8,9 @@ import { BrowserStore } from './db.js';
 import { browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { executeBrowserBatch } from './executor.js';
-import { observePage, registerPageSecret, type BrowserRef } from './observe.js';
+
+import { observePage, type BrowserRef } from './observe.js';
+import { registerPageSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
 import {
   executeRecipe,
@@ -57,6 +59,7 @@ it('pins immutable recipe versions and keys checks by every named value', async 
       "CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('job-store');",
     );
     await browserRecipesMigration.up(db);
+    await db.exec('CREATE TABLE gws_ea_browser_requests(answer_json TEXT,job_id TEXT,started_at TEXT,action TEXT)');
     const step = {
       action: { kind: 'type', ref: 'e1', generation: 1, text: '2' },
       targets: [
@@ -95,8 +98,9 @@ it('pins immutable recipe versions and keys checks by every named value', async 
     expect(await loadRecipe(String(second.recipe_id), db)).toMatchObject({ version: 2 });
     const page = {
       url: () => 'https://fixture.example/search',
+      on() {},
       frames: () => [],
-      locator: () => ({ ariaSnapshot: async () => '- heading "Find tables"' }),
+      locator: () => ({ ariaSnapshotJSON: async () => [{ role: 'heading', name: 'Find tables' }] }),
     } as unknown as Page;
     expect((await observePage(page)).site?.recipes).toEqual([
       { recipe_id: second.recipe_id, name: 'Find tables', version: 2, parameters: ['party'], read_only: true },
@@ -135,6 +139,18 @@ it('pins immutable recipe versions and keys checks by every named value', async 
       parameters: [],
     });
     expect((await loadRecipe(String(fromBlank.recipe_id), db))?.readOnly).toBe(true);
+    await db.run(
+      'INSERT INTO gws_ea_browser_requests(answer_json,job_id,started_at,action) VALUES(?,?,?,?)',
+      JSON.stringify({
+        ok: true,
+        data: { status: 'completed', recording: { status: 'unavailable', trace_indices: [] } },
+      }),
+      'job-store',
+      new Date().toISOString(),
+      'browser',
+    );
+    await expect(saveBrowserRecipe(context, input)).rejects.toThrow('provable recording coverage');
+    expect((await loadRecipe(String(first.recipe_id), db))?.version).toBe(1);
   } finally {
     await closeDb();
   }
@@ -159,6 +175,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     );
     await browserSiteLeasesMigration.up(db);
     await browserRecipesMigration.up(db);
+    await db.exec('CREATE TABLE gws_ea_browser_requests(answer_json TEXT,job_id TEXT,started_at TEXT,action TEXT)');
     server = createServer((req, res) => {
       if (!req.url?.startsWith('http://fixture.example/')) {
         res.writeHead(403).end();
@@ -229,11 +246,22 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
         { status: 'completed', trace_index: 1 },
       ],
     });
+    expect(result).toMatchObject({ recording: { status: 'unavailable', trace_indices: [0, 1] } });
+    await expect(
+      saveBrowserRecipe(context, { name: 'Incomplete GET search', first_action: 0, last_action: 1, parameters: [] }),
+    ).rejects.toThrow('safe recorded');
+    await executeBrowserBatch(
+      context,
+      { actions: [{ kind: 'navigate', url: 'http://fixture.example/search?venue=venue-A' }] },
+      { record: false },
+    );
+    await executeBrowserBatch(context, { actions: [{ kind: 'type', ...(await target('Party size')), text: '2' }] });
+    await executeBrowserBatch(context, { actions: [{ kind: 'click', ...(await target('Search')) }] });
     const saved = await saveBrowserRecipe(context, {
       name: 'GET search',
-      first_action: 0,
-      last_action: 1,
-      parameters: [{ name: 'party', action_index: 0 }],
+      first_action: 2,
+      last_action: 3,
+      parameters: [{ name: 'party', action_index: 2 }],
     });
     await executeBrowserBatch(
       context,
@@ -416,8 +444,6 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     });
     await page.getByRole('textbox', { name: 'Party size', exact: true }).fill('');
     await page.getByRole('textbox', { name: 'Contact', exact: true }).fill('');
-    const snapshot = await observePage(page);
-    const allRefs = [...snapshot.snapshot.matchAll(/\[ref=((?:f\d+)?e\d+)\]/gu)].length;
     const resolve = vi.spyOn(page, 'getByRef');
     try {
       expect(
@@ -425,7 +451,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
       ).toMatchObject({ status: 'completed' });
       expect(await page.getByRole('textbox', { name: 'Party size', exact: true }).inputValue()).toBe('3');
       expect(await page.getByRole('textbox', { name: 'Contact', exact: true }).inputValue()).toBe('Morgan');
-      expect(resolve.mock.calls.length).toBeLessThanOrEqual(allRefs + 2);
+      expect(resolve).not.toHaveBeenCalled();
     } finally {
       resolve.mockRestore();
     }
@@ -503,9 +529,14 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     ).toMatchObject({ status: 'checkpoint_failed' });
     expect(await page.locator('input[name=party]').inputValue()).toBe('3');
   });
-  it('measures a five-action native batch and its checked replay on the same fixture', async () => {
+  it('runs a five-action batch with one core snapshot and refuses missing intermediate checkpoints', async () => {
     const ref = await target('Party size');
-    const started = performance.now();
+    const body = page.locator('body');
+    const snapshot = vi.spyOn(body, 'ariaSnapshotJSON');
+    const locator = page.locator.bind(page);
+    const locate = vi
+      .spyOn(page, 'locator')
+      .mockImplementation((selector, options) => (selector === 'body' ? body : locator(selector, options)));
     expect(
       await executeBrowserBatch(context, {
         actions: [
@@ -517,24 +548,17 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
         ],
       }),
     ).toMatchObject({ status: 'completed' });
-    const batchMs = performance.now() - started;
-    const saved = await saveBrowserRecipe(context, {
-      name: 'Five actions',
-      first_action: 0,
-      last_action: 4,
-      parameters: [{ name: 'party', action_index: 0 }],
-    });
-    const replayStarted = performance.now();
-    expect(await executeRecipe(context, { recipe_id: saved.recipe_id, parameters: { party: '3' } })).toMatchObject({
-      status: 'completed',
-    });
-    console.info(
-      'Native recipe fixture timing',
-      JSON.stringify({
-        batch_with_trace_ms: Math.round(batchMs),
-        checked_replay_ms: Math.round(performance.now() - replayStarted),
-        actions: 5,
-      }),
+    expect(await page.getByRole('textbox', { name: 'Party size', exact: true }).inputValue()).toBe('2');
+    const rows = await db.all<{ step_json: string }>(
+      'SELECT step_json FROM gws_ea_browser_action_trace ORDER BY action_index',
     );
+    expect(rows).toHaveLength(5);
+    expect(rows.slice(0, 4).every((row) => JSON.parse(row.step_json).saveError)).toBe(true);
+    await expect(
+      saveBrowserRecipe(context, { name: 'Five actions', first_action: 0, last_action: 4, parameters: [] }),
+    ).rejects.toThrow('safe recorded');
+    expect(snapshot.mock.calls).toHaveLength(1);
+    snapshot.mockRestore();
+    locate.mockRestore();
   });
 });

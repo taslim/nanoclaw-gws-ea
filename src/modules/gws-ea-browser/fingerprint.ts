@@ -1,5 +1,5 @@
 import { zonedInstant } from './iso-time.js';
-import type { StructuredBrowserLocator } from './recipes.js';
+import type { StructuredBrowserLocator } from './locators.js';
 
 /** The generic signature's flow (KTD4): any checkout no reviewed signature reads. */
 export const GENERIC_FLOW_ID = 'generic-checkout-v1';

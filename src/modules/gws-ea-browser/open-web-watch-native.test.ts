@@ -61,7 +61,7 @@ import './index.js';
 import { configureBrowserCancellation } from './cancel.js';
 import type { ChromeConnection } from './connection.js';
 import { BrowserStore } from './db.js';
-import type { BrowserAction } from './executor.js';
+import type { BrowserAction } from './actions.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { prepareMerchantPage } from './merchant-signatures.js';
 import {

@@ -8,7 +8,7 @@ import { cancelBrowserJob } from './cancel.js';
 import type { ReservationAvailability } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
-import type { StructuredBrowserLocator } from './recipes.js';
+import type { StructuredBrowserLocator } from './locators.js';
 import {
   deliverWatchNotices,
   emitWatchNotice,

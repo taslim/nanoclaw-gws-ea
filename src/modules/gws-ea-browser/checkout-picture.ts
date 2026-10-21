@@ -9,7 +9,7 @@ import type { CheckoutBox } from './control-facts.js';
 import type { PurchaseFacts } from './fingerprint.js';
 import { union } from './generic-signature.js';
 import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-signatures.js';
-import { pageMayShowSecret } from './observe.js';
+import { pageMayShowSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
 
 const PICTURE_TIMEOUT_MS = 10_000;

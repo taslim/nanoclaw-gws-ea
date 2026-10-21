@@ -7,9 +7,9 @@ import {
   disposeBrowserRefs,
   hasBrowserChallenge,
   pinBrowserRefs,
-  redactPageText,
   type BrowserRef,
 } from './observe.js';
+import { redactPageText } from './page-privacy.js';
 import { browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-signatures.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
@@ -17,13 +17,8 @@ import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { BrowserOperation } from './operation.js';
-import {
-  captureRecipeRegion,
-  executeRecipe,
-  locateStructured,
-  type BrowserRecipe,
-  type StructuredBrowserLocator,
-} from './recipes.js';
+import { captureRecipeRegion, executeRecipe, type BrowserRecipe } from './recipes.js';
+import { locateStructured, type StructuredBrowserLocator } from './locators.js';
 import type { BrowserWatchCheckInput, BrowserWatchCheckResult } from './scheduler.js';
 import { withSignedOutBrowserPage } from './signed-out.js';
 import { WATCH_REGION_TEXT_LIMIT } from './watch-policy.js';

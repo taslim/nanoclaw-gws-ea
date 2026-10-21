@@ -14,7 +14,12 @@ import {
   type ReservationAvailability,
   type ReservationPolicy,
 } from './merchant-contract.js';
-import { bindPageSecretDocuments, registerPageRedaction, registerPageSecret, releasePageSecret } from './observe.js';
+import {
+  bindPageSecretDocuments,
+  registerPageRedaction,
+  registerPageSecret,
+  releasePageSecret,
+} from './page-privacy.js';
 
 const ORIGINS = ['https://resy.com', 'https://widgets.resy.com'] as const;
 const API = 'https://api.resy.com';

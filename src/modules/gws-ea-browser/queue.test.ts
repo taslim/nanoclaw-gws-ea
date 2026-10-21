@@ -117,6 +117,7 @@ it('persists observed HTTP response evidence with the exact request answer witho
           url: () => 'https://fixture.example/private-secret-sentinel?token=secret-sentinel',
           method: () => 'GET',
           resourceType: () => 'document',
+          redirectedFrom: () => null,
           headers: () => {
             throw new Error('Diagnostics must never read headers');
           },
@@ -189,6 +190,48 @@ it('preserves a sanitized native refusal before commit and uncertainty after a c
     ]),
   );
   await queue.stop();
+});
+
+it('returns an internal TypeError as a sanitized native error frame while preserving marked uncertainty', async () => {
+  actions = {
+    ...actions,
+    browser: {
+      validate: (content) => ({ marked: content.marked === true }),
+      async execute(context, payload) {
+        if (payload.marked) await context.markCommitStarted();
+        throw new TypeError('private-runtime-sentinel https://example.com/?token=private');
+      },
+    },
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  try {
+    await queue.accept('browser', {}, session, 'type-error');
+    await queue.accept('browser', { marked: true }, session, 'type-error-marked');
+    await queue.idle();
+    expect(responses()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: 'type-error',
+          frame: {
+            id: 'type-error',
+            ok: false,
+            error: { code: 'handler-error', message: 'The browser action failed unexpectedly.' },
+          },
+        }),
+        expect.objectContaining({
+          requestId: 'type-error-marked',
+          frame: expect.objectContaining({
+            ok: true,
+            data: expect.objectContaining({ reason: 'unconfirmed', repeat_safe: false }),
+          }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(responses())).not.toContain('private-runtime-sentinel');
+  } finally {
+    await queue.stop();
+  }
 });
 
 it('blocks the whole site before delivering an uncertain marked purchase answer', async () => {

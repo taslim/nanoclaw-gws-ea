@@ -26,6 +26,20 @@ const RESOURCES = new Set([
   'other',
 ]);
 const ACTIONS = new Set<string>(BROWSER_ACTION_NAMES);
+const RULES = new Set([
+  'blocked_address',
+  'purchase_control',
+  'account_security',
+  'speaks_as_principal',
+  'consent_control',
+  'consent_required',
+  'read_only',
+  'site_busy',
+  'secret_field',
+  'card_field',
+  'stale_ref',
+  'personal_data',
+]);
 
 export interface BrowserDiagnosticCorrelation {
   readonly jobId: string;
@@ -43,9 +57,18 @@ interface RequestFacts {
 type BrowserDiagnosticFact =
   | (RequestFacts & { source: 'http_response'; status: number })
   | (RequestFacts & { source: 'transport_failure'; category: TransportCategory })
-  | (Partial<RequestFacts> & { source: 'host_refusal'; category: BrowserHostRefusal })
+  | (Partial<RequestFacts> & { source: 'host_refusal'; category: BrowserHostRefusal; rule?: string })
   | { source: 'runtime_error'; category: 'unavailable' | 'disconnected' | 'execution' };
-export type BrowserDiagnosticEvent = BrowserDiagnosticFact & { elapsed_ms: number };
+export type BrowserDiagnosticEvent = BrowserDiagnosticFact & {
+  elapsed_ms: number;
+  action_index?: number;
+  request_index?: number;
+  redirected_from?: number;
+};
+interface DiagnosticEpoch {
+  readonly attempt: BrowserDiagnosticAttempt;
+  readonly actionIndex?: number;
+}
 export interface BrowserDiagnostics {
   schema_version: 1;
   job_id: string;
@@ -100,40 +123,58 @@ function transportCategory(raw: string | undefined): TransportCategory {
   }
 }
 
-const current = new WeakMap<Page, BrowserDiagnosticAttempt>();
+const current = new WeakMap<Page, DiagnosticEpoch>();
 const attached = new WeakSet<Page>();
 
 /** Installed before a job page can act. Request object identity, never a URL match, binds its later events. */
 export function attachBrowserDiagnostics(page: Page): void {
   if (attached.has(page)) return;
   attached.add(page);
-  const requests = new WeakMap<Request, { attempt: BrowserDiagnosticAttempt; facts: RequestFacts }>();
+  const requests = new WeakMap<
+    Request,
+    { epoch: DiagnosticEpoch; facts: RequestFacts; index: number; redirectedFrom?: number }
+  >();
+  let sequence = 0;
   page.on('request', (request) => {
-    const attempt = current.get(page);
-    if (!attempt) return;
+    const epoch = current.get(page);
+    if (!epoch) return;
+    const redirected = request.redirectedFrom();
+    const previous = redirected ? requests.get(redirected) : undefined;
+    if (redirected && previous?.epoch !== epoch) return;
     requests.set(request, {
-      attempt,
+      epoch,
+      index: ++sequence,
+      redirectedFrom: previous?.index,
       facts: facts({ url: request.url(), method: request.method(), resource: request.resourceType() }),
     });
   });
   page.on('response', (response) => {
     const request = requests.get(response.request());
     const status = response.status();
-    if (!request || current.get(page) !== request.attempt || !Number.isInteger(status) || status < 100 || status > 599)
+    if (!request || current.get(page) !== request.epoch || !Number.isInteger(status) || status < 100 || status > 599)
       return;
-    request.attempt.record({ ...request.facts, source: 'http_response', status });
+    request.epoch.attempt.record(
+      { ...request.facts, source: 'http_response', status },
+      request.epoch.actionIndex,
+      request.index,
+      request.redirectedFrom,
+    );
   });
   page.on('requestfailed', (request) => {
     const captured = requests.get(request);
-    if (!captured || current.get(page) !== captured.attempt) return;
-    captured.attempt.record({
-      ...captured.facts,
-      source: 'transport_failure',
-      category: transportCategory(request.failure()?.errorText),
-    });
+    if (!captured || current.get(page) !== captured.epoch) return;
+    captured.epoch.attempt.record(
+      {
+        ...captured.facts,
+        source: 'transport_failure',
+        category: transportCategory(request.failure()?.errorText),
+      },
+      captured.epoch.actionIndex,
+      captured.index,
+      captured.redirectedFrom,
+    );
     requests.delete(request);
   });
-  page.on('requestfinished', (request) => requests.delete(request));
   page.once('close', () => current.delete(page));
 }
 
@@ -161,7 +202,12 @@ function safeFact(event: BrowserDiagnosticFact): BrowserDiagnosticFact {
         resource: event.resource,
       };
     case 'host_refusal':
-      return { source: event.source, category: event.category, ...request };
+      return {
+        source: event.source,
+        category: event.category,
+        ...request,
+        ...(event.rule && RULES.has(event.rule) ? { rule: event.rule } : {}),
+      };
     case 'runtime_error':
       return { source: event.source, category: event.category };
   }
@@ -193,21 +239,27 @@ export class BrowserDiagnosticAttempt {
     attachBrowserDiagnostics(page);
     this.chrome ??= version(page.context().browser()?.version());
     this.pages.add(page);
-    current.set(page, this);
+    current.set(page, { attempt: this });
   }
 
-  record(event: BrowserDiagnosticFact): void {
+  record(event: BrowserDiagnosticFact, actionIndex?: number, requestIndex?: number, redirectedFrom?: number): void {
     if (this.closed) return;
     if (this.events.length >= EVENT_LIMIT) {
       this.omitted++;
       return;
     }
-    this.events.push({ ...safeFact(event), elapsed_ms: Math.max(0, Math.round(performance.now() - this.started)) });
+    this.events.push({
+      ...safeFact(event),
+      ...(actionIndex === undefined ? {} : { action_index: actionIndex }),
+      ...(requestIndex === undefined ? {} : { request_index: requestIndex }),
+      ...(redirectedFrom === undefined ? {} : { redirected_from: redirectedFrom }),
+      elapsed_ms: Math.max(0, Math.round(performance.now() - this.started)),
+    });
   }
 
   finish(): BrowserDiagnostics {
     this.closed = true;
-    for (const page of this.pages) if (current.get(page) === this) current.delete(page);
+    for (const page of this.pages) if (current.get(page)?.attempt === this) current.delete(page);
     this.pages.clear();
     return {
       schema_version: 1,
@@ -229,10 +281,19 @@ export class BrowserDiagnosticAttempt {
 /** Capture at the decision's start, before awaiting policy/lease work. A late refusal is discarded. */
 export function captureBrowserDiagnosticRefusal(
   page: Page,
-): (category: BrowserHostRefusal, request?: { url: string; method: string; resource: string }) => void {
-  const attempt = current.get(page);
-  return (category, request) => {
-    if (!attempt || current.get(page) !== attempt) return;
-    attempt.record({ source: 'host_refusal', category, ...(request ? facts(request) : {}) });
+): (category: BrowserHostRefusal, request?: { url: string; method: string; resource: string }, rule?: string) => void {
+  const epoch = current.get(page);
+  return (category, request, rule) => {
+    if (!epoch || current.get(page) !== epoch) return;
+    epoch.attempt.record(
+      { source: 'host_refusal', category, rule, ...(request ? facts(request) : {}) },
+      epoch.actionIndex,
+    );
   };
+}
+
+/** Each action owns a distinct immutable event epoch, even within one request. */
+export function beginBrowserDiagnosticAction(page: Page, actionIndex: number): void {
+  const previous = current.get(page);
+  if (previous) current.set(page, { attempt: previous.attempt, actionIndex });
 }

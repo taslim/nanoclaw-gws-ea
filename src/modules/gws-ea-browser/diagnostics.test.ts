@@ -8,7 +8,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChromePipe, createBackgroundPage, type ChromeConnection } from './connection.js';
-import { BrowserDiagnosticAttempt, captureBrowserDiagnosticRefusal } from './diagnostics.js';
+import {
+  BrowserDiagnosticAttempt,
+  beginBrowserDiagnosticAction,
+  captureBrowserDiagnosticRefusal,
+} from './diagnostics.js';
 import { browserPaths } from './paths.js';
 
 function pageFixture() {
@@ -26,6 +30,7 @@ function request(errorText?: string): Request {
     url: () => 'https://secret-sentinel.fixture.example/secret-sentinel?password=secret-sentinel#secret-sentinel',
     method: () => 'POST',
     resourceType: () => 'document',
+    redirectedFrom: () => null,
     failure: () => (errorText ? { errorText } : null),
     headers: () => {
       throw new Error('Headers are private');
@@ -118,6 +123,40 @@ it('bounds evidence and allowlists unrecognized methods, resources and transport
     method: 'OTHER',
     resource: 'other',
   });
+  expect(JSON.stringify(result)).not.toContain('secret-sentinel');
+});
+
+it('correlates redirects within an action and discards late events and redirects from an earlier action', () => {
+  const { events, page } = pageFixture();
+  const capture = attempt();
+  capture.observe(page);
+  beginBrowserDiagnosticAction(page, 0);
+  const first = request();
+  const redirected = { ...request(), redirectedFrom: () => first } as unknown as Request;
+  events.emit('request', first);
+  events.emit('response', { request: () => first, status: () => 302 });
+  events.emit('requestfinished', first);
+  events.emit('request', redirected);
+  events.emit('response', { request: () => redirected, status: () => 403 });
+  const late = request('net::ERR_NAME_NOT_RESOLVED');
+  events.emit('request', late);
+  const refuse = captureBrowserDiagnosticRefusal(page);
+  beginBrowserDiagnosticAction(page, 1);
+  events.emit('response', { request: () => late, status: () => 500 });
+  events.emit('requestfailed', late);
+  refuse('document');
+  const lateRedirect = { ...request(), redirectedFrom: () => late } as unknown as Request;
+  events.emit('request', lateRedirect);
+  events.emit('response', { request: () => lateRedirect, status: () => 503 });
+  const current = request();
+  events.emit('request', current);
+  events.emit('response', { request: () => current, status: () => 200 });
+  const result = capture.finish();
+  expect(result.events).toMatchObject([
+    { source: 'http_response', status: 302, action_index: 0, request_index: 1 },
+    { source: 'http_response', status: 403, action_index: 0, request_index: 2, redirected_from: 1 },
+    { source: 'http_response', status: 200, action_index: 1 },
+  ]);
   expect(JSON.stringify(result)).not.toContain('secret-sentinel');
 });
 

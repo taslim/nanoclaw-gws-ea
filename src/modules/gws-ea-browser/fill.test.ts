@@ -12,7 +12,8 @@ import {
 } from './fill.js';
 import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
-import { observePage, pageHasSecret } from './observe.js';
+import { observePage } from './observe.js';
+import { pageHasSecret } from './page-privacy.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
@@ -101,7 +102,7 @@ function fixture(origin = 'https://www.shop.example') {
     frames: () => [frame],
     mainFrame: () => frame,
     isClosed: () => false,
-    locator: () => ({ innerText: async () => '', ariaSnapshot: async () => `- alert: ${SECRET}` }),
+    locator: () => ({ innerText: async () => '', ariaSnapshotJSON: async () => [{ role: 'alert', text: SECRET }] }),
     keyboard: {
       insertText: vi.fn(async (value: string) => {
         (activeElement as { value: string }).value = value;

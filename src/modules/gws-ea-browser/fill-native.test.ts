@@ -13,6 +13,7 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { executeBrowserBatch } from './executor.js';
+
 import { bindBrowserSecretField, fillBoundBrowserSecret } from './fill.js';
 import './merchant-signatures.js';
 import { browserSiteLeasesMigration } from './migration.js';

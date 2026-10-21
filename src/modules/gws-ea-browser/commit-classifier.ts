@@ -1,3 +1,4 @@
+import { captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { genericCheckoutSignature } from './generic-signature.js';
@@ -455,6 +456,8 @@ async function approvedPress(
 /** All recipes, fills, watches and tool activations use this single boundary. */
 export interface ActivationIntent {
   kind: 'click' | 'submit' | 'select' | 'download';
+  /** Immutable facts already required for this activation; recording never re-reads the control. */
+  onFacts?: (facts: ControlFacts) => void;
   /** Host-only cancellation/deadline check immediately before a native authentication submit. */
   assertActive?: () => Promise<void>;
   /** The action's remaining budget: its script-request window never outlasts it. */
@@ -496,8 +499,14 @@ export async function activateControl(
   // An approved press makes the very payment requests an ordinary action's window refuses: it is read and
   // pressed only once every such window on the page has closed.
   if (authority) await (await ensureBrowserNavigationGuard(page)).actionsSettled();
+  const recordRefusal = captureBrowserDiagnosticRefusal(page);
   const dispatch = await activationDispatch(page, element, intent.kind);
   const { classification, facts } = dispatch;
+  try {
+    intent.onFacts?.(structuredClone(facts));
+  } catch {
+    // An optional evidence projection cannot veto this required policy decision or operation.
+  }
   if (authority) {
     // An approval covers a commit's press: a control that no longer reads as one, or that its approval does not
     // cover, is refused before the commit marker, never pressed another way.
@@ -514,7 +523,10 @@ export async function activateControl(
     }
     return { ordinaryPress: false };
   }
-  if (classification !== 'ordinary') throw new BrowserActivationError(classification);
+  if (classification !== 'ordinary') {
+    recordRefusal('action', undefined, classification);
+    throw new BrowserActivationError(classification);
+  }
   if (dispatch.authentication) {
     const authentication = dispatch.authentication;
     await consentBeforeSubmission(page, element, intent.assertActive);
@@ -757,6 +769,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   const { targetInfo } = await pageSession.send('Target.getTargetInfo');
   const unregister = gate.register(targetInfo.targetId, {
     capture() {
+      const recordRefusal = captureBrowserDiagnosticRefusal(page);
       const scopes = [...policies];
       const approved = approvedPresses.get(page);
       const pausedIn = generation;
@@ -786,9 +799,17 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
               : { allow: true };
           }
           record(classification);
+          recordRefusal(
+            'document',
+            { url: document.url, method: document.method, resource: 'document' },
+            classification,
+          );
           return { allow: false };
         },
-        refuse: () => record('blocked_address'),
+        refuse: () => {
+          record('blocked_address');
+          recordRefusal('document', undefined, 'blocked_address');
+        },
       };
     },
   });
@@ -812,7 +833,14 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   const coverScripts = (): Promise<void> => {
     covering ??= coverPageTargets(page, async (session) => {
       session.on('Fetch.requestPaused', (event) => {
-        const answered = refusedScriptRequest(event.request)
+        const refused = refusedScriptRequest(event.request);
+        if (refused)
+          captureBrowserDiagnosticRefusal(page)(
+            'action',
+            { url: event.request.url, method: event.request.method, resource: event.resourceType.toLowerCase() },
+            'purchase_control',
+          );
+        const answered = refused
           ? session.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' })
           : session.send('Fetch.continueRequest', { requestId: event.requestId });
         void answered.catch(() => undefined);

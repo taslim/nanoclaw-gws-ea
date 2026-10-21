@@ -1,3 +1,4 @@
+import type { BrowserRef } from './observe.js';
 import type { Page } from 'playwright-core';
 import type { ResponseFrame } from '../../cli/frame.js';
 import type { Session } from '../../types.js';
@@ -69,3 +70,81 @@ export const BROWSER_ACTION_NAMES = [
 export type BrowserActionName = (typeof BROWSER_ACTION_NAMES)[number];
 
 export type BrowserActions = Readonly<Record<BrowserActionName, BrowserQueuedAction>>;
+
+/** Unexpected execution faults carry no page-authored or credential-bearing error payload. */
+export class BrowserExecutionError extends Error {
+  constructor() {
+    super('The browser action failed unexpectedly.');
+  }
+}
+
+export type BrowserStopReason =
+  | 'stale_ref'
+  | 'not_actionable'
+  | 'timeout'
+  | 'navigation_failed'
+  | 'navigated'
+  | 'purchase_control'
+  | 'speaks_as_principal'
+  | 'account_security'
+  | 'consent_control'
+  | 'consent_required'
+  | 'secret_field'
+  | 'card_field'
+  | 'read_only'
+  | 'unapproved_commit'
+  | 'blocked_address'
+  | 'challenge'
+  | 'sign_in_wall'
+  | 'site_busy'
+  | 'window_closed'
+  | 'browser_unavailable'
+  | 'alias_unavailable'
+  | 'personal_data'
+  | 'interrupted';
+export type BrowserAction =
+  | { kind: 'navigate'; url: string }
+  | { kind: 'observe' | 'screenshot' }
+  | ({ kind: 'click' | 'download' } & BrowserRef)
+  | ({ kind: 'type'; text: string } & BrowserRef)
+  | ({ kind: 'select'; value: string } & BrowserRef)
+  | ({ kind: 'key'; key: string } & BrowserRef)
+  | { kind: 'scroll'; direction: 'up' | 'down' | 'left' | 'right'; amount?: number }
+  | { kind: 'wait_for'; text?: string; timeout_ms?: number }
+  | { kind: 'form_input'; fields: Array<BrowserRef & { value: string }>; submit?: BrowserRef }
+  | ({ kind: 'upload'; path: string } & BrowserRef);
+
+export interface BrowserBatch {
+  actions: BrowserAction[];
+}
+/** Host callers may replay on a signed-out page; none of these options are model inputs. */
+export interface BrowserBatchOptions {
+  page?: Page;
+  record?: boolean;
+  readOnly?: boolean;
+  siteAccess?: import('./commit-classifier.js').BrowserSiteAccess;
+  /** Host-only persisted targets, in the action's target order. Never converted through model refs. */
+  targets?: readonly import('./locators.js').StructuredBrowserLocator[];
+}
+export interface BrowserActionData {
+  trace_index?: number;
+  image_index?: number;
+  path?: string;
+  filename?: string;
+  bytes?: number;
+}
+export type BrowserActionResult = { index: number } & (
+  | { status: 'not_executed' }
+  | ({ status: 'completed' } & BrowserActionData)
+  | {
+      status: 'stopped';
+      reason: BrowserStopReason;
+      trace_index?: number;
+      consent?: readonly import('./consent.js').ConsentStopView[];
+    }
+);
+
+export function browserActionRefs(action: BrowserAction): BrowserRef[] {
+  if ('ref' in action) return [action];
+  return action.kind === 'form_input' ? [...action.fields, ...(action.submit ? [action.submit] : [])] : [];
+}

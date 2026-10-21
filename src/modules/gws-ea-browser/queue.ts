@@ -16,7 +16,12 @@ import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import type { BrowserActionName, BrowserActions, BrowserExecutionContext } from './actions.js';
+import {
+  BrowserExecutionError,
+  type BrowserActionName,
+  type BrowserActions,
+  type BrowserExecutionContext,
+} from './actions.js';
 import { BrowserOperation } from './operation.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } from './db.js';
 import { SiteLeaseStore } from './leases.js';
@@ -343,7 +348,10 @@ export class BrowserQueue {
           ? stopped('unconfirmed', false)
           : error instanceof ActionRefusal
             ? error
-            : ((await this.action(request.action)?.recover?.(started)) ?? stopped('browser_unavailable', false)),
+            : ((await this.action(request.action)?.recover?.(started)) ??
+              (error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
+                ? stopped('browser_unavailable', false)
+                : new BrowserExecutionError())),
       );
     } finally {
       await operation.finish();
@@ -418,13 +426,17 @@ export class BrowserQueue {
     }
   }
 
-  async finish(request: BrowserRequest, result: Record<string, unknown> | ActionRefusal): Promise<void> {
+  async finish(
+    request: BrowserRequest,
+    result: Record<string, unknown> | ActionRefusal | BrowserExecutionError,
+  ): Promise<void> {
     const at = new Date().toISOString();
     const latest = await this.store.request(request.id);
     if (!latest) return;
     if (
       latest.commit_started_at &&
       !(result instanceof ActionRefusal) &&
+      !(result instanceof BrowserExecutionError) &&
       (result.status === 'unconfirmed' || result.reason === 'unconfirmed')
     ) {
       await this.followUps.recordUnknownBrowserPurchaseRequest(request.id);
@@ -432,11 +444,11 @@ export class BrowserQueue {
     const diagnostics = this.diagnosticAttempts.get(request.id)?.finish();
     this.diagnosticAttempts.delete(request.id);
     const frame: ResponseFrame =
-      result instanceof ActionRefusal
+      result instanceof ActionRefusal || result instanceof BrowserExecutionError
         ? {
             id: request.request_id,
             ok: false,
-            error: { code: result.code, message: result.message },
+            error: { code: result instanceof ActionRefusal ? result.code : 'handler-error', message: result.message },
           }
         : {
             id: request.request_id,

@@ -50,15 +50,13 @@ import {
 } from './fill.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import {
-  bindPageSecretDocuments,
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerPageSecret,
-  releasePageSecret,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
+import { bindPageSecretDocuments, registerPageSecret, releasePageSecret } from './page-privacy.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { signInAddress } from './web-address.js';

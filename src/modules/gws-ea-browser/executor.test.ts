@@ -4,15 +4,16 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import './index.js';
-import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from './executor.js';
+import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
+import { isSecretBrowserField } from './action-targets.js';
 import type { PinnedBrowserRef } from './observe.js';
 import type { BrowserExecutionContext } from './actions.js';
-import { registerPageSecret } from './observe.js';
+import { registerPageSecret } from './page-privacy.js';
 
 // A fake page has no isolated worlds, so its scan for secret values would fail closed; native suites cover the
 // scan. The host's own secret on a page still refuses a screenshot here.
-vi.mock('./observe.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./observe.js')>()),
+vi.mock('./page-privacy.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./page-privacy.js')>()),
   pageMayShowSecret: vi.fn(async () => false),
 }));
 
@@ -45,7 +46,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
     frames: () => [],
     mainFrame: () => ({}),
     isClosed: () => false,
-    locator: () => ({ ariaSnapshot: async () => '- document' }),
+    locator: () => ({ ariaSnapshotJSON: async () => [{ role: 'document' }] }),
     screenshot: async () => {
       screenshots++;
       return Buffer.from('screenshot');

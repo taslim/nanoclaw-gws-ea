@@ -27,6 +27,7 @@ import { BrowserStore } from './db.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import { browserAction } from './executor.js';
+
 import { saveRecipeAction, runRecipeAction } from './recipes.js';
 import './capability.js';
 import { fillSecretAction } from './fill.js';
@@ -248,17 +249,8 @@ export {
   ensureBrowserNavigationGuard,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
-export {
-  observePage,
-  pinBrowserRefs,
-  disposeBrowserRefs,
-  registerPageSecret,
-  releasePageSecret,
-  redactPageText,
-  pageHasSecret,
-  type BrowserRef,
-  type PinnedBrowserRef,
-} from './observe.js';
+export { observePage, pinBrowserRefs, disposeBrowserRefs, type BrowserRef, type PinnedBrowserRef } from './observe.js';
+export { registerPageSecret, releasePageSecret, redactPageText, pageHasSecret } from './page-privacy.js';
 onHostShutdown(async () => {
   setBrowserAdmissionReady(false);
   if (reconcileTimer) clearInterval(reconcileTimer);
