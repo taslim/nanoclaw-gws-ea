@@ -1,4 +1,3 @@
-/** Selects a concrete reviewed reader, or the generic reader for an unreviewed site. */
 import type { ElementHandle, Page } from 'playwright-core';
 import type { PurchaseFacts } from './fingerprint.js';
 import { genericCheckoutSignature } from './generic-signature.js';

@@ -97,25 +97,35 @@ export async function bindPageSecretDocuments(page: Page, value: string): Promis
   for (const loader of loaders) state.secretDocumentLoaders.add(loader);
   if (loaders.size) state.unboundSecretDocuments.delete(value);
 }
-export function redactPageText(page: Page, text: string): string {
+function redactText(text: string, secrets: readonly string[]): string {
   let result = text;
-  for (const value of [...stateFor(page).secrets].sort((a, b) => b.length - a.length))
-    result = result.split(value).join('[redacted]');
+  for (const value of secrets) result = result.split(value).join('[redacted]');
   return result.replace(
     /https?:\/\/[^\s"<>]*(?:[?&#](?:[\w-]*token|code|key|ticket|auth|secret|credential|signature|reservation)=)[^\s"<>]*/giu,
     '[redacted URL]',
   );
 }
 
+export function redactPageText(page: Page, text: string): string {
+  return redactText(
+    text,
+    [...stateFor(page).secrets].sort((a, b) => b.length - a.length),
+  );
+}
+
 /** Redacts host-read structured values before serialization, keeping object keys and JSON syntax intact. */
 export function redactPageData(page: Page, value: unknown): unknown {
-  if (typeof value === 'string') return redactPageText(page, value);
-  if (Array.isArray(value)) return value.map((item: unknown) => redactPageData(page, item));
-  if (typeof value === 'object' && value !== null) {
-    const fields = value as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(fields).map(([key, item]) => [key, redactPageData(page, item)]));
-  }
-  return value;
+  const secrets = [...stateFor(page).secrets].sort((a, b) => b.length - a.length);
+  const visit = (item: unknown): unknown => {
+    if (typeof item === 'string') return redactText(item, secrets);
+    if (Array.isArray(item)) return item.map((child: unknown) => visit(child));
+    if (typeof item === 'object' && item !== null) {
+      const fields = item as Record<string, unknown>;
+      return Object.fromEntries(Object.entries(fields).map(([key, child]) => [key, visit(child)]));
+    }
+    return item;
+  };
+  return visit(value);
 }
 
 declare const replayUrl: unique symbol;

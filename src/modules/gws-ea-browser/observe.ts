@@ -68,7 +68,6 @@ export interface BrowserStructure {
   readonly replayUrl?: BrowserReplayUrl;
 }
 
-/** Presentation of the supported structured snapshot. Refs come from that same native snapshot. */
 function presentStructure(tree: unknown, depth = 0): string[] {
   if (Array.isArray(tree)) return tree.flatMap((node) => presentStructure(node, depth));
   if (!isRecord(tree) || typeof tree.role !== 'string') return [];

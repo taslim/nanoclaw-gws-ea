@@ -222,8 +222,7 @@ export async function resolveLocator(
 }
 
 /** The existing core snapshot already owns exact accessible names, counts and native target identities. */
-export function captureSnapshotLocator(target: PinnedBrowserRef, tree: unknown): StructuredBrowserLocator {
-  const nodes = flatten(ariaNodes(tree));
+export function captureSnapshotLocator(target: PinnedBrowserRef, nodes: readonly AriaNode[]): StructuredBrowserLocator {
   const node = nodes.find((candidate) => candidate.ref === target.ref);
   if (!node || !isRole(node.role)) throw new BrowserLocatorError('Snapshot target is unavailable');
   const framePrefix = (ref: string | undefined): string | undefined =>

@@ -1,4 +1,4 @@
-import type { BrowserRecipeStep, RecipeCheckpoint } from './recording.js';
+import { checkpoint as recordedCheckpoint, type BrowserRecipeStep, type RecipeCheckpoint } from './recording.js';
 import { browserKeyboardSubmitTarget } from './action-targets.js';
 import { browserActionRefs, type BrowserAction, type BrowserBatchOptions } from './actions.js';
 import {
@@ -132,8 +132,7 @@ export function validateRunRecipe(raw: Record<string, unknown>): RunRecipeInput 
 }
 function checkpoint(snapshot: Awaited<ReturnType<typeof snapshotBrowserStructure>>): RecipeCheckpoint {
   if (!snapshot.replayUrl) throw invalidArgs('This page has no safe replay checkpoint.');
-  const heading = flatten(ariaNodes(snapshot.tree)).find((node) => node.role === 'heading')?.name;
-  return { url: checkpointUrl(snapshot.replayUrl), ...(heading ? { heading } : {}) };
+  return recordedCheckpoint(snapshot);
 }
 /**
  * A watch's marked region (KTD20): the element's structured locator, recorded as a recipe step's target is, when its

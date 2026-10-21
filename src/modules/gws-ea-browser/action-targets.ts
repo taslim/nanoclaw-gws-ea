@@ -3,14 +3,8 @@ import { readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { browserActionRefs } from './actions.js';
 import { browserStructureFacts } from './observe.js';
 import { browserPageReplayUrl, redactPageData } from './page-privacy.js';
-import {
-  ariaNodes,
-  flatten,
-  checkpointUrl,
-  captureSnapshotLocator,
-  type StructuredBrowserLocator,
-} from './locators.js';
-import type { BrowserRecipeStep } from './recording.js';
+import { ariaNodes, flatten, captureSnapshotLocator, type StructuredBrowserLocator } from './locators.js';
+import { checkpoint, type BrowserRecipeStep } from './recording.js';
 import type { ElementHandle, JSHandle, Page } from 'playwright-core';
 import { classifyActivation, type ActivationIntent } from './commit-classifier.js';
 import type { BrowserRef, PinnedBrowserRef } from './observe.js';
@@ -100,16 +94,17 @@ export function prepareBrowserActionFacts(
     (page.url() === 'about:blank' ? { generation: 0, replayUrl: browserPageReplayUrl(page), tree: [] } : undefined);
   if (!snapshot?.replayUrl) return undefined;
   try {
-    const heading = flatten(ariaNodes(snapshot.tree)).find((node) => node.role === 'heading')?.name;
+    const nodes = flatten(ariaNodes(snapshot.tree));
+    const before = checkpoint(snapshot, nodes);
     const targets = browserActionRefs(action).map((ref, index) => {
       const target = refs.get(ref.ref);
       if (!target) throw new Error('Target unavailable');
-      return persistedTargets?.[index] ?? captureSnapshotLocator(target, snapshot.tree);
+      return persistedTargets?.[index] ?? captureSnapshotLocator(target, nodes);
     });
     const step = {
       action: structuredClone(action),
       targets,
-      before: { url: checkpointUrl(snapshot.replayUrl), ...(heading ? { heading } : {}) },
+      before,
       readOnly: false,
     };
     return JSON.stringify(redactPageData(page, step)) === JSON.stringify(step) ? structuredClone(step) : undefined;

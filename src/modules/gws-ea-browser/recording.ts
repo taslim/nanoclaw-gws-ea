@@ -1,3 +1,4 @@
+import { withinTime } from './page-targets.js';
 import type { DbDriver } from '../../db/driver.js';
 import type { BrowserAction } from './actions.js';
 import type { BrowserStructure } from './observe.js';
@@ -20,17 +21,16 @@ export interface BrowserRecipeStep {
   clickHref?: string;
 }
 
-function checkpoint(snapshot: BrowserStructure): RecipeCheckpoint {
+export function checkpoint(
+  snapshot: Pick<BrowserStructure, 'tree' | 'replayUrl'>,
+  nodes?: ReturnType<typeof flatten>,
+): RecipeCheckpoint {
   // Display strings never become executable checkpoint state.
   if (!snapshot.replayUrl) throw new Error('Checkpoint unavailable');
-  const heading = flatten(ariaNodes(snapshot.tree)).find((node) => node.role === 'heading')?.name;
+  const heading = (nodes ?? flatten(ariaNodes(snapshot.tree))).find((node) => node.role === 'heading')?.name;
   return { url: checkpointUrl(snapshot.replayUrl), ...(heading ? { heading } : {}) };
 }
 
-export interface BrowserRecordingCoverage {
-  readonly status: 'complete' | 'unavailable';
-  readonly trace_indices: readonly number[];
-}
 export interface BrowserActionTrace {
   readonly index: number;
   finish(step: BrowserRecipeStep | undefined, after: BrowserStructure | undefined, reason?: string): Promise<boolean>;
@@ -43,17 +43,7 @@ export async function withinBrowserRecordingBudget<T>(
 ): Promise<T | undefined> {
   const budget = Math.min(250, Math.max(0, remaining - 1_000));
   if (budget === 0) return undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      work().catch(() => undefined),
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), budget);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
+  return withinTime(work(), budget).catch(() => undefined);
 }
 
 /** No page read and no executable invented checkpoint. The committed incomplete row survives a crash. */

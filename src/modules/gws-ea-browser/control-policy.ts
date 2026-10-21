@@ -1,4 +1,3 @@
-/** Shared control and route policy. Checkout readers consume it without importing the action executor. */
 import type { ElementHandle, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { httpsOrigin, type CredentialKind } from './authentication-signatures.js';
