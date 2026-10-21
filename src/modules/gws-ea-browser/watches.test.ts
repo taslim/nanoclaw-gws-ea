@@ -1,3 +1,17 @@
+import { recoverBrowserWatchState } from './watch-state.js';
+import { repairBrowserWatchChecks } from './scheduler.js';
+import {
+  type WatchBounds,
+  type WatchRow,
+  getBrowserWatch,
+  compareWatchBounds,
+  claimWatchBooking,
+  finishWatchPurchase,
+  claimRegionWatchCommit,
+  finishWatchCommit,
+} from './watch-state.js';
+import { recoverAndStartBrowserQueue } from './index.js';
+import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -15,26 +29,12 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import { BrowserQueue } from './queue.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
-import {
-  claimRegionWatchCommit,
-  claimWatchBooking,
-  compareWatchBounds,
-  createBrowserWatch,
-  finishWatchCommit,
-  finishWatchPurchase,
-  getBrowserWatch,
-  prepareWatchPurchase,
-  recoverBrowserWatches,
-  renderWatchCard,
-  validateWatchRequest,
-  type WatchBounds,
-  type WatchRow,
-} from './watches.js';
+import { createBrowserWatch, renderWatchCard, validateWatchRequest } from './watches.js';
+import { prepareWatchPurchase } from './watch-purchase.js';
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
 import * as watchRuntime from './watch-runtime.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
@@ -42,6 +42,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { saveBrowserRecipe } from './recipes.js';
+
 import { cancelBrowserJob } from './cancel.js';
 
 const bounds: WatchBounds = {
@@ -100,6 +101,7 @@ beforeEach(async () => {
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
 });
 afterEach(async () => {
+  await stopHeldBrowserRequests();
   vi.restoreAllMocks();
   vi.useRealTimers();
   delete process.env.GWS_EA_BROWSER_POLICY_FILE;
@@ -113,9 +115,7 @@ async function executionContext(name: string) {
   const { getSession } = await import('../../db/sessions.js');
   const session = (await getSession(job.browser_session_id))!;
   await store.accept(job, session, name, 'purchase', {}, 90_000);
-  const request = (await store.pending(jobId)).find((candidate) => candidate.request_id === name)!;
-  await store.start(request.id);
-  const queue = new BrowserQueue(store, {
+  return holdBrowserRequest(store, {
     async pageForJob(): Promise<never> {
       throw new Error('Unexpected browser');
     },
@@ -125,7 +125,6 @@ async function executionContext(name: string) {
     async closeJob() {},
     onDisconnected: () => () => undefined,
   });
-  return { queue, context: (await queue.contextForRequest(request.id))! };
 }
 
 /** An armed watch of the job: a reader watch on `watched`, a site, or a region watch (KTD20) with those bounds. */
@@ -229,7 +228,7 @@ describe('native watch bounds and one booking claim', () => {
         }),
       ),
     ).rejects.toThrow('already claimed');
-    await finishWatchPurchase(getDb(), 'friday', 'attempt', true, 'page');
+    await finishWatchPurchase(getDb(), 'friday', 'attempt', true);
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'saturday')).toEqual({
       status: 'cancelled',
     });
@@ -265,8 +264,7 @@ describe('native watch bounds and one booking claim', () => {
     const session = (await getSession(job.browser_session_id))!;
     await store.accept(job, session, 'native-commit', 'purchase', {}, 90_000);
     const request = (await store.pending(jobId))[0];
-    await store.start(request.id);
-    const queue = new BrowserQueue(store, {
+    const { context } = await holdBrowserRequest(store, {
       async pageForJob(): Promise<never> {
         throw new Error('No DOM in authority test');
       },
@@ -276,7 +274,6 @@ describe('native watch bounds and one booking claim', () => {
       async closeJob() {},
       onDisconnected: () => () => undefined,
     });
-    const context = (await queue.contextForRequest(request.id))!;
     const authorityStore = new PurchaseAuthorityStore();
     const authority = await authorityStore.create({
       id: 'free-watch',
@@ -300,19 +297,17 @@ describe('native watch bounds and one booking claim', () => {
       jobId,
       new Date().toISOString(),
     );
-    await queue.withJobLock(jobId, () =>
-      authorityStore.begin(context, authority.id, facts, (db, accepted, current) =>
-        claimWatchBooking(db, {
-          watchId: 'friday',
-          jobId,
-          authorityId: accepted.id,
-          attemptId: accepted.attempt_id,
-          requestId: request.id,
-          facts: current,
-          calendarCheckedReservation: facts.reservation!,
-          at: new Date().toISOString(),
-        }),
-      ),
+    await authorityStore.begin(context, authority.id, facts, (db, accepted, current) =>
+      claimWatchBooking(db, {
+        watchId: 'friday',
+        jobId,
+        authorityId: accepted.id,
+        attemptId: accepted.attempt_id,
+        requestId: request.id,
+        facts: current,
+        calendarCheckedReservation: facts.reservation!,
+        at: new Date().toISOString(),
+      }),
     );
     expect(await store.request(request.id)).toMatchObject({ commit_started_at: expect.any(String) });
     expect(await authorityStore.get(authority.id)).toMatchObject({ state: 'committing' });
@@ -433,7 +428,7 @@ describe('native watch bounds and one booking claim', () => {
     await seedWatch('friday');
     await getDb().run("UPDATE gws_ea_browser_watches SET status='preparing' WHERE id='friday'");
     const { queue, context } = await executionContext('recovery');
-    await recoverBrowserWatches(queue);
+    await recoverBrowserWatchState(queue);
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'friday')).toEqual({
       status: 'armed',
     });
@@ -473,7 +468,23 @@ describe('native watch bounds and one booking claim', () => {
         at: new Date().toISOString(),
       }),
     );
-    await queue.start();
+    const stoppedHost = vi.spyOn(queue, 'finish').mockRejectedValue(new Error('Host stopped before answer'));
+    await expect(queue.stop()).rejects.toThrow('Host stopped before answer');
+    stoppedHost.mockRestore();
+    expect(await store.get(authority.id)).toMatchObject({ state: 'committing' });
+    expect((await queue.store.request(context.request.id))?.answered_at).toBeNull();
+    const run = getDb().run.bind(getDb());
+    const unavailableChecks = vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes('UPDATE gws_ea_browser_watch_checks')) throw new Error('Scheduled checks unavailable');
+      return run(sql, ...parameters);
+    });
+    try {
+      await recoverAndStartBrowserQueue(queue);
+      await expect(repairBrowserWatchChecks(queue)).rejects.toThrow('Scheduled checks unavailable');
+      expect(unavailableChecks).toHaveBeenCalled();
+    } finally {
+      unavailableChecks.mockRestore();
+    }
     expect(await store.get(authority.id)).toMatchObject({ state: 'unknown' });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'friday')).toEqual({
       status: 'outcome_unknown',
@@ -586,95 +597,139 @@ describe('native watch bounds and one booking claim', () => {
     });
     expect(cards).toHaveLength(1);
   });
-  it('promotes only the recorded booking path present at the verified commit, not a later same-site save', async () => {
-    await seedWatch('friday');
-    const facts = freeFacts();
-    const step = {
-      action: { kind: 'click', ref: 'e1', generation: 1 },
-      targets: [
-        {
-          role: 'button',
-          name: 'Reserve',
-          ordinal: 0,
-          count: 1,
-          framePath: [],
-          frameUrls: ['https://resy.com/venue/bistro'],
-        },
-      ],
-      before: { url: 'https://resy.com/venue/bistro' },
-      after: { url: 'https://resy.com/venue/bistro' },
-      readOnly: false,
-      stopReason: 'purchase_control',
-    };
-    await getDb().run(
-      'INSERT INTO gws_ea_browser_action_trace VALUES(?,?,?,?,?)',
-      jobId,
-      0,
-      'preparation',
-      JSON.stringify(step),
-      new Date().toISOString(),
-    );
-    const { context } = await executionContext('verified-path');
-    const saved = await saveBrowserRecipe(context, { name: 'Book', first_action: 0, last_action: 0, parameters: [] });
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_watch_recipe_links')).toEqual([]);
-    const store = new PurchaseAuthorityStore();
-    const authority = await store.create({
-      id: 'recipe-authority',
-      jobId,
-      kind: 'watch',
-      watchId: 'friday',
-      facts,
-      bounds: {
-        reservation: {
-          venueId: 'bistro',
-          partySize: 4,
-          windowStart: bounds.windows[0].start,
-          windowEnd: bounds.windows[0].end,
-        },
-      },
-      attemptId: 'recipe-attempt',
-      expiresAt: bounds.until,
-    });
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_site_leases VALUES('resy.com',?,'active',?)",
-      jobId,
-      new Date().toISOString(),
-    );
-    await store.begin(context, authority.id, facts, (db, current, latest) =>
-      claimWatchBooking(db, {
-        watchId: 'friday',
+  it.each(['available', 'failed', 'held'])(
+    'settles a verified booking with recipe metadata %s, promoting only its recorded path',
+    async (metadataState) => {
+      await seedWatch('friday');
+      const facts = freeFacts();
+      const step = {
+        action: { kind: 'click', ref: 'e1', generation: 1 },
+        targets: [
+          {
+            role: 'button',
+            name: 'Reserve',
+            ordinal: 0,
+            count: 1,
+            framePath: [],
+            frameUrls: ['https://resy.com/venue/bistro'],
+          },
+        ],
+        before: { url: 'https://resy.com/venue/bistro' },
+        after: { url: 'https://resy.com/venue/bistro' },
+        readOnly: false,
+        stopReason: 'purchase_control',
+      };
+      await getDb().run(
+        'INSERT INTO gws_ea_browser_action_trace VALUES(?,?,?,?,?)',
         jobId,
-        authorityId: current.id,
-        attemptId: current.attempt_id,
-        requestId: context.request.id,
-        facts: latest,
-        calendarCheckedReservation: facts.reservation!,
-        at: new Date().toISOString(),
-      }),
-    );
-    await store.resolve(authority.attempt_id, {
-      placed: true,
-      source: 'page',
-      evidence: { recordId: 'reservation-recipe' },
-      record: { id: 'reservation-recipe', account: 'principal' },
-      outcome: { status: 'booked' },
-    });
-    expect(
-      await getDb().all('SELECT booking_recipe_id,source_attempt_id FROM gws_ea_browser_watch_recipe_links'),
-    ).toEqual([{ booking_recipe_id: saved.recipe_id, source_attempt_id: 'recipe-attempt' }]);
-    await getDb().run(
-      'INSERT INTO gws_ea_browser_action_trace VALUES(?,?,?,?,?)',
-      jobId,
-      1,
-      'later-preparation',
-      JSON.stringify(step),
-      new Date().toISOString(),
-    );
-    await saveBrowserRecipe(context, { name: 'Different path', first_action: 1, last_action: 1, parameters: [] });
-    expect(await getDb().all('SELECT booking_recipe_id FROM gws_ea_browser_watch_recipe_links')).toEqual([
-      { booking_recipe_id: saved.recipe_id },
-    ]);
-  });
+        0,
+        'preparation',
+        JSON.stringify(step),
+        new Date().toISOString(),
+      );
+      const { context } = await executionContext('verified-path');
+      const saved = await saveBrowserRecipe(context, { name: 'Book', first_action: 0, last_action: 0, parameters: [] });
+      expect(await getDb().all('SELECT * FROM gws_ea_browser_watch_recipe_links')).toEqual([]);
+      const store = new PurchaseAuthorityStore();
+      const authority = await store.create({
+        id: 'recipe-authority',
+        jobId,
+        kind: 'watch',
+        watchId: 'friday',
+        facts,
+        bounds: {
+          reservation: {
+            venueId: 'bistro',
+            partySize: 4,
+            windowStart: bounds.windows[0].start,
+            windowEnd: bounds.windows[0].end,
+          },
+        },
+        attemptId: 'recipe-attempt',
+        expiresAt: bounds.until,
+      });
+      await getDb().run(
+        "INSERT INTO gws_ea_browser_site_leases VALUES('resy.com',?,'active',?)",
+        jobId,
+        new Date().toISOString(),
+      );
+      await store.begin(context, authority.id, facts, (db, current, latest) =>
+        claimWatchBooking(db, {
+          watchId: 'friday',
+          jobId,
+          authorityId: current.id,
+          attemptId: current.attempt_id,
+          requestId: context.request.id,
+          facts: latest,
+          calendarCheckedReservation: facts.reservation!,
+          at: new Date().toISOString(),
+        }),
+      );
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let releasedByTimer = false;
+      let catalogReads = 0;
+      const pending: Promise<unknown>[] = [];
+      const alarm = setTimeout(() => {
+        releasedByTimer = true;
+        release();
+      }, 1_000);
+      const get = getDb().get.bind(getDb());
+      const catalog = vi.spyOn(getDb(), 'get').mockImplementation(async (sql, ...parameters) => {
+        if (sql.includes('FROM gws_ea_browser_recipes')) {
+          catalogReads++;
+          if (metadataState === 'failed') throw new Error('Catalog unavailable');
+          if (metadataState === 'held') {
+            const read = held.then(() => get(sql, ...parameters));
+            pending.push(read);
+            return read;
+          }
+        }
+        return get(sql, ...parameters);
+      });
+      try {
+        await store.resolve(authority.attempt_id, {
+          placed: true,
+          source: 'page',
+          evidence: { recordId: 'reservation-recipe' },
+          record: { id: 'reservation-recipe', account: 'principal' },
+          outcome: { status: 'booked' },
+        });
+        expect(catalogReads).toBeGreaterThan(0);
+        expect(releasedByTimer).toBe(false);
+      } finally {
+        release();
+        clearTimeout(alarm);
+        await Promise.all(pending);
+        catalog.mockRestore();
+      }
+      expect(await store.get(authority.id)).toMatchObject({ state: 'committed' });
+      expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id=?', jobId)).toEqual({
+        state: 'booked',
+      });
+      expect(
+        await getDb().all('SELECT booking_recipe_id,source_attempt_id FROM gws_ea_browser_watch_recipe_links'),
+      ).toEqual(
+        metadataState !== 'available'
+          ? []
+          : [{ booking_recipe_id: saved.recipe_id, source_attempt_id: 'recipe-attempt' }],
+      );
+      await getDb().run(
+        'INSERT INTO gws_ea_browser_action_trace VALUES(?,?,?,?,?)',
+        jobId,
+        1,
+        'later-preparation',
+        JSON.stringify(step),
+        new Date().toISOString(),
+      );
+      await saveBrowserRecipe(context, { name: 'Different path', first_action: 1, last_action: 1, parameters: [] });
+      expect(await getDb().all('SELECT booking_recipe_id FROM gws_ea_browser_watch_recipe_links')).toEqual(
+        metadataState !== 'available' ? [] : [{ booking_recipe_id: saved.recipe_id }],
+      );
+    },
+  );
   it('does not let two jobs consume the same shared slot under different venue display spellings', async () => {
     await seedWatch('first');
     const facts = freeFacts();
@@ -1023,9 +1078,9 @@ describe('watches on sites with no reader (KTD20)', () => {
     // The claim is spent: a second commit leaves the other watch armed.
     await claimRegionWatchCommit(getDb(), { jobId, site: 'tables.example', attemptId: 'again', requestId: 'r2', at });
     expect(await getBrowserWatch('elsewhere')).toMatchObject({ status: 'armed' });
-    await finishWatchCommit(getDb(), jobId, 'other', true, 'page');
+    await finishWatchCommit(getDb(), jobId, 'other', true);
     expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booking' });
-    await finishWatchCommit(getDb(), jobId, 'free', true, 'page');
+    await finishWatchCommit(getDb(), jobId, 'free', true);
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
     expect(await getBrowserWatch('larder')).toMatchObject({ status: 'booked' });
     // The job's other watches end with it.
@@ -1103,7 +1158,8 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(() => validateWatchRequest({ ...regionRequest, watch_id: 'watch-1' })).toThrow('watch_id');
     // The queue keeps the agent's own fields, so the run reads a release rule as the agent sent it.
     const { queue } = await executionContext('queued-release');
-    await queue.start();
+    await queue.stop();
+    await recoverAndStartBrowserQueue(queue);
     try {
       await getDb().run(
         "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",

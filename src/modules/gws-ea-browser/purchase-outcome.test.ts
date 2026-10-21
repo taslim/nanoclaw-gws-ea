@@ -1,3 +1,6 @@
+import { claimRegionWatchCommit } from './watch-state.js';
+import { createBrowserQueue } from './index.js';
+import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /**
  * Purchase outcomes against a real central DB and real session DBs (KTD8, KTD9, KTD10): an attempt with no page
  * proof is unconfirmed and told once, main records its outcome through the one resolve function, and every edge
@@ -45,8 +48,8 @@ import { SiteLeaseStore } from './leases.js';
 import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
 import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
-import { claimRegionWatchCommit } from './watches.js';
-import { BrowserQueue } from './queue.js';
+
+import { type BrowserQueue } from './queue.js';
 
 const ALIAS = 'aya.web@example.test';
 const SITE = 'pottery.example';
@@ -144,10 +147,8 @@ const record = (
   source: 'email' | 'principal',
   from: Session = main,
 ) =>
-  recordPurchaseOutcome(
-    { thread, attempt_id: attemptId, outcome, source },
-    from,
-    () => new BrowserQueue(new BrowserStore(), runtime),
+  recordPurchaseOutcome({ thread, attempt_id: attemptId, outcome, source }, from, () =>
+    createBrowserQueue(new BrowserStore(), runtime),
   );
 
 let requests = 0;
@@ -190,6 +191,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await stopHeldBrowserRequests();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await closeDb();
@@ -403,7 +405,7 @@ describe('main recording an unconfirmed purchase', () => {
     expect(await leases.acquire(waiting.job.id, `https://${SITE}/`)).toMatchObject({ acquired: false });
     await duplicate(
       'mugs',
-      new BrowserQueue(new BrowserStore(), {
+      createBrowserQueue(new BrowserStore(), {
         ...runtime,
         closeJob: () => Promise.reject(new Error('Staged upload removal failed')),
       }),
@@ -411,7 +413,7 @@ describe('main recording an unconfirmed purchase', () => {
     const woken = (await notes(waiting.session)).filter((text) => text.includes('browser_site_available'));
     expect(woken).toHaveLength(1);
     // Any other cleanup that fails after the incident is recorded and told leaves the answer standing.
-    const failing = new BrowserQueue(new BrowserStore(), runtime);
+    const failing = createBrowserQueue(new BrowserStore(), runtime);
     vi.spyOn(failing, 'wakeWaiters').mockRejectedValue(new Error('Mailbox unavailable'));
     const bowls = await duplicate('bowls', failing);
     expect(warned).toHaveBeenCalledWith(
@@ -490,10 +492,7 @@ describe('the begin rule', () => {
   async function approved(job: BrowserJob, session: Session, name: string, exceptions: string[]) {
     const store = new BrowserStore();
     await store.accept(job, session, name, 'purchase', {}, 90_000);
-    const request = (await store.pending(job.id)).find((candidate) => candidate.request_id === name)!;
-    await store.start(request.id);
-    const queue = new BrowserQueue(store, runtime);
-    const context = (await queue.contextForRequest(request.id))!;
+    const { queue, context } = await holdBrowserRequest(store, runtime);
     await getDb().run(
       `INSERT INTO gws_ea_browser_authorities
        (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
@@ -512,7 +511,7 @@ describe('the begin rule', () => {
       job.id,
       new Date().toISOString(),
     );
-    return context;
+    return { queue, context };
   }
 
   it('makes another purchase on the site wait unless its card’s one-attempt exception names the earlier one', async () => {
@@ -521,11 +520,14 @@ describe('the begin rule', () => {
     const { session, job } = await errand('main-p', 'plates');
     const store = new PurchaseAuthorityStore();
     const plain = await approved(job, session, 'plain', []);
-    await expect(store.begin(plain, 'authority-plain', checkout())).rejects.toThrow(PurchaseAuthorityError);
+    await expect(store.begin(plain.context, 'authority-plain', checkout())).rejects.toThrow(PurchaseAuthorityError);
     expect(await store.get('authority-plain')).toMatchObject({ state: 'live' });
     await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'revoked' WHERE id = 'authority-plain'");
+    await plain.queue.stop();
     const excepted = await approved(job, session, 'excepted', [id]);
-    expect(await store.begin(excepted, 'authority-excepted', checkout())).toMatchObject({ state: 'committing' });
+    expect(await store.begin(excepted.context, 'authority-excepted', checkout())).toMatchObject({
+      state: 'committing',
+    });
     expect(await attempt('attempt-excepted')).toMatchObject({ resolution: null });
   });
 });
@@ -669,13 +671,13 @@ describe('a restart', () => {
       waiting.job.id,
       new Date().toISOString(),
     );
-    await recoverBrowserPurchases(new BrowserQueue(new BrowserStore(), runtime));
+    await recoverBrowserPurchases(createBrowserQueue(new BrowserStore(), runtime));
     expect(await blocks()).toEqual([{ site: 'bowls.example' }]);
     expect(await authority(cutOff)).toMatchObject({ state: 'unknown' });
     expect((await unconfirmedNotes(main)).filter((text) => text.includes(cutOff))).toHaveLength(1);
     expect(await attempt(resolved)).toMatchObject({ resolution: 'not_committed' });
     expect((await notes(waiting.session)).filter((text) => text.includes('browser_site_available'))).toHaveLength(1);
-    await recoverBrowserPurchases(new BrowserQueue(new BrowserStore(), runtime));
+    await recoverBrowserPurchases(createBrowserQueue(new BrowserStore(), runtime));
     expect(await blocks()).toEqual([{ site: 'bowls.example' }]);
     expect((await unconfirmedNotes(main)).filter((text) => text.includes(cutOff))).toHaveLength(1);
   });

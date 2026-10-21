@@ -1,3 +1,5 @@
+import { formatLocalTimeWithZone } from '../../timezone.js';
+import { detachBrowserWatchCards } from './watch-state.js';
 /** Native job reads and cancellation, shared by delegation, matters and policy reconciliation. */
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
@@ -6,17 +8,19 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { readPendingSignInSite } from '../gws-ea-inbox/claims.js';
+import { attemptSummary } from './notices.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
-import { errandSource, hasBrowserAccess } from './access.js';
+import { errandSource, hasBrowserAccess, readHostBrowserPolicy } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
 import { PurchaseAuthorityStore } from './authority.js';
-import { cardTime, detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
+import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
 import { formatMoney, type PurchaseFacts } from './fingerprint.js';
 import { principalClock } from './watch-policy.js';
-import { readBrowserPolicy } from './policy.js';
+
 import type { BrowserQueue } from './queue.js';
 
 export type BrowserJobState = 'idle' | 'working' | 'awaiting_principal' | 'watching' | 'cancelled';
@@ -60,7 +64,7 @@ async function purchaseState(
   );
   const attempts = await new PurchaseAuthorityStore(store.db).unconfirmedOf(jobId);
   if (!card && !attempts.length) return {};
-  const [{ attemptSummary }, zone] = await Promise.all([import('./purchase-outcome.js'), principalClock()]);
+  const zone = await principalClock();
   const facts = card ? (JSON.parse(card.facts_json) as PurchaseFacts) : undefined;
   return {
     ...(card && facts
@@ -69,7 +73,7 @@ async function purchaseState(
             site: facts.site,
             total: formatMoney(facts.totalMinor, facts.currency),
             due_now: formatMoney(facts.dueNowMinor, facts.currency),
-            expires: cardTime(card.expires_at, zone),
+            expires: formatLocalTimeWithZone(card.expires_at, zone),
           },
         }
       : {}),
@@ -81,7 +85,7 @@ async function purchaseState(
               attempt_id: attempt.id,
               what,
               ...(total ? { total } : {}),
-              pressed: cardTime(attempt.attempted_at, zone),
+              pressed: formatLocalTimeWithZone(attempt.attempted_at, zone),
             };
           }),
         }
@@ -153,9 +157,7 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
         job.id,
       )
     : undefined;
-  const waitingSignIn = job.cancelled
-    ? undefined
-    : await (await import('./sign-in-mail.js')).readPendingSignInSite(job.id);
+  const waitingSignIn = job.cancelled ? undefined : await readPendingSignInSite(job.id);
   const report = await withExistingMailboxSession(browser, job.browser_session_id, (mailbox) =>
     mailbox.getLatestDeliveredAgentReport(job.source_agent_group_id),
   );
@@ -235,7 +237,7 @@ export async function cancelBrowserJobInTransaction(
   const inProgress = await committing(store.db, job.id);
   const withdrawnCards = purchases ? await detachPurchaseCards(job.id, 'withdrawn') : [];
   if (await store.db.hasTable('gws_ea_browser_watches'))
-    withdrawnCards.push(...(await (await import('./watches.js')).detachBrowserWatchCards(job.id, 'cancelled')));
+    withdrawnCards.push(...(await detachBrowserWatchCards(job.id, 'cancelled')));
   // No authority the job has not used survives it: nothing was disclosed for these.
   const abandonedAttempts = (await store.db.hasTable('gws_ea_browser_credential_attempts'))
     ? await credentialAttempts.abandonForJob(job.id)
@@ -273,21 +275,33 @@ export async function finishBrowserJobCancellation(
   queue = cancellationQueue,
   running?: string,
 ): Promise<void> {
-  if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
-  if (result.withdrawnCards)
-    await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
-  if (result.withdrawnCards && (await getDb().hasTable('gws_ea_browser_watches')))
-    for (const card of result.withdrawnCards)
-      await getDb().run(
-        'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
-        new Date().toISOString(),
-        card.approval_id,
-      );
-  if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
-  await queue.interruptJob(result.job.id, running);
-  // The job is already cancelled; a window that fails to close leaves its site's waiters to be woken all the same.
-  await queue.runtime.closeJob(result.job.id).catch(() => undefined);
-  await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
+  const cleanup = await Promise.allSettled([
+    (async () => {
+      if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
+    })(),
+    (async () => {
+      if (!result.withdrawnCards) return;
+      await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
+      if (await getDb().hasTable('gws_ea_browser_watches'))
+        for (const card of result.withdrawnCards)
+          await getDb().run(
+            'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
+            new Date().toISOString(),
+            card.approval_id,
+          );
+    })(),
+    (async () => {
+      if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
+      try {
+        await queue.interruptJob(result.job.id, running);
+      } finally {
+        await queue.runtime.closeJob(result.job.id).catch(() => undefined);
+        await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
+      }
+    })(),
+  ]);
+  const failed = cleanup.find((result) => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
 export async function cancelBrowserJob(
@@ -413,7 +427,7 @@ export async function sweepBrowserJobSessions(
 export const browserDelegateGuard = defineGuardedAction({
   action: 'gws_ea_browser.delegate',
   async decide({ actor }) {
-    const policy = await readBrowserPolicy();
+    const policy = await readHostBrowserPolicy();
     if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
       return DENY('Only an agent with browser access may manage browser jobs.');
     if (!policy.enabled) return DENY('The operator needs to enable the browser for this assistant.');
@@ -427,7 +441,7 @@ export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): 
     'cancel_job',
     answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
-      if (!(await readBrowserPolicy()).enabled)
+      if (!(await readHostBrowserPolicy()).enabled)
         throw forbidden('The operator needs to enable the browser for this assistant.');
       configureBrowserCancellation(queue());
       // Each agent cancels only the errands it opened.

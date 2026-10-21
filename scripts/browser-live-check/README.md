@@ -12,6 +12,33 @@ command. The owner uses their normal channel. The harness reads the deployed hos
 `ncl.sock` and independently checks the supplied verification artifacts. Any real
 booking or purchase still needs its normal explicit principal authority.
 
+## Refactor verification boundaries
+
+The concrete runtime and security fixtures use the pinned Playwright 1.64.0 and
+`GWS_EA_BROWSER_TEST_CHROME` pointing to the actual supported Chrome binary.
+Run named focused suites during implementation, then the integrated full host
+suite with Chrome configured. A suite skipped because that variable is absent
+proves nothing about native operation. Keep fixture correctness separate from
+the managed acceptance run below.
+
+A navigation onto a denial remains `challenge`; its evidence can report the
+observed status and any correlated local refusal without assigning an unobserved
+bot-detection cause. Record the original OpenTable reservation route, Resy and
+Tock independently on the same authorized release and account state. An
+OpenTable denial leaves the booking unresolved even when fixture recovery passes.
+
+A local temporary-profile rendering probe can verify screenshot content and
+native input without a live account. It cannot prove active operator focus when
+the sampler observes the login window, or prove Spaces through AppKit. Minimized
+rendering remains a separate optional claim: on the October 20 U6 probe, native
+input worked while minimized but screenshot capture timed out even with the old
+screenshot feature override. Do not turn that limitation into a pass.
+
+Code-only rollback keeps live DB/profile/authority records. An old binary cannot
+safely save a newly affected recording whose optional trace reservation failed;
+repair recording storage forward. Do not use a state snapshot to erase uncertain
+external actions taken after startup but before health verification.
+
 ## Start an evidence run
 
 Use the deployed merged commit SHA, an absolute evidence directory, and the

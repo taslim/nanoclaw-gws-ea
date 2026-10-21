@@ -20,61 +20,20 @@ import type { Session } from '../../types.js';
 import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import { PurchaseAuthorityStore, type PurchaseAttemptRow, type ResolutionSource } from './authority.js';
 import { finishBrowserJobCancellation } from './cancel.js';
-import { cardTime } from './cards.js';
 import { BrowserStore, type BrowserJob } from './db.js';
-import { formatMoney, type FreeCommitFacts, type PurchaseFacts } from './fingerprint.js';
-import { freeCommitBooks } from './generic-signature.js';
 import { notifyIncident, recordIncidentWithStop } from './incidents.js';
-import { tellOfPurchaseOnce } from './notices.js';
+import { attemptSummary, notifyUnconfirmedPurchase } from './notices.js';
 import type { BrowserQueue } from './queue.js';
-import { principalClock } from './watch-policy.js';
-
-/** What an attempt was, as main reads it: a booking or an order, free or paid with its total, on its merchant. */
-export function attemptSummary(attempt: PurchaseAttemptRow): { booking: boolean; what: string; total?: string } {
-  if (attempt.kind === 'free') {
-    const booking = freeCommitBooks(JSON.parse(attempt.facts_json) as FreeCommitFacts);
-    return { booking, what: `free ${booking ? 'booking' : 'order'} on ${attempt.site}` };
-  }
-  const facts = JSON.parse(attempt.facts_json) as PurchaseFacts;
-  const booking = Boolean(facts.reservation || facts.generic?.booking);
-  return {
-    booking,
-    what: `${booking ? 'booking' : 'purchase'} on ${attempt.site}`,
-    total: formatMoney(facts.totalMinor, facts.currency),
-  };
-}
-
-/** What the delegating group reads of an unconfirmed attempt: what, when, its attempt id, and what settles it. */
-async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Promise<string> {
-  const { what, total } = attemptSummary(attempt);
-  return (
-    `Browser job ${job.thread_id}: the ${what}${total ? ` for ${total}` : ''}, pressed ` +
-    `${cardTime(attempt.attempted_at, await principalClock())}, has no page proving whether it went through, so it is ` +
-    `unconfirmed (attempt ${attempt.id}). When the merchant's order email reaches you, or once you have asked the ` +
-    `principal whether it went through, record it with record_purchase_outcome. Until then another purchase on ` +
-    `${attempt.site} waits on it; browsing there goes on.`
-  );
-}
-
-/** Tells an unconfirmed attempt's delegating group of it, once; a notice that cannot go out yet waits for the sweep. */
-export async function notifyUnconfirmedPurchase(attemptId: string, db: DbDriver = getDb()): Promise<void> {
-  const attempt = await new PurchaseAuthorityStore(db).attempt(attemptId);
-  if (!attempt || attempt.resolution || !attempt.unconfirmed_at || attempt.notified_at) return;
-  await tellOfPurchaseOnce(db, attempt, {
-    table: attempt.kind === 'paid' ? 'gws_ea_browser_purchase_attempts' : 'gws_ea_browser_free_attempts',
-    noteId: `browser-unconfirmed-${attempt.id}`,
-    text: (job) => unconfirmedText(job, attempt),
-    unsent: { message: 'Nobody to tell of an unconfirmed purchase yet', kind: 'attempt' },
-  });
-}
 
 /** The host's sweep: every unconfirmed attempt whose delegating group has not heard of it yet. */
 export async function notifyPendingUnconfirmed(db: DbDriver = getDb()): Promise<void> {
   for (const { id } of await db.all<{ id: string }>(
     `SELECT id FROM gws_ea_browser_purchase_attempts WHERE resolution IS NULL AND unconfirmed_at IS NOT NULL AND notified_at IS NULL
      UNION ALL SELECT id FROM gws_ea_browser_free_attempts WHERE resolution IS NULL AND unconfirmed_at IS NOT NULL AND notified_at IS NULL`,
-  ))
-    await notifyUnconfirmedPurchase(id, db);
+  )) {
+    const attempt = await new PurchaseAuthorityStore(db).attempt(id);
+    if (attempt) await notifyUnconfirmedPurchase(attempt, db);
+  }
 }
 
 /** Who may record an attempt's outcome: an agent with browser access, and main whatever the setting lists. */

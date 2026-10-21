@@ -32,7 +32,7 @@ import type { ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { notifyPendingIncidents, recordIncidentWithStop, stopForUnapprovedCommit } from './incidents.js';
 import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 
 const EVIDENCE: ConfirmationEvidence = {
   source: 'https://shop.example/reorder/submit',

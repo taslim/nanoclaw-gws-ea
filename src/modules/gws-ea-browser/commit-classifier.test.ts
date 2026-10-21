@@ -1,6 +1,15 @@
+import {
+  classifyControlFacts,
+  classifyCredentialControlFacts,
+  classifyCredentialNavigation,
+  classifyNavigationUrl,
+  type ActionClass,
+} from './control-policy.js';
+import type { ControlFacts, ControlRegion } from './control-facts.js';
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
+import { amazonRetailSignature, AMAZON_RETAIL } from './merchant-signatures.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
@@ -8,17 +17,9 @@ afterEach(() => vi.restoreAllMocks());
 import {
   activateControl,
   classifyActivation,
-  classifyControlFacts,
-  classifyCredentialControlFacts,
-  classifyCredentialNavigation,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   refusedScriptRequest,
-  registerReviewedMerchantFlow,
-  type ActionClass,
   type ActivationIntent,
-  type ControlFacts,
-  type ControlRegion,
 } from './commit-classifier.js';
 
 const button = (name: string, changes: Partial<ControlFacts> = {}): ControlFacts => ({
@@ -297,39 +298,10 @@ it('keeps reviewed Amazon authentication routes precise and leaves its other rou
 });
 
 it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
-  registerReviewedMerchantFlow({
-    id: 'test-unhandled-auth-flow',
-    matches: (url) => url.hostname === 'auth-dispatch.example',
-    classifyControl: async () => undefined,
-    classifyNavigation: () => undefined,
-  });
   const native = vi.fn();
   const frame = { url: () => 'https://auth-dispatch.example/login' };
-  const form = {
-    action: 'https://auth-dispatch.example/login',
-    method: 'post',
-    target: '',
-    elements: [
-      { name: 'username', type: 'text', getAttribute: () => 'username' },
-      { name: 'password', type: 'password', getAttribute: () => 'current-password' },
-    ],
-    querySelector: () => true,
-  };
-  const node = {
-    tagName: 'BUTTON',
-    type: 'submit',
-    textContent: 'Sign in',
-    form,
-    getAttribute: (name: string) => (name === 'type' ? 'submit' : null),
-    ownerDocument: {
-      location: { origin: 'https://auth-dispatch.example' },
-      defaultView: { HTMLFormElement: { prototype: { submit: native } } },
-    },
-  };
-  const element = {
-    ownerFrame: async () => frame,
-    evaluate: async (fn: (node: unknown, argument: unknown) => unknown, argument: unknown) => fn(node, argument),
-  } as unknown as ElementHandle;
+  const form = { action: 'https://auth-dispatch.example/login', method: 'post' };
+  const element = { ownerFrame: async () => frame } as unknown as ElementHandle;
   const page = {
     url: () => frame.url(),
     frames: () => [frame],
@@ -387,13 +359,8 @@ it('submits positively identified native authentication forms without invoking a
 
 it('lets a reviewed flow decide only what the open rule leaves ordinary', async () => {
   let reviewed: ActionClass | undefined;
-  registerReviewedMerchantFlow({
-    id: 'test-reviewed-precision',
-    matches: (url) => url.hostname === 'reviewed.example',
-    classifyControl: async () => reviewed,
-    classifyNavigation: () => undefined,
-  });
-  const page = { url: () => 'https://reviewed.example/item' } as unknown as Page;
+  vi.spyOn(amazonRetailSignature, 'classifyControl').mockImplementation(async () => reviewed);
+  const page = { url: () => `${AMAZON_RETAIL.origin}/item` } as unknown as Page;
   const element = {} as ElementHandle;
   const read = vi
     .spyOn(isolatedFacts, 'readPageControlFacts')
@@ -622,26 +589,21 @@ it('strips Referer only from subresources, once across nested sign-in scopes, an
   expect(patterns.every((pattern) => pattern.resourceType && pattern.resourceType !== 'Document')).toBe(true);
 });
 
-/** A reviewed flow on `host` that reads every control and route as a purchase it verifies, so an approval presses it. */
-function registerApprovingFlow(id: string, host: string): void {
-  registerReviewedMerchantFlow({
-    id,
-    matches: (url) => url.hostname === host,
-    classifyControl: async () => 'purchase_control',
-    classifyNavigation: () => 'purchase_control',
-    verifyPurchaseControl: async () => true,
-  });
+/** An approved press through the actual closed reviewed flow; only its DOM verification is a fake here. */
+function approveReviewedFixture(): void {
+  vi.spyOn(amazonRetailSignature, 'classifyControl').mockResolvedValue('purchase_control');
+  vi.spyOn(amazonRetailSignature, 'verifyPurchaseControl').mockResolvedValue(true);
 }
 
 it('decides a document under the purchase press that was approved when it paused', async () => {
-  registerApprovingFlow('approved-press-fixture', 'press.example');
+  approveReviewedFixture();
   let place!: () => void;
   const placed = new Promise<never>((_resolve, reject) => {
     place = () => reject(new Error('Protocol error (Target.getTargetInfo): No target with given id found'));
   });
   // The receipt's frame is placed only after the press has ended.
   const fixture = guardedPageFixture(
-    'https://press.example/checkout',
+    `${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`,
     { frame: { id: 'fixture-page' }, childFrames: [{ frame: { id: 'receipt-frame' } }] },
     () => placed,
   );
@@ -656,7 +618,7 @@ it('decides a document under the purchase press that was approved when it paused
         requestId: 'receipt',
         frameId: 'receipt-frame',
         resourceType: 'Document',
-        request: { url: 'https://press.example/receipt', headers: {} },
+        request: { url: `${AMAZON_RETAIL.origin}${AMAZON_RETAIL.confirmationPath}`, headers: {} },
       });
     },
     { commitStarted: async () => undefined },
@@ -846,8 +808,8 @@ describe("an ordinary action's script-request window", () => {
   });
 
   it('starts an approved press only once every ordinary window on its page has closed', async () => {
-    registerApprovingFlow('settled-press-fixture', 'settled-press.example');
-    const window = await windowFixture('settled-press.example');
+    approveReviewedFixture();
+    const window = await windowFixture('www.amazon.com');
     const element = { ownerFrame: async () => window.page.mainFrame() } as unknown as ElementHandle;
     vi.spyOn(isolatedFacts, 'readPageControlFacts').mockResolvedValue(button('Place order'));
     vi.useFakeTimers();

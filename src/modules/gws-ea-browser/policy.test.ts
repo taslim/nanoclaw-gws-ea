@@ -11,6 +11,7 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import '../gws-ea-profile/index.js';
 import { browserAccessGroups, browserDelegators, errandSource, hasBrowserAccess } from './access.js';
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 
 const file = `${ROOT}/browser/policy.json`;
 function write(policy: unknown): void {
@@ -42,11 +43,11 @@ afterEach(async () => {
 
 describe('version 1', () => {
   it('grants main alone, whether the browser is enabled, disabled or has no policy at all', async () => {
-    const policies: BrowserPolicy[] = [await readBrowserPolicy(file)];
+    const policies: BrowserPolicy[] = [await readHostBrowserPolicy(file)];
     write({ schemaVersion: 1, enabled: true });
-    policies.push(await readBrowserPolicy(file));
+    policies.push(await readHostBrowserPolicy(file));
     write({ schemaVersion: 1, enabled: false });
-    policies.push(await readBrowserPolicy(file));
+    policies.push(await readHostBrowserPolicy(file));
     expect(policies.map((policy) => policy.status)).toEqual(['disabled', 'enabled', 'disabled']);
     for (const policy of policies) {
       expect(policy).toMatchObject({ access: { version: 1 } });
@@ -60,14 +61,14 @@ describe('version 1', () => {
 describe('version 2', () => {
   it('grants exactly the groups it lists, and keeps them while disabled', async () => {
     write({ schemaVersion: 2, enabled: true, agentGroupIds: ['ag-research', 'ag-main'] });
-    const enabled = await readBrowserPolicy(file);
+    const enabled = await readHostBrowserPolicy(file);
     expect(enabled).toMatchObject({
       status: 'enabled',
       access: { version: 2, agentGroupIds: ['ag-research', 'ag-main'] },
     });
     expect(await browserAccessGroups(enabled)).toEqual(['ag-research', 'ag-main']);
     write({ schemaVersion: 2, enabled: false, agentGroupIds: ['ag-research'] });
-    const disabled = await readBrowserPolicy(file);
+    const disabled = await readHostBrowserPolicy(file);
     expect(disabled).toMatchObject({ status: 'disabled', access: { version: 2, agentGroupIds: ['ag-research'] } });
     expect(await hasBrowserAccess('ag-research', disabled)).toBe(true);
     expect(await hasBrowserAccess('ag-main', disabled)).toBe(false);
@@ -75,7 +76,7 @@ describe('version 2', () => {
 
   it('allows no delegator when its list is empty, main included', async () => {
     write({ schemaVersion: 2, enabled: true, agentGroupIds: [] });
-    const policy = await readBrowserPolicy(file);
+    const policy = await readHostBrowserPolicy(file);
     expect(policy).toMatchObject({ status: 'enabled', access: { version: 2, agentGroupIds: [] } });
     expect(await browserAccessGroups(policy)).toEqual([]);
     expect(await hasBrowserAccess('ag-main', policy)).toBe(false);
@@ -86,7 +87,7 @@ describe('version 2', () => {
     ['names the browser itself', ['ag-browser']],
   ])('reads as invalid, leaving the browser unavailable, when edited by hand so it %s', async (_case, ids) => {
     write({ schemaVersion: 2, enabled: true, agentGroupIds: ids });
-    const policy = await readBrowserPolicy(file);
+    const policy = await readHostBrowserPolicy(file);
     expect(policy).toMatchObject({ status: 'unavailable', enabled: false, reason: 'invalid-browser-policy' });
     // Nothing runs while unavailable; main keeps its guidance, as under any unreadable policy.
     expect(await browserAccessGroups(policy)).toEqual(['ag-main']);
@@ -108,12 +109,12 @@ it.each([
   ['a version this host does not read', { schemaVersion: 3, enabled: true, agentGroupIds: [] }],
 ])('reads %s as invalid', async (_case, policy) => {
   write(policy);
-  expect(await readBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
+  expect(await readHostBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
 });
 
 it('names each delegator as the browser addresses it: main as main, any other group by its own name', async () => {
   write({ schemaVersion: 2, enabled: true, agentGroupIds: ['ag-other-main', 'ag-research', 'ag-main', 'ag-gone'] });
-  expect(await browserDelegators(await readBrowserPolicy(file))).toEqual([
+  expect(await browserDelegators(await readHostBrowserPolicy(file))).toEqual([
     { agentGroupId: 'ag-other-main', name: 'main-2' },
     { agentGroupId: 'ag-research', name: 'research-desk' },
     { agentGroupId: 'ag-main', name: 'main' },
@@ -125,4 +126,24 @@ it('reads the group that opened an errand from its thread alone', () => {
   expect(errandSource('system:a2a:ag-main:msg:with:colons')).toBe('ag-main');
   for (const thread of [null, undefined, '', 'system:task:scheduled', 'system:a2a:ag-main:', 'system:a2a::x'])
     expect(errandSource(thread)).toBeUndefined();
+});
+
+it.each([true, false])(
+  'keeps operator reads DB-free and fails host v2 authority closed when enabled=%s',
+  async (enabled) => {
+    write({ schemaVersion: 2, enabled, agentGroupIds: ['ag-research'] });
+    await closeDb();
+    expect(await readBrowserPolicy(file)).toMatchObject({ status: enabled ? 'enabled' : 'disabled', enabled });
+    expect(await readHostBrowserPolicy(file)).toMatchObject({
+      status: 'unavailable',
+      reason: 'invalid-browser-policy',
+    });
+    write({ schemaVersion: 1, enabled });
+    expect(await readHostBrowserPolicy(file)).toMatchObject({ status: enabled ? 'enabled' : 'disabled', enabled });
+  },
+);
+
+it('rejects a disabled v2 policy naming a sealed group before any later enable', async () => {
+  write({ schemaVersion: 2, enabled: false, agentGroupIds: ['ag-browser'] });
+  expect(await readHostBrowserPolicy(file)).toMatchObject({ status: 'unavailable', reason: 'invalid-browser-policy' });
 });

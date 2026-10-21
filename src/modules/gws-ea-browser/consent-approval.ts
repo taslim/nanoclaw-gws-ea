@@ -18,7 +18,7 @@ import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
-import { hasBrowserAccess } from './access.js';
+import { hasBrowserAccess, readHostBrowserPolicy } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
 import { ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
 import {
@@ -30,8 +30,8 @@ import {
 } from './consent.js';
 import { BrowserStore } from './db.js';
 import { writeBrowserNotice } from './notices.js';
-import { readBrowserPolicy } from './policy.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { quoted } from '../approvals/request-text.js';
 
 /** The `pending_approvals.action` a consent card resolves through. */
@@ -61,7 +61,7 @@ export const browserConsentGuard = defineGuardedAction({
       job.cancelled
     )
       return DENY('The browser job is no longer live.');
-    if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    if (!(await readHostBrowserPolicy()).enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Agreeing to anything beyond a site’s own terms is the principal’s decision.', principal)
@@ -254,7 +254,10 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
   if (changed.changes && stop) await notifyConsentOutcome(stop, status);
 });
 
-registerBrowserQueuedAction('request_consent', { validate: validateConsentRequest, execute: executeConsentRequest });
+export const requestConsentAction: BrowserQueuedAction = {
+  validate: validateConsentRequest,
+  execute: executeConsentRequest,
+};
 
 // ---------------------------------------------------------------- the principal's grants, through main
 

@@ -1,3 +1,4 @@
+import { getBrowserWatch, compareWatchBounds, claimRegionWatchCommit, finishWatchCommit } from './watch-state.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isUniqueViolation } from '../../db/errors.js';
@@ -5,20 +6,22 @@ import { getSession } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
-import { writeBrowserNotice } from './notices.js';
+import { notifyUnconfirmedPurchase, writeBrowserNotice } from './notices.js';
 import type { RecordedNotPlaced } from './cards.js';
 import { agreementsGranted } from './consent.js';
-import { markBrowserRequestCommitStarted } from './db.js';
+import { BrowserStore, markBrowserRequestCommitStarted } from './db.js';
 import { heldCredentialSites } from './leases.js';
 import {
   completePurchaseFacts,
+  guaranteeCoversReservation,
+  isFreeReservation,
   materialPurchaseChange,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
-import { readBrowserPolicy } from './policy.js';
-import type { BrowserExecutionContext } from './queue.js';
-import type { WatchBounds } from './watches.js';
+import { readHostBrowserPolicy } from './access.js';
+import type { BrowserExecutionContext } from './actions.js';
+import type { WatchBounds } from './watch-state.js';
 
 export interface SpendingAuthority {
   id: string;
@@ -265,7 +268,6 @@ export class PurchaseAuthorityStore {
         )
           throw new PurchaseAuthorityError('authority_unavailable');
       } else if (input.kind === 'watch') {
-        const { getBrowserWatch, compareWatchBounds } = await import('./watches.js');
         const watch = await getBrowserWatch(input.watchId, this.db);
         const bounds: unknown = watch ? JSON.parse(watch.bounds_json) : undefined;
         if (
@@ -296,7 +298,6 @@ export class PurchaseAuthorityStore {
           )
             throw new PurchaseAuthorityError('authority_unavailable');
         } else {
-          const { isFreeReservation } = await import('./fingerprint.js');
           if (
             !isFreeReservation(input.facts) ||
             !isRecord(bounds) ||
@@ -306,13 +307,11 @@ export class PurchaseAuthorityStore {
             throw new PurchaseAuthorityError('authority_unavailable');
         }
       } else {
-        const { guaranteeCoversReservation, readDelegatedReservationBounds } =
-          await import('./reservation-guarantee.js');
         const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
           'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
           input.guaranteeId,
         );
-        const reservation = await readDelegatedReservationBounds(input.jobId, this.db);
+        const reservation = await new BrowserStore(this.db).reservationBounds(input.jobId);
         const checkout = await this.db.get(
           'SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? LIMIT 1',
           input.jobId,
@@ -363,7 +362,7 @@ export class PurchaseAuthorityStore {
     claim?: (db: DbDriver, authority: SpendingAuthority, immediatelyRereadFacts: PurchaseFacts) => Promise<void>,
   ): Promise<SpendingAuthority> {
     await context.assertActive();
-    if (!(await readBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
+    if (!(await readHostBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
     return this.db.transaction(async () => {
       const authority = await this.get(authorityId);
       const at = new Date().toISOString();
@@ -398,7 +397,6 @@ export class PurchaseAuthorityStore {
       else if (current.reservation || current.generic?.booking) {
         // A booking a card or the standing guarantee covers on a region watch's site spends its one booking
         // (KTD20), and only a watch whose bounds the booking does not fall outside.
-        const { claimRegionWatchCommit } = await import('./watches.js');
         await claimRegionWatchCommit(this.db, {
           jobId: authority.job_id,
           site: current.site,
@@ -450,12 +448,11 @@ export class PurchaseAuthorityStore {
     if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
       throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
     if (authority.guarantee_id) {
-      const { guaranteeCoversReservation, readDelegatedReservationBounds } = await import('./reservation-guarantee.js');
       const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
         'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
         authority.guarantee_id,
       );
-      const reservation = await readDelegatedReservationBounds(jobId, this.db);
+      const reservation = await new BrowserStore(this.db).reservationBounds(jobId);
       const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
       if (
         !reservation ||
@@ -557,8 +554,7 @@ export class PurchaseAuthorityStore {
       }
       // The watch whose one booking this attempt claimed, by a watch's own authority, a card or guarantee booking
       // on a region watch's site, or a free table there (KTD20), ends with it.
-      const { finishWatchCommit } = await import('./watches.js');
-      await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed, resolution.source);
+      await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed);
       if (!(await this.unresolved(attempt.site)).length) {
         await this.db.run('DELETE FROM gws_ea_browser_purchase_blocks WHERE site = ?', attempt.site);
         await this.db.run(
@@ -570,6 +566,11 @@ export class PurchaseAuthorityStore {
       return { status: 'resolved', attempt };
     });
     if (result.status === 'resolved') {
+      if (resolution.placed && resolution.source === 'page')
+        await afterCommit('A watch recipe', async () => {
+          const { promoteCommittedWatchRecipe } = await import('./watch-recipes.js');
+          await promoteCommittedWatchRecipe(this.db, result.attempt.job_id, result.attempt.id);
+        });
       const authorityId = result.attempt.authority_id;
       if (authorityId && !mainsAnswer)
         await afterCommit('A purchase outcome', () => notifyPurchaseOutcome(authorityId, this));
@@ -634,13 +635,14 @@ export class PurchaseAuthorityStore {
         await this.settleRequestedCancellation(authority.job_id, at);
       }
       // A watch whose booking it claimed waits on its outcome too.
-      const { finishWatchCommit } = await import('./watches.js');
       await finishWatchCommit(this.db, attempt.job_id, attempt.id, undefined);
       return true;
     });
     if (changed) {
-      const { notifyUnconfirmedPurchase } = await import('./purchase-outcome.js');
-      await afterCommit('An unconfirmed purchase', () => notifyUnconfirmedPurchase(attemptId, this.db));
+      await afterCommit('An unconfirmed purchase', async () => {
+        const attempt = await this.attempt(attemptId);
+        if (attempt) await notifyUnconfirmedPurchase(attempt, this.db);
+      });
     }
     return outcome;
   }

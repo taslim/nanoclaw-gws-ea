@@ -1,3 +1,4 @@
+import { claimRegionWatchCommit } from './watch-state.js';
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Page } from 'playwright-core';
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
@@ -47,15 +48,10 @@ import {
   materialPurchaseChange,
   type FreeCommitFacts,
   type PurchaseBounds,
+  freeCommitBooks,
   type PurchaseFacts,
 } from './fingerprint.js';
-import {
-  confirmsOnSite,
-  freeCommitBooks,
-  genericCheckoutSignature,
-  offersPayment,
-  pressRefusal,
-} from './generic-signature.js';
+import { confirmsOnSite, genericCheckoutSignature, offersPayment, pressRefusal } from './generic-signature.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -64,17 +60,13 @@ import {
   readMerchantPurchase,
   readMerchantPurchaseEvidence,
   type MerchantPurchaseRead,
-} from './merchant-signatures.js';
+} from './merchant-read.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { writeBrowserNotice } from './notices.js';
 import { notifyPendingUnconfirmed } from './purchase-outcome.js';
-import {
-  BrowserQueue,
-  registerBrowserActionDelivery,
-  registerBrowserQueuedAction,
-  type BrowserExecutionContext,
-} from './queue.js';
+import { type BrowserQueue, registerBrowserActionDelivery } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { evidenceMatchesAttempt, reconcilePurchaseAttempt } from './reconciliation.js';
 import { deriveReservationGuaranteeAuthority } from './reservation-guarantee.js';
 import { principalClock } from './watch-policy.js';
@@ -114,7 +106,7 @@ export const browserPurchaseGuard = defineGuardedAction({
       session.status !== 'active'
     )
       return DENY('The browser job is no longer live.');
-    if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    if (!(await readHostBrowserPolicy()).enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('A purchase requires the principal to confirm the complete merchant facts.', principal)
@@ -625,7 +617,7 @@ export async function executeAuthorizedPurchase(
       return unreadyCommit(read);
     }
     let marked = false;
-    let watchRefusal: import('./watches.js').WatchPurchaseRefusal | undefined;
+    let watchRefusal: import('./watch-state.js').WatchPurchaseRefusal | undefined;
     let facts = read.facts;
     let element = read.element;
     /** The approved press, re-checked by `commitStarted` immediately before it. */
@@ -644,6 +636,12 @@ export async function executeAuthorizedPurchase(
           await arrived;
         },
         { commitStarted, ...(facts.generic ? { checkout: { origin: facts.origin } } : {}) },
+        {
+          kind: 'click',
+          scope: { jobId: context.job.id, db: context.store.db },
+          assertActive: context.assertActive,
+          remaining: context.remaining,
+        },
       );
     };
     /** The outcome is told to the job, and the merchant's site goes to its waiters. */
@@ -672,7 +670,7 @@ export async function executeAuthorizedPurchase(
           throw new PurchaseAuthorityError('changed', 'The checkout is no longer readable.');
         let commitClaim = claim;
         if (authority.kind === 'watch') {
-          const { prepareWatchCommit } = await import('./watches.js');
+          const { prepareWatchCommit } = await import('./watch-purchase.js');
           const checked = await prepareWatchCommit(context, authority, latest.facts);
           if (typeof checked !== 'function') {
             watchRefusal = checked;
@@ -905,7 +903,6 @@ async function commitFree(
             // A free table on a region watch's site spends the one booking of a watch it is within (KTD20);
             // region watches live only on sites without a reviewed reader.
             if (free.kind === 'generic' && freeCommitBooks(free.facts)) {
-              const { claimRegionWatchCommit } = await import('./watches.js');
               await claimRegionWatchCommit(db, {
                 jobId: context.job.id,
                 site: free.facts.site,
@@ -919,6 +916,7 @@ async function commitFree(
           attempted = true;
         },
       },
+      { kind: 'click', scope, assertActive: context.assertActive, remaining: context.remaining },
     );
   } catch (error) {
     if (!attempted && error instanceof PurchaseAuthorityError)
@@ -1053,7 +1051,7 @@ export async function executeBrowserPurchase(
         }
         const facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
         const store = new PurchaseAuthorityStore(context.store.db);
-        const { prepareWatchPurchase } = await import('./watches.js');
+        const { prepareWatchPurchase } = await import('./watch-purchase.js');
         const watch = await prepareWatchPurchase(context, facts);
         if (watch)
           return watch.status === 'ready'
@@ -1100,7 +1098,10 @@ export async function executeBrowserPurchase(
   }
 }
 
-registerBrowserQueuedAction('purchase', { validate: validatePurchaseRequest, execute: executeBrowserPurchase });
+export const purchaseAction: BrowserQueuedAction = {
+  validate: validatePurchaseRequest,
+  execute: executeBrowserPurchase,
+};
 
 /** Internal approval work has no polling MCP caller; every pre-commit answer resumes its job. */
 async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
@@ -1153,7 +1154,7 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
   }
   void requestWake(session, 'browser-purchase-outcome').catch(() => undefined);
 }
-registerBrowserQueuedAction('browser_purchase_commit', {
+export const purchaseCommitAction: BrowserQueuedAction = {
   validate(content) {
     if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');
     return { authority_id: content.authority_id };
@@ -1168,7 +1169,7 @@ registerBrowserQueuedAction('browser_purchase_commit', {
     }
   },
   deliverAnswer: deliverPurchaseCommitAnswer,
-});
+};
 export function registerBrowserPurchaseDelivery(queue: () => BrowserQueue): void {
   getPurchaseQueue = queue;
   registerBrowserActionDelivery('purchase', queue);
@@ -1228,7 +1229,7 @@ export async function recoverBrowserPurchases(queue: BrowserQueue): Promise<void
   await notifyPendingUnconfirmed(store.db);
   await notifyPurchaseWaiters(store.db);
 }
-/** Call only after queue.start(): early approval replay persisted durable work without starting it. */
+/** Persist resumed commits before queue.start(); queue readiness alone admits their workers. */
 export async function resumeBrowserPurchaseCommits(queue: BrowserQueue): Promise<void> {
   commitsReady = true;
   if (!getPurchaseQueue) getPurchaseQueue = () => queue;

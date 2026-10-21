@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -55,7 +56,8 @@ import {
   type VaultFixtureFiles,
 } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
-import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { openSignupVerification } from './sign-in-mail.js';
 
 const ORIGIN = 'https://accounts.shop.example';
@@ -299,7 +301,7 @@ describe("main's credential authority", () => {
 describe('the browser credential request', () => {
   const ref = (n: number) => ({ ref: `e${n}`, generation: 3 });
 
-  it('accepts only an authority, fresh element refs and an activation control: never a value', () => {
+  it('accepts only an authority, fresh element refs and an activation control: never a value', async () => {
     const authority = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b';
     expect(
       validateCredentialForm({
@@ -344,6 +346,15 @@ describe('the browser credential request', () => {
       { authority: 'op://vault/item', new_password: ref(2), activate: ref(4) },
     ])
       expect(() => validateCredentialForm(content)).toThrow();
+    const { context: execution, page } = context();
+    await expect(
+      executeCredentialForm(
+        execution,
+        { authority, new_password: ref(2), accept_terms: ref(3), activate: ref(4) },
+        { attempts },
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-args' });
+    expect(page).not.toHaveBeenCalled();
   });
 
   const run = (authority: string, fields: Record<string, unknown> = { new_password: ref(2) }) => {
@@ -433,19 +444,6 @@ describe('the browser credential request', () => {
     });
     expect(page).not.toHaveBeenCalled();
     expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
-  });
-
-  // The request's fields are the same for every credential operation, a signup's included.
-  it('never takes a terms checkbox from the agent', async () => {
-    await assistantLogin();
-    const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
-    const { page, result } = run(String(recorded.authority), {
-      current_password: ref(1),
-      new_password: ref(2),
-      accept_terms: ref(3),
-    });
-    await expect(result).rejects.toMatchObject({ code: 'invalid-args' });
-    expect(page).not.toHaveBeenCalled();
   });
 
   describe('reconciliation', () => {
@@ -622,7 +620,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       messaging_group_id: 'mg-principal-dm',
       resolved_at: at,
     });
-    queue = new BrowserQueue(new BrowserStore(), {
+    queue = createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => {
         throw new Error('A release never opens a page');
       },

@@ -233,6 +233,37 @@ removed from the list has its errands cancelled.
 reports it. While a list is in place, `rollback`, and reverting an open update,
 are refused to a release that cannot read it; `--main-only` lifts that.
 
+### Browser diagnosis and release acceptance
+
+`gws-ea capabilities check browser --id <full-id>` checks the selected managed
+assistant. Browser request evidence distinguishes an observed website response,
+a local rule refusal, a transport failure and a runtime failure; a completed
+navigation onto an Access Denied page is still a challenge. A website denial is
+not proof of its cause or a completed booking. Main reports the practical
+limitation; operator evidence stays bounded and redacted.
+
+The implementation uses one persistent host Playwright runtime, with background
+pages owned by individual errands. Recipe recording and site metadata are optional;
+an unavailable recording cannot block ordinary actions or a later permitted
+navigation. A successful watch region mark includes a fresh observation: use its
+refs for the next action. After an error, observe again before acting.
+
+Use the existing exact-commit managed update after deployment is authorized;
+never start a second NanoClaw install in this tool checkout. Check the staged
+preview for unchanged central migrations and session schemas. The default
+code-only rollback preserves the live database and browser profile, including
+attempts created between service start and health verification. Restoring a
+snapshot cannot undo a website action. An older binary cannot safely save a
+recording whose trace reservation failed but whose new request ledger records
+unavailable coverage; fix that storage failure forward.
+
+Real OpenTable, Resy and Tock results, sign-in and confirmed-result checks, active
+operator focus/Spaces, cross-install isolation and the elapsed watch soak remain
+separate release acceptance evidence. Follow
+[`scripts/browser-live-check/README.md`](../scripts/browser-live-check/README.md)
+on the authorized deployed release. Fixture passes and a locked-desktop sample
+do not establish those claims.
+
 ## Automation and streams
 
 ```sh

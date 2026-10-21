@@ -266,7 +266,7 @@ it("names earlier purchases on a reviewed card by count and time, never by id, a
 });
 
 it('covers an unreviewed booking under the standing guarantee only when its venue, party size, time and fee are read within bounds', async () => {
-  const { guaranteeCoversReservation } = await import('./reservation-guarantee.js');
+  const { guaranteeCoversReservation } = await import('./fingerprint.js');
   const grant = { currency: 'USD', max_total_minor: 5000, revoked_at: null };
   const bounds = {
     reservation: {

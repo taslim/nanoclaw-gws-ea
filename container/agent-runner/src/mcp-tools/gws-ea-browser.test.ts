@@ -198,6 +198,36 @@ function schemaNames(schema: unknown, names = new Set<string>()): Set<string> {
 }
 
 describe('the browser tools', () => {
+  it('keeps native error provenance readable through request_status after the original request ends', async () => {
+    const metadata = {
+      diagnostics: { events: [{ source: 'runtime_error', category: 'execution' }], request_id: 'host-request' },
+    };
+    getInboundDb()
+      .prepare('INSERT INTO messages_in (id, kind, timestamp, content, trigger) VALUES (?, ?, ?, ?, 0)')
+      .run(
+        'action-resp-act-failed-browser',
+        'system',
+        new Date().toISOString(),
+        JSON.stringify({
+          type: 'action_response',
+          requestId: 'act-failed-browser',
+          frame: {
+            id: 'act-failed-browser',
+            ok: false,
+            error: { code: 'handler-error', message: 'The browser action failed unexpectedly.', metadata },
+          },
+        }),
+      );
+    const result = await requestStatus.handler({ request_id: 'act-failed-browser' });
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([
+      {
+        type: 'text',
+        text: `Error: The browser action failed unexpectedly.\n${JSON.stringify({ code: 'handler-error', metadata })}`,
+      },
+    ]);
+  });
+
   it('sends exactly one native host request with its own action name and returns its answer', async () => {
     for (const [tool, fields] of cases) {
       const data = { status: 'completed', detail: `${tool.tool.name} answered` };

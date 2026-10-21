@@ -64,6 +64,9 @@ export interface ControlFacts {
   visibleLabel?: string;
   formMethod?: string;
   formAction?: string;
+  inputName?: string;
+  formFieldNames?: readonly string[];
+  secretEntry?: boolean;
   authenticationForm?: boolean;
   role: string;
   tag: string;
@@ -515,13 +518,14 @@ const librarySource = String.raw`(sources) => {
     const said = [describe(element), labelsOf(element)].join(' ');
     return textEntry(element) && re.cardEntry.test(said) && !re.giftCard.test(said);
   };
-  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete or names.
+  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete, names or labels.
   const secretField = (element) => textEntry(element) && (element.type === 'password' ||
-    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') || re.secretField.test(describe(element)));
+    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') ||
+    re.secretField.test([describe(element), labelsOf(element)].join(' ')));
   // A field holding a secret (KTD6): a password, a code or payment details, by its type, autocomplete, names or
   // labels, so a show-password toggle that made it a text field still counts.
-  const secretValue = (element) => (secretField(element) || cardEntryField(element) ||
-    (textEntry(element) && re.secretField.test(labelsOf(element)))) && typeof element.value === 'string' && element.value !== '';
+  const secretValue = (element) => (secretField(element) || cardEntryField(element)) &&
+    typeof element.value === 'string' && element.value !== '';
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';
@@ -687,6 +691,9 @@ const librarySource = String.raw`(sources) => {
     return {
       name: nameOf(node),
       visibleLabel: textOf(node),
+      inputName: node.getAttribute('name') || '',
+      formFieldNames: form ? fields.map((field) => field.getAttribute('name') || '').filter(Boolean) : [],
+      secretEntry: secretField(node),
       formMethod: form ? (own('formmethod') ? node.formMethod : formProperty(form, 'method')) : undefined,
       formAction: form ? (own('formaction') ? node.formAction : formProperty(form, 'action')) : undefined,
       authenticationForm: Boolean(form && /^post$/iu.test(formProperty(form, 'method')) &&
@@ -1080,6 +1087,9 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
   const formMethod = text(facts.formMethod);
   const formAction = text(facts.formAction);
   return {
+    inputName: text(facts.inputName),
+    formFieldNames: texts(facts.formFieldNames),
+    secretEntry: flag(facts.secretEntry),
     name,
     visibleLabel: text(facts.visibleLabel) ?? '',
     ...(formMethod !== undefined ? { formMethod } : {}),
@@ -1247,12 +1257,13 @@ export async function readCheckoutRegion(page: Page, element: ElementHandle): Pr
 }
 
 /**
- * Whether any field on the page holds a secret (KTD6): a password, a code or payment details, in every frame and
+ * Host-only values of fields holding a secret (KTD6): passwords, codes or payment details, in every frame and
  * every shadow root, closed ones included. Each target's pierced DOM tree finds the fields, and each field's
  * value is read in its frame's isolated world, so page script cannot answer for it. Throws
  * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
  */
-export async function pageHoldsSecretValue(page: Page): Promise<boolean> {
+export async function readPageSecretValues(page: Page): Promise<readonly string[]> {
+  const values = new Set<string>();
   const objectGroup = `gws-ea-secret-scan-${randomUUID()}`;
   const sessions = await openSessions(page);
   try {
@@ -1285,18 +1296,19 @@ export async function pageHoldsSecretValue(page: Page): Promise<boolean> {
         const result = await bounded(
           session.send('Runtime.callFunctionOn', {
             executionContextId: hosted.context,
-            functionDeclaration: `function (...fields) { return fields.some((field) => globalThis.${LIBRARY}.secretValue(field)); }`,
+            functionDeclaration: `function (...fields) { return fields.filter((field) => globalThis.${LIBRARY}.secretValue(field)).map((field) => field.value); }`,
             arguments: handed,
             returnByValue: true,
           }),
           READ_TIMEOUT_MS,
         );
-        if (result.exceptionDetails || typeof result.result.value !== 'boolean')
+        const read: unknown = result.result.value;
+        if (result.exceptionDetails || !Array.isArray(read) || read.some((value) => typeof value !== 'string'))
           throw new ControlFactsUnavailableError();
-        if (result.result.value) return true;
+        for (const value of read as string[]) if (value) values.add(value);
       }
     }
-    return false;
+    return [...values];
   } catch (_error) {
     // A scan that cannot complete proves nothing about the page.
     throw new ControlFactsUnavailableError();

@@ -32,7 +32,7 @@ import { loadPersonalData, privateValueReference } from '../gws-ea-privacy/index
 import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
 import { registrableSite } from './commit-classifier.js';
-import type { BrowserAction } from './executor.js';
+import type { BrowserAction } from './actions.js';
 import type { BrowserRef, PinnedBrowserRef } from './observe.js';
 
 // ---------------------------------------------------------------- main's disclosure

@@ -113,3 +113,18 @@ export function parseZonedToUtc(input: string, tz: string): Date {
   const offsetMs = zonedAsUtcMs - asIfUtc.getTime();
   return new Date(asIfUtc.getTime() - offsetMs);
 }
+
+/** A zone named as people say it: its city, or the zone's own short name at `at` when it has none. */
+export function timeZoneLabel(timeZone: string, at: string): string {
+  const zone = resolveTimezone(timeZone);
+  const city = /^(?!Etc\/)[A-Za-z]+\/(?:[^/]+\/)?([^/]+)$/u.exec(zone)?.[1];
+  return city
+    ? `${city.replaceAll('_', ' ')} time`
+    : (new Intl.DateTimeFormat('en-US', { timeZone: zone, timeZoneName: 'short' })
+        .formatToParts(new Date(at))
+        .find((part) => part.type === 'timeZoneName')?.value ?? zone);
+}
+/** A moment on the clock of `timeZone`, labelled with it. */
+export function formatLocalTimeWithZone(at: string, timeZone: string): string {
+  return `${formatLocalTime(at, timeZone)} ${timeZoneLabel(timeZone, at)}`;
+}

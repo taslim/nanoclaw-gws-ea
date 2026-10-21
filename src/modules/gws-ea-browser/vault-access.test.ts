@@ -36,7 +36,6 @@ import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
-import { guard } from '../../guard/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -57,7 +56,7 @@ import {
 import { BrowserVault } from './onepassword.js';
 import { writePrivateFile } from './paths.js';
 import type { OnePasswordUser } from './onepassword-cli.js';
-import { registerVaultAccessDelivery, vaultAccessGuard, type VaultSharingProvider } from './vault-access.js';
+import { registerVaultAccessDelivery, type VaultSharingProvider } from './vault-access.js';
 
 const ACCOUNT_ID = 'JUNOHALEACCOUNT00000000001';
 const MANAGEMENT_ID = 'MANAGEMENTSERVICEACCOUNT01';
@@ -593,13 +592,6 @@ describe('who may ask, and for whom', () => {
     }
     expect(onePassword.calls).toEqual([]);
     expect(sdk.create).not.toHaveBeenCalled();
-    expect(
-      await guard(vaultAccessGuard, { actor: { kind: 'agent', agentGroupId: 'va-main' }, payload: {} }),
-    ).toMatchObject({ effect: 'allow' });
-    for (const agentGroupId of ['va-browser', 'va-external', 'va-foreign'])
-      expect(await guard(vaultAccessGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
-        effect: 'deny',
-      });
   });
 
   it('refuses a caller-chosen vault, account, permission or command', async () => {

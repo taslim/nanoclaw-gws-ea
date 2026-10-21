@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -37,7 +37,6 @@ describe('dedicated Chrome profile and launch', () => {
     expect(launch.args).toEqual(
       expect.arrayContaining([
         '--remote-debugging-pipe',
-        '--disable-blink-features=AutomationControlled',
         `--user-data-dir=${paths.profileDir}`,
         '--proxy-server=http://127.0.0.1:45678',
         '--proxy-bypass-list=<-loopback>',
@@ -50,7 +49,9 @@ describe('dedicated Chrome profile and launch', () => {
     );
     expect(
       launch.args.some((arg) =>
-        /--(?:remote-debugging-port|enable-automation|remote-allow-origins|headless)/.test(arg),
+        /--(?:remote-debugging-port|enable-automation|remote-allow-origins|headless)|AutomationControlled|CDPScreenshotNewSurface/.test(
+          arg,
+        ),
       ),
     ).toBe(false);
   });
@@ -101,6 +102,21 @@ describe('dedicated Chrome profile and launch', () => {
     expect((await lstat(pref)).mode & 0o777).toBe(0o600);
     await symlink(path.join(root, 'elsewhere'), path.join(paths.stagingDir, 'escape'));
     await expect(ensureBrowserPaths(paths)).rejects.toThrow(/symbolic|symlink/i);
+  });
+
+  it('retains Chrome’s version sentinel without following it, only at the profile root', async () => {
+    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    await ensureBrowserPaths(paths);
+    const sentinel = path.join(paths.profileDir, 'RunningChromeVersion');
+    await symlink('155.0.8059.85:1', sentinel);
+    await prepareChromeProfile(paths);
+    expect(await readlink(sentinel)).toBe('155.0.8059.85:1');
+    const staged = path.join(paths.stagingDir, 'RunningChromeVersion');
+    await symlink('155.0.8059.85:1', staged);
+    await expect(ensureBrowserPaths(paths)).rejects.toThrow(/symlink/iu);
+    await rm(staged);
+    await symlink(path.join(root, 'elsewhere'), path.join(paths.profileDir, 'unknown-link'));
+    await expect(ensureBrowserPaths(paths)).rejects.toThrow(/symlink/iu);
   });
 
   it('drops every service worker registration while Chrome is stopped', async () => {

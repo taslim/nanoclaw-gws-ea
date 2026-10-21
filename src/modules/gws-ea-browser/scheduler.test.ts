@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { getEventListeners } from 'node:events';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -18,10 +19,10 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import { BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
 import { createBrowserWatchScheduler, type BrowserWatchCheckResult } from './scheduler.js';
-import type { WatchBounds } from './watches.js';
+import type { WatchBounds } from './watch-state.js';
 import type { ReservationAvailability } from './merchant-contract.js';
 import { nextWatchCheck, watchSitePolicy, type WatchReleaseRule, type WatchSitePolicy } from './watch-policy.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
@@ -47,7 +48,7 @@ beforeEach(async () => {
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Missing job');
   jobId = job.id;
-  queue = new BrowserQueue(store, {
+  queue = createBrowserQueue(store, {
     async pageForJob(): Promise<never> {
       throw new Error('Unexpected signed-in browser');
     },

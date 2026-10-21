@@ -8,9 +8,9 @@ import type { RequestPicture } from '../approvals/index.js';
 import type { CheckoutBox } from './control-facts.js';
 import type { PurchaseFacts } from './fingerprint.js';
 import { union } from './generic-signature.js';
-import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-signatures.js';
-import { pageMayShowSecret } from './observe.js';
-import type { BrowserExecutionContext } from './queue.js';
+import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-read.js';
+import { pageMayShowSecret } from './page-privacy.js';
+import type { BrowserExecutionContext } from './actions.js';
 
 const PICTURE_TIMEOUT_MS = 10_000;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);

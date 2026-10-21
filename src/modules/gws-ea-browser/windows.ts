@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 
-import { secureJobPage, type ChromeConnection } from './connection.js';
+import { createBackgroundPage, type ChromeConnection } from './connection.js';
 import { releaseBrowserUploads } from './files.js';
 
 export const BROWSER_WINDOW_IDLE_MS = 10 * 60 * 1000;
@@ -23,72 +23,18 @@ export class JobWindows {
       release = resolve;
     });
     await prior;
-    let createdTargetId: string | undefined;
-    let setupFailed = false;
-    const closeCreatedTarget = async (): Promise<void> => {
-      if (createdTargetId) {
-        await this.connection.session.send('Target.closeTarget', { targetId: createdTargetId }).catch(() => undefined);
-      }
-    };
     try {
       const existing = this.pages.get(jobId);
       if (existing && !existing.page.isClosed()) {
         existing.lastUsed = Date.now();
         return existing.page;
       }
-      let resolveTarget!: (id: string) => void;
-      const expectedTarget = new Promise<string>((resolve) => {
-        resolveTarget = resolve;
-      });
-      const appeared = this.connection.context.waitForEvent('page', {
-        timeout: 10_000,
-        predicate: async (candidate) => {
-          const targetId = await expectedTarget;
-          if (!targetId || candidate.isClosed()) return false;
-          const metadata = await this.connection.context.newCDPSession(candidate);
-          try {
-            const { targetInfo } = await metadata.send('Target.getTargetInfo');
-            return targetInfo.targetId === targetId;
-          } finally {
-            await metadata.detach();
-          }
-        },
-      });
-      // Bind the resulting page to the exact created target, so an unrelated
-      // page event can never become another job's working page.
-      const created = this.connection.session
-        .send('Target.createTarget', {
-          url: 'about:blank',
-          newWindow: true,
-          background: true,
-        })
-        .then(
-          (result) => {
-            createdTargetId = result.targetId;
-            if (setupFailed) void closeCreatedTarget();
-            resolveTarget(result.targetId);
-            return result;
-          },
-          (error: unknown) => {
-            resolveTarget('');
-            throw error;
-          },
-        );
-      const [, page] = await Promise.all([created, appeared]);
-      await secureJobPage(page);
-      if (page.viewportSize() !== null) {
-        await page.close();
-        throw new Error('Chrome unexpectedly enabled viewport emulation');
-      }
+      const page = await createBackgroundPage(this.connection);
       this.pages.set(jobId, { page, lastUsed: Date.now() });
       page.once('close', () => {
         if (this.pages.get(jobId)?.page === page) this.pages.delete(jobId);
       });
       return page;
-    } catch (error) {
-      setupFailed = true;
-      await closeCreatedTarget();
-      throw error;
     } finally {
       release();
     }

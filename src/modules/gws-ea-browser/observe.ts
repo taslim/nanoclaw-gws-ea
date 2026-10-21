@@ -1,10 +1,19 @@
-import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
+import type { ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
-import { httpsOrigin, SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
-import { ControlFactsUnavailableError, pageHoldsSecretValue } from './control-facts.js';
+import { httpsOrigin } from './authentication-signatures.js';
+import {
+  browserDocumentIdentity,
+  browserPageReplayUrl,
+  collectSecretFields,
+  redactPageText,
+  redactPageData,
+  type BrowserDocumentIdentity,
+  type BrowserReplayUrl,
+} from './page-privacy.js';
 import type { CookieBannerReport } from './cookie-banners.js';
+import { withinTime } from './page-targets.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -49,11 +58,52 @@ interface PageObservationState {
   generation: number;
   url: string;
   snapshot: string;
-  secrets: Set<string>;
-  activeSecrets: Set<string>;
   siteOriginsKey?: string;
-  unboundSecretDocuments: Set<string>;
-  secretDocumentLoaders: Set<string>;
+  structure?: BrowserStructure;
+  document?: BrowserDocumentIdentity;
+}
+export interface BrowserStructure {
+  readonly generation: number;
+  readonly url: string;
+  readonly tree: unknown;
+  readonly replayUrl?: BrowserReplayUrl;
+}
+
+function presentStructure(tree: unknown, depth = 0): string[] {
+  if (Array.isArray(tree)) return tree.flatMap((node) => presentStructure(node, depth));
+  if (!isRecord(tree) || typeof tree.role !== 'string') return [];
+  const indent = '  '.repeat(depth);
+  if (tree.role === 'text') return [`${indent}- text: ${JSON.stringify(String(tree.text ?? ''))}`];
+  let label = tree.role;
+  if (typeof tree.name === 'string' && tree.name) label += ` ${JSON.stringify(tree.name)}`;
+  for (const name of ['checked', 'disabled', 'expanded', 'active', 'invalid', 'level', 'pressed', 'selected']) {
+    const value = tree[name];
+    if (value === true) label += ` [${name}]`;
+    else if (typeof value === 'string' || typeof value === 'number') label += ` [${name}=${JSON.stringify(value)}]`;
+  }
+  if (typeof tree.ref === 'string') label += ` [ref=${tree.ref}]`;
+  if (tree.cursor === 'pointer') label += ' [cursor=pointer]';
+  const properties = ['url', 'placeholder'].flatMap((key) =>
+    typeof tree[key] === 'string' ? [`${indent}  - /${key}: ${JSON.stringify(tree[key])}`] : [],
+  );
+  const children = presentStructure(tree.children, depth + 1);
+  if (!properties.length && !children.length && typeof tree.text === 'string')
+    return [`${indent}- ${label}: ${JSON.stringify(tree.text)}`];
+  return [
+    `${indent}- ${label}${properties.length || children.length ? ':' : ''}`,
+    ...properties,
+    ...(typeof tree.text === 'string' ? [`${indent}  - text: ${JSON.stringify(tree.text)}`] : children),
+  ];
+}
+
+/** Immutable safe facts from the most recent core observation; never refreshes refs or reads a page. */
+export function browserStructureFacts(page: Page): BrowserStructure | undefined {
+  const state = stateFor(page);
+  return state.structure?.replayUrl &&
+    state.structure.replayUrl === browserPageReplayUrl(page) &&
+    state.document === browserDocumentIdentity(page)
+    ? structuredClone(state.structure)
+    : undefined;
 }
 const pages = new WeakMap<Page, PageObservationState>();
 
@@ -64,153 +114,57 @@ function stateFor(page: Page): PageObservationState {
       generation: 0,
       url: '',
       snapshot: '',
-      secrets: new Set(),
-      activeSecrets: new Set(),
-      unboundSecretDocuments: new Set(),
-      secretDocumentLoaders: new Set(),
     };
     pages.set(page, state);
   }
   return state;
 }
 
-type BrowserSiteInfoProvider = (
-  page: Page,
-  origin: string,
-  assertActive?: () => Promise<void>,
-) => Promise<Record<string, unknown>>;
-const siteInfoProviders: BrowserSiteInfoProvider[] = [];
-/** Host-owned optional enrichment. It receives an origin only and never page-authored instructions. */
-export function registerBrowserSiteInfoProvider(provider: BrowserSiteInfoProvider): void {
-  siteInfoProviders.push(provider);
+interface BrowserSiteInfo {
+  recipes?(origin: string): Promise<Record<string, unknown>>;
+  vault?(origins: readonly string[], assertActive: () => Promise<void>): Promise<Record<string, unknown>>;
 }
-
-/** Public inventory bindings are redacted without claiming they are a filled credential. */
-export function registerPageRedaction(page: Page, value: string): void {
-  if (!value) return;
-  const secrets = stateFor(page).secrets;
-  secrets.add(value);
-  secrets.add(encodeURIComponent(value));
-}
-
-/** Secret values stay host-only, including after a field was cleared or navigation completed. */
-export function registerPageSecret(page: Page, value: string): void {
-  if (!value) return;
-  const state = stateFor(page);
-  registerPageRedaction(page, value);
-  state.activeSecrets.add(value);
-  state.unboundSecretDocuments.add(value);
-}
-export function releasePageSecret(page: Page, value: string): void {
-  stateFor(page).activeSecrets.delete(value);
-}
-
-const documentSessions = new WeakMap<Page, Promise<CDPSession>>();
-interface DocumentTree {
-  frame: { loaderId: string };
-  childFrames?: DocumentTree[];
-}
-/** The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the
- * main-frame document it was created under, and that document is always in this tree.
- */
-async function documentLoaders(page: Page): Promise<Set<string>> {
-  let attached = documentSessions.get(page);
-  if (!attached) {
-    attached = page.context().newCDPSession(page);
-    documentSessions.set(page, attached);
-    page.once('close', () => {
-      documentSessions.delete(page);
-      void attached?.then((session) => session.detach()).catch(() => undefined);
-    });
-  }
-  const session = await attached;
-  const tree = await session.send('Page.getFrameTree');
-  const loaders = new Set<string>();
-  const visit = (node: DocumentTree): void => {
-    if (node.frame.loaderId) loaders.add(node.frame.loaderId);
-    node.childFrames?.forEach(visit);
-  };
-  visit(tree.frameTree);
-  return loaders;
-}
-
-/** Bind taint to native document identities before inserting a value or consuming a bearer URL.
- * All current frames are tainted: same-origin scripts and postMessage can copy a value into another frame's canvas.
- * Loader IDs remain remembered for the page lifetime, including a back/forward-cache restoration.
- */
-export async function bindPageSecretDocuments(page: Page, value: string): Promise<void> {
-  const state = stateFor(page);
-  const loaders = await documentLoaders(page);
-  for (const loader of loaders) state.secretDocumentLoaders.add(loader);
-  if (loaders.size) state.unboundSecretDocuments.delete(value);
-}
-export function redactPageText(page: Page, text: string): string {
-  let result = text;
-  for (const value of [...stateFor(page).secrets].sort((a, b) => b.length - a.length))
-    result = result.split(value).join('[redacted]');
-  return result.replace(
-    /https?:\/\/[^\s"<>]*(?:[?&#](?:[\w-]*token|code|key|ticket|auth|secret|credential|signature|reservation)=)[^\s"<>]*/giu,
-    '[redacted URL]',
-  );
-}
-
-/** A text field a show-password toggle produced still holds a password, so the scan never trusts the type alone. */
-const SECRET_FIELD_VALUES = `Array.from(document.querySelectorAll('input')).filter(e => e.type === 'password' ||
-  new RegExp(${JSON.stringify(SECRET_AUTOCOMPLETE.source)}, 'iu').test(e.getAttribute('autocomplete') || '') ||
-  new RegExp(${JSON.stringify(SECRET_DESCRIPTION.source)}, 'iu').test([e.name, e.id, e.getAttribute('aria-label') || '', e.getAttribute('placeholder') || ''].join(' '))
-).map(e => e.value).filter(Boolean)`;
-
-/** Host-owned inspection, never an agent-supplied expression or field-read tool. */
-async function collectSecretFields(page: Page): Promise<boolean> {
-  let present = false;
-  for (const frame of page.frames()) {
-    const values: unknown = await frame.evaluate(SECRET_FIELD_VALUES);
-    if (!Array.isArray(values)) continue;
-    for (const value of values)
-      if (typeof value === 'string' && value) {
-        registerPageSecret(page, value);
-        await bindPageSecretDocuments(page, value);
-        present = true;
-      }
-  }
-  return present;
-}
-
-/** Whether the host inserted a secret on one of the page's current documents, or holds one not yet bound to them. */
-async function hostSecretOnPage(page: Page): Promise<boolean> {
-  const state = stateFor(page);
-  if (state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
-  if (!state.secretDocumentLoaders.size) return false;
-  try {
-    const loaders = await documentLoaders(page);
-    return !loaders.size || [...loaders].some((loader) => state.secretDocumentLoaders.has(loader));
-  } catch (_error) {
-    return true;
-  }
-}
-
-export async function pageHasSecret(page: Page): Promise<boolean> {
-  return (await collectSecretFields(page)) || (await hostSecretOnPage(page));
-}
-
-/**
- * Whether a picture of the page could show a secret (KTD6): the host inserted one on the page, or an
- * isolated-world scan of every frame, shadow roots included, finds a field holding one. A scan that cannot
- * complete counts as finding one.
- */
-export async function pageMayShowSecret(page: Page): Promise<boolean> {
-  if (await hostSecretOnPage(page)) return true;
-  try {
-    return await pageHoldsSecretValue(page);
-  } catch (error) {
-    if (error instanceof ControlFactsUnavailableError) return true;
-    throw error;
-  }
+let siteInfo: BrowserSiteInfo = {};
+/** Composition supplies the two known optional readers. Neither receives a Page or a native handle. */
+export function configureBrowserSiteInfo(readers: BrowserSiteInfo): void {
+  siteInfo = readers;
 }
 
 export interface ObservePageOptions {
   /** What the host did about a cookie banner just before this observation (R18), for it to report. */
   readonly cookieBanner?: CookieBannerReport | undefined;
+  readonly remaining?: () => number;
+  readonly signal?: AbortSignal;
+}
+
+/** Allow first-use vault discovery up to ten seconds, while reserving a second for the required answer. */
+async function optionalSiteInfo(
+  work: (assertActive: () => Promise<void>) => Promise<Record<string, unknown>>,
+  unavailable: Record<string, unknown>,
+  assertActive: (() => Promise<void>) | undefined,
+  options: ObservePageOptions,
+): Promise<Record<string, unknown>> {
+  const allowance = Math.min(10_000, Math.max(0, (options.remaining?.() ?? 11_000) - 1_000));
+  if (!allowance || options.signal?.aborted) return unavailable;
+  let active = true;
+  let stop: (() => void) | undefined;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    stop = () => reject(new Error('Site metadata interrupted'));
+    options.signal?.addEventListener('abort', stop, { once: true });
+  });
+  const check = async (): Promise<void> => {
+    if (!active || options.signal?.aborted) throw new Error('Site metadata allowance ended');
+    await assertActive?.();
+    if (!active || options.signal?.aborted) throw new Error('Site metadata allowance ended');
+  };
+  try {
+    return await withinTime(Promise.race([Promise.resolve().then(() => work(check)), interrupted]), allowance);
+  } catch {
+    return unavailable;
+  } finally {
+    active = false;
+    if (stop) options.signal?.removeEventListener('abort', stop);
+  }
 }
 
 export async function observePage(
@@ -218,12 +172,10 @@ export async function observePage(
   assertActive?: () => Promise<void>,
   options: ObservePageOptions = {},
 ): Promise<BrowserObservation> {
-  await collectSecretFields(page);
   const state = stateFor(page);
-  const url = redactPageText(page, page.url());
-  // This is the only snapshot producer. Every call invalidates all earlier refs.
-  ++state.generation;
-  const snapshot = redactPageText(page, await page.locator('body').ariaSnapshot({ mode: 'ai' }));
+  const structure = await snapshotBrowserStructure(page);
+  const url = structure.url;
+  const snapshot = presentStructure(structure.tree).join('\n');
   const previous = new Set(state.snapshot.split('\n'));
   const current = new Set(snapshot.split('\n'));
   const delta =
@@ -246,11 +198,35 @@ export async function observePage(
       if (origin) origins.add(origin.origin);
     }
     const originsKey = JSON.stringify([current.origin, [...origins].sort()]);
-    if (current.protocol === 'https:' && domain && state.siteOriginsKey !== originsKey && siteInfoProviders.length) {
+    if (
+      current.protocol === 'https:' &&
+      domain &&
+      state.siteOriginsKey !== originsKey &&
+      (siteInfo.recipes || siteInfo.vault)
+    ) {
       site = { origin: current.origin, untrusted: true };
-      for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
-      site = JSON.parse(redactPageText(page, JSON.stringify(site))) as BrowserObservation['site'];
-      state.siteOriginsKey = originsKey;
+      const { recipes: readRecipes, vault: readVault } = siteInfo;
+      const [recipes, vault] = await Promise.all([
+        readRecipes
+          ? optionalSiteInfo(
+              () => readRecipes(current.origin),
+              { recipes_status: 'unavailable' },
+              assertActive,
+              options,
+            )
+          : Promise.resolve<Record<string, unknown>>({}),
+        readVault
+          ? optionalSiteInfo(
+              (check) => readVault([...origins], check),
+              { vault_status: 'vault_unavailable' },
+              assertActive,
+              options,
+            )
+          : Promise.resolve<Record<string, unknown>>({}),
+      ]);
+      Object.assign(site, recipes, vault);
+      site = redactPageData(page, site) as BrowserObservation['site'];
+      if (!recipes.recipes_status && !vault.vault_status) state.siteOriginsKey = originsKey;
     }
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */
@@ -265,18 +241,62 @@ export async function observePage(
   };
 }
 
-/** Structured host checkpoints replace native refs just like agent observations do. */
-export async function snapshotBrowserStructure(
+/** Map only structured native candidates to a real current public ref; display text never supplies identities. */
+export async function browserRefForElement(
   page: Page,
-): Promise<{ generation: number; url: string; tree: unknown }> {
+  element: ElementHandle,
+  target: { role: string; name?: string },
+): Promise<BrowserRef> {
+  const state = stateFor(page);
+  if (!state.structure || state.document !== browserDocumentIdentity(page)) throw new BrowserRefError('stale_ref');
+  const generation = state.generation;
+  const refs = (tree: unknown): string[] => {
+    if (Array.isArray(tree)) return tree.flatMap(refs);
+    if (!isRecord(tree)) return [];
+    const current =
+      tree.role === target.role &&
+      (target.name === undefined || tree.name === target.name) &&
+      typeof tree.ref === 'string' &&
+      BROWSER_REF_PATTERN.test(tree.ref)
+        ? [tree.ref]
+        : [];
+    return [...current, ...refs(tree.children)];
+  };
+  for (const ref of refs(state.structure.tree)) {
+    if (await page.getByRef(ref).evaluate((node, other) => node === other, element)) {
+      if (state.generation !== generation || state.document !== browserDocumentIdentity(page))
+        throw new BrowserRefError('stale_ref');
+      return { ref, generation };
+    }
+  }
+  throw new BrowserRefError('not_actionable');
+}
+
+/** An ancillary native snapshot replaces Playwright's ref map even if its caller later fails. */
+export function invalidateBrowserRefs(page: Page): void {
+  const state = stateFor(page);
+  state.generation++;
+  state.document = undefined;
+  state.structure = undefined;
+}
+
+/** Structured host checkpoints replace native refs just like agent observations do. */
+export async function snapshotBrowserStructure(page: Page): Promise<BrowserStructure> {
   await collectSecretFields(page);
-  const generation = ++stateFor(page).generation;
+  const state = stateFor(page);
+  const generation = ++state.generation;
+  const document = browserDocumentIdentity(page);
   const tree: unknown = await page.locator('body').ariaSnapshotJSON({ mode: 'ai' });
-  return {
+  if (document !== browserDocumentIdentity(page)) throw new BrowserRefError('stale_ref');
+  const structure = {
     generation,
     url: redactPageText(page, page.url()),
-    tree: JSON.parse(redactPageText(page, JSON.stringify(tree))) as unknown,
+    tree: redactPageData(page, tree),
+    replayUrl: browserPageReplayUrl(page),
   };
+  state.document = document;
+  state.structure = structure;
+  return structuredClone(structure);
 }
 
 export class BrowserRefError extends Error {
@@ -288,7 +308,11 @@ export class BrowserRefError extends Error {
 /** Resolve the entire batch before another snapshot can replace e1 with a different element. */
 export async function pinBrowserRefs(page: Page, refs: readonly BrowserRef[]): Promise<Map<string, PinnedBrowserRef>> {
   const state = stateFor(page);
-  if (refs.some((ref) => ref.generation !== state.generation || !BROWSER_REF_PATTERN.test(ref.ref)))
+  if (
+    refs.length &&
+    (state.document !== browserDocumentIdentity(page) ||
+      refs.some((ref) => ref.generation !== state.generation || !BROWSER_REF_PATTERN.test(ref.ref)))
+  )
     throw new BrowserRefError('stale_ref');
   const pinned = new Map<string, PinnedBrowserRef>();
   try {
@@ -300,9 +324,9 @@ export async function pinBrowserRefs(page: Page, refs: readonly BrowserRef[]): P
       pinned.set(ref.ref, { ...ref, element, frame });
     }
     return pinned;
-  } catch (_error) {
+  } catch (error) {
     for (const value of pinned.values()) await value.element.dispose();
-    throw new BrowserRefError('stale_ref');
+    throw error;
   }
 }
 

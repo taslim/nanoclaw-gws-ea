@@ -1,3 +1,7 @@
+import { BrowserLocatorError, resolveLocator } from './locators.js';
+import { classifyNavigationUrl } from './control-policy.js';
+import { readCheckoutRegion, readPageControlFacts } from './control-facts.js';
+import { createBrowserQueue } from './index.js';
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -43,17 +47,19 @@ import { configureBrowserCancellation } from './cancel.js';
 import {
   activateControl,
   classifyActivation,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
-  readControlFacts,
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
-import { executeBrowserBatch, type BrowserAction } from './executor.js';
+import { BrowserDiagnosticAttempt } from './diagnostics.js';
+import * as actionTargets from './action-targets.js';
+import * as nativeControlFacts from './control-facts.js';
+import { executeBrowserBatch } from './executor.js';
+import { type BrowserAction } from './actions.js';
 import { setBrowserAdmissionReady } from './group.js';
-import { prepareMerchantPage, readMerchantPurchase } from './merchant-signatures.js';
+import { prepareMerchantPage, readMerchantPurchase } from './merchant-read.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import {
   CONSENT,
@@ -77,8 +83,10 @@ import { browserVault } from './onepassword.js';
 import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
-import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { type BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
+
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
 
@@ -120,6 +128,7 @@ async function jobDb(...jobs: string[]): Promise<SqliteDriver> {
   for (const job of jobs) await db.run('INSERT INTO gws_ea_browser_jobs VALUES(?)', job);
   for (const migration of [browserSiteLeasesMigration, browserConsentMigration, browserRecipesMigration])
     await migration.up(db);
+  await db.exec('CREATE TABLE gws_ea_browser_requests(answer_json TEXT,job_id TEXT,started_at TEXT,action TEXT)');
   return db;
 }
 
@@ -211,7 +220,7 @@ async function startErrandHost(thread: string): Promise<ErrandHost> {
     sent: [],
     attached: [],
     closed: 0,
-    queue: new BrowserQueue(new BrowserStore(), {
+    queue: createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
       connection: async (): Promise<never> => {
         throw new Error('Not used');
@@ -287,7 +296,7 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   }
   const classify = (target: Locator, kind?: ActivationIntent['kind']): Promise<string> =>
     withElement(target, (element) => classifyActivation(page, element, kind));
-  const facts = (target: Locator) => withElement(target, (element) => readControlFacts(page, element));
+  const facts = (target: Locator) => withElement(target, (element) => readPageControlFacts(page, element));
 
   it('keeps preparation on a transaction page ordinary and refuses its commits', async () => {
     await visit(OPEN_WEB.payment);
@@ -740,6 +749,216 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
   const posts = (): string[] =>
     fixture.requests.filter((request) => request.method !== 'GET').map((request) => request.url);
 
+  it('leaves a secret-query page even when its recording checkpoint is unavailable', async () => {
+    const page = await open();
+    await page.goto(`${OPEN_WEB.article}?token=fixture-private-bearer`);
+    expect((await observePage(page)).url).toBe('[redacted URL]');
+    const result = await executeBrowserBatch(context(page), { actions: [{ kind: 'navigate', url: OPEN_WEB.faq }] });
+    expect(result).toMatchObject({
+      reason: 'navigated',
+      actions: [{ status: 'completed' }],
+      recording: { status: 'unavailable' },
+    });
+    expect(page.url()).toBe(OPEN_WEB.faq);
+    expect(JSON.stringify(result)).not.toContain('fixture-private-bearer');
+    const traces = await db.all('SELECT step_json FROM gws_ea_browser_action_trace');
+    expect(JSON.stringify(traces)).not.toContain('fixture-private-bearer');
+    expect(await click(page, 'Show delivery times')).toMatchObject({ status: 'completed' });
+    expect(await page.locator('#times').isVisible()).toBe(true);
+  });
+
+  it.each([403, 200])(
+    'reports a fixture HTTP %i denial ahead of the navigation boundary, then permits another action',
+    async (status) => {
+      const denied = 'https://news.example/denied';
+      fixture.serve(denied, () => ({
+        status,
+        body: htmlPage('Denied', '<h1>Access Denied</h1><p>Request refused.</p>'),
+      }));
+      const page = await open();
+      const diagnostic = new BrowserDiagnosticAttempt({ jobId: 'job-a', requestId: 'denial', action: 'browser' });
+      diagnostic.observe(page);
+      expect(await go(page, denied)).toMatchObject({
+        reason: 'challenge',
+        actions: [{ status: 'completed' }],
+        observation: { url: denied, snapshot: expect.stringContaining('Access Denied') },
+      });
+      expect(diagnostic.finish().events).toContainEqual(
+        expect.objectContaining({ source: 'http_response', status, resource: 'document', action_index: 0 }),
+      );
+      expect(page.url()).toBe(denied);
+      expect(await go(page, OPEN_WEB.faq)).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
+      expect(await click(page, 'Show delivery times')).toMatchObject({ status: 'completed' });
+      expect(await page.locator('#times').isVisible()).toBe(true);
+    },
+  );
+
+  it('reports a host-blocked destination without borrowing the previous page response', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.faq);
+    const diagnostic = new BrowserDiagnosticAttempt({ jobId: 'job-a', requestId: 'blocked', action: 'browser' });
+    diagnostic.observe(page);
+    const result = await go(page, 'file:///private-fixture');
+    expect(result).toMatchObject({ reason: 'blocked_address', observation: { url: OPEN_WEB.faq } });
+    const events = diagnostic.finish().events;
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        source: 'host_refusal',
+        category: 'address',
+        rule: 'blocked_address',
+        action_index: 0,
+      }),
+    );
+    expect(events.some((event) => event.source === 'http_response')).toBe(false);
+    expect(await click(page, 'Show delivery times')).toMatchObject({ status: 'completed' });
+  });
+
+  it('reports a failed transport without inventing an HTTP response and permits a later navigation', async () => {
+    const page = await open();
+    await page.route('https://news.example/transport-failure', (route) => route.abort('namenotresolved'));
+    const diagnostic = new BrowserDiagnosticAttempt({ jobId: 'job-a', requestId: 'transport', action: 'browser' });
+    diagnostic.observe(page);
+    expect(await go(page, 'https://news.example/transport-failure')).toMatchObject({ reason: 'navigation_failed' });
+    const events = diagnostic.finish().events;
+    expect(events).toContainEqual(
+      expect.objectContaining({ source: 'transport_failure', category: 'dns', action_index: 0 }),
+    );
+    expect(events.some((event) => event.source === 'http_response')).toBe(false);
+    expect(await go(page, OPEN_WEB.faq)).toMatchObject({ reason: 'navigated' });
+    expect(await click(page, 'Show delivery times')).toMatchObject({ status: 'completed' });
+  });
+
+  it.each(['reservation', 'preparation', 'completion'] as const)(
+    'runs an action once when recording %s fails',
+    async (phase) => {
+      const url = 'https://news.example/recording-failure';
+      fixture.serve(
+        url,
+        htmlPage(
+          'Details',
+          '<h1>Details</h1><button type="button" onclick="window.presses=(window.presses||0)+1">Show details</button>',
+        ),
+      );
+      const page = await open();
+      await go(page, url);
+      const target = refIn(await observePage(page), 'Show details');
+      const get = db.get.bind(db);
+      const reservation = vi.spyOn(db, 'get').mockImplementation(async (sql, ...parameters) => {
+        if (phase === 'reservation' && sql.startsWith('INSERT INTO gws_ea_browser_action_trace'))
+          throw new Error('private-storage-sentinel');
+        return get(sql, ...parameters);
+      });
+      const run = db.run.bind(db);
+      const storage = vi.spyOn(db, 'run').mockImplementation(async (sql, ...parameters) => {
+        if (phase === 'completion' && sql.startsWith('UPDATE gws_ea_browser_action_trace'))
+          throw new Error('private-storage-sentinel');
+        return run(sql, ...parameters);
+      });
+      const preparation =
+        phase === 'preparation'
+          ? vi.spyOn(actionTargets, 'prepareBrowserActionFacts').mockImplementation(() => {
+              throw new TypeError('private-preparation-sentinel');
+            })
+          : undefined;
+      try {
+        const result = await executeBrowserBatch(context(page), { actions: [{ kind: 'click', ...target }] });
+        expect(result).toMatchObject({
+          status: 'completed',
+          actions: [{ status: 'completed' }],
+          recording: { status: 'unavailable' },
+        });
+        expect(await page.evaluate('window.presses')).toBe(1);
+        expect(JSON.stringify(result)).not.toContain('sentinel');
+        const rows = await db.all<{ step_json: string }>('SELECT step_json FROM gws_ea_browser_action_trace');
+        expect(rows).toHaveLength(phase === 'reservation' ? 0 : 1);
+        for (const row of rows) expect(JSON.parse(row.step_json)).toMatchObject({ saveError: 'Recording incomplete.' });
+        expect((result.actions as Array<{ trace_index?: number }>)[0].trace_index).toBe(
+          phase === 'reservation' ? undefined : 0,
+        );
+      } finally {
+        storage.mockRestore();
+        reservation.mockRestore();
+        preparation?.mockRestore();
+      }
+      expect(await click(page, 'Show details')).toMatchObject({ status: 'completed' });
+      expect(await page.evaluate('window.presses')).toBe(2);
+    },
+  );
+
+  it('records existing native control facts without another control inspection or snapshot generation', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.faq);
+    const before = await observePage(page);
+    const read = vi.spyOn(nativeControlFacts, 'readPageControlFacts');
+    try {
+      const result = await executeBrowserBatch(context(page), {
+        actions: [{ kind: 'click', ...refIn(before, 'Show delivery times') }],
+      });
+      expect(result).toMatchObject({
+        status: 'completed',
+        recording: { status: 'complete' },
+        observation: { generation: before.generation + 1 },
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(await page.locator('#times').isVisible()).toBe(true);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it.each(['reservation', 'completion'] as const)(
+    'answers a completed action before a stalled recording %s finishes',
+    async (phase) => {
+      const page = await open();
+      await go(page, OPEN_WEB.faq);
+      const target = refIn(await observePage(page), 'Show delivery times');
+      let release: (() => void) | undefined;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const pending: Promise<unknown>[] = [];
+      const get = db.get.bind(db);
+      const reservation = vi.spyOn(db, 'get').mockImplementation((sql, ...parameters) => {
+        if (phase === 'reservation' && sql.startsWith('INSERT INTO gws_ea_browser_action_trace')) {
+          const work = held.then(() => get(sql, ...parameters));
+          pending.push(work);
+          return work;
+        }
+        return get(sql, ...parameters);
+      });
+      const run = db.run.bind(db);
+      const storage = vi.spyOn(db, 'run').mockImplementation((sql, ...parameters) => {
+        if (phase === 'completion' && sql.startsWith('UPDATE gws_ea_browser_action_trace')) {
+          const work = held.then(() => run(sql, ...parameters));
+          pending.push(work);
+          return work;
+        }
+        return run(sql, ...parameters);
+      });
+      try {
+        const result = await executeBrowserBatch(context(page), { actions: [{ kind: 'click', ...target }] });
+        expect(result).toMatchObject({
+          status: 'completed',
+          recording: { status: 'unavailable' },
+          actions: [{ status: 'completed' }],
+        });
+        expect(await page.locator('#times').isVisible()).toBe(true);
+        expect((result.actions as Array<{ trace_index?: number }>)[0].trace_index).toBe(
+          phase === 'reservation' ? undefined : 0,
+        );
+      } finally {
+        release?.();
+        await Promise.all(pending);
+        storage.mockRestore();
+        reservation.mockRestore();
+      }
+      const rows = await db.all<{ step_json: string }>('SELECT step_json FROM gws_ea_browser_action_trace');
+      expect(rows).toHaveLength(1);
+      if (phase === 'reservation')
+        expect(JSON.parse(rows[0].step_json)).toMatchObject({ saveError: 'Recording incomplete.' });
+    },
+  );
+
   it('runs a script button, a box, a radio choice and a select as real actions', async () => {
     const page = await open();
     expect(await go(page, OPEN_WEB.faq)).toMatchObject({ status: 'stopped', reason: 'navigated' });
@@ -770,6 +989,75 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     });
     expect(posts()).toEqual([]);
     expect(page.url()).toBe(OPEN_WEB.overlay);
+  });
+
+  it('ends a batch on a same-URL reload and invalidates targets from the replaced document', async () => {
+    const url = 'https://news.example/reload';
+    fixture.serve(
+      url,
+      htmlPage(
+        'Reload',
+        '<h1>Reload</h1><button type="button" onclick="location.reload()">Reload page</button><input aria-label="Search term">',
+      ),
+    );
+    const page = await open();
+    await go(page, url);
+    const observation = await observePage(page);
+    const old = refIn(observation, 'Search term');
+    const result = await batch(page, [
+      { kind: 'click', ...refIn(observation, 'Reload page') },
+      { kind: 'type', ...old, text: 'must not run' },
+    ]);
+    expect(result).toMatchObject({
+      reason: 'navigated',
+      actions: [{ status: 'completed' }, { status: 'not_executed' }],
+    });
+    expect(page.url()).toBe(url);
+    expect(await page.getByRole('textbox', { name: 'Search term' }).inputValue()).toBe('');
+    expect(await batch(page, [{ kind: 'type', ...old, text: 'stale' }])).toMatchObject({ reason: 'stale_ref' });
+    const fresh = refIn(await observePage(page), 'Search term');
+    expect(await batch(page, [{ kind: 'type', ...fresh, text: 'current' }])).toMatchObject({ status: 'completed' });
+    expect(await page.getByRole('textbox', { name: 'Search term' }).inputValue()).toBe('current');
+  });
+
+  it('does not turn an internal TypeError into an actionability refusal', async () => {
+    const page = await open();
+    await go(page, OPEN_WEB.faq);
+    const wheel = vi.spyOn(page.mouse, 'wheel').mockRejectedValue(new TypeError('private-runtime-sentinel'));
+    try {
+      await expect(batch(page, [{ kind: 'scroll', direction: 'down' }])).rejects.toThrow(
+        'The browser action failed unexpectedly.',
+      );
+    } finally {
+      wheel.mockRestore();
+    }
+    expect(await click(page, 'Show delivery times')).toMatchObject({ status: 'completed' });
+  });
+
+  it('reports a pinned target detached by an earlier action without pressing a replacement', async () => {
+    const url = 'https://news.example/detached';
+    fixture.serve(
+      url,
+      htmlPage(
+        'Controls',
+        '<h1>Controls</h1><button type="button" onclick="document.getElementById(\'old\').remove()">Remove old control</button><button type="button" id="old" onclick="window.oldPresses=(window.oldPresses||0)+1">Old control</button>',
+      ),
+    );
+    const page = await open();
+    await go(page, url);
+    const before = await observePage(page);
+    expect(
+      await batch(page, [
+        { kind: 'click', ...refIn(before, 'Remove old control') },
+        { kind: 'click', ...refIn(before, 'Old control') },
+      ]),
+    ).toMatchObject({
+      reason: 'not_actionable',
+      actions: [{ status: 'completed' }, { status: 'stopped', reason: 'not_actionable' }],
+    });
+    expect(await page.evaluate('window.oldPresses || 0')).toBe(0);
+    expect(await page.getByRole('button', { name: 'Old control', exact: true }).count()).toBe(0);
+    expect(await batch(page, [{ kind: 'observe' }])).toMatchObject({ status: 'completed' });
   });
 
   it('refuses a page timer that posts after the batch, follows its GET on the leased site, and refuses one to another site', async () => {
@@ -835,7 +1123,12 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     try {
       // The activation boundary alone, inside the job's operation: a batch goes on to observe the page.
       const pressed = await withBrowserJobNavigation(context(page), page, () =>
-        activateControl(page, element, () => element.click({ noWaitAfter: true })),
+        activateControl(page, element, () => element.click({ noWaitAfter: true }), undefined, {
+          kind: 'click',
+          scope: { jobId: context(page).job.id, db },
+          assertActive: context(page).assertActive,
+          remaining: context(page).remaining,
+        }),
       );
       expect(pressed).toEqual({ ordinaryPress: true });
     } finally {
@@ -938,6 +1231,95 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(posts()).toEqual(['https://bistro.example/availability/hold']);
   });
 
+  it.each([
+    { source: 'autocomplete', label: 'Display value', attributes: 'autocomplete="new-password"' },
+    { source: 'label', label: 'Password', attributes: '' },
+  ])(
+    'refuses ordinary typing and editing of a secret field even when page script hides its attributes ($source)',
+    async ({ label, attributes }) => {
+      const page = await open();
+      const url = 'https://shop.example/secret-entry';
+      fixture.serve(
+        url,
+        htmlPage(
+          'Profile',
+          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" ${attributes}></label><button>Continue</button></form>`,
+          `
+      const read = HTMLInputElement.prototype.getAttribute;
+      HTMLInputElement.prototype.getAttribute = function(name) {
+        return this.id === 'entry' && ['type', 'autocomplete'].includes(name) ? null : read.call(this, name);
+      };
+    `,
+        ),
+      );
+      fixture.serve(`${url}/submitted`, htmlPage('Submitted', 'Done'));
+      await page.goto(url);
+      const secret = 'Synthetic-"credential\\U3-42';
+      await page.locator('#entry').fill(secret);
+      const checkout = await withElement(page.locator('button'), (element) => readCheckoutRegion(page, element));
+      expect.soft(checkout.region.fields).toMatchObject([{ secret: true, value: null }]);
+      const observation = await observePage(page);
+      for (const text of [observation.snapshot, JSON.stringify(observation)])
+        for (const encoded of [secret, JSON.stringify(secret).slice(1, -1)]) expect(text).not.toContain(encoded);
+      await page.locator('#entry').fill('');
+      for (const kind of ['type', 'key', 'form_input'] as const) {
+        const field = refIn(await observePage(page), label);
+        const action: BrowserAction =
+          kind === 'type'
+            ? { kind, ...field, text: 'ordinary-text' }
+            : kind === 'key'
+              ? { kind, ...field, key: 'Backspace' }
+              : { kind, fields: [{ ...field, value: 'ordinary-text' }] };
+        const result = await batch(page, [action]);
+        expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+        expect(await page.locator('#entry').inputValue()).toBe('');
+      }
+      await page.locator('#entry').fill(secret);
+      const submitted = await batch(page, [{ kind: 'click', ...refIn(await observePage(page), 'Continue') }]);
+      expect.soft(submitted).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(fixture.requests.some((request) => request.url === `${url}/submitted`)).toBe(false);
+    },
+  );
+
+  it('stops a watch batch at a download without running later actions', async () => {
+    const page = await open();
+    const url = 'https://shop.example/watch-download';
+    fixture.serve(
+      url,
+      htmlPage(
+        'Receipt',
+        '<a href="/receipt.txt" download>Download receipt</a><button onclick="this.textContent=\'Ran later action\'">Continue</button>',
+      ),
+    );
+    await page.goto(url);
+    const observation = await observePage(page);
+    const watch: BrowserWatchExecutionContext = {
+      ...context(page),
+      kind: 'watch_check',
+      check: { id: 'check-download' },
+    };
+    const result = await executeBrowserBatch(
+      watch,
+      {
+        actions: [
+          { kind: 'download', ...refIn(observation, 'Download receipt') },
+          { kind: 'click', ...refIn(observation, 'Continue') },
+        ],
+      },
+      { record: false },
+    );
+    expect(result).toMatchObject({
+      status: 'stopped',
+      reason: 'read_only',
+      actions: [
+        { index: 0, status: 'stopped', reason: 'read_only' },
+        { index: 1, status: 'not_executed' },
+      ],
+    });
+    expect(await page.locator('button').textContent()).toBe('Continue');
+    expect(fixture.requests.some((request) => request.url === 'https://shop.example/receipt.txt')).toBe(false);
+  });
+
   it('stops typing into a card field with card_field, on the page and inside a processor frame', async () => {
     const page = await open();
     await go(page, OPEN_WEB.platform);
@@ -992,6 +1374,55 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     getDb().all<{ kind: string; site: string; job_id: string }>(
       'SELECT kind, site, job_id FROM gws_ea_browser_incidents',
     );
+
+  it.each(['catalog', 'vault'] as const)(
+    'keeps completed navigation and the next action usable when %s metadata does not answer',
+    async (source) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const all = getDb().all.bind(getDb());
+      const catalog = vi.spyOn(getDb(), 'all').mockImplementation(async (sql, ...parameters) => {
+        if (source === 'catalog' && sql.includes('SELECT r.* FROM gws_ea_browser_recipes')) await held;
+        return all(sql, ...parameters);
+      });
+      const vault = vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async () => {
+        if (source === 'vault') await held;
+        // A useful first inventory may take longer than the recorder's allowance.
+        else await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        return [{ item_handle: 'vault_after-retry', title: 'Fixture login' }];
+      });
+      // Release even on the old implementation, whose queue must settle its timed-out operation before answering.
+      const timer = setTimeout(release, 5_000);
+      try {
+        const result = await errandRequest(host, 'held-catalog', 'browser', {
+          actions: [{ kind: 'navigate', url: OPEN_WEB.faq }],
+          budget_ms: 3_000,
+        });
+        expect(result).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
+        expect((result.observation as BrowserObservation).site).toMatchObject(
+          source === 'catalog'
+            ? { recipes_status: 'unavailable', vault_items: [{ item_handle: 'vault_after-retry' }] }
+            : { recipes: [], vault_status: 'vault_unavailable' },
+        );
+        release();
+        catalog.mockRestore();
+        const retried = await observePage(page);
+        expect(retried.site).toMatchObject({ recipes: [], vault_items: [{ item_handle: 'vault_after-retry' }] });
+        expect(
+          await run('after-held-catalog', [
+            { kind: 'click', ...refIn(await observePage(page), 'Show delivery times') },
+          ]),
+        ).toMatchObject({ status: 'completed' });
+      } finally {
+        release();
+        clearTimeout(timer);
+        catalog.mockRestore();
+        vault.mockRestore();
+      }
+    },
+  );
 
   it('stops the job with an incident when an ordinary Submit lands on a paid order confirmation', async () => {
     const answer = await press(OPEN_WEB.reorder, 'Submit');
@@ -1306,7 +1737,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
           target: refIn(signIn, 'Email'),
           submit: refIn(signIn, 'Continue'),
         }),
-      ).toEqual({ status: 'submitted' });
+      ).toMatchObject({ status: 'submitted' });
       expect(resolve).toHaveBeenCalledWith(
         'vault_osteria',
         'username',
@@ -1445,8 +1876,9 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     return result;
   };
 
-  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed (AE3)', async () => {
+  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed without recipe storage (AE3)', async () => {
     await open(GENERIC.review);
+    await getDb().exec('DROP TABLE gws_ea_browser_action_trace; DROP TABLE gws_ea_browser_recipes;');
     await run('note', [
       { kind: 'type', ...refIn(await observePage(page), 'Delivery instructions'), text: 'Leave it with the porter' },
     ]);
@@ -1695,7 +2127,12 @@ document.getElementById('updated').addEventListener('click', () => location.assi
 
   it('answers card_needed with the site, account, items and total when no payment method is saved', async () => {
     await open(GENERIC.guest);
-    expect(await purchase('Place order')).toMatchObject({
+    const seen = await observePage(page);
+    const handler = getDeliveryAction('purchase');
+    if (!handler) throw new Error('purchase delivery missing');
+    await handler({ action: 'purchase', requestId: 'card-needed', target: refIn(seen, 'Place order') }, session);
+    await queue.idle();
+    expect(await answer('card-needed')).toMatchObject({
       status: 'card_needed',
       site: 'pottery.example',
       account: 'guest checkout',
@@ -1704,6 +2141,46 @@ document.getElementById('updated').addEventListener('click', () => location.assi
       repeat_safe: true,
     });
     expect(await approvals()).toEqual([]);
+    expect(posts()).toEqual([]);
+    const edit = await run('edit-after-card-needed', [
+      { kind: 'type', ...refIn(seen, 'Email'), text: 'other@example.com' },
+    ]);
+    expect(edit.reason).toBeUndefined();
+    expect(edit).toMatchObject({
+      status: 'completed',
+      actions: [{ status: 'completed' }],
+    });
+    expect(await page.locator('[name="email"]').inputValue()).toBe('other@example.com');
+  });
+
+  it('keeps a generic control locator exact across duplicate labels and refuses unnamed controls', async () => {
+    await open(GENERIC.review);
+    await observePage(page);
+    await page.locator('#commit').evaluate((button) => {
+      const duplicate = button.cloneNode(true) as typeof button;
+      duplicate.id = 'duplicate-commit';
+      button.parentElement!.append(duplicate);
+    });
+    const element = await page.locator('#commit').elementHandle();
+    if (!element) throw new Error('Fixture commit control missing');
+    const result = await readMerchantPurchase(page, element);
+    expect(result.status).toBe('ready');
+    if (result.status !== 'ready' || !result.facts.control.locator) throw new Error('No generic locator');
+    const locator = result.facts.control.locator;
+    expect(locator).toMatchObject({ name: 'Place order', ordinal: 0, count: 2 });
+    const resolved = await resolveLocator(page, locator);
+    expect(await resolved.getAttribute('id')).toBe('commit');
+    await resolved.dispose();
+    await page.locator('#duplicate-commit').evaluate((button) => button.remove());
+    await expect(resolveLocator(page, locator)).rejects.toBeInstanceOf(BrowserLocatorError);
+    await result.element.dispose();
+    await page.locator('#commit').evaluate((button) => {
+      button.textContent = '';
+    });
+    expect(await read('#commit')).toMatchObject({
+      status: 'facts_incomplete',
+      missing: ['a commit control the host can find again'],
+    });
     expect(posts()).toEqual([]);
   });
 

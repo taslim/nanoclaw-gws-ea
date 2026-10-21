@@ -17,7 +17,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { ElementHandle, Page } from 'playwright-core';
 
 import { isolationSelector } from './authentication-submit.js';
-import { activateControl, BrowserActivationError } from './commit-classifier.js';
+import { activateControl, BrowserActivationError, type ActivationIntent } from './commit-classifier.js';
 import { frameGone, record } from './control-facts.js';
 import {
   bounded,
@@ -755,12 +755,14 @@ function loadFor(page: Page, loader: string): CookieBannerLoad {
  * activation boundary every host press takes, which reads it fresh as ordinary and keeps Playwright's
  * hit-target check, never forced or dispatched.
  */
+type CookieBannerOperation = Pick<ActivationIntent, 'scope' | 'assertActive' | 'remaining'>;
+
 async function press(
   page: Page,
   round: BannerRound,
   banner: FoundBanner,
   control: number,
-  assertActive?: () => Promise<void>,
+  operation: CookieBannerOperation,
 ): Promise<'pressed' | 'refused' | 'failed'> {
   let element: ElementHandle | undefined;
   try {
@@ -771,11 +773,15 @@ async function press(
       page,
       target,
       async () => {
-        await assertActive?.();
-        await target.click({ timeout: PRESS_TIMEOUT_MS });
+        await operation.assertActive?.();
+        await target.click({ timeout: Math.min(PRESS_TIMEOUT_MS, operation.remaining?.() ?? PRESS_TIMEOUT_MS) });
       },
       undefined,
-      { kind: 'click', assertActive, remaining: () => PRESS_TIMEOUT_MS },
+      {
+        ...operation,
+        kind: 'click',
+        remaining: () => Math.min(PRESS_TIMEOUT_MS, operation.remaining?.() ?? PRESS_TIMEOUT_MS),
+      },
     );
     return 'pressed';
     // eslint-disable-next-line no-catch-all/no-catch-all -- a press that cannot complete is a reject that failed
@@ -823,12 +829,12 @@ async function awaitSecondLayer(page: Page, assertActive?: () => Promise<void>):
  */
 export async function settleCookieBanners(
   page: Page,
-  assertActive?: () => Promise<void>,
+  operation: CookieBannerOperation = {},
 ): Promise<CookieBannerReport | undefined> {
   let round: BannerRound | undefined;
   try {
     if (page.isClosed() || !/^https?:/u.test(page.url()) || !isolationSelector(page.context())) return undefined;
-    await assertActive?.();
+    await operation.assertActive?.();
     round = await readBanners(page);
     let load = loadFor(page, round.loader);
     // At most a second layer, then a reject: the loop ends within two presses.
@@ -840,7 +846,7 @@ export async function settleCookieBanners(
         case 'report':
           return { status: step.status };
         case 'reject': {
-          const pressed = await press(page, round, step.banner, step.control, assertActive);
+          const pressed = await press(page, round, step.banner, step.control, operation);
           load.after = pressed === 'refused' ? 'no_reject_option' : 'reject_failed';
           if (pressed !== 'pressed' || !(await closes(round, step.banner))) return { status: load.after };
           load.after = 'reappeared';
@@ -848,11 +854,11 @@ export async function settleCookieBanners(
         }
         case 'open': {
           load.opened = true;
-          if ((await press(page, round, step.banner, step.control, assertActive)) !== 'pressed')
+          if ((await press(page, round, step.banner, step.control, operation)) !== 'pressed')
             return { status: 'no_reject_option' };
           await round.close();
           round = undefined;
-          round = await awaitSecondLayer(page, assertActive);
+          round = await awaitSecondLayer(page, operation.assertActive);
           // A second layer that loaded a new page is that page's own, already opened.
           load = loadFor(page, round.loader);
           load.opened = true;

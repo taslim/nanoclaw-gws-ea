@@ -1,3 +1,6 @@
+import * as structuredLocators from './locators.js';
+import { locateStructured } from './locators.js';
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /**
  * Wake-on-change watches against native Chrome (KTD20): an unreviewed booking site whose slot list changes, checked
  * by the real scheduler and replay without the model. The signed-out context is the fixture's own page, since the
@@ -60,9 +63,9 @@ import './index.js';
 import { configureBrowserCancellation } from './cancel.js';
 import type { ChromeConnection } from './connection.js';
 import { BrowserStore } from './db.js';
-import type { BrowserAction } from './executor.js';
+import type { BrowserAction } from './actions.js';
 import { setBrowserAdmissionReady } from './group.js';
-import { prepareMerchantPage } from './merchant-signatures.js';
+import { prepareMerchantPage } from './merchant-read.js';
 import {
   WATCHED,
   openWebFixture,
@@ -76,10 +79,13 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { freeResyTable, resyFixture } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
-import { BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 import { watchSitePolicy } from './watch-policy.js';
-import type { WatchBounds, WatchRow } from './watches.js';
+import type { WatchBounds, WatchRow } from './watch-state.js';
+import { readWatchRegion } from './watch-runtime.js';
+import type { StructuredBrowserLocator } from './locators.js';
+import * as nativeControlFacts from './control-facts.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -207,7 +213,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     for (const [url, route] of Object.entries(watched.pages)) fixture.serve(url, route);
     page = await fixture.newPage();
     await prepareMerchantPage(page);
-    queue = new BrowserQueue(new BrowserStore(), {
+    queue = createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
       // The signed-out check page is the fixture's own (see the mock above); no host Chrome is reached.
       connection: async () => ({}) as ChromeConnection,
@@ -216,7 +222,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     });
     configureBrowserCancellation(queue);
     registerBrowserPurchaseDelivery(() => queue);
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     setBrowserAdmissionReady(true);
     // The fixture site's politeness floor and the principal's night would only slow these checks down.
@@ -338,6 +344,67 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
     expect(await watch()).toMatchObject({ status: 'armed' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+  });
+
+  it('returns current refs after a successful mark and makes refs stale when a region snapshot fails', async () => {
+    site.slots = ['1930'];
+    const marked = await setWatch();
+    expect(marked.observation).toBeDefined();
+    const seen = marked.observation as Awaited<ReturnType<typeof observePage>>;
+    const region = JSON.parse((await watch()).region_json!) as StructuredBrowserLocator;
+    const target = await locateStructured(page, region);
+    const snapshot = vi.spyOn(target, 'ariaSnapshot').mockRejectedValue(new Error('Snapshot failed'));
+    const locate = vi.spyOn(structuredLocators, 'locateStructured').mockResolvedValue(target);
+    try {
+      expect(await readWatchRegion(page, region)).toBeUndefined();
+      expect(await run([{ kind: 'click', ...refIn(seen, '7:30 PM') }])).toMatchObject({ reason: 'stale_ref' });
+    } finally {
+      snapshot.mockRestore();
+      locate.mockRestore();
+    }
+    const fresh = await observePage(page);
+    const result = await request('watch', {
+      ...BOUNDS,
+      recipe_id: (await watch()).check_recipe_id,
+      financial: FREE,
+      watch_id: marked.watch_id,
+      region: refIn(fresh, 'Available tables'),
+    });
+    expect(result.status).toBe('marked');
+    const current = result.observation as Awaited<ReturnType<typeof observePage>>;
+    expect(await run([{ kind: 'click', ...refIn(current, '7:30 PM') }])).toMatchObject({ reason: 'navigated' });
+    expect(page.url()).toBe(`${WATCHED.book}?slot=1930`);
+  });
+
+  it('redacts a newly changed secret field from a region read and permits the next watch check', async () => {
+    await setWatch();
+    // The page changed after its core observation, before the narrower region read.
+    await page.getByRole('region', { name: 'Available tables' }).evaluate((region) => {
+      const field = region.ownerDocument.createElement('input');
+      field.type = 'password';
+      field.value = 'new-region-secret-U4';
+      const echo = region.ownerDocument.createElement('p');
+      echo.textContent = field.value;
+      region.append(field, echo);
+    });
+    const marked = JSON.parse((await watch()).region_json!) as StructuredBrowserLocator;
+    const text = await readWatchRegion(page, marked);
+    expect(text).toContain('[redacted]');
+    expect(text).not.toContain('new-region-secret-U4');
+    const unavailable = vi
+      .spyOn(nativeControlFacts, 'readPageSecretValues')
+      .mockRejectedValueOnce(new nativeControlFacts.ControlFactsUnavailableError());
+    try {
+      await expect(readWatchRegion(page, marked)).rejects.toBeInstanceOf(
+        nativeControlFacts.ControlFactsUnavailableError,
+      );
+    } finally {
+      unavailable.mockRestore();
+    }
+    expect(await run([{ kind: 'navigate', url: WATCHED.tables }])).toMatchObject({ reason: 'navigated' });
+    await checkNow();
+    expect(await outcomes()).toEqual(['region_read']);
+    expect(await notices()).toEqual([]);
   });
 
   it('wakes the agent to mark the region again when a redesign drops it, and checks the new mark', async () => {
@@ -541,13 +608,13 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
       await prepareMerchantPage(checkPage);
       return checkPage;
     };
-    queue = new BrowserQueue(store, {
+    queue = createBrowserQueue(store, {
       pageForJob: async () => resy.page,
       connection: async () => ({}) as ChromeConnection,
       closeJob: async () => undefined,
       onDisconnected: () => () => undefined,
     });
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
   });
   afterEach(async () => {
     signedOut.open = undefined;

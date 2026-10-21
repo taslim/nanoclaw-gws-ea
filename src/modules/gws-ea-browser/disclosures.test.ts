@@ -19,7 +19,7 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { personalDataStop, type FieldFrames } from './disclosures.js';
-import type { BrowserAction } from './executor.js';
+import type { BrowserAction } from './actions.js';
 import { deliverAction, refusal } from './testing/delivery-answer.js';
 
 const MOBILE = '+1 415 555 0134';

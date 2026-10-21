@@ -1,3 +1,4 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** Native Chrome + real queue/authority/claims. Only calendar service and container wake are fixture boundaries. */
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,12 +27,14 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
-import { BrowserQueue } from './queue.js';
-import { observePage, pageMayShowSecret } from './observe.js';
+import { type BrowserQueue } from './queue.js';
+import { observePage } from './observe.js';
+import { loadRecipe } from './recipe-store.js';
+import { pageMayShowSecret } from './page-privacy.js';
 import { principalReachable, seedPrincipal } from './principal-fixture.js';
 import { freeResyTable, resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
-import type { WatchBounds } from './watches.js';
+import type { WatchBounds } from './watch-state.js';
 import type { Session } from '../../types.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 describe.skipIf(!chromePath)('native reservation through the common purchase executor', { timeout: 30_000 }, () => {
@@ -90,7 +93,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     fixture = await resyFixture(chromePath, fixtureState);
     await resyReservationSignature.preparePage?.(fixture.page);
     await load();
-    queue = new BrowserQueue(store, {
+    queue = createBrowserQueue(store, {
       pageForJob: async () => fixture.page,
       connection: async () => {
         throw new Error('No file transfer in reservation fixture');
@@ -100,7 +103,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       },
       onDisconnected: () => () => undefined,
     });
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     const bounds: WatchBounds = {
       site: 'resy.com',
       venue: { id: '25973', name: "L'Artusi" },
@@ -127,6 +130,44 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     fs.rmSync(root, { recursive: true, force: true });
     vi.useRealTimers();
   });
+  it('records a reviewed purchase control as non-read-only even when its generic facts look ordinary', async () => {
+    await fixture.page.locator('body').evaluate((body) => {
+      body.innerHTML =
+        '<h1>Reservation checkout</h1><button type="button" data-test-id="order_summary_page-button-book">Continue</button>';
+    });
+    const observation = await observePage(fixture.page);
+    const ref = /- button "Continue" \[ref=((?:f\d+)?e\d+)\]/u.exec(observation.snapshot)?.[1];
+    if (!ref) throw new Error('Missing native reviewed control');
+    await queue.accept(
+      'browser',
+      { actions: [{ kind: 'click', ref, generation: observation.generation }] },
+      session,
+      'reviewed-control',
+    );
+    await queue.idle();
+    const request = await queue.store.request(browserRequestId(session.id, 'reviewed-control'));
+    expect(JSON.parse(request?.answer_json ?? '{}')).toMatchObject({
+      data: { reason: 'purchase_control', recording: { status: 'complete', trace_indices: [0] } },
+    });
+    expect(fixture.submitted()).toBe(0);
+    const trace = await getDb().get<{ step_json: string }>(
+      'SELECT step_json FROM gws_ea_browser_action_trace WHERE job_id = ? AND action_index = 0',
+      jobId,
+    );
+    expect(JSON.parse(trace?.step_json ?? '{}')).toMatchObject({ readOnly: false });
+    await queue.accept(
+      'save_recipe',
+      { name: 'Reviewed reservation', first_action: 0, last_action: 0, parameters: [] },
+      session,
+      'save-reviewed-control',
+    );
+    await queue.idle();
+    const saved = await queue.store.request(browserRequestId(session.id, 'save-reviewed-control'));
+    const answer = JSON.parse(saved?.answer_json ?? '{}') as { data?: { recipe_id?: string; read_only?: boolean } };
+    expect(answer.data).toMatchObject({ status: 'saved', read_only: false });
+    expect(await loadRecipe(answer.data?.recipe_id ?? '', getDb())).toMatchObject({ readOnly: false });
+  });
+
   it('books an explicitly free reservation exactly once without an invented payment card approval', async () => {
     expect(await purchase('first')).toMatchObject({ status: 'booked', order_number: '90123' });
     expect(fixture.submitted()).toBe(1);

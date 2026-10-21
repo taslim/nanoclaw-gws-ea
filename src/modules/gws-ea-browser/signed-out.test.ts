@@ -74,6 +74,29 @@ describe.skipIf(!chromePath)('native signed-out watch pages', { timeout: 30_000 
     expect(connection.browser.contexts()).toEqual([connection.context]);
   });
 
+  it('cleans its exact context and target when target setup fails while retaining the persistent account', async () => {
+    const createContext = connection.browser.newContext.bind(connection.browser);
+    const creation = vi.spyOn(connection.browser, 'newContext').mockImplementationOnce(async (options) => {
+      const context = await createContext(options);
+      vi.spyOn(context, 'newCDPSession').mockRejectedValueOnce(new Error('Target lost during setup'));
+      return context;
+    });
+    const check = vi.fn(async () => undefined);
+    try {
+      await expect(withSignedOutBrowserPage(connection, check)).rejects.toThrow('Target lost during setup');
+      expect(check).not.toHaveBeenCalled();
+      expect(connection.browser.contexts()).toEqual([connection.context]);
+      expect(await connection.context.cookies('https://fixture.example')).toEqual([
+        expect.objectContaining({ name: 'assistant-session', value: 'persistent-only' }),
+      ]);
+      await withSignedOutBrowserPage(connection, async (page) => {
+        expect(page.isClosed()).toBe(false);
+      });
+    } finally {
+      creation.mockRestore();
+    }
+  });
+
   it('allows checks to overlap while keeping their browser contexts and pages distinct', async () => {
     const contexts = new Set<BrowserContext>();
     let entered = 0;

@@ -13,6 +13,11 @@ import { mkdir, readdir, readFile, readlink, rm, stat, symlink, writeFile } from
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
+import { SqliteDriver } from '../db/drivers/sqlite.js';
+import type { Session } from '../types.js';
+import { BrowserStore, browserRequestId } from '../modules/gws-ea-browser/db.js';
+import { browserQueueMigration, browserRecipesMigration } from '../modules/gws-ea-browser/migration.js';
+import { loadRecipe } from '../modules/gws-ea-browser/recipe-store.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -1019,12 +1024,99 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
+    const file = path.join(runtime.state_root, 'data', 'v2.db');
+    const db = new SqliteDriver(new Database(file));
+    await browserQueueMigration.up(db);
+    await browserRecipesMigration.up(db);
+    const at = new Date().toISOString();
+    const browserSession: Session = {
+      id: 'browser-session',
+      agent_group_id: 'ag-main',
+      messaging_group_id: null,
+      thread_id: 'system:a2a:ag-main:rollback-errand',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'idle',
+      last_active: null,
+      created_at: at,
+    };
+    const jobId = browserSession.thread_id!;
+    await db.run('INSERT INTO sessions VALUES (?,?,?,?,?,?)', browserSession.id, 'ag-main', null, jobId, 'active', at);
+    await db.run(
+      'INSERT INTO gws_ea_browser_jobs VALUES (?,?,?,?,0,?,?)',
+      jobId,
+      jobId,
+      browserSession.id,
+      'ag-main',
+      at,
+      at,
+    );
+    const store = new BrowserStore(db);
+    const job = (await store.getJob(jobId))!;
+    for (const requestId of ['completed-action', 'uncertain-press'])
+      await store.accept(
+        job,
+        browserSession,
+        requestId,
+        'browser',
+        { actions: [{ kind: 'click', ref: 'e1', generation: 1 }] },
+        90_000,
+      );
+    const savedSteps = [
+      {
+        action: { kind: 'observe' },
+        targets: [],
+        before: { url: 'https://fixture.example/' },
+        after: { url: 'https://fixture.example/' },
+        readOnly: true,
+      },
+    ];
+    await db.run(
+      "INSERT INTO gws_ea_browser_recipes VALUES (?,?,'Existing route',1,?,0,0,'[]',?,1,?)",
+      'saved-route',
+      'fixture.example',
+      jobId,
+      JSON.stringify(savedSteps),
+      at,
+    );
+    await db.close();
     const next = await nextRelease(host);
     const state = world(runtime);
     // The new release's Google Chat never receives, and its host serves one message before it is rolled back.
     state.onStart = (root) => {
       state.chatDown = readlinkSync(root) === releaseName(next.commit);
-      if (state.chatDown) void converse(runtime, 'm2');
+      if (!state.chatDown) return;
+      void converse(runtime, 'm2');
+      const live = new Database(file);
+      try {
+        // The release is serving before health runs. These rows must survive code-only recovery.
+        live.prepare('UPDATE gws_ea_browser_requests SET started_at=? WHERE job_id=?').run(at, jobId);
+        live
+          .prepare('UPDATE gws_ea_browser_requests SET commit_started_at=? WHERE request_id=?')
+          .run(at, 'uncertain-press');
+        live.prepare('UPDATE gws_ea_browser_requests SET answered_at=?,answer_json=? WHERE request_id=?').run(
+          at,
+          JSON.stringify({
+            id: 'completed-action',
+            ok: true,
+            data: { status: 'completed', recording: { status: 'unavailable', trace_indices: [0] } },
+          }),
+          'completed-action',
+        );
+        live.prepare('INSERT INTO gws_ea_browser_action_trace VALUES (?,0,?,?,?)').run(
+          jobId,
+          browserRequestId(browserSession.id, 'completed-action'),
+          JSON.stringify({
+            action: { kind: 'observe' },
+            targets: [],
+            readOnly: false,
+            saveError: 'Recording incomplete.',
+          }),
+          at,
+        );
+      } finally {
+        live.close();
+      }
     };
     const inode = await centralInode(runtime);
     const { run, err } = cli(host, state, next, runtime);
@@ -1039,6 +1131,38 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(await readRollbackPoint(host.paths, runtime.instance_id)).toBeUndefined();
+    const resumedDb = new SqliteDriver(new Database(file));
+    try {
+      const resumed = new BrowserStore(resumedDb);
+      const completed = await resumed.request(browserRequestId(browserSession.id, 'completed-action'));
+      expect(JSON.parse(completed?.answer_json ?? 'null')).toMatchObject({
+        ok: true,
+        data: { status: 'completed', recording: { status: 'unavailable' } },
+      });
+      const uncertain = await resumed.request(browserRequestId(browserSession.id, 'uncertain-press'));
+      expect(uncertain).toMatchObject({ started_at: at, commit_started_at: at, answered_at: null });
+      for (const requestId of ['completed-action', 'uncertain-press']) {
+        expect(await resumed.accept(job, browserSession, requestId, 'browser', {}, 90_000)).toBe(false);
+        expect(await resumed.start(browserRequestId(browserSession.id, requestId))).toBeUndefined();
+      }
+      expect(await loadRecipe('saved-route', resumedDb)).toMatchObject({
+        id: 'saved-route',
+        steps: savedSteps,
+        readOnly: true,
+      });
+      const incomplete = await resumedDb.get<{ step_json: string }>(
+        'SELECT step_json FROM gws_ea_browser_action_trace WHERE job_id=? AND action_index=0',
+        jobId,
+      );
+      expect(JSON.parse(incomplete?.step_json ?? 'null')).toEqual({
+        action: { kind: 'observe' },
+        targets: [],
+        readOnly: false,
+        saveError: 'Recording incomplete.',
+      });
+    } finally {
+      await resumedDb.close();
+    }
   });
 
   it('restores the snapshot it took when the new release migrated the database, keeping what it replaced', async () => {

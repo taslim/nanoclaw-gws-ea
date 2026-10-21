@@ -1,5 +1,5 @@
 import type { ElementHandle, Page } from 'playwright-core';
-import type { ReviewedMerchantFlow } from './commit-classifier.js';
+import type { ReviewedMerchantFlow } from './control-policy.js';
 import type { CheckoutBox } from './control-facts.js';
 import type { FinancialCommitment, FreeCommitFacts, PurchaseFacts, ReservationFacts } from './fingerprint.js';
 

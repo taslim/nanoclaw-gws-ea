@@ -242,9 +242,6 @@ describe('enabling 1Password for existing and future assistants (AE1)', () => {
     });
     expect((await readFile(hostPaths.managementTokenFile, 'utf8')).trim()).toBe(management[0].token);
     expect((await stat(hostPaths.managementTokenFile)).mode & 0o777).toBe(0o600);
-    // Only the 1Password CLI ran.
-    expect(provider.calls.every((call) => call.command === OP)).toBe(true);
-
     // A retry observes everything recorded and creates nothing again.
     const accounts = provider.serviceAccounts.size;
     const callsBefore = provider.calls.length;

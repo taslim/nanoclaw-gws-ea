@@ -30,9 +30,10 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
+
 import { observePage, type BrowserRef } from './observe.js';
 import { browserPaths, writePrivateFile } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { JobWindows } from './windows.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
@@ -121,6 +122,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     page = await windows.pageForJob(job.id);
     await page.goto('http://fixture.example/docs/archive');
     context = {
+      kind: 'request',
       job,
       request,
       session,
@@ -327,6 +329,41 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     } finally {
       await plain.close();
     }
+  });
+
+  it('reopens the owned Chrome profile without losing its persistent cookies', async () => {
+    await connection.context.addCookies([
+      {
+        name: 'owned-profile-cookie',
+        value: 'retained-after-restart',
+        domain: 'fixture.example',
+        path: '/',
+        expires: Math.floor(Date.now() / 1000) + 3600,
+      },
+    ]);
+    await windows.close();
+    await connection.close();
+    expect(connection.child.exitCode !== null || connection.child.signalCode !== null).toBe(true);
+    await prepareChromeProfile(paths);
+    const address = server.address();
+    if (!chromePath || !address || typeof address === 'string') throw new Error('Native fixture unavailable');
+    connection = await connectChromePipe(
+      spawnChrome({
+        chromePath,
+        paths,
+        proxyUrl: `http://127.0.0.1:${address.port}`,
+      }),
+      paths,
+    );
+    windows = new JobWindows(connection);
+    page = await windows.pageForJob(context.job.id);
+    await page.goto('http://fixture.example/docs/archive');
+    expect(await connection.context.cookies('http://fixture.example')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'owned-profile-cookie', value: 'retained-after-restart' }),
+      ]),
+    );
+    expect(await page.getByRole('heading', { name: 'Invoice archive' }).isVisible()).toBe(true);
   });
 
   it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {

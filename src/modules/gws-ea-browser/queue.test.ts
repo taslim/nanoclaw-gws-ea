@@ -1,4 +1,7 @@
+import { repairBrowserWatchChecks } from './scheduler.js';
 import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
+import type { Page } from 'playwright-core';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -20,15 +23,22 @@ import type { Session } from '../../types.js';
 import { forbidden } from '../../cli/delivery-action.js';
 import { guard } from '../../guard/index.js';
 import '../gws-ea-profile/index.js';
-import './index.js';
+import { browserActions, browserQueueFollowUps, recoverAndStartBrowserQueue } from './index.js';
+import type { BrowserActions } from './actions.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted, type BrowserJob } from './db.js';
-import { BrowserQueue, browserRequestGuard, registerBrowserQueuedAction } from './queue.js';
+import { BrowserQueue, browserRequestGuard } from './queue.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { recoverCredentialRequest } from './credential-operations.js';
+import * as signedOut from './signed-out.js';
+import * as recipes from './recipes.js';
+import { runBrowserWatchCheck } from './watch-runtime.js';
+import type { ChromeConnection } from './connection.js';
 
 let store: BrowserStore;
 let session: Session;
+let actions: BrowserActions;
 beforeEach(async () => {
+  actions = browserActions;
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());
   for (const id of ['main-q', 'browser-q', 'external-q'])
@@ -78,6 +88,10 @@ const runtime = {
     return () => undefined;
   },
 };
+function createQueue(runtimeArg: BrowserQueue['runtime']): BrowserQueue {
+  return new BrowserQueue(store, runtimeArg, actions, browserQueueFollowUps);
+}
+
 function responses(): unknown[] {
   const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
   try {
@@ -89,18 +103,73 @@ function responses(): unknown[] {
   }
 }
 
-it('preserves a sanitized native refusal before commit and uncertainty after a commit marker', async () => {
-  registerBrowserQueuedAction('queue_refusal_fixture', {
-    validate: (content) => ({ marked: content.marked === true }),
-    async execute(context, payload) {
-      if (payload.marked) await context.markCommitStarted();
-      throw forbidden('The bound authentication field is no longer safe.');
+it('persists observed HTTP response evidence with the exact request answer without network payloads', async () => {
+  const events = new EventEmitter();
+  const page = Object.assign(events, {
+    context: () => ({ browser: () => ({ version: () => '155.0.0.0' }) }),
+  }) as unknown as Page;
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        await context.page();
+        const networkRequest = {
+          url: () => 'https://fixture.example/private-secret-sentinel?token=secret-sentinel',
+          method: () => 'GET',
+          resourceType: () => 'document',
+          redirectedFrom: () => null,
+          headers: () => {
+            throw new Error('Diagnostics must never read headers');
+          },
+          postData: () => {
+            throw new Error('Diagnostics must never read bodies');
+          },
+        };
+        events.emit('request', networkRequest);
+        events.emit('response', { request: () => networkRequest, status: () => 403 });
+        events.emit('requestfinished', networkRequest);
+        return { status: 'completed' };
+      },
+    },
+  };
+  const queue = createQueue({ ...runtime, pageForJob: async () => page });
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', {}, session, 'diagnostic-response');
+  await queue.idle();
+  const request = await store.request(browserRequestId(session.id, 'diagnostic-response'));
+  const answer: unknown = JSON.parse(request?.answer_json ?? 'null');
+  expect(answer).toMatchObject({
+    data: {
+      diagnostics: {
+        schema_version: 1,
+        request_id: browserRequestId(session.id, 'diagnostic-response'),
+        runtime: { chrome: '155.0.0.0', playwright: '1.64.0' },
+        events: [
+          { source: 'http_response', site: 'fixture.example', method: 'GET', resource: 'document', status: 403 },
+        ],
+      },
     },
   });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
-  await queue.accept('queue_refusal_fixture', {}, session, 'refused-before');
-  await queue.accept('queue_refusal_fixture', { marked: true }, session, 'refused-after');
+  expect(JSON.stringify(answer)).not.toContain('secret-sentinel');
+  await queue.stop();
+});
+
+it('preserves a sanitized native refusal before commit and uncertainty after a commit marker', async () => {
+  actions = {
+    ...actions,
+    browser: {
+      validate: (content) => ({ marked: content.marked === true }),
+      async execute(context, payload) {
+        if (payload.marked) await context.markCommitStarted();
+        throw forbidden('The bound authentication field is no longer safe.');
+      },
+    },
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', {}, session, 'refused-before');
+  await queue.accept('browser', { marked: true }, session, 'refused-after');
   await queue.idle();
   expect(responses()).toEqual(
     expect.arrayContaining([
@@ -124,44 +193,98 @@ it('preserves a sanitized native refusal before commit and uncertainty after a c
   await queue.stop();
 });
 
+it('returns an internal TypeError as a sanitized native error frame while preserving marked uncertainty', async () => {
+  actions = {
+    ...actions,
+    browser: {
+      validate: (content) => ({ marked: content.marked === true }),
+      async execute(context, payload) {
+        if (payload.marked) await context.markCommitStarted();
+        throw new TypeError('private-runtime-sentinel https://example.com/?token=private');
+      },
+    },
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  try {
+    await queue.accept('browser', {}, session, 'type-error');
+    await queue.accept('browser', { marked: true }, session, 'type-error-marked');
+    await queue.idle();
+    expect(responses()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: 'type-error',
+          frame: {
+            id: 'type-error',
+            ok: false,
+            error: {
+              code: 'handler-error',
+              message: 'The browser action failed unexpectedly.',
+              metadata: {
+                diagnostics: expect.objectContaining({
+                  request_id: browserRequestId(session.id, 'type-error'),
+                  events: [expect.objectContaining({ source: 'runtime_error', category: 'execution' })],
+                }),
+              },
+            },
+          },
+        }),
+        expect.objectContaining({
+          requestId: 'type-error-marked',
+          frame: expect.objectContaining({
+            ok: true,
+            data: expect.objectContaining({ reason: 'unconfirmed', repeat_safe: false }),
+          }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(responses())).not.toContain('private-runtime-sentinel');
+  } finally {
+    await queue.stop();
+  }
+});
+
 it('blocks the whole site before delivering an uncertain marked purchase answer', async () => {
-  registerBrowserQueuedAction('queue_marked_purchase_fixture', {
-    validate: () => ({}),
-    async execute(context) {
-      await context.markCommitStarted();
-      const at = new Date().toISOString();
-      await store.db.run(
-        `INSERT INTO gws_ea_browser_authorities
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        await context.markCommitStarted();
+        const at = new Date().toISOString();
+        await store.db.run(
+          `INSERT INTO gws_ea_browser_authorities
          (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at,commit_request_id)
          VALUES(?,?,'checkout','committing',?,'{}','[]',?,?,?,?)`,
-        'marked-authority',
-        context.job.id,
-        JSON.stringify({ site: 'amazon.com' }),
-        'marked-attempt',
-        new Date(Date.now() + 60_000).toISOString(),
-        at,
-        context.request.id,
-      );
-      await store.db.run(
-        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at)
+          'marked-authority',
+          context.job.id,
+          JSON.stringify({ site: 'amazon.com' }),
+          'marked-attempt',
+          new Date(Date.now() + 60_000).toISOString(),
+          at,
+          context.request.id,
+        );
+        await store.db.run(
+          `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at)
          VALUES(?,?,?,'amazon.com',?,?)`,
-        'marked-attempt',
-        'marked-authority',
-        context.job.id,
-        JSON.stringify({ site: 'amazon.com' }),
-        at,
-      );
-      throw new Error('The browser disconnected after the durable commit marker');
+          'marked-attempt',
+          'marked-authority',
+          context.job.id,
+          JSON.stringify({ site: 'amazon.com' }),
+          at,
+        );
+        throw new Error('The browser disconnected after the durable commit marker');
+      },
+      async deliverAnswer() {
+        expect(
+          await store.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', 'amazon.com'),
+        ).toEqual({ site: 'amazon.com' });
+      },
     },
-    async deliverAnswer() {
-      expect(
-        await store.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', 'amazon.com'),
-      ).toEqual({ site: 'amazon.com' });
-    },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
-  await queue.accept('queue_marked_purchase_fixture', {}, session, 'marked-purchase');
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', {}, session, 'marked-purchase');
   await queue.idle();
   expect(await store.db.get('SELECT site FROM gws_ea_browser_purchase_blocks WHERE site = ?', 'amazon.com')).toEqual({
     site: 'amazon.com',
@@ -176,22 +299,25 @@ it('retries a delegated terminal answer from its durable frame after startup int
   let unavailable = true;
   const delivered: unknown[] = [];
   let executions = 0;
-  registerBrowserQueuedAction('queue_terminal_answer_fixture', {
-    validate: () => ({}),
-    async execute() {
-      executions++;
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        executions++;
+        return { status: 'completed' };
+      },
+      async deliverAnswer(_request, frame) {
+        delivered.push(frame);
+        if (unavailable) throw new Error('The main mailbox is unavailable');
+      },
     },
-    async deliverAnswer(_request, frame) {
-      delivered.push(frame);
-      if (unavailable) throw new Error('The main mailbox is unavailable');
-    },
-  });
+  };
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Expected browser job');
-  await store.accept(job, session, 'terminal-recovery', 'queue_terminal_answer_fixture', {}, 90_000);
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
+  await store.accept(job, session, 'terminal-recovery', 'browser', {}, 90_000);
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
   const id = browserRequestId(session.id, 'terminal-recovery');
   const first = await store.request(id);
   expect(first).toMatchObject({ answered_at: expect.any(String), delivered_at: null });
@@ -220,9 +346,9 @@ it('wakes an interrupted internal purchase after restart without consuming or pr
     new Date(Date.now() + 60_000).toISOString(),
     at,
   );
-  const queue = new BrowserQueue(store, runtime);
+  const queue = createQueue(runtime);
   await queue.accept('browser_purchase_commit', { authority_id: 'restart-live' }, session, 'internal-restart');
-  await queue.start();
+  await recoverAndStartBrowserQueue(queue);
   await queue.idle();
   const notes = (): Array<{ kind: string; trigger: number; content: string }> => {
     const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
@@ -254,7 +380,7 @@ it('wakes an interrupted internal purchase after restart without consuming or pr
 });
 
 it('refuses main, external-email, a foreign thread and cancelled browser jobs', async () => {
-  const queue = new BrowserQueue(store, runtime);
+  const queue = createQueue(runtime);
   for (const id of ['main-q', 'external-q']) {
     const other = (await resolveSystemSession(id, 'system:a2a:main-q:other')).session;
     await expect(queue.accept('browser', {}, other, 'r1')).rejects.toThrow('live browser job');
@@ -272,24 +398,27 @@ it('accepts without waiting, never executes replays, and persists a timed answer
   const waiting = new Promise<void>((resolve) => {
     release = resolve;
   });
-  registerBrowserQueuedAction('queue_fixture', {
-    validate: () => ({}),
-    async execute() {
-      runs++;
-      await waiting;
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        runs++;
+        await waiting;
+        return { status: 'completed' };
+      },
     },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
-  await queue.accept('queue_fixture', {}, session, 'r-running');
-  await queue.accept('queue_fixture', {}, session, 'r-running');
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', {}, session, 'r-running');
+  await queue.accept('browser', {}, session, 'r-running');
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(runs).toBe(1);
   expect(responses()).toEqual([]);
   release();
   await queue.idle();
-  await queue.accept('queue_fixture', {}, session, 'r-running');
+  await queue.accept('browser', {}, session, 'r-running');
   await queue.idle();
   expect(runs).toBe(1);
   const request = await store.request(browserRequestId(session.id, 'r-running'));
@@ -309,11 +438,11 @@ it('answers pre-crash requests interrupted or unknown once before new workers st
   await store.accept(job, session, 'r-interrupted', 'browser', {}, 90_000);
   await store.accept(job, session, 'r-unknown', 'browser', {}, 90_000);
   await markBrowserRequestCommitStarted(getDb(), browserRequestId(session.id, 'r-unknown'));
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
   await queue.stop();
-  const restarted = new BrowserQueue(store, runtime);
-  await restarted.start();
+  const restarted = createQueue(runtime);
+  await recoverAndStartBrowserQueue(restarted);
   expect(responses()).toHaveLength(2);
   expect(responses()).toEqual(
     expect.arrayContaining([
@@ -338,18 +467,21 @@ it('expires a request waiting behind a batch without executing it', async () => 
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
-  registerBrowserQueuedAction('queue_deadline_fixture', {
-    validate: () => ({}),
-    async execute() {
-      runs++;
-      await held;
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        runs++;
+        await held;
+        return { status: 'completed' };
+      },
     },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
-  await queue.accept('queue_deadline_fixture', {}, session, 'long');
-  await queue.accept('queue_deadline_fixture', { budget_ms: 1 }, session, 'expired');
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', {}, session, 'long');
+  await queue.accept('browser', { budget_ms: 1 }, session, 'expired');
   await new Promise((resolve) => setTimeout(resolve, 10));
   release();
   await queue.idle();
@@ -365,28 +497,111 @@ it('expires a request waiting behind a batch without executing it', async () => 
   await queue.stop();
 });
 
+it('clears a failed context deadline before recovery gives the job a replacement page', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  let open = true;
+  const page = Object.assign(new EventEmitter(), {
+    context: () => ({ browser: () => ({ version: () => '155.0.0.0' }) }),
+    isClosed: () => !open,
+    close: async () => {
+      open = false;
+    },
+  }) as unknown as Page;
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        await context.page();
+        return { status: 'completed' };
+      },
+    },
+  };
+  const queue = createQueue({ ...runtime, pageForJob: async () => page, closeJob: async () => page.close() });
+  let entered!: () => void;
+  const loading = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let rejectContext!: (error: Error) => void;
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectContext = reject;
+  });
+  try {
+    await recoverAndStartBrowserQueue(queue);
+    const getJob = store.getJob.bind(store);
+    let failed = false;
+    const lookup = vi.spyOn(store, 'getJob').mockImplementation(async (jobId) => {
+      const first = await store.request(browserRequestId(session.id, 'failed-context'));
+      if (first?.started_at && !failed) {
+        failed = true;
+        entered();
+        return failure;
+      }
+      return getJob(jobId);
+    });
+    await queue.accept('browser', { budget_ms: 100 }, session, 'failed-context');
+    await loading;
+    const idle = queue.idle();
+    rejectContext(new Error('Transient context read failure'));
+    await expect(idle).rejects.toThrow('Transient context read failure');
+    lookup.mockRestore();
+    expect(await store.request(browserRequestId(session.id, 'failed-context'))).toMatchObject({
+      started_at: expect.any(String),
+      answered_at: null,
+    });
+    await queue.accept('browser', { budget_ms: 1_000 }, session, 'replacement-page');
+    await queue.idle();
+    expect(responses()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: 'failed-context',
+          frame: expect.objectContaining({
+            data: expect.objectContaining({ reason: 'interrupted' }),
+          }),
+        }),
+        expect.objectContaining({
+          requestId: 'replacement-page',
+          frame: expect.objectContaining({
+            data: expect.objectContaining({ status: 'completed' }),
+          }),
+        }),
+      ]),
+    );
+    await vi.advanceTimersByTimeAsync(101);
+    expect(page.isClosed()).toBe(false);
+    expect(responses()).toHaveLength(2);
+  } finally {
+    await queue.stop();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  }
+});
+
 it('does not strand acceptance at the final empty-read boundary', async () => {
   let runs = 0;
-  registerBrowserQueuedAction('queue_boundary_fixture', {
-    validate: () => ({}),
-    async execute() {
-      runs++;
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        runs++;
+        return { status: 'completed' };
+      },
     },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
   const pending = store.nextPending.bind(store);
   let inserted = false;
   vi.spyOn(store, 'nextPending').mockImplementation(async (jobId) => {
     const result = await pending(jobId);
     if (jobId && !result && !inserted) {
       inserted = true;
-      await queue.accept('queue_boundary_fixture', {}, session, 'boundary-second');
+      await queue.accept('browser', {}, session, 'boundary-second');
     }
     return result;
   });
-  await queue.accept('queue_boundary_fixture', {}, session, 'boundary-first');
+  await queue.accept('browser', {}, session, 'boundary-first');
   await queue.idle();
   expect(runs).toBe(2);
   expect(responses()).toHaveLength(2);
@@ -399,21 +614,24 @@ it('keeps a timed-out job locked until its late operation settles and forbids an
     release = resolve;
   });
   let lateRefused = false;
-  registerBrowserQueuedAction('queue_late_fixture', {
-    validate: () => ({}),
-    async execute(context) {
-      await held;
-      try {
-        await context.page();
-      } catch (_error) {
-        lateRefused = true;
-      }
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        await held;
+        try {
+          await context.page();
+        } catch (_error) {
+          lateRefused = true;
+        }
+        return { status: 'completed' };
+      },
     },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
-  await queue.accept('queue_late_fixture', { budget_ms: 5 }, session, 'late-1');
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', { budget_ms: 5 }, session, 'late-1');
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(responses()).toHaveLength(1);
   expect(responses()).toEqual([
@@ -428,21 +646,195 @@ it('keeps a timed-out job locked until its late operation settles and forbids an
   await queue.stop();
 });
 
-it('recovers orphaned started requests without executing them or spinning the drain', async () => {
-  let runs = 0;
-  registerBrowserQueuedAction('queue_orphan_fixture', {
-    validate: () => ({}),
-    async execute() {
-      runs++;
-      return { status: 'completed' };
+it('closes a page acquired after timeout before another owner can take the job', async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const close = vi.fn(async () => undefined);
+  const page = { close } as unknown as Page;
+  let refused = false;
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        try {
+          await context.page();
+        } catch {
+          refused = true;
+        }
+        return { status: 'completed' };
+      },
+    },
+  };
+  const queue = createQueue({
+    ...runtime,
+    pageForJob: async () => {
+      await held;
+      return page;
     },
   });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
+  await recoverAndStartBrowserQueue(queue);
+  await queue.accept('browser', { budget_ms: 10 }, session, 'late-page');
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Expected native job');
+  expect(await queue.tryWithJobLocks([job.id], async () => 'replacement')).toEqual({ acquired: false });
+  release();
+  await queue.idle();
+  expect(refused).toBe(true);
+  expect(close).toHaveBeenCalledOnce();
+  expect(await queue.tryWithJobLocks([job.id], async () => 'replacement')).toEqual({
+    acquired: true,
+    value: 'replacement',
+  });
+  await queue.stop();
+});
+
+it('bounds a real watch check with its own provenance and keeps late work quarantined', async () => {
+  const file = `${root}/browser/policy.json`;
+  fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+  const queue = createQueue({ ...runtime, connection: async () => ({}) as ChromeConnection });
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Expected native job');
+  const at = new Date().toISOString();
+  await store.db.run(
+    `INSERT INTO gws_ea_browser_watch_checks(id,site,check_recipe_id,check_recipe_version,parameter_hash,trigger,scheduled_at,started_at)
+     VALUES('native-check','resy.com','recipe',1,'parameters','timer',?,?)`,
+    at,
+    at,
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered!: () => void;
+  const executing = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const close = vi.fn(async () => undefined);
+  const page = { close } as unknown as Page;
+  const signedOutPage = vi
+    .spyOn(signedOut, 'withSignedOutBrowserPage')
+    .mockImplementation(async (_connection, run) => run(page));
+  let lateRefused = false;
+  const replay = vi.spyOn(recipes, 'executeRecipe').mockImplementation(async (context) => {
+    expect(context).toMatchObject({ kind: 'watch_check', check: { id: 'native-check' } });
+    expect(context).not.toHaveProperty('request');
+    entered();
+    await held;
+    try {
+      await context.page();
+    } catch {
+      lateRefused = true;
+    }
+    return { status: 'checkpoint_failed' };
+  });
+  vi.useFakeTimers();
+  const running = runBrowserWatchCheck(
+    queue,
+    {
+      id: 'native-check',
+      jobId: job.id,
+      site: 'resy.com',
+      recipeId: 'recipe',
+      parameters: {},
+      venueId: 'venue',
+      partySize: 2,
+    },
+    new AbortController().signal,
+  );
+  try {
+    await executing;
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(close).toHaveBeenCalledOnce();
+    expect(await queue.tryWithJobLocks([job.id], async () => 'replacement')).toEqual({ acquired: false });
+    expect(await store.db.all('SELECT id FROM gws_ea_browser_requests')).toEqual([]);
+    expect(await store.db.get('SELECT id,finished_at FROM gws_ea_browser_watch_checks')).toEqual({
+      id: 'native-check',
+      finished_at: null,
+    });
+    release();
+    expect(await running).toEqual({ status: 'failed' });
+    expect(lateRefused).toBe(true);
+    expect(await queue.tryWithJobLocks([job.id], async () => 'replacement')).toEqual({
+      acquired: true,
+      value: 'replacement',
+    });
+  } finally {
+    release();
+    await running;
+    vi.useRealTimers();
+    replay.mockRestore();
+    signedOutPage.mockRestore();
+  }
+});
+
+it('settles another job when one feature cannot recover its interrupted request', async () => {
+  let entered!: () => void;
+  const bothRunning = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let executing = 0;
+  actions = {
+    ...actions,
+    browser: {
+      validate: (content) => ({ fail: content.fail === true }),
+      async execute(context) {
+        if (++executing === 2) entered();
+        await new Promise<void>((resolve) => context.signal.addEventListener('abort', () => resolve(), { once: true }));
+        return { status: 'completed' };
+      },
+      async recover(request) {
+        if ((JSON.parse(request.payload_json) as { fail: boolean }).fail) throw new Error('Feature recovery failed');
+        return undefined;
+      },
+    },
+  };
+  const closed: string[] = [];
+  const queue = createQueue({
+    ...runtime,
+    closeJob: async (jobId) => {
+      closed.push(jobId);
+    },
+  });
+  await recoverAndStartBrowserQueue(queue);
+  const other = (await resolveSystemSession('browser-q', 'system:a2a:main-q:unrelated-stop')).session;
+  await queue.accept('browser', { fail: true }, session, 'failed-feature');
+  await queue.accept('browser', {}, other, 'unrelated-stop');
+  await bothRunning;
+  await expect(queue.interruptRunning()).rejects.toThrow('Feature recovery failed');
+  await queue.idle().catch(() => undefined);
+  expect(await store.request(browserRequestId(other.id, 'unrelated-stop'))).toMatchObject({
+    answered_at: expect.any(String),
+    delivered_at: expect.any(String),
+  });
+  expect(closed).toEqual(expect.arrayContaining([session.thread_id, other.thread_id]));
+  expect(closed).toHaveLength(2);
+  await queue.stop();
+});
+
+it('recovers orphaned started requests without executing them or spinning the drain', async () => {
+  let runs = 0;
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        runs++;
+        return { status: 'completed' };
+      },
+    },
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Expected browser job');
   for (const id of ['orphan-before', 'orphan-marked']) {
-    await store.accept(job, session, id, 'queue_orphan_fixture', {}, 90_000);
+    await store.accept(job, session, id, 'browser', {}, 90_000);
     await store.start(browserRequestId(session.id, id));
   }
   await markBrowserRequestCommitStarted(store.db, browserRequestId(session.id, 'orphan-marked'));
@@ -477,15 +869,18 @@ it('recovers orphaned started requests without executing them or spinning the dr
 
 it('defers a failed durable answer until the periodic retry instead of immediately spinning', async () => {
   let runs = 0;
-  registerBrowserQueuedAction('queue_disk_fixture', {
-    validate: () => ({}),
-    async execute() {
-      runs++;
-      return { status: 'completed' };
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute() {
+        runs++;
+        return { status: 'completed' };
+      },
     },
-  });
-  const queue = new BrowserQueue(store, runtime);
-  await queue.start();
+  };
+  const queue = createQueue(runtime);
+  await recoverAndStartBrowserQueue(queue);
   const pending = store.nextPending.bind(store);
   let reads = 0;
   const pendingSpy = vi.spyOn(store, 'nextPending').mockImplementation(async (jobId) => {
@@ -493,7 +888,7 @@ it('defers a failed durable answer until the periodic retry instead of immediate
     return pending(jobId);
   });
   const answerSpy = vi.spyOn(store, 'answer').mockRejectedValue(new Error('Disk full'));
-  await queue.accept('queue_disk_fixture', {}, session, 'disk-failure');
+  await queue.accept('browser', {}, session, 'disk-failure');
   await queue.idle().catch(() => undefined);
   await new Promise((resolve) => setTimeout(resolve, 5));
   expect(reads).toBeLessThanOrEqual(2);
@@ -514,7 +909,7 @@ it('defers a failed durable answer until the periodic retry instead of immediate
 });
 
 it('does not queue a signed-out check behind an active errand and acquires its job set atomically', async () => {
-  const queue = new BrowserQueue(store, runtime);
+  const queue = createQueue(runtime);
   let release!: () => void;
   const held = queue.withJobLock(
     'checkout-owner',
@@ -534,7 +929,7 @@ it('does not queue a signed-out check behind an active errand and acquires its j
 });
 
 it('refuses ordinary site contention before creating a signed-out Chrome context', async () => {
-  const queue = new BrowserQueue(store, runtime);
+  const queue = createQueue(runtime);
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Missing native job');
   const ownerSession = (await resolveSystemSession('browser-q', 'system:a2a:main-q:checkout')).session;
@@ -564,7 +959,7 @@ it('refuses ordinary site contention before creating a signed-out Chrome context
 });
 
 it('keeps a pending checkout exclusive while its owning job is executing', async () => {
-  const queue = new BrowserQueue(store, runtime);
+  const queue = createQueue(runtime);
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Missing native job');
   const ownerSession = (await resolveSystemSession('browser-q', 'system:a2a:main-q:checkout')).session;
@@ -668,8 +1063,19 @@ describe('an authorized credential operation cut off after disclosure', () => {
     // The crash came during the first input callback: the attempt was recorded exposed, then nothing answered.
     await attempt(job, 'exposed', new Date(Date.now() + 1_000).toISOString());
 
-    const queue = new BrowserQueue(store, runtime);
-    await queue.start();
+    const queue = createQueue(runtime);
+    const run = store.db.run.bind(store.db);
+    const unavailableChecks = vi.spyOn(store.db, 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes('UPDATE gws_ea_browser_watch_checks')) throw new Error('Scheduled checks unavailable');
+      return run(sql, ...parameters);
+    });
+    try {
+      await recoverAndStartBrowserQueue(queue);
+      await expect(repairBrowserWatchChecks(queue)).rejects.toThrow('Scheduled checks unavailable');
+      expect(unavailableChecks).toHaveBeenCalled();
+    } finally {
+      unavailableChecks.mockRestore();
+    }
     expect(answer('credential-crash')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
     await noPurchaseRecords();
@@ -679,8 +1085,8 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await queue.idle();
     expect(answer('credential-retry')).toEqual(expect.objectContaining({ status: 'outcome_unknown' }));
     await queue.stop();
-    const restarted = new BrowserQueue(store, runtime);
-    await restarted.start();
+    const restarted = createQueue(runtime);
+    await recoverAndStartBrowserQueue(restarted);
     expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
     await noPurchaseRecords();
 
@@ -702,25 +1108,28 @@ describe('an authorized credential operation cut off after disclosure', () => {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    registerBrowserQueuedAction('credential_timeout_fixture', {
-      validate: (content) => ({ authority: content.authority }),
-      async execute() {
-        await store.db.run(
-          "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
-          new Date().toISOString(),
-          AUTHORITY,
-        );
-        await held;
-        return { status: 'account_created', vault: 'saved' };
+    actions = {
+      ...actions,
+      browser: {
+        validate: (content) => ({ authority: content.authority }),
+        async execute() {
+          await store.db.run(
+            "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
+            new Date().toISOString(),
+            AUTHORITY,
+          );
+          await held;
+          return { status: 'account_created', vault: 'saved' };
+        },
+        recover: recoverCredentialRequest,
       },
-      recover: recoverCredentialRequest,
-    });
+    };
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
     await attempt(job, 'saved', null);
-    const queue = new BrowserQueue(store, runtime);
-    await queue.start();
-    await queue.accept('credential_timeout_fixture', { authority: AUTHORITY, budget_ms: 50 }, session, 'timed-out');
+    const queue = createQueue(runtime);
+    await recoverAndStartBrowserQueue(queue);
+    await queue.accept('browser', { authority: AUTHORITY, budget_ms: 50 }, session, 'timed-out');
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(answer('timed-out')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown' });
@@ -735,32 +1144,35 @@ describe('an authorized credential operation cut off after disclosure', () => {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    registerBrowserQueuedAction('credential_late_settle_fixture', {
-      validate: (content) => ({ authority: content.authority }),
-      async execute() {
-        await store.db.run(
-          "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
-          new Date().toISOString(),
-          AUTHORITY,
-        );
-        await held;
-        return { status: 'account_created', vault: 'saved' };
+    actions = {
+      ...actions,
+      browser: {
+        validate: (content) => ({ authority: content.authority }),
+        async execute() {
+          await store.db.run(
+            "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
+            new Date().toISOString(),
+            AUTHORITY,
+          );
+          await held;
+          return { status: 'account_created', vault: 'saved' };
+        },
+        recover: recoverCredentialRequest,
       },
-      recover: recoverCredentialRequest,
-    });
+    };
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
     await attempt(job, 'saved', null);
     // Closing the timed-out page ends the cut-off operation, which settles before the answer is recorded.
-    const queue = new BrowserQueue(store, {
+    const queue = createQueue({
       ...runtime,
       async closeJob() {
         release();
         await new Promise((resolve) => setTimeout(resolve, 0));
       },
     });
-    await queue.start();
-    await queue.accept('credential_late_settle_fixture', { authority: AUTHORITY, budget_ms: 20 }, session, 'late');
+    await recoverAndStartBrowserQueue(queue);
+    await queue.accept('browser', { authority: AUTHORITY, budget_ms: 20 }, session, 'late');
     await queue.idle();
     expect(answer('late')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown' });
@@ -774,8 +1186,8 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await attempt(job, 'awaiting_verification', new Date(Date.now() - 30_000).toISOString());
     await store.accept(job, session, 'later-step', 'credential_form', form, 90_000);
     await store.start(browserRequestId(session.id, 'later-step'));
-    const queue = new BrowserQueue(store, runtime);
-    await queue.start();
+    const queue = createQueue(runtime);
+    await recoverAndStartBrowserQueue(queue);
     expect(answer('later-step')).toMatchObject({ status: 'stopped', reason: 'interrupted' });
     expect(await read()).toMatchObject({ phase: 'awaiting_verification' });
     await queue.stop();

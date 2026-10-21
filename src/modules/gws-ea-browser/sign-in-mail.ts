@@ -1,3 +1,4 @@
+import { classifyNavigationUrl } from './control-policy.js';
 import { createHash } from 'node:crypto';
 import type { Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
@@ -35,7 +36,6 @@ import { browserDelegateGuard } from './cancel.js';
 import type { BrowserJob, BrowserRequest } from './db.js';
 import {
   activateControl,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
   withBrowserJobNavigation,
@@ -50,16 +50,15 @@ import {
 } from './fill.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import {
-  bindPageSecretDocuments,
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerPageSecret,
-  releasePageSecret,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { bindPageSecretDocuments, registerPageSecret, releasePageSecret } from './page-privacy.js';
+import { type BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { signInAddress } from './web-address.js';
 
 interface SignInPayload extends Record<string, unknown> {
@@ -575,7 +574,12 @@ export async function executeSignInCode(
             throw forbidden('This sign-in flow requires native submission.');
           },
           undefined,
-          { kind: 'submit', assertActive: context.assertActive },
+          {
+            kind: 'submit',
+            scope: { jobId: context.job.id, db: context.store.db },
+            assertActive: context.assertActive,
+            remaining: context.remaining,
+          },
         );
       }
       await context.assertActive();
@@ -764,15 +768,6 @@ export function registerSignInMailDelivery(queue: () => BrowserQueue): void {
   );
 }
 
-/** Main can name the host-recorded site without ever reading the waiting field or a credential. */
-export async function readPendingSignInSite(
-  jobId: string,
-): Promise<{ site: string; origin: string; expires_at: string } | undefined> {
-  if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return undefined;
-  const claim = await waitingSignInClaim(jobId, 'principal');
-  return claim ? { site: claim.domain, origin: claim.origin, expires_at: claim.expires_at } : undefined;
-}
-
 /** Native queue delivery owns this side answer for success, pre-start expiry, interruption and restart alike. */
 async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
   const payload = validateRelayPayload(JSON.parse(request.payload_json) as Record<string, unknown>);
@@ -835,9 +830,9 @@ export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
   await cleanupSignInClaims();
 }
 
-registerBrowserQueuedAction('sign_in_code', { validate: validateSignInCode, execute: executeSignInCode });
-registerBrowserQueuedAction('browser_relay_sign_in', {
+export const signInCodeAction: BrowserQueuedAction = { validate: validateSignInCode, execute: executeSignInCode };
+export const relaySignInAction: BrowserQueuedAction = {
   validate: validateRelayPayload,
   execute: executeRelayCode,
   deliverAnswer: deliverRelayAnswer,
-});
+};

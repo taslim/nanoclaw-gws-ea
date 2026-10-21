@@ -51,24 +51,8 @@ async function tunnel(port: number, target: string): Promise<string> {
 }
 
 describe('public-only browser proxy', () => {
-  const forbidden = [
-    '127.0.0.1',
-    '10.1.2.3',
-    '172.18.2.3',
-    '192.168.1.2',
-    '169.254.169.254',
-    '100.64.0.1',
-    '192.168.65.254',
-    '[::1]',
-    '[::ffff:127.0.0.1]',
-    '[fd00::1]',
-    '[fe80::1]',
-    '[::192.168.1.2]',
-    '[2002:0808:0808::1]',
-    '[2001:0000::1]',
-    '2130706433',
-  ];
-  it.each(forbidden)('refuses literal %s in CONNECT and absolute HTTP without DNS', async (host) => {
+  const literals = ['127.0.0.1', '[::1]', '2130706433', '8.8.8.8', '[2001:4860:4860::8888]'];
+  it.each(literals)('refuses literal %s in CONNECT and absolute HTTP without DNS', async (host) => {
     const lookup = dnsBoundary.lookup;
     const running = await proxy();
     expect(await tunnel(running.port, `${host}:443`)).toMatch(/^HTTP\/1\.1 403/);

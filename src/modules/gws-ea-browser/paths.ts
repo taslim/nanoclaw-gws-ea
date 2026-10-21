@@ -39,16 +39,20 @@ export async function ensurePrivateDirectory(directory: string): Promise<void> {
   if ((stat.mode & 0o7777) !== 0o700) await chmod(directory, 0o700);
 }
 
-async function makeTreePrivate(directory: string, singletonLinks = false): Promise<void> {
+async function makeTreePrivate(directory: string, chromeRootLinks = false): Promise<void> {
   await ensurePrivateDirectory(directory);
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const file = path.join(directory, entry.name);
     const stat = await lstat(file);
     assertOwner(stat);
     if (stat.isSymbolicLink()) {
-      // Chromium's process singleton uses these three symlinks in its own
-      // root. They are not traversed, copied, or made accessible to agents.
-      if (singletonLinks && ['SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(entry.name)) continue;
+      // Chrome owns process-singleton links and a version sentinel in its profile root (Chrome 155:
+      // RunningChromeVersion -> 155.0.8059.85:1). None is traversed, copied, or exposed to agents.
+      if (
+        chromeRootLinks &&
+        ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'RunningChromeVersion'].includes(entry.name)
+      )
+        continue;
       throw new Error('Browser private tree contains a symlink');
     }
     if (stat.isDirectory()) await makeTreePrivate(file);

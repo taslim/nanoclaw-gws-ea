@@ -12,6 +12,7 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'stale_ref',
   'not_actionable',
   'timeout',
+  'navigation_failed',
   'navigated',
   'purchase_control',
   'speaks_as_principal',

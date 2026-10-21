@@ -11,8 +11,8 @@ import { isErrno } from '../../community-portal/errors.js';
 import { sessionDir } from '../../session-manager.js';
 import { withBrowserDownload } from './connection.js';
 import { ensurePrivateDirectory } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
-import { redactPageText } from './observe.js';
+import type { BrowserExecutionContext } from './actions.js';
+import { redactPageText } from './page-privacy.js';
 
 const readAt = promisify(fs.read);
 const fstat = promisify(fs.fstat);

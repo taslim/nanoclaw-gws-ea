@@ -19,14 +19,11 @@ import {
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerPageSecret,
-  bindPageSecretDocuments,
-  releasePageSecret,
-  registerBrowserSiteInfoProvider,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { registerPageSecret, bindPageSecretDocuments, releasePageSecret } from './page-privacy.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -223,7 +220,12 @@ export async function fillBoundBrowserSecret(
         throw forbidden('This sign-in flow requires native form submission.');
       },
       undefined,
-      { kind: 'submit', assertActive: context.assertActive },
+      {
+        kind: 'submit',
+        scope: { jobId: context.job.id, db: context.store.db },
+        assertActive: context.assertActive,
+        remaining: context.remaining,
+      },
     );
     await context.assertActive();
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
@@ -338,16 +340,12 @@ export async function executeFillSecret(
   });
 }
 
-registerBrowserQueuedAction('fill_secret', { validate: validateFillSecret, execute: executeFillSecret });
-registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
+export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
+export async function readVaultSiteInfo(
+  origins: readonly string[],
+  assertActive: () => Promise<void>,
+): Promise<Record<string, unknown>> {
   try {
-    const origins = new Set([
-      origin,
-      ...page.frames().flatMap((frame) => {
-        const url = httpsOrigin(frame.url());
-        return url ? [url.origin] : [];
-      }),
-    ]);
     const items = new Map<string, { item_handle: string; title: string }>();
     for (const frameOrigin of origins)
       for (const item of await browserVault.itemsForOrigin(frameOrigin, assertActive))
@@ -357,4 +355,4 @@ registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
   } catch (error) {
     return { vault_status: error instanceof BrowserVaultError ? error.reason : 'vault_unavailable' };
   }
-});
+}

@@ -1,3 +1,4 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** The principal's side of the consent engine: real approvals, delivery, central DB and mailbox. Only the container wake is mocked. */
 import fs from 'node:fs';
 import type { Locator, Page } from 'playwright-core';
@@ -103,7 +104,7 @@ beforeEach(async () => {
       return `message-${sent.length}`;
     },
   });
-  queue = new BrowserQueue(new BrowserStore(), {
+  queue = createBrowserQueue(new BrowserStore(), {
     pageForJob: async (): Promise<never> => {
       throw new Error('A consent request never opens the page');
     },
@@ -113,7 +114,7 @@ beforeEach(async () => {
     closeJob: async () => undefined,
     onDisconnected: () => () => undefined,
   });
-  await queue.start();
+  await recoverAndStartBrowserQueue(queue);
   setBrowserAdmissionReady(true);
 });
 afterEach(async () => {

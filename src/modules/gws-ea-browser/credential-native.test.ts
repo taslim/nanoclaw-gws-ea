@@ -58,6 +58,7 @@ import { connectChromePipe, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { executeCredentialForm } from './credential-operations.js';
 import { executeBrowserBatch } from './executor.js';
+
 import './index.js';
 import {
   browserConsentMigration,
@@ -74,7 +75,7 @@ import {
 } from './onepassword-fixture.js';
 import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
 
 registerMigration(gwsEaInboxMigration);

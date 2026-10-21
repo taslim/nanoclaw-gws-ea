@@ -1,11 +1,9 @@
 import type { Page } from 'playwright-core';
 import { PurchaseAuthorityStore, type PurchaseAttemptRow } from './authority.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
-import {
-  readMerchantPurchaseEvidence,
-  merchantSignatures,
-  type MerchantPurchaseEvidence,
-} from './merchant-signatures.js';
+import { readMerchantPurchaseEvidence } from './merchant-read.js';
+import { merchantSignatures } from './merchant-signatures.js';
+import type { MerchantPurchaseEvidence } from './merchant-contract.js';
 
 /**
  * Evidence is parsed by the host's merchant signature. A model verdict never enters this comparison. A generic

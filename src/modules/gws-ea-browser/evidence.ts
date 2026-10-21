@@ -1,3 +1,12 @@
+import { getDomain } from 'tldts';
+import { BROWSER_ACTION_NAMES } from './actions.js';
+import {
+  BROWSER_DIAGNOSTIC_EVENT_LIMIT,
+  BROWSER_DIAGNOSTIC_RESOURCES,
+  BROWSER_DIAGNOSTIC_RULES,
+  type BrowserDiagnostics,
+  type BrowserDiagnosticEvent,
+} from './diagnostics.js';
 import { getDb } from '../../db/connection.js';
 import type { MailboxSession } from '../../mailbox/types.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -29,6 +38,8 @@ export interface BrowserEvidence {
     deliveredAt: string | null;
     status: string | null;
     reason: string | null;
+    diagnostics?: BrowserDiagnostics;
+    recording?: { status: 'complete' | 'unavailable'; trace_indices: number[] };
   }>;
   downloads: Array<{ id: string; filename: string; bytes: number; handedOffAt: string | null }>;
   purchase: { openCards: number; committedAttempts: number; unresolvedAttempts: number };
@@ -81,22 +92,7 @@ interface EvidenceWatchCheck {
 
 const HISTORY_LIMIT = 2_000;
 const RECORD_LIMIT = 25_000;
-const ACTIONS = new Set([
-  'browser',
-  'fill_secret',
-  'credential_form',
-  'sign_in_code',
-  'save_recipe',
-  'run_recipe',
-  'purchase',
-  'watch',
-  'list_watches',
-  'cancel_watch',
-  'request_consent',
-  'browser_watch_book',
-  'browser_purchase_commit',
-  'browser_relay_sign_in',
-]);
+const ACTIONS = new Set<string>(BROWSER_ACTION_NAMES);
 const CHECK_OUTCOMES = new Set([
   'ready',
   'region_read',
@@ -115,19 +111,140 @@ function record(value: unknown): Record<string, unknown> | undefined {
 function code(value: unknown): string | null {
   return typeof value === 'string' && OPERATIONAL_CODES.has(value) ? value : null;
 }
-function resultCodes(raw: string | null): { status: string | null; reason: string | null } {
+function member<const T extends readonly string[]>(value: unknown, choices: T): T[number] | undefined {
+  return typeof value === 'string' ? choices.find((choice) => choice === value) : undefined;
+}
+function count(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+function runtimeVersion(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length <= 64 && /^\d+(?:\.\d+){1,3}(?:-[a-z0-9.]+)?$/iu.test(value)
+    ? value
+    : undefined;
+}
+function diagnosticSite(value: unknown): string | undefined {
+  return typeof value === 'string' &&
+    value.length <= 253 &&
+    /^[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?$/u.test(value) &&
+    !value.includes('..') &&
+    getDomain(value, { allowPrivateDomains: true }) === value
+    ? value
+    : undefined;
+}
+function diagnosticEvent(raw: unknown): BrowserDiagnosticEvent | undefined {
+  const event = record(raw);
+  if (!event || !count(event.elapsed_ms)) return undefined;
+  const common = {
+    elapsed_ms: event.elapsed_ms,
+    ...(count(event.action_index) ? { action_index: event.action_index } : {}),
+    ...(count(event.request_index) ? { request_index: event.request_index } : {}),
+    ...(count(event.redirected_from) ? { redirected_from: event.redirected_from } : {}),
+  };
+  const site = diagnosticSite(event.site);
+  const method = member(event.method, [
+    'GET',
+    'HEAD',
+    'POST',
+    'PUT',
+    'PATCH',
+    'DELETE',
+    'OPTIONS',
+    'CONNECT',
+    'TRACE',
+    'OTHER',
+  ]);
+  const resource =
+    typeof event.resource === 'string' && BROWSER_DIAGNOSTIC_RESOURCES.has(event.resource) ? event.resource : undefined;
+  const request = { ...(site ? { site } : {}), ...(method ? { method } : {}), ...(resource ? { resource } : {}) };
+  switch (event.source) {
+    case 'http_response':
+      return method && resource && count(event.status) && event.status >= 100 && event.status <= 599
+        ? { ...common, ...(site ? { site } : {}), method, resource, source: event.source, status: event.status }
+        : undefined;
+    case 'transport_failure': {
+      const category = member(event.category, ['dns', 'tls', 'aborted', 'connection', 'timeout', 'unknown']);
+      return method && resource && category
+        ? { ...common, ...(site ? { site } : {}), method, resource, source: event.source, category }
+        : undefined;
+    }
+    case 'host_refusal': {
+      const category = member(event.category, ['address', 'document', 'action', 'target', 'download']);
+      const rule = typeof event.rule === 'string' && BROWSER_DIAGNOSTIC_RULES.has(event.rule) ? event.rule : undefined;
+      return category
+        ? { ...common, ...request, source: event.source, category, ...(rule ? { rule } : {}) }
+        : undefined;
+    }
+    case 'runtime_error': {
+      const category = member(event.category, ['unavailable', 'disconnected', 'execution']);
+      return category ? { ...common, source: event.source, category } : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+function diagnosticMetadata(raw: unknown, request: EvidenceRequest, job: EvidenceJob): BrowserDiagnostics | undefined {
+  const metadata = record(raw);
+  const runtime = record(metadata?.runtime);
+  const node = runtimeVersion(runtime?.node);
+  if (
+    !metadata ||
+    metadata.schema_version !== 1 ||
+    metadata.job_id !== job.id ||
+    metadata.request_id !== request.id ||
+    metadata.action !== request.action ||
+    !ACTIONS.has(request.action) ||
+    !node ||
+    !Array.isArray(metadata.events) ||
+    !count(metadata.omitted_events)
+  )
+    return undefined;
+  const playwright = runtimeVersion(runtime?.playwright);
+  const chrome = runtimeVersion(runtime?.chrome);
+  return {
+    schema_version: 1,
+    job_id: job.id,
+    request_id: request.id,
+    action: request.action,
+    ...(count(metadata.action_index) ? { action_index: metadata.action_index } : {}),
+    runtime: { node, ...(playwright ? { playwright } : {}), ...(chrome ? { chrome } : {}) },
+    events: metadata.events.slice(0, BROWSER_DIAGNOSTIC_EVENT_LIMIT).flatMap((event) => {
+      const safe = diagnosticEvent(event);
+      return safe ? [safe] : [];
+    }),
+    omitted_events: metadata.omitted_events + Math.max(0, metadata.events.length - BROWSER_DIAGNOSTIC_EVENT_LIMIT),
+  };
+}
+function resultMetadata(
+  request: EvidenceRequest,
+  job: EvidenceJob,
+): Pick<BrowserEvidence['requests'][number], 'status' | 'reason' | 'diagnostics' | 'recording'> {
   const absent = { status: null, reason: null };
-  if (!raw) return absent;
+  if (!request.answer_json) return absent;
   let frame: Record<string, unknown> | undefined;
   try {
-    frame = record(JSON.parse(raw));
+    frame = record(JSON.parse(request.answer_json));
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     return absent;
   }
-  if (frame?.ok === false) return { status: 'error', reason: code(record(frame.error)?.code) };
-  const data = frame?.ok === true ? record(frame.data) : undefined;
-  return { status: code(data?.status), reason: code(data?.reason) };
+  const error = frame?.ok === false ? record(frame.error) : undefined;
+  const data = frame?.ok === true ? record(frame.data) : record(error?.metadata);
+  const diagnostics = diagnosticMetadata(data?.diagnostics, request, job);
+  const recording = record(data?.recording);
+  const recordingStatus = member(recording?.status, ['complete', 'unavailable']);
+  return {
+    status: frame?.ok === false ? 'error' : code(data?.status),
+    reason: error ? code(error.code) : code(data?.reason),
+    ...(diagnostics ? { diagnostics } : {}),
+    ...(recordingStatus && Array.isArray(recording?.trace_indices)
+      ? {
+          recording: {
+            status: recordingStatus,
+            trace_indices: recording.trace_indices.slice(0, RECORD_LIMIT).filter(count),
+          },
+        }
+      : {}),
+  };
 }
 
 function mailboxMetadata(mailbox: MailboxSession, job: EvidenceJob, requests: EvidenceRequest[]) {
@@ -235,7 +352,7 @@ export async function readBrowserEvidence(thread: string): Promise<BrowserEviden
       commitStartedAt: request.commit_started_at,
       answeredAt: request.answered_at,
       deliveredAt: request.delivered_at,
-      ...resultCodes(request.answer_json),
+      ...resultMetadata(request, job),
     })),
     downloads: downloads.map((download) => ({
       id: download.id,

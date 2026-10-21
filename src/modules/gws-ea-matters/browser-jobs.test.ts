@@ -12,7 +12,8 @@ vi.mock('../../config.js', async (original) => ({
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
-import '../gws-ea-browser/index.js';
+import { createBrowserQueue, getBrowserRuntime, recoverAndStartBrowserQueue } from '../gws-ea-browser/index.js';
+import { BrowserStore, browserRequestId } from '../gws-ea-browser/db.js';
 import { readBrowserJob } from '../gws-ea-browser/cancel.js';
 import { cancelClosedMatterJobs, closeMatter, getMatter, openMatter, placeInMatter } from './db.js';
 import './index.js';
@@ -49,6 +50,47 @@ it('places a job once, renders state and delivered report freshly, then cancels 
     { kind: 'job', reference: THREAD, from: first.id },
   ]);
   expect((await getMatter(first.id))?.links).toEqual([]);
+  const linkedJob = (await getMatter(second.id))?.links;
+  expect(linkedJob).toMatchObject([{ kind: 'job', reference: THREAD }]);
+  const store = new BrowserStore();
+  await readBrowserJob(THREAD);
+  const job = await store.getJob(THREAD);
+  const session = await getDb().get<import('../../types.js').Session>(
+    'SELECT * FROM sessions WHERE id=?',
+    browserSession,
+  );
+  if (!job || !session) throw new Error('Expected native browser errand');
+  await store.accept(job, session, 'pending-before-restart', 'browser', { actions: [{ kind: 'observe' }] }, 90_000);
+  // Restart recovery answers the existing request, retaining the matter's original job identity.
+  for (let restart = 0; restart < 2; restart++) {
+    const queue = createBrowserQueue(store, getBrowserRuntime());
+    try {
+      await recoverAndStartBrowserQueue(queue);
+    } finally {
+      await queue.stop();
+    }
+  }
+  expect(await store.request(browserRequestId(browserSession, 'pending-before-restart'))).toMatchObject({
+    job_id: THREAD,
+    delivered_at: expect.any(String),
+  });
+  const answers = await withExistingMailboxSession('browser', browserSession, (mailbox) =>
+    mailbox.getInboundHistory(100).filter((message) => {
+      const value: unknown = JSON.parse(message.content);
+      return (
+        typeof value === 'object' &&
+        value !== null &&
+        'requestId' in value &&
+        value.requestId === 'pending-before-restart'
+      );
+    }),
+  );
+  expect(answers).toHaveLength(1);
+  expect(JSON.parse(answers![0].content)).toMatchObject({
+    frame: { ok: true, data: { status: 'stopped', reason: 'interrupted' } },
+  });
+  expect((await getMatter(second.id))?.links).toEqual(linkedJob);
+
   await withExistingMailboxSession('browser', browserSession, async (mailbox) => {
     await mailbox.writeDirect({
       id: 'report',

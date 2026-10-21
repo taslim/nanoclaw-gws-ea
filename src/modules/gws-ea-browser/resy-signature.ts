@@ -5,7 +5,8 @@
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Frame, Page, Request, Response } from 'playwright-core';
 import { isRecord } from '../../gws-ea/validation.js';
-import type { ActionClass, ControlFacts } from './commit-classifier.js';
+import type { ActionClass } from './control-policy.js';
+import type { ControlFacts } from './control-facts.js';
 import { amountMinor, currencyExponent, type PurchaseFacts, type ReservationFacts } from './fingerprint.js';
 import {
   REVIEWED_CHECKOUT_MISSING,
@@ -14,7 +15,12 @@ import {
   type ReservationAvailability,
   type ReservationPolicy,
 } from './merchant-contract.js';
-import { bindPageSecretDocuments, registerPageRedaction, registerPageSecret, releasePageSecret } from './observe.js';
+import {
+  bindPageSecretDocuments,
+  registerPageRedaction,
+  registerPageSecret,
+  releasePageSecret,
+} from './page-privacy.js';
 
 const ORIGINS = ['https://resy.com', 'https://widgets.resy.com'] as const;
 const API = 'https://api.resy.com';

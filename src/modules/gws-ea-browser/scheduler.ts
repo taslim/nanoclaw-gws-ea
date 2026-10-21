@@ -1,3 +1,16 @@
+import { runBrowserWatchCheck } from './watch-runtime.js';
+import {
+  type WatchBounds,
+  type WatchRow,
+  watchSlotKey,
+  watchReleases,
+  emitWatchNotice,
+  regionWatchSlowdown,
+  type RegionCheckRead,
+  recordRegionCheck,
+  deliverWatchNotices,
+  expireBrowserWatches,
+} from './watch-state.js';
 import { createHash, randomUUID } from 'node:crypto';
 import type { DbDriver } from '../../db/driver.js';
 import { findPrincipalCalendarConflicts, type CalendarConflictResult } from '../gws-ea-meetings/calendar-facts.js';
@@ -6,21 +19,10 @@ import type { ParsedMail } from '../gws-ea-inbox/mime.js';
 import { registerInboxObserver } from '../gws-ea-inbox/observers.js';
 import { cancelBrowserJob } from './cancel.js';
 import type { ReservationAvailability } from './merchant-contract.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import type { BrowserQueue } from './queue.js';
-import type { StructuredBrowserLocator } from './recipes.js';
-import {
-  deliverWatchNotices,
-  emitWatchNotice,
-  expireBrowserWatches,
-  recordRegionCheck,
-  regionWatchSlowdown,
-  watchReleases,
-  watchSlotKey,
-  type RegionCheckRead,
-  type WatchBounds,
-  type WatchRow,
-} from './watches.js';
+import type { StructuredBrowserLocator } from './locators.js';
+
 import { nextWatchCheck, principalClock, watchSitePolicy, watchStartAt, type WatchSitePolicy } from './watch-policy.js';
 
 export interface BrowserWatchCheckInput {
@@ -81,8 +83,7 @@ export class BrowserWatchScheduler {
     deps: Partial<WatchSchedulerDeps> = {},
   ) {
     this.deps = {
-      check: async (activeQueue, input, signal) =>
-        (await import('./watch-runtime.js')).runBrowserWatchCheck(activeQueue, input, signal),
+      check: runBrowserWatchCheck,
       calendar: findPrincipalCalendarConflicts,
       policy: watchSitePolicy,
       random: Math.random,
@@ -151,7 +152,7 @@ export class BrowserWatchScheduler {
   private async runTick(): Promise<void> {
     const db = this.queue.store.db;
     if (!(await db.hasTable('gws_ea_browser_watches')) || this.controller.signal.aborted) return;
-    if (!(await readBrowserPolicy()).enabled) {
+    if (!(await readHostBrowserPolicy()).enabled) {
       const jobs = await db.all<{ job_id: string }>(
         "SELECT DISTINCT job_id FROM gws_ea_browser_watches WHERE status IN ('awaiting_principal','armed','checking','preparing','booking')",
       );
@@ -447,4 +448,16 @@ export function createBrowserWatchScheduler(
   deps: Partial<WatchSchedulerDeps> = {},
 ): BrowserWatchScheduler {
   return new BrowserWatchScheduler(queue, deps);
+}
+
+/** Optional scheduled-check repair never gates required attempts or ordinary browser admission. */
+export async function repairBrowserWatchChecks(queue: BrowserQueue): Promise<void> {
+  const db = queue.store.db;
+  if (!(await db.hasTable('gws_ea_browser_watches'))) return;
+  await db.run(
+    "UPDATE gws_ea_browser_watch_checks SET finished_at = ?,outcome = 'interrupted' WHERE finished_at IS NULL",
+    new Date().toISOString(),
+  );
+  await expireBrowserWatches(db);
+  await deliverWatchNotices(db);
 }

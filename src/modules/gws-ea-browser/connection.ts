@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 
 import {
@@ -11,11 +12,12 @@ import {
 } from 'playwright-core';
 
 import { stopChrome } from './chrome.js';
-import { prepareMerchantPage } from './merchant-signatures.js';
+import { prepareMerchantPage } from './merchant-read.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { documentGate } from './document-gate.js';
 import { coverPageTargets } from './page-targets.js';
 import { ensurePrivateDirectory, type BrowserPaths } from './paths.js';
+import { attachBrowserDiagnostics } from './diagnostics.js';
 
 const allowedDownloads = new WeakSet<Page>();
 const downloadTails = new WeakMap<ChromeConnection, Promise<void>>();
@@ -35,6 +37,7 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
   if (!(outbound instanceof Writable) || !(inbound instanceof Readable)) throw new Error('Chrome pipe unavailable');
   let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let ended = false;
+  let gracefulShutdown = false;
   const transport: ConnectOverCDPTransport = {
     send(message) {
       if (ended) return;
@@ -43,14 +46,14 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
       });
     },
     close() {
-      child.kill('SIGTERM');
+      if (!gracefulShutdown) child.kill('SIGTERM');
     },
   };
   function terminate(): void {
     if (ended) return;
     ended = true;
     transport.onclose?.('Chrome pipe closed');
-    child.kill('SIGTERM');
+    if (!gracefulShutdown) child.kill('SIGTERM');
   }
   inbound.on('data', (chunk: Buffer) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -100,10 +103,7 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
     // Every document of this connection pauses at its gate from the first request; the gate ends with it.
     await documentGate(browser);
     const session = await browser.newBrowserCDPSession();
-    for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
-      await session.send('Browser.setPermission', { permission: { name }, setting: 'denied' });
-    }
-    await session.send('Browser.setDownloadBehavior', { behavior: 'deny' });
+    await applyChromeContextPolicy(session);
     let closing: Promise<void> | undefined;
     const attached = browser;
     return {
@@ -113,14 +113,31 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
       child,
       close() {
         closing ??= (async () => {
-          // Chrome may not answer Browser.close after a process crash.
-          const requested = attached.close().catch(() => undefined);
-          const deadline = new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, 2_000);
-            timer.unref();
-          });
-          await Promise.race([requested, deadline]);
+          // A CDP browser.close() disconnects its transport, whose fallback kills the child. Ask Chrome
+          // itself to quit first so it flushes the persistent profile, and wait for exit independently of
+          // the protocol reply. Pipe/disconnect callbacks must not SIGTERM it during this allowance.
+          gracefulShutdown = true;
+          const exited =
+            child.exitCode !== null || child.signalCode !== null
+              ? Promise.resolve()
+              : once(child, 'exit').then(() => undefined);
+          void session.send('Browser.close').catch(() => undefined);
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([
+              exited,
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, 2_000);
+                timer.unref();
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          // The client close waits for disconnect; forced child retirement must remain reachable if
+          // Chrome never honored Browser.close and the graceful transport deliberately did not kill it.
           await stopChrome(child);
+          await attached.close().catch(() => undefined);
         })();
         return closing;
       },
@@ -130,6 +147,116 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
     await stopChrome(child);
     throw new Error('Chrome connection unavailable', { cause: error });
   }
+}
+
+/** Permissions and download denial are scoped to this native context, never borrowed from another. */
+export async function applyChromeContextPolicy(session: CDPSession, browserContextId?: string): Promise<void> {
+  const scope = browserContextId ? { browserContextId } : {};
+  for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
+    await session.send('Browser.setPermission', { permission: { name }, setting: 'denied', ...scope });
+  }
+  await session.send('Browser.setDownloadBehavior', { behavior: 'deny', ...scope });
+}
+
+/**
+ * CDP supplies background native-window creation and its exact target identity. Playwright supplies
+ * the page and all interactions; its ordinary new-page operation cannot request a background window.
+ */
+export async function createBackgroundPage(
+  connection: ChromeConnection,
+  context: BrowserContext = connection.context,
+  browserContextId?: string,
+): Promise<Page> {
+  let createdTargetId: string | undefined;
+  let setupFailed = false;
+  const closeCreatedTarget = async (): Promise<void> => {
+    if (createdTargetId)
+      await connection.session.send('Target.closeTarget', { targetId: createdTargetId }).catch(() => undefined);
+  };
+  let resolveTarget!: (id: string) => void;
+  const expectedTarget = new Promise<string>((resolve) => {
+    resolveTarget = resolve;
+  });
+  const appeared = context.waitForEvent('page', {
+    timeout: 10_000,
+    predicate: async (candidate) => {
+      const targetId = await expectedTarget;
+      if (!targetId || candidate.isClosed()) return false;
+      const metadata = await context.newCDPSession(candidate);
+      try {
+        return (await metadata.send('Target.getTargetInfo')).targetInfo.targetId === targetId;
+      } finally {
+        await metadata.detach();
+      }
+    },
+  });
+  try {
+    const created = connection.session
+      .send('Target.createTarget', {
+        url: 'about:blank',
+        newWindow: true,
+        background: true,
+        ...(browserContextId ? { browserContextId } : {}),
+      })
+      .then(
+        ({ targetId }) => {
+          createdTargetId = targetId;
+          if (setupFailed) void closeCreatedTarget();
+          resolveTarget(targetId);
+        },
+        (error: unknown) => {
+          resolveTarget('');
+          throw error;
+        },
+      );
+    const [, page] = await Promise.all([created, appeared]);
+    attachBrowserDiagnostics(page);
+    await secureJobPage(page);
+    if (page.isClosed() || page.viewportSize() !== null) throw new Error('Native Chrome page unavailable');
+    return page;
+  } catch (error) {
+    setupFailed = true;
+    await closeCreatedTarget();
+    throw error;
+  }
+}
+
+/** The same host-owned probes verify the persistent profile and each signed-out context. */
+export async function verifyChromePolicy(page: Page): Promise<void> {
+  const result: unknown = await page.evaluate(`new Promise((resolve) => {
+    const peer = new RTCPeerConnection({iceServers: []});
+    let candidates = 0;
+    let finished = false;
+    const finish = (complete) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      peer.close();
+      resolve({complete, candidates});
+    };
+    const timer = setTimeout(() => finish(false), 3000);
+    peer.onicecandidate = event => {if (event.candidate) candidates += 1;};
+    peer.onicegatheringstatechange = () => {if (peer.iceGatheringState === 'complete') finish(true);};
+    peer.createDataChannel('host-policy-check');
+    peer.createOffer().then(offer => peer.setLocalDescription(offer)).catch(() => finish(false));
+  })`);
+  if (
+    typeof result !== 'object' ||
+    result === null ||
+    !('complete' in result) ||
+    result.complete !== true ||
+    !('candidates' in result) ||
+    result.candidates !== 0
+  )
+    throw new Error('Chrome WebRTC policy unavailable');
+  let blocked = false;
+  try {
+    await page.goto('nanoclaw-runtime-policy-check://no-registered-handler');
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('ERR_BLOCKED_BY_ADMINISTRATOR')) blocked = true;
+    else throw error;
+  }
+  if (!blocked) throw new Error('Chrome external-protocol policy unavailable');
 }
 
 /** Install before exposing a job page. Native dialogs/choosers never reach the operator. */

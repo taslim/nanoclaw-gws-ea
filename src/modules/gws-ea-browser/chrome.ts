@@ -36,11 +36,10 @@ export function buildChromeLaunch(input: ChromeLaunchInput): { command: string; 
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-search-engine-choice-screen',
+      // Native background targets still need rendering and timer progress for errands and watches.
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
       '--disable-background-timer-throttling',
-      '--enable-features=CDPScreenshotNewSurface',
-      '--disable-blink-features=AutomationControlled',
       `--proxy-server=${input.proxyUrl}`,
       '--proxy-bypass-list=<-loopback>',
       '--disable-quic',

@@ -4,15 +4,17 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
+  readVaultSiteInfo,
   bindBrowserSecretField,
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecret,
   validateFillSecret,
 } from './fill.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
-import { observePage, pageHasSecret } from './observe.js';
+import { observePage, configureBrowserSiteInfo } from './observe.js';
+import { pageHasSecret } from './page-privacy.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
@@ -20,6 +22,7 @@ import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepass
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
+  configureBrowserSiteInfo({ vault: readVaultSiteInfo });
   vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
 });
 afterEach(() => {
@@ -28,25 +31,11 @@ afterEach(() => {
 });
 function fixture(origin = 'https://www.shop.example') {
   let url = `${origin}/login`;
-  let activeElement: unknown;
   const nodes: Array<{ value: string }> = [];
   const form = {
     action: `${origin}/login`,
     method: 'post',
     target: '',
-    elements: [] as unknown[],
-    querySelector: (selector: string) => !selector.includes('cc-'),
-  };
-  const document = {
-    get activeElement() {
-      return activeElement;
-    },
-    location: {
-      get origin() {
-        return new URL(url).origin;
-      },
-    },
-    defaultView: { HTMLFormElement: { prototype: { submit() {} } } },
   };
   const field = {
     tagName: 'INPUT',
@@ -54,7 +43,6 @@ function fixture(origin = 'https://www.shop.example') {
     name: 'password',
     value: '',
     form,
-    ownerDocument: document,
     isConnected: true,
     getAttribute(name: string): string | null {
       return (
@@ -68,18 +56,13 @@ function fixture(origin = 'https://www.shop.example') {
     name: '',
     textContent: 'Sign in',
     form,
-    ownerDocument: document,
     isConnected: true,
     getAttribute: (name: string) => (name === 'type' ? 'submit' : null),
   };
-  form.elements = [field, button];
   nodes.push(field);
   const navigations = new Set<(frame: unknown) => void>();
   const handle = (node: unknown) => ({
     ownerFrame: async () => frame,
-    focus: async () => {
-      activeElement = node;
-    },
     inputValue: async () => (node as { value: string }).value,
     evaluate: async (fn: (value: unknown, arg: unknown) => unknown, argument?: unknown) =>
       fn(
@@ -101,11 +84,9 @@ function fixture(origin = 'https://www.shop.example') {
     frames: () => [frame],
     mainFrame: () => frame,
     isClosed: () => false,
-    locator: () => ({ innerText: async () => '', ariaSnapshot: async () => `- alert: ${SECRET}` }),
+    locator: () => ({ innerText: async () => '', ariaSnapshotJSON: async () => [{ role: 'alert', text: SECRET }] }),
     keyboard: {
-      insertText: vi.fn(async (value: string) => {
-        (activeElement as { value: string }).value = value;
-      }),
+      insertText: vi.fn(),
     },
     on: (event: string, callback: (frame: unknown) => void) => {
       if (event === 'framenavigated') navigations.add(callback);
@@ -134,6 +115,7 @@ function fixture(origin = 'https://www.shop.example') {
     remaining: () => 10_000,
     runtime: { closeJob: vi.fn(async () => undefined) },
     job: { id: 'job' },
+    store: { db: {} },
   } as unknown as BrowserExecutionContext;
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
@@ -204,9 +186,6 @@ function fixture(origin = 'https://www.shop.example') {
     nativeFill,
     setUrl: (value: string) => {
       url = value;
-    },
-    focus: (value: unknown) => {
-      activeElement = value;
     },
     navigate: () => {
       url = `${origin}/`;
@@ -287,7 +266,13 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
   const error = await fillBoundBrowserSecret(f.context, binding, async () => {
     throw new Error(SECRET);
   }).catch((value: unknown) => value);
+  expect(error).toMatchObject({
+    code: 'forbidden',
+    message: 'The host could not safely complete this sign-in. Take a fresh observation.',
+  });
   expect(String(error)).not.toContain(SECRET);
+  expect(f.nativeFill).not.toHaveBeenCalled();
+  expect(f.nativeSubmit).not.toHaveBeenCalled();
   expect(() =>
     validateFillSecret({
       item_handle: 'op://vault/item/password',
@@ -379,3 +364,9 @@ it('offers a newly attached login iframe origin without repeatedly refreshing an
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
 });
+
+// These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
+vi.mock('./control-facts.js', async (original) => ({
+  ...(await original<typeof import('./control-facts.js')>()),
+  readPageSecretValues: vi.fn(async () => []),
+}));

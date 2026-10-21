@@ -1,0 +1,305 @@
+import { createRequire } from 'node:module';
+
+import type { Page, Request } from 'playwright-core';
+import { getDomain } from 'tldts';
+
+import { BROWSER_ACTION_NAMES } from './actions.js';
+import { pageHostnameIsPrivate } from './page-privacy.js';
+
+const manifest: unknown = createRequire(import.meta.url)('playwright-core/package.json');
+const playwrightVersion =
+  typeof manifest === 'object' && manifest !== null && 'version' in manifest ? version(manifest.version) : undefined;
+export const BROWSER_DIAGNOSTIC_EVENT_LIMIT = 64;
+const METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']);
+export const BROWSER_DIAGNOSTIC_RESOURCES: ReadonlySet<string> = new Set([
+  'document',
+  'stylesheet',
+  'image',
+  'media',
+  'font',
+  'script',
+  'texttrack',
+  'xhr',
+  'fetch',
+  'eventsource',
+  'websocket',
+  'manifest',
+  'other',
+]);
+const ACTIONS = new Set<string>(BROWSER_ACTION_NAMES);
+export const BROWSER_DIAGNOSTIC_RULES: ReadonlySet<string> = new Set([
+  'blocked_address',
+  'purchase_control',
+  'account_security',
+  'speaks_as_principal',
+  'consent_control',
+  'consent_required',
+  'read_only',
+  'site_busy',
+  'secret_field',
+  'card_field',
+  'stale_ref',
+  'personal_data',
+]);
+
+export interface BrowserDiagnosticCorrelation {
+  readonly jobId: string;
+  readonly requestId: string;
+  readonly action: string;
+  readonly actionIndex?: number;
+}
+export type BrowserHostRefusal = 'address' | 'document' | 'action' | 'target' | 'download';
+type TransportCategory = 'dns' | 'tls' | 'aborted' | 'connection' | 'timeout' | 'unknown';
+interface RequestFacts {
+  site?: string;
+  method: string;
+  resource: string;
+}
+type BrowserDiagnosticFact =
+  | (RequestFacts & { source: 'http_response'; status: number })
+  | (RequestFacts & { source: 'transport_failure'; category: TransportCategory })
+  | (Partial<RequestFacts> & { source: 'host_refusal'; category: BrowserHostRefusal; rule?: string })
+  | { source: 'runtime_error'; category: 'unavailable' | 'disconnected' | 'execution' };
+export type BrowserDiagnosticEvent = BrowserDiagnosticFact & {
+  elapsed_ms: number;
+  action_index?: number;
+  request_index?: number;
+  redirected_from?: number;
+};
+interface DiagnosticEpoch {
+  readonly attempt: BrowserDiagnosticAttempt;
+  readonly actionIndex?: number;
+}
+export interface BrowserDiagnostics {
+  schema_version: 1;
+  job_id: string;
+  request_id: string;
+  action: string;
+  action_index?: number;
+  runtime: { playwright?: string; chrome?: string; node: string };
+  events: readonly BrowserDiagnosticEvent[];
+  omitted_events: number;
+}
+
+function version(value: unknown): string | undefined {
+  return typeof value === 'string' && /^\d+(?:\.\d+){1,3}(?:-[a-z0-9.]+)?$/i.test(value) && value.length <= 64
+    ? value
+    : undefined;
+}
+function facts(input: { url: string; method: string; resource: string }): RequestFacts {
+  const url = URL.canParse(input.url) ? new URL(input.url) : undefined;
+  const site =
+    url && (url.protocol === 'http:' || url.protocol === 'https:')
+      ? getDomain(url.hostname, { allowPrivateDomains: true })
+      : null;
+  return {
+    ...(site ? { site } : {}),
+    method: METHODS.has(input.method) ? input.method : 'OTHER',
+    resource: BROWSER_DIAGNOSTIC_RESOURCES.has(input.resource) ? input.resource : 'other',
+  };
+}
+function transportCategory(raw: string | undefined): TransportCategory {
+  switch (raw) {
+    case 'net::ERR_NAME_NOT_RESOLVED':
+    case 'net::ERR_DNS_TIMED_OUT':
+      return 'dns';
+    case 'net::ERR_CERT_AUTHORITY_INVALID':
+    case 'net::ERR_CERT_COMMON_NAME_INVALID':
+    case 'net::ERR_CERT_DATE_INVALID':
+    case 'net::ERR_SSL_PROTOCOL_ERROR':
+    case 'net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH':
+      return 'tls';
+    case 'net::ERR_ABORTED':
+      return 'aborted';
+    case 'net::ERR_CONNECTION_REFUSED':
+    case 'net::ERR_CONNECTION_RESET':
+    case 'net::ERR_CONNECTION_CLOSED':
+    case 'net::ERR_INTERNET_DISCONNECTED':
+      return 'connection';
+    case 'net::ERR_TIMED_OUT':
+    case 'net::ERR_CONNECTION_TIMED_OUT':
+      return 'timeout';
+    default:
+      return 'unknown';
+  }
+}
+
+const current = new WeakMap<Page, DiagnosticEpoch>();
+const attached = new WeakSet<Page>();
+
+/** Installed before a job page can act. Request object identity, never a URL match, binds its later events. */
+export function attachBrowserDiagnostics(page: Page): void {
+  if (attached.has(page)) return;
+  attached.add(page);
+  const requests = new WeakMap<
+    Request,
+    { epoch: DiagnosticEpoch; facts: RequestFacts; index: number; redirectedFrom?: number }
+  >();
+  let sequence = 0;
+  page.on('request', (request) => {
+    const epoch = current.get(page);
+    if (!epoch) return;
+    const redirected = request.redirectedFrom();
+    const previous = redirected ? requests.get(redirected) : undefined;
+    if (redirected && previous?.epoch !== epoch) return;
+    requests.set(request, {
+      epoch,
+      index: ++sequence,
+      redirectedFrom: previous?.index,
+      facts: facts({ url: request.url(), method: request.method(), resource: request.resourceType() }),
+    });
+  });
+  page.on('response', (response) => {
+    const request = requests.get(response.request());
+    const status = response.status();
+    if (!request || current.get(page) !== request.epoch || !Number.isInteger(status) || status < 100 || status > 599)
+      return;
+    request.epoch.attempt.record(
+      { ...request.facts, source: 'http_response', status },
+      request.epoch.actionIndex,
+      request.index,
+      request.redirectedFrom,
+    );
+  });
+  page.on('requestfailed', (request) => {
+    const captured = requests.get(request);
+    if (!captured || current.get(page) !== captured.epoch) return;
+    captured.epoch.attempt.record(
+      {
+        ...captured.facts,
+        source: 'transport_failure',
+        category: transportCategory(request.failure()?.errorText),
+      },
+      captured.epoch.actionIndex,
+      captured.index,
+      captured.redirectedFrom,
+    );
+    requests.delete(request);
+  });
+  page.once('close', () => current.delete(page));
+}
+
+function safeFact(event: BrowserDiagnosticFact): BrowserDiagnosticFact {
+  const request = {
+    ...(event.source !== 'runtime_error' && event.site ? { site: event.site } : {}),
+    ...(event.source !== 'runtime_error' && event.method ? { method: event.method } : {}),
+    ...(event.source !== 'runtime_error' && event.resource ? { resource: event.resource } : {}),
+  };
+  switch (event.source) {
+    case 'http_response':
+      return {
+        source: event.source,
+        status: event.status,
+        site: event.site,
+        method: event.method,
+        resource: event.resource,
+      };
+    case 'transport_failure':
+      return {
+        source: event.source,
+        category: event.category,
+        site: event.site,
+        method: event.method,
+        resource: event.resource,
+      };
+    case 'host_refusal':
+      return {
+        source: event.source,
+        category: event.category,
+        ...request,
+        ...(event.rule && BROWSER_DIAGNOSTIC_RULES.has(event.rule) ? { rule: event.rule } : {}),
+      };
+    case 'runtime_error':
+      return { source: event.source, category: event.category };
+  }
+}
+
+/** One immutable correlation/epoch; an event from an older attempt cannot enter a newer one. */
+export class BrowserDiagnosticAttempt {
+  private readonly started = performance.now();
+  private readonly pages = new Set<Page>();
+  private readonly events: BrowserDiagnosticEvent[] = [];
+  private omitted = 0;
+  private closed = false;
+  private chrome: string | undefined;
+  private readonly correlation: BrowserDiagnosticCorrelation;
+
+  constructor(correlation: BrowserDiagnosticCorrelation) {
+    this.correlation = {
+      jobId: correlation.jobId,
+      requestId: correlation.requestId,
+      action: correlation.action,
+      ...(Number.isInteger(correlation.actionIndex) && (correlation.actionIndex ?? -1) >= 0
+        ? { actionIndex: correlation.actionIndex }
+        : {}),
+    };
+  }
+
+  observe(page: Page): void {
+    if (this.closed) return;
+    attachBrowserDiagnostics(page);
+    this.chrome ??= version(page.context().browser()?.version());
+    this.pages.add(page);
+    current.set(page, { attempt: this });
+  }
+
+  record(event: BrowserDiagnosticFact, actionIndex?: number, requestIndex?: number, redirectedFrom?: number): void {
+    if (this.closed) return;
+    if (this.events.length >= BROWSER_DIAGNOSTIC_EVENT_LIMIT) {
+      this.omitted++;
+      return;
+    }
+    this.events.push({
+      ...safeFact(event),
+      ...(actionIndex === undefined ? {} : { action_index: actionIndex }),
+      ...(requestIndex === undefined ? {} : { request_index: requestIndex }),
+      ...(redirectedFrom === undefined ? {} : { redirected_from: redirectedFrom }),
+      elapsed_ms: Math.max(0, Math.round(performance.now() - this.started)),
+    });
+  }
+
+  finish(): BrowserDiagnostics {
+    this.closed = true;
+    for (const event of this.events) {
+      const site = 'site' in event ? event.site : undefined;
+      if (site && [...this.pages].some((page) => pageHostnameIsPrivate(page, site)) && 'site' in event)
+        delete event.site;
+    }
+    for (const page of this.pages) if (current.get(page)?.attempt === this) current.delete(page);
+    this.pages.clear();
+    return {
+      schema_version: 1,
+      job_id: this.correlation.jobId,
+      request_id: this.correlation.requestId,
+      action: ACTIONS.has(this.correlation.action) ? this.correlation.action : 'unknown',
+      ...(this.correlation.actionIndex === undefined ? {} : { action_index: this.correlation.actionIndex }),
+      runtime: {
+        ...(playwrightVersion ? { playwright: playwrightVersion } : {}),
+        ...(this.chrome ? { chrome: this.chrome } : {}),
+        node: process.versions.node,
+      },
+      events: this.events.map((event) => ({ ...event })),
+      omitted_events: this.omitted,
+    };
+  }
+}
+
+/** Capture at the decision's start, before awaiting policy/lease work. A late refusal is discarded. */
+export function captureBrowserDiagnosticRefusal(
+  page: Page,
+): (category: BrowserHostRefusal, request?: { url: string; method: string; resource: string }, rule?: string) => void {
+  const epoch = current.get(page);
+  return (category, request, rule) => {
+    if (!epoch || current.get(page) !== epoch) return;
+    epoch.attempt.record(
+      { source: 'host_refusal', category, rule, ...(request ? facts(request) : {}) },
+      epoch.actionIndex,
+    );
+  };
+}
+
+/** Each action owns a distinct immutable event epoch, even within one request. */
+export function beginBrowserDiagnosticAction(page: Page, actionIndex: number): void {
+  const previous = current.get(page);
+  if (previous) current.set(page, { attempt: previous.attempt, actionIndex });
+}

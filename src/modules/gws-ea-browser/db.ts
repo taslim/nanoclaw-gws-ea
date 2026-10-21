@@ -6,6 +6,7 @@ import type { DbDriver } from '../../db/driver.js';
 import type { Session } from '../../types.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import { errandSource, hasBrowserAccess } from './access.js';
+import type { PurchaseBounds } from './fingerprint.js';
 
 export interface BrowserJob {
   id: string;
@@ -56,6 +57,15 @@ export class BrowserStore {
 
   getJob(id: string): Promise<BrowserJob | undefined> {
     return this.db.get<BrowserJob>('SELECT * FROM gws_ea_browser_jobs WHERE id = ?', id);
+  }
+
+  /** The delegator's recorded reservation scope; it grants no financial authority. */
+  async reservationBounds(jobId: string): Promise<PurchaseBounds['reservation']> {
+    const row = await this.db.get<{ bounds_json: string }>(
+      'SELECT bounds_json FROM gws_ea_browser_reservation_bounds WHERE job_id = ?',
+      jobId,
+    );
+    return row ? (JSON.parse(row.bounds_json) as NonNullable<PurchaseBounds['reservation']>) : undefined;
   }
 
   /** The live job of an errand from a group that may use the browser; its row is created on first use. */
