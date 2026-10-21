@@ -1,3 +1,5 @@
+import { classifyNavigationUrl } from './control-policy.js';
+import { readPageControlFacts } from './control-facts.js';
 import { createBrowserQueue } from './index.js';
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
 import { randomUUID } from 'node:crypto';
@@ -44,9 +46,7 @@ import { configureBrowserCancellation } from './cancel.js';
 import {
   activateControl,
   classifyActivation,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
-  readControlFacts,
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
@@ -58,7 +58,7 @@ import * as nativeControlFacts from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { type BrowserAction } from './actions.js';
 import { setBrowserAdmissionReady } from './group.js';
-import { prepareMerchantPage, readMerchantPurchase } from './merchant-signatures.js';
+import { prepareMerchantPage, readMerchantPurchase } from './merchant-read.js';
 import { browserConsentMigration, browserRecipesMigration, browserSiteLeasesMigration } from './migration.js';
 import {
   CONSENT,
@@ -294,7 +294,7 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   }
   const classify = (target: Locator, kind?: ActivationIntent['kind']): Promise<string> =>
     withElement(target, (element) => classifyActivation(page, element, kind));
-  const facts = (target: Locator) => withElement(target, (element) => readControlFacts(page, element));
+  const facts = (target: Locator) => withElement(target, (element) => readPageControlFacts(page, element));
 
   it('keeps preparation on a transaction page ordinary and refuses its commits', async () => {
     await visit(OPEN_WEB.payment);
@@ -1121,7 +1121,12 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     try {
       // The activation boundary alone, inside the job's operation: a batch goes on to observe the page.
       const pressed = await withBrowserJobNavigation(context(page), page, () =>
-        activateControl(page, element, () => element.click({ noWaitAfter: true })),
+        activateControl(page, element, () => element.click({ noWaitAfter: true }), undefined, {
+          kind: 'click',
+          scope: { jobId: context(page).job.id, db },
+          assertActive: context(page).assertActive,
+          remaining: context(page).remaining,
+        }),
       );
       expect(pressed).toEqual({ ordinaryPress: true });
     } finally {
@@ -1222,6 +1227,39 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
       ),
     ).toMatchObject({ status: 'checkpoint_failed', step: 1, found: { reason: 'read_only' } });
     expect(posts()).toEqual(['https://bistro.example/availability/hold']);
+  });
+
+  it('refuses ordinary typing and editing of a secret field even when page script hides its attributes', async () => {
+    const page = await open();
+    const url = 'https://shop.example/secret-entry';
+    fixture.serve(
+      url,
+      htmlPage(
+        'Profile',
+        '<label>Display value <input id="entry" type="text" autocomplete="new-password"></label>',
+        `
+      const read = HTMLInputElement.prototype.getAttribute;
+      HTMLInputElement.prototype.getAttribute = function(name) {
+        return this.id === 'entry' && ['type', 'autocomplete'].includes(name) ? null : read.call(this, name);
+      };
+    `,
+      ),
+    );
+    await page.goto(url);
+    const secret = 'Synthetic-"credential\\U3-42';
+    await page.locator('#entry').fill(secret);
+    const observation = await observePage(page);
+    for (const text of [observation.snapshot, JSON.stringify(observation)])
+      for (const encoded of [secret, JSON.stringify(secret).slice(1, -1)]) expect(text).not.toContain(encoded);
+    await page.locator('#entry').fill('');
+    for (const kind of ['type', 'key'] as const) {
+      const field = refIn(await observePage(page), 'Display value');
+      const action: BrowserAction =
+        kind === 'type' ? { kind, ...field, text: 'ordinary-text' } : { kind, ...field, key: 'Backspace' };
+      const result = await batch(page, [action]);
+      expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(await page.locator('#entry').inputValue()).toBe('');
+    }
   });
 
   it('stops typing into a card field with card_field, on the page and inside a processor frame', async () => {
@@ -1731,8 +1769,9 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     return result;
   };
 
-  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed (AE3)', async () => {
+  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed without recipe storage (AE3)', async () => {
     await open(GENERIC.review);
+    await getDb().exec('DROP TABLE gws_ea_browser_action_trace; DROP TABLE gws_ea_browser_recipes;');
     await run('note', [
       { kind: 'type', ...refIn(await observePage(page), 'Delivery instructions'), text: 'Leave it with the porter' },
     ]);

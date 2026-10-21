@@ -8,7 +8,7 @@ import type { RequestPicture } from '../approvals/index.js';
 import type { CheckoutBox } from './control-facts.js';
 import type { PurchaseFacts } from './fingerprint.js';
 import { union } from './generic-signature.js';
-import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-signatures.js';
+import { readMerchantPurchase, type MerchantPurchaseRead } from './merchant-read.js';
 import { pageMayShowSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
 

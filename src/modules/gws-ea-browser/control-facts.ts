@@ -1256,12 +1256,13 @@ export async function readCheckoutRegion(page: Page, element: ElementHandle): Pr
 }
 
 /**
- * Whether any field on the page holds a secret (KTD6): a password, a code or payment details, in every frame and
+ * Host-only values of fields holding a secret (KTD6): passwords, codes or payment details, in every frame and
  * every shadow root, closed ones included. Each target's pierced DOM tree finds the fields, and each field's
  * value is read in its frame's isolated world, so page script cannot answer for it. Throws
  * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
  */
-export async function pageHoldsSecretValue(page: Page): Promise<boolean> {
+export async function readPageSecretValues(page: Page): Promise<readonly string[]> {
+  const values = new Set<string>();
   const objectGroup = `gws-ea-secret-scan-${randomUUID()}`;
   const sessions = await openSessions(page);
   try {
@@ -1294,18 +1295,19 @@ export async function pageHoldsSecretValue(page: Page): Promise<boolean> {
         const result = await bounded(
           session.send('Runtime.callFunctionOn', {
             executionContextId: hosted.context,
-            functionDeclaration: `function (...fields) { return fields.some((field) => globalThis.${LIBRARY}.secretValue(field)); }`,
+            functionDeclaration: `function (...fields) { return fields.filter((field) => globalThis.${LIBRARY}.secretValue(field)).map((field) => field.value); }`,
             arguments: handed,
             returnByValue: true,
           }),
           READ_TIMEOUT_MS,
         );
-        if (result.exceptionDetails || typeof result.result.value !== 'boolean')
+        const read: unknown = result.result.value;
+        if (result.exceptionDetails || !Array.isArray(read) || read.some((value) => typeof value !== 'string'))
           throw new ControlFactsUnavailableError();
-        if (result.result.value) return true;
+        for (const value of read as string[]) if (value) values.add(value);
       }
     }
-    return false;
+    return [...values];
   } catch (_error) {
     // A scan that cannot complete proves nothing about the page.
     throw new ControlFactsUnavailableError();

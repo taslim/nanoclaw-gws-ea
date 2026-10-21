@@ -1032,23 +1032,9 @@ export interface ConsentScope {
 export interface ConsentPassOptions {
   /** Inside a purchase: agreements join the card instead of stopping, and kept extras join its facts. */
   readonly purchase?: boolean;
-  /** Defaults to the job scope the page runs in. */
+  /** The operation's job and database; omitted only when there is no job to record a stop for. */
   readonly scope?: ConsentScope;
   readonly assertActive?: () => Promise<void>;
-}
-
-const scopes = new WeakMap<Page, ConsentScope>();
-
-/** Runs a job's operation on its page, so every consent pass on that page records its stops for that job. */
-export async function withConsentScope<T>(page: Page, scope: ConsentScope, operation: () => Promise<T>): Promise<T> {
-  const previous = scopes.get(page);
-  scopes.set(page, scope);
-  try {
-    return await operation();
-  } finally {
-    if (previous) scopes.set(page, previous);
-    else scopes.delete(page);
-  }
 }
 
 /** The site a page belongs to: its top document's registrable domain, as the principal sees it. */
@@ -1083,7 +1069,7 @@ export async function runConsentPass(
   control: ElementHandle,
   options: ConsentPassOptions = {},
 ): Promise<ConsentPassResult> {
-  const scope = options.scope ?? scopes.get(page);
+  const scope = options.scope;
   const purchase = options.purchase === true;
   const site = siteOf(page);
   const decide = async (round: ConsentRound, kept?: ReadonlySet<number>): Promise<ConsentDecision> =>

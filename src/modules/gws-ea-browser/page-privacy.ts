@@ -1,6 +1,5 @@
 import type { CDPSession, Page } from 'playwright-core';
-import { SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
-import { ControlFactsUnavailableError, pageHoldsSecretValue } from './control-facts.js';
+import { ControlFactsUnavailableError, readPageSecretValues } from './control-facts.js';
 
 interface PagePrivacyState {
   secrets: Set<string>;
@@ -108,6 +107,17 @@ export function redactPageText(page: Page, text: string): string {
   );
 }
 
+/** Redacts host-read structured values before serialization, keeping object keys and JSON syntax intact. */
+export function redactPageData(page: Page, value: unknown): unknown {
+  if (typeof value === 'string') return redactPageText(page, value);
+  if (Array.isArray(value)) return value.map((item: unknown) => redactPageData(page, item));
+  if (typeof value === 'object' && value !== null) {
+    const fields = value as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(fields).map(([key, item]) => [key, redactPageData(page, item)]));
+  }
+  return value;
+}
+
 declare const replayUrl: unique symbol;
 export type BrowserReplayUrl = string & { readonly [replayUrl]: true };
 
@@ -118,29 +128,20 @@ export function browserPageReplayUrl(page: Page): BrowserReplayUrl | undefined {
   return new URL(raw).href as BrowserReplayUrl;
 }
 
-/** A text field a show-password toggle produced still holds a password, so the scan never trusts the type alone. */
-const SECRET_FIELD_VALUES = `Array.from(document.querySelectorAll('input')).filter(e => e.type === 'password' ||
-  new RegExp(${JSON.stringify(SECRET_AUTOCOMPLETE.source)}, 'iu').test(e.getAttribute('autocomplete') || '') ||
-  new RegExp(${JSON.stringify(SECRET_DESCRIPTION.source)}, 'iu').test([e.name, e.id, e.getAttribute('aria-label') || '', e.getAttribute('placeholder') || ''].join(' '))
-).map(e => e.value).filter(Boolean)`;
-
-/** Host-owned inspection, never an agent-supplied expression or field-read tool. */
+/** Host-only isolated collection shares the native field reader used to protect pictures. */
 export async function collectSecretFields(page: Page): Promise<boolean> {
-  let present = false;
-  for (const frame of page.frames()) {
-    const values: unknown = await frame.evaluate(SECRET_FIELD_VALUES);
-    if (!Array.isArray(values)) continue;
-    for (const value of values)
-      if (typeof value === 'string' && value) {
-        registerPageSecret(page, value);
-        await bindPageSecretDocuments(page, value);
-        present = true;
-      }
+  if (!page.frames().length) return false;
+  const values = await readPageSecretValues(page);
+  for (const value of values) {
+    // An observed value taints its documents; only a host fill owns active atomic exposure.
+    registerPageRedaction(page, value);
+    stateFor(page).unboundSecretDocuments.add(value);
+    await bindPageSecretDocuments(page, value);
   }
-  return present;
+  return values.length > 0;
 }
 
-/** Whether the host inserted a secret on one of the page's current documents, or holds one not yet bound to them. */
+/** Active host exposure, an unbound secret, or a current document the host observed or filled a secret on. */
 async function hostSecretOnPage(page: Page): Promise<boolean> {
   const state = stateFor(page);
   if (state.activeSecrets.size || state.unboundSecretDocuments.size) return true;
@@ -158,14 +159,14 @@ export async function pageHasSecret(page: Page): Promise<boolean> {
 }
 
 /**
- * Whether a picture of the page could show a secret (KTD6): the host inserted one on the page, or an
+ * Whether a picture could show a secret (KTD6): active exposure, observed or filled document taint, or an
  * isolated-world scan of every frame, shadow roots included, finds a field holding one. A scan that cannot
  * complete counts as finding one.
  */
 export async function pageMayShowSecret(page: Page): Promise<boolean> {
   if (await hostSecretOnPage(page)) return true;
   try {
-    return await pageHoldsSecretValue(page);
+    return await collectSecretFields(page);
   } catch (error) {
     if (error instanceof ControlFactsUnavailableError) return true;
     throw error;

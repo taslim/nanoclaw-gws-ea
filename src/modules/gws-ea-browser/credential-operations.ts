@@ -28,6 +28,12 @@
  * only in the same document the host was watching with no interaction since;
  * from `confirmed` it re-runs the vault's finalize.
  */
+import {
+  classifyCredentialControlFacts,
+  classifyCredentialNavigation,
+  type CredentialActivationClass,
+} from './control-policy.js';
+import { readPageControlFacts } from './control-facts.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { ElementHandle, Frame, Page } from 'playwright-core';
@@ -63,14 +69,7 @@ import {
   type NativeFieldFacts,
 } from './authentication-submit.js';
 import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
-import {
-  BrowserSiteBusyError,
-  classifyCredentialActivation,
-  classifyCredentialNavigation,
-  ensureBrowserNavigationGuard,
-  withBrowserJobNavigation,
-  type CredentialActivationClass,
-} from './commit-classifier.js';
+import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
 import { runConsentPass } from './consent.js';
 import type { BrowserRequest } from './db.js';
 import {
@@ -928,10 +927,15 @@ async function bindGroup(
     if (attempt.kind === 'signup' && others?.some((field) => namesAccount(field) && field.holds === 'other'))
       throw new StepStop('unsupported_form');
   }
-  const activation = await classifyCredentialActivation(page, control.element, attempt.kind, attempt.site, {
-    formControl: controlBinding.formBackendNodeId === form,
-    step: scope.step,
-  });
+  const activation = classifyCredentialControlFacts(
+    await readPageControlFacts(page, control.element),
+    attempt.kind,
+    attempt.site,
+    {
+      formControl: controlBinding.formBackendNodeId === form,
+      step: scope.step,
+    },
+  );
   if (activation !== 'ordinary') throw stopFor(activation);
   return {
     ...group,

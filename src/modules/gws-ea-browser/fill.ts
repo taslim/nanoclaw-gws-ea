@@ -221,7 +221,12 @@ export async function fillBoundBrowserSecret(
         throw forbidden('This sign-in flow requires native form submission.');
       },
       undefined,
-      { kind: 'submit', assertActive: context.assertActive },
+      {
+        kind: 'submit',
+        scope: { jobId: context.job.id, db: context.store.db },
+        assertActive: context.assertActive,
+        remaining: context.remaining,
+      },
     );
     await context.assertActive();
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };

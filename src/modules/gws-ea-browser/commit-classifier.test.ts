@@ -1,3 +1,12 @@
+import {
+  classifyControlFacts,
+  classifyCredentialControlFacts,
+  classifyCredentialNavigation,
+  classifyNavigationUrl,
+  registerReviewedMerchantFlow,
+  type ActionClass,
+} from './control-policy.js';
+import type { ControlFacts, ControlRegion } from './control-facts.js';
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
@@ -8,17 +17,9 @@ afterEach(() => vi.restoreAllMocks());
 import {
   activateControl,
   classifyActivation,
-  classifyControlFacts,
-  classifyCredentialControlFacts,
-  classifyCredentialNavigation,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   refusedScriptRequest,
-  registerReviewedMerchantFlow,
-  type ActionClass,
   type ActivationIntent,
-  type ControlFacts,
-  type ControlRegion,
 } from './commit-classifier.js';
 
 const button = (name: string, changes: Partial<ControlFacts> = {}): ControlFacts => ({

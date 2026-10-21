@@ -1,3 +1,4 @@
+import { classifyNavigationUrl } from './control-policy.js';
 import { beginBrowserDiagnosticAction, captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import path from 'node:path';
 import { errors, type Page } from 'playwright-core';
@@ -9,10 +10,8 @@ import {
   activateControl,
   BrowserActivationError,
   BrowserSiteBusyError,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
-  readControlFacts,
   registrableSite,
   withBrowserJobNavigation,
   type ActivationIntent,
@@ -37,7 +36,7 @@ import {
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { pageHasSecret, pageMayShowSecret } from './page-privacy.js';
+import { pageMayShowSecret } from './page-privacy.js';
 import { readBrowserPolicy } from './policy.js';
 import { browserOperationId, type BrowserOperationContext, type BrowserQueuedAction } from './actions.js';
 import {
@@ -48,7 +47,6 @@ import {
 } from './recording.js';
 import {
   isReadOnlyBrowserAction,
-  isSecretBrowserField,
   browserKeyboardSubmitTarget,
   prepareBrowserActionFacts,
   enrichBrowserActionFacts,
@@ -63,7 +61,7 @@ import {
   type BrowserBatchOptions,
   type BrowserBatch,
 } from './actions.js';
-import { ControlFactsUnavailableError, type ControlFacts } from './control-facts.js';
+import { ControlFactsUnavailableError, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { givenAddressStop } from './web-address.js';
 import { BrowserLocatorError, resolveLocator } from './locators.js';
 
@@ -190,9 +188,9 @@ function givenText(action: BrowserAction): string[] {
 
 /** Payment details are never entered (R12); passwords and codes only through the host's own fills. */
 async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<ControlFacts> {
-  const facts = await readControlFacts(page, target.element);
+  const facts = await readPageControlFacts(page, target.element);
   if (facts.cardEntry === true) throw new BrowserBatchStop('card_field');
-  if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
+  if (facts.secretEntry) throw new BrowserBatchStop('secret_field');
   return facts;
 }
 
@@ -205,7 +203,6 @@ async function fieldInput(
   guard: BrowserNavigationGuard,
   fields: ReadonlyArray<{ readonly target: PinnedBrowserRef; readonly value: string }>,
 ): Promise<void> {
-  for (const { target } of fields) if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
   await context.assertActive();
   await guard.duringAction(context.remaining(), async () => {
     for (const { target, value } of fields) {
@@ -414,6 +411,7 @@ async function executeBatch(
   const intent = (kind: ActivationIntent['kind'], target?: PinnedBrowserRef): ActivationIntent => ({
     ...(target ? { onFacts: (facts: ControlFacts) => controls.set(target.ref, facts) } : {}),
     kind,
+    scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
     remaining: context.remaining,
   });
@@ -453,12 +451,10 @@ async function executeBatch(
       let pressed = false;
       try {
         await context.assertActive();
-        if (action.kind !== 'navigate' && /^https?:/u.test(page.url())) {
-          const lease = options.siteAccess
-            ? { acquired: (await options.siteAccess(new URL(page.url()))) === 'ordinary', waitingJobs: [] }
-            : await new SiteLeaseStore(context.store.db).acquire(context.job.id, page.url());
-          await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:action-release`);
-          if (!lease.acquired) throw new BrowserBatchStop('site_busy');
+        // A signed-out check may share another job's held checkout; that ownership can change while it waits.
+        // The job's own active-site lease is already owned by the enclosing navigation scope.
+        if (action.kind !== 'navigate' && options.siteAccess && /^https?:/u.test(page.url())) {
+          if ((await options.siteAccess(new URL(page.url()))) !== 'ordinary') throw new BrowserBatchStop('site_busy');
         }
         if (options.record !== false && context.kind !== 'watch_check') {
           const { db } = context.store;
@@ -570,7 +566,9 @@ async function executeBatch(
             break;
           case 'key':
             if (target) {
-              if (await isSecretBrowserField(target)) throw new BrowserBatchStop('secret_field');
+              const facts = await readPageControlFacts(page, target.element);
+              if (facts.secretEntry) throw new BrowserBatchStop('secret_field');
+              controls.set(target.ref, facts);
               const press = (): Promise<void> =>
                 nativeAction(context, (options) => target.element.press(action.key, options));
               if (ENTER_KEY.test(action.key)) {
@@ -640,8 +638,7 @@ async function executeBatch(
           }
           case 'screenshot':
             // The same isolated-world scan as the card's picture, shadow roots included (KTD6).
-            if ((await pageHasSecret(page)) || (await pageMayShowSecret(page)))
-              throw new BrowserBatchStop('secret_field');
+            if (await pageMayShowSecret(page)) throw new BrowserBatchStop('secret_field');
             else {
               const image = {
                 mime_type: 'image/png',
@@ -750,7 +747,11 @@ async function executeBatch(
   if (!page.isClosed()) {
     try {
       // Still inside the job's operation: the host settles a cookie banner before it observes (R18).
-      const cookieBanner = await settleCookieBanners(page, context.assertActive);
+      const cookieBanner = await settleCookieBanners(page, {
+        scope: { jobId: context.job.id, db: context.store.db },
+        assertActive: context.assertActive,
+        remaining: context.remaining,
+      });
       observation = await observePage(page, context.assertActive, { cookieBanner });
     } catch (error) {
       if (!unapproved) {

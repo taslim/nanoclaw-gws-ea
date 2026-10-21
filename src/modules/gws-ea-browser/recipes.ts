@@ -1,5 +1,5 @@
 import type { BrowserRecipeStep, RecipeCheckpoint } from './recording.js';
-import { browserKeyboardSubmitTarget, isSecretBrowserField } from './action-targets.js';
+import { browserKeyboardSubmitTarget } from './action-targets.js';
 import { browserActionRefs, type BrowserAction, type BrowserBatchOptions } from './actions.js';
 import {
   ariaNodes,
@@ -15,7 +15,8 @@ import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isRecord } from '../../gws-ea/validation.js';
-import { classifyNavigationUrl, readControlFacts } from './commit-classifier.js';
+import { classifyNavigationUrl } from './control-policy.js';
+import { readPageControlFacts } from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { browserSite } from './leases.js';
 import {
@@ -28,7 +29,7 @@ import {
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { redactPageText } from './page-privacy.js';
+import { redactPageData } from './page-privacy.js';
 import type { BrowserExecutionContext, BrowserOperationContext, BrowserQueuedAction } from './actions.js';
 
 export interface BrowserRecipeParameter {
@@ -419,8 +420,8 @@ export async function executeRecipe(
     status: 'checkpoint_failed',
     ...coverage(),
     step,
-    expected: JSON.parse(redactPageText(page, JSON.stringify(expected))) as unknown,
-    found: JSON.parse(redactPageText(page, JSON.stringify(found))) as unknown,
+    expected: redactPageData(page, expected),
+    found: redactPageData(page, found),
     ...(!page.isClosed() ? { observation: await observePage(page, context.assertActive) } : {}),
     repeat_safe: repeatSafe,
   });
@@ -439,7 +440,7 @@ export async function executeRecipe(
     if (parameter?.kind === 'target_name' && step.clickHref && targets[0]) {
       const element = await resolveLocator(page, targets[0]);
       try {
-        const href = (await readControlFacts(page, element)).href;
+        const href = (await readPageControlFacts(page, element)).href;
         if (!href || !sameLinkShape(step.clickHref, href) || classifyNavigationUrl(href) !== 'ordinary')
           return failed(index, { target_url: step.clickHref }, { target_url: 'origin, path or query keys changed' });
         activeHrefs.set(checkpointUrl(step.clickHref), checkpointUrl(href));
@@ -536,7 +537,8 @@ export async function executeRecipe(
         for (const locator of targets.slice(0, expectedInputs.length)) {
           const element = await resolveLocator(page, locator, false);
           try {
-            if (await isSecretBrowserField({ element })) throw new Error('The recorded input became a secret field');
+            if ((await readPageControlFacts(page, element)).secretEntry)
+              throw new Error('The recorded input became a secret field');
             actual.push(await element.inputValue());
           } finally {
             await element.dispose();

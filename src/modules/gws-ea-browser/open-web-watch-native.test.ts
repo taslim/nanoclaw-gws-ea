@@ -63,7 +63,7 @@ import type { ChromeConnection } from './connection.js';
 import { BrowserStore } from './db.js';
 import type { BrowserAction } from './actions.js';
 import { setBrowserAdmissionReady } from './group.js';
-import { prepareMerchantPage } from './merchant-signatures.js';
+import { prepareMerchantPage } from './merchant-read.js';
 import {
   WATCHED,
   openWebFixture,

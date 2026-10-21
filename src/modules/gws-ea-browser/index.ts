@@ -245,7 +245,6 @@ export type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js'
 export {
   activateControl,
   classifyActivation,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
@@ -303,3 +302,5 @@ register({
     }
   },
 });
+
+export { classifyNavigationUrl } from './control-policy.js';

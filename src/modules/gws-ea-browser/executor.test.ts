@@ -5,17 +5,9 @@ import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import './index.js';
 import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
-import { isSecretBrowserField } from './action-targets.js';
-import type { PinnedBrowserRef } from './observe.js';
+import { isSensitiveField } from './authentication-signatures.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { registerPageSecret } from './page-privacy.js';
-
-// A fake page has no isolated worlds, so its scan for secret values would fail closed; native suites cover the
-// scan. The host's own secret on a page still refuses a screenshot here.
-vi.mock('./page-privacy.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./page-privacy.js')>()),
-  pageMayShowSecret: vi.fn(async () => false),
-}));
 
 it('rejects unknown actions and clipboard shortcuts without running a partial batch', () => {
   expect(() =>
@@ -87,14 +79,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   expect(screenshots).toBe(2);
 });
 
-it('refuses ordinary typing into new, confirming and show-password-toggled credential fields', async () => {
-  const field = (attributes: Record<string, string>) =>
-    ({
-      element: {
-        evaluate: async (read: (node: unknown) => unknown) =>
-          read({ getAttribute: (name: string) => attributes[name] ?? null }),
-      },
-    }) as unknown as Pick<PinnedBrowserRef, 'element'>;
+it('recognizes new, confirming and show-password-toggled credential fields', () => {
   const secret: ReadonlyArray<Record<string, string>> = [
     { type: 'text', name: 'password', autocomplete: 'new-password' },
     { type: 'text', name: 'confirm_password' },
@@ -106,8 +91,10 @@ it('refuses ordinary typing into new, confirming and show-password-toggled crede
     { type: 'email', name: 'email', autocomplete: 'email' },
     { type: 'text', name: 'passenger_name' },
   ];
-  for (const attributes of secret) expect(await isSecretBrowserField(field(attributes))).toBe(true);
-  for (const attributes of ordinary) expect(await isSecretBrowserField(field(attributes))).toBe(false);
+  for (const facts of secret)
+    expect(isSensitiveField({ name: '', type: '', autocomplete: '', ...facts, label: facts['aria-label'] })).toBe(true);
+  for (const facts of ordinary)
+    expect(isSensitiveField({ name: '', type: '', autocomplete: '', ...facts })).toBe(false);
 });
 
 describe("the assistant's own address in a site field (KTD14, R23)", () => {
@@ -178,3 +165,9 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
       await expect(executeBrowserBatch(context, payload), JSON.stringify(payload)).rejects.toBe(opened);
   });
 });
+
+// These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
+vi.mock('./control-facts.js', async (original) => ({
+  ...(await original<typeof import('./control-facts.js')>()),
+  readPageSecretValues: vi.fn(async () => []),
+}));

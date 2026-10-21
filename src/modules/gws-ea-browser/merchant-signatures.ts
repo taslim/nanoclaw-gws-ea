@@ -3,7 +3,8 @@
  * digital delivery, marketplace financing and every unreadable/drifted layout.
  */
 import type { ElementHandle, Locator, Page } from 'playwright-core';
-import type { ActionClass, ControlFacts, ReviewedMerchantFlow } from './commit-classifier.js';
+import type { ActionClass, ReviewedMerchantFlow } from './control-policy.js';
+import type { ControlFacts } from './control-facts.js';
 import { completePurchaseFacts, moneyMinor, type PurchaseFacts } from './fingerprint.js';
 import {
   REVIEWED_CHECKOUT_MISSING,
@@ -11,9 +12,7 @@ import {
   type MerchantPurchaseEvidence,
   type MerchantSignature,
 } from './merchant-contract.js';
-import { genericCheckoutSignature } from './generic-signature.js';
 import { resyReservationSignature } from './resy-signature.js';
-export type { MerchantPurchaseEvidence } from './merchant-contract.js';
 
 export const AMAZON_RETAIL = Object.freeze({
   id: 'amazon-us-retail-v1',
@@ -275,10 +274,6 @@ export const amazonRetailFlow: ReviewedMerchantFlow = {
   },
 };
 
-export type MerchantPurchaseRead =
-  | (Extract<MerchantCheckoutRead, { status: 'ready' }> & { signature: MerchantSignature })
-  | Exclude<MerchantCheckoutRead, { status: 'ready' }>;
-
 /** Every value comes from visible host-selected DOM, and the activating element must match the signature. */
 async function readAmazonPurchase(page: Page, target?: ElementHandle): Promise<MerchantCheckoutRead> {
   const url = new URL(page.url());
@@ -443,39 +438,3 @@ export const amazonRetailSignature: MerchantSignature = {
  * one of them: a flow that matched every page would press any control directly (KTD4).
  */
 export const merchantSignatures: readonly MerchantSignature[] = [amazonRetailSignature, resyReservationSignature];
-/** The page's reviewed signature, which keeps precedence on its site, else the generic one for any web page. */
-export function merchantSignatureFor(page: Page): MerchantSignature | undefined {
-  try {
-    const url = new URL(page.url());
-    return (
-      merchantSignatures.find((signature) => signature.matches(url)) ??
-      (genericCheckoutSignature.matches(url) ? genericCheckoutSignature : undefined)
-    );
-  } catch {
-    return undefined;
-  }
-}
-export async function prepareMerchantPage(page: Page): Promise<void> {
-  for (const signature of [...merchantSignatures, genericCheckoutSignature]) await signature.preparePage?.(page);
-}
-/**
- * Reads the page's checkout with its signature. A reviewed flow that no longer matches its page fails closed
- * for that flow; it never falls back to the generic one.
- */
-export async function readMerchantPurchase(
-  page: Page,
-  target?: ElementHandle,
-  expected?: PurchaseFacts,
-): Promise<MerchantPurchaseRead> {
-  const signature = merchantSignatureFor(page);
-  if (!signature) return { status: 'checkout_lapsed' };
-  const read = await signature.readPurchase(page, target, expected);
-  return read.status === 'ready' ? { ...read, signature } : read;
-}
-/** The page's signature's evidence of the purchase `attempted` made. */
-export async function readMerchantPurchaseEvidence(
-  page: Page,
-  attempted: PurchaseFacts,
-): Promise<MerchantPurchaseEvidence | undefined> {
-  return merchantSignatureFor(page)?.readEvidence(page, attempted);
-}

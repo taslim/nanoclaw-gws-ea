@@ -22,6 +22,7 @@ import {
   PAYMENT_VOCABULARY,
   paymentProcessorHost,
   readCheckoutRegion,
+  readPageControlFacts,
   type CheckoutBox,
   type CheckoutField,
   type CheckoutRead,
@@ -42,7 +43,8 @@ import type {
   MerchantPurchaseEvidence,
   MerchantSignature,
 } from './merchant-contract.js';
-import type { StructuredBrowserLocator } from './locators.js';
+import { captureElementLocator, resolveLocator, type StructuredBrowserLocator } from './locators.js';
+import { classifyControlFacts } from './control-policy.js';
 
 const VOCABULARY = {
   /** A total, an amount due or what will be paid; a subtotal is none. */
@@ -755,7 +757,6 @@ function checkoutMerchant(page: Page): string | undefined {
 
 /** Re-finds an approved control by its locator, or undefined when the page no longer shows it there. */
 async function locate(page: Page, locator: StructuredBrowserLocator): Promise<ElementHandle | undefined> {
-  const { resolveLocator } = await import('./locators.js');
   return resolveLocator(page, locator).catch(() => undefined);
 }
 
@@ -764,7 +765,6 @@ async function locate(page: Page, locator: StructuredBrowserLocator): Promise<El
  * carry the same name. Two different ones leave no next step to press.
  */
 async function findGenericCommit(page: Page): Promise<ElementHandle | undefined> {
-  const { classifyControlFacts, readControlFacts } = await import('./commit-classifier.js');
   const found: Array<{ element: ElementHandle; name: string }> = [];
   const discard = async (element: ElementHandle): Promise<void> => {
     await element.dispose().catch(() => undefined);
@@ -790,7 +790,7 @@ async function findGenericCommit(page: Page): Promise<ElementHandle | undefined>
         await discard(handle);
         continue;
       }
-      const facts = await readControlFacts(page, handle).catch(() => undefined);
+      const facts = await readPageControlFacts(page, handle).catch(() => undefined);
       if (facts && classifyControlFacts(facts) === 'purchase_control')
         found.push({ element: handle, name: squash(facts.name) });
       else await discard(handle);
@@ -821,7 +821,6 @@ async function readGenericPurchase(
     if (!frame || frame.page() !== page || !merchant) return { status: 'checkout_lapsed' };
     const [read, controlBox] = await Promise.all([readCheckoutRegion(page, element), element.boundingBox()]);
     if (!controlBox) return { status: 'checkout_lapsed' };
-    const { captureElementLocator } = await import('./locators.js');
     let locator: StructuredBrowserLocator;
     try {
       locator = await captureElementLocator(element);

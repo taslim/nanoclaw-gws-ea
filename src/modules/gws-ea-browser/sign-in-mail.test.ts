@@ -837,3 +837,9 @@ describe('a signup waiting for its email verification', () => {
     expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'not_watched' });
   });
 });
+
+// These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
+vi.mock('./control-facts.js', async (original) => ({
+  ...(await original<typeof import('./control-facts.js')>()),
+  readPageSecretValues: vi.fn(async () => []),
+}));

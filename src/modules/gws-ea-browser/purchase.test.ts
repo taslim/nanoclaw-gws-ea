@@ -41,7 +41,8 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
 import { BrowserQueue } from './queue.js';
-import { readMerchantPurchase, AMAZON_RETAIL } from './merchant-signatures.js';
+import { readMerchantPurchase } from './merchant-read.js';
+import { AMAZON_RETAIL } from './merchant-signatures.js';
 import { observePage } from './observe.js';
 import { PurchaseAuthorityStore, notifyPurchaseOutcome, type SpendingAuthority } from './authority.js';
 import {

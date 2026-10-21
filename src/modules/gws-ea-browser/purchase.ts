@@ -64,7 +64,7 @@ import {
   readMerchantPurchase,
   readMerchantPurchaseEvidence,
   type MerchantPurchaseRead,
-} from './merchant-signatures.js';
+} from './merchant-read.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
 import { writeBrowserNotice } from './notices.js';
@@ -640,6 +640,12 @@ export async function executeAuthorizedPurchase(
           await arrived;
         },
         { commitStarted, ...(facts.generic ? { checkout: { origin: facts.origin } } : {}) },
+        {
+          kind: 'click',
+          scope: { jobId: context.job.id, db: context.store.db },
+          assertActive: context.assertActive,
+          remaining: context.remaining,
+        },
       );
     };
     /** The outcome is told to the job, and the merchant's site goes to its waiters. */
@@ -915,6 +921,7 @@ async function commitFree(
           attempted = true;
         },
       },
+      { kind: 'click', scope, assertActive: context.assertActive, remaining: context.remaining },
     );
   } catch (error) {
     if (!attempted && error instanceof PurchaseAuthorityError)

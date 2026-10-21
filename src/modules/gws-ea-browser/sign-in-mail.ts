@@ -1,3 +1,4 @@
+import { classifyNavigationUrl } from './control-policy.js';
 import { createHash } from 'node:crypto';
 import type { Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
@@ -35,7 +36,6 @@ import { browserDelegateGuard } from './cancel.js';
 import type { BrowserJob, BrowserRequest } from './db.js';
 import {
   activateControl,
-  classifyNavigationUrl,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
   withBrowserJobNavigation,
@@ -574,7 +574,12 @@ export async function executeSignInCode(
             throw forbidden('This sign-in flow requires native submission.');
           },
           undefined,
-          { kind: 'submit', assertActive: context.assertActive },
+          {
+            kind: 'submit',
+            scope: { jobId: context.job.id, db: context.store.db },
+            assertActive: context.assertActive,
+            remaining: context.remaining,
+          },
         );
       }
       await context.assertActive();

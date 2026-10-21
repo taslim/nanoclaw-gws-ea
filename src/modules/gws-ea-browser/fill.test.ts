@@ -135,6 +135,7 @@ function fixture(origin = 'https://www.shop.example') {
     remaining: () => 10_000,
     runtime: { closeJob: vi.fn(async () => undefined) },
     job: { id: 'job' },
+    store: { db: {} },
   } as unknown as BrowserExecutionContext;
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
@@ -380,3 +381,9 @@ it('offers a newly attached login iframe origin without repeatedly refreshing an
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
 });
+
+// These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
+vi.mock('./control-facts.js', async (original) => ({
+  ...(await original<typeof import('./control-facts.js')>()),
+  readPageSecretValues: vi.fn(async () => []),
+}));

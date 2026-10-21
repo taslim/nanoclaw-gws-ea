@@ -8,6 +8,7 @@ import {
   browserPageReplayUrl,
   collectSecretFields,
   redactPageText,
+  redactPageData,
   type BrowserDocumentIdentity,
   type BrowserReplayUrl,
 } from './page-privacy.js';
@@ -169,7 +170,7 @@ export async function observePage(
     if (current.protocol === 'https:' && domain && state.siteOriginsKey !== originsKey && siteInfoProviders.length) {
       site = { origin: current.origin, untrusted: true };
       for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
-      site = JSON.parse(redactPageText(page, JSON.stringify(site))) as BrowserObservation['site'];
+      site = redactPageData(page, site) as BrowserObservation['site'];
       state.siteOriginsKey = originsKey;
     }
   } catch (_error) {
@@ -196,7 +197,7 @@ export async function snapshotBrowserStructure(page: Page): Promise<BrowserStruc
   const structure = {
     generation,
     url: redactPageText(page, page.url()),
-    tree: JSON.parse(redactPageText(page, JSON.stringify(tree))) as unknown,
+    tree: redactPageData(page, tree),
     replayUrl: browserPageReplayUrl(page),
   };
   state.document = document;

@@ -11,7 +11,7 @@ import {
 } from './observe.js';
 import { redactPageText } from './page-privacy.js';
 import { browserSite, type SiteLease } from './leases.js';
-import { merchantSignatureFor } from './merchant-signatures.js';
+import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
@@ -210,12 +210,16 @@ function structuralFailure(result: Record<string, unknown>): boolean {
  * so nothing the site shows over the page asks the agent to mark it again.
  */
 async function readRegionCheck(
+  context: BrowserWatchExecutionContext,
   page: Page,
   region: StructuredBrowserLocator,
   result: Record<string, unknown>,
-  assertActive: () => Promise<void>,
 ): Promise<BrowserWatchCheckResult> {
-  const banner = await settleCookieBanners(page, assertActive);
+  const banner = await settleCookieBanners(page, {
+    scope: { jobId: context.job.id, db: context.store.db },
+    assertActive: context.assertActive,
+    remaining: context.remaining,
+  });
   const covered = banner !== undefined && banner.status !== 'rejected';
   if (result.status !== 'completed') {
     const failure = watchCheckFailure(result);
@@ -227,7 +231,7 @@ async function readRegionCheck(
   if (typeof snapshot === 'string' && hasBrowserChallenge(snapshot)) return { status: 'blocked' };
   // The replay checked the route; the region's own frames are checked as it is found.
   const text = await readWatchRegion(page, region, false);
-  await assertActive();
+  await context.assertActive();
   if (text !== undefined) return { status: 'region_read', text };
   return covered ? { status: 'failed' } : { status: 'region_missing', reason: 'region_not_found' };
 }
@@ -315,7 +319,7 @@ export async function runBrowserWatchCheck(
               { recipe_id: input.recipeId, parameters: input.parameters },
               { page: signedOut, record: false, readOnly: true, siteAccess },
             );
-            if (input.region) return readRegionCheck(signedOut, input.region, result, assertActive);
+            if (input.region) return readRegionCheck(context, signedOut, input.region, result);
             if (result.status !== 'completed') return watchCheckFailure(result);
             const availability = await merchantSignatureFor(signedOut)?.readAvailability?.(signedOut, {
               venueId: input.venueId,

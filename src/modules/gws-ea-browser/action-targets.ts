@@ -1,7 +1,8 @@
-import type { ControlFacts } from './control-facts.js';
+import { classifyControlFacts, classifyNavigationUrl } from './control-policy.js';
+import { readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { browserActionRefs } from './actions.js';
 import { browserStructureFacts } from './observe.js';
-import { browserPageReplayUrl, redactPageText } from './page-privacy.js';
+import { browserPageReplayUrl, redactPageData } from './page-privacy.js';
 import {
   ariaNodes,
   flatten,
@@ -11,32 +12,9 @@ import {
 } from './locators.js';
 import type { BrowserRecipeStep } from './recording.js';
 import type { ElementHandle, JSHandle, Page } from 'playwright-core';
-import { isSensitiveField } from './authentication-signatures.js';
-import {
-  classifyActivation,
-  classifyControlFacts,
-  classifyNavigationUrl,
-  readControlFacts,
-  type ActivationIntent,
-} from './commit-classifier.js';
+import { classifyActivation, type ActivationIntent } from './commit-classifier.js';
 import type { BrowserRef, PinnedBrowserRef } from './observe.js';
 import type { BrowserAction } from './actions.js';
-
-export async function isSecretBrowserField(target: Pick<PinnedBrowserRef, 'element'>): Promise<boolean> {
-  const facts = await target.element.evaluate((node) => {
-    const e = node as unknown as { getAttribute(name: string): string | null };
-    const read = (name: string): string => e.getAttribute(name) ?? '';
-    return {
-      type: read('type'),
-      autocomplete: read('autocomplete'),
-      name: read('name'),
-      id: read('id'),
-      label: read('aria-label'),
-      placeholder: read('placeholder'),
-    };
-  });
-  return isSensitiveField(facts);
-}
 
 /** The keyboard and recipe paths must identify the very same native submit control. */
 export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSHandle<unknown>> {
@@ -53,9 +31,13 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
  * submits by anything but GET. Its replay loads GET documents only (KTD2), so a script that posts is refused.
  */
 async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: ActivationIntent['kind']): Promise<boolean> {
-  if (await isSecretBrowserField(target)) return false;
-  const facts = await readControlFacts(page, target.element);
-  if (facts.transaction || facts.cardEntry || (await classifyActivation(page, target.element, kind)) !== 'ordinary')
+  const facts = await readPageControlFacts(page, target.element);
+  if (
+    facts.secretEntry ||
+    facts.transaction ||
+    facts.cardEntry ||
+    (await classifyActivation(page, target.element, kind)) !== 'ordinary'
+  )
     return false;
   return facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get';
 }
@@ -130,7 +112,7 @@ export function prepareBrowserActionFacts(
       before: { url: checkpointUrl(snapshot.replayUrl), ...(heading ? { heading } : {}) },
       readOnly: false,
     };
-    return redactPageText(page, JSON.stringify(step)) === JSON.stringify(step) ? structuredClone(step) : undefined;
+    return JSON.stringify(redactPageData(page, step)) === JSON.stringify(step) ? structuredClone(step) : undefined;
   } catch {
     return undefined;
   }
@@ -187,7 +169,7 @@ export function enrichBrowserActionFacts(
           (facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get')
         );
       });
-    return redactPageText(page, JSON.stringify(step)) === JSON.stringify(step) ? step : undefined;
+    return JSON.stringify(redactPageData(page, step)) === JSON.stringify(step) ? step : undefined;
   } catch {
     return undefined;
   }

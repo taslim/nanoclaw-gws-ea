@@ -11,7 +11,7 @@ import {
 } from 'playwright-core';
 
 import { stopChrome } from './chrome.js';
-import { prepareMerchantPage } from './merchant-signatures.js';
+import { prepareMerchantPage } from './merchant-read.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { documentGate } from './document-gate.js';
 import { coverPageTargets } from './page-targets.js';
