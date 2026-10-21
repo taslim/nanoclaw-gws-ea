@@ -293,7 +293,6 @@ export async function finishBrowserJobCancellation(
       try {
         await queue.interruptJob(result.job.id, running);
       } finally {
-        // Closing this job must not strand its site's waiters.
         await queue.runtime.closeJob(result.job.id).catch(() => undefined);
         await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
       }

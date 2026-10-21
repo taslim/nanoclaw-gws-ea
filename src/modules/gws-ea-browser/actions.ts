@@ -49,20 +49,23 @@ export interface BrowserQueuedAction {
   budgetMs?: number;
 }
 
-export type BrowserActionName =
-  | 'browser'
-  | 'fill_secret'
-  | 'credential_form'
-  | 'sign_in_code'
-  | 'browser_relay_sign_in'
-  | 'save_recipe'
-  | 'run_recipe'
-  | 'request_consent'
-  | 'purchase'
-  | 'browser_purchase_commit'
-  | 'watch'
-  | 'list_watches'
-  | 'cancel_watch'
-  | 'browser_watch_book';
+export const BROWSER_ACTION_NAMES = [
+  'browser',
+  'fill_secret',
+  'credential_form',
+  'sign_in_code',
+  'browser_relay_sign_in',
+  'save_recipe',
+  'run_recipe',
+  'request_consent',
+  'purchase',
+  'browser_purchase_commit',
+  'watch',
+  'list_watches',
+  'cancel_watch',
+  'browser_watch_book',
+] as const;
+
+export type BrowserActionName = (typeof BROWSER_ACTION_NAMES)[number];
 
 export type BrowserActions = Readonly<Record<BrowserActionName, BrowserQueuedAction>>;

@@ -1,4 +1,3 @@
-/** Owns the assistant's Chrome process, inherited pipe, public proxy and job pages. */
 import type { Page } from 'playwright-core';
 
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';

@@ -1,8 +1,9 @@
-/** Passive, bounded facts only: network payloads and raw failure text never cross this boundary. */
 import { createRequire } from 'node:module';
 
 import type { Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
+
+import { BROWSER_ACTION_NAMES } from './actions.js';
 
 const manifest: unknown = createRequire(import.meta.url)('playwright-core/package.json');
 const playwrightVersion =
@@ -24,22 +25,7 @@ const RESOURCES = new Set([
   'manifest',
   'other',
 ]);
-const ACTIONS = new Set([
-  'browser',
-  'fill_secret',
-  'credential_form',
-  'sign_in_code',
-  'save_recipe',
-  'run_recipe',
-  'purchase',
-  'watch',
-  'list_watches',
-  'cancel_watch',
-  'request_consent',
-  'browser_watch_book',
-  'browser_purchase_commit',
-  'browser_relay_sign_in',
-]);
+const ACTIONS = new Set<string>(BROWSER_ACTION_NAMES);
 
 export interface BrowserDiagnosticCorrelation {
   readonly jobId: string;
@@ -151,7 +137,6 @@ export function attachBrowserDiagnostics(page: Page): void {
   page.once('close', () => current.delete(page));
 }
 
-/** Construct each persisted event explicitly; extra properties can never turn into stored payloads. */
 function safeFact(event: BrowserDiagnosticFact): BrowserDiagnosticFact {
   const request = {
     ...(event.source !== 'runtime_error' && event.site ? { site: event.site } : {}),
