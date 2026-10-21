@@ -7,8 +7,9 @@ import type { ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { lookup } from '../../cli/registry.js';
-import { BrowserRuntime, getBrowserRuntime } from './index.js';
-import { getHostStartCallbacks } from '../../host-lifecycle.js';
+import { getBrowserRuntime } from './index.js';
+import { BrowserRuntime } from './runtime.js';
+import { getHostShutdownCallbacks, getHostStartCallbacks } from '../../host-lifecycle.js';
 import { closeDb, initTestDb } from '../../db/index.js';
 import { BrowserQueue } from './queue.js';
 import { BrowserWatchScheduler } from './scheduler.js';
@@ -219,6 +220,64 @@ describe('optional host browser lifecycle', () => {
   it('registers read-only browser health as a host-only command', () => {
     expect(lookup('gws-ea-browser-health')).toMatchObject({ access: 'hidden', hostOnly: true });
   });
+  it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+    'keeps the other native job page usable when one job closes',
+    async () => {
+      await ensureBrowserPaths(browserPaths(file));
+      await writePrivateFile(
+        file,
+        JSON.stringify({
+          schemaVersion: 1,
+          enabled: true,
+          chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME,
+        }),
+      );
+      const [first, second] = await Promise.all([runtime.pageForJob('first'), runtime.pageForJob('second')]);
+      expect(first).not.toBe(second);
+      expect(first.viewportSize()).toBeNull();
+      expect(second.viewportSize()).toBeNull();
+      await runtime.closeJob('first');
+      expect(first.isClosed()).toBe(true);
+      expect(await second.evaluate('21 * 2')).toBe(42);
+      expect(await runtime.pageForJob('second')).toBe(second);
+    },
+    30_000,
+  );
+  it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+    'stops the owned Chrome after its connection loses target setup',
+    async () => {
+      await ensureBrowserPaths(browserPaths(file));
+      await writePrivateFile(
+        file,
+        JSON.stringify({
+          schemaVersion: 1,
+          enabled: true,
+          chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME,
+        }),
+      );
+      const connect = connection.connectChromePipe;
+      const spawn = vi.spyOn(chrome, 'spawnChrome');
+      vi.spyOn(connection, 'connectChromePipe').mockImplementationOnce(async (child, paths) => {
+        const attached = await connect(child, paths);
+        vi.spyOn(attached.context, 'newCDPSession').mockRejectedValueOnce(new Error('Target lost during setup'));
+        return attached;
+      });
+      try {
+        await expect(runtime.connection()).rejects.toMatchObject({ code: 'browser_unavailable' });
+        const spawned = spawn.mock.results[0];
+        if (spawned?.type !== 'return') throw new Error('Expected an owned Chrome process');
+        const child = spawned.value;
+        expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+        expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
+        const state = runtime.state();
+        await runtime.shutdown();
+        if (state.proxy.state === 'listening') expect(await listening(state.proxy.port)).toBe(false);
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+    30_000,
+  );
   it('bounds a stalled Chrome attachment and reports unavailable without retaining startup admission', async () => {
     await ensureBrowserPaths(browserPaths(file));
     await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
@@ -258,4 +317,49 @@ describe('optional host browser lifecycle', () => {
       vi.restoreAllMocks();
     }
   });
+  it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+    'closes the owned Chrome and proxy when optional scheduler shutdown fails',
+    async () => {
+      const db = await initTestDb();
+      await ensureBrowserPaths(browserPaths(file));
+      await writePrivateFile(
+        file,
+        JSON.stringify({ schemaVersion: 1, enabled: true, chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME }),
+      );
+      vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+      vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
+      vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
+      vi.spyOn(BrowserQueue.prototype, 'start').mockResolvedValue();
+      const stopQueue = vi.spyOn(BrowserQueue.prototype, 'stop').mockResolvedValue();
+      vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
+      vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
+      vi.spyOn(purchases, 'sweepBrowserPurchaseState').mockResolvedValue();
+      vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
+      vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
+      vi.spyOn(BrowserWatchScheduler.prototype, 'start').mockImplementation(() => undefined);
+      vi.spyOn(BrowserWatchScheduler.prototype, 'stop').mockRejectedValue(new Error('Scheduler cleanup failed'));
+      const owned = getBrowserRuntime();
+      try {
+        await getHostStartCallbacks().at(-1)!({
+          db,
+          signal: new AbortController().signal,
+          deliveryAdapter: { deliver: async () => undefined },
+        });
+        const attached = await owned.connection();
+        const state = owned.state();
+        if (state.proxy.state !== 'listening') throw new Error('Expected an owned proxy');
+        expect(await listening(state.proxy.port)).toBe(true);
+        await expect(getHostShutdownCallbacks().at(-1)!()).rejects.toThrow('Scheduler cleanup failed');
+        expect(attached.browser.isConnected()).toBe(false);
+        expect(attached.child.exitCode !== null || attached.child.signalCode !== null).toBe(true);
+        expect(await listening(state.proxy.port)).toBe(false);
+        expect(stopQueue).toHaveBeenCalledOnce();
+      } finally {
+        await owned.shutdown();
+        vi.restoreAllMocks();
+        await closeDb();
+      }
+    },
+    30_000,
+  );
 });

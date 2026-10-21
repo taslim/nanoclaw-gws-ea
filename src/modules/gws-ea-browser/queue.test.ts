@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
+import type { Page } from 'playwright-core';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -88,6 +90,54 @@ function responses(): unknown[] {
     db.close();
   }
 }
+
+it('persists observed HTTP response evidence with the exact request answer without network payloads', async () => {
+  const events = new EventEmitter();
+  const page = Object.assign(events, {
+    context: () => ({ browser: () => ({ version: () => '155.0.0.0' }) }),
+  }) as unknown as Page;
+  registerBrowserQueuedAction('queue_diagnostic_fixture', {
+    validate: () => ({}),
+    async execute(context) {
+      await context.page();
+      const networkRequest = {
+        url: () => 'https://fixture.example/private-secret-sentinel?token=secret-sentinel',
+        method: () => 'GET',
+        resourceType: () => 'document',
+        headers: () => {
+          throw new Error('Diagnostics must never read headers');
+        },
+        postData: () => {
+          throw new Error('Diagnostics must never read bodies');
+        },
+      };
+      events.emit('request', networkRequest);
+      events.emit('response', { request: () => networkRequest, status: () => 403 });
+      events.emit('requestfinished', networkRequest);
+      return { status: 'completed' };
+    },
+  });
+  const queue = new BrowserQueue(store, { ...runtime, pageForJob: async () => page });
+  await queue.start();
+  await queue.accept('queue_diagnostic_fixture', {}, session, 'diagnostic-response');
+  await queue.idle();
+  const request = await store.request(browserRequestId(session.id, 'diagnostic-response'));
+  const answer: unknown = JSON.parse(request?.answer_json ?? 'null');
+  expect(answer).toMatchObject({
+    data: {
+      diagnostics: {
+        schema_version: 1,
+        request_id: browserRequestId(session.id, 'diagnostic-response'),
+        runtime: { chrome: '155.0.0.0', playwright: '1.64.0' },
+        events: [
+          { source: 'http_response', site: 'fixture.example', method: 'GET', resource: 'document', status: 403 },
+        ],
+      },
+    },
+  });
+  expect(JSON.stringify(answer)).not.toContain('secret-sentinel');
+  await queue.stop();
+});
 
 it('preserves a sanitized native refusal before commit and uncertainty after a commit marker', async () => {
   registerBrowserQueuedAction('queue_refusal_fixture', {

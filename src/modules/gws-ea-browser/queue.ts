@@ -19,13 +19,14 @@ import { log } from '../../log.js';
 import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserJob, type BrowserRequest } from './db.js';
-import type { BrowserRuntime } from './index.js';
+import type { BrowserRuntime } from './runtime.js';
 import { SiteLeaseStore } from './leases.js';
 import { sweepBrowserStartup } from './start-sweep.js';
 import { readBrowserPolicy } from './policy.js';
 import { reconcileBrowserGroup } from './reconcile.js';
 import { writeBrowserNotice } from './notices.js';
 import { browserAdmissionReady } from './group.js';
+import { BrowserDiagnosticAttempt } from './diagnostics.js';
 
 export const BROWSER_REQUEST_BUDGET_MS = 90_000;
 export const BROWSER_REQUEST_MAX_BUDGET_MS = 100_000;
@@ -107,6 +108,7 @@ export class BrowserQueue {
   private readonly drains = new Map<string, Promise<void>>();
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly running = new Map<string, AbortController>();
+  private readonly diagnosticAttempts = new Map<string, BrowserDiagnosticAttempt>();
   private disconnect: (() => void) | undefined;
   readonly leases: SiteLeaseStore;
 
@@ -264,6 +266,7 @@ export class BrowserQueue {
         await assertActive();
         const page = await this.runtime.pageForJob(job.id);
         await assertActive();
+        this.diagnosticAttempts.get(id)?.observe(page);
         return page;
       },
       assertActive,
@@ -312,6 +315,12 @@ export class BrowserQueue {
       return;
     }
     this.running.set(request.id, controller);
+    const diagnostics = new BrowserDiagnosticAttempt({
+      jobId: request.job_id,
+      requestId: request.id,
+      action: request.action,
+    });
+    this.diagnosticAttempts.set(request.id, diagnostics);
     let timer: NodeJS.Timeout | undefined;
     let execution: Promise<Record<string, unknown>> | undefined;
     try {
@@ -353,6 +362,14 @@ export class BrowserQueue {
             : ((await actions.get(request.action)?.recover?.(started)) ?? result),
       );
     } catch (error) {
+      if (!(error instanceof ActionRefusal))
+        diagnostics.record({
+          source: 'runtime_error',
+          category:
+            error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
+              ? 'unavailable'
+              : 'execution',
+        });
       const latest = await this.store.request(request.id);
       await this.finish(
         started,
@@ -367,6 +384,8 @@ export class BrowserQueue {
       // An interrupted SDK call may finish late. Keep this job quarantined until it settles;
       // its assertActive checks prohibit any further interaction in the meantime.
       if (controller.signal.aborted) await execution?.catch(() => undefined);
+      diagnostics.finish();
+      this.diagnosticAttempts.delete(request.id);
       this.running.delete(request.id);
       await this.releaseJobLeases(request.job_id, request.id);
     }
@@ -443,6 +462,8 @@ export class BrowserQueue {
       const { recordUnknownBrowserPurchaseRequest } = await import('./purchase.js');
       await recordUnknownBrowserPurchaseRequest(request.id);
     }
+    const diagnostics = this.diagnosticAttempts.get(request.id)?.finish();
+    this.diagnosticAttempts.delete(request.id);
     const frame: ResponseFrame =
       result instanceof ActionRefusal
         ? {
@@ -455,6 +476,7 @@ export class BrowserQueue {
             ok: true,
             data: {
               ...result,
+              ...(diagnostics && diagnostics.events.length ? { diagnostics } : {}),
               timing: { accepted_at: request.accepted_at, started_at: latest.started_at, answered_at: at },
             },
           };
