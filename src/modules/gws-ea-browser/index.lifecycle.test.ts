@@ -316,7 +316,13 @@ describe('optional host browser lifecycle', () => {
     const reconcile = vi.spyOn(getBrowserRuntime(), 'reconcile');
     try {
       for (let index = 0; index < 2; index++)
-        expect(await health.handler(health.parseArgs({}), { caller: 'host' })).toMatchObject({ schemaVersion: 1 });
+        expect(await health.handler(health.parseArgs({}), { caller: 'host' })).toMatchObject({
+          schemaVersion: 1,
+          policyVersions: [1, 2],
+          enabled: false,
+          proxy: { state: 'stopped' },
+          chrome: { state: 'stopped' },
+        });
       expect(registration).not.toHaveBeenCalled();
       expect(reconcile).not.toHaveBeenCalled();
       expect(getHostStartCallbacks()).toEqual(callbacks);

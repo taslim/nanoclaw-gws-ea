@@ -1914,6 +1914,15 @@ describe("removal of the assistant's 1Password resources (KTD9, AE5)", () => {
       atStop.push(await exists(vault.tokenFile), provider.vaults.has(vault.vaultId));
     });
 
+    const preview = await describeRemoval(paths, input.instance_id, { onePassword: provider.cli() });
+    expect(preview.onepassword).toMatchObject({
+      vault_id: vault.vaultId,
+      owned: true,
+      item_count: 0,
+      vault: 'delete',
+      runtime_service_account_ids: [vault.runtimeId],
+    });
+
     const outcome = await removeAssistant(paths, input.instance_id, { ...dependencies, uninstallNanoclaw });
 
     expect(order).toEqual(['nanoclaw', 'vault-delete']);
@@ -1951,7 +1960,6 @@ describe("removal of the assistant's 1Password resources (KTD9, AE5)", () => {
   });
 
   it.each([
-    { items: 0, deleteVault: false, vault: 'deleted' },
     { items: 3, deleteVault: false, vault: 'retained' },
     { items: 3, deleteVault: true, vault: 'deleted' },
   ])(

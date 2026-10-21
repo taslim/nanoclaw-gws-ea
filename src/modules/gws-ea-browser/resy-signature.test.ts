@@ -374,9 +374,9 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
       await fixture.close();
     }
   });
-  it('does not accept a different book token as the approved result', async () => {
+  it.each(['book token', 'payment method'])('does not accept a different %s as the approved result', async (drift) => {
     const state = checkoutFixture();
-    state.bookToken = 'different-book-token';
+    if (drift === 'book token') state.bookToken = 'different-book-token';
     const fixture = await loadFixture(state);
     try {
       const checkout = await resyReservationSignature.readPurchase(fixture.page);
@@ -384,7 +384,17 @@ describe.skipIf(!chromePath)('source-backed Resy checkout in owned native Chrome
       const result = expect(resyReservationSignature.waitForResult(fixture.page, 250)).rejects.toThrow(
         'result is unavailable',
       );
-      await checkout.element.click();
+      if (drift === 'book token') await checkout.element.click();
+      else
+        await fixture.page.evaluate(async () => {
+          await fetch('https://api.resy.com/3/book', {
+            method: 'POST',
+            body: new URLSearchParams({
+              book_token: 'secret-book-token',
+              struct_payment_method: JSON.stringify({ id: 102 }),
+            }),
+          });
+        });
       await result;
       expect(await resyReservationSignature.readEvidence(fixture.page)).toBeUndefined();
     } finally {

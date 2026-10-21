@@ -40,11 +40,8 @@ it('uses positive native endpoints and refuses arbitrary JS-only, financial and 
     expect(authenticationEndpoint(new URL(url))).toBe(false);
 });
 
-it('keeps exact-node handoff in a fixed isolated selector and submission in public CDP', async () => {
+it('keeps unsupported Playwright internals and page-world submission out of authentication', async () => {
   const source = await readFile(new URL('./authentication-submit.ts', import.meta.url), 'utf8');
-  expect(source).toContain('selectors.register(name, selectorSource, { contentScript: true })');
-  expect(source).toContain("session.send('DOM.resolveNode'");
-  expect(source).toContain("session.send('Runtime.callFunctionOn'");
   expect(source).not.toMatch(/\._(?:objectId|channel|connection|sessions)\b|\bFetch\./u);
   expect(source).not.toMatch(/\belement\.evaluate\s*\(|\belement\.dispatchEvent\s*\(/u);
 });
@@ -70,12 +67,14 @@ it('treats every password-bearing field as secret, including a show-password tog
     ...facts,
   });
   for (const facts of [
-    field({ type: 'password' }),
+    field({ type: 'password', name: 'pin' }),
     field({ autocomplete: 'new-password' }),
     field({ autocomplete: 'current-password' }),
     field({ name: 'confirm_password' }),
     field({ name: 'passwordConfirmation' }),
     field({ id: 'new-pwd' }),
+    field({ id: 'currentPassword' }),
+    field({ label: 'Repeat password' }),
     field({ label: 'Repeat passphrase' }),
     field({ autocomplete: 'one-time-code' }),
     field({ autocomplete: 'cc-number' }),

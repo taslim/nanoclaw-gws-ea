@@ -94,13 +94,6 @@ it('keeps multiline page text and property values literal so they cannot mint ap
   expect(observation.snapshot).toContain('link "Help" [ref=e2]');
 });
 
-it('refuses screenshots after a value is cleared because page scripts may have copied it into a canvas', async () => {
-  const page = { frames: () => [{ evaluate: async () => [] }] } as unknown as Page;
-  registerPageSecret(page, 'echoed-into-canvas');
-  releasePageSecret(page, 'echoed-into-canvas');
-  expect(await pageHasSecret(page)).toBe(true);
-});
-
 it('permits a fresh document and remembers tainted document identities across history restoration', async () => {
   let loaderId = 'tainted-native-document';
   const page = {
@@ -127,6 +120,9 @@ it('keeps a discovered secret unexportable when its document identity cannot be 
   } as unknown as Page;
   vi.mocked(readPageSecretValues).mockResolvedValueOnce(['unbound-field-value']);
   expect(await pageHasSecret(page)).toBe(true);
+  expect(await pageMayShowSecret(page)).toBe(true);
+  registerPageSecret(page, 'unbound-field-value');
+  releasePageSecret(page, 'unbound-field-value');
   // The next scan sees the field cleared; the unresolved native document identity still refuses export.
   expect(await pageMayShowSecret(page)).toBe(true);
 });

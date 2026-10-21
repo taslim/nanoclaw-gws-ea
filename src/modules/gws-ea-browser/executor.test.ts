@@ -5,7 +5,6 @@ import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import './index.js';
 import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
-import { isSensitiveField } from './authentication-signatures.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { registerPageSecret } from './page-privacy.js';
 
@@ -77,24 +76,6 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   expect(refused).toMatchObject({ status: 'stopped', reason: 'secret_field' });
   expect(refused.images).toBeUndefined();
   expect(screenshots).toBe(2);
-});
-
-it('recognizes new, confirming and show-password-toggled credential fields', () => {
-  const secret: ReadonlyArray<Record<string, string>> = [
-    { type: 'text', name: 'password', autocomplete: 'new-password' },
-    { type: 'text', name: 'confirm_password' },
-    { type: 'text', id: 'currentPassword', autocomplete: 'current-password' },
-    { type: 'text', 'aria-label': 'Repeat password' },
-    { type: 'password', name: 'pin' },
-  ];
-  const ordinary: ReadonlyArray<Record<string, string>> = [
-    { type: 'email', name: 'email', autocomplete: 'email' },
-    { type: 'text', name: 'passenger_name' },
-  ];
-  for (const facts of secret)
-    expect(isSensitiveField({ name: '', type: '', autocomplete: '', ...facts, label: facts['aria-label'] })).toBe(true);
-  for (const facts of ordinary)
-    expect(isSensitiveField({ name: '', type: '', autocomplete: '', ...facts })).toBe(false);
 });
 
 describe("the assistant's own address in a site field (KTD14, R23)", () => {

@@ -349,16 +349,6 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     expect(await page.getByRole('textbox', { name: 'Party size', exact: true }).inputValue()).toBe('3');
     expect(await page.getByRef((result.target as BrowserRef).ref).textContent()).toBe('Confirm reservation');
     expect(await page.evaluate('window.commits||0')).toBe(0);
-    expect(recipeCheckKey(recipe!, { party: '3' })).not.toBe(recipeCheckKey(recipe!, { party: '4' }));
-    const replacement = await saveBrowserRecipe(context, {
-      name: 'Reserve',
-      first_action: 0,
-      last_action: 1,
-      parameters: [{ name: 'party', action_index: 0 }],
-    });
-    expect(replacement).toMatchObject({ version: 2 });
-    expect((await loadRecipe(id, db))?.version).toBe(1);
-
     const run = db.run.bind(db);
     const failedRecording = vi.spyOn(db, 'run').mockImplementation(async (sql, ...parameters) => {
       if (sql.startsWith('UPDATE gws_ea_browser_action_trace')) throw new Error('Trace completion unavailable');

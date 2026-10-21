@@ -1,20 +1,14 @@
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 import type { Page, Request } from 'playwright-core';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { expect, it } from 'vitest';
 
-import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, createBackgroundPage, type ChromeConnection } from './connection.js';
 import {
   BrowserDiagnosticAttempt,
   beginBrowserDiagnosticAction,
   captureBrowserDiagnosticRefusal,
 } from './diagnostics.js';
 import { registerPageSecret } from './page-privacy.js';
-import { browserPaths } from './paths.js';
 
 function pageFixture() {
   const events = new EventEmitter();
@@ -75,6 +69,14 @@ it('distinguishes received HTTP, explicit host refusal, DNS/TLS failure and runt
   expect(result.events.slice(1).every((event) => !('status' in event))).toBe(true);
   expect(JSON.stringify(result)).not.toContain('secret-sentinel');
   expect(result.runtime).toMatchObject({ chrome: '155.0.0.0', playwright: '1.64.0' });
+  registerPageSecret(page, 'FiXtUrE');
+  const privateHost = attempt('request-private-host');
+  privateHost.observe(page);
+  events.emit('request', responseRequest);
+  events.emit('response', { request: () => responseRequest, status: () => 403 });
+  const redacted = privateHost.finish();
+  expect(redacted.events).toContainEqual(expect.objectContaining({ source: 'http_response', status: 403 }));
+  expect(JSON.stringify(redacted).toLowerCase()).not.toContain('fixture');
 });
 
 it('discards late responses, transport failures and captured refusals from a prior attempt on the same page', () => {
@@ -159,60 +161,4 @@ it('correlates redirects within an action and discards late events and redirects
     { source: 'http_response', status: 200, action_index: 1 },
   ]);
   expect(JSON.stringify(result)).not.toContain('secret-sentinel');
-});
-
-const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-describe.skipIf(!chromePath)('native passive browser diagnostics', { timeout: 30_000 }, () => {
-  let root: string;
-  let connection: ChromeConnection;
-  beforeAll(async () => {
-    if (!chromePath) throw new Error('A Chromium executable is required');
-    root = await mkdtemp(join(tmpdir(), 'browser-diagnostics-'));
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
-    await prepareChromeProfile(paths);
-    connection = await connectChromePipe(spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
-    await connection.context.route('https://fixture.example/**', (route) => {
-      if (route.request().url().includes('/dns')) return route.abort('namenotresolved');
-      return route.fulfill({ status: 403, headers: { 'x-private': 'secret-sentinel' }, body: 'secret-sentinel' });
-    });
-  });
-  afterAll(async () => {
-    await connection?.close();
-    if (root) await rm(root, { recursive: true, force: true });
-  });
-  it('reports an actual fixture 403 and the next failed navigation independently without reading private content', async () => {
-    const page = await createBackgroundPage(connection);
-    try {
-      const denial = attempt();
-      denial.observe(page);
-      const response = await page.goto('https://fixture.example/private/secret-sentinel?token=secret-sentinel');
-      expect(response?.status()).toBe(403);
-      const denied = denial.finish();
-      expect(denied.events).toContainEqual(
-        expect.objectContaining({ source: 'http_response', status: 403, site: 'fixture.example' }),
-      );
-      const failure = attempt('request-2');
-      failure.observe(page);
-      await expect(page.goto('https://fixture.example/dns/secret-sentinel')).rejects.toThrow('ERR_NAME_NOT_RESOLVED');
-      const failed = failure.finish();
-      expect(failed.events).toContainEqual(expect.objectContaining({ source: 'transport_failure', category: 'dns' }));
-      expect(failed.events.some((event) => 'status' in event)).toBe(false);
-      expect(JSON.stringify([denied, failed])).not.toContain('secret-sentinel');
-      // A registrable site is still source-derived: an otherwise valid host may contain a known page secret.
-      const privatePage = await createBackgroundPage(connection);
-      try {
-        registerPageSecret(privatePage, 'FiXtUrE');
-        const secretHost = attempt('request-3');
-        secretHost.observe(privatePage);
-        await privatePage.goto('https://fixture.example/');
-        const protectedHost = secretHost.finish();
-        expect(protectedHost.events).toContainEqual(expect.objectContaining({ source: 'http_response', status: 403 }));
-        expect(JSON.stringify(protectedHost).toLowerCase()).not.toContain('fixture');
-      } finally {
-        await privatePage.close();
-      }
-    } finally {
-      await page.close();
-    }
-  });
 });

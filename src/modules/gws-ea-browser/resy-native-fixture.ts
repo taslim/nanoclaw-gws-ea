@@ -12,8 +12,6 @@ export interface ResyFixtureState {
   inventory: Record<string, unknown>;
   details: Record<string, unknown>;
   policy: string[];
-  doubleConfirmation?: boolean;
-  dueNow?: number;
   partyLabel?: string;
   dateLabel?: string;
   extraTerms?: string;

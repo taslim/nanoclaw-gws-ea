@@ -203,7 +203,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     );
   }
 
-  it('never sends a secret to the cross-origin parent when focus is stolen at the native insertion boundary', async () => {
+  it('fills the exact cross-origin field without ambient keyboard insertion or disclosure to the focused parent', async () => {
     await page.goto('https://parent.example/login');
     const frame = page.frames().find((candidate) => candidate.url() === 'https://auth.example/login');
     if (!frame) throw new Error('Cross-origin authentication frame missing');
@@ -212,16 +212,15 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     await page.locator('#untrusted').focus();
     const bound = await binding(frame);
     const nativeInsert = page.keyboard.insertText.bind(page.keyboard);
-    vi.spyOn(page.keyboard, 'insertText').mockImplementation(async (value) => {
-      // Deterministically schedule the renderer's focus theft after all host checks,
-      // before Chrome processes ambient insertion. No secret is supplied to page JS.
+    const ambientInsert = vi.spyOn(page.keyboard, 'insertText').mockImplementation(async (value) => {
+      // A regression to ambient insertion lets the page steal focus before Chrome receives the value.
       await frame.evaluate("parent.postMessage('steal-focus', 'https://parent.example')");
       await page.locator('body[data-stolen="yes"]').waitFor();
       await nativeInsert(value);
     });
-    await fillBoundBrowserSecret(context(), bound, async () => secret).catch(() => undefined);
+    expect(await fillBoundBrowserSecret(context(), bound, async () => secret)).toEqual({ status: 'submitted' });
+    expect(ambientInsert).not.toHaveBeenCalled();
     expect(await page.locator('body').getAttribute('data-captured')).toBeNull();
-    expect(posts.every((post) => post.host === 'auth.example')).toBe(true);
     expect(posts).toEqual([{ host: 'auth.example', body: `password=${secret}` }]);
   });
 

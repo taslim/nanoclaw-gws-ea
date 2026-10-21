@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { materialPurchaseChange, type PurchaseFacts } from './fingerprint.js';
 
-export const retailFacts: PurchaseFacts = {
+const retailFacts: PurchaseFacts = {
   flowId: 'amazon-us-retail-v1',
   site: 'amazon.com',
   origin: 'https://www.amazon.com',

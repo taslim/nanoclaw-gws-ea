@@ -31,25 +31,11 @@ afterEach(() => {
 });
 function fixture(origin = 'https://www.shop.example') {
   let url = `${origin}/login`;
-  let activeElement: unknown;
   const nodes: Array<{ value: string }> = [];
   const form = {
     action: `${origin}/login`,
     method: 'post',
     target: '',
-    elements: [] as unknown[],
-    querySelector: (selector: string) => !selector.includes('cc-'),
-  };
-  const document = {
-    get activeElement() {
-      return activeElement;
-    },
-    location: {
-      get origin() {
-        return new URL(url).origin;
-      },
-    },
-    defaultView: { HTMLFormElement: { prototype: { submit() {} } } },
   };
   const field = {
     tagName: 'INPUT',
@@ -57,7 +43,6 @@ function fixture(origin = 'https://www.shop.example') {
     name: 'password',
     value: '',
     form,
-    ownerDocument: document,
     isConnected: true,
     getAttribute(name: string): string | null {
       return (
@@ -71,18 +56,13 @@ function fixture(origin = 'https://www.shop.example') {
     name: '',
     textContent: 'Sign in',
     form,
-    ownerDocument: document,
     isConnected: true,
     getAttribute: (name: string) => (name === 'type' ? 'submit' : null),
   };
-  form.elements = [field, button];
   nodes.push(field);
   const navigations = new Set<(frame: unknown) => void>();
   const handle = (node: unknown) => ({
     ownerFrame: async () => frame,
-    focus: async () => {
-      activeElement = node;
-    },
     inputValue: async () => (node as { value: string }).value,
     evaluate: async (fn: (value: unknown, arg: unknown) => unknown, argument?: unknown) =>
       fn(
@@ -106,9 +86,7 @@ function fixture(origin = 'https://www.shop.example') {
     isClosed: () => false,
     locator: () => ({ innerText: async () => '', ariaSnapshotJSON: async () => [{ role: 'alert', text: SECRET }] }),
     keyboard: {
-      insertText: vi.fn(async (value: string) => {
-        (activeElement as { value: string }).value = value;
-      }),
+      insertText: vi.fn(),
     },
     on: (event: string, callback: (frame: unknown) => void) => {
       if (event === 'framenavigated') navigations.add(callback);
@@ -209,9 +187,6 @@ function fixture(origin = 'https://www.shop.example') {
     setUrl: (value: string) => {
       url = value;
     },
-    focus: (value: unknown) => {
-      activeElement = value;
-    },
     navigate: () => {
       url = `${origin}/`;
       for (const callback of navigations) callback(frame);
@@ -291,7 +266,13 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
   const error = await fillBoundBrowserSecret(f.context, binding, async () => {
     throw new Error(SECRET);
   }).catch((value: unknown) => value);
+  expect(error).toMatchObject({
+    code: 'forbidden',
+    message: 'The host could not safely complete this sign-in. Take a fresh observation.',
+  });
   expect(String(error)).not.toContain(SECRET);
+  expect(f.nativeFill).not.toHaveBeenCalled();
+  expect(f.nativeSubmit).not.toHaveBeenCalled();
   expect(() =>
     validateFillSecret({
       item_handle: 'op://vault/item/password',

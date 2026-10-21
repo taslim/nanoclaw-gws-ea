@@ -1293,21 +1293,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     },
     30_000,
   );
-  it('completes a batch whose widget frame navigates back to the hosting page site', async () => {
-    await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
-    const frame = await widgetFrame();
-    await assertOutOfProcess(frame);
-    await queue.accept(
-      'browser',
-      { actions: [{ kind: 'click', ...(await nativeRef('link "Kettle details"')) }] },
-      session,
-      'widget-back',
-    );
-    await queue.idle();
-    expect(await request('widget-back')).toMatchObject({ status: 'completed' });
-    expect(frame.url()).toBe(`${AMAZON_RETAIL.origin}/dp/B012345678`);
-    await expect(page.context().newCDPSession(frame)).rejects.toThrow('does not have a separate CDP session');
-  }, 30_000);
   it('completes a batch that removes its out-of-process widget frame', async () => {
     await navigate(`${AMAZON_RETAIL.origin}/dp/B0PAYFRAME`, 'widget-page');
     const frame = await widgetFrame();
@@ -1370,6 +1355,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     );
     await queue.idle();
     expect(await request('widget-back')).toMatchObject({ status: 'completed' });
+    expect(frame.url()).toBe(`${AMAZON_RETAIL.origin}/dp/B012345678`);
     await expect(page.context().newCDPSession(frame)).rejects.toThrow('does not have a separate CDP session');
     await queue.accept(
       'browser',

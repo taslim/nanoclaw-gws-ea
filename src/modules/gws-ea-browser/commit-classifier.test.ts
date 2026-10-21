@@ -300,31 +300,8 @@ it('keeps reviewed Amazon authentication routes precise and leaves its other rou
 it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
   const native = vi.fn();
   const frame = { url: () => 'https://auth-dispatch.example/login' };
-  const form = {
-    action: 'https://auth-dispatch.example/login',
-    method: 'post',
-    target: '',
-    elements: [
-      { name: 'username', type: 'text', getAttribute: () => 'username' },
-      { name: 'password', type: 'password', getAttribute: () => 'current-password' },
-    ],
-    querySelector: () => true,
-  };
-  const node = {
-    tagName: 'BUTTON',
-    type: 'submit',
-    textContent: 'Sign in',
-    form,
-    getAttribute: (name: string) => (name === 'type' ? 'submit' : null),
-    ownerDocument: {
-      location: { origin: 'https://auth-dispatch.example' },
-      defaultView: { HTMLFormElement: { prototype: { submit: native } } },
-    },
-  };
-  const element = {
-    ownerFrame: async () => frame,
-    evaluate: async (fn: (node: unknown, argument: unknown) => unknown, argument: unknown) => fn(node, argument),
-  } as unknown as ElementHandle;
+  const form = { action: 'https://auth-dispatch.example/login', method: 'post' };
+  const element = { ownerFrame: async () => frame } as unknown as ElementHandle;
   const page = {
     url: () => frame.url(),
     frames: () => [frame],
