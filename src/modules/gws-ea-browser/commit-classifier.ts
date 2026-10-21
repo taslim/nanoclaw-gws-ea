@@ -87,7 +87,7 @@ export class BrowserFramesUnreadyError extends BrowserActivationError {
 }
 
 /** The stable, repeat-safe stop every executor answers when the guard refused to start its operation. */
-export function framesUnreadyStop(error: unknown): Record<string, unknown> | undefined {
+export function framesUnreadyStop(error: unknown): import('./actions.js').BrowserBatchResult | undefined {
   return error instanceof BrowserFramesUnreadyError
     ? { status: 'stopped', reason: error.reason, repeat_safe: true }
     : undefined;

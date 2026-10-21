@@ -4,6 +4,7 @@ import type { Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 
 import { BROWSER_ACTION_NAMES } from './actions.js';
+import { pageHostnameIsPrivate } from './page-privacy.js';
 
 const manifest: unknown = createRequire(import.meta.url)('playwright-core/package.json');
 const playwrightVersion =
@@ -259,6 +260,12 @@ export class BrowserDiagnosticAttempt {
 
   finish(): BrowserDiagnostics {
     this.closed = true;
+    // Values may become private after a request began (for example when a credential field was read).
+    for (const event of this.events) {
+      const site = 'site' in event ? event.site : undefined;
+      if (site && [...this.pages].some((page) => pageHostnameIsPrivate(page, site)) && 'site' in event)
+        delete event.site;
+    }
     for (const page of this.pages) if (current.get(page)?.attempt === this) current.delete(page);
     this.pages.clear();
     return {

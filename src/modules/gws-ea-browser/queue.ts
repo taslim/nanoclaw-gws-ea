@@ -448,7 +448,11 @@ export class BrowserQueue {
         ? {
             id: request.request_id,
             ok: false,
-            error: { code: result instanceof ActionRefusal ? result.code : 'handler-error', message: result.message },
+            error: {
+              code: result instanceof ActionRefusal ? result.code : 'handler-error',
+              message: result.message,
+              ...(diagnostics && diagnostics.events.length ? { metadata: { diagnostics } } : {}),
+            },
           }
         : {
             id: request.request_id,

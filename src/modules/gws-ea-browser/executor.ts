@@ -58,6 +58,7 @@ import {
   type BrowserActionData,
   type BrowserStopReason,
   type BrowserActionResult,
+  type BrowserBatchResult,
   type BrowserBatchOptions,
   type BrowserBatch,
 } from './actions.js';
@@ -354,7 +355,7 @@ export async function executeBrowserBatch(
   context: BrowserOperationContext,
   payload: Record<string, unknown>,
   options: BrowserBatchOptions = {},
-): Promise<Record<string, unknown>> {
+): Promise<BrowserBatchResult> {
   if (options.siteAccess && (!options.page || !options.readOnly))
     throw new Error('Signed-out site access requires an explicit read-only page');
   const { actions } = validateBrowserBatch(payload);
@@ -362,7 +363,7 @@ export async function executeBrowserBatch(
   const addressStop = await givenAddressStop(actions.flatMap(givenText));
   if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
-  let ran: { answer: Record<string, unknown>; unapproved?: UnapprovedCommit };
+  let ran: { answer: BrowserBatchResult; unapproved?: UnapprovedCommit };
   try {
     ran = await withBrowserJobNavigation(context, page, () => executeBatch(context, actions, page, options), {
       ...(options.siteAccess ? { siteAccess: options.siteAccess } : {}),
@@ -385,7 +386,7 @@ async function executeBatch(
   actions: readonly BrowserAction[],
   page: Page,
   options: BrowserBatchOptions,
-): Promise<{ answer: Record<string, unknown>; unapproved?: UnapprovedCommit }> {
+): Promise<{ answer: BrowserBatchResult; unapproved?: UnapprovedCommit }> {
   const results: BrowserActionResult[] = actions.map((_action, index) => ({ index, status: 'not_executed' }));
   const images: Array<{ mime_type: 'image/png'; data: string }> = [];
   // The guard starts each operation clean, before its readiness pass.
@@ -798,8 +799,7 @@ async function executeBatch(
   }
   return {
     answer: {
-      status: reason ? 'stopped' : 'completed',
-      ...(reason ? { reason } : {}),
+      ...(reason ? { status: 'stopped' as const, reason } : { status: 'completed' as const }),
       ...(consent ? { consent } : {}),
       actions: results,
       ...(recording ? { recording } : {}),

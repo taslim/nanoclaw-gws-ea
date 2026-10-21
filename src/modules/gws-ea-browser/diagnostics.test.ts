@@ -13,6 +13,7 @@ import {
   beginBrowserDiagnosticAction,
   captureBrowserDiagnosticRefusal,
 } from './diagnostics.js';
+import { registerPageSecret } from './page-privacy.js';
 import { browserPaths } from './paths.js';
 
 function pageFixture() {
@@ -197,6 +198,19 @@ describe.skipIf(!chromePath)('native passive browser diagnostics', { timeout: 30
       expect(failed.events).toContainEqual(expect.objectContaining({ source: 'transport_failure', category: 'dns' }));
       expect(failed.events.some((event) => 'status' in event)).toBe(false);
       expect(JSON.stringify([denied, failed])).not.toContain('secret-sentinel');
+      // A registrable site is still source-derived: an otherwise valid host may contain a known page secret.
+      const privatePage = await createBackgroundPage(connection);
+      try {
+        registerPageSecret(privatePage, 'FiXtUrE');
+        const secretHost = attempt('request-3');
+        secretHost.observe(privatePage);
+        await privatePage.goto('https://fixture.example/');
+        const protectedHost = secretHost.finish();
+        expect(protectedHost.events).toContainEqual(expect.objectContaining({ source: 'http_response', status: 403 }));
+        expect(JSON.stringify(protectedHost).toLowerCase()).not.toContain('fixture');
+      } finally {
+        await privatePage.close();
+      }
     } finally {
       await page.close();
     }

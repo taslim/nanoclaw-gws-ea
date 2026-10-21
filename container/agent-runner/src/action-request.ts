@@ -28,7 +28,15 @@ import type { McpToolDefinition } from './mcp-tools/types.js';
 /** The host's answer: mirrors `ResponseFrame` in src/cli/frame.ts. */
 export type ActionResponseFrame =
   | { readonly id: string; readonly ok: true; readonly data: unknown }
-  | { readonly id: string; readonly ok: false; readonly error: { readonly code: string; readonly message: string } };
+  | {
+      readonly id: string;
+      readonly ok: false;
+      readonly error: {
+        readonly code: string;
+        readonly message: string;
+        readonly metadata?: Readonly<Record<string, unknown>>;
+      };
+    };
 
 export type ActionRequestResult =
   | { readonly status: 'answered'; readonly frame: ActionResponseFrame }
@@ -89,7 +97,15 @@ function frameOf(content: string, requestId: string): ActionResponseFrame {
     typeof frame.error.code === 'string' &&
     typeof frame.error.message === 'string'
   ) {
-    return { id: requestId, ok: false, error: { code: frame.error.code, message: frame.error.message } };
+    return {
+      id: requestId,
+      ok: false,
+      error: {
+        code: frame.error.code,
+        message: frame.error.message,
+        ...(isRecord(frame.error.metadata) ? { metadata: frame.error.metadata } : {}),
+      },
+    };
   }
   return { id: requestId, ok: false, error: { code: 'transport-error', message: "The host's answer was unreadable" } };
 }
@@ -194,7 +210,11 @@ function responseImage(value: unknown): value is ActionResponseImage {
 
 /** An answer as a tool returns it: its message or structured data, optional images, or a refusal. */
 export function answerResult(frame: ActionResponseFrame): CallToolResult {
-  if (!frame.ok) return errorResult(frame.error.message);
+  if (!frame.ok)
+    return errorResult(
+      frame.error.message +
+        (frame.error.metadata ? `\n${JSON.stringify({ code: frame.error.code, metadata: frame.error.metadata })}` : ''),
+    );
   let data = frame.data;
   let images: ActionResponseImage[] = [];
   if (isRecord(data) && Object.hasOwn(data, 'images')) {

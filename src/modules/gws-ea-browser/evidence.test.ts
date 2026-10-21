@@ -352,3 +352,141 @@ it('attributes shared watch checks only to persisted consumer watches for this j
   await getDb().run("UPDATE gws_ea_browser_watches SET status='cancelled' WHERE id=?", 'own-watch');
   expect(await readBrowserEvidence(thread)).toMatchObject({ watchNextCheckAt: null });
 });
+
+it('projects fresh bounded provenance and recording from both success and native error envelopes', async () => {
+  const success = await accept('provenance');
+  const failure = await accept('provenance-error');
+  for (const [id, ok] of [
+    [success, true],
+    [failure, false],
+  ] as const) {
+    const diagnostics = {
+      schema_version: 1,
+      job_id: thread,
+      request_id: id,
+      action: 'browser',
+      action_index: 0,
+      runtime: { playwright: '1.64.0', chrome: '155.0.0.0', node: '22.0.0', headers: canary },
+      events: [
+        {
+          source: 'http_response',
+          site: 'fixture.example',
+          method: 'GET',
+          resource: 'document',
+          status: 403,
+          elapsed_ms: 3,
+          action_index: 0,
+          request_index: 2,
+          redirected_from: 1,
+          body: canary,
+          url: `https://example.com/?token=${canary}`,
+        },
+        { source: 'host_refusal', category: 'document', rule: 'blocked_address', elapsed_ms: 4, action_index: 0 },
+        {
+          source: 'transport_failure',
+          site: 'fixture.example',
+          method: 'GET',
+          resource: 'document',
+          category: 'tls',
+          elapsed_ms: 5,
+          request_index: 3,
+        },
+        { source: 'runtime_error', category: 'execution', elapsed_ms: 6, raw_error: canary },
+        {
+          source: 'http_response',
+          site: `https://example.com/${canary}`,
+          method: 'GET',
+          resource: 'document',
+          status: 200,
+          elapsed_ms: 7,
+        },
+        { source: canary, elapsed_ms: 8 },
+      ],
+      omitted_events: 2,
+      screenshot: canary,
+    };
+    const metadata = { diagnostics, recording: { status: 'unavailable', trace_indices: [2, 3], page: canary } };
+    await getDb().run(
+      'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+      JSON.stringify(
+        ok
+          ? { ok, data: { status: 'stopped', reason: 'challenge', ...metadata, observation: canary } }
+          : { ok, error: { code: 'handler-error', message: canary, metadata } },
+      ),
+      id,
+    );
+  }
+  const evidence = await readBrowserEvidence(thread);
+  for (const request of evidence.requests) {
+    expect(request).toMatchObject({
+      diagnostics: {
+        schema_version: 1,
+        job_id: thread,
+        request_id: request.id,
+        action: 'browser',
+        action_index: 0,
+        runtime: { playwright: '1.64.0', chrome: '155.0.0.0', node: '22.0.0' },
+        events: [
+          {
+            source: 'http_response',
+            site: 'fixture.example',
+            method: 'GET',
+            resource: 'document',
+            status: 403,
+            elapsed_ms: 3,
+            action_index: 0,
+            request_index: 2,
+            redirected_from: 1,
+          },
+          { source: 'host_refusal', category: 'document', rule: 'blocked_address', elapsed_ms: 4, action_index: 0 },
+          {
+            source: 'transport_failure',
+            site: 'fixture.example',
+            method: 'GET',
+            resource: 'document',
+            category: 'tls',
+            elapsed_ms: 5,
+            request_index: 3,
+          },
+          { source: 'runtime_error', category: 'execution', elapsed_ms: 6 },
+          { source: 'http_response', method: 'GET', resource: 'document', status: 200, elapsed_ms: 7 },
+        ],
+        omitted_events: 2,
+      },
+      recording: { status: 'unavailable', trace_indices: [2, 3] },
+    });
+  }
+  expect(evidence.requests.map(({ status, reason }) => [status, reason])).toEqual(
+    expect.arrayContaining([
+      ['stopped', 'challenge'],
+      ['error', 'handler-error'],
+    ]),
+  );
+  expect(JSON.stringify(evidence)).not.toContain(canary);
+  expect(JSON.stringify(evidence)).not.toMatch(/screenshot|headers|raw_error|observation|body|https:/u);
+  const diagnostics = {
+    schema_version: 1,
+    job_id: thread,
+    request_id: success,
+    action: 'browser',
+    runtime: { node: '22.0.0' },
+    events: Array.from({ length: 70 }, () => ({ source: 'runtime_error', category: 'execution', elapsed_ms: 1 })),
+    omitted_events: 2,
+  };
+  await getDb().run(
+    'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+    JSON.stringify({ ok: true, data: { diagnostics } }),
+    success,
+  );
+  const bounded = (await readBrowserEvidence(thread)).requests.find((request) => request.id === success);
+  expect(bounded?.diagnostics?.events).toHaveLength(64);
+  expect(bounded?.diagnostics?.omitted_events).toBe(8);
+  await getDb().run(
+    'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+    JSON.stringify({ ok: true, data: { diagnostics: { ...diagnostics, job_id: canary } } }),
+    success,
+  );
+  expect(
+    (await readBrowserEvidence(thread)).requests.find((request) => request.id === success)?.diagnostics,
+  ).toBeUndefined();
+});

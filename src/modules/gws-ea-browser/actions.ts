@@ -144,6 +144,19 @@ export type BrowserActionResult = { index: number } & (
     }
 );
 
+/** Core batch outcomes are closed; domain tools keep their own native result contracts. */
+export type BrowserBatchResult = (
+  | { status: 'completed'; reason?: never; actions: BrowserActionResult[] }
+  | { status: 'stopped'; reason: BrowserStopReason; actions?: BrowserActionResult[] }
+) & {
+  repeat_safe: boolean;
+  consent?: readonly import('./consent.js').ConsentStopView[];
+  recording?: { status: 'complete' | 'unavailable'; trace_indices: number[] };
+  images?: ReadonlyArray<{ mime_type: 'image/png'; data: string }>;
+  observation?: import('./observe.js').BrowserObservation;
+  incident?: { readonly site: string; readonly reference: string; readonly charged?: string };
+};
+
 export function browserActionRefs(action: BrowserAction): BrowserRef[] {
   if ('ref' in action) return [action];
   return action.kind === 'form_input' ? [...action.fields, ...(action.submit ? [action.submit] : [])] : [];

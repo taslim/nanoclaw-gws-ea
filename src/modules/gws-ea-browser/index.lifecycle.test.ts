@@ -7,7 +7,8 @@ import type { ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { lookup } from '../../cli/registry.js';
-import { getBrowserRuntime } from './index.js';
+import { browserActions, getBrowserRuntime } from './index.js';
+import * as delivery from '../../delivery.js';
 import { BrowserRuntime } from './runtime.js';
 import { getHostShutdownCallbacks, getHostStartCallbacks } from '../../host-lifecycle.js';
 import { closeDb, initTestDb } from '../../db/index.js';
@@ -285,8 +286,44 @@ describe('optional host browser lifecycle', () => {
       lastFailure: { reason: 'browser_unavailable' },
     });
   });
-  it('registers read-only browser health as a host-only command', () => {
-    expect(lookup('gws-ea-browser-health')).toMatchObject({ access: 'hidden', hostOnly: true });
+  it('registers the exact native actions once and reads host-only health without initializing them again', async () => {
+    const names = [
+      'browser',
+      'fill_secret',
+      'credential_form',
+      'sign_in_code',
+      'browser_relay_sign_in',
+      'save_recipe',
+      'run_recipe',
+      'request_consent',
+      'purchase',
+      'browser_purchase_commit',
+      'watch',
+      'list_watches',
+      'cancel_watch',
+      'browser_watch_book',
+    ];
+    expect(Object.keys(browserActions).sort()).toEqual([...names].sort());
+    const internal = new Set(['browser_relay_sign_in', 'browser_purchase_commit', 'browser_watch_book']);
+    for (const name of names)
+      if (internal.has(name)) expect(delivery.getDeliveryAction(name)).toBeUndefined();
+      else expect(delivery.getDeliveryAction(name)).toBeTypeOf('function');
+    const health = lookup('gws-ea-browser-health');
+    expect(health).toMatchObject({ access: 'hidden', hostOnly: true });
+    if (!health) throw new Error('Expected native health command');
+    const callbacks = getHostStartCallbacks();
+    const registration = vi.spyOn(delivery, 'registerDeliveryAction');
+    const reconcile = vi.spyOn(getBrowserRuntime(), 'reconcile');
+    try {
+      for (let index = 0; index < 2; index++)
+        expect(await health.handler(health.parseArgs({}), { caller: 'host' })).toMatchObject({ schemaVersion: 1 });
+      expect(registration).not.toHaveBeenCalled();
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(getHostStartCallbacks()).toEqual(callbacks);
+    } finally {
+      registration.mockRestore();
+      reconcile.mockRestore();
+    }
   });
   it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
     'keeps the other native job page usable when one job closes',

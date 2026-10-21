@@ -113,6 +113,12 @@ export function redactPageText(page: Page, text: string): string {
   );
 }
 
+/** URL hostnames are canonicalized to lowercase before diagnostics read them. */
+export function pageHostnameIsPrivate(page: Page, hostname: string): boolean {
+  const canonical = hostname.toLowerCase();
+  return [...stateFor(page).secrets].some((secret) => canonical.includes(secret.toLowerCase()));
+}
+
 /** Redacts host-read structured values before serialization, keeping object keys and JSON syntax intact. */
 export function redactPageData(page: Page, value: unknown): unknown {
   const secrets = [...stateFor(page).secrets].sort((a, b) => b.length - a.length);

@@ -217,7 +217,16 @@ it('returns an internal TypeError as a sanitized native error frame while preser
           frame: {
             id: 'type-error',
             ok: false,
-            error: { code: 'handler-error', message: 'The browser action failed unexpectedly.' },
+            error: {
+              code: 'handler-error',
+              message: 'The browser action failed unexpectedly.',
+              metadata: {
+                diagnostics: expect.objectContaining({
+                  request_id: browserRequestId(session.id, 'type-error'),
+                  events: [expect.objectContaining({ source: 'runtime_error', category: 'execution' })],
+                }),
+              },
+            },
           },
         }),
         expect.objectContaining({
