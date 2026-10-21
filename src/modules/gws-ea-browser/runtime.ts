@@ -3,7 +3,8 @@ import type { Page } from 'playwright-core';
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
 import { connectChromePipe, verifyChromePolicy, type ChromeConnection } from './connection.js';
-import { DEFAULT_BROWSER_POLICY, readBrowserPolicy, type BrowserPolicy } from './policy.js';
+import { DEFAULT_BROWSER_POLICY, type BrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 
@@ -55,7 +56,7 @@ export class BrowserRuntime {
       await this.stopOwned();
       return;
     }
-    const current = await readBrowserPolicy(this.policyFile);
+    const current = await readHostBrowserPolicy(this.policyFile);
     if (!current.enabled) {
       this.policy = current;
       await this.stopOwned();

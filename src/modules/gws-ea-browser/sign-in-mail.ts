@@ -768,15 +768,6 @@ export function registerSignInMailDelivery(queue: () => BrowserQueue): void {
   );
 }
 
-/** Main can name the host-recorded site without ever reading the waiting field or a credential. */
-export async function readPendingSignInSite(
-  jobId: string,
-): Promise<{ site: string; origin: string; expires_at: string } | undefined> {
-  if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return undefined;
-  const claim = await waitingSignInClaim(jobId, 'principal');
-  return claim ? { site: claim.domain, origin: claim.origin, expires_at: claim.expires_at } : undefined;
-}
-
 /** Native queue delivery owns this side answer for success, pre-start expiry, interruption and restart alike. */
 async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
   const payload = validateRelayPayload(JSON.parse(request.payload_json) as Record<string, unknown>);

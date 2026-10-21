@@ -26,17 +26,9 @@ export interface ReviewedMerchantFlow {
   classifyNavigation(url: URL): ActionClass | undefined;
   verifyPurchaseControl?(page: Page, element: ElementHandle): Promise<boolean>;
 }
-const merchantFlows: ReviewedMerchantFlow[] = [...merchantSignatures];
-
-/** Trusted source registrations only. Neither page prose nor stored recipes can register support. */
-export function registerReviewedMerchantFlow(flow: ReviewedMerchantFlow): void {
-  if (merchantFlows.some((existing) => existing.id === flow.id)) throw new Error('Merchant flow already registered');
-  merchantFlows.push(flow);
-}
-
 /** The reviewed flow owning this page, from trusted host code only. */
 export function reviewedMerchantFlow(url: URL): ReviewedMerchantFlow | undefined {
-  return merchantFlows.find((candidate) => candidate.matches(url));
+  return merchantSignatures.find((candidate) => candidate.matches(url));
 }
 
 // Vocabulary is data: widen or narrow it here, never by bypassing the classification order.

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getSession } from '../../db/sessions.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy, errandSource, hasBrowserAccess } from './access.js';
 import './capability.js';
 import '../capabilities/index.js';
 
@@ -25,7 +25,6 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { getBrowserAgentGroupId, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
-import { errandSource, hasBrowserAccess } from './access.js';
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const BROWSER_TEMPLATE = 'gws-ea/browser';
@@ -177,7 +176,7 @@ registerProtectedGroupPolicy('gws-ea-browser:host-owned', async (agentGroupId) =
 
 registerSessionAdmissionPolicy('gws-ea-browser:stamped-reach', async ({ key }) => {
   if (!(await getDb().hasTable('gws_ea_profile')) || key.agentGroupId !== (await getBrowserAgentGroupId())) return;
-  const policy = await readBrowserPolicy();
+  const policy = await readHostBrowserPolicy();
   if (!policy.enabled) throw new Error('browser may not start: the operator must enable it');
   if (!browserAdmissionReady()) throw new Error('browser may not start: host browser recovery is unavailable');
   const session = await getSession(key.sessionId);

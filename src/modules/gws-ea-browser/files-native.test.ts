@@ -331,6 +331,41 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     }
   });
 
+  it('reopens the owned Chrome profile without losing its persistent cookies', async () => {
+    await connection.context.addCookies([
+      {
+        name: 'owned-profile-cookie',
+        value: 'retained-after-restart',
+        domain: 'fixture.example',
+        path: '/',
+        expires: Math.floor(Date.now() / 1000) + 3600,
+      },
+    ]);
+    await windows.close();
+    await connection.close();
+    expect(connection.child.exitCode !== null || connection.child.signalCode !== null).toBe(true);
+    await prepareChromeProfile(paths);
+    const address = server.address();
+    if (!chromePath || !address || typeof address === 'string') throw new Error('Native fixture unavailable');
+    connection = await connectChromePipe(
+      spawnChrome({
+        chromePath,
+        paths,
+        proxyUrl: `http://127.0.0.1:${address.port}`,
+      }),
+      paths,
+    );
+    windows = new JobWindows(connection);
+    page = await windows.pageForJob(context.job.id);
+    await page.goto('http://fixture.example/docs/archive');
+    expect(await connection.context.cookies('http://fixture.example')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'owned-profile-cookie', value: 'retained-after-restart' }),
+      ]),
+    );
+    expect(await page.getByRole('heading', { name: 'Invoice archive' }).isVisible()).toBe(true);
+  });
+
   it('decides a back navigation made after its errand ended, rather than restoring the page', async () => {
     for (const url of ['http://elsewhere.example/help/first', 'http://fixture.example/help/second'])
       await executeBrowserBatch(context, { actions: [{ kind: 'navigate', url }] }, { record: false });

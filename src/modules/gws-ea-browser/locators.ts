@@ -148,7 +148,7 @@ function framePath(frame: Frame): { framePath: number[]; frameUrls: string[] } {
   return { framePath: path, frameUrls: urls };
 }
 export async function captureLocator(
-  target: PinnedBrowserRef,
+  target: Pick<PinnedBrowserRef, 'element' | 'frame'>,
   nodes: readonly AriaNode[],
 ): Promise<StructuredBrowserLocator> {
   const visited = new Set<string>();
@@ -181,23 +181,21 @@ export async function captureElementRole(element: ElementHandle): Promise<Browse
   throw new BrowserLocatorError('No accessible press role for this element');
 }
 /**
- * A host-found control's structured locator (KTD4): its role and accessible name as Playwright reads them, its
- * ordinal among their matches, and its frame path, so `resolveLocator` finds it again on a later read.
+ * Reuses native names from the current core observation, with the freshly read control label as a candidate.
+ * Every candidate must match this exact element through Playwright's native role/name locator. A second aria
+ * snapshot would replace Playwright's model ref map without advancing the observation generation.
  */
-export async function captureElementLocator(element: ElementHandle): Promise<StructuredBrowserLocator> {
+export async function captureElementLocator(
+  element: ElementHandle,
+  nodes: readonly AriaNode[],
+  label: string,
+): Promise<StructuredBrowserLocator> {
   const frame = await element.ownerFrame();
   if (!frame) throw new BrowserLocatorError('Detached element');
   const role = await captureElementRole(element);
-  const all = frame.getByRole(role);
-  const index = await all.evaluateAll((elements, target) => elements.indexOf(target), element);
-  if (index < 0) throw new BrowserLocatorError('Element is absent');
-  const [node] = ariaNodes(await all.nth(index).ariaSnapshotJSON({ timeout: 1_000 }));
-  if (node?.role !== role) throw new BrowserLocatorError('Accessible role changed');
-  const name = node.name;
-  const matches = frame.getByRole(role, { name, exact: true });
-  const ordinal = await matches.evaluateAll((elements, target) => elements.indexOf(target), element);
-  if (ordinal >= 0) return { role, name, ordinal, count: await matches.count(), ...framePath(frame) };
-  throw new BrowserLocatorError('No structured accessible locator for this element');
+  const candidates = nodes.filter((node) => node.role === role && node.name);
+  if (label) candidates.push({ role, name: label, children: [] });
+  return captureLocator({ element, frame }, candidates);
 }
 /** The element a structured locator names, as a Playwright locator: its frames and its matches' count unchanged. */
 export async function locateStructured(

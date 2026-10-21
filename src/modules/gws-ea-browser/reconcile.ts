@@ -9,10 +9,10 @@ import {
   getDestinations,
 } from '../agent-to-agent/db/agent-destinations.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
-import { browserDelegators, errandSource, type BrowserDelegator } from './access.js';
+import { browserDelegators, errandSource, type BrowserDelegator, readHostBrowserPolicy } from './access.js';
 import { cancelBrowserJob } from './cancel.js';
 import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
-import { readBrowserPolicy } from './policy.js';
+
 import './destination-policy.js';
 
 /** Called by the browser composition on start, every use and periodic sweep, after request recovery. */
@@ -91,7 +91,7 @@ function sameEdge(row: AgentDestination | undefined, wanted: AgentDestination): 
 
 async function reconcileDestinations(policyFile?: string): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
-  const policy = await readBrowserPolicy(policyFile);
+  const policy = await readHostBrowserPolicy(policyFile);
   const granted = await browserDelegators(policy);
   const delegators = policy.enabled ? granted : [];
   const existing = await getBrowserAgentGroupId();

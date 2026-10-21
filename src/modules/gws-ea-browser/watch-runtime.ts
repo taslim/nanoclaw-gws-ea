@@ -4,6 +4,7 @@ import { isRecord } from '../../gws-ea/validation.js';
 import { settleCookieBanners } from './cookie-banners.js';
 import {
   BrowserRefError,
+  invalidateBrowserRefs,
   disposeBrowserRefs,
   hasBrowserChallenge,
   pinBrowserRefs,
@@ -13,7 +14,7 @@ import { collectSecretFields, redactPageText } from './page-privacy.js';
 import { browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import type { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { BrowserOperation } from './operation.js';
@@ -105,6 +106,8 @@ export async function readWatchRegion(
   await collectSecretFields(page);
   try {
     const target = await locateStructured(page, region, checkMainUrl);
+    // Default snapshots replace Playwright's ref map too; failures must leave earlier model refs stale.
+    invalidateBrowserRefs(page);
     return normalizeWatchRegion(redactPageText(page, await target.ariaSnapshot({ timeout: 1_000 })));
   } catch (error) {
     if (error instanceof Error) return undefined;
@@ -273,7 +276,7 @@ export async function runBrowserWatchCheck(
           current.cancel_requested ||
           !check ||
           check.finished_at ||
-          !(await readBrowserPolicy()).enabled
+          !(await readHostBrowserPolicy()).enabled
         )
           throw new Error('Watch check is no longer active');
         operation.assertActive();

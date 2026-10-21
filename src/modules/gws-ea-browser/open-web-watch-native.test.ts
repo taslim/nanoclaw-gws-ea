@@ -1,3 +1,5 @@
+import * as structuredLocators from './locators.js';
+import { locateStructured } from './locators.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /**
  * Wake-on-change watches against native Chrome (KTD20): an unreviewed booking site whose slot list changes, checked
@@ -342,6 +344,36 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
     expect(await watch()).toMatchObject({ status: 'armed' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+  });
+
+  it('returns current refs after a successful mark and makes refs stale when a region snapshot fails', async () => {
+    site.slots = ['1930'];
+    const marked = await setWatch();
+    expect(marked.observation).toBeDefined();
+    const seen = marked.observation as Awaited<ReturnType<typeof observePage>>;
+    const region = JSON.parse((await watch()).region_json!) as StructuredBrowserLocator;
+    const target = await locateStructured(page, region);
+    const snapshot = vi.spyOn(target, 'ariaSnapshot').mockRejectedValue(new Error('Snapshot failed'));
+    const locate = vi.spyOn(structuredLocators, 'locateStructured').mockResolvedValue(target);
+    try {
+      expect(await readWatchRegion(page, region)).toBeUndefined();
+      expect(await run([{ kind: 'click', ...refIn(seen, '7:30 PM') }])).toMatchObject({ reason: 'stale_ref' });
+    } finally {
+      snapshot.mockRestore();
+      locate.mockRestore();
+    }
+    const fresh = await observePage(page);
+    const result = await request('watch', {
+      ...BOUNDS,
+      recipe_id: (await watch()).check_recipe_id,
+      financial: FREE,
+      watch_id: marked.watch_id,
+      region: refIn(fresh, 'Available tables'),
+    });
+    expect(result.status).toBe('marked');
+    const current = result.observation as Awaited<ReturnType<typeof observePage>>;
+    expect(await run([{ kind: 'click', ...refIn(current, '7:30 PM') }])).toMatchObject({ reason: 'navigated' });
+    expect(page.url()).toBe(`${WATCHED.book}?slot=1930`);
   });
 
   it('redacts a newly changed secret field from a region read and permits the next watch check', async () => {

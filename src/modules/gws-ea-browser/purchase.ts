@@ -48,15 +48,10 @@ import {
   materialPurchaseChange,
   type FreeCommitFacts,
   type PurchaseBounds,
+  freeCommitBooks,
   type PurchaseFacts,
 } from './fingerprint.js';
-import {
-  confirmsOnSite,
-  freeCommitBooks,
-  genericCheckoutSignature,
-  offersPayment,
-  pressRefusal,
-} from './generic-signature.js';
+import { confirmsOnSite, genericCheckoutSignature, offersPayment, pressRefusal } from './generic-signature.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -67,7 +62,7 @@ import {
   type MerchantPurchaseRead,
 } from './merchant-read.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { writeBrowserNotice } from './notices.js';
 import { notifyPendingUnconfirmed } from './purchase-outcome.js';
 import { type BrowserQueue, registerBrowserActionDelivery } from './queue.js';
@@ -111,7 +106,7 @@ export const browserPurchaseGuard = defineGuardedAction({
       session.status !== 'active'
     )
       return DENY('The browser job is no longer live.');
-    if (!(await readBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    if (!(await readHostBrowserPolicy()).enabled) return DENY('Browser is disabled.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('A purchase requires the principal to confirm the complete merchant facts.', principal)
@@ -1234,7 +1229,7 @@ export async function recoverBrowserPurchases(queue: BrowserQueue): Promise<void
   await notifyPendingUnconfirmed(store.db);
   await notifyPurchaseWaiters(store.db);
 }
-/** Call only after queue.start(): early approval replay persisted durable work without starting it. */
+/** Persist resumed commits before queue.start(); queue readiness alone admits their workers. */
 export async function resumeBrowserPurchaseCommits(queue: BrowserQueue): Promise<void> {
   commitsReady = true;
   if (!getPurchaseQueue) getPurchaseQueue = () => queue;

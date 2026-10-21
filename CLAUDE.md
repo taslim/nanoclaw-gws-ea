@@ -297,6 +297,26 @@ Watches on a site without a reader record a recipe, a marked region and its
 baseline, and wake the agent only when the region changes; release checks
 follow the venue's stated schedule.
 
+The host has one concrete runtime (`runtime.ts`), composed by `index.ts` with the
+closed action handlers and lifecycle work. `operation.ts` owns deadline, abort
+and page mechanics; `executor.ts` binds targets once and runs ordinary native
+Playwright actions under fresh policy. Shared locators and page privacy sit
+below recipes, checkout readers and credentials. The DB-free policy file reader serves the operator; native host callers explicitly
+validate sealed-group access through `access.ts`, without import-time callbacks.
+Chrome quits through native `Browser.close` and waits for its owned child to exit
+before forced fallback, preserving freshly written profile cookies. Chrome's
+root version sentinel is retained without traversal; staging and arbitrary
+profile symlinks remain refused. Observation owns model ref
+generations: a non-mutating checkout read preserves refs, while a watch region
+snapshot invalidates them and a successful mark returns a fresh observation.
+The recorder consumes safe immutable facts after required execution; unavailable
+recording refuses an incomplete recipe save without changing the action result.
+Optional recipe/vault metadata receives safe origin facts and a bounded allowance,
+never page ownership. Navigation completion and the resulting page condition are
+separate: a denial returns `challenge` even when navigation completed. Request
+evidence records observed responses, transport failures and host refusals with
+correlation and runtime versions, without raw URLs or secret-bearing payloads.
+
 ## Rebuild Workflow (Temporary)
 
 `rebuild-v2` is the integration branch for the in-progress GWS-EA rebuild. Public

@@ -25,7 +25,7 @@ import {
 import { BrowserOperation } from './operation.js';
 import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } from './db.js';
 import { SiteLeaseStore } from './leases.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { reconcileBrowserGroup } from './reconcile.js';
 import { writeBrowserNotice } from './notices.js';
 import { browserAdmissionReady } from './group.js';
@@ -38,7 +38,7 @@ export const browserRequestGuard = defineGuardedAction({
   action: 'gws_ea_browser.request',
   async decide({ actor }) {
     if (actor.kind !== 'agent' || !actor.sessionId) return DENY('Only a live browser job may use the host browser.');
-    if (!(await readBrowserPolicy()).enabled)
+    if (!(await readHostBrowserPolicy()).enabled)
       return DENY('The operator needs to enable the browser for this assistant.');
     if (!browserAdmissionReady())
       return DENY('The browser is temporarily unavailable; the operator can check browser health.');

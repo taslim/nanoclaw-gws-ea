@@ -14,7 +14,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { normalizeName } from '../agent-to-agent/db/agent-destinations.js';
 import { getBrowserAgentGroupId, getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
-import { readBrowserPolicy, registerBrowserAccessListCheck, type BrowserPolicy } from './policy.js';
+import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 
 /**
  * The agent groups `policy` grants the browser. An unreadable policy grants
@@ -22,7 +22,7 @@ import { readBrowserPolicy, registerBrowserAccessListCheck, type BrowserPolicy }
  * that grant opens nothing, and main still knows to tell the principal.
  */
 export async function browserAccessGroups(policy?: BrowserPolicy): Promise<readonly string[]> {
-  const current = policy ?? (await readBrowserPolicy());
+  const current = policy ?? (await readHostBrowserPolicy());
   if (current.status !== 'unavailable' && current.access.version === 2) return current.access.agentGroupIds;
   if (!(await getDb().hasTable('gws_ea_profile'))) return [];
   const main = await getMainAgentGroupId();
@@ -75,12 +75,20 @@ export function errandSource(thread: string | null | undefined): string | undefi
   return thread ? ERRAND_THREAD.exec(thread)?.[1] : undefined;
 }
 
-/**
- * A version-2 list never names the browser itself or external-email: the
- * host reads one that does as an invalid policy, so the browser is unavailable.
- */
-registerBrowserAccessListCheck(async (agentGroupIds) => {
-  if (!(await getDb().hasTable('gws_ea_profile'))) return true;
-  const sealed = [await getBrowserAgentGroupId(), await getExternalEmailAgentGroupId()];
-  return !agentGroupIds.some((id) => sealed.includes(id));
-});
+/** The native host validates sealed groups on every policy read; operator file reads stay DB-free. */
+export async function readHostBrowserPolicy(file?: string): Promise<BrowserPolicy> {
+  const policy = await readBrowserPolicy(file);
+  if (policy.status === 'unavailable' || policy.access.version === 1) return policy;
+  try {
+    if (await getDb().hasTable('gws_ea_profile')) {
+      const sealed = [await getBrowserAgentGroupId(), await getExternalEmailAgentGroupId()];
+      if (policy.access.agentGroupIds.some((id) => sealed.includes(id)))
+        return { status: 'unavailable', enabled: false, reason: 'invalid-browser-policy' };
+    }
+    return policy;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Every failed host authority read denies browser admission.
+  } catch {
+    // A failed host authority read is never permission to admit work, even for a disabled v2 policy.
+    return { status: 'unavailable', enabled: false, reason: 'invalid-browser-policy' };
+  }
+}

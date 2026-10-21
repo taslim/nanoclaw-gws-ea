@@ -42,17 +42,6 @@ export const DEFAULT_BROWSER_POLICY: BrowserPolicy = {
   access: { version: 1 },
 };
 
-/**
- * The host's own check of a version-2 list (`access.ts`): whether it may
- * grant these groups the browser. The launcher reads the file alone; it
- * validated the IDs through the running host before writing them.
- */
-type AccessListCheck = (agentGroupIds: readonly string[]) => Promise<boolean>;
-let accessListCheck: AccessListCheck | undefined;
-export function registerBrowserAccessListCheck(check: AccessListCheck): void {
-  accessListCheck = check;
-}
-
 export function browserPolicyFile(): string | undefined {
   return (
     process.env[BROWSER_POLICY_FILE_ENV]?.trim() ||
@@ -95,7 +84,7 @@ export function browserAccessOf(file: BrowserPolicyFile): BrowserAccessPolicy {
   return file.schemaVersion === 1 ? { version: 1 } : { version: 2, agentGroupIds: file.agentGroupIds };
 }
 
-/** Optional capability policy is re-read for every host operation. Malformed state fails closed. */
+/** DB-free operator file read; native host callers use access.readHostBrowserPolicy for sealed-group validation. */
 export async function readBrowserPolicy(file = browserPolicyFile()): Promise<BrowserPolicy> {
   if (!file) return DEFAULT_BROWSER_POLICY;
   /* eslint-disable no-catch-all/no-catch-all -- invalid optional operator state disables browser admission, never text service */
@@ -104,8 +93,6 @@ export async function readBrowserPolicy(file = browserPolicyFile()): Promise<Bro
     const parsed = parseBrowserPolicyFile(JSON.parse(await readPrivateFile(file, 16 * 1024)));
     if (!parsed) throw new Error('Invalid browser policy');
     const access = browserAccessOf(parsed);
-    if (access.version === 2 && accessListCheck && !(await accessListCheck(access.agentGroupIds)))
-      throw new Error('Invalid browser policy');
     if (!parsed.enabled) return { status: 'disabled', enabled: false, reason: 'operator-enablement-required', access };
     return { status: 'enabled', enabled: true, paths, chromePath: parsed.chromePath ?? SYSTEM_CHROME, access };
   } catch (error) {

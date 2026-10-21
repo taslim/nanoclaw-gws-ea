@@ -1,3 +1,4 @@
+import { BrowserLocatorError, resolveLocator } from './locators.js';
 import { classifyNavigationUrl } from './control-policy.js';
 import { readPageControlFacts } from './control-facts.js';
 import { createBrowserQueue } from './index.js';
@@ -2070,7 +2071,12 @@ document.getElementById('updated').addEventListener('click', () => location.assi
 
   it('answers card_needed with the site, account, items and total when no payment method is saved', async () => {
     await open(GENERIC.guest);
-    expect(await purchase('Place order')).toMatchObject({
+    const seen = await observePage(page);
+    const handler = getDeliveryAction('purchase');
+    if (!handler) throw new Error('purchase delivery missing');
+    await handler({ action: 'purchase', requestId: 'card-needed', target: refIn(seen, 'Place order') }, session);
+    await queue.idle();
+    expect(await answer('card-needed')).toMatchObject({
       status: 'card_needed',
       site: 'pottery.example',
       account: 'guest checkout',
@@ -2079,6 +2085,46 @@ document.getElementById('updated').addEventListener('click', () => location.assi
       repeat_safe: true,
     });
     expect(await approvals()).toEqual([]);
+    expect(posts()).toEqual([]);
+    const edit = await run('edit-after-card-needed', [
+      { kind: 'type', ...refIn(seen, 'Email'), text: 'other@example.com' },
+    ]);
+    expect(edit.reason).toBeUndefined();
+    expect(edit).toMatchObject({
+      status: 'completed',
+      actions: [{ status: 'completed' }],
+    });
+    expect(await page.locator('[name="email"]').inputValue()).toBe('other@example.com');
+  });
+
+  it('keeps a generic control locator exact across duplicate labels and refuses unnamed controls', async () => {
+    await open(GENERIC.review);
+    await observePage(page);
+    await page.locator('#commit').evaluate((button) => {
+      const duplicate = button.cloneNode(true) as typeof button;
+      duplicate.id = 'duplicate-commit';
+      button.parentElement!.append(duplicate);
+    });
+    const element = await page.locator('#commit').elementHandle();
+    if (!element) throw new Error('Fixture commit control missing');
+    const result = await readMerchantPurchase(page, element);
+    expect(result.status).toBe('ready');
+    if (result.status !== 'ready' || !result.facts.control.locator) throw new Error('No generic locator');
+    const locator = result.facts.control.locator;
+    expect(locator).toMatchObject({ name: 'Place order', ordinal: 0, count: 2 });
+    const resolved = await resolveLocator(page, locator);
+    expect(await resolved.getAttribute('id')).toBe('commit');
+    await resolved.dispose();
+    await page.locator('#duplicate-commit').evaluate((button) => button.remove());
+    await expect(resolveLocator(page, locator)).rejects.toBeInstanceOf(BrowserLocatorError);
+    await result.element.dispose();
+    await page.locator('#commit').evaluate((button) => {
+      button.textContent = '';
+    });
+    expect(await read('#commit')).toMatchObject({
+      status: 'facts_incomplete',
+      missing: ['a commit control the host can find again'],
+    });
     expect(posts()).toEqual([]);
   });
 

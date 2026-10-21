@@ -6,18 +6,20 @@ import { getSession } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
-import { writeBrowserNotice } from './notices.js';
+import { notifyUnconfirmedPurchase, writeBrowserNotice } from './notices.js';
 import type { RecordedNotPlaced } from './cards.js';
 import { agreementsGranted } from './consent.js';
-import { markBrowserRequestCommitStarted } from './db.js';
+import { BrowserStore, markBrowserRequestCommitStarted } from './db.js';
 import { heldCredentialSites } from './leases.js';
 import {
   completePurchaseFacts,
+  guaranteeCoversReservation,
+  isFreeReservation,
   materialPurchaseChange,
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import type { BrowserExecutionContext } from './actions.js';
 import type { WatchBounds } from './watch-state.js';
 
@@ -296,7 +298,6 @@ export class PurchaseAuthorityStore {
           )
             throw new PurchaseAuthorityError('authority_unavailable');
         } else {
-          const { isFreeReservation } = await import('./fingerprint.js');
           if (
             !isFreeReservation(input.facts) ||
             !isRecord(bounds) ||
@@ -306,13 +307,11 @@ export class PurchaseAuthorityStore {
             throw new PurchaseAuthorityError('authority_unavailable');
         }
       } else {
-        const { guaranteeCoversReservation, readDelegatedReservationBounds } =
-          await import('./reservation-guarantee.js');
         const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
           'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
           input.guaranteeId,
         );
-        const reservation = await readDelegatedReservationBounds(input.jobId, this.db);
+        const reservation = await new BrowserStore(this.db).reservationBounds(input.jobId);
         const checkout = await this.db.get(
           'SELECT 1 FROM gws_ea_browser_purchase_cards WHERE job_id = ? LIMIT 1',
           input.jobId,
@@ -363,7 +362,7 @@ export class PurchaseAuthorityStore {
     claim?: (db: DbDriver, authority: SpendingAuthority, immediatelyRereadFacts: PurchaseFacts) => Promise<void>,
   ): Promise<SpendingAuthority> {
     await context.assertActive();
-    if (!(await readBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
+    if (!(await readHostBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
     return this.db.transaction(async () => {
       const authority = await this.get(authorityId);
       const at = new Date().toISOString();
@@ -449,12 +448,11 @@ export class PurchaseAuthorityStore {
     if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
       throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
     if (authority.guarantee_id) {
-      const { guaranteeCoversReservation, readDelegatedReservationBounds } = await import('./reservation-guarantee.js');
       const grant = await this.db.get<{ currency: string; max_total_minor: number; revoked_at: string | null }>(
         'SELECT currency,max_total_minor,revoked_at FROM gws_ea_browser_reservation_guarantees WHERE id = ?',
         authority.guarantee_id,
       );
-      const reservation = await readDelegatedReservationBounds(jobId, this.db);
+      const reservation = await new BrowserStore(this.db).reservationBounds(jobId);
       const bounds = JSON.parse(authority.bounds_json) as PurchaseBounds;
       if (
         !reservation ||
@@ -641,8 +639,10 @@ export class PurchaseAuthorityStore {
       return true;
     });
     if (changed) {
-      const { notifyUnconfirmedPurchase } = await import('./purchase-outcome.js');
-      await afterCommit('An unconfirmed purchase', () => notifyUnconfirmedPurchase(attemptId, this.db));
+      await afterCommit('An unconfirmed purchase', async () => {
+        const attempt = await this.attempt(attemptId);
+        if (attempt) await notifyUnconfirmedPurchase(attempt, this.db);
+      });
     }
     return outcome;
   }

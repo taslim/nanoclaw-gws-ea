@@ -1,3 +1,5 @@
+import { observePage } from './observe.js';
+import { formatLocalTimeWithZone } from '../../timezone.js';
 import { createHash } from 'node:crypto';
 import { markWatchRegion, readBrowserWatchSetup } from './watch-runtime.js';
 import { executeBrowserPurchase } from './purchase.js';
@@ -25,12 +27,12 @@ import { finishApprovalWithdrawal, registerApprovalHandler, requestApproval } fr
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { readIsoTime } from './iso-time.js';
-import { cardEventSpan, cardTime, ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
+import { cardEventSpan, ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
 import { browserSite } from './leases.js';
 import { amountMinor, formatMoney } from './fingerprint.js';
 import { merchantSignatures } from './merchant-signatures.js';
 import { readBrowserRef, type BrowserRef } from './observe.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { executeRecipe } from './recipes.js';
 import { loadRecipe, recipeCheckKey, type BrowserRecipe } from './recipe-store.js';
 import { type StructuredBrowserLocator } from './locators.js';
@@ -229,7 +231,7 @@ const watchSetupGuard = defineGuardedAction({
     if (
       actor.kind !== 'agent' ||
       !actor.sessionId ||
-      !(await readBrowserPolicy()).enabled ||
+      !(await readHostBrowserPolicy()).enabled ||
       typeof payload.watchId !== 'string'
     )
       return DENY('Only a live browser watch can request its setup approval.');
@@ -271,7 +273,7 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
       ),
       `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
       'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
-      `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
+      `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
     ].join('\n');
   return [
     'Approve one reservation across this errand’s watches, within these bounds:',
@@ -285,9 +287,9 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
     `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
     ...financial.policy!.commitments.map(
       (term) =>
-        `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${cardTime(term.conversionAt, principalTimeZone)}` : ''}`,
+        `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}` : ''}`,
     ),
-    `Watch deadline: ${cardTime(bounds.until, principalTimeZone)}`,
+    `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
   ].join('\n');
 }
 type PreparedWatch =
@@ -614,7 +616,23 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
     );
 });
 
-export const watchAction: BrowserQueuedAction = { validate: validateQueuedWatch, execute: createBrowserWatch };
+export const watchAction: BrowserQueuedAction = {
+  validate: validateQueuedWatch,
+  async execute(context, payload) {
+    const result = await createBrowserWatch(context, payload);
+    // Region marking needs its own default snapshot for the durable baseline. Return a current core view
+    // after it so the next model action never targets the replaced native ref map.
+    return result.region
+      ? {
+          ...result,
+          observation: await observePage(await context.page(), context.assertActive, {
+            remaining: context.remaining,
+            signal: context.signal,
+          }),
+        }
+      : result;
+  },
+};
 export const listWatchesAction: BrowserQueuedAction = {
   validate: () => ({}),
   async execute(context) {

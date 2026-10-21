@@ -273,6 +273,14 @@ export async function browserRefForElement(
   throw new BrowserRefError('not_actionable');
 }
 
+/** An ancillary native snapshot replaces Playwright's ref map even if its caller later fails. */
+export function invalidateBrowserRefs(page: Page): void {
+  const state = stateFor(page);
+  state.generation++;
+  state.document = undefined;
+  state.structure = undefined;
+}
+
 /** Structured host checkpoints replace native refs just like agent observations do. */
 export async function snapshotBrowserStructure(page: Page): Promise<BrowserStructure> {
   await collectSecretFields(page);

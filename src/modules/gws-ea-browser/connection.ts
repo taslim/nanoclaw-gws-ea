@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 
 import {
@@ -36,6 +37,7 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
   if (!(outbound instanceof Writable) || !(inbound instanceof Readable)) throw new Error('Chrome pipe unavailable');
   let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let ended = false;
+  let gracefulShutdown = false;
   const transport: ConnectOverCDPTransport = {
     send(message) {
       if (ended) return;
@@ -44,14 +46,14 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
       });
     },
     close() {
-      child.kill('SIGTERM');
+      if (!gracefulShutdown) child.kill('SIGTERM');
     },
   };
   function terminate(): void {
     if (ended) return;
     ended = true;
     transport.onclose?.('Chrome pipe closed');
-    child.kill('SIGTERM');
+    if (!gracefulShutdown) child.kill('SIGTERM');
   }
   inbound.on('data', (chunk: Buffer) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -111,14 +113,31 @@ export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths
       child,
       close() {
         closing ??= (async () => {
-          // Chrome may not answer Browser.close after a process crash.
-          const requested = attached.close().catch(() => undefined);
-          const deadline = new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, 2_000);
-            timer.unref();
-          });
-          await Promise.race([requested, deadline]);
+          // A CDP browser.close() disconnects its transport, whose fallback kills the child. Ask Chrome
+          // itself to quit first so it flushes the persistent profile, and wait for exit independently of
+          // the protocol reply. Pipe/disconnect callbacks must not SIGTERM it during this allowance.
+          gracefulShutdown = true;
+          const exited =
+            child.exitCode !== null || child.signalCode !== null
+              ? Promise.resolve()
+              : once(child, 'exit').then(() => undefined);
+          void session.send('Browser.close').catch(() => undefined);
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([
+              exited,
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, 2_000);
+                timer.unref();
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          // The client close waits for disconnect; forced child retirement must remain reachable if
+          // Chrome never honored Browser.close and the graceful transport deliberately did not kill it.
           await stopChrome(child);
+          await attached.close().catch(() => undefined);
         })();
         return closing;
       },

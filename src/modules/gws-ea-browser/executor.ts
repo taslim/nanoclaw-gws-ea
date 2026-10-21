@@ -37,7 +37,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { pageMayShowSecret } from './page-privacy.js';
-import { readBrowserPolicy } from './policy.js';
+import { readHostBrowserPolicy } from './access.js';
 import { browserOperationId, type BrowserOperationContext, type BrowserQueuedAction } from './actions.js';
 import {
   reserveBrowserActionTrace,
@@ -653,7 +653,7 @@ async function executeBatch(
             break;
           case 'upload':
             if (target) {
-              const policy = await readBrowserPolicy();
+              const policy = await readHostBrowserPolicy();
               if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
               const staged = await stageBrowserUpload(
                 sessionDir(context.session.agent_group_id, context.session.id),
@@ -680,7 +680,7 @@ async function executeBatch(
               break;
             }
             if (target) {
-              const policy = await readBrowserPolicy();
+              const policy = await readHostBrowserPolicy();
               if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
               data = await captureBrowserDownload(
                 context,

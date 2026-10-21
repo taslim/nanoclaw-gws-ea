@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { guaranteeCoversReservation } from './reservation-guarantee.js';
+import { guaranteeCoversReservation } from './fingerprint.js';
 import type { PurchaseBounds, PurchaseFacts } from './fingerprint.js';
 const bounds: PurchaseBounds = {
   reservation: {

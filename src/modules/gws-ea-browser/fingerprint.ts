@@ -381,3 +381,54 @@ export function completePurchaseFacts(facts: PurchaseFacts): boolean {
     );
   });
 }
+
+/** A commit label that books rather than buys. */
+export const BOOKING_CONTROL = /\b(?:reserve|reservation|book(?:ing)?|table|rsvp|wait\s*list|waitlist)\b/iu;
+
+/** Whether the host-read free commit books rather than orders. */
+export function freeCommitBooks(facts: FreeCommitFacts): boolean {
+  return Boolean(facts.booking) || BOOKING_CONTROL.test(facts.control.label);
+}
+
+/**
+ * Whether the standing guarantee covers a booking (R38, KTD21): its venue, party size and time read and within
+ * main's recorded bounds, nothing due now, and only cancellation or no-show fees whose whole exposure is within
+ * the guarantee's limit. An unreviewed booking must also state its fee terms.
+ */
+export function guaranteeCoversReservation(
+  grant:
+    | { readonly currency: string; readonly max_total_minor: number; readonly revoked_at: string | null }
+    | undefined,
+  facts: PurchaseFacts,
+  bounds: PurchaseBounds,
+): boolean {
+  const reservation = bookedReservation(facts);
+  const delegated = bounds.reservation;
+  if (
+    !grant ||
+    grant.revoked_at ||
+    !reservation ||
+    !delegated ||
+    facts.addOns?.length ||
+    facts.dueNowMinor !== 0 ||
+    facts.currency !== grant.currency ||
+    (facts.generic && !facts.commitments.length) ||
+    !completePurchaseFacts(facts)
+  )
+    return false;
+  if (!withinReservationBounds(reservation, delegated)) return false;
+  if (
+    !facts.commitments.every(
+      (term) =>
+        term.kind === 'conditional_fee' &&
+        (term.conditionalTrigger === 'cancellation' || term.conditionalTrigger === 'no_show'),
+    )
+  )
+    return false;
+  // Distinct conditional fees can both apply; the ceiling covers total exposure, never one person's amount.
+  const exposure = facts.commitments.reduce(
+    (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? reservation.partySize : 1),
+    0,
+  );
+  return Number.isSafeInteger(exposure) && exposure <= grant.max_total_minor;
+}

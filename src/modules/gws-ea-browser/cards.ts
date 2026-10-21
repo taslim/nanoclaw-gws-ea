@@ -3,7 +3,7 @@ import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
 import { writeBrowserNotice } from './notices.js';
 import { requestWake } from '../../request-wake.js';
-import { formatLocalTime, resolveTimezone } from '../../timezone.js';
+import { formatLocalTime, formatLocalTimeWithZone, timeZoneLabel } from '../../timezone.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import type { PendingApproval } from '../../types.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
@@ -31,25 +31,11 @@ export interface PurchaseCard {
 export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
 /** The longest seller-controlled string a card quotes without a bound of its own; each is quoted (`quoted`). */
 export const SELLER_TEXT_LIMIT = 360;
-/** A zone named as people say it: its city, or the zone's own short name at `at` when it has none. */
-function zoneLabel(timeZone: string, at: string): string {
-  const zone = resolveTimezone(timeZone);
-  const city = /^(?!Etc\/)[A-Za-z]+\/(?:[^/]+\/)?([^/]+)$/u.exec(zone)?.[1];
-  return city
-    ? `${city.replaceAll('_', ' ')} time`
-    : (new Intl.DateTimeFormat('en-US', { timeZone: zone, timeZoneName: 'short' })
-        .formatToParts(new Date(at))
-        .find((part) => part.type === 'timeZoneName')?.value ?? zone);
-}
-/** A moment on the clock of `timeZone`, labelled with it. */
-export function cardTime(at: string, timeZone: string): string {
-  return `${formatLocalTime(at, timeZone)} ${zoneLabel(timeZone, at)}`;
-}
 function cardSpan(start: string, end: string, timeZone: string): string {
   const from = formatLocalTime(start, timeZone),
     to = formatLocalTime(end, timeZone);
   const day = from.slice(0, from.lastIndexOf(', ') + 2);
-  return `${from} through ${to.startsWith(day) ? to.slice(day.length) : to} ${zoneLabel(timeZone, start)}`;
+  return `${from} through ${to.startsWith(day) ? to.slice(day.length) : to} ${timeZoneLabel(timeZone, start)}`;
 }
 /**
  * An event's span on the venue's clock, where it happens, with the principal's equivalent
@@ -67,10 +53,10 @@ export function cardEventSpan(start: string, end: string, venueTimeZone: string,
  * read differently.
  */
 export function cardEventTime(at: string, venueTimeZone: string, principalTimeZone: string): string {
-  const venue = cardTime(at, venueTimeZone);
+  const venue = formatLocalTimeWithZone(at, venueTimeZone);
   return formatLocalTime(at, venueTimeZone) === formatLocalTime(at, principalTimeZone)
     ? venue
-    : `${venue} (${cardTime(at, principalTimeZone)})`;
+    : `${venue} (${formatLocalTimeWithZone(at, principalTimeZone)})`;
 }
 /** An earlier purchase on the site main recorded as not placed, from the merchant's email or the principal (KTD9). */
 export interface RecordedNotPlaced {
@@ -90,7 +76,7 @@ export const NO_EARLIER_PURCHASES: EarlierPurchases = { unresolved: 0, recordedN
 function earlierLines(earlier: EarlierPurchases, principalTimeZone: string): string[] {
   const lines = earlier.recordedNotPlaced.map(
     (recorded) =>
-      `Earlier purchase here, tried ${cardTime(recorded.attemptedAt, principalTimeZone)}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
+      `Earlier purchase here, tried ${formatLocalTimeWithZone(recorded.attemptedAt, principalTimeZone)}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
   );
   if (!earlier.unresolved) return lines;
   const count =
@@ -128,9 +114,10 @@ function termLines(
       );
     if (term.trigger) lines.push(`Trigger: ${quoted(term.trigger, SELLER_TEXT_LIMIT)}`);
     if (term.cancellationDeadline)
-      lines.push(`Cancellation deadline: ${cardTime(term.cancellationDeadline, principalTimeZone)}`);
+      lines.push(`Cancellation deadline: ${formatLocalTimeWithZone(term.cancellationDeadline, principalTimeZone)}`);
     if (term.cancellationTerms) lines.push(`Cancellation terms: ${quoted(term.cancellationTerms, 700)}`);
-    if (term.conversionAt) lines.push(`Trial conversion: ${cardTime(term.conversionAt, principalTimeZone)}`);
+    if (term.conversionAt)
+      lines.push(`Trial conversion: ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}`);
     if (term.frequency) lines.push(`Recurring frequency: ${quoted(term.frequency, SELLER_TEXT_LIMIT)}`);
   }
   return lines;
@@ -228,7 +215,7 @@ export function renderPurchaseCard(
           `Approved delivery window: ${quoted(bounds.deliveryWindow.start, SELLER_TEXT_LIMIT)} through ${quoted(bounds.deliveryWindow.end, SELLER_TEXT_LIMIT)}`,
         ]
       : []),
-    ...(bounds.neededBy ? [`Needed by: ${cardTime(bounds.neededBy, principalTimeZone)}`] : []),
+    ...(bounds.neededBy ? [`Needed by: ${formatLocalTimeWithZone(bounds.neededBy, principalTimeZone)}`] : []),
     ...choiceLines(facts),
     ...termLines(facts, facts.reservation?.partySize, money, principalTimeZone),
   ];

@@ -29,6 +29,7 @@ import {
 } from './control-facts.js';
 import {
   GENERIC_FLOW_ID,
+  BOOKING_CONTROL,
   currencyExponent,
   formatMoney,
   type FinancialCommitment,
@@ -43,7 +44,14 @@ import type {
   MerchantPurchaseEvidence,
   MerchantSignature,
 } from './merchant-contract.js';
-import { captureElementLocator, resolveLocator, type StructuredBrowserLocator } from './locators.js';
+import {
+  ariaNodes,
+  flatten,
+  captureElementLocator,
+  resolveLocator,
+  type StructuredBrowserLocator,
+} from './locators.js';
+import { browserStructureFacts } from './observe.js';
 import { classifyControlFacts } from './control-policy.js';
 
 const VOCABULARY = {
@@ -73,7 +81,7 @@ const VOCABULARY = {
     /\btable\s+for\s+(\d{1,2})\b|\bparty\s+of\s+(\d{1,2})\b|\b(\d{1,2})\s+(?:guests?|people|persons|adults|diners|covers)\b/iu,
   partyField: /\b(?:party|guests?|people|persons?|covers|diners|adults|group\s+size)\b/iu,
   /** A commit that books rather than buys. */
-  bookingControl: /\b(?:reserve|reservation|book(?:ing)?|table|rsvp|wait\s*list|waitlist)\b/iu,
+  bookingControl: BOOKING_CONTROL,
   venueLine: /^(?:venue|restaurant|location|where)\s*:\s*(.{2,120})$/iu,
   emailField: /e-?mail/iu,
   email: /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu,
@@ -823,7 +831,11 @@ async function readGenericPurchase(
     if (!controlBox) return { status: 'checkout_lapsed' };
     let locator: StructuredBrowserLocator;
     try {
-      locator = await captureElementLocator(element);
+      locator = await captureElementLocator(
+        element,
+        flatten(ariaNodes(browserStructureFacts(page)?.tree)),
+        read.facts.name,
+      );
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       return { status: 'facts_incomplete', missing: ['a commit control the host can find again'] };
@@ -904,11 +916,6 @@ async function waitForGenericResult(page: Page, timeoutMs: number): Promise<void
 export function pressRefusal(lines: readonly string[]): 'declined' | 'failed' | undefined {
   if (lines.some((line) => VOCABULARY.decline.test(line))) return 'declined';
   return lines.some((line) => VOCABULARY.failure.test(line)) ? 'failed' : undefined;
-}
-
-/** Whether a free commit books (a table, a waitlist, an RSVP) rather than places an order. */
-export function freeCommitBooks(facts: FreeCommitFacts): boolean {
-  return Boolean(facts.booking) || VOCABULARY.bookingControl.test(facts.control.label);
 }
 
 /** Whether a confirmation is the merchant's own, or its payment platform's: a document on another site proves nothing of its attempt. */
