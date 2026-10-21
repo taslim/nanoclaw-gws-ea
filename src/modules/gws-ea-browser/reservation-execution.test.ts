@@ -27,13 +27,13 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore, browserRequestId } from './db.js';
-import { BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
 import { observePage } from './observe.js';
 import { pageMayShowSecret } from './page-privacy.js';
 import { principalReachable, seedPrincipal } from './principal-fixture.js';
 import { freeResyTable, resyFixture, type ResyFixtureState } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
-import type { WatchBounds } from './watches.js';
+import type { WatchBounds } from './watch-state.js';
 import type { Session } from '../../types.js';
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 describe.skipIf(!chromePath)('native reservation through the common purchase executor', { timeout: 30_000 }, () => {

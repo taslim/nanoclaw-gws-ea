@@ -13,6 +13,7 @@ import {
   type BrowserReplayUrl,
 } from './page-privacy.js';
 import type { CookieBannerReport } from './cookie-banners.js';
+import { withinTime } from './page-targets.js';
 
 /** A challenge is a blocked public read, including when it changed a recipe checkpoint. */
 export function hasBrowserChallenge(snapshot: string): boolean {
@@ -119,20 +120,51 @@ function stateFor(page: Page): PageObservationState {
   return state;
 }
 
-type BrowserSiteInfoProvider = (
-  page: Page,
-  origin: string,
-  assertActive?: () => Promise<void>,
-) => Promise<Record<string, unknown>>;
-const siteInfoProviders: BrowserSiteInfoProvider[] = [];
-/** Host-owned optional enrichment. It receives an origin only and never page-authored instructions. */
-export function registerBrowserSiteInfoProvider(provider: BrowserSiteInfoProvider): void {
-  siteInfoProviders.push(provider);
+interface BrowserSiteInfo {
+  recipes?(origin: string): Promise<Record<string, unknown>>;
+  vault?(origins: readonly string[], assertActive: () => Promise<void>): Promise<Record<string, unknown>>;
+}
+let siteInfo: BrowserSiteInfo = {};
+/** Composition supplies the two known optional readers. Neither receives a Page or a native handle. */
+export function configureBrowserSiteInfo(readers: BrowserSiteInfo): void {
+  siteInfo = readers;
 }
 
 export interface ObservePageOptions {
   /** What the host did about a cookie banner just before this observation (R18), for it to report. */
   readonly cookieBanner?: CookieBannerReport | undefined;
+  readonly remaining?: () => number;
+  readonly signal?: AbortSignal;
+}
+
+/** Allow first-use vault discovery up to ten seconds, while reserving a second for the required answer. */
+async function optionalSiteInfo(
+  work: (assertActive: () => Promise<void>) => Promise<Record<string, unknown>>,
+  unavailable: Record<string, unknown>,
+  assertActive: (() => Promise<void>) | undefined,
+  options: ObservePageOptions,
+): Promise<Record<string, unknown>> {
+  const allowance = Math.min(10_000, Math.max(0, (options.remaining?.() ?? 11_000) - 1_000));
+  if (!allowance || options.signal?.aborted) return unavailable;
+  let active = true;
+  let stop: (() => void) | undefined;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    stop = () => reject(new Error('Site metadata interrupted'));
+    options.signal?.addEventListener('abort', stop, { once: true });
+  });
+  const check = async (): Promise<void> => {
+    if (!active || options.signal?.aborted) throw new Error('Site metadata allowance ended');
+    await assertActive?.();
+    if (!active || options.signal?.aborted) throw new Error('Site metadata allowance ended');
+  };
+  try {
+    return await withinTime(Promise.race([Promise.resolve().then(() => work(check)), interrupted]), allowance);
+  } catch {
+    return unavailable;
+  } finally {
+    active = false;
+    if (stop) options.signal?.removeEventListener('abort', stop);
+  }
 }
 
 export async function observePage(
@@ -166,11 +198,36 @@ export async function observePage(
       if (origin) origins.add(origin.origin);
     }
     const originsKey = JSON.stringify([current.origin, [...origins].sort()]);
-    if (current.protocol === 'https:' && domain && state.siteOriginsKey !== originsKey && siteInfoProviders.length) {
+    if (
+      current.protocol === 'https:' &&
+      domain &&
+      state.siteOriginsKey !== originsKey &&
+      (siteInfo.recipes || siteInfo.vault)
+    ) {
       site = { origin: current.origin, untrusted: true };
-      for (const provider of siteInfoProviders) Object.assign(site, await provider(page, current.origin, assertActive));
+      const { recipes: readRecipes, vault: readVault } = siteInfo;
+      const [recipes, vault] = await Promise.all([
+        readRecipes
+          ? optionalSiteInfo(
+              () => readRecipes(current.origin),
+              { recipes_status: 'unavailable' },
+              assertActive,
+              options,
+            )
+          : Promise.resolve<Record<string, unknown>>({}),
+        readVault
+          ? optionalSiteInfo(
+              (check) => readVault([...origins], check),
+              { vault_status: 'vault_unavailable' },
+              assertActive,
+              options,
+            )
+          : Promise.resolve<Record<string, unknown>>({}),
+      ]);
+      Object.assign(site, recipes, vault);
       site = redactPageData(page, site) as BrowserObservation['site'];
-      state.siteOriginsKey = originsKey;
+      // Unavailable discovery can be retried by the next observation on this same origin set.
+      if (!recipes.recipes_status && !vault.vault_status) state.siteOriginsKey = originsKey;
     }
   } catch (_error) {
     /* Optional site metadata cannot prevent a redacted observation. */
@@ -183,6 +240,37 @@ export async function observePage(
     ...(site ? { site } : {}),
     ...(options.cookieBanner ? { cookie_banner: options.cookieBanner } : {}),
   };
+}
+
+/** Map only structured native candidates to a real current public ref; display text never supplies identities. */
+export async function browserRefForElement(
+  page: Page,
+  element: ElementHandle,
+  target: { role: string; name?: string },
+): Promise<BrowserRef> {
+  const state = stateFor(page);
+  if (!state.structure || state.document !== browserDocumentIdentity(page)) throw new BrowserRefError('stale_ref');
+  const generation = state.generation;
+  const refs = (tree: unknown): string[] => {
+    if (Array.isArray(tree)) return tree.flatMap(refs);
+    if (!isRecord(tree)) return [];
+    const current =
+      tree.role === target.role &&
+      (target.name === undefined || tree.name === target.name) &&
+      typeof tree.ref === 'string' &&
+      BROWSER_REF_PATTERN.test(tree.ref)
+        ? [tree.ref]
+        : [];
+    return [...current, ...refs(tree.children)];
+  };
+  for (const ref of refs(state.structure.tree)) {
+    if (await page.getByRef(ref).evaluate((node, other) => node === other, element)) {
+      if (state.generation !== generation || state.document !== browserDocumentIdentity(page))
+        throw new BrowserRefError('stale_ref');
+      return { ref, generation };
+    }
+  }
+  throw new BrowserRefError('not_actionable');
 }
 
 /** Structured host checkpoints replace native refs just like agent observations do. */

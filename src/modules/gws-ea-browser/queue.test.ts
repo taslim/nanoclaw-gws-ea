@@ -1,3 +1,4 @@
+import { repairBrowserWatchChecks } from './scheduler.js';
 import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import type { Page } from 'playwright-core';
@@ -974,7 +975,18 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await attempt(job, 'exposed', new Date(Date.now() + 1_000).toISOString());
 
     const queue = createQueue(runtime);
-    await recoverAndStartBrowserQueue(queue);
+    const run = store.db.run.bind(store.db);
+    const unavailableChecks = vi.spyOn(store.db, 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes('UPDATE gws_ea_browser_watch_checks')) throw new Error('Scheduled checks unavailable');
+      return run(sql, ...parameters);
+    });
+    try {
+      await recoverAndStartBrowserQueue(queue);
+      await expect(repairBrowserWatchChecks(queue)).rejects.toThrow('Scheduled checks unavailable');
+      expect(unavailableChecks).toHaveBeenCalled();
+    } finally {
+      unavailableChecks.mockRestore();
+    }
     expect(answer('credential-crash')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
     await noPurchaseRecords();

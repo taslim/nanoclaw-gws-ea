@@ -1,3 +1,4 @@
+import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /**
@@ -47,8 +48,8 @@ import { SiteLeaseStore } from './leases.js';
 import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
 import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
-import { claimRegionWatchCommit } from './watches.js';
-import { BrowserQueue } from './queue.js';
+
+import { type BrowserQueue } from './queue.js';
 
 const ALIAS = 'aya.web@example.test';
 const SITE = 'pottery.example';

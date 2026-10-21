@@ -1,3 +1,5 @@
+import { configureBrowserSiteInfo } from './observe.js';
+import { readRecipeSiteInfo } from './recipe-store.js';
 /** Optional, host-owned Chrome runtime. Importing registers lifecycle only; Chrome is lazy. */
 
 import { register } from '../../cli/registry.js';
@@ -29,8 +31,9 @@ import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import { browserAction } from './executor.js';
 
 import { saveRecipeAction, runRecipeAction } from './recipes.js';
+
 import './capability.js';
-import { fillSecretAction } from './fill.js';
+import { fillSecretAction, readVaultSiteInfo } from './fill.js';
 import {
   credentialFormAction,
   registerCredentialAuthorityDelivery,
@@ -68,9 +71,12 @@ import { registerConsentGrantsDelivery, requestConsentAction } from './consent-a
 import { registerDisclosureDelivery } from './disclosures.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
 import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } from './watches.js';
+
 import type { BrowserActions, BrowserExecutionContext } from './actions.js';
 import { sweepBrowserStartup } from './start-sweep.js';
-import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
+import { createBrowserWatchScheduler, repairBrowserWatchChecks, type BrowserWatchScheduler } from './scheduler.js';
+
+configureBrowserSiteInfo({ recipes: readRecipeSiteInfo, vault: readVaultSiteInfo });
 
 registerMigration(browserSiteLeasesMigration);
 registerMigration(browserQueueMigration);
@@ -130,6 +136,7 @@ onHostStart(async ({ signal }) => {
       if (scheduler) await optional(() => scheduler.stop());
     } else if (!watchScheduler) {
       await optional(async () => {
+        await repairBrowserWatchChecks(activeQueue);
         const scheduler = createBrowserWatchScheduler(activeQueue);
         try {
           scheduler.start(signal);

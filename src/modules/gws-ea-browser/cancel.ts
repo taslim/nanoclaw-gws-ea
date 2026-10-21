@@ -1,3 +1,4 @@
+import { detachBrowserWatchCards } from './watch-state.js';
 /** Native job reads and cancellation, shared by delegation, matters and policy reconciliation. */
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
@@ -235,7 +236,7 @@ export async function cancelBrowserJobInTransaction(
   const inProgress = await committing(store.db, job.id);
   const withdrawnCards = purchases ? await detachPurchaseCards(job.id, 'withdrawn') : [];
   if (await store.db.hasTable('gws_ea_browser_watches'))
-    withdrawnCards.push(...(await (await import('./watches.js')).detachBrowserWatchCards(job.id, 'cancelled')));
+    withdrawnCards.push(...(await detachBrowserWatchCards(job.id, 'cancelled')));
   // No authority the job has not used survives it: nothing was disclosed for these.
   const abandonedAttempts = (await store.db.hasTable('gws_ea_browser_credential_attempts'))
     ? await credentialAttempts.abandonForJob(job.id)

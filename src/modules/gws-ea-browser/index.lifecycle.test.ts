@@ -13,6 +13,7 @@ import { getHostShutdownCallbacks, getHostStartCallbacks } from '../../host-life
 import { closeDb, initTestDb } from '../../db/index.js';
 import { BrowserQueue } from './queue.js';
 import { BrowserWatchScheduler } from './scheduler.js';
+import * as scheduling from './scheduler.js';
 import * as group from './group.js';
 import * as reconciliation from './reconcile.js';
 import * as signInMail from './sign-in-mail.js';
@@ -54,6 +55,7 @@ async function listening(port: number): Promise<boolean> {
 describe('optional host browser lifecycle', () => {
   it('contains startup and sweep projection failures while durable maintenance continues and admission stays closed', async () => {
     const db = await initTestDb();
+    vi.spyOn(scheduling, 'repairBrowserWatchChecks').mockResolvedValue();
     const recoverMail = vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
     const recover = vi.spyOn(startup, 'sweepBrowserStartup').mockResolvedValue();
     const queueStart = vi.spyOn(BrowserQueue.prototype, 'start').mockResolvedValue();
@@ -110,6 +112,7 @@ describe('optional host browser lifecycle', () => {
 
   it('does not reconcile or admit browser work before failed purchase recovery is retried successfully', async () => {
     const db = await initTestDb();
+    vi.spyOn(scheduling, 'repairBrowserWatchChecks').mockResolvedValue();
     vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
     vi.spyOn(startup, 'sweepBrowserStartup')
       .mockRejectedValueOnce(new Error('EIO: purchase recovery'))
@@ -152,54 +155,62 @@ describe('optional host browser lifecycle', () => {
       await closeDb();
     }
   });
-  it('keeps recovered browser work available when optional watch scheduling cannot start', async () => {
-    const db = await initTestDb();
-    vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
-    const recovery = vi.spyOn(startup, 'sweepBrowserStartup').mockResolvedValue();
-    const startQueue = vi.spyOn(BrowserQueue.prototype, 'start').mockResolvedValue();
-    vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
-    vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
-    vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
-    vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
-    const retry = vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
-    vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
-    vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
-    vi.spyOn(purchases, 'sweepBrowserPurchaseState').mockResolvedValue();
-    const schedule = vi
-      .spyOn(BrowserWatchScheduler.prototype, 'start')
-      .mockImplementationOnce(() => {
-        throw new Error('Watch scheduling unavailable');
-      })
-      .mockImplementation(() => undefined);
-    const stop = vi.spyOn(BrowserWatchScheduler.prototype, 'stop').mockResolvedValue();
-    const controller = new AbortController();
-    vi.useFakeTimers();
-    try {
-      await expect(
-        getHostStartCallbacks().at(-1)!({
-          db,
-          signal: controller.signal,
-          deliveryAdapter: { deliver: async () => undefined },
-        }),
-      ).resolves.toBeUndefined();
-      expect(group.browserAdmissionReady()).toBe(true);
-      expect(recovery).toHaveBeenCalledOnce();
-      expect(startQueue).toHaveBeenCalledOnce();
-      expect(stop).toHaveBeenCalledOnce();
-      expect(retry).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(30_001);
-      expect(schedule).toHaveBeenCalledTimes(2);
-      expect(recovery).toHaveBeenCalledOnce();
-      expect(group.browserAdmissionReady()).toBe(true);
-    } finally {
-      controller.abort();
-      await vi.advanceTimersByTimeAsync(30_000);
-      vi.clearAllTimers();
-      vi.useRealTimers();
-      vi.restoreAllMocks();
-      await closeDb();
-    }
-  });
+  it.each(['repair', 'start'])(
+    'keeps recovered browser work available when optional watch %s fails',
+    async (failure) => {
+      const db = await initTestDb();
+      const repair = vi.spyOn(scheduling, 'repairBrowserWatchChecks');
+      if (failure === 'repair') repair.mockRejectedValueOnce(new Error('Watch repair unavailable'));
+      repair.mockResolvedValue();
+      vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
+      const recovery = vi.spyOn(startup, 'sweepBrowserStartup').mockResolvedValue();
+      const startQueue = vi.spyOn(BrowserQueue.prototype, 'start').mockResolvedValue();
+      vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
+      vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
+      vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
+      vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+      const retry = vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
+      vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
+      vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
+      vi.spyOn(purchases, 'sweepBrowserPurchaseState').mockResolvedValue();
+      const schedule = vi
+        .spyOn(BrowserWatchScheduler.prototype, 'start')
+        .mockImplementationOnce(() => {
+          if (failure === 'start') throw new Error('Watch scheduling unavailable');
+        })
+        .mockImplementation(() => undefined);
+      const stop = vi.spyOn(BrowserWatchScheduler.prototype, 'stop').mockResolvedValue();
+      const controller = new AbortController();
+      vi.useFakeTimers();
+      try {
+        await expect(
+          getHostStartCallbacks().at(-1)!({
+            db,
+            signal: controller.signal,
+            deliveryAdapter: { deliver: async () => undefined },
+          }),
+        ).resolves.toBeUndefined();
+        expect(group.browserAdmissionReady()).toBe(true);
+        expect(recovery).toHaveBeenCalledOnce();
+        expect(startQueue).toHaveBeenCalledOnce();
+        expect(repair).toHaveBeenCalledOnce();
+        expect(stop).toHaveBeenCalledTimes(failure === 'repair' ? 0 : 1);
+        expect(retry).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(30_001);
+        expect(repair).toHaveBeenCalledTimes(2);
+        expect(schedule).toHaveBeenCalledTimes(failure === 'repair' ? 1 : 2);
+        expect(recovery).toHaveBeenCalledOnce();
+        expect(group.browserAdmissionReady()).toBe(true);
+      } finally {
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(30_000);
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+        await closeDb();
+      }
+    },
+  );
 
   it('does not admit a browser while Playwright protocol diagnostics can expose credentials', async () => {
     await ensureBrowserPaths(browserPaths(file));
@@ -378,6 +389,7 @@ describe('optional host browser lifecycle', () => {
     'closes the owned Chrome and proxy when optional scheduler shutdown fails',
     async () => {
       const db = await initTestDb();
+      vi.spyOn(scheduling, 'repairBrowserWatchChecks').mockResolvedValue();
       await ensureBrowserPaths(browserPaths(file));
       await writePrivateFile(
         file,

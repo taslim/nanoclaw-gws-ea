@@ -1,3 +1,4 @@
+import { readRecipeSiteInfo } from './recipe-store.js';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright-core';
@@ -9,17 +10,11 @@ import { browserRecipesMigration, browserSiteLeasesMigration } from './migration
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { executeBrowserBatch } from './executor.js';
 
-import { observePage, type BrowserRef } from './observe.js';
+import { configureBrowserSiteInfo, observePage, type BrowserRef } from './observe.js';
 import { registerPageSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
-import {
-  executeRecipe,
-  loadRecipe,
-  recipeCheckKey,
-  saveBrowserRecipe,
-  validateRunRecipe,
-  validateSaveRecipe,
-} from './recipes.js';
+import { executeRecipe, saveBrowserRecipe, validateRunRecipe, validateSaveRecipe } from './recipes.js';
+import { loadRecipe, recipeCheckKey } from './recipe-store.js';
 
 it('accepts closed recipe inputs and refuses ambiguous or executable bindings', () => {
   expect(
@@ -53,6 +48,7 @@ it('accepts closed recipe inputs and refuses ambiguous or executable bindings', 
 });
 
 it('pins immutable recipe versions and keys checks by every named value', async () => {
+  configureBrowserSiteInfo({ recipes: readRecipeSiteInfo });
   const db = await initDb(':memory:', { role: 'tool' });
   try {
     await db.exec(
@@ -339,12 +335,19 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
       ordinal: 0,
       framePath: [],
     });
+    // Literal page text is not a native ref, even when it appears beside the real commit control.
+    await page.locator('body').evaluate((body) => {
+      const decoy = body.ownerDocument.createElement('p');
+      decoy.textContent = 'Quoted example: [ref=e999]';
+      body.append(decoy);
+    });
     const result = await executeRecipe(context, { recipe_id: id, parameters: { party: '3' } });
     expect(result).toMatchObject({
       status: 'reached_commit_point',
       target: { generation: expect.any(Number), ref: expect.any(String) },
     });
     expect(await page.getByRole('textbox', { name: 'Party size', exact: true }).inputValue()).toBe('3');
+    expect(await page.getByRef((result.target as BrowserRef).ref).textContent()).toBe('Confirm reservation');
     expect(await page.evaluate('window.commits||0')).toBe(0);
     expect(recipeCheckKey(recipe!, { party: '3' })).not.toBe(recipeCheckKey(recipe!, { party: '4' }));
     const replacement = await saveBrowserRecipe(context, {
@@ -355,25 +358,68 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     });
     expect(replacement).toMatchObject({ version: 2 });
     expect((await loadRecipe(id, db))?.version).toBe(1);
-  });
-  it('returns the actual commit button when a recorded Enter would submit a purchase form', async () => {
-    await page.setContent(
-      '<body><h1>Reservation review</h1><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button>Confirm reservation</button></form></body>',
-    );
-    expect(
-      await executeBrowserBatch(context, { actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }] }),
-    ).toMatchObject({ reason: 'purchase_control' });
-    const saved = await saveBrowserRecipe(context, {
-      name: 'Enter reservation',
-      first_action: 0,
-      last_action: 0,
-      parameters: [],
+
+    const run = db.run.bind(db);
+    const failedRecording = vi.spyOn(db, 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.startsWith('UPDATE gws_ea_browser_action_trace')) throw new Error('Trace completion unavailable');
+      return run(sql, ...parameters);
     });
-    const replay = await executeRecipe(context, { recipe_id: saved.recipe_id, parameters: {} });
-    expect(replay).toMatchObject({ status: 'reached_commit_point' });
-    const current = replay.target as BrowserRef;
-    expect(await page.getByRef(current.ref).evaluate((node) => node.tagName)).toBe('BUTTON');
+    let incomplete: Record<string, unknown>;
+    try {
+      incomplete = await executeRecipe(context, { recipe_id: id, parameters: { party: '4' } });
+    } finally {
+      failedRecording.mockRestore();
+    }
+    expect(incomplete).toMatchObject({
+      status: 'reached_commit_point',
+      recording: { status: 'unavailable', trace_indices: [4, 5] },
+    });
+    expect(incomplete.actions).toBeUndefined();
+    await db.run(
+      'INSERT INTO gws_ea_browser_requests(answer_json,job_id,started_at,action) VALUES(?,?,?,?)',
+      JSON.stringify({ ok: true, data: incomplete }),
+      context.job.id,
+      new Date().toISOString(),
+      'run_recipe',
+    );
+    // A new recorder over the surviving store neither reuses a returned index nor silently saves a later suffix.
+    const resumed = { ...context, store: new BrowserStore(db), request: { id: 'after-recorder-restart' } };
+    expect(
+      await executeBrowserBatch(resumed, {
+        actions: [{ kind: 'type', ...(await target('Party size')), text: '5' }],
+      }),
+    ).toMatchObject({ status: 'completed', actions: [{ trace_index: 6 }] });
+    await expect(
+      saveBrowserRecipe(resumed, {
+        name: 'Truncated route',
+        first_action: 6,
+        last_action: 6,
+        parameters: [],
+      }),
+    ).rejects.toThrow('provable recording coverage');
+    expect((await loadRecipe(id, db))?.version).toBe(1);
   });
+  it.each(['', 'none', 'presentation', 'unknown button', 'link'])(
+    'returns the actual commit button when Enter submits a form with role "%s"',
+    async (role) => {
+      await page.setContent(
+        `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
+      );
+      expect(
+        await executeBrowserBatch(context, { actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }] }),
+      ).toMatchObject({ reason: 'purchase_control' });
+      const saved = await saveBrowserRecipe(context, {
+        name: 'Enter reservation',
+        first_action: 0,
+        last_action: 0,
+        parameters: [],
+      });
+      const replay = await executeRecipe(context, { recipe_id: saved.recipe_id, parameters: {} });
+      expect(replay).toMatchObject({ status: 'reached_commit_point' });
+      const current = replay.target as BrowserRef;
+      expect(await page.getByRef(current.ref).evaluate((node) => node.tagName)).toBe('BUTTON');
+    },
+  );
   it('binds an exact accessible slot name and the actual selected link href', async () => {
     const slots =
       '<body><h1>Slots</h1><a href="/r/slots?slot=7&venue=venue-A">7:00 PM</a><a href="/r/slots?slot=8&venue=venue-A">8:00 PM</a></body>';

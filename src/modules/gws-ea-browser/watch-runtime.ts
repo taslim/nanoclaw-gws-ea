@@ -9,7 +9,7 @@ import {
   pinBrowserRefs,
   type BrowserRef,
 } from './observe.js';
-import { redactPageText } from './page-privacy.js';
+import { collectSecretFields, redactPageText } from './page-privacy.js';
 import { browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
@@ -17,7 +17,8 @@ import { readBrowserPolicy } from './policy.js';
 import type { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { BrowserOperation } from './operation.js';
-import { captureRecipeRegion, executeRecipe, type BrowserRecipe } from './recipes.js';
+import { captureRecipeRegion, executeRecipe } from './recipes.js';
+import { type BrowserRecipe } from './recipe-store.js';
 import { locateStructured, type StructuredBrowserLocator } from './locators.js';
 import type { BrowserWatchCheckInput, BrowserWatchCheckResult } from './scheduler.js';
 import { withSignedOutBrowserPage } from './signed-out.js';
@@ -100,6 +101,8 @@ export async function readWatchRegion(
   region: StructuredBrowserLocator,
   checkMainUrl = true,
 ): Promise<string | undefined> {
+  // A failed privacy read is an operationally failed check, never a missing region.
+  await collectSecretFields(page);
   try {
     const target = await locateStructured(page, region, checkMainUrl);
     return normalizeWatchRegion(redactPageText(page, await target.ariaSnapshot({ timeout: 1_000 })));

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
+  readVaultSiteInfo,
   bindBrowserSecretField,
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
@@ -12,7 +13,7 @@ import {
 } from './fill.js';
 import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
-import { observePage } from './observe.js';
+import { observePage, configureBrowserSiteInfo } from './observe.js';
 import { pageHasSecret } from './page-privacy.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
@@ -21,6 +22,7 @@ import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepass
 
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
+  configureBrowserSiteInfo({ vault: readVaultSiteInfo });
   vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
 });
 afterEach(() => {

@@ -19,7 +19,6 @@ import {
   disposeBrowserRefs,
   pinBrowserRefs,
   readBrowserRef,
-  registerBrowserSiteInfoProvider,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
@@ -342,15 +341,11 @@ export async function executeFillSecret(
 }
 
 export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
-registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
+export async function readVaultSiteInfo(
+  origins: readonly string[],
+  assertActive: () => Promise<void>,
+): Promise<Record<string, unknown>> {
   try {
-    const origins = new Set([
-      origin,
-      ...page.frames().flatMap((frame) => {
-        const url = httpsOrigin(frame.url());
-        return url ? [url.origin] : [];
-      }),
-    ]);
     const items = new Map<string, { item_handle: string; title: string }>();
     for (const frameOrigin of origins)
       for (const item of await browserVault.itemsForOrigin(frameOrigin, assertActive))
@@ -360,4 +355,4 @@ registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
   } catch (error) {
     return { vault_status: error instanceof BrowserVaultError ? error.reason : 'vault_unavailable' };
   }
-});
+}

@@ -82,9 +82,10 @@ import { browserVault } from './onepassword.js';
 import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
-import { BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
+
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
 
@@ -1316,6 +1317,55 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     getDb().all<{ kind: string; site: string; job_id: string }>(
       'SELECT kind, site, job_id FROM gws_ea_browser_incidents',
     );
+
+  it.each(['catalog', 'vault'] as const)(
+    'keeps completed navigation and the next action usable when %s metadata does not answer',
+    async (source) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const all = getDb().all.bind(getDb());
+      const catalog = vi.spyOn(getDb(), 'all').mockImplementation(async (sql, ...parameters) => {
+        if (source === 'catalog' && sql.includes('SELECT r.* FROM gws_ea_browser_recipes')) await held;
+        return all(sql, ...parameters);
+      });
+      const vault = vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async () => {
+        if (source === 'vault') await held;
+        // A useful first inventory may take longer than the recorder's allowance.
+        else await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        return [{ item_handle: 'vault_after-retry', title: 'Fixture login' }];
+      });
+      // Release even on the old implementation, whose queue must settle its timed-out operation before answering.
+      const timer = setTimeout(release, 5_000);
+      try {
+        const result = await errandRequest(host, 'held-catalog', 'browser', {
+          actions: [{ kind: 'navigate', url: OPEN_WEB.faq }],
+          budget_ms: 3_000,
+        });
+        expect(result).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
+        expect((result.observation as BrowserObservation).site).toMatchObject(
+          source === 'catalog'
+            ? { recipes_status: 'unavailable', vault_items: [{ item_handle: 'vault_after-retry' }] }
+            : { recipes: [], vault_status: 'vault_unavailable' },
+        );
+        release();
+        catalog.mockRestore();
+        const retried = await observePage(page);
+        expect(retried.site).toMatchObject({ recipes: [], vault_items: [{ item_handle: 'vault_after-retry' }] });
+        expect(
+          await run('after-held-catalog', [
+            { kind: 'click', ...refIn(await observePage(page), 'Show delivery times') },
+          ]),
+        ).toMatchObject({ status: 'completed' });
+      } finally {
+        release();
+        clearTimeout(timer);
+        catalog.mockRestore();
+        vault.mockRestore();
+      }
+    },
+  );
 
   it('stops the job with an incident when an ordinary Submit lands on a paid order confirmation', async () => {
     const answer = await press(OPEN_WEB.reorder, 'Submit');

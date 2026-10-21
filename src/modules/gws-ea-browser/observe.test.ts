@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import { readPageSecretValues } from './control-facts.js';
-import { observePage, registerBrowserSiteInfoProvider, snapshotBrowserStructure, pinBrowserRefs } from './observe.js';
+import { observePage, configureBrowserSiteInfo, snapshotBrowserStructure, pinBrowserRefs } from './observe.js';
 import {
   registerPageSecret,
   releasePageSecret,
@@ -140,9 +140,11 @@ it('emits host site metadata for changed full origins and keeps titles untrusted
     locator: () => ({ ariaSnapshotJSON: async () => [{ role: 'heading', name: 'Sign in' }] }),
   } as unknown as Page;
   registerPageSecret(page, 'private-fixture-value');
-  registerBrowserSiteInfoProvider(async () => ({
-    vault_items: [{ title: 'Login private-fixture-value', item_handle: 'vault_host-opaque' }],
-  }));
+  configureBrowserSiteInfo({
+    vault: async () => ({
+      vault_items: [{ title: 'Login private-fixture-value', item_handle: 'vault_host-opaque' }],
+    }),
+  });
   const first = await observePage(page);
   expect(first.site).toEqual({
     origin: 'https://alice.github.io',

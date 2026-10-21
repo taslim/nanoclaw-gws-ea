@@ -1,3 +1,4 @@
+import { claimRegionWatchCommit } from './watch-state.js';
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Page } from 'playwright-core';
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
@@ -69,7 +70,7 @@ import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js
 import { readBrowserPolicy } from './policy.js';
 import { writeBrowserNotice } from './notices.js';
 import { notifyPendingUnconfirmed } from './purchase-outcome.js';
-import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
+import { type BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { evidenceMatchesAttempt, reconcilePurchaseAttempt } from './reconciliation.js';
 import { deriveReservationGuaranteeAuthority } from './reservation-guarantee.js';
@@ -621,7 +622,7 @@ export async function executeAuthorizedPurchase(
       return unreadyCommit(read);
     }
     let marked = false;
-    let watchRefusal: import('./watches.js').WatchPurchaseRefusal | undefined;
+    let watchRefusal: import('./watch-state.js').WatchPurchaseRefusal | undefined;
     let facts = read.facts;
     let element = read.element;
     /** The approved press, re-checked by `commitStarted` immediately before it. */
@@ -674,7 +675,7 @@ export async function executeAuthorizedPurchase(
           throw new PurchaseAuthorityError('changed', 'The checkout is no longer readable.');
         let commitClaim = claim;
         if (authority.kind === 'watch') {
-          const { prepareWatchCommit } = await import('./watches.js');
+          const { prepareWatchCommit } = await import('./watch-purchase.js');
           const checked = await prepareWatchCommit(context, authority, latest.facts);
           if (typeof checked !== 'function') {
             watchRefusal = checked;
@@ -907,7 +908,6 @@ async function commitFree(
             // A free table on a region watch's site spends the one booking of a watch it is within (KTD20);
             // region watches live only on sites without a reviewed reader.
             if (free.kind === 'generic' && freeCommitBooks(free.facts)) {
-              const { claimRegionWatchCommit } = await import('./watches.js');
               await claimRegionWatchCommit(db, {
                 jobId: context.job.id,
                 site: free.facts.site,
@@ -1056,7 +1056,7 @@ export async function executeBrowserPurchase(
         }
         const facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
         const store = new PurchaseAuthorityStore(context.store.db);
-        const { prepareWatchPurchase } = await import('./watches.js');
+        const { prepareWatchPurchase } = await import('./watch-purchase.js');
         const watch = await prepareWatchPurchase(context, facts);
         if (watch)
           return watch.status === 'ready'

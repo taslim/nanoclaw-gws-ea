@@ -77,10 +77,13 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { freeResyTable, resyFixture } from './resy-native-fixture.js';
 import { resyReservationSignature } from './resy-signature.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
-import { BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 import { watchSitePolicy } from './watch-policy.js';
-import type { WatchBounds, WatchRow } from './watches.js';
+import type { WatchBounds, WatchRow } from './watch-state.js';
+import { readWatchRegion } from './watch-runtime.js';
+import type { StructuredBrowserLocator } from './locators.js';
+import * as nativeControlFacts from './control-facts.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -339,6 +342,37 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
     expect(await watch()).toMatchObject({ status: 'armed' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+  });
+
+  it('redacts a newly changed secret field from a region read and permits the next watch check', async () => {
+    await setWatch();
+    // The page changed after its core observation, before the narrower region read.
+    await page.getByRole('region', { name: 'Available tables' }).evaluate((region) => {
+      const field = region.ownerDocument.createElement('input');
+      field.type = 'password';
+      field.value = 'new-region-secret-U4';
+      const echo = region.ownerDocument.createElement('p');
+      echo.textContent = field.value;
+      region.append(field, echo);
+    });
+    const marked = JSON.parse((await watch()).region_json!) as StructuredBrowserLocator;
+    const text = await readWatchRegion(page, marked);
+    expect(text).toContain('[redacted]');
+    expect(text).not.toContain('new-region-secret-U4');
+    const unavailable = vi
+      .spyOn(nativeControlFacts, 'readPageSecretValues')
+      .mockRejectedValueOnce(new nativeControlFacts.ControlFactsUnavailableError());
+    try {
+      await expect(readWatchRegion(page, marked)).rejects.toBeInstanceOf(
+        nativeControlFacts.ControlFactsUnavailableError,
+      );
+    } finally {
+      unavailable.mockRestore();
+    }
+    expect(await run([{ kind: 'navigate', url: WATCHED.tables }])).toMatchObject({ reason: 'navigated' });
+    await checkNow();
+    expect(await outcomes()).toEqual(['region_read']);
+    expect(await notices()).toEqual([]);
   });
 
   it('wakes the agent to mark the region again when a redesign drops it, and checks the new mark', async () => {

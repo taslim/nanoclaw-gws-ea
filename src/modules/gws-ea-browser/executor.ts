@@ -752,7 +752,11 @@ async function executeBatch(
         assertActive: context.assertActive,
         remaining: context.remaining,
       });
-      observation = await observePage(page, context.assertActive, { cookieBanner });
+      observation = await observePage(page, context.assertActive, {
+        cookieBanner,
+        remaining: context.remaining,
+        signal: context.signal,
+      });
     } catch (error) {
       if (!unapproved) {
         const failure = batchErrorReason(error, guard.reason(), context, page);

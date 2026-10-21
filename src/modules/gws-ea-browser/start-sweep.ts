@@ -1,13 +1,14 @@
+import { recoverBrowserWatchState } from './watch-state.js';
 import { log } from '../../log.js';
 import type { BrowserQueue } from './queue.js';
 import { recoverBrowserPurchases } from './purchase.js';
-import { recoverBrowserWatches } from './watches.js';
+
 import { recoverCredentialAttempts, settleConfirmedAttempts } from './credential-operations.js';
 
 /** Runs before workers: a marker is never interpreted as permission to repeat a press. */
 export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
   await recoverBrowserPurchases(queue);
-  await recoverBrowserWatches(queue);
+  await recoverBrowserWatchState(queue);
   // Each interrupted request records its own durable outcome before its answer: a credential
   // attempt it disclosed becomes unknown, never a purchase, and is never submitted again.
   for (const request of await queue.store.pending())

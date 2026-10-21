@@ -1,3 +1,5 @@
+import { linkWatchBookingRecipe } from './watch-recipes.js';
+import { type BrowserRecipeParameter, type BrowserRecipe, loadRecipe } from './recipe-store.js';
 import { checkpoint as recordedCheckpoint, type BrowserRecipeStep, type RecipeCheckpoint } from './recording.js';
 import { browserKeyboardSubmitTarget } from './action-targets.js';
 import { browserActionRefs, type BrowserAction, type BrowserBatchOptions } from './actions.js';
@@ -6,24 +8,21 @@ import {
   flatten,
   checkpointUrl,
   captureLocator,
+  captureElementRole,
   resolveLocator,
   type StructuredBrowserLocator,
 } from './locators.js';
-import { createHash, randomUUID } from 'node:crypto';
-import type { ElementHandle, Page } from 'playwright-core';
+import { randomUUID } from 'node:crypto';
+import type { Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
-import { getDb } from '../../db/connection.js';
-import type { DbDriver } from '../../db/driver.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { classifyNavigationUrl } from './control-policy.js';
 import { readPageControlFacts } from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { browserSite } from './leases.js';
 import {
-  disposeBrowserRefs,
+  browserRefForElement,
   observePage,
-  pinBrowserRefs,
-  registerBrowserSiteInfoProvider,
   snapshotBrowserStructure,
   type BrowserObservation,
   type BrowserRef,
@@ -32,38 +31,6 @@ import {
 import { redactPageData } from './page-privacy.js';
 import type { BrowserExecutionContext, BrowserOperationContext, BrowserQueuedAction } from './actions.js';
 
-export interface BrowserRecipeParameter {
-  name: string;
-  step: number;
-  recordedValue: string;
-  kind: 'value' | 'target_name';
-  inputName?: string;
-  origin?: string;
-}
-export interface BrowserRecipe {
-  id: string;
-  site: string;
-  name: string;
-  version: number;
-  sourceJobId: string;
-  firstAction: number;
-  lastAction: number;
-  parameters: BrowserRecipeParameter[];
-  steps: BrowserRecipeStep[];
-  readOnly: boolean;
-}
-interface RecipeRow {
-  id: string;
-  site: string;
-  name: string;
-  version: number;
-  parameters_json: string;
-  steps_json: string;
-  read_only: number;
-  source_job_id: string;
-  first_action: number;
-  last_action: number;
-}
 interface TraceRow {
   action_index: number;
   step_json: string;
@@ -261,7 +228,6 @@ export async function saveBrowserRecipe(
   if (await context.store.db.hasTable('gws_ea_browser_watches')) {
     const recipe = await loadRecipe(saved.id, context.store.db);
     if (recipe) {
-      const { linkWatchBookingRecipe } = await import('./watches.js');
       await linkWatchBookingRecipe(context, recipe);
     }
   }
@@ -276,38 +242,6 @@ export async function saveBrowserRecipe(
     repeat_safe: false,
   };
 }
-export async function loadRecipe(id: string, db: DbDriver = getDb()): Promise<BrowserRecipe | undefined> {
-  const row = await db.get<RecipeRow>('SELECT * FROM gws_ea_browser_recipes WHERE id = ?', id);
-  if (!row) return undefined;
-  return {
-    id: row.id,
-    site: row.site,
-    name: row.name,
-    version: row.version,
-    sourceJobId: row.source_job_id,
-    firstAction: row.first_action,
-    lastAction: row.last_action,
-    parameters: JSON.parse(row.parameters_json) as BrowserRecipe['parameters'],
-    steps: JSON.parse(row.steps_json) as BrowserRecipeStep[],
-    readOnly: row.read_only === 1,
-  };
-}
-export function recipeCheckKey(
-  recipe: Pick<BrowserRecipe, 'id' | 'version'>,
-  parameters: Record<string, string>,
-): string {
-  return createHash('sha256')
-    .update(
-      JSON.stringify([
-        recipe.id,
-        recipe.version,
-        Object.keys(parameters)
-          .sort()
-          .map((name) => [name, parameters[name]]),
-      ]),
-    )
-    .digest('hex');
-}
 function bindAction(step: BrowserRecipeStep, refs: BrowserRef[], value?: string): BrowserAction {
   const action = structuredClone(step.action);
   if ('ref' in action) {
@@ -321,37 +255,6 @@ function bindAction(step: BrowserRecipeStep, refs: BrowserRef[], value?: string)
     if (action.submit) action.submit = refs[action.fields.length];
   }
   return action;
-}
-async function observationRefs(page: Page, observation: BrowserObservation): Promise<Map<string, PinnedBrowserRef>> {
-  return pinBrowserRefs(
-    page,
-    [...observation.snapshot.matchAll(/\[ref=((?:f\d+)?e\d+)\]/gu)].map((match) => ({
-      ref: match[1],
-      generation: observation.generation,
-    })),
-  );
-}
-async function nativeRef(
-  page: Page,
-  target: StructuredBrowserLocator,
-  pinned: ReadonlyMap<string, PinnedBrowserRef>,
-): Promise<BrowserRef> {
-  const element = await resolveLocator(page, target);
-  try {
-    return await nativeRefForElement(element, pinned);
-  } finally {
-    await element.dispose();
-  }
-}
-async function nativeRefForElement(
-  element: ElementHandle,
-  pinned: ReadonlyMap<string, PinnedBrowserRef>,
-): Promise<BrowserRef> {
-  const frame = await element.ownerFrame();
-  for (const candidate of pinned.values())
-    if (candidate.frame === frame && (await candidate.element.evaluate((node, other) => node === other, element)))
-      return { ref: candidate.ref, generation: candidate.generation };
-  throw new Error('No current native ref for the recorded target');
 }
 interface ActiveUrlInput {
   parameter: BrowserRecipeParameter;
@@ -421,7 +324,14 @@ export async function executeRecipe(
     step,
     expected: redactPageData(page, expected),
     found: redactPageData(page, found),
-    ...(!page.isClosed() ? { observation: await observePage(page, context.assertActive) } : {}),
+    ...(!page.isClosed()
+      ? {
+          observation: await observePage(page, context.assertActive, {
+            remaining: context.remaining,
+            signal: context.signal,
+          }),
+        }
+      : {}),
     repeat_safe: repeatSafe,
   });
   for (let index = 0; index < recipe.steps.length; index++) {
@@ -467,31 +377,26 @@ export async function executeRecipe(
     if (result.repeat_safe === false) repeatSafe = false;
     const observation = isRecord(result.observation)
       ? (result.observation as unknown as BrowserObservation)
-      : await observePage(page, context.assertActive);
+      : await observePage(page, context.assertActive, { remaining: context.remaining, signal: context.signal });
     if (result.reason === 'purchase_control') {
       const commit = targets[action.kind === 'form_input' ? targets.length - 1 : 0];
       if (!commit) return failed(index, { commit: 'recorded control' }, { commit: 'unavailable' });
       try {
         let target: BrowserRef;
-        const pinned = await observationRefs(page, observation);
+        const element = await resolveLocator(page, commit);
         try {
           if (action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)) {
-            const element = await resolveLocator(page, commit);
+            const handle = await browserKeyboardSubmitTarget(element);
             try {
-              const handle = await browserKeyboardSubmitTarget(element);
-              try {
-                const submit = handle.asElement();
-                if (!submit) throw new Error('No submit control');
-                target = await nativeRefForElement(submit, pinned);
-              } finally {
-                await handle.dispose();
-              }
+              const submit = handle.asElement();
+              if (!submit) throw new Error('No submit control');
+              target = await browserRefForElement(page, submit, { role: await captureElementRole(submit) });
             } finally {
-              await element.dispose();
+              await handle.dispose();
             }
-          } else target = await nativeRef(page, commit, pinned);
+          } else target = await browserRefForElement(page, element, commit);
         } finally {
-          await disposeBrowserRefs(pinned);
+          await element.dispose();
         }
         return {
           status: 'reached_commit_point',
@@ -553,25 +458,13 @@ export async function executeRecipe(
   return {
     status: 'completed',
     ...coverage(),
-    observation: await observePage(page, context.assertActive),
+    observation: await observePage(page, context.assertActive, {
+      remaining: context.remaining,
+      signal: context.signal,
+    }),
     repeat_safe: repeatSafe,
   };
 }
 
 export const saveRecipeAction: BrowserQueuedAction = { validate: validateSaveRecipe, execute: saveBrowserRecipe };
 export const runRecipeAction: BrowserQueuedAction = { validate: validateRunRecipe, execute: executeRecipe };
-registerBrowserSiteInfoProvider(async (_page, origin) => {
-  const rows = await getDb().all<RecipeRow>(
-    `SELECT r.* FROM gws_ea_browser_recipes r WHERE r.site = ? AND r.version = (SELECT MAX(latest.version) FROM gws_ea_browser_recipes latest WHERE latest.site = r.site AND latest.name = r.name) ORDER BY r.name`,
-    browserSite(origin),
-  );
-  return {
-    recipes: rows.map((row) => ({
-      recipe_id: row.id,
-      name: row.name,
-      version: row.version,
-      parameters: (JSON.parse(row.parameters_json) as BrowserRecipe['parameters']).map((parameter) => parameter.name),
-      read_only: row.read_only === 1,
-    })),
-  };
-});

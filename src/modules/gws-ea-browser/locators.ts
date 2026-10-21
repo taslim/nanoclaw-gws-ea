@@ -172,6 +172,14 @@ export async function captureLocator(
 }
 /** The roles a host-found control can carry: what a press can be aimed at. */
 const PRESS_ROLES: readonly BrowserRole[] = ['button', 'link', 'menuitem', 'tab', 'option'];
+/** Computed native role membership, without taking a snapshot that would replace the current public ref map. */
+export async function captureElementRole(element: ElementHandle): Promise<BrowserRole> {
+  const frame = await element.ownerFrame();
+  if (!frame) throw new BrowserLocatorError('Detached element');
+  for (const role of PRESS_ROLES)
+    if (await frame.getByRole(role).evaluateAll((elements, target) => elements.includes(target), element)) return role;
+  throw new BrowserLocatorError('No accessible press role for this element');
+}
 /**
  * A host-found control's structured locator (KTD4): its role and accessible name as Playwright reads them, its
  * ordinal among their matches, and its frame path, so `resolveLocator` finds it again on a later read.
@@ -179,17 +187,16 @@ const PRESS_ROLES: readonly BrowserRole[] = ['button', 'link', 'menuitem', 'tab'
 export async function captureElementLocator(element: ElementHandle): Promise<StructuredBrowserLocator> {
   const frame = await element.ownerFrame();
   if (!frame) throw new BrowserLocatorError('Detached element');
-  for (const role of PRESS_ROLES) {
-    const all = frame.getByRole(role);
-    const index = await all.evaluateAll((elements, target) => elements.indexOf(target), element);
-    if (index < 0) continue;
-    const [node] = ariaNodes(await all.nth(index).ariaSnapshotJSON({ timeout: 1_000 }));
-    if (node?.role !== role) continue;
-    const name = node.name;
-    const matches = frame.getByRole(role, { name, exact: true });
-    const ordinal = await matches.evaluateAll((elements, target) => elements.indexOf(target), element);
-    if (ordinal >= 0) return { role, name, ordinal, count: await matches.count(), ...framePath(frame) };
-  }
+  const role = await captureElementRole(element);
+  const all = frame.getByRole(role);
+  const index = await all.evaluateAll((elements, target) => elements.indexOf(target), element);
+  if (index < 0) throw new BrowserLocatorError('Element is absent');
+  const [node] = ariaNodes(await all.nth(index).ariaSnapshotJSON({ timeout: 1_000 }));
+  if (node?.role !== role) throw new BrowserLocatorError('Accessible role changed');
+  const name = node.name;
+  const matches = frame.getByRole(role, { name, exact: true });
+  const ordinal = await matches.evaluateAll((elements, target) => elements.indexOf(target), element);
+  if (ordinal >= 0) return { role, name, ordinal, count: await matches.count(), ...framePath(frame) };
   throw new BrowserLocatorError('No structured accessible locator for this element');
 }
 /** The element a structured locator names, as a Playwright locator: its frames and its matches' count unchanged. */

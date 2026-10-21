@@ -1,3 +1,4 @@
+import { deliverWatchNotices } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -26,7 +27,6 @@ import './index.js';
 import { BrowserStore } from './db.js';
 import { notifyPurchaseOutcome } from './authority.js';
 import { notifyPurchaseCard } from './cards.js';
-import { deliverWatchNotices } from './watches.js';
 
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });

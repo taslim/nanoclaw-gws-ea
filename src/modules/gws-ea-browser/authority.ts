@@ -1,3 +1,4 @@
+import { getBrowserWatch, compareWatchBounds, claimRegionWatchCommit, finishWatchCommit } from './watch-state.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isUniqueViolation } from '../../db/errors.js';
@@ -18,7 +19,7 @@ import {
 } from './fingerprint.js';
 import { readBrowserPolicy } from './policy.js';
 import type { BrowserExecutionContext } from './actions.js';
-import type { WatchBounds } from './watches.js';
+import type { WatchBounds } from './watch-state.js';
 
 export interface SpendingAuthority {
   id: string;
@@ -265,7 +266,6 @@ export class PurchaseAuthorityStore {
         )
           throw new PurchaseAuthorityError('authority_unavailable');
       } else if (input.kind === 'watch') {
-        const { getBrowserWatch, compareWatchBounds } = await import('./watches.js');
         const watch = await getBrowserWatch(input.watchId, this.db);
         const bounds: unknown = watch ? JSON.parse(watch.bounds_json) : undefined;
         if (
@@ -398,7 +398,6 @@ export class PurchaseAuthorityStore {
       else if (current.reservation || current.generic?.booking) {
         // A booking a card or the standing guarantee covers on a region watch's site spends its one booking
         // (KTD20), and only a watch whose bounds the booking does not fall outside.
-        const { claimRegionWatchCommit } = await import('./watches.js');
         await claimRegionWatchCommit(this.db, {
           jobId: authority.job_id,
           site: current.site,
@@ -557,8 +556,7 @@ export class PurchaseAuthorityStore {
       }
       // The watch whose one booking this attempt claimed, by a watch's own authority, a card or guarantee booking
       // on a region watch's site, or a free table there (KTD20), ends with it.
-      const { finishWatchCommit } = await import('./watches.js');
-      await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed, resolution.source);
+      await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed);
       if (!(await this.unresolved(attempt.site)).length) {
         await this.db.run('DELETE FROM gws_ea_browser_purchase_blocks WHERE site = ?', attempt.site);
         await this.db.run(
@@ -570,6 +568,11 @@ export class PurchaseAuthorityStore {
       return { status: 'resolved', attempt };
     });
     if (result.status === 'resolved') {
+      if (resolution.placed && resolution.source === 'page')
+        await afterCommit('A watch recipe', async () => {
+          const { promoteCommittedWatchRecipe } = await import('./watch-recipes.js');
+          await promoteCommittedWatchRecipe(this.db, result.attempt.job_id, result.attempt.id);
+        });
       const authorityId = result.attempt.authority_id;
       if (authorityId && !mainsAnswer)
         await afterCommit('A purchase outcome', () => notifyPurchaseOutcome(authorityId, this));
@@ -634,7 +637,6 @@ export class PurchaseAuthorityStore {
         await this.settleRequestedCancellation(authority.job_id, at);
       }
       // A watch whose booking it claimed waits on its outcome too.
-      const { finishWatchCommit } = await import('./watches.js');
       await finishWatchCommit(this.db, attempt.job_id, attempt.id, undefined);
       return true;
     });
