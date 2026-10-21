@@ -1,6 +1,6 @@
 import { BrowserLocatorError, resolveLocator } from './locators.js';
 import { classifyNavigationUrl } from './control-policy.js';
-import { readPageControlFacts } from './control-facts.js';
+import { readCheckoutRegion, readPageControlFacts } from './control-facts.js';
 import { createBrowserQueue } from './index.js';
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
 import { randomUUID } from 'node:crypto';
@@ -84,7 +84,7 @@ import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { type BrowserQueue } from './queue.js';
-import type { BrowserExecutionContext } from './actions.js';
+import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
@@ -1231,37 +1231,93 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(posts()).toEqual(['https://bistro.example/availability/hold']);
   });
 
-  it('refuses ordinary typing and editing of a secret field even when page script hides its attributes', async () => {
-    const page = await open();
-    const url = 'https://shop.example/secret-entry';
-    fixture.serve(
-      url,
-      htmlPage(
-        'Profile',
-        '<label>Display value <input id="entry" type="text" autocomplete="new-password"></label>',
-        `
+  it.each([
+    { source: 'autocomplete', label: 'Display value', attributes: 'autocomplete="new-password"' },
+    { source: 'label', label: 'Password', attributes: '' },
+  ])(
+    'refuses ordinary typing and editing of a secret field even when page script hides its attributes ($source)',
+    async ({ label, attributes }) => {
+      const page = await open();
+      const url = 'https://shop.example/secret-entry';
+      fixture.serve(
+        url,
+        htmlPage(
+          'Profile',
+          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" ${attributes}></label><button>Continue</button></form>`,
+          `
       const read = HTMLInputElement.prototype.getAttribute;
       HTMLInputElement.prototype.getAttribute = function(name) {
         return this.id === 'entry' && ['type', 'autocomplete'].includes(name) ? null : read.call(this, name);
       };
     `,
+        ),
+      );
+      fixture.serve(`${url}/submitted`, htmlPage('Submitted', 'Done'));
+      await page.goto(url);
+      const secret = 'Synthetic-"credential\\U3-42';
+      await page.locator('#entry').fill(secret);
+      const checkout = await withElement(page.locator('button'), (element) => readCheckoutRegion(page, element));
+      expect.soft(checkout.region.fields).toMatchObject([{ secret: true, value: null }]);
+      const observation = await observePage(page);
+      for (const text of [observation.snapshot, JSON.stringify(observation)])
+        for (const encoded of [secret, JSON.stringify(secret).slice(1, -1)]) expect(text).not.toContain(encoded);
+      await page.locator('#entry').fill('');
+      for (const kind of ['type', 'key', 'form_input'] as const) {
+        const field = refIn(await observePage(page), label);
+        const action: BrowserAction =
+          kind === 'type'
+            ? { kind, ...field, text: 'ordinary-text' }
+            : kind === 'key'
+              ? { kind, ...field, key: 'Backspace' }
+              : { kind, fields: [{ ...field, value: 'ordinary-text' }] };
+        const result = await batch(page, [action]);
+        expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+        expect(await page.locator('#entry').inputValue()).toBe('');
+      }
+      await page.locator('#entry').fill(secret);
+      const submitted = await batch(page, [{ kind: 'click', ...refIn(await observePage(page), 'Continue') }]);
+      expect.soft(submitted).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(fixture.requests.some((request) => request.url === `${url}/submitted`)).toBe(false);
+    },
+  );
+
+  it('stops a watch batch at a download without running later actions', async () => {
+    const page = await open();
+    const url = 'https://shop.example/watch-download';
+    fixture.serve(
+      url,
+      htmlPage(
+        'Receipt',
+        '<a href="/receipt.txt" download>Download receipt</a><button onclick="this.textContent=\'Ran later action\'">Continue</button>',
       ),
     );
     await page.goto(url);
-    const secret = 'Synthetic-"credential\\U3-42';
-    await page.locator('#entry').fill(secret);
     const observation = await observePage(page);
-    for (const text of [observation.snapshot, JSON.stringify(observation)])
-      for (const encoded of [secret, JSON.stringify(secret).slice(1, -1)]) expect(text).not.toContain(encoded);
-    await page.locator('#entry').fill('');
-    for (const kind of ['type', 'key'] as const) {
-      const field = refIn(await observePage(page), 'Display value');
-      const action: BrowserAction =
-        kind === 'type' ? { kind, ...field, text: 'ordinary-text' } : { kind, ...field, key: 'Backspace' };
-      const result = await batch(page, [action]);
-      expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
-      expect(await page.locator('#entry').inputValue()).toBe('');
-    }
+    const watch: BrowserWatchExecutionContext = {
+      ...context(page),
+      kind: 'watch_check',
+      check: { id: 'check-download' },
+    };
+    const result = await executeBrowserBatch(
+      watch,
+      {
+        actions: [
+          { kind: 'download', ...refIn(observation, 'Download receipt') },
+          { kind: 'click', ...refIn(observation, 'Continue') },
+        ],
+      },
+      { record: false },
+    );
+    expect(result).toMatchObject({
+      status: 'stopped',
+      reason: 'read_only',
+      actions: [
+        { index: 0, status: 'stopped', reason: 'read_only' },
+        { index: 1, status: 'not_executed' },
+      ],
+    });
+    expect(await page.locator('button').textContent()).toBe('Continue');
+    expect(fixture.requests.some((request) => request.url === 'https://shop.example/receipt.txt')).toBe(false);
   });
 
   it('stops typing into a card field with card_field, on the page and inside a processor frame', async () => {

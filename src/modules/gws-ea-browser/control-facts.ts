@@ -518,13 +518,14 @@ const librarySource = String.raw`(sources) => {
     const said = [describe(element), labelsOf(element)].join(' ');
     return textEntry(element) && re.cardEntry.test(said) && !re.giftCard.test(said);
   };
-  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete or names.
+  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete, names or labels.
   const secretField = (element) => textEntry(element) && (element.type === 'password' ||
-    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') || re.secretField.test(describe(element)));
+    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') ||
+    re.secretField.test([describe(element), labelsOf(element)].join(' ')));
   // A field holding a secret (KTD6): a password, a code or payment details, by its type, autocomplete, names or
   // labels, so a show-password toggle that made it a text field still counts.
-  const secretValue = (element) => (secretField(element) || cardEntryField(element) ||
-    (textEntry(element) && re.secretField.test(labelsOf(element)))) && typeof element.value === 'string' && element.value !== '';
+  const secretValue = (element) => (secretField(element) || cardEntryField(element)) &&
+    typeof element.value === 'string' && element.value !== '';
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';

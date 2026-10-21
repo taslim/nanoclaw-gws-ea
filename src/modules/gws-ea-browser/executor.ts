@@ -680,10 +680,7 @@ async function executeBatch(
             }
             break;
           case 'download':
-            if (context.kind === 'watch_check') {
-              reason = 'read_only';
-              break;
-            }
+            if (context.kind === 'watch_check') throw new BrowserBatchStop('read_only');
             if (target) {
               const policy = await readHostBrowserPolicy();
               if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
