@@ -1,4 +1,4 @@
-/** Native Chrome file bytes, the production pipe/window boundary and real durable job records. */
+/** Native Chrome file bytes, the production connection/window boundary and real durable job records. */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -26,7 +26,7 @@ import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, type ChromeConnection } from './connection.js';
+import { connectChrome, type ChromeConnection } from './connection.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted } from './db.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
@@ -93,8 +93,8 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Fixture proxy did not bind');
-    connection = await connectChromePipe(
-      spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${address.port}` }),
+    connection = await connectChrome(
+      await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${address.port}` }),
       paths,
     );
     windows = new JobWindows(connection);
@@ -347,8 +347,8 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     await prepareChromeProfile(paths);
     const address = server.address();
     if (!chromePath || !address || typeof address === 'string') throw new Error('Native fixture unavailable');
-    connection = await connectChromePipe(
-      spawnChrome({
+    connection = await connectChrome(
+      await spawnChrome({
         chromePath,
         paths,
         proxyUrl: `http://127.0.0.1:${address.port}`,

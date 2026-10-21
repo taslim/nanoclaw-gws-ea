@@ -1,8 +1,8 @@
 import type { Page } from 'playwright-core';
 
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
-import { prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
-import { connectChromePipe, verifyChromePolicy, type ChromeConnection } from './connection.js';
+import { prepareChromeProfile, spawnChrome, stopChrome, type OwnedChrome } from './chrome.js';
+import { connectChrome, verifyChromePolicy, type ChromeConnection } from './connection.js';
 import { DEFAULT_BROWSER_POLICY, type BrowserPolicy } from './policy.js';
 import { readHostBrowserPolicy } from './access.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
@@ -25,6 +25,7 @@ export class BrowserRuntime {
   private tail: Promise<void> = Promise.resolve();
   private closing = false;
   private starting = false;
+  private startup: AbortController | undefined;
   private stopped = false;
   private retiring: Promise<void> = Promise.resolve();
   private generation = 0;
@@ -47,7 +48,8 @@ export class BrowserRuntime {
   }
 
   /** Re-read policy on each use; enabled policy prewarms the proxy without starting Chrome. */
-  reconcile(): Promise<void> {
+  async reconcile(): Promise<void> {
+    if (this.startup && !(await readHostBrowserPolicy(this.policyFile)).enabled) this.startup?.abort();
     return this.exclusive(() => this.reconcilePolicy());
   }
 
@@ -83,7 +85,7 @@ export class BrowserRuntime {
     if (!this.policy.enabled) throw new BrowserUnavailableError();
   }
 
-  /** Host internals only. No pipe/session/browser object is ever serialized to a tool response. */
+  /** Host internals only. No endpoint/session/browser object is ever serialized to a tool response. */
   connection(): Promise<ChromeConnection> {
     return this.exclusive(async () => {
       await this.reconcilePolicy();
@@ -97,31 +99,56 @@ export class BrowserRuntime {
   private async launch(policy: EnabledPolicy, proxy: PublicBrowserProxy): Promise<ChromeConnection> {
     this.starting = true;
     const generation = ++this.generation;
+    const startup = new AbortController();
+    this.startup = startup;
+    const startupTimer = setTimeout(() => startup.abort(), 30_000);
+    startupTimer.unref();
     let connection: ChromeConnection | undefined;
-    let child: ReturnType<typeof spawnChrome> | undefined;
-    let startupTimer: NodeJS.Timeout | undefined;
+    let owned: OwnedChrome | undefined;
+    let rejectAborted!: (reason: BrowserUnavailableError) => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAborted = reject;
+    });
+    const onAbort = (): void => rejectAborted(new BrowserUnavailableError());
+    startup.signal.addEventListener('abort', onAbort, { once: true });
+    const check = (): void => {
+      startup.signal.throwIfAborted();
+      if (this.stopped || generation !== this.generation) throw new BrowserUnavailableError();
+    };
+    const onExit = (): void => startup.abort();
     try {
-      await prepareChromeProfile(policy.paths);
-      child = spawnChrome({ chromePath: policy.chromePath, paths: policy.paths, proxyUrl: proxy.url });
-      const spawned = child;
       const attaching = (async () => {
-        connection = await connectChromePipe(spawned, policy.paths);
-        const windows = new JobWindows(connection);
-        const probe = await windows.pageForJob('__host_launch_probe__');
+        await prepareChromeProfile(policy.paths);
+        check();
+        owned = await spawnChrome(
+          { chromePath: policy.chromePath, paths: policy.paths, proxyUrl: proxy.url },
+          startup.signal,
+        );
+        owned.child.once('exit', onExit);
+        owned.child.once('error', onExit);
         try {
-          await verifyChromePolicy(probe);
-        } finally {
-          await windows.close();
+          check();
+          connection = await connectChrome(owned, policy.paths, startup.signal);
+          check();
+          const windows = new JobWindows(connection);
+          const probe = await windows.pageForJob('__host_launch_probe__');
+          try {
+            await verifyChromePolicy(probe);
+          } finally {
+            await windows.close();
+          }
+          check();
+          if (!connection.browser.isConnected()) throw new BrowserUnavailableError();
+          return connection;
+        } catch (error) {
+          await stopChrome(owned.child);
+          void connection?.close().catch(() => undefined);
+          throw error;
         }
-        return connection;
       })();
-      const attached = await Promise.race([
-        attaching,
-        new Promise<never>((_resolve, reject) => {
-          startupTimer = setTimeout(() => reject(new BrowserUnavailableError()), 30_000);
-          startupTimer.unref();
-        }),
-      ]);
+      const attached = await Promise.race([attaching, aborted]);
+      check();
+      if (!attached.browser.isConnected()) throw new BrowserUnavailableError();
       this.attached = attached;
       this.windows = new JobWindows(attached);
       this.lastFailure = null;
@@ -139,13 +166,18 @@ export class BrowserRuntime {
         this.restart.unref();
       });
       return attached;
-    } catch (_error) {
-      await connection?.close().catch(() => undefined);
-      if (child) await stopChrome(child);
+    } catch {
+      startup.abort();
+      if (owned) await stopChrome(owned.child);
+      void connection?.close().catch(() => undefined);
       this.lastFailure = { reason: 'browser_unavailable', at: new Date().toISOString() };
       throw new BrowserUnavailableError();
     } finally {
-      if (startupTimer) clearTimeout(startupTimer);
+      clearTimeout(startupTimer);
+      startup.signal.removeEventListener('abort', onAbort);
+      owned?.child.removeListener('exit', onExit);
+      owned?.child.removeListener('error', onExit);
+      if (this.startup === startup) this.startup = undefined;
       this.starting = false;
     }
   }
@@ -174,6 +206,7 @@ export class BrowserRuntime {
 
   /** Stop owned processes and proxy; a future explicit enable may start a fresh runtime. */
   stop(): Promise<void> {
+    this.startup?.abort();
     return this.exclusive(() => this.stopOwned());
   }
 
@@ -212,7 +245,7 @@ export class BrowserRuntime {
     reason?: string;
     proxy: { state: 'listening'; port: number } | { state: 'stopped' };
     chrome:
-      | { state: 'running'; pid: number | undefined; version: string }
+      | { state: 'running'; pid: number | undefined; version: string; debuggerPort: number }
       | { state: 'starting' | 'stopped' | 'unavailable' };
     windows: number;
     lastFailure: { reason: 'browser_unavailable'; at: string } | null;
@@ -223,7 +256,12 @@ export class BrowserRuntime {
       ...(this.policy.enabled ? {} : { reason: this.policy.reason }),
       proxy: this.proxy ? { state: 'listening', port: this.proxy.port } : { state: 'stopped' },
       chrome: this.attached
-        ? { state: 'running', pid: this.attached.child.pid, version: this.attached.browser.version() }
+        ? {
+            state: 'running',
+            pid: this.attached.child.pid,
+            version: this.attached.browser.version(),
+            debuggerPort: this.attached.debuggerPort,
+          }
         : { state: this.starting ? 'starting' : this.lastFailure ? 'unavailable' : 'stopped' },
       windows: this.windows?.size ?? 0,
       lastFailure: this.lastFailure,

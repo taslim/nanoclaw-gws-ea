@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
+import net from 'node:net';
 
 import {
   ensureBrowserPaths,
@@ -18,11 +19,21 @@ interface ChromeLaunchInput {
   proxyUrl: string;
 }
 
+export interface OwnedChrome {
+  readonly child: ChildProcess;
+  readonly debuggerPort: number;
+}
+
 /** Positional argv only: the shell establishes the child's umask then execs Chrome. */
-export function buildChromeLaunch(input: ChromeLaunchInput): { command: string; args: string[] } {
+export function buildChromeLaunch(input: ChromeLaunchInput & { debuggerPort: number }): {
+  command: string;
+  args: string[];
+} {
   const proxy = new URL(input.proxyUrl);
   if (proxy.protocol !== 'http:' || proxy.hostname !== '127.0.0.1' || !proxy.port)
     throw new Error('Chrome needs the host public-only proxy');
+  if (!Number.isInteger(input.debuggerPort) || input.debuggerPort < 1 || input.debuggerPort > 65_535)
+    throw new Error('Chrome needs an explicit debugger port');
   return {
     command: '/bin/sh',
     args: [
@@ -31,7 +42,8 @@ export function buildChromeLaunch(input: ChromeLaunchInput): { command: string; 
       'gws-ea-chrome',
       input.chromePath,
       `--user-data-dir=${input.paths.profileDir}`,
-      '--remote-debugging-pipe',
+      '--remote-debugging-address=127.0.0.1',
+      `--remote-debugging-port=${input.debuggerPort}`,
       '--no-startup-window',
       '--no-first-run',
       '--no-default-browser-check',
@@ -45,7 +57,6 @@ export function buildChromeLaunch(input: ChromeLaunchInput): { command: string; 
       '--disable-quic',
       '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       '--deny-permission-prompts',
-      '--disable-notifications',
       '--block-new-web-contents',
       '--noerrdialogs',
       '--disable-session-crashed-bubble',
@@ -119,12 +130,50 @@ export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
   await writePrivateFile(file, JSON.stringify(prefs));
 }
 
-export function spawnChrome(input: ChromeLaunchInput): ChildProcess {
-  const launch = buildChromeLaunch(input);
-  return spawn(launch.command, launch.args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+export async function spawnChrome(input: ChromeLaunchInput, signal?: AbortSignal): Promise<OwnedChrome> {
+  signal?.throwIfAborted();
+  const selector = net.createServer();
+  const debuggerPort = await new Promise<number>((resolve, reject) => {
+    const onAbort = (): void => {
+      selector.close();
+      reject(new Error('Chrome startup cancelled'));
+    };
+    const finish = (): void => signal?.removeEventListener('abort', onAbort);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    selector.once('error', (error) => {
+      finish();
+      reject(error);
+    });
+    selector.listen(0, '127.0.0.1', () => {
+      const address = selector.address();
+      selector.close((error) => {
+        finish();
+        if (error) reject(error);
+        else if (!address || typeof address === 'string') reject(new Error('Chrome debugger port unavailable'));
+        else resolve(address.port);
+      });
+    });
+  });
+  signal?.throwIfAborted();
+  const launch = buildChromeLaunch({ ...input, debuggerPort });
+  const child = spawn(launch.command, launch.args, { stdio: 'ignore' });
+  // The shell can fail before the connection owner installs its listeners.
+  child.on('error', () => undefined);
+  return { child, debuggerPort };
 }
 
-export async function stopChrome(child: ChildProcess): Promise<void> {
+const retirements = new WeakMap<ChildProcess, Promise<void>>();
+
+export function stopChrome(child: ChildProcess): Promise<void> {
+  let retirement = retirements.get(child);
+  if (!retirement) {
+    retirement = retireChrome(child);
+    retirements.set(child, retirement);
+  }
+  return retirement;
+}
+
+async function retireChrome(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   // A failed spawn has no pid and never emits exit.
   if (child.pid === undefined) return;

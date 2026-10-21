@@ -1,17 +1,11 @@
-import type { ChildProcess } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { Readable, Writable } from 'node:stream';
+import http from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type CDPSession,
-  type ConnectOverCDPTransport,
-  type Page,
-} from 'playwright-core';
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from 'playwright-core';
 
-import { stopChrome } from './chrome.js';
+import { stopChrome, type OwnedChrome } from './chrome.js';
 import { prepareMerchantPage } from './merchant-read.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { documentGate } from './document-gate.js';
@@ -27,132 +21,207 @@ export interface ChromeConnection {
   readonly context: BrowserContext;
   readonly session: CDPSession;
   readonly child: ChildProcess;
+  readonly debuggerPort: number;
   close(): Promise<void>;
 }
 
-/** Attach only to descriptors inherited from the Chrome child this host spawned. */
-export async function connectChromePipe(child: ChildProcess, paths: BrowserPaths): Promise<ChromeConnection> {
-  const outbound = child.stdio[3];
-  const inbound = child.stdio[4];
-  if (!(outbound instanceof Writable) || !(inbound instanceof Readable)) throw new Error('Chrome pipe unavailable');
-  let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-  let ended = false;
-  let gracefulShutdown = false;
-  const transport: ConnectOverCDPTransport = {
-    send(message) {
-      if (ended) return;
-      outbound.write(`${JSON.stringify(message)}\0`, (error) => {
-        if (error) terminate();
-      });
-    },
-    close() {
-      if (!gracefulShutdown) child.kill('SIGTERM');
-    },
-  };
-  function terminate(): void {
-    if (ended) return;
-    ended = true;
-    transport.onclose?.('Chrome pipe closed');
-    if (!gracefulShutdown) child.kill('SIGTERM');
+/** Every listener must be the exact loopback endpoint of our live child. Empty is startup only. */
+async function ownsDebugger(owned: OwnedChrome, signal: AbortSignal): Promise<boolean> {
+  signal.throwIfAborted();
+  const { child, debuggerPort } = owned;
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null)
+    throw new Error('Chrome process unavailable');
+  const output = await new Promise<string>((resolve, reject) => {
+    execFile(
+      'lsof',
+      ['-nP', '-a', `-iTCP:${debuggerPort}`, '-sTCP:LISTEN', '-Fpn'],
+      { signal, timeout: 2_000, maxBuffer: 64 * 1024, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        // lsof uses status 1 for an empty selection. Any diagnostics or other failure is unobservable.
+        if (stderr || (error && !(error.code === 1 && !error.killed && !error.signal && stdout === ''))) {
+          reject(new Error('Chrome listener ownership unavailable'));
+        } else resolve(stdout);
+      },
+    );
+  });
+  if (!output) return false;
+  let pid: number | undefined;
+  let file = false;
+  let named = false;
+  let listeners = 0;
+  for (const line of output.replace(/\n$/, '').split('\n')) {
+    if (/^p[1-9]\d*$/.test(line)) {
+      if (pid !== undefined && (!file || !named)) throw new Error('Chrome listener ownership invalid');
+      pid = Number(line.slice(1));
+      file = false;
+    } else if (/^f\d+$/.test(line) && pid !== undefined) {
+      if (file && !named) throw new Error('Chrome listener ownership invalid');
+      file = true;
+      named = false;
+    } else if (line.startsWith('n') && file && !named) {
+      if (pid !== child.pid || line !== `n127.0.0.1:${debuggerPort}`)
+        throw new Error('Chrome listener is not owned loopback');
+      named = true;
+      listeners++;
+    } else throw new Error('Chrome listener ownership invalid');
   }
-  inbound.on('data', (chunk: Buffer) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > 32 * 1024 * 1024) {
-      terminate();
-      return;
-    }
-    let end: number;
-    while ((end = buffer.indexOf(0)) !== -1) {
-      const frame = buffer.subarray(0, end).toString('utf8');
-      buffer = buffer.subarray(end + 1);
-      if (!frame) continue;
-      let message: unknown;
-      try {
-        message = JSON.parse(frame) as unknown;
-      } catch (error) {
-        if (error instanceof SyntaxError) {
-          terminate();
+  if (!listeners || !file || !named) throw new Error('Chrome listener ownership invalid');
+  signal.throwIfAborted();
+  return true;
+}
+
+async function discoverDebugger(debuggerPort: number, signal: AbortSignal): Promise<string> {
+  const body = await new Promise<string>((resolve, reject) => {
+    const request = http.get(
+      { hostname: '127.0.0.1', port: debuggerPort, path: '/json/version', signal },
+      (response) => {
+        if (response.statusCode !== 200) {
+          response.destroy();
+          reject(new Error('Chrome discovery unavailable'));
           return;
         }
-        throw error;
-      }
-      if (typeof message !== 'object' || message === null || Array.isArray(message)) {
-        terminate();
-        return;
-      }
-      // Match Playwright's native pipe transport: each protocol message gets
-      // its own task so response continuations install listeners before the
-      // next event, even when Chrome coalesces both into one pipe chunk.
-      setImmediate(() => transport.onmessage?.(message));
-    }
-  });
-  inbound.on('error', terminate);
-  outbound.on('error', terminate);
-  child.on('error', terminate);
-  child.on('exit', terminate);
-  let browser: Browser | undefined;
-  try {
-    browser = await chromium.connectOverCDP(transport, {
-      isLocal: true,
-      artifactsDir: paths.artifactsDir,
-      timeout: 15_000,
-    });
-    const context = browser.contexts()[0];
-    if (!context) throw new Error('Chrome default context unavailable');
-    await prepareAuthenticationIsolation(context);
-    // Every document of this connection pauses at its gate from the first request; the gate ends with it.
-    await documentGate(browser);
-    const session = await browser.newBrowserCDPSession();
-    await applyChromeContextPolicy(session);
-    let closing: Promise<void> | undefined;
-    const attached = browser;
-    return {
-      browser,
-      context,
-      session,
-      child,
-      close() {
-        closing ??= (async () => {
-          // A CDP browser.close() disconnects its transport, whose fallback kills the child. Ask Chrome
-          // itself to quit first so it flushes the persistent profile, and wait for exit independently of
-          // the protocol reply. Pipe/disconnect callbacks must not SIGTERM it during this allowance.
-          gracefulShutdown = true;
-          const exited =
-            child.exitCode !== null || child.signalCode !== null
-              ? Promise.resolve()
-              : once(child, 'exit').then(() => undefined);
-          void session.send('Browser.close').catch(() => undefined);
-          let timer: NodeJS.Timeout | undefined;
-          try {
-            await Promise.race([
-              exited,
-              new Promise<void>((resolve) => {
-                timer = setTimeout(resolve, 2_000);
-                timer.unref();
-              }),
-            ]);
-          } finally {
-            if (timer) clearTimeout(timer);
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 64 * 1024) {
+            response.destroy(new Error('Chrome discovery response too large'));
+            return;
           }
-          // The client close waits for disconnect; forced child retirement must remain reachable if
-          // Chrome never honored Browser.close and the graceful transport deliberately did not kill it.
-          await stopChrome(child);
-          await attached.close().catch(() => undefined);
-        })();
-        return closing;
+          chunks.push(chunk);
+        });
+        response.once('error', reject);
+        response.once('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
       },
-    };
-  } catch (error) {
-    await browser?.close().catch(() => undefined);
-    await stopChrome(child);
-    throw new Error('Chrome connection unavailable', { cause: error });
+    );
+    request.once('error', reject);
+  });
+  const version: unknown = JSON.parse(body);
+  if (
+    typeof version !== 'object' ||
+    version === null ||
+    !('webSocketDebuggerUrl' in version) ||
+    typeof version.webSocketDebuggerUrl !== 'string'
+  )
+    throw new Error('Chrome discovery invalid');
+  const endpoint = new URL(version.webSocketDebuggerUrl);
+  if (
+    version.webSocketDebuggerUrl !== endpoint.href ||
+    endpoint.protocol !== 'ws:' ||
+    endpoint.hostname !== '127.0.0.1' ||
+    endpoint.port !== String(debuggerPort) ||
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.search ||
+    endpoint.hash ||
+    !/^\/devtools\/browser\/[A-Za-z0-9-]+$/.test(endpoint.pathname)
+  )
+    throw new Error('Chrome discovery invalid');
+  return endpoint.href;
+}
+
+/** Native Playwright attachment to the verified loopback listener of the child we spawned. */
+export async function connectChrome(
+  owned: OwnedChrome,
+  paths: BrowserPaths,
+  startupSignal: AbortSignal = AbortSignal.timeout(30_000),
+): Promise<ChromeConnection> {
+  const { child, debuggerPort } = owned;
+  const ended = new AbortController();
+  const onExit = (): void => ended.abort();
+  child.once('exit', onExit);
+  child.once('error', onExit);
+  const signal = AbortSignal.any([startupSignal, ended.signal]);
+  let browser: Browser | undefined;
+  let retiring: Promise<void> | undefined;
+  const retire = (): Promise<void> => (retiring ??= stopChrome(child));
+  const check = (): void => {
+    signal.throwIfAborted();
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error('Chrome process unavailable');
+  };
+  let rejectAborted!: (reason: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = reject;
+  });
+  const onAbort = (): void => rejectAborted(new Error('Chrome startup cancelled'));
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    const setup = (async (): Promise<ChromeConnection> => {
+      check();
+      while (!(await ownsDebugger(owned, signal))) await delay(50, undefined, { signal });
+      const endpoint = await discoverDebugger(debuggerPort, signal);
+      if (!(await ownsDebugger(owned, signal))) throw new Error('Chrome listener disappeared');
+      check();
+      browser = await chromium.connectOverCDP(endpoint, { isLocal: true, artifactsDir: paths.artifactsDir });
+      if (signal.aborted) {
+        await retire();
+        void browser.close().catch(() => undefined);
+        check();
+      }
+      const attached = browser;
+      const context = attached.contexts()[0];
+      if (!context) throw new Error('Chrome default context unavailable');
+      await prepareAuthenticationIsolation(context);
+      check();
+      await documentGate(attached);
+      check();
+      const session = await attached.newBrowserCDPSession();
+      await applyChromeContextPolicy(session);
+      check();
+      let closing: Promise<void> | undefined;
+      return {
+        browser: attached,
+        context,
+        session,
+        child,
+        debuggerPort,
+        close() {
+          closing ??= (async () => {
+            const exited =
+              child.exitCode !== null || child.signalCode !== null
+                ? Promise.resolve()
+                : once(child, 'exit').then(() => undefined);
+            // Profile flushing is independent of the protocol reply, which Chrome may never send.
+            void session.send('Browser.close').catch(() => undefined);
+            let timer: NodeJS.Timeout | undefined;
+            try {
+              await Promise.race([
+                exited,
+                new Promise<void>((resolve) => {
+                  timer = setTimeout(resolve, 2_000);
+                  timer.unref();
+                }),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+            await retire();
+            // Process retirement must remain reachable even if the client never finishes disposal.
+            void attached.close().catch(() => undefined);
+          })();
+          return closing;
+        },
+      };
+    })();
+    const connection = await Promise.race([setup, aborted]);
+    check();
+    return connection;
+  } catch {
+    await retire();
+    void browser?.close().catch(() => undefined);
+    // eslint-disable-next-line preserve-caught-error -- Native causes can expose private debugger endpoints or browser identifiers.
+    throw new Error('Chrome connection unavailable');
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    child.removeListener('exit', onExit);
+    child.removeListener('error', onExit);
   }
 }
 
 /** Permissions and download denial are scoped to this native context, never borrowed from another. */
 export async function applyChromeContextPolicy(session: CDPSession, browserContextId?: string): Promise<void> {
   const scope = browserContextId ? { browserContextId } : {};
-  for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
+  for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access', 'notifications']) {
     await session.send('Browser.setPermission', { permission: { name }, setting: 'denied', ...scope });
   }
   await session.send('Browser.setDownloadBehavior', { behavior: 'deny', ...scope });
