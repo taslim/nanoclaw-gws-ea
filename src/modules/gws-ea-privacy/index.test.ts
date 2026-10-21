@@ -384,7 +384,7 @@ describe('removing a private value', () => {
     await run('private-values-remove', { id }, agent(main));
     const [approval] = await pendingApprovals();
 
-    await finalizeReject(approval, main, PRINCIPAL, 'I still need it kept private');
+    await finalizeReject(approval, PRINCIPAL, 'I still need it kept private');
     expect(await listPrivateValues()).toHaveLength(1);
     expect(notes(main).at(-1)).toBe(
       `The principal declined to stop protecting their private address "${HOME_LABEL}": "I still need it kept private". It stays protected.`,

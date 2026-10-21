@@ -269,7 +269,7 @@ describe('a new principal address once the inbox exists', () => {
     await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main));
     const [approval] = await pendingApprovals();
 
-    await finalizeReject(approval!, main, PRINCIPAL, 'that one is my partner’s');
+    await finalizeReject(approval!, PRINCIPAL, 'that one is my partner’s');
     expect(await addresses()).not.toContain(NEW_ADDRESS);
     expect(notes(main).at(-1)).toBe(
       `The principal declined to add ${NEW_ADDRESS} as one of their addresses: "that one is my partner’s". Mail from it carries no authority of theirs.`,

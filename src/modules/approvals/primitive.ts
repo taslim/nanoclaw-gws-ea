@@ -90,8 +90,8 @@ export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
 /**
  * What the requesting agent reads when its request is rejected, given the
  * rejected row and the approver's reason, if any (already clamped). `null`
- * writes no note: the module tells the agent itself, from an approval-resolved
- * callback, which runs before the rejection wakes the agent.
+ * writes no note: the module's required rejection finalizer durably records
+ * its own notification before the rejection wakes the agent.
  */
 export type ApprovalRejectionNote = (
   approval: PendingApproval,
@@ -103,12 +103,19 @@ export interface ApprovalHandlerOptions {
   restartSafe?: boolean;
   /** Words the rejection for this action; without it the agent reads the generic note (finalize.ts). */
   rejectionNote?: ApprovalRejectionNote;
+  /**
+   * Required, idempotent rejection settlement. Persist module state and its
+   * notification before returning; failures retain the decision for replay at
+   * startup and on the host sweep. Best-effort observers run afterwards.
+   */
+  finalizeRejection?: ApprovalRejectionFinalizer;
 }
 
 interface ApprovalHandlerRegistration {
   handler: ApprovalHandler;
   restartSafe: boolean;
   rejectionNote?: ApprovalRejectionNote;
+  finalizeRejection?: ApprovalRejectionFinalizer;
 }
 
 const approvalHandlers = new Map<string, ApprovalHandlerRegistration>();
@@ -125,6 +132,7 @@ export function registerApprovalHandler(
     handler,
     restartSafe: options.restartSafe === true,
     rejectionNote: options.rejectionNote,
+    finalizeRejection: options.finalizeRejection,
   });
 }
 
@@ -134,6 +142,10 @@ export function getApprovalHandler(action: string): ApprovalHandler | undefined 
 
 export function getApprovalRejectionNote(action: string): ApprovalRejectionNote | undefined {
   return approvalHandlers.get(action)?.rejectionNote;
+}
+
+export function getApprovalRejectionFinalizer(action: string): ApprovalRejectionFinalizer | undefined {
+  return approvalHandlers.get(action)?.finalizeRejection;
 }
 
 export function getRegisteredApprovalActions(): readonly string[] {
@@ -164,6 +176,9 @@ export interface ApprovalResolvedEvent {
   /** The reason given with a rejection. */
   reason?: string;
 }
+
+export type ApprovalRejectedEvent = ApprovalResolvedEvent & { outcome: 'reject' };
+export type ApprovalRejectionFinalizer = (event: ApprovalRejectedEvent) => Promise<void>;
 
 export type ApprovalResolvedHandler = (event: ApprovalResolvedEvent) => Promise<void> | void;
 

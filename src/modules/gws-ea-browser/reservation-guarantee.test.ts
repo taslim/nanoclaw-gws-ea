@@ -210,7 +210,7 @@ describe('a standing guarantee the principal declines', () => {
 
   it('carries the reason the principal gave, and keeps the guarantee they already allow', async () => {
     await answer(await propose('first', '50.00'), 'approve');
-    await finalizeReject(await propose('raise', '200.00'), main, PRINCIPAL, 'keep it at fifty');
+    await finalizeReject(await propose('raise', '200.00'), PRINCIPAL, 'keep it at fifty');
     expect(notes().at(-1)).toBe(
       'The principal declined to allow reservation guarantees of up to $200.00 (USD): "keep it at fifty". The guarantee they already allow, up to $50.00 (USD), stays as it is.',
     );

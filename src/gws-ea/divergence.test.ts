@@ -1691,14 +1691,17 @@ describe('recorded divergence: an approval module can word its own rejection', (
       'The principal declined the trip: "not now"',
     );
     expect(primitive.getApprovalRejectionNote('divergence:unregistered')).toBeUndefined();
-    // finalizeReject words the note before its claim, writes none for null, and wakes only after the resolved callbacks.
-    expect(finalize.indexOf('getApprovalRejectionNote(approval.action)')).toBeGreaterThan(-1);
-    expect(finalize.indexOf('getApprovalRejectionNote(approval.action)')).toBeLessThan(
-      finalize.indexOf('transitionPendingApprovalStatus('),
-    );
+    // Rejections keep their durable claim until required settlement, notes, and wake all succeed.
+    expect(finalize).toContain("SET status = 'rejected', rejection_user_id = ?, rejection_reason = ?, rejected_at = ?");
     expect(finalize).toContain('if (text !== null)');
-    expect(finalize.indexOf('await notifyApprovalResolved(')).toBeLessThan(
+    expect(finalize.indexOf('await getApprovalRejectionFinalizer(approval.action)?.(event)')).toBeLessThan(
+      finalize.indexOf('const rejectionNote = getApprovalRejectionNote(approval.action)'),
+    );
+    expect(finalize.indexOf('await notifyApprovalResolved(event)')).toBeLessThan(
       finalize.indexOf("await requestWake(session, 'approval-response')"),
+    );
+    expect(finalize.indexOf("await requestWake(session, 'approval-response')")).toBeLessThan(
+      finalize.lastIndexOf('await deletePendingApproval(approvalId)'),
     );
   });
 });
