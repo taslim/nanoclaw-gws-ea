@@ -1,4 +1,4 @@
-import { classifyControlFacts, classifyNavigationUrl } from './control-policy.js';
+import { classifyNavigationUrl, type ActionClass } from './control-policy.js';
 import { readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { browserActionRefs } from './actions.js';
 import { browserStructureFacts } from './observe.js';
@@ -109,11 +109,16 @@ export function prepareBrowserActionFacts(
   }
 }
 
+export interface BrowserActionControl {
+  readonly facts: ControlFacts;
+  readonly classification: ActionClass;
+}
+
 /** Finish safe replay facts from the checks execution already needed, never a second inspection. */
 export function enrichBrowserActionFacts(
   page: Page,
   prepared: BrowserRecipeStep | undefined,
-  controls: ReadonlyMap<string, ControlFacts>,
+  controls: ReadonlyMap<string, BrowserActionControl>,
 ): BrowserRecipeStep | undefined {
   try {
     if (!prepared) return undefined;
@@ -124,7 +129,7 @@ export function enrichBrowserActionFacts(
       action.kind === 'type' || action.kind === 'select' ? 1 : action.kind === 'form_input' ? action.fields.length : 0;
     step.inputs = [];
     for (let index = 0; index < inputCount; index++) {
-      const facts = controls.get(targets[index].ref);
+      const facts = controls.get(targets[index].ref)?.facts;
       const frameUrl = step.targets[index]?.frameUrls.at(-1);
       if (!facts || facts.secretEntry || !frameUrl) return undefined;
       step.inputs.push({ name: facts.inputName ?? '', origin: new URL(facts.formAction ?? frameUrl).origin });
@@ -135,7 +140,7 @@ export function enrichBrowserActionFacts(
       (action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)) ||
       (action.kind === 'form_input' && action.submit);
     const submitRef = targets[action.kind === 'form_input' ? targets.length - 1 : 0];
-    const submit = submitRef ? controls.get(submitRef.ref) : undefined;
+    const submit = submitRef ? controls.get(submitRef.ref)?.facts : undefined;
     if (submits && submit) {
       if (action.kind === 'click' && submit.href) step.clickHref = submit.href;
       if (submit.formMethod?.toLowerCase() === 'get') step.getSubmissionFields = [...(submit.formFieldNames ?? [])];
@@ -143,20 +148,14 @@ export function enrichBrowserActionFacts(
     step.readOnly =
       !['upload', 'download'].includes(action.kind) &&
       targets.every((ref) => {
-        const facts = controls.get(ref.ref);
+        const control = controls.get(ref.ref);
+        if (!control) return false;
+        const { facts, classification } = control;
         return (
-          facts &&
           !facts.secretEntry &&
           !facts.cardEntry &&
           !facts.transaction &&
-          classifyControlFacts(
-            facts,
-            action.kind === 'select'
-              ? 'select'
-              : action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)
-                ? 'submit'
-                : 'click',
-          ) === 'ordinary' &&
+          classification === 'ordinary' &&
           (facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get')
         );
       });

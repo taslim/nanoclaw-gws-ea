@@ -497,6 +497,86 @@ it('expires a request waiting behind a batch without executing it', async () => 
   await queue.stop();
 });
 
+it('clears a failed context deadline before recovery gives the job a replacement page', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  let open = true;
+  const page = Object.assign(new EventEmitter(), {
+    context: () => ({ browser: () => ({ version: () => '155.0.0.0' }) }),
+    isClosed: () => !open,
+    close: async () => {
+      open = false;
+    },
+  }) as unknown as Page;
+  actions = {
+    ...actions,
+    browser: {
+      validate: () => ({}),
+      async execute(context) {
+        await context.page();
+        return { status: 'completed' };
+      },
+    },
+  };
+  const queue = createQueue({ ...runtime, pageForJob: async () => page, closeJob: async () => page.close() });
+  let entered!: () => void;
+  const loading = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let rejectContext!: (error: Error) => void;
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectContext = reject;
+  });
+  try {
+    await recoverAndStartBrowserQueue(queue);
+    const getJob = store.getJob.bind(store);
+    let failed = false;
+    const lookup = vi.spyOn(store, 'getJob').mockImplementation(async (jobId) => {
+      const first = await store.request(browserRequestId(session.id, 'failed-context'));
+      if (first?.started_at && !failed) {
+        failed = true;
+        entered();
+        return failure;
+      }
+      return getJob(jobId);
+    });
+    await queue.accept('browser', { budget_ms: 100 }, session, 'failed-context');
+    await loading;
+    const idle = queue.idle();
+    rejectContext(new Error('Transient context read failure'));
+    await expect(idle).rejects.toThrow('Transient context read failure');
+    lookup.mockRestore();
+    expect(await store.request(browserRequestId(session.id, 'failed-context'))).toMatchObject({
+      started_at: expect.any(String),
+      answered_at: null,
+    });
+    await queue.accept('browser', { budget_ms: 1_000 }, session, 'replacement-page');
+    await queue.idle();
+    expect(responses()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: 'failed-context',
+          frame: expect.objectContaining({
+            data: expect.objectContaining({ reason: 'interrupted' }),
+          }),
+        }),
+        expect.objectContaining({
+          requestId: 'replacement-page',
+          frame: expect.objectContaining({
+            data: expect.objectContaining({ status: 'completed' }),
+          }),
+        }),
+      ]),
+    );
+    await vi.advanceTimersByTimeAsync(101);
+    expect(page.isClosed()).toBe(false);
+    expect(responses()).toHaveLength(2);
+  } finally {
+    await queue.stop();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  }
+});
+
 it('does not strand acceptance at the final empty-read boundary', async () => {
   let runs = 0;
   actions = {

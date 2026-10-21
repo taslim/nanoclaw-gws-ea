@@ -1,4 +1,4 @@
-import { classifyNavigationUrl } from './control-policy.js';
+import { classifyControlFacts, classifyNavigationUrl } from './control-policy.js';
 import { beginBrowserDiagnosticAction, captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import path from 'node:path';
 import { errors, type Page } from 'playwright-core';
@@ -50,6 +50,7 @@ import {
   browserKeyboardSubmitTarget,
   prepareBrowserActionFacts,
   enrichBrowserActionFacts,
+  type BrowserActionControl,
 } from './action-targets.js';
 import {
   BrowserExecutionError,
@@ -408,9 +409,16 @@ async function executeBatch(
     if (frame === page.mainFrame()) ++navigation;
   };
   /** Every activation carries the request's own deadline checks and budget. */
-  let controls = new Map<string, ControlFacts>();
+  let controls = new Map<string, BrowserActionControl>();
+  const recordField = (
+    target: PinnedBrowserRef,
+    facts: ControlFacts,
+    kind: ActivationIntent['kind'] = 'click',
+  ): void => {
+    controls.set(target.ref, { facts, classification: classifyControlFacts(facts, kind) });
+  };
   const intent = (kind: ActivationIntent['kind'], target?: PinnedBrowserRef): ActivationIntent => ({
-    ...(target ? { onFacts: (facts: ControlFacts) => controls.set(target.ref, facts) } : {}),
+    ...(target ? { onFacts: (facts, classification) => controls.set(target.ref, { facts, classification }) } : {}),
     kind,
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
@@ -543,13 +551,13 @@ async function executeBatch(
             break;
           case 'type':
             if (target) {
-              controls.set(target.ref, await refuseFieldEntry(page, target));
+              recordField(target, await refuseFieldEntry(page, target));
               await fieldInput(context, guard, [{ target, value: action.text }]);
             }
             break;
           case 'select':
             if (target) {
-              controls.set(target.ref, await refuseFieldEntry(page, target));
+              recordField(target, await refuseFieldEntry(page, target));
               await activateControl(
                 page,
                 target.element,
@@ -566,7 +574,7 @@ async function executeBatch(
             if (target) {
               const facts = await readPageControlFacts(page, target.element);
               if (facts.secretEntry) throw new BrowserBatchStop('secret_field');
-              controls.set(target.ref, facts);
+              recordField(target, facts, ENTER_KEY.test(action.key) ? 'submit' : 'click');
               const press = (): Promise<void> =>
                 nativeAction(context, (options) => target.element.press(action.key, options));
               if (ENTER_KEY.test(action.key)) {
@@ -615,7 +623,7 @@ async function executeBatch(
             for (const field of action.fields) {
               const pinned = refs.get(field.ref);
               if (!pinned) throw new BrowserBatchStop('stale_ref');
-              controls.set(pinned.ref, await refuseFieldEntry(page, pinned));
+              recordField(pinned, await refuseFieldEntry(page, pinned));
             }
             await fieldInput(
               context,

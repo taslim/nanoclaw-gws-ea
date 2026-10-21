@@ -155,8 +155,8 @@ export interface ActivationIntent {
   kind: ActivationKind;
   /** Consent stops and grants belong to this operation's job, never ambient page state. */
   scope?: ConsentScope;
-  /** Immutable facts already required for this activation; recording never re-reads the control. */
-  onFacts?: (facts: ControlFacts) => void;
+  /** Facts and final policy decision already required for this activation; recording never re-reads the control. */
+  onFacts?: (facts: ControlFacts, classification: ActionClass) => void;
   /** Host-only cancellation/deadline check immediately before a native authentication submit. */
   assertActive?: () => Promise<void>;
   /** The action's remaining budget: its script-request window never outlasts it. */
@@ -202,7 +202,7 @@ export async function activateControl(
   const dispatch = await activationDispatch(page, element, intent.kind);
   const { classification, facts } = dispatch;
   try {
-    intent.onFacts?.(structuredClone(facts));
+    intent.onFacts?.(structuredClone(facts), classification);
   } catch {
     // An optional evidence projection cannot veto this required policy decision or operation.
   }

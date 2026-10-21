@@ -290,75 +290,78 @@ export class BrowserQueue {
     const operation = new BrowserOperation(Date.parse(request.accepted_at) + request.budget_ms, () =>
       this.runtime.closeJob(request.job_id),
     );
-    const context = await this.contextForRequest(request.id, operation);
-    if (!context) {
-      await operation.finish();
-      await this.finish(request, stopped('interrupted', true));
-      return;
-    }
-    if (context.job.cancelled) {
-      await operation.finish();
-      await this.finish(started, stopped('interrupted', true));
-      return;
-    }
-    if (!context.remaining()) {
-      await operation.finish();
-      await this.finish(started, stopped('timeout', true));
-      return;
-    }
-    this.running.set(request.id, operation);
-    const diagnostics = new BrowserDiagnosticAttempt({
-      jobId: request.job_id,
-      requestId: request.id,
-      action: request.action,
-    });
-    this.diagnosticAttempts.set(request.id, diagnostics);
+    let diagnostics: BrowserDiagnosticAttempt | undefined;
     try {
-      const action = this.action(request.action);
-      if (!action) {
+      const context = await this.contextForRequest(request.id, operation);
+      if (!context) {
+        await operation.finish();
+        await this.finish(request, stopped('interrupted', true));
+        return;
+      }
+      if (context.job.cancelled) {
+        await operation.finish();
         await this.finish(started, stopped('interrupted', true));
         return;
       }
-      const outcome = await operation.run(() =>
-        action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>),
-      );
-      await operation.closeAbortedPage();
-      const latest = await this.store.request(request.id);
-      await this.finish(
-        started,
-        operation.signal.aborted && latest?.commit_started_at
-          ? stopped('unconfirmed', false)
-          : 'value' in outcome
-            ? outcome.value
-            : ((await action.recover?.(started)) ?? stopped(outcome.stopped, false)),
-      );
-    } catch (error) {
-      if (!(error instanceof ActionRefusal))
-        diagnostics.record({
-          source: 'runtime_error',
-          category:
-            error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
-              ? 'unavailable'
-              : 'execution',
-        });
-      const latest = await this.store.request(request.id);
-      await this.finish(
-        started,
-        latest?.commit_started_at
-          ? stopped('unconfirmed', false)
-          : error instanceof ActionRefusal
-            ? error
-            : ((await this.action(request.action)?.recover?.(started)) ??
-              (error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
-                ? stopped('browser_unavailable', false)
-                : new BrowserExecutionError())),
-      );
+      if (!context.remaining()) {
+        await operation.finish();
+        await this.finish(started, stopped('timeout', true));
+        return;
+      }
+      this.running.set(request.id, operation);
+      diagnostics = new BrowserDiagnosticAttempt({
+        jobId: request.job_id,
+        requestId: request.id,
+        action: request.action,
+      });
+      this.diagnosticAttempts.set(request.id, diagnostics);
+      try {
+        const action = this.action(request.action);
+        if (!action) {
+          await this.finish(started, stopped('interrupted', true));
+          return;
+        }
+        const outcome = await operation.run(() =>
+          action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>),
+        );
+        await operation.closeAbortedPage();
+        const latest = await this.store.request(request.id);
+        await this.finish(
+          started,
+          operation.signal.aborted && latest?.commit_started_at
+            ? stopped('unconfirmed', false)
+            : 'value' in outcome
+              ? outcome.value
+              : ((await action.recover?.(started)) ?? stopped(outcome.stopped, false)),
+        );
+      } catch (error) {
+        if (!(error instanceof ActionRefusal))
+          diagnostics.record({
+            source: 'runtime_error',
+            category:
+              error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
+                ? 'unavailable'
+                : 'execution',
+          });
+        const latest = await this.store.request(request.id);
+        await this.finish(
+          started,
+          latest?.commit_started_at
+            ? stopped('unconfirmed', false)
+            : error instanceof ActionRefusal
+              ? error
+              : ((await this.action(request.action)?.recover?.(started)) ??
+                (error instanceof Error && 'code' in error && error.code === 'browser_unavailable'
+                  ? stopped('browser_unavailable', false)
+                  : new BrowserExecutionError())),
+        );
+      }
     } finally {
       await operation.finish();
-      diagnostics.finish();
+      diagnostics?.finish();
       this.diagnosticAttempts.delete(request.id);
       this.running.delete(request.id);
-      await this.releaseJobLeases(request.job_id, request.id);
+      if (diagnostics) await this.releaseJobLeases(request.job_id, request.id);
     }
   }
 
