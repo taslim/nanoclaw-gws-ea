@@ -54,6 +54,7 @@ import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
 import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
 import { setActiveInbox, type InboxRuntime } from '../gws-ea-inbox/runtime.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
+import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
@@ -1105,34 +1106,45 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       }, 30_000);
   });
 
-  it('restores ordinary requests when the form changed before any credential was inserted', async () => {
-    await page.goto(`${SITE}/native-signup`);
-    const authority = await signupAuthority();
-    let changed = false;
-    const active = context();
-    const result = await executeCredentialForm(
-      {
-        ...active,
-        assertActive: async () => {
-          await active.assertActive();
-          if (!changed && (await attempts.get(authority.id))?.phase === 'exposed') {
-            changed = true;
-            await page.evaluate("document.querySelector('[name=password_confirmation]').remove()");
-          }
+  it.each([false, true])(
+    'releases only its own uninserted hold (another authority held: %s)',
+    async (otherHeld) => {
+      await page.goto(`${SITE}/native-signup`);
+      const guard = await ensureBrowserNavigationGuard(page);
+      if (otherHeld) guard.holdSubmissions('other-authority');
+      const authority = await signupAuthority();
+      let changed = false;
+      const active = context();
+      const result = await executeCredentialForm(
+        {
+          ...active,
+          assertActive: async () => {
+            await active.assertActive();
+            if (!changed && (await attempts.get(authority.id))?.phase === 'exposed') {
+              changed = true;
+              await page.evaluate("document.querySelector('[name=password_confirmation]').remove()");
+            }
+          },
         },
-      },
-      { authority: authority.id, ...(await refs(SIGNUP)) },
-      { attempts },
-    );
-    expect(result).toEqual({ status: 'refused', reason: 'form_changed' });
-    expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected' });
-    expect(posts).toEqual([]);
-    expect(await page.locator('input[name=password]').inputValue()).toBe('');
-    await page.evaluate(
-      "fetch('/ordinary-save', { method: 'POST', body: 'safe=ordinary' }).then(response => response.text())",
-    );
-    expect(posts.map((post) => [post.path, post.body])).toEqual([['/ordinary-save', 'safe=ordinary']]);
-  }, 30_000);
+        { authority: authority.id, ...(await refs(SIGNUP)) },
+        { attempts },
+      );
+      expect(result).toEqual({ status: 'refused', reason: 'form_changed' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected' });
+      expect(posts).toEqual([]);
+      expect(await page.locator('input[name=password]').inputValue()).toBe('');
+      if (otherHeld) {
+        await page.evaluate("fetch('/ordinary-save', { method: 'POST', body: 'blocked=other' }).catch(() => {})");
+        expect(posts).toEqual([]);
+        guard.allowSubmissions('other-authority');
+      }
+      await page.evaluate(
+        "fetch('/ordinary-save', { method: 'POST', body: 'safe=ordinary' }).then(response => response.text())",
+      );
+      expect(posts.map((post) => [post.path, post.body])).toEqual([['/ordinary-save', 'safe=ordinary']]);
+    },
+    30_000,
+  );
 
   describe('a box only the principal can agree to, which the form resets on every fill (KTD11)', () => {
     const stops = () =>
@@ -1207,6 +1219,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       ).toEqual({ status: 'account_created', vault: 'saved' });
       expect(posts.map((post) => post.path)).toEqual(['/socket-signup']);
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
+      await page.goto(`${SITE}/native-signup`);
+      expect(await page.locator('h1').textContent()).toBe('Join');
     }, 30_000);
 
     it('keeps a post-fill consent stop uncertain and refuses a refill after the grant', async () => {

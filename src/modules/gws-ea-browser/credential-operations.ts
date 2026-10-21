@@ -121,6 +121,25 @@ const DEFAULT_DEPENDENCIES: CredentialOperationDependencies = { attempts: creden
 type Outcome = Record<string, unknown>;
 const refused = (reason: string): Outcome => ({ status: 'refused', reason });
 
+/** Live pages with a credential request hold; a closed page needs no transport cleanup. */
+const credentialHeldPages = new Map<string, Page>();
+
+async function holdCredentialSubmissions(page: Page, authority: string): Promise<void> {
+  (await ensureBrowserNavigationGuard(page)).holdSubmissions(authority);
+  credentialHeldPages.set(authority, page);
+  page.once('close', () => {
+    if (credentialHeldPages.get(authority) === page) credentialHeldPages.delete(authority);
+  });
+}
+
+/** A known outcome or informed release frees only that authority's hold, without opening a page. */
+async function releaseCredentialSubmissions(authority: string): Promise<void> {
+  const page = credentialHeldPages.get(authority);
+  if (!page) return;
+  if (!page.isClosed()) (await ensureBrowserNavigationGuard(page)).allowSubmissions(authority);
+  credentialHeldPages.delete(authority);
+}
+
 // ---------------------------------------------------------------- main's authority
 
 const AUTHORITY_FIELDS: ReadonlySet<string> = new Set([
@@ -469,9 +488,10 @@ function releasedFrom(attempt: CredentialAttempt, approvalId: string): Credentia
  */
 async function freeSite(
   queue: BrowserQueue,
-  attempt: Pick<CredentialAttempt, 'job_id' | 'site'>,
+  attempt: Pick<CredentialAttempt, 'id' | 'job_id' | 'site'>,
   eventId: string,
 ): Promise<void> {
+  await releaseCredentialSubmissions(attempt.id);
   const running = await queue.store.db.get<{ present: number }>(
     'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     attempt.job_id,
@@ -698,6 +718,7 @@ async function finalizedOutcome(
   attempts: CredentialAttempts,
   assertActive: () => Promise<void>,
 ): Promise<Outcome> {
+  await releaseCredentialSubmissions(attempt.id);
   return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, assertActive)).status));
 }
 
@@ -1422,7 +1443,6 @@ async function disclosingStep(
     watchResponse(saved.id, context, page, group, { step: 'credentials', before });
     return { status: 'outcome_unknown' };
   };
-  const submissionGuard = await ensureBrowserNavigationGuard(page);
   let uninserted = false;
   page.on('framenavigated', navigation);
   try {
@@ -1439,7 +1459,7 @@ async function disclosingStep(
     }
     // A page's input/change handlers can submit without navigating. Install this before any value reaches
     // them, and retain it through a consent hold (and secret cleanup), not just this call's stack.
-    submissionGuard.holdSubmissions();
+    await holdCredentialSubmissions(page, saved.id);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
     if (filled === 'not_inserted') {
       uninserted = true;
@@ -1455,7 +1475,7 @@ async function disclosingStep(
       watchResponse(saved.id, context, page, group, { step: 'credentials', before });
       return { ...stopped.outcome, status: 'outcome_unknown' };
     }
-    submissionGuard.allowSubmissions();
+    await releaseCredentialSubmissions(saved.id);
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
       if (activation === 'activated') await attempts.markAwaitingVerification(saved.id);
       const result = await awaitWebsite(context, page, group, before, activation === 'activated' ? 15_000 : 2_000);
@@ -1491,7 +1511,7 @@ async function disclosingStep(
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
-    if (uninserted) submissionGuard.allowSubmissions();
+    if (uninserted) await releaseCredentialSubmissions(saved.id);
     // The wait stays open while the site may still send its verification email: asked for, or unknown.
     if (verifying) {
       const phase = (await attempts.get(saved.id))?.phase;
@@ -1622,9 +1642,11 @@ async function reconcileResponse(
     case 'current_password_rejected':
     case 'password_rejected':
       await attempts.markRejected(attempt.id, proof);
+      await releaseCredentialSubmissions(attempt.id);
       return { status: result };
     case 'verification_requested':
       await attempts.markVerificationRequested(attempt.id, proof);
+      await releaseCredentialSubmissions(attempt.id);
       return { status: 'verification_requested' };
     case 'confirmed':
       await attempts.markConfirmed(attempt.id, proof);

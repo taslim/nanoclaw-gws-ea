@@ -277,9 +277,9 @@ export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
   clearReason(): void;
   /** Hold HTTP requests before credential callbacks run, including while waiting for consent. */
-  holdSubmissions(): void;
-  /** Release the hold only for the host-authorized activation. */
-  allowSubmissions(): void;
+  holdSubmissions(authority: string): void;
+  /** Release only this authority's hold when it activates, settles or is explicitly released. */
+  allowSubmissions(authority: string): void;
   runWithPolicy<T>(policy: BrowserNavigationPolicy, operation: () => Promise<T>): Promise<T>;
   /**
    * Runs one ordinary action inside its script-request window (KTD2): from the action's start, through a short
@@ -444,7 +444,7 @@ function withoutReferrer(headers: Record<string, string>): Array<{ name: string;
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: NavigationRefusal | undefined;
   const policies: BrowserNavigationPolicy[] = [];
-  let submissionsHeld = false;
+  const submissionHolds = new Set<string>();
   // Each outermost operation, and each span between them, is its own generation. A decision is
   // reported only to the generation its request paused in; a late one is still enforced, not reported.
   let generation = 0;
@@ -475,7 +475,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     capture() {
       const recordRefusal = captureBrowserDiagnosticRefusal(page);
       const scopes = [...policies];
-      const held = submissionsHeld;
+      const held = submissionHolds.size > 0;
       const approved = approvedPresses.get(page);
       const pausedIn = generation;
       // A document between operations is judged by the page as it stood when the document paused.
@@ -573,11 +573,11 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     clearReason() {
       blocked = undefined;
     },
-    holdSubmissions() {
-      submissionsHeld = true;
+    holdSubmissions(authority) {
+      submissionHolds.add(authority);
     },
-    allowSubmissions() {
-      submissionsHeld = false;
+    allowSubmissions(authority) {
+      submissionHolds.delete(authority);
     },
     async runWithPolicy(scope, operation) {
       const outermost = !policies.length;
