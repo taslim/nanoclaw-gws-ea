@@ -12,11 +12,7 @@ import {
   writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from './onepassword-policy.js';
-import {
-  browserConsentMigration,
-  browserCredentialAttemptsMigration,
-  browserCredentialConsentHoldMigration,
-} from './migration.js';
+import { browserCredentialAttemptsMigration } from './migration.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
@@ -908,79 +904,28 @@ describe('password changes', () => {
 });
 
 describe('phases', () => {
-  /** The consent stops a job's passes recorded, one per wording, each in the state the principal left it. */
-  async function consentStops(...statuses: string[]): Promise<string[]> {
-    await getDb().exec(
-      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
-    );
-    await browserConsentMigration.up(getDb());
-    const ids: string[] = [];
-    for (const [index, status] of statuses.entries()) {
-      const id = `00000000-0000-4000-8000-00000000000${index}`;
-      await getDb().run(
-        "INSERT INTO gws_ea_browser_consent_stops(id,job_id,site,origin,wording,kind,form_fingerprint,status,created_at) VALUES(?,?,'shop.example',?,?,'agreement','join-form',?,?)",
-        id,
-        JOB,
-        ORIGIN,
-        `Wording ${index}`,
-        status,
-        new Date().toISOString(),
-      );
-      ids.push(id);
-    }
-    return ids;
-  }
-  const evidenceOf = async (id: string): Promise<unknown> =>
-    JSON.parse(
-      (await getDb().get<{ evidence_json: string }>(
-        'SELECT evidence_json FROM gws_ea_browser_credential_attempts WHERE id = ?',
-        id,
-      ))!.evidence_json,
-    );
-
-  it('copies every attempt as it was when the consent hold joins the phases, then holds and ends one by its own stops', async () => {
+  it('never discloses an uncertain candidate again, retaining its password and evidence for reconciliation', async () => {
     const subject = service();
     const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
     await subject.save(attempt.id);
-    const before = await rows();
-    await browserCredentialConsentHoldMigration.up(getDb());
-    expect(await rows()).toEqual(before);
-    const [first, second, unrelated] = await consentStops('requested', 'open', 'requested');
     await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
-    expect(await subject.markAwaitingConsent(attempt.id, { signal: 'consent' }, [first])).toMatchObject({
-      phase: 'awaiting_consent',
+    const before = await subject.get(attempt.id);
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
     });
-    expect(await evidenceOf(attempt.id)).toEqual({ signal: 'consent', held: true, stops: first });
-    // The same authority discloses its one candidate again for the fill after the grant, which is no longer
-    // provably unsubmitted.
-    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
-    expect(await phase(attempt.id)).toBe('exposed');
-    expect(await evidenceOf(attempt.id)).toEqual({ stops: first });
-    // Held again before the principal answered: it waits on both the earlier card and the new stop.
-    await subject.markAwaitingConsent(attempt.id, { signal: 'consent' }, [second]);
-    expect(await evidenceOf(attempt.id)).toEqual({ signal: 'consent', held: true, stops: `${first} ${second}` });
-    expect(await subject.endConsentHolds(JOB, unrelated)).toEqual([]);
-    expect(await subject.endConsentHolds(OTHER_JOB, first)).toEqual([]);
-    expect(await subject.endConsentHolds(JOB, first)).toEqual([attempt.id]);
+    await subject.markUnknown(attempt.id, { signal: 'consent', activation: 'none' });
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
+    });
+    expect(await subject.get(attempt.id)).toMatchObject({
+      phase: 'unknown',
+      candidate_item_id: before?.candidate_item_id,
+    });
+    expect(fake.items.has(before!.candidate_item_id!)).toBe(true);
+    expect(await subject.abandonForJob(JOB)).toEqual([]);
     expect(await phase(attempt.id)).toBe('unknown');
-    await expect(
-      getDb().run("UPDATE gws_ea_browser_credential_attempts SET phase = 'held' WHERE id = ?", attempt.id),
-    ).rejects.toThrow();
-  });
-
-  it('never holds a fill again once the principal declined a stop it waited on', async () => {
-    const subject = service();
-    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
-    await subject.save(attempt.id);
-    await browserCredentialConsentHoldMigration.up(getDb());
-    const [first, second] = await consentStops('requested', 'open');
-    await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
-    await subject.markAwaitingConsent(attempt.id, { signal: 'consent' }, [first]);
-    await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
-    // The card was declined while the form was being filled again: no end of the hold would follow.
-    await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'rejected' WHERE id = ?", first);
-    expect(await subject.markAwaitingConsent(attempt.id, { signal: 'consent' }, [second])).toBeUndefined();
-    expect(await phase(attempt.id)).toBe('exposed');
   });
 
   it('moves only along the diagram and records flat evidence that never carries a value', async () => {

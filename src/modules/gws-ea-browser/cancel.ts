@@ -241,8 +241,6 @@ export async function cancelBrowserJobInTransaction(
   // No authority the job has not used survives it: nothing was disclosed for these.
   const credentials = await store.db.hasTable('gws_ea_browser_credential_attempts');
   const abandonedAttempts = credentials ? await credentialAttempts.abandonForJob(job.id) : [];
-  // A form held for the principal's consent is never filled again once its job ends: it is unknown, for release.
-  if (credentials) await credentialAttempts.endConsentHolds(job.id);
   // Read after abandoning, so an attempt whose disclosure won the race keeps the job live.
   if (inProgress || (await heldCredentialSites(store.db, job.id)).size > 0) {
     await store.db.run(

@@ -6,9 +6,7 @@
  * saved for it, and the phase it reached:
  *
  *   preparing → saved → exposed → awaiting_verification → confirmed → finalized
- *   exposed → awaiting_consent → exposed, when a consent stop held the filled form unsubmitted until a grant
  *   exposed | awaiting_verification → unknown → confirmed | rejected
- *   awaiting_consent → unknown, when a card for one of its stops is declined, lapses or is withdrawn, or the job ends
  *   unknown → awaiting_verification, when the site's late response asks for email verification
  *   awaiting_verification → rejected;  confirmed → conflict, when the login changed in 1Password meanwhile
  *   preparing | saved → rejected, when abandoned before any disclosure
@@ -54,7 +52,6 @@ export type CredentialAttemptPhase =
   | 'preparing'
   | 'saved'
   | 'exposed'
-  | 'awaiting_consent'
   | 'awaiting_verification'
   | 'unknown'
   | 'rejected'
@@ -194,11 +191,6 @@ const MAX_EVIDENCE_TEXT = 200;
 const MAX_JOB_ID = 512;
 export const MAX_USERNAME = 256;
 const now = (): string => new Date().toISOString();
-/** The consent stops a held attempt waits on, as its evidence names them. */
-function heldStops(attempt: Pick<CredentialAttempt, 'evidence_json'>): string[] {
-  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
-  return isRecord(evidence) && typeof evidence.stops === 'string' && evidence.stops ? evidence.stops.split(' ') : [];
-}
 const refused = <Reason extends string>(reason: Reason): Refused<Reason> => ({ status: 'refused', reason });
 
 /** A provider step's value, or its bounded failure; any other error is the caller's own and passes through. */
@@ -670,8 +662,7 @@ export class CredentialAttempts {
   ): Promise<CredentialDisclosure> {
     const attempt = await this.require(id);
     if (attempt.job_id !== binding.jobId) return refused('wrong_job');
-    if (attempt.phase !== 'saved' && attempt.phase !== 'exposed' && attempt.phase !== 'awaiting_consent')
-      return refused('not_saved');
+    if (attempt.phase !== 'saved') return refused('not_saved');
     if (registrableDomain(binding.origin) !== attempt.site) return refused('origin_mismatch');
     const candidate = await this.candidate(attempt, assertActive);
     if (!('secret' in candidate)) return candidate.status === 'mismatch' ? refused('candidate_mismatch') : candidate;
@@ -687,16 +678,11 @@ export class CredentialAttempts {
     if (!(await this.usable(attempt))) return { status: 'vault_unavailable' };
     await assertActive();
     const at = now();
-    // A held form filled again is no longer provably unsubmitted: its evidence keeps only the stops it waited on.
-    const refilled =
-      attempt.phase === 'awaiting_consent' ? this.evidenceJson(id, { stops: heldStops(attempt).join(' ') }) : null;
     const changed = await this.db.run(
-      `UPDATE ${TABLE} SET phase = 'exposed', exposed_at = COALESCE(exposed_at, ?), updated_at = ?,
-         evidence_json = CASE WHEN phase = 'awaiting_consent' THEN ? ELSE evidence_json END
-       WHERE id = ? AND job_id = ? AND phase IN ('saved','exposed','awaiting_consent')`,
+      `UPDATE ${TABLE} SET phase = 'exposed', exposed_at = COALESCE(exposed_at, ?), updated_at = ?
+       WHERE id = ? AND job_id = ? AND phase = 'saved'`,
       at,
       at,
-      refilled,
       id,
       binding.jobId,
     );
@@ -754,57 +740,6 @@ export class CredentialAttempts {
     }
     if (to === 'rejected') this.secrets.delete(id);
     return this.require(id);
-  }
-
-  /**
-   * A consent stop on the first read after the fill, with no choice changed and no navigation since: the form
-   * provably went unsubmitted, so the same authority may fill it again once the principal grants the wording.
-   * The attempt waits on `stops` and on those of its earlier holds, so the principal's no on any of them ends
-   * it (`endConsentHolds`). When one was already declined, lapsed or withdrawn nothing would end the hold, so
-   * the attempt stays exposed (undefined) for the caller's unknown path; more stops than evidence holds is
-   * refused (`invalid_request`) for the same path.
-   */
-  async markAwaitingConsent(
-    id: string,
-    evidence: CredentialEvidence,
-    stops: readonly string[],
-  ): Promise<CredentialAttempt | undefined> {
-    return this.db.transaction(async () => {
-      const waiting = [...new Set([...heldStops(await this.require(id)), ...stops])];
-      if (
-        !waiting.length ||
-        (await this.db.get(
-          `SELECT id FROM gws_ea_browser_consent_stops WHERE id IN (${waiting.map(() => '?').join(',')}) AND status IN ('rejected','expired','withdrawn')`,
-          ...waiting,
-        ))
-      )
-        return undefined;
-      return this.move(id, ['exposed'], 'awaiting_consent', { ...evidence, held: true, stops: waiting.join(' ') });
-    });
-  }
-
-  /**
-   * The held attempts of `jobId` become unknown, or only those waiting on `stopId` when given, DB-only so a
-   * cancellation can join its transaction: the principal declined that stop, its card lapsed or was withdrawn,
-   * or the job is ending, and only reconciliation or the principal's release settles them now.
-   */
-  async endConsentHolds(jobId: string, stopId?: string): Promise<string[]> {
-    const ended: string[] = [];
-    for (const attempt of await this.db.all<CredentialAttempt>(
-      `SELECT * FROM ${TABLE} WHERE job_id = ? AND phase = 'awaiting_consent' ORDER BY created_at, id`,
-      jobId,
-    )) {
-      if (stopId !== undefined && !heldStops(attempt).includes(stopId)) continue;
-      const { id } = attempt;
-      try {
-        await this.move(id, ['awaiting_consent'], 'unknown');
-        ended.push(id);
-      } catch (error) {
-        // A grant re-filled it first: it is settled through its job like any other disclosed attempt.
-        if (!(error instanceof CredentialAttemptError)) throw error;
-      }
-    }
-    return ended;
   }
 
   /** The bounded activation ran after disclosure; its outcome is not yet verified. */

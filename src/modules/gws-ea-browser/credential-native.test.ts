@@ -4,6 +4,7 @@
  * is the SDK fake. Generated passwords are read back only from that fake.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
@@ -65,6 +66,7 @@ import {
   browserConsentMigration,
   browserCredentialAttemptsMigration,
   browserCredentialConsentHoldMigration,
+  browserCredentialUncertaintyMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
@@ -211,6 +213,9 @@ const PAGES: Record<string, string> = {
   // Each fill resets a box only the principal can agree to: the form shows it, unticked, once a password is typed.
   '/waiver-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}');`)}`,
   // The fill also moves the page to a new address, as a single-page app's router does.
+  '/waiver-and-submit-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}'); window.callbackSubmission = fetch('/api/signup', { method: 'POST', body: new URLSearchParams(new FormData(form)) }).catch(() => {}); window.submitFilledForm = () => fetch('/api/signup', { method: 'POST', body: new URLSearchParams(new FormData(form)) }).catch(() => {});`)}`,
+  '/waiver-and-get-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}'); const send = () => fetch('/callback-signup?data=' + encodeURIComponent(new URLSearchParams(new FormData(form)).toString())).catch(() => {}); window.callbackSubmission = send(); window.submitFilledForm = send;`)}`,
+  '/waiver-document-submit-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}'); form.requestSubmit();`)}`,
   '/waiver-and-route-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}'); history.pushState({}, '', '/join/password');`)}`,
   // After the fill the page ticks an offers box again whenever the host unticks it.
   '/offers-on-fill': `${nativeForm('/signup')}${onFill(`const offers = box('offers', 'Send me news and special offers'); offers.checked = true; offers.addEventListener('change', () => { if (!offers.checked) setTimeout(() => { offers.checked = true; }, 20); });`)}`,
@@ -282,6 +287,16 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         const html = (body: string): void => {
           response.writeHead(200, { 'content-type': 'text/html' }).end(body);
         };
+        // This site's signup endpoint mutates on GET, so HTTP method alone cannot prove a read.
+        if (path === '/callback-signup') {
+          posts.push({
+            host,
+            path,
+            body: new URL(request.url ?? '/', `https://${host}`).searchParams.get('data') ?? '',
+          });
+          html('<h1>Account created</h1>');
+          return;
+        }
         if (request.method !== 'POST') {
           addresses.push(`${host}${request.url ?? ''}`);
           if (path === '/verify-away') {
@@ -290,7 +305,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
           }
           if (host === 'parent.example')
             html(
-              `<input id="untrusted" aria-label="Untrusted"><iframe src="${SITE}${({ '/get': '/get-signup', '/waiver': '/waiver-on-fill' } as Record<string, string>)[path] ?? '/native-signup'}"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
+              `<input id="untrusted" aria-label="Untrusted"><iframe src="${SITE}${({ '/get': '/get-signup', '/waiver': '/waiver-on-fill', '/waiver-submit': '/waiver-and-submit-on-fill' } as Record<string, string>)[path] ?? '/native-signup'}"></iframe><script>document.querySelector('input').addEventListener('input', e => { document.body.dataset.captured = e.target.value; });addEventListener('message', e => { if (e.data === 'steal-focus') { document.querySelector('input').focus(); document.body.dataset.stolen = 'yes'; } });</script>`,
             );
           else html(PAGES[path] ?? '<h1>Not found</h1>');
           return;
@@ -319,6 +334,41 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         });
       },
     );
+    server.on('upgrade', (request, socket) => {
+      const key = request.headers['sec-websocket-key'];
+      if (request.url !== '/socket-signup' || typeof key !== 'string') {
+        socket.destroy();
+        return;
+      }
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      socket.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      const answer = (text: string): void => {
+        socket.write(Buffer.concat([Buffer.from([0x81, Buffer.byteLength(text)]), Buffer.from(text)]));
+      };
+      // This fixture speaks only short, masked text frames; Chrome may split their bytes across packets.
+      let buffered: Buffer = Buffer.alloc(0);
+      socket.on('data', (chunk: Buffer) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        while (buffered.length >= 2) {
+          const length = buffered[1] & 0x7f;
+          if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
+            socket.destroy();
+            return;
+          }
+          if (buffered.length < length + 6) return;
+          const mask = buffered.subarray(2, 6);
+          const body = Buffer.from(buffered.subarray(6, length + 6));
+          for (let index = 0; index < body.length; index++) body[index] ^= mask[index % 4];
+          buffered = buffered.subarray(length + 6);
+          posts.push({ host: request.headers.host ?? '', path: '/socket-signup', body: body.toString() });
+          answer('recorded');
+          held.push(() => answer('created'));
+        }
+      });
+      socket.on('error', () => socket.destroy());
+    });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('TLS fixture did not bind');
@@ -363,6 +413,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     await browserSiteLeasesMigration.up(db);
     await browserCredentialAttemptsMigration.up(db);
     await browserCredentialConsentHoldMigration.up(db);
+    await browserCredentialUncertaintyMigration.up(db);
     // Consent stops name their job; this suite's job needs no other row.
     await db.exec(
       `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
@@ -648,6 +699,53 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected', exposed_at: null });
       expect(await page.locator('input[name=current_password]').inputValue()).toBe('');
     }, 30_000);
+
+    for (const modification of ['password edit', 'removal'] as const)
+      it(`keeps an exposed change uncertain after source Login ${modification} without deleting its candidate`, async () => {
+        const { itemId, handle } = await ownedAccount();
+        const authority = await changeAuthority(handle);
+        await page.goto(`${SITE}/change`);
+        await page.evaluate(`(() => {
+          const label = ${JSON.stringify(WAIVER)};
+          document.querySelector('[name=new_password]')?.addEventListener('input', () => {
+            if (document.querySelector('[name=waiver]')) return;
+            const wrapper = document.createElement('label');
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.name = 'waiver';
+            wrapper.append(input, label);
+            document.querySelector('form')?.append(wrapper);
+          });
+        })()`);
+        expect(await fill(authority, await refs(CHANGE))).toMatchObject({ reason: 'consent_required' });
+        const held = await attempts.get(authority.id);
+        expect(held?.phase).toBe('unknown');
+        const stop = await getDb().get<{ site: string; origin: string; wording: string }>(
+          'SELECT site, origin, wording FROM gws_ea_browser_consent_stops WHERE job_id = ?',
+          JOB,
+        );
+        if (!stop || !held?.candidate_item_id) throw new Error('Missing held credential evidence');
+        await recordConsentGrant(getDb(), {
+          ...stop,
+          approvalId: 'approval-rotation',
+          principalUserId: 'gchat:users/principal',
+        });
+        if (modification === 'removal') fake.items.delete(itemId);
+        else
+          fake.edit(itemId, (item) => ({
+            ...item,
+            fields: item.fields.map((entry) =>
+              entry.id === 'password' ? { ...entry, value: 'principal-new-password' } : entry,
+            ),
+          }));
+        expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'outcome_unknown' });
+        expect(await attempts.get(authority.id)).toMatchObject({
+          phase: 'unknown',
+          candidate_item_id: held.candidate_item_id,
+        });
+        expect(fake.items.has(held.candidate_item_id)).toBe(true);
+        expect(posts).toEqual([]);
+      }, 30_000);
 
     it('reports a rejected current password as rejected, never as a change', async () => {
       const { handle } = await ownedAccount();
@@ -1007,6 +1105,35 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       }, 30_000);
   });
 
+  it('restores ordinary requests when the form changed before any credential was inserted', async () => {
+    await page.goto(`${SITE}/native-signup`);
+    const authority = await signupAuthority();
+    let changed = false;
+    const active = context();
+    const result = await executeCredentialForm(
+      {
+        ...active,
+        assertActive: async () => {
+          await active.assertActive();
+          if (!changed && (await attempts.get(authority.id))?.phase === 'exposed') {
+            changed = true;
+            await page.evaluate("document.querySelector('[name=password_confirmation]').remove()");
+          }
+        },
+      },
+      { authority: authority.id, ...(await refs(SIGNUP)) },
+      { attempts },
+    );
+    expect(result).toEqual({ status: 'refused', reason: 'form_changed' });
+    expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected' });
+    expect(posts).toEqual([]);
+    expect(await page.locator('input[name=password]').inputValue()).toBe('');
+    await page.evaluate(
+      "fetch('/ordinary-save', { method: 'POST', body: 'safe=ordinary' }).then(response => response.text())",
+    );
+    expect(posts.map((post) => [post.path, post.body])).toEqual([['/ordinary-save', 'safe=ordinary']]);
+  }, 30_000);
+
   describe('a box only the principal can agree to, which the form resets on every fill (KTD11)', () => {
     const stops = () =>
       getDb().all<{ id: string; site: string; origin: string; wording: string }>(
@@ -1028,13 +1155,67 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     const pageText = async (): Promise<string> =>
       `${JSON.stringify(await page.evaluate("Array.from(document.querySelectorAll('input'), (input) => input.value)"))}${(await observePage(page)).snapshot}`;
 
-    it('covers AE4: holds the filled form unsubmitted, and after one grant the same authority completes it', async () => {
+    it('reconciles an existing socket submission without filling or submitting again after consent', async () => {
+      await page.goto(`${SITE}/waiver-on-fill`);
+      await page.evaluate(`(() => {
+        window.socketMessages = [];
+        window.socketReady = new Promise(resolve => {
+          const socket = new WebSocket('wss://accounts.shop.example/socket-signup');
+          socket.addEventListener('open', () => resolve());
+          socket.addEventListener('message', ({ data }) => {
+            window.socketMessages.push(data);
+            if (data === 'created') document.querySelector('h1').textContent = 'Account created';
+          });
+          document.querySelector('[name=password]').addEventListener('input', ({ target }) => {
+            if (target.value) socket.send('signup');
+          });
+        });
+      })()`);
+      await page.evaluate('window.socketReady');
+      const authority = await signupAuthority();
+      const controls = await refs(SIGNUP);
+      expect(await fill(authority, controls)).toMatchObject({ status: 'outcome_unknown', reason: 'consent_required' });
+      await page.waitForFunction("window.socketMessages.includes('recorded')");
+      expect(posts.map((post) => post.path)).toEqual(['/socket-signup']);
+      const uncertain = await attempts.get(authority.id);
+      expect(uncertain).toMatchObject({ phase: 'unknown', candidate_item_id: expect.any(String) });
+      await grant();
+      expect(await fill(authority, controls)).toEqual({ status: 'outcome_unknown' });
+      expect(posts.map((post) => post.path)).toEqual(['/socket-signup']);
+      expect((await attempts.get(authority.id))?.candidate_item_id).toBe(uncertain?.candidate_item_id);
+      // Queue history includes the consent card request and the refused no-op refill: neither interacted
+      // with the page, so the response remains attributable to this attempt's one disclosure.
+      await getDb().exec(
+        'CREATE TABLE gws_ea_browser_requests(id TEXT PRIMARY KEY,job_id TEXT,action TEXT,payload_json TEXT,started_at TEXT)',
+      );
+      for (const [id, action, payload] of [
+        ['socket-consent', 'request_consent', { stop_id: (await stops())[0].id }],
+        ['socket-no-refill', 'credential_form', { authority: authority.id, ...controls }],
+      ] as const)
+        await getDb().run(
+          'INSERT INTO gws_ea_browser_requests VALUES(?,?,?,?,?)',
+          id,
+          JOB,
+          action,
+          JSON.stringify(payload),
+          new Date().toISOString(),
+        );
+      answerSlow();
+      await page.waitForFunction("window.socketMessages.includes('created')");
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'account_created', vault: 'saved' });
+      expect(posts.map((post) => post.path)).toEqual(['/socket-signup']);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized' });
+    }, 30_000);
+
+    it('keeps a post-fill consent stop uncertain and refuses a refill after the grant', async () => {
       await page.goto(`${SITE}/waiver-on-fill`);
       const authority = await signupAuthority();
       const held = await fill(authority, await refs(SIGNUP));
       const [stop] = await stops();
       expect(held).toEqual({
-        status: 'refused',
+        status: 'outcome_unknown',
         reason: 'consent_required',
         consent: [
           {
@@ -1046,55 +1227,85 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       });
       expect(posts).toEqual([]);
       expect(await attempts.get(authority.id)).toMatchObject({
-        phase: 'awaiting_consent',
+        phase: 'unknown',
         exposed_at: expect.any(String),
       });
       const password = await candidatePassword(authority.id);
       expect(await pageText()).not.toContain(password);
       await grant();
       const done = await fill(authority, await refs(SIGNUP));
-      expect(done).toEqual({ status: 'account_created', vault: 'saved' });
-      expect(posts).toEqual([
-        {
-          host: 'accounts.shop.example',
-          path: '/signup',
-          body: new URLSearchParams({
-            email: USERNAME,
-            password,
-            password_confirmation: password,
-            waiver: 'on',
-          }).toString(),
-        },
-      ]);
+      expect(done).toEqual({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
       // One candidate, one disclosure's value, and no answer that carries it.
       expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
       expect(JSON.stringify([held, done])).not.toContain(password);
     }, 30_000);
 
-    it('holds a form framed by a page from another site against its own stop, which names the page', async () => {
+    for (const address of [
+      `${SITE}/waiver-and-submit-on-fill`,
+      `${SITE}/waiver-and-get-on-fill`,
+      'https://parent.example/waiver-submit',
+    ])
+      it(`blocks HTTP callback submissions before consent, including while uncertain, on ${address}`, async () => {
+        await page.goto(address);
+        const authority = await signupAuthority();
+        expect(await fill(authority, await refs(SIGNUP))).toMatchObject({ reason: 'consent_required' });
+        expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+        const formFrame = page.frames().find((frame) => frame.url().startsWith(SITE));
+        if (!formFrame) throw new Error('Missing credential frame');
+        await formFrame.evaluate('window.callbackSubmission');
+        expect(posts).toEqual([]);
+        await formFrame.evaluate('window.submitFilledForm()');
+        expect(posts).toEqual([]);
+        const newFrame = page.waitForEvent('framenavigated', {
+          predicate: (frame) => frame.url() === 'about:srcdoc',
+        });
+        await formFrame.evaluate(`(() => {
+          const child = document.createElement('iframe');
+          child.srcdoc = "<body><script>fetch('https://parent.example/callback-signup?data=frame').catch(() => {}).finally(() => { document.body.dataset.finished = 'yes'; });</script></body>";
+          document.body.append(child);
+        })()`);
+        const child = await newFrame;
+        await child.waitForFunction("document.body.dataset.finished === 'yes'");
+        expect(posts).toEqual([]);
+        await grant();
+        expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'outcome_unknown' });
+        expect(posts).toEqual([]);
+      }, 30_000);
+
+    it('blocks a native document POST requested by an input callback', async () => {
+      await page.goto(`${SITE}/waiver-document-submit-on-fill`);
+      const authority = await signupAuthority();
+      const controls = await refs(SIGNUP);
+      expect(await fill(authority, controls)).toMatchObject({ status: 'outcome_unknown' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      expect(posts).toEqual([]);
+      expect(await fill(authority, controls)).toMatchObject({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
+    }, 30_000);
+
+    it('keeps a framed credential attempt uncertain while its consent stop names the page', async () => {
       await page.goto('https://parent.example/waiver');
       const authority = await signupAuthority();
       expect(await fill(authority, await refs(SIGNUP))).toMatchObject({
-        status: 'refused',
+        status: 'outcome_unknown',
         reason: 'consent_required',
       });
       const [stop] = await stops();
       expect(stop).toMatchObject({ site: 'parent.example', origin: SITE });
-      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'awaiting_consent', site: 'shop.example' });
-      // The principal's no on that stop's card is what ends the hold.
-      expect(await attempts.endConsentHolds(JOB, stop.id)).toEqual([authority.id]);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown', site: 'shop.example' });
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
       expect(posts).toEqual([]);
     }, 30_000);
 
-    it('keeps the hold across a host restart, and completes after the grant', async () => {
+    it('keeps uncertainty across a host restart and never refills after a grant', async () => {
       await page.goto(`${SITE}/waiver-on-fill`);
       const authority = await signupAuthority();
       expect(await fill(authority, await refs(SIGNUP))).toMatchObject({ reason: 'consent_required' });
       // A fresh process knows only the durable record and 1Password.
       const restarted = new CredentialAttempts({ db: getDb(), vault });
       await recoverCredentialAttempts(restarted);
-      expect(await restarted.get(authority.id)).toMatchObject({ phase: 'awaiting_consent' });
+      expect(await restarted.get(authority.id)).toMatchObject({ phase: 'unknown' });
       await grant();
       expect(
         await executeCredentialForm(
@@ -1102,20 +1313,24 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
           { authority: authority.id, ...(await refs(SIGNUP)) },
           { attempts: restarted },
         ),
-      ).toEqual({ status: 'account_created', vault: 'saved' });
-      expect(posts.map((post) => post.path)).toEqual(['/signup']);
+      ).toEqual({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
+      expect(
+        await executeCredentialForm(
+          context(),
+          { authority: authority.id, operation: 'reconcile' },
+          { attempts: restarted },
+        ),
+      ).toEqual({ status: 'inconclusive' });
     }, 30_000);
 
-    it('asks again, still holding, when the form is submitted before the principal answers', async () => {
+    it('refuses a refill while the principal has not answered', async () => {
       await page.goto(`${SITE}/waiver-on-fill`);
       const authority = await signupAuthority();
       await fill(authority, await refs(SIGNUP));
-      expect(await fill(authority, await refs(SIGNUP))).toMatchObject({
-        status: 'refused',
-        reason: 'consent_required',
-      });
+      expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'outcome_unknown' });
       expect(posts).toEqual([]);
-      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'awaiting_consent' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
     }, 30_000);
 
     for (const [path, outcome, why] of [
@@ -1127,7 +1342,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       ['/waiver-and-route-on-fill', { status: 'outcome_unknown', reason: 'consent_required' }, 'a fill that navigated'],
       ['/donation-on-fill', { status: 'outcome_unknown', reason: 'purchase_control' }, 'a paid extra after the fill'],
     ] as const)
-      it(`leaves the attempt unknown, never held, after ${why}`, async () => {
+      it(`leaves the attempt unknown after ${why}`, async () => {
         await page.goto(`${SITE}${path}`);
         const authority = await signupAuthority();
         expect(await fill(authority, await refs(SIGNUP))).toMatchObject(outcome);

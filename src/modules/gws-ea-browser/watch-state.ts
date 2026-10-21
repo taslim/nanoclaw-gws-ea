@@ -374,7 +374,7 @@ export async function finishWatchPurchase(
   );
 }
 
-async function insertWatchNotice(
+export async function insertWatchNotice(
   db: DbDriver,
   watch: WatchRow,
   status: string,

@@ -1,4 +1,5 @@
 import { recoverBrowserWatchState } from './watch-state.js';
+import { recoverConsentOutcomes } from './consent-approval.js';
 import { log } from '../../log.js';
 import type { BrowserQueue } from './queue.js';
 import { recoverBrowserPurchases } from './purchase.js';
@@ -9,6 +10,7 @@ import { recoverCredentialAttempts, settleConfirmedAttempts } from './credential
 export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
   await recoverBrowserPurchases(queue);
   await recoverBrowserWatchState(queue);
+  await recoverConsentOutcomes();
   // Each interrupted request records its own durable outcome before its answer: a credential
   // attempt it disclosed becomes unknown, never a purchase, and is never submitted again.
   for (const request of await queue.store.pending())

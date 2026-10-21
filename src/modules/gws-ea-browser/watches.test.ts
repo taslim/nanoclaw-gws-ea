@@ -45,7 +45,7 @@ import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
-import { finalizeReject } from '../approvals/finalize.js';
+import { finalizeReject, resumeRejectedApprovals } from '../approvals/finalize.js';
 import { requestApproval } from '../approvals/index.js';
 import { saveBrowserRecipe } from './recipes.js';
 
@@ -1382,9 +1382,37 @@ describe('a watch the principal declines', () => {
     expect(cards.some((card) => card.includes('Withdrawn'))).toBe(false);
   });
 
+  it('commits a declined watch and its recoverable notice together, then retries after a failed insert', async () => {
+    const { approval, session } = await awaitingCard('declined-interrupted');
+    const db = getDb();
+    const run = db.run.bind(db);
+    let interrupt = true;
+    const write = vi.spyOn(db, 'run').mockImplementation(async (sql, ...params) => {
+      if (interrupt && sql.includes('INSERT INTO gws_ea_browser_watch_notices')) {
+        interrupt = false;
+        throw new Error('notice insert interrupted');
+      }
+      return run(sql, ...params);
+    });
+    try {
+      await finalizeReject(approval, 'gchat:users/watch-principal', 'too late');
+      expect((await getBrowserWatch('declined-interrupted'))?.status).toBe('awaiting_principal');
+      expect(await told(session)).toEqual([]);
+    } finally {
+      write.mockRestore();
+    }
+    await resumeRejectedApprovals();
+    await deliverWatchNotices();
+    await resumeRejectedApprovals();
+    expect((await getBrowserWatch('declined-interrupted'))?.status).toBe('cancelled');
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late"');
+  });
+
   it('carries the reason the principal gave', async () => {
     const { approval, session } = await awaitingCard('declined-why');
-    await finalizeReject(approval, session, 'gchat:users/watch-principal', 'too late on a weeknight');
+    await finalizeReject(approval, 'gchat:users/watch-principal', 'too late on a weeknight');
     const notes = await told(session);
     expect(notes).toHaveLength(1);
     expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late on a weeknight"');

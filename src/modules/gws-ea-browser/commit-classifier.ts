@@ -276,6 +276,10 @@ export interface BrowserNavigationPolicy {
 export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
   clearReason(): void;
+  /** Hold HTTP requests before credential callbacks run, including while waiting for consent. */
+  holdSubmissions(): void;
+  /** Release the hold only for the host-authorized activation. */
+  allowSubmissions(): void;
   runWithPolicy<T>(policy: BrowserNavigationPolicy, operation: () => Promise<T>): Promise<T>;
   /**
    * Runs one ordinary action inside its script-request window (KTD2): from the action's start, through a short
@@ -440,6 +444,7 @@ function withoutReferrer(headers: Record<string, string>): Array<{ name: string;
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: NavigationRefusal | undefined;
   const policies: BrowserNavigationPolicy[] = [];
+  let submissionsHeld = false;
   // Each outermost operation, and each span between them, is its own generation. A decision is
   // reported only to the generation its request paused in; a late one is still enforced, not reported.
   let generation = 0;
@@ -470,6 +475,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     capture() {
       const recordRefusal = captureBrowserDiagnosticRefusal(page);
       const scopes = [...policies];
+      const held = submissionsHeld;
       const approved = approvedPresses.get(page);
       const pausedIn = generation;
       // A document between operations is judged by the page as it stood when the document paused.
@@ -479,7 +485,9 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         if (pausedIn === generation) blocked = classification;
       };
       return {
+        submissionsHeld: held,
         async decide(document) {
+          if (held) return { allow: false };
           let classification: ActionClass | 'site_busy' | 'read_only';
           try {
             classification = await decideNavigation(document.url, document, scopes, approved, () =>
@@ -514,7 +522,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   });
   // Script requests during an ordinary action (KTD2), on the page and on every out-of-process frame, since a
   // payment frame sends its own. Their sessions are set up on the first action; outside every action's window
-  // nothing pauses.
+  // nothing pauses. Credential holds instead use the browser-level gate, which covers a new target's first request.
   const scriptSessions = new Set<CDPSession>();
   let actions = 0;
   let covering: Promise<void> | undefined;
@@ -564,6 +572,12 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     reason: () => blocked,
     clearReason() {
       blocked = undefined;
+    },
+    holdSubmissions() {
+      submissionsHeld = true;
+    },
+    allowSubmissions() {
+      submissionsHeld = false;
     },
     async runWithPolicy(scope, operation) {
       const outermost = !policies.length;

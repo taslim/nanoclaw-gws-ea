@@ -17,7 +17,7 @@ import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
-import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
+import { registerApprovalResolvedHandler, type ApprovalResolvedEvent } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { hasBrowserAccess, readHostBrowserPolicy } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
@@ -30,7 +30,6 @@ import {
   type ConsentGrant,
   type ConsentStop,
 } from './consent.js';
-import { credentialAttempts } from './credential-attempts.js';
 import { BrowserStore } from './db.js';
 import { writeBrowserNotice } from './notices.js';
 
@@ -41,6 +40,9 @@ import { quoted } from '../approvals/request-text.js';
 export const CONSENT_APPROVAL = 'browser_consent';
 export const CONSENT_CARD_LIFE_MS = 24 * 60 * 60 * 1000;
 const STOP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+// A periodic sweep must not mistake card creation's awaits for an interrupted, cardless request.
+const creatingConsentCards = new Set<string>();
 
 /** Only a live browser job may ask for its own stop, and only the principal may agree. */
 export const browserConsentGuard = defineGuardedAction({
@@ -117,7 +119,8 @@ export async function executeConsentRequest(
   if (stop.status !== 'open') return { status: 'refused', reason: 'stop_used' };
   if ((await liveConsentGrants(db, stop.site, stop.origin)).has(stop.wording)) {
     await db.run(
-      "UPDATE gws_ea_browser_consent_stops SET status = 'approved',decided_at = ? WHERE id = ? AND status = 'open'",
+      "UPDATE gws_ea_browser_consent_stops SET status = 'approved',decided_at = ?,outcome_notified_at = ? WHERE id = ? AND status = 'open'",
+      new Date().toISOString(),
       new Date().toISOString(),
       stop.id,
     );
@@ -129,68 +132,71 @@ export async function executeConsentRequest(
     payload: approval,
   });
   if (decision.effect !== 'hold') throw forbidden(decision.reason);
-  const claimed = await db.run(
-    "UPDATE gws_ea_browser_consent_stops SET status = 'requested',requested_at = ? WHERE id = ? AND status = 'open'",
-    new Date().toISOString(),
-    stop.id,
-  );
-  if (!claimed.changes) return { status: 'refused', reason: 'stop_used' };
-  const approvalId = await requestApproval({
-    session: context.session,
-    agentName: 'browser',
-    action: CONSENT_APPROVAL,
-    payload: approval,
-    title: `Agree to this on ${stop.site}?`,
-    question: consentQuestion(stop),
-    approverUserId: decision.approverUserId,
-    expiresAt: new Date(Date.now() + CONSENT_CARD_LIFE_MS).toISOString(),
-    originLine: ERRAND_ORIGIN_LINE,
-    details: { facts: { site: stop.site, wording: stop.wording } },
-  });
-  if (!approvalId) {
-    await db.run(
-      "UPDATE gws_ea_browser_consent_stops SET status = 'withdrawn',decided_at = ? WHERE id = ? AND status = 'requested'",
+  if (creatingConsentCards.has(stop.id)) return { status: 'refused', reason: 'stop_used' };
+  creatingConsentCards.add(stop.id);
+  try {
+    const claimed = await db.run(
+      "UPDATE gws_ea_browser_consent_stops SET status = 'requested',requested_at = ? WHERE id = ? AND status = 'open'",
       new Date().toISOString(),
       stop.id,
     );
-    await endHeldCredentialForms(stop);
-    return { status: 'withdrawn', stop_id: stop.id };
+    if (!claimed.changes) return { status: 'refused', reason: 'stop_used' };
+    const approvalId = await requestApproval({
+      session: context.session,
+      agentName: 'browser',
+      action: CONSENT_APPROVAL,
+      payload: approval,
+      title: `Agree to this on ${stop.site}?`,
+      question: consentQuestion(stop),
+      approverUserId: decision.approverUserId,
+      expiresAt: new Date(Date.now() + CONSENT_CARD_LIFE_MS).toISOString(),
+      originLine: ERRAND_ORIGIN_LINE,
+      details: { facts: { site: stop.site, wording: stop.wording } },
+    });
+    if (!approvalId) {
+      await db.transaction(async () => {
+        const at = new Date().toISOString();
+        await db.run(
+          "UPDATE gws_ea_browser_consent_stops SET status = 'withdrawn',decided_at = ?,outcome_notified_at = ? WHERE id = ? AND status = 'requested'",
+          at,
+          at,
+          stop.id,
+        );
+      });
+      return { status: 'withdrawn', stop_id: stop.id };
+    }
+    // A click delivered before the id returned has already set it.
+    await db.run(
+      'UPDATE gws_ea_browser_consent_stops SET approval_id = ? WHERE id = ? AND approval_id IS NULL',
+      approvalId,
+      stop.id,
+    );
+    return { status: 'awaiting_principal', stop_id: stop.id };
+  } finally {
+    creatingConsentCards.delete(stop.id);
   }
-  // A click delivered before the id returned has already set it.
-  await db.run(
-    'UPDATE gws_ea_browser_consent_stops SET approval_id = ? WHERE id = ? AND approval_id IS NULL',
-    approvalId,
-    stop.id,
-  );
-  return { status: 'awaiting_principal', stop_id: stop.id };
-}
-
-/**
- * A credential form held for this stop will not be agreed to now: its attempt is unknown, which the job's
- * reconcile or the principal's release settles (KTD11). The attempt names its own stops, since a form framed by
- * another site's page is held under its own site while the stop names the page's.
- */
-async function endHeldCredentialForms(stop: ConsentStop): Promise<void> {
-  if (await getDb().hasTable('gws_ea_browser_credential_attempts'))
-    await credentialAttempts.endConsentHolds(stop.job_id, stop.id);
 }
 
 const OUTCOME_MESSAGES = {
   approved:
-    'The principal agreed. Submit the form again from a fresh observation: the host ticks this box there now, and whenever this exact wording appears on the site again.',
+    'The principal agreed. The host may tick this box when this exact wording appears on the site. If credentials already reached the page, reconcile that attempt before trying again: consent does not prove the first attempt was unsubmitted.',
   rejected:
     'The principal declined. The host leaves this box unticked; do not submit a form that needs it, and report this to the agent that sent the errand.',
   expired:
     'The principal did not answer in time. The box stays unticked; report this to the agent that sent the errand.',
   withdrawn:
-    'The card was withdrawn before the principal answered. The box stays unticked; report this to the agent that sent the errand.',
+    'The consent card is no longer open. The box stays unticked; report this to the agent that sent the errand.',
 } as const;
 
 /** The job hears the principal's decision on its stop, once. */
 async function notifyConsentOutcome(stop: ConsentStop, status: keyof typeof OUTCOME_MESSAGES): Promise<void> {
-  const job = await new BrowserStore(getDb()).getJob(stop.job_id);
+  const db = getDb();
+  const current = await getConsentStop(db, stop.id);
+  if (!current || current.status !== status || current.outcome_notified_at !== null) return;
+  const job = await new BrowserStore(db).getJob(stop.job_id);
   const session = job ? await getSession(job.browser_session_id) : undefined;
   if (!session) return;
+  let written = false;
   try {
     await writeBrowserNotice(
       session,
@@ -205,10 +211,17 @@ async function notifyConsentOutcome(stop: ConsentStop, status: keyof typeof OUTC
         message: OUTCOME_MESSAGES[status],
       }),
     );
+    written = true;
   } catch (error) {
     if (!isUniqueViolation(error)) throw error;
   }
-  void requestWake(session, 'approval-response').catch(() => undefined);
+  await db.run(
+    'UPDATE gws_ea_browser_consent_stops SET outcome_notified_at = ? WHERE id = ? AND status = ? AND outcome_notified_at IS NULL',
+    new Date().toISOString(),
+    stop.id,
+    status,
+  );
+  if (written) void requestWake(session, 'approval-response').catch(() => undefined);
 }
 
 /**
@@ -253,26 +266,90 @@ registerApprovalHandler(
     });
     if (approved) await notifyConsentOutcome(stop, 'approved');
   },
-  // A no reaches the job once, from the resolved callback below.
-  { restartSafe: true, rejectionNote: () => null },
+  {
+    restartSafe: true,
+    rejectionNote: () => null,
+    finalizeRejection: settleConsentOutcome,
+  },
 );
 
-registerApprovalResolvedHandler(async ({ approval, outcome }) => {
+async function settleConsentOutcome({ approval, outcome }: ApprovalResolvedEvent): Promise<void> {
   if (approval.action !== CONSENT_APPROVAL || outcome === 'approve') return;
-  const payload = JSON.parse(approval.payload) as { stopId?: unknown };
+  const payload = JSON.parse(approval.payload) as { stopId?: unknown; jobId?: unknown };
   if (typeof payload.stopId !== 'string') return;
+  const stopId = payload.stopId;
   const status = outcome === 'reject' ? 'rejected' : outcome;
-  const changed = await getDb().run(
-    "UPDATE gws_ea_browser_consent_stops SET status = ?,decided_at = ? WHERE id = ? AND status = 'requested'",
-    status,
-    new Date().toISOString(),
-    payload.stopId,
-  );
-  const stop = await getConsentStop(getDb(), payload.stopId);
-  if (!changed.changes || !stop) return;
-  await endHeldCredentialForms(stop);
-  await notifyConsentOutcome(stop, status);
+  const db = getDb();
+  const stop = await db.transaction(async () => {
+    const current = await getConsentStop(db, stopId);
+    if (
+      !current ||
+      current.job_id !== payload.jobId ||
+      (current.approval_id !== null && current.approval_id !== approval.approval_id) ||
+      (current.status !== 'requested' && current.status !== status)
+    )
+      return undefined;
+    await db.run(
+      'UPDATE gws_ea_browser_consent_stops SET status = ?,decided_at = COALESCE(decided_at, ?) WHERE id = ?',
+      status,
+      new Date().toISOString(),
+      current.id,
+    );
+    return current;
+  });
+  if (stop) await notifyConsentOutcome(stop, status);
+}
+
+registerApprovalResolvedHandler(async (event) => {
+  if (event.outcome !== 'reject') await settleConsentOutcome(event);
 });
+
+/** Repairs interrupted card requests, then retries outcomes whose deterministic mailbox notice is still owed. */
+export async function recoverConsentOutcomes(): Promise<void> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_browser_consent_stops'))) return;
+  const requested = await db.all<{ id: string }>(
+    "SELECT id FROM gws_ea_browser_consent_stops WHERE status = 'requested' ORDER BY requested_at,id",
+  );
+  for (const { id } of requested) {
+    await db.transaction(async () => {
+      if (creatingConsentCards.has(id)) return;
+      const stop = await getConsentStop(db, id);
+      if (!stop || stop.status !== 'requested') return;
+      const cards = await db.all<{ approval_id: string; payload: string }>(
+        'SELECT approval_id,payload FROM pending_approvals WHERE action = ?',
+        CONSENT_APPROVAL,
+      );
+      const card = cards.find((candidate) => {
+        const payload = JSON.parse(candidate.payload) as { stopId?: unknown; jobId?: unknown };
+        return payload.stopId === stop.id && payload.jobId === stop.job_id;
+      });
+      if (card) {
+        // Card delivery and its answer may precede the request's final approval-id write.
+        await db.run(
+          "UPDATE gws_ea_browser_consent_stops SET approval_id = ? WHERE id = ? AND status = 'requested'",
+          card.approval_id,
+          stop.id,
+        );
+        return;
+      }
+      // The original reason may have disappeared with the card. Its absence proves only that consent
+      // cannot complete now, never that the principal agreed: retain a truthful terminal outcome to notify.
+      await db.run(
+        "UPDATE gws_ea_browser_consent_stops SET status = 'withdrawn',decided_at = COALESCE(decided_at, ?) WHERE id = ? AND status = 'requested'",
+        new Date().toISOString(),
+        stop.id,
+      );
+    });
+  }
+  const pending = await db.all<ConsentStop>(
+    "SELECT * FROM gws_ea_browser_consent_stops WHERE outcome_notified_at IS NULL AND status IN ('approved','rejected','expired','withdrawn') ORDER BY decided_at,id",
+  );
+  for (const stop of pending) {
+    if (stop.status === 'open' || stop.status === 'requested') continue;
+    await notifyConsentOutcome(stop, stop.status);
+  }
+}
 
 export const requestConsentAction: BrowserQueuedAction = {
   validate: validateConsentRequest,

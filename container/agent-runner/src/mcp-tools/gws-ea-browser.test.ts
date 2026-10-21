@@ -314,12 +314,15 @@ describe('the browser tools', () => {
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 
-  it('lets credential_form submit again only after a consent stop, which submitted nothing', () => {
+  it('distinguishes a pre-disclosure consent refusal from an uncertain attempt that must never be submitted again', () => {
     const description = credentialForm.tool.description;
-    expect(description).toContain(
-      'The authority covers one submission: never submit it again, except after consent_required, which submitted nothing:',
+    expect(description).toContain('refused with consent_required before disclosure');
+    expect(description).toContain('outcome_unknown with reason consent_required after disclosure');
+    expect(description).toContain('A grant never permits refilling an exposed attempt.');
+    expect(description).not.toContain('consent_required, which submitted nothing');
+    expect(requestConsent.tool.description).toContain(
+      'If credentials already reached the page, reconcile that attempt before trying again',
     );
-    expect(description).toMatch(/approved, submit the form again from a fresh observation with the same authority/u);
   });
 
   it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {

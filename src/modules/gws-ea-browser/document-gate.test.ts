@@ -343,3 +343,27 @@ it('refuses within its bound a frame whose possible host never answers, blaming 
   expect(Date.now() - started).toBeLessThan(4_000);
   expect([one.refuse.mock.calls.length, two.refuse.mock.calls.length]).toEqual([1, 0]);
 });
+
+it('holds script submissions in newly created frames and windows from their first request', async () => {
+  const { browser, pause } = fixture(
+    {
+      main: { type: 'page' },
+      newFrame: { type: 'iframe', parentFrameId: 'main' },
+      popup: { type: 'page', openerId: 'main' },
+      other: { type: 'page' },
+    },
+    [{ tree: tree('main') }, { tree: tree('other') }],
+  );
+  let held = true;
+  const guarded = guardedPage();
+  (await documentGate(browser)).register('main', {
+    capture: () => ({ ...guarded.page.capture(), submissionsHeld: held }),
+  });
+  for (const frame of ['main', 'newFrame', 'popup'])
+    for (const resource of ['XHR', 'Fetch', 'Ping']) expect(await pause(frame, resource, {}, 'POST')).toBe('refused');
+  expect(await pause('newFrame', 'Fetch')).toBe('refused');
+  expect(await pause('newFrame', 'Fetch', {}, 'HEAD')).toBe('refused');
+  expect(await pause('other', 'Fetch', {}, 'POST')).toBe('continued');
+  held = false;
+  expect(await pause('newFrame', 'Fetch', {}, 'POST')).toBe('continued');
+});

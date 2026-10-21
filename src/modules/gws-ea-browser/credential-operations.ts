@@ -15,14 +15,12 @@
  * host-read evidence from the site, never a model verdict, an HTTP status or
  * a URL change alone (KTD8). Values never leave host memory and 1Password.
  *
- * Phases are the attempt's: an attempt past its one disclosure is never
- * filled again, so a retry or restart cannot submit a second time. The one
- * exception is a form the consent engine stopped on its first read after the
- * fill, with no choice changed and no navigation since: it provably went
- * unsubmitted, so the attempt waits (`awaiting_consent`, KTD11) and the same
- * authority fills it again once the principal grants the wording. A request
- * cut off after its disclosure leaves the attempt `unknown` (KTD8), with its
- * site held for its job; nothing about it becomes a purchase record.
+ * An attempt past its one disclosure is never filled again, so a retry or
+ * restart cannot submit a second time. Even a consent stop after filling
+ * leaves the attempt `unknown`: an input callback may already have sent the
+ * credential through an existing socket that HTTP interception cannot see.
+ * Its site stays held for its job until reconciliation or the principal's
+ * informed release settles it; nothing becomes a purchase record.
  *
  * Two later steps settle an attempt without submitting it again. `verify`
  * completes a signup the site asked to confirm by email: its claim, opened
@@ -339,16 +337,8 @@ function parsedEvidence(attempt: Pick<CredentialAttempt, 'evidence_json'>): unkn
   return attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
 }
 
-/** Whether an attempt was held for the principal's consent before it became unknown: the host never submitted it. */
-function wasHeld(attempt: CredentialAttempt): boolean {
-  const evidence: unknown = parsedEvidence(attempt);
-  return attempt.phase === 'unknown' && isRecord(evidence) && evidence.held === true;
-}
-
 /** What happened, as the principal reads it first on the card. */
 function situation(attempt: CredentialAttempt, account: string): string {
-  if (wasHeld(attempt))
-    return `I filled in ${attempt.kind === 'signup' ? 'the signup' : 'the new password'} for ${account}, but the site needed an agreement you didn't give, so I never submitted it.`;
   if (attempt.kind === 'signup')
     switch (attempt.phase) {
       case 'conflict':
@@ -388,7 +378,7 @@ function finishedWords(attempt: Pick<CredentialAttempt, 'kind' | 'site'>, vault:
 /** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
 function releaseQuestion(attempt: CredentialAttempt): string {
   const account = `${quoted(attempt.username, 256)} on ${attempt.site}`;
-  const uncertain = (attempt.phase === 'unknown' && !wasHeld(attempt)) || attempt.phase === 'awaiting_verification';
+  const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
   const consequence =
     attempt.kind === 'signup'
       ? `If you release it, I stop waiting on it and free the site, and I change nothing more in 1Password.${uncertain ? ' Trying again could create a second account.' : ''}`
@@ -729,11 +719,7 @@ function websiteOutcome(kind: CredentialKind, vault: VaultState): Outcome {
   }
 }
 
-/**
- * An attempt past its one disclosure is reported, never filled again, except one held unsubmitted for the
- * principal's consent (KTD11), which the same authority fills again: the fill revalidates the frame and the
- * form, and the consent engine stops it again until the principal agrees.
- */
+/** An attempt past its one disclosure is reported, never filled again. */
 async function settledOutcome(
   attempt: CredentialAttempt,
   attempts: CredentialAttempts,
@@ -742,7 +728,6 @@ async function settledOutcome(
   switch (attempt.phase) {
     case 'preparing':
     case 'saved':
-    case 'awaiting_consent':
       return undefined;
     case 'exposed':
     case 'unknown':
@@ -991,14 +976,8 @@ async function bindGroup(
   };
 }
 
-/**
- * A submission the consent engine stopped, whether it stopped on its first read, before setting any choice,
- * and the stops it recorded, whose cards a held attempt waits on.
- */
 interface ConsentStopped {
   readonly outcome: Outcome;
-  readonly firstRead: boolean;
-  readonly stops: readonly string[];
 }
 
 /**
@@ -1020,12 +999,9 @@ async function consentStop(
     case 'consent_required':
       return {
         outcome: { ...refused('consent_required'), consent: consentStopsForAgent(consent.stops) },
-        firstRead: !consent.hostChanged,
-        stops: consent.stops.flatMap((stop) => (stop.stop_id === null ? [] : [stop.stop_id])),
       };
-    // No grant clears an extra the site keeps, so a stop for one is never held.
     case 'add_on':
-      return { outcome: refused('purchase_control'), firstRead: false, stops: [] };
+      return { outcome: refused('purchase_control') };
   }
 }
 
@@ -1295,8 +1271,7 @@ async function ensureSaved(
   attempts: CredentialAttempts,
   assertActive: () => Promise<void>,
 ): Promise<{ readonly saved: CredentialAttempt } | Stopped> {
-  // A held attempt's candidate was saved before its first fill.
-  if (attempt.phase === 'saved' || attempt.phase === 'awaiting_consent') return { saved: attempt };
+  if (attempt.phase === 'saved') return { saved: attempt };
   const saved =
     attempt.save_started_at === null
       ? await attempts.save(attempt.id, assertActive)
@@ -1447,6 +1422,8 @@ async function disclosingStep(
     watchResponse(saved.id, context, page, group, { step: 'credentials', before });
     return { status: 'outcome_unknown' };
   };
+  const submissionGuard = await ensureBrowserNavigationGuard(page);
+  let uninserted = false;
   page.on('framenavigated', navigation);
   try {
     for (const secret of secrets) {
@@ -1460,29 +1437,25 @@ async function disclosingStep(
       await rejectExposed(attempts, saved.id, evidence('none', 'not_inserted', 'none'));
       return { status: 'vault_unavailable' };
     }
+    // A page's input/change handlers can submit without navigating. Install this before any value reaches
+    // them, and retain it through a consent hold (and secret cleanup), not just this call's stack.
+    submissionGuard.holdSubmissions();
     const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
     if (filled === 'not_inserted') {
+      uninserted = true;
       // Proven: nothing reached the page, so no website could have acted on it.
       await rejectExposed(attempts, saved.id, evidence('none', filled, 'none'));
       return refused('form_changed');
     }
-    // The check again just before the press. The values are in the page by now, so a stop here leaves the
-    // attempt unknown, as any activation that did not run does, unless it provably went unsubmitted: stopped on
-    // its first read, before the host changed a choice, with no navigation since the fill. That one waits for
-    // the principal, keeping its stops, and the same authority fills it again after the grant (KTD11).
+    // HTTP holds limit callbacks, but an existing socket may already have submitted. A consent stop
+    // after disclosure is uncertain too: keep the candidate and watch the response without refilling.
     const stopped = await consentStop(context, page, group);
     if (stopped) {
-      if (stopped.firstRead && !navigated) {
-        try {
-          if (await attempts.markAwaitingConsent(saved.id, evidence('consent', filled, 'none'), stopped.stops))
-            return stopped.outcome;
-        } catch (error) {
-          if (!(error instanceof CredentialAttemptError)) throw error;
-        }
-      }
       await settle(() => attempts.markUnknown(saved.id, evidence('consent', filled, 'none')));
+      watchResponse(saved.id, context, page, group, { step: 'credentials', before });
       return { ...stopped.outcome, status: 'outcome_unknown' };
     }
+    submissionGuard.allowSubmissions();
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
       if (activation === 'activated') await attempts.markAwaitingVerification(saved.id);
       const result = await awaitWebsite(context, page, group, before, activation === 'activated' ? 15_000 : 2_000);
@@ -1518,6 +1491,7 @@ async function disclosingStep(
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
+    if (uninserted) submissionGuard.allowSubmissions();
     // The wait stays open while the site may still send its verification email: asked for, or unknown.
     if (verifying) {
       const phase = (await attempts.get(saved.id))?.phase;
@@ -1565,10 +1539,12 @@ function watchResponse(
 
 /** Browser actions that cannot change what a site shows: anything else since the activation makes its response unattributable. */
 const READ_ONLY_ACTIONS: ReadonlySet<unknown> = new Set(['observe', 'screenshot', 'wait_for']);
-function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'>): boolean {
+function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'>, authority: string): boolean {
   const payload: unknown = JSON.parse(request.payload_json);
   if (!isRecord(payload)) return false;
-  if (request.action === 'credential_form') return payload.operation === 'reconcile';
+  if (request.action === 'request_consent') return true;
+  if (request.action === 'credential_form')
+    return payload.operation === 'reconcile' || (payload.authority === authority && payload.operation === undefined);
   return (
     request.action === 'browser' &&
     Array.isArray(payload.actions) &&
@@ -1577,7 +1553,11 @@ function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'
 }
 
 /** The site's response is the activation's only if nothing since could have navigated or interacted. */
-async function attributable(context: BrowserExecutionContext, watched: WatchedResponse): Promise<boolean> {
+async function attributable(
+  context: BrowserExecutionContext,
+  watched: WatchedResponse,
+  authority: string,
+): Promise<boolean> {
   const { db } = context.store;
   if (watched.page.isClosed() || !(await db.hasTable('gws_ea_browser_requests'))) return !watched.page.isClosed();
   const later = await db.all<Pick<BrowserRequest, 'action' | 'payload_json'>>(
@@ -1587,7 +1567,7 @@ async function attributable(context: BrowserExecutionContext, watched: WatchedRe
     context.request.id,
     watched.at,
   );
-  return later.every(readOnlyRequest);
+  return later.every((request) => readOnlyRequest(request, authority));
 }
 
 /**
@@ -1607,14 +1587,11 @@ async function reconcile(
     case 'preparing':
     case 'saved':
       return refused('not_disclosed');
-    // Nothing was submitted: the form waits on the principal's consent, then credential_form fills it again.
-    case 'awaiting_consent':
-      return refused('consent_required');
     case 'confirmed':
       return await finalizedOutcome(attempt, attempts, context.assertActive);
     case 'unknown': {
       const watched = watchedResponses.get(attempt.id);
-      if (!watched || !(await attributable(context, watched))) return { status: 'inconclusive' };
+      if (!watched || !(await attributable(context, watched, attempt.id))) return { status: 'inconclusive' };
       return onSitePage(context, (page) => reconcileResponse(context, page, attempt, watched, attempts));
     }
     default:
@@ -1678,7 +1655,6 @@ async function verify(
   payload: CredentialVerifyPayload,
   attempts: CredentialAttempts,
 ): Promise<Outcome> {
-  if (attempt.phase === 'awaiting_consent') return refused('consent_required');
   if (attempt.phase !== 'awaiting_verification')
     return (await settledOutcome(attempt, attempts, context.assertActive)) ?? refused('not_disclosed');
   const arrived = await takeSignupVerification(context, attempt.id, context.remaining() - VERIFY_MARGIN_MS);

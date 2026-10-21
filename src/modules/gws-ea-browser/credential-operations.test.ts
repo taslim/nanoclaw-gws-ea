@@ -775,13 +775,13 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     if (!approvalId || !stop.stop_id) throw new Error('No consent card');
     return { stopId: stop.stop_id, approvalId };
   }
-  /** A signup whose filled form waits on the principal's card for a wording on the page's site (KTD11). */
-  async function heldForConsent(site = 'shop.example'): Promise<{ id: string; approvalId: string }> {
+  /** A disclosed signup stays uncertain while the principal decides a wording on the page's site. */
+  async function uncertainAfterConsent(site = 'shop.example'): Promise<{ id: string; approvalId: string }> {
     const id = await disclosedSignup();
     await holdSite();
     const { stopId, approvalId } = await consentCard(site, WAIVER, 'join-form');
-    expect(await attempts.markAwaitingConsent(id, { signal: 'consent' }, [stopId])).toMatchObject({
-      phase: 'awaiting_consent',
+    expect(await attempts.markUnknown(id, { signal: 'consent', stops: stopId, held: true })).toMatchObject({
+      phase: 'unknown',
     });
     return { id, approvalId };
   }
@@ -805,35 +805,35 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       },
     ],
   ] as const)(
-    'leaves a held signup unknown when the principal %s its consent card, for the release path to end',
+    'keeps a signup uncertain when the principal %s its consent card, with a truthful release warning',
     async (_case, decide) => {
-      const { id, approvalId } = await heldForConsent();
-      expect(await release(id)).toEqual({ status: 'not_releasable' });
+      const { id, approvalId } = await uncertainAfterConsent();
       await decide(approvalId);
       expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
       expect(await lease()).toEqual({ job_id: job.thread_id });
       expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-      // The host never submitted the form, and the card says so.
+      // Even an old held marker cannot prove that an input callback never submitted.
       const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
       expect(question).toContain(
-        `I filled in the signup for "${USERNAME}" on shop.example, but the site needed an agreement you didn't give, so I never submitted it.`,
+        `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the account was created.`,
       );
-      expect(question).not.toContain('Trying again could');
+      expect(question).toContain('Trying again could create a second account.');
+      expect(question).not.toContain('never submitted');
       await click('approve');
       expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
       expect(await lease()).toBeUndefined();
     },
   );
 
-  it('ends a hold when its card is declined though its form sits in a page from another site', async () => {
+  it('keeps a framed signup uncertain when the card on its parent site is declined', async () => {
     // A signup form another site embeds: the stop names the page's site, the attempt its own form's.
-    const { id, approvalId } = await heldForConsent('parent.example');
+    const { id, approvalId } = await uncertainAfterConsent('parent.example');
     await decline(approvalId);
     expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
   });
 
-  it('keeps a hold whose own stop the principal approved when they decline another stop on the site', async () => {
+  it('keeps an exposed signup uncertain across decisions on its own and other consent stops', async () => {
     const id = await disclosedSignup();
     await holdSite();
     const [own] = await recordConsentStops(
@@ -846,31 +846,28 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       },
     );
     await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'approved' WHERE id = ?", own.stop_id);
-    await attempts.markAwaitingConsent(id, { signal: 'consent' }, [own.stop_id!]);
+    await attempts.markUnknown(id, { signal: 'consent', stops: own.stop_id! });
     const other = await consentCard('shop.example', 'I agree to share my details with travel partners', 'offers-form');
     await decline(other.approvalId);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_consent' });
-    expect(await release(id)).toEqual({ status: 'not_releasable' });
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
   });
 
-  it('warns of a second account once a held signup is filled again after the grant and its outcome is unknown', async () => {
-    const { id } = await heldForConsent();
-    // The fill after the grant: the same authority discloses its candidate again, and the control runs.
-    expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toMatchObject({
-      status: 'disclosed',
+  it('does not redisclose a candidate after a consent grant, and warns that a new attempt may duplicate it', async () => {
+    const { id } = await uncertainAfterConsent();
+    const candidate = (await attempts.get(id))?.candidate_item_id;
+    expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
     });
-    await attempts.markAwaitingVerification(id);
-    await attempts.markUnknown(id);
+    expect((await attempts.get(id))?.candidate_item_id).toBe(candidate);
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
     const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
-    expect(question).toContain(
-      `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the account was created.`,
-    );
     expect(question).toContain('Trying again could create a second account.');
   });
 
-  it('ends a held signup as unknown when its job is cancelled, keeping the site for the release', async () => {
-    const { id } = await heldForConsent();
+  it('keeps an uncertain signup and its site when its job is cancelled, until an informed release', async () => {
+    const { id } = await uncertainAfterConsent();
     const { cancelBrowserJob } = await import('./cancel.js');
     expect(await cancelBrowserJob(job.thread_id!)).toMatchObject({ status: 'in_progress' });
     expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });

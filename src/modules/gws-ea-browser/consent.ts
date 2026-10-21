@@ -1176,6 +1176,7 @@ export interface ConsentStop {
   created_at: string;
   requested_at: string | null;
   decided_at: string | null;
+  outcome_notified_at: string | null;
 }
 export interface ConsentGrant {
   id: string;
